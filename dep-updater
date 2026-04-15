@@ -1528,13 +1528,15 @@ write_npm_pr_body() {
   {
     printf '%s\n\n' '## Stack Context'
     printf "Automated dependency updates via \`dep-update\`.\n"
-    printf '%s\n\n' 'Each PR bumps exactly one dependency. Merge the full stack to update all.'
-    printf '%s\n\n' '## Why?'
-    printf "\`%s\` has a newer version available.\n\n" "$pkg"
-    printf "- **From:** \`%s\`\n" "$from_ver"
-    printf "- **To:** \`%s\`\n" "$to_ver"
-    printf -- '- **Ecosystem:** %s\n' "$eco"
-    printf -- '- **Files changed:** %s\n' "$files"
+    printf '%s\n\n' 'Each PR bumps exactly one dependency group. Merge the full stack to update all.'
+    printf '%s\n\n' '## Updates'
+    printf '| Package | From | To |\n'
+    printf '|---|---|---|\n'
+    while IFS=' ' read -r entry_pkg entry_old entry_new; do
+      [[ -z "$entry_pkg" ]] && continue
+      printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$entry_pkg" "$entry_old" "$entry_new"
+    done <<< "$entries"
+    printf '\n- **Ecosystem:** npm (%s)\n' "$npm_tool"
   } > "$body_file"
 }
 
@@ -2396,6 +2398,7 @@ wait_for_ci() {
   # Check for merge conflicts every 4 cycles (~2 min) while CI runs.
   local -r mergeable_check_interval=4
   local cycles_since_mergeable_check=0
+  local status raw merge_state
 
   if [[ -n "$target_sha" ]]; then
     log "Waiting for CI on '${branch}' (head ${target_sha:0:8})…"
@@ -2404,7 +2407,6 @@ wait_for_ci() {
   fi
 
   while true; do
-    local status raw
     raw="$(gh run list --branch "$branch" --limit 30 --json name,headSha,status,conclusion,createdAt 2>/dev/null || echo '[]')"
 
     if [[ -n "$target_sha" ]]; then
@@ -2469,7 +2471,6 @@ wait_for_ci() {
     cycles_since_mergeable_check=$(( cycles_since_mergeable_check + 1 ))
     if [[ -n "$pr_num" && $cycles_since_mergeable_check -ge $mergeable_check_interval ]]; then
       cycles_since_mergeable_check=0
-      local merge_state
       merge_state="$(gh pr view "$pr_num" --json mergeable --jq '.mergeable' 2>/dev/null || echo 'UNKNOWN')"
       if [[ "$merge_state" == 'CONFLICTING' ]]; then
         die "PR #${pr_num} developed merge conflicts during CI wait. Rebase the stack and re-run."
@@ -2520,10 +2521,10 @@ wait_for_mergeable() {
   local -r pr_num="$1"
   local -r timeout_min=5
   local elapsed=0
+  local state
 
   log "Checking merge conflict status for PR #${pr_num}…"
   while true; do
-    local state
     state="$(gh pr view "$pr_num" --json mergeable --jq '.mergeable' 2>/dev/null || echo 'UNKNOWN')"
     case "$state" in
       MERGEABLE)
@@ -2554,9 +2555,9 @@ wait_for_mergeable_quick() {
   local -r pr_num="$1"
   local -r timeout_sec=60
   local elapsed=0
+  local state
 
   while true; do
-    local state
     state="$(gh pr view "$pr_num" --json mergeable --jq '.mergeable' 2>/dev/null || echo 'UNKNOWN')"
     case "$state" in
       MERGEABLE)
@@ -2622,9 +2623,12 @@ require_resume_ci_gate() {
   if ! git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${last_branch}"; then
     # Branch may have been wiped by a prior cleanup interrupt. Try the remote.
     if git -C "$worktree_path" show-ref --verify --quiet "refs/remotes/origin/${last_branch}" 2>/dev/null; then
-      git -C "$worktree_path" checkout --track "origin/${last_branch}" --quiet 2>/dev/null \
-        && log "Checked out '${last_branch}' from origin for resume CI gate." \
-        || { log "Resume CI gate skipped: could not check out '${last_branch}' from origin."; return 0; }
+      if git -C "$worktree_path" checkout --track "origin/${last_branch}" --quiet 2>/dev/null; then
+        log "Checked out '${last_branch}' from origin for resume CI gate."
+      else
+        log "Resume CI gate skipped: could not check out '${last_branch}' from origin."
+        return 0
+      fi
     else
       log "Resume CI gate skipped: branch '${last_branch}' not found locally or on origin."
       return 0
@@ -2888,13 +2892,12 @@ poll_until_merged() {
   log "Waiting for all PRs to merge (timeout: ${timeout_min} min)…"
   log "PRs: $(csv_pretty "$prs_csv")"
 
+  local all_merged p merged
   while true; do
-    local all_merged=1
-    local p
+    all_merged=1
     IFS=',' read -ra pr_list <<< "$prs_csv"
     for p in "${pr_list[@]}"; do
       [[ -z "$p" ]] && continue
-      local merged
       merged="$(gh_pr_merged_for_number "$p")"
       if [[ "$merged" != 'true' ]]; then
         all_merged=0
