@@ -247,6 +247,26 @@ die() {
   exit 1
 }
 
+# Commit in the worktree, inheriting the signing config (gpg/ssh) from the
+# source repo's effective config.  Without this, commits made in the worktree
+# may be unsigned even when the user has commit.gpgsign=true in their repo or
+# global git config, because git -C <worktree> can resolve the config but the
+# GPG/SSH agent environment may differ from the calling shell's context.
+_worktree_commit() {
+  local -r msg="$1"
+  local -a sign_flags=()
+  local gpg_sign gpg_format sign_key
+  gpg_sign="$(git -C "$dir" config --bool commit.gpgsign 2>/dev/null || echo 'false')"
+  if [[ "$gpg_sign" == 'true' ]]; then
+    sign_flags+=('-c' 'commit.gpgsign=true')
+    gpg_format="$(git -C "$dir" config gpg.format 2>/dev/null || true)"
+    [[ -n "$gpg_format" ]] && sign_flags+=('-c' "gpg.format=${gpg_format}")
+    sign_key="$(git -C "$dir" config commit.signingkey 2>/dev/null || true)"
+    [[ -n "$sign_key" ]] && sign_flags+=('-c' "commit.signingkey=${sign_key}")
+  fi
+  git -C "$worktree_path" "${sign_flags[@]}" commit -m "$msg"
+}
+
 # ---------------------------------------------------------------------------
 # Exit / signal traps — clean up the worktree on unexpected death
 # (Registered in main(); defined here so they can reference cleanup_on_error.)
@@ -591,15 +611,25 @@ detect_ecosystem() {
   if [[ "$ecosystem" == 'npm' || "$ecosystem" == 'auto' ]]; then
     if [[ -f "$dir/package.json" ]]; then
       has_npm=1
-      # Detect the package manager from the lockfile present in the project.
-      if [[ -f "$dir/pnpm-lock.yaml" ]]; then
+      # Detect the package manager from the lockfile.  Check both the current
+      # working tree AND origin/main (the worktree base), because a feature branch
+      # may predate the project's adoption of pnpm/yarn and therefore lack the
+      # lockfile that exists on main.  Checking origin/main avoids committing
+      # a wrong-tool lockfile (e.g. package-lock.json on a pnpm project).
+      _lockfile_in_main() {
+        local f="$1"
+        [[ -f "$dir/$f" ]] \
+          || git -C "$dir" ls-tree --name-only origin/main -- "$f" 2>/dev/null | grep -q .
+      }
+      if _lockfile_in_main "pnpm-lock.yaml"; then
         npm_tool="pnpm"
-      elif [[ -f "$dir/yarn.lock" ]]; then
+      elif _lockfile_in_main "yarn.lock"; then
         npm_tool="yarn"
       else
         # package-lock.json or no lockfile at all — default to npm.
         npm_tool="npm"
       fi
+      unset -f _lockfile_in_main
     fi
   fi
 
@@ -1412,7 +1442,7 @@ npm_update_group() {
   # Create branch and commit with git directly so commit.gpgsign/user.signingkey
   # from the global git config are respected. gt create -m bypasses GPG signing.
   git -C "$worktree_path" checkout -b "$branch"
-  git -C "$worktree_path" commit -m "$commit_msg"
+  _worktree_commit "$commit_msg"
   # Tell Graphite about the branch parentage.
   if [[ "$parent_branch" == "$wt_base_branch" ]]; then
     run_in_worktree gt track -p main
@@ -1677,7 +1707,7 @@ npm_security_update() {
 
   local commit_msg="fix(deps): patch CVE vulnerabilities in npm dependencies"
   git -C "$worktree_path" checkout -b "$branch"
-  git -C "$worktree_path" commit -m "$commit_msg"
+  _worktree_commit "$commit_msg"
 
   if [[ "$parent_branch" == "$wt_base_branch" ]]; then
     run_in_worktree gt track -p main
@@ -1792,7 +1822,7 @@ py_security_update() {
 
   local commit_msg="fix(deps): patch CVE vulnerabilities in Python dependencies"
   git -C "$worktree_path" checkout -b "$branch"
-  git -C "$worktree_path" commit -m "$commit_msg"
+  _worktree_commit "$commit_msg"
 
   if [[ "$parent_branch" == "$wt_base_branch" ]]; then
     run_in_worktree gt track -p main
@@ -1940,7 +1970,7 @@ py_update_one() {
   # Create branch and commit with git directly so commit.gpgsign/user.signingkey
   # from the global git config are respected. gt create -m bypasses GPG signing.
   git -C "$worktree_path" checkout -b "$branch"
-  git -C "$worktree_path" commit -m "$commit_msg"
+  _worktree_commit "$commit_msg"
   # Tell Graphite about the branch parentage.
   if [[ "$parent_branch" == "$wt_base_branch" ]]; then
     run_in_worktree gt track -p main
@@ -2173,7 +2203,7 @@ batch_update_all() {
   fi
 
   git -C "$worktree_path" checkout -b "$branch"
-  git -C "$worktree_path" commit -m "$commit_msg"
+  _worktree_commit "$commit_msg"
   run_in_worktree gt track -p main
   log "[gate] Submitting batch PR for '${branch}'…"
   run_in_worktree gt submit --no-interactive --publish --no-stack
