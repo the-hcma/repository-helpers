@@ -2107,6 +2107,13 @@ batch_update_all() {
   fi
 
   # ── npm ──────────────────────────────────────────────────────────────────
+  # Capture the old package.json text so we can later diff against the
+  # installed result to determine which packages actually changed.
+  local old_pkg_json=""
+  if [[ "$has_npm" == '1' ]]; then
+    old_pkg_json="$(cat "${worktree_path}/package.json" 2>/dev/null || true)"
+  fi
+
   if [[ "$has_npm" == '1' ]]; then
     local lockfile
     case "$npm_tool" in
@@ -2243,6 +2250,23 @@ batch_update_all() {
     fi
   fi
 
+  # Determine which npm packages actually changed after install.
+  # pnpm outdated can report packages whose lockfile already resolves them to
+  # the latest version (node_modules was stale).  Using the pre/post package.json
+  # diff gives the ground truth: only packages whose specifier actually changed.
+  local actual_npm_lines=""
+  if [[ "$any_npm" == '1' && -n "$old_pkg_json" ]]; then
+    actual_npm_lines="$(jq -r --argjson old "$old_pkg_json" '
+        ([$old.dependencies, $old.devDependencies, $old.peerDependencies]
+          | map(select(. != null)) | add // {}) as $old_deps |
+        [.dependencies, .devDependencies, .peerDependencies]
+          | map(select(. != null)) | add // {}
+          | to_entries[]
+          | select($old_deps[.key] != .value)
+          | "\(.key) \($old_deps[.key] // "-") \(.value)"
+      ' "${worktree_path}/package.json" 2>/dev/null || true)"
+  fi
+
   if git -C "$worktree_path" diff --cached --quiet; then
     log "Batch: no file changes — all dependencies already up to date. Skipping PR."
     return 0
@@ -2301,14 +2325,14 @@ batch_update_all() {
       printf '\n'
     fi
     if [[ "$security_only" == '0' ]]; then
-      if [[ -n "$npm_lines_arg" ]]; then
+      if [[ -n "$actual_npm_lines" ]]; then
         printf '## npm updates\n\n'
         printf '| Package | From | To |\n'
         printf '|---|---|---|\n'
         while IFS=' ' read -r pkg old_ver new_ver; do
           [[ -z "$pkg" ]] && continue
           printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$pkg" "$old_ver" "$new_ver"
-        done <<< "$npm_lines_arg"
+        done <<< "$actual_npm_lines"
         printf '\n'
       fi
       if [[ -n "$py_lines_arg" ]]; then
