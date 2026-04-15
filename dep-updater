@@ -587,7 +587,11 @@ detect_ecosystem() {
   fi
 
   if [[ "$has_npm" == '0' && -z "$py_tool" ]]; then
-    die "No supported ecosystem detected in: $dir"
+    if [[ "$dry_run" == '1' ]]; then
+      log "No supported ecosystem detected in: $dir"
+    else
+      die "No supported ecosystem detected in: $dir"
+    fi
   fi
 
   readonly has_npm npm_tool py_tool
@@ -890,12 +894,19 @@ create_worktree() {
   # main is already checked out in the primary clone. A named branch is also
   # required by gt, which refuses to operate on a detached HEAD.
   local main_sha
-  main_sha="$(git -C "$dir" rev-parse origin/main)"
-  # Fast-forward local main to origin/main so that `gt submit` doesn't abort
-  # with "trunk branch is out of date". git update-ref is used instead of
-  # `git branch -f` because `main` is typically checked out in the primary
-  # clone and `git branch -f` refuses to move a checked-out branch.
-  git -C "$dir" update-ref refs/heads/main "$main_sha"
+  if ! main_sha="$(git -C "$dir" rev-parse origin/main 2>/dev/null)"; then
+    # No remote or fetch failed — fall back to local HEAD (e.g. during dry-run
+    # against a repo that has no origin configured).
+    main_sha="$(git -C "$dir" rev-parse HEAD)" \
+      || die "Could not resolve origin/main or HEAD in: $dir"
+    log "[worktree] origin/main not available; using local HEAD as base"
+  else
+    # Fast-forward local main to origin/main so that `gt submit` doesn't abort
+    # with "trunk branch is out of date". git update-ref is used instead of
+    # `git branch -f` because `main` is typically checked out in the primary
+    # clone and `git branch -f` refuses to move a checked-out branch.
+    git -C "$dir" update-ref refs/heads/main "$main_sha"
+  fi
   wt_base_branch="dep-update-wt-${timestamp}-$$"
   git -C "$dir" worktree add -b "$wt_base_branch" "$worktree_path" "$main_sha"
   readonly worktree_path
@@ -2704,39 +2715,44 @@ poll_until_merged() {
 }
 
 # ---------------------------------------------------------------------------
-# Dry-run table formatting helper
+# Dry-run output helpers
 # ---------------------------------------------------------------------------
 
+# Print a columnar table of ecosystem|package|from|to rows.
+# The header row is included in the column pipeline so widths align.
 print_update_table() {
   local -a rows=("$@")
   if [[ ${#rows[@]} -eq 0 ]]; then
     return 0
   fi
-  printf '%s|%s|%s|%s\n' "ECOSYSTEM" "PACKAGE" "FROM" "TO"
-  printf '%s\n' "---------------------------------------------"
-  printf '%s\n' "${rows[@]}" | column -t -s '|'
+  {
+    printf 'ECOSYSTEM|PACKAGE|FROM|TO\n'
+    printf '%s\n' "${rows[@]}"
+  } | column -t -s '|'
 }
 
-# In print_dry_run_table, gather all rows and call print_update_table:
-print_dry_run_table() {
-  local -r eco="$1"
-  local -r lines="$2"
-  if [[ -z "$lines" ]]; then
-    return 0
+# Print a per-PR plan entry for dry-run mode.
+# Args: index scope branch commit files entries cmd
+print_dry_run_pr_plan() {
+  local -r idx="$1"
+  local -r scope="$2"
+  local -r branch="$3"
+  local -r commit="$4"
+  local -r files="$5"
+  local -r entries="$6"
+  local -r cmd="$7"
+  printf '\n── PR #%s: %s\n' "$idx" "$scope"
+  printf '   Branch  : %s\n' "$branch"
+  printf '   Commit  : %s\n' "$commit"
+  printf '   Files   : %s\n' "$files"
+  printf '   Command : %s\n' "$cmd"
+  if [[ -n "$entries" ]]; then
+    printf '   Updates :\n'
+    while IFS=' ' read -r u_pkg u_old u_new; do
+      [[ -z "$u_pkg" ]] && continue
+      printf '     %s  %s → %s\n' "$u_pkg" "$u_old" "$u_new"
+    done <<< "$entries"
   fi
-  log ""
-  local -a table_lines=()
-  while IFS=' ' read -r pkg from to; do
-    [[ -z "$pkg" ]] && continue
-    local this_eco
-    if [[ "$pkg" == @* || "$pkg" == *eslint* || "$pkg" == esbuild || "$pkg" == jsdom || "$pkg" == typescript* || "$pkg" == vitest* || "$pkg" == globals ]]; then
-      this_eco="npm"
-    else
-      this_eco="python"
-    fi
-    table_lines+=("$this_eco|$pkg|$from|$to")
-  done <<< "$lines"
-  print_update_table "${table_lines[@]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -2772,7 +2788,9 @@ main() {
   parse_args "$@"
   init_prompt_style
   check_core_prereqs
-  init_repo_api_context
+  if [[ "$dry_run" == '0' ]]; then
+    init_repo_api_context
+  fi
   detect_ecosystem
   check_ecosystem_prereqs "$has_npm" "$py_tool"
   if [[ "$dry_run" == '0' ]]; then
@@ -2821,18 +2839,34 @@ main() {
   warn_if_dirty_workdir
 
 # ---------------------------------------------------------------------------
-# Dry-run mode: use a temporary worktree from origin/main ─────────────
+# Dry-run mode: temporary worktree → scan → plan → destroy
+# ---------------------------------------------------------------------------
+# Helper: destroy the dry-run worktree and its tracking branch cleanly.
+_dry_run_teardown() {
+  local -r wt="$1"
+  log "[worktree] Removing: $wt"
+  cd - >/dev/null 2>&1 || true
+  git -C "$dir" worktree remove --force "$wt" 2>/dev/null || true
+  git -C "$dir" branch -D "$wt_base_branch" 2>/dev/null || true
+  log "[worktree] Removed: $wt"
+}
+
 if [[ "$dry_run" == '1' ]]; then
-  local audit_dir
+  # Always create (and destroy) the worktree so lifecycle is exercised even
+  # when no ecosystem is present — this is the main testable invariant.
   create_worktree
-  audit_dir="$worktree_path"
+  local audit_dir="$worktree_path"
   cd "$audit_dir" || die "Failed to cd to dry-run worktree: $audit_dir"
-  # Do NOT redeclare or reassign any readonly globals (has_npm, py_tool, etc.)
-  local npm_lines="" py_lines=""
+
+  # ── No ecosystem detected ────────────────────────────────────────────
+  if [[ "$has_npm" == '0' && -z "$py_tool" ]]; then
+    log "No supported ecosystem detected — nothing to update."
+    _dry_run_teardown "$audit_dir"
+    exit 0
+  fi
+
+  # ── Security audit ───────────────────────────────────────────────────
   local npm_audit_lines="" py_audit_lines=""
-
-  # Always run security audits in dry-run so CVEs are visible.
-
   if [[ "$has_npm" == '1' ]]; then
     npm_audit_lines="$(npm_audit)"
   fi
@@ -2840,92 +2874,174 @@ if [[ "$dry_run" == '1' ]]; then
     py_audit_lines="$(py_audit "$py_tool" "$audit_dir")"
   fi
 
-  # Only print the CVE table if there is at least one real result (not just a placeholder or empty)
-  if [[ -n "$npm_audit_lines" ]] && grep -qE '^\S+' <<< "$npm_audit_lines"; then
-    real_cve_lines="$(printf '%s\n' "$npm_audit_lines" | grep -v '^ *$')"
-    if [[ -n "$real_cve_lines" && ! "$real_cve_lines" =~ \(\(cd ]]; then
-      printf '\n[npm] CVEs with available fixes:\n'
-      {
-        printf '%s\t%s\t%s\t%s\n' "PACKAGE" "CURRENT" "FIX" "CVEs"
-        while IFS=' ' read -r pkg cur fix cves; do
-          printf '%s\t%s\t%s\t%s\n' "$pkg" "$cur" "$fix" "$cves"
-        done <<< "$real_cve_lines"
-      } | column -t
-    fi
+  if [[ -n "$npm_audit_lines" ]]; then
+    printf '\n[npm] CVEs with available fixes:\n'
+    {
+      printf 'PACKAGE|CURRENT|FIX|CVEs\n'
+      while IFS=' ' read -r cve_pkg cve_cur cve_fix cve_ids; do
+        [[ -z "$cve_pkg" ]] && continue
+        printf '%s|%s|%s|%s\n' "$cve_pkg" "$cve_cur" "$cve_fix" "$cve_ids"
+      done <<< "$npm_audit_lines"
+    } | column -t -s '|'
   fi
-
   if [[ -n "$py_audit_lines" ]]; then
     printf '\n[python/%s] CVEs with available fixes:\n' "$py_tool"
     {
-      printf '%s\t%s\t%s\t%s\n' "PACKAGE" "CURRENT" "FIX" "CVEs"
-      while IFS=' ' read -r pkg cur fix cves; do
-        printf '%s\t%s\t%s\t%s\n' "$pkg" "$cur" "$fix" "$cves"
+      printf 'PACKAGE|CURRENT|FIX|CVEs\n'
+      while IFS=' ' read -r cve_pkg cve_cur cve_fix cve_ids; do
+        [[ -z "$cve_pkg" ]] && continue
+        printf '%s|%s|%s|%s\n' "$cve_pkg" "$cve_cur" "$cve_fix" "$cve_ids"
       done <<< "$py_audit_lines"
-    } | column -t
+    } | column -t -s '|'
   fi
-
   if [[ -z "$npm_audit_lines" && -z "$py_audit_lines" ]]; then
     log "No CVEs with direct fixes found."
   fi
 
   if [[ "$security_only" == '1' ]]; then
-    cd - >/dev/null 2>&1 || true
-    git worktree remove --force "$audit_dir" 2>/dev/null || true
+    _dry_run_teardown "$audit_dir"
     exit 0
   fi
 
+  # ── Outdated packages ────────────────────────────────────────────────
+  local npm_lines="" py_lines=""
   if [[ "$has_npm" == '1' ]]; then
-    # Always use the npm_outdated helper to get clean tabular output
     npm_lines="$(npm_outdated)"
   fi
   if [[ -n "$py_tool" ]]; then
     py_lines="$(py_outdated "$py_tool" "$audit_dir")"
   fi
 
+  # Normalize empty/null/'{}'
+  [[ "$npm_lines" == '{}' || "$npm_lines" == 'null' ]] && npm_lines=""
+  [[ "$py_lines"  == '{}' || "$py_lines"  == 'null' ]] && py_lines=""
 
-  # Treat empty, '{}' or 'null' as no updates for npm and Python
-  local no_npm_updates=0
-  local no_py_updates=0
-  if [[ -z "$npm_lines" || "$npm_lines" == '{}' || "$npm_lines" == 'null' ]]; then
-    no_npm_updates=1
-  fi
-  if [[ -z "$py_lines" || "$py_lines" == '{}' || "$py_lines" == 'null' ]]; then
-    no_py_updates=1
-  fi
-  if (( no_npm_updates == 1 && no_py_updates == 1 )); then
+  if [[ -z "$npm_lines" && -z "$py_lines" ]]; then
     log "All dependencies are up to date."
-    cd - >/dev/null 2>&1 || true
-    git worktree remove --force "$audit_dir" 2>/dev/null || true
+    _dry_run_teardown "$audit_dir"
     exit 0
   fi
 
+  # ── Summary table (all ecosystems, one table) ────────────────────────
+  printf '\n'
+  local -a all_rows=()
   if [[ -n "$npm_lines" ]]; then
-    print_dry_run_table "npm" "$npm_lines"
+    while IFS=' ' read -r pkg old_ver new_ver; do
+      [[ -z "$pkg" ]] && continue
+      all_rows+=("npm|$pkg|$old_ver|$new_ver")
+    done <<< "$npm_lines"
   fi
   if [[ -n "$py_lines" ]]; then
-    print_dry_run_table "python/$py_tool" "$py_lines"
+    while IFS=' ' read -r pkg old_ver new_ver; do
+      [[ -z "$pkg" ]] && continue
+      all_rows+=("python/${py_tool}|$pkg|$old_ver|$new_ver")
+    done <<< "$py_lines"
   fi
+  print_update_table "${all_rows[@]}"
 
-  # Only print the dry-run plan if there are actual updates
-  if [[ -n "$npm_lines" || -n "$py_lines" ]]; then
-    local -a all_rows=()
+  # ── Per-PR plan ───────────────────────────────────────────────────────
+  printf '\n'
+  if [[ "$batch" == '1' ]]; then
+    printf '── Batch PR plan ──────────────────────────────────────────────\n'
+    printf '   Branch  : dep-updates/batch\n'
+    printf '   Commit  : chore(deps): batch dependency updates\n'
+    printf '   (All updates above combined into a single PR)\n'
+  else
+    local pr_index=0
+
     if [[ -n "$npm_lines" ]]; then
-      while IFS=' ' read -r pkg old_ver new_ver; do
-        [[ -z "$pkg" ]] && continue
-        all_rows+=("npm|$pkg|$old_ver|$new_ver")
-      done <<< "$npm_lines"
+      local group_keys
+      group_keys="$(list_npm_group_keys "$npm_lines")"
+      while IFS= read -r group_key; do
+        [[ -z "$group_key" ]] && continue
+        local entries
+        entries="$(npm_entries_for_group "$group_key" "$npm_lines")"
+        [[ -z "$entries" ]] && continue
+
+        local safe_group scope_label commit_msg lockfile cmd_prefix
+        safe_group="$(sanitize_branch_name "${group_key#@}")"
+        local branch="dep-updates/npm-${safe_group}"
+
+        local pkg_count=0 first_pkg="" first_old="" first_new=""
+        while IFS=' ' read -r pkg old_ver new_ver; do
+          [[ -z "$pkg" ]] && continue
+          pkg_count=$(( pkg_count + 1 ))
+          if [[ "$pkg_count" -eq 1 ]]; then
+            first_pkg="$pkg"; first_old="$old_ver"; first_new="$new_ver"
+          fi
+        done <<< "$entries"
+
+        if [[ "$pkg_count" -eq 1 ]]; then
+          commit_msg="chore(deps): bump ${first_pkg} from ${first_old} to ${first_new}"
+          scope_label="npm/${first_pkg}"
+        else
+          commit_msg="chore(deps): bump ${group_key} from ${first_old} to ${first_new}"
+          scope_label="npm/${group_key} (${pkg_count} packages)"
+        fi
+
+        case "$npm_tool" in
+          pnpm) lockfile="pnpm-lock.yaml" ;;
+          yarn) lockfile="yarn.lock" ;;
+          *)    lockfile="package-lock.json" ;;
+        esac
+
+        case "$npm_tool" in
+          pnpm)
+            if [[ "$semver_only" == '1' ]]; then
+              cmd_prefix="pnpm --dir <worktree> update"
+            else
+              cmd_prefix="pnpm --dir <worktree> update --latest"
+            fi
+            ;;
+          yarn) cmd_prefix="yarn --cwd <worktree> upgrade --latest" ;;
+          *)
+            if [[ "$semver_only" == '1' ]]; then
+              cmd_prefix="npm update --prefix <worktree>"
+            else
+              cmd_prefix="npm install --prefix <worktree> __PKG__@latest"
+            fi
+            ;;
+        esac
+
+        pr_index=$(( pr_index + 1 ))
+        print_dry_run_pr_plan \
+          "$pr_index" \
+          "$scope_label" \
+          "$branch" \
+          "$commit_msg" \
+          "package.json + ${lockfile}" \
+          "$entries" \
+          "$cmd_prefix"
+      done <<< "$group_keys"
     fi
+
     if [[ -n "$py_lines" ]]; then
       while IFS=' ' read -r pkg old_ver new_ver; do
         [[ -z "$pkg" ]] && continue
-        all_rows+=("python|$pkg|$old_ver|$new_ver")
+        local safe_name py_branch py_commit py_files py_cmd
+        safe_name="$(sanitize_branch_name "$pkg")"
+        py_branch="dep-updates/py-${safe_name}"
+        py_commit="chore(deps): bump ${pkg} from ${old_ver} to ${new_ver}"
+        case "$py_tool" in
+          uv)     py_files="pyproject.toml + uv.lock" ;   py_cmd="uv --directory <worktree> add ${pkg}==${new_ver}" ;;
+          poetry) py_files="pyproject.toml + poetry.lock"; py_cmd="poetry add ${pkg}@${new_ver}" ;;
+          pipenv) py_files="Pipfile + Pipfile.lock" ;      py_cmd="pipenv install ${pkg}==${new_ver}" ;;
+          *)      py_files="requirements.txt" ;            py_cmd="${py_tool} install ${pkg}==${new_ver}" ;;
+        esac
+        pr_index=$(( pr_index + 1 ))
+        print_dry_run_pr_plan \
+          "$pr_index" \
+          "python/${py_tool}/${pkg}" \
+          "$py_branch" \
+          "$py_commit" \
+          "$py_files" \
+          "${pkg} ${old_ver} ${new_ver}" \
+          "$py_cmd"
       done <<< "$py_lines"
     fi
-    print_update_table "${all_rows[@]}"
   fi
 
-  cd - >/dev/null 2>&1 || true
-  git worktree remove --force "$audit_dir" 2>/dev/null || true
+  _dry_run_teardown "$audit_dir"
   exit 0
 fi
 
@@ -3050,68 +3166,7 @@ else
       local entries
       entries="$(npm_entries_for_group "$group_key" "$npm_lines")"
       [[ -z "$entries" ]] && continue
-
-      local safe_group
-      safe_group="$(sanitize_branch_name "${group_key#@}")"
-      local branch="dep-updates/npm-${safe_group}"
-
-      local pkg_count=0 first_pkg="" first_old="" first_new=""
-      while IFS=' ' read -r pkg old_ver new_ver; do
-        [[ -z "$pkg" ]] && continue
-        pkg_count=$(( pkg_count + 1 ))
-        if [[ "$pkg_count" -eq 1 ]]; then
-          first_pkg="$pkg"
-          first_old="$old_ver"
-          first_new="$new_ver"
-        fi
-      done <<< "$entries"
-
-      local commit_msg scope_label
-      if [[ "$pkg_count" -eq 1 ]]; then
-        commit_msg="chore(deps): bump ${first_pkg} from ${first_old} to ${first_new}"
-        scope_label="npm/${first_pkg}"
-      else
-        commit_msg="chore(deps): bump ${group_key} from ${first_old} to ${first_new}"
-        scope_label="npm/${group_key} (${pkg_count} packages)"
-      fi
-
-      local lockfile
-      case "$npm_tool" in
-        pnpm) lockfile="pnpm-lock.yaml" ;;
-        yarn) lockfile="yarn.lock" ;;
-        npm)  lockfile="package-lock.json" ;;
-        *)    lockfile="lockfile" ;;
-      esac
-
-      local cmd_prefix
-      case "$npm_tool" in
-        pnpm)
-          if [[ "$semver_only" == '1' ]]; then
-            cmd_prefix="pnpm --dir <worktree> update"
-          else
-            cmd_prefix="pnpm --dir <worktree> update --latest"
-          fi
-          ;;
-        yarn) cmd_prefix="yarn --cwd <worktree> upgrade --latest" ;;
-        npm)
-          if [[ "$semver_only" == '1' ]]; then
-            cmd_prefix="npm update --prefix <worktree>"
-          else
-            cmd_prefix="npm install --prefix <worktree> __PKG__@latest"
-          fi
-          ;;
-        *) cmd_prefix="<unknown tool> update" ;;
-      esac
-
-      pr_index=$(( pr_index + 1 ))
-      print_dry_run_pr_plan \
-        "$pr_index" \
-        "$scope_label" \
-        "$branch" \
-        "$commit_msg" \
-        "package.json + ${lockfile}" \
-        "$entries" \
-        "$cmd_prefix"
+      npm_update_group "$group_key" "$entries"
     done <<< "$group_keys"
   fi
 
