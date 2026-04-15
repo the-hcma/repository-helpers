@@ -2519,8 +2519,53 @@ require_resume_ci_gate() {
     return 0
   fi
 
-  log "Resuming after existing PR #${last_pr} (${last_branch}); waiting for CI before creating new PRs..."
-  wait_for_ci "$last_branch" "$current_head"
+  # Check current CI conclusion before deciding what to do.
+  local ci_status
+  ci_status="$(ci_conclusion_for_head "$last_branch" "$current_head")"
+
+  case "$ci_status" in
+    failure)
+      # CI has already failed on the interrupted PR — close it automatically
+      # and clean up so the next run starts fresh.
+      log "PR #${last_pr} (${last_branch}) failed CI. Closing it automatically."
+      gh pr close "$last_pr" \
+        --comment "Closed by dep-updater: CI failed on branch '${last_branch}'. Re-run to create a fresh update." \
+        2>/dev/null || true
+      cleanup
+      _cleanup_trap_active=0
+      die "PR #${last_pr} was closed. Re-run dep-updater to create a fresh update."
+      ;;
+    success|skipped|neutral)
+      # CI already passed — nothing to wait for.
+      log "Resuming after existing PR #${last_pr} (${last_branch}); CI already passed."
+      return 0
+      ;;
+    *)
+      # CI is still pending (or conclusion unknown).
+      log "PR #${last_pr} (${last_branch}) is still waiting on CI (status: ${ci_status})."
+      if is_interactive; then
+        if prompt_yes_no "Wait for CI on PR #${last_pr}?" "y"; then
+          log "Waiting for CI on PR #${last_pr} (${last_branch})…"
+          wait_for_ci "$last_branch" "$current_head" "$last_pr"
+        elif prompt_yes_no "Close PR #${last_pr} and start fresh?" "n"; then
+          log "Closing PR #${last_pr}…"
+          gh pr close "$last_pr" \
+            --comment "Closed by dep-updater: run was interrupted while CI was pending." \
+            2>/dev/null || true
+          cleanup
+          _cleanup_trap_active=0
+          die "PR #${last_pr} has been closed. Re-run dep-updater to create a fresh update."
+        else
+          log "Leaving PR #${last_pr} open. Re-run dep-updater when ready to continue."
+          exit 0
+        fi
+      else
+        # Non-interactive (e.g. CI): resume waiting as before.
+        log "Resuming after existing PR #${last_pr} (${last_branch}); waiting for CI before creating new PRs..."
+        wait_for_ci "$last_branch" "$current_head" "$last_pr"
+      fi
+      ;;
+  esac
 }
 
 maybe_label_top_pr_for_merge() {
