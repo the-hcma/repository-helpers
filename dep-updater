@@ -1,0 +1,3140 @@
+#!/usr/bin/env bash
+# dep-updater — discover and bump outdated dependencies via a Graphite PR stack.
+#
+# Creates one stacked PR per outdated package inside a dedicated git worktree,
+# waits for CI on each PR, then cleans up the worktree once the stack is merged.
+#
+# See scripts/dep-update.plan.md for full design documentation.
+set -euo pipefail
+set -eE
+trap '_on_exit' ERR
+
+# Prefer user-local installs (e.g. gh, gt installed via their official installers
+# under ~/.local/bin) over system-wide ones that may be stale or absent.
+if [[ -d "${HOME}/.local/bin" ]]; then
+  PATH="${HOME}/.local/bin:${PATH}"
+fi
+
+# ---------------------------------------------------------------------------
+# Script-level constants
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Mutable globals — set during startup; frozen to readonly after parsing
+# ---------------------------------------------------------------------------
+
+dry_run=0
+cleanup_mode=0
+rebase_mode=0
+dir=""
+ecosystem="auto"
+semver_only=0
+no_wait_ci=0
+no_wait_merge=0
+security_only=0
+batch=0
+merge_timeout_min=15
+
+# Newline-separated list of workflow names that trigger on pull_request events.
+# Populated by detect_ci_workflows(); empty means "all runs" (fallback).
+ci_workflow_names=""
+
+# Set after detect_ecosystem
+has_npm=0
+npm_tool=""
+py_tool=""
+
+# Set after create_worktree / init_state_file
+worktree_path=""
+wt_base_branch=""
+state_file=""
+
+summary_lines=""
+
+# Set to 1 once the worktree is live so the EXIT trap knows cleanup is needed.
+_cleanup_trap_active=0
+
+prompt_color=""
+prompt_color_reset=""
+
+# Cyan for our own log lines — distinguishes dep-update output from tool stdout.
+log_color=""
+log_reset=""
+
+repo_owner=""
+repo_name=""
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+is_interactive() {
+  # Returns 0 (true) if stdin is a TTY and we're not in a non-interactive flag mode
+  [[ -t 0 ]] && [[ "$dry_run" == '0' ]]
+}
+
+init_prompt_style() {
+  if ! is_interactive; then
+    return 0
+  fi
+
+  if [[ -n "${NO_COLOR:-}" ]]; then
+    return 0
+  fi
+
+  local term_value
+  term_value="${TERM:-}"
+  if [[ "$term_value" == "dumb" || -z "$term_value" ]]; then
+    return 0
+  fi
+
+  # Blue prompt text for interactive questions; reset afterward.
+  prompt_color='\033[1;34m'
+  prompt_color_reset='\033[0m'
+
+  # Cyan log lines so our output is visually distinct from tool output.
+  log_color='\033[0;36m'
+  log_reset='\033[0m'
+}
+
+prompt_yes_no() {
+  local -r question="$1"
+  local -r default="${2:-n}"
+
+  if ! is_interactive; then
+    return 1  # Non-interactive; assume "no"
+  fi
+
+  local prompt_text="$question"
+  case "$default" in
+    y) prompt_text="${prompt_text} [Y/n] " ;;
+    n) prompt_text="${prompt_text} [y/N] " ;;
+    *) prompt_text="${prompt_text} [y/n] " ;;
+  esac
+
+  if [[ -n "$prompt_color" ]]; then
+    printf '%b%s%b' "$prompt_color" "$prompt_text" "$prompt_color_reset" >&2
+  else
+    printf '%s' "$prompt_text" >&2
+  fi
+  read -r -s -n 1 response
+  printf '\n' >&2
+
+  case "$response" in
+    Y|y) return 0 ;;
+    N|n) return 1 ;;
+    '') [[ "$default" == "y" ]] ;;
+    *)   return 1 ;;
+  esac
+}
+
+# Checks if the Graphite stack needs rebasing on main
+# Returns 0 (true) if stack needs restack, 1 (false) if up-to-date
+stack_needs_rebase() {
+  local branches_csv gt_state_json
+  branches_csv="$(state_get "branches")"
+  [[ -z "$branches_csv" ]] && return 1
+
+  # Strict signal: gt state JSON (stable and branch-specific).
+  gt_state_json="$(run_in_worktree gt state 2>/dev/null || true)"
+  if [[ -z "$gt_state_json" ]]; then
+    die "Could not read Graphite state (empty output from 'gt state')."
+  fi
+
+  if ! printf '%s' "$gt_state_json" | jq -e . >/dev/null 2>&1; then
+    die "Could not parse Graphite state JSON from 'gt state'."
+  fi
+
+  if printf '%s' "$gt_state_json" \
+    | jq -e --arg csv "$branches_csv" '
+        ($csv | split(",") | map(select(length > 0))) as $branches
+        | any($branches[]; (. [.]?.needs_restack // false) == true)
+      ' >/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+log_stack_rebase_context() {
+  local branches_csv current_branch gt_state_json needs_restack_lines
+  branches_csv="$(state_get "branches")"
+  current_branch="$(git -C "$worktree_path" branch --show-current 2>/dev/null || true)"
+  gt_state_json="$(run_in_worktree gt state 2>/dev/null || true)"
+
+  if [[ -z "$gt_state_json" ]]; then
+    die "Could not read Graphite state for rebase diagnostics (empty output from 'gt state')."
+  fi
+
+  if ! printf '%s' "$gt_state_json" | jq -e . >/dev/null 2>&1; then
+    die "Could not parse Graphite state JSON for rebase diagnostics."
+  fi
+
+  needs_restack_lines="$(printf '%s' "$gt_state_json" \
+    | jq -r --arg csv "$branches_csv" '
+        ($csv | split(",") | map(select(length > 0))) as $branches
+        | [
+            $branches[] as $b
+            | select((.[ $b ]?.needs_restack // false) == true)
+            | "\($b) (needs_restack=true)"
+          ]
+        | .[]?
+      ' 2>/dev/null || true)"
+
+  log "Stack needs rebase on main."
+  log "  worktree: $worktree_path"
+  if [[ -n "$current_branch" ]]; then
+    log "  current branch: $current_branch"
+  fi
+  if [[ -n "$branches_csv" ]]; then
+    log "  tracked stack branches: $branches_csv"
+  fi
+
+  if [[ -n "$needs_restack_lines" ]]; then
+    log "  reason (Graphite):"
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      log "    - ${line}"
+    done <<< "$needs_restack_lines"
+  fi
+
+  if [[ -n "$branches_csv" ]]; then
+    local first_branch left_only right_only
+    first_branch="$(cut -d',' -f1 <<< "$branches_csv")"
+    if [[ -n "$first_branch" ]] \
+      && git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${first_branch}" \
+      && git -C "$worktree_path" show-ref --verify --quiet "refs/remotes/origin/main"; then
+      left_only="$(git -C "$worktree_path" rev-list --left-only --count "${first_branch}...origin/main" 2>/dev/null || echo 0)"
+      right_only="$(git -C "$worktree_path" rev-list --right-only --count "${first_branch}...origin/main" 2>/dev/null || echo 0)"
+      log "  reason (commit delta):"
+      log "    - commits on stack base not on origin/main: ${left_only}"
+      log "    - commits on origin/main not on stack base: ${right_only}"
+      if [[ "$right_only" != '0' ]]; then
+        log "    - origin/main has moved ahead of the stack base."
+      fi
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+log() {
+  local ts
+  ts="$(date '+%H:%M:%S.%3N')"
+  if [[ -n "$log_color" ]]; then
+    printf '%b%s  %s%b\n' "$log_color" "$ts" "$*" "$log_reset" >&2
+  else
+    printf '%s  %s\n' "$ts" "$*" >&2
+  fi
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Exit / signal traps — clean up the worktree on unexpected death
+# (Registered in main(); defined here so they can reference cleanup_on_error.)
+# ---------------------------------------------------------------------------
+
+# shellcheck disable=SC2317  # invoked via EXIT trap, not directly
+_on_exit() {
+  local exit_code=$?
+  # Only run cleanup if the worktree phase was reached and the exit is non-zero.
+  if [[ "$_cleanup_trap_active" == '1' && $exit_code -ne 0 ]]; then
+    cleanup_on_error "script exited unexpectedly (exit code ${exit_code})"
+  fi
+}
+
+# shellcheck disable=SC2317  # invoked via INT/TERM traps, not directly
+_on_signal() {
+  local sig="$1"
+  # Reset all traps before re-raising so we don't loop back into this handler.
+  trap - EXIT INT TERM
+  if [[ "$_cleanup_trap_active" == '1' ]]; then
+    log ""
+    log "Interrupted (SIG${sig}) — cleaning up…"
+    cleanup_on_error "interrupted by SIG${sig}"
+  fi
+  # Re-raise with the conventional signal exit code so the caller's $? is right.
+  kill -s "$sig" "$$"
+}
+
+init_repo_api_context() {
+  local remote_url
+  remote_url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+  if [[ -z "$remote_url" ]]; then
+    die "Could not resolve git remote 'origin' from: $dir"
+  fi
+
+  local slug
+  slug="$(printf '%s' "$remote_url" \
+    | sed -E 's#^git@github.com:##; s#^https://github.com/##; s#\.git$##')"
+
+  if [[ "$slug" != */* ]]; then
+    die "Could not parse GitHub owner/repo from origin URL: $remote_url"
+  fi
+
+  repo_owner="${slug%%/*}"
+  repo_name="${slug##*/}"
+}
+
+gh_pr_number_for_branch() {
+  local -r branch="$1"
+  # Filter by state=open and the dep-updater label so closed/merged PRs from
+  # previous runs are never confused with the current run's PR.
+  gh api "repos/${repo_owner}/${repo_name}/pulls" \
+    --method GET \
+    -f state=open \
+    -f head="${repo_owner}:${branch}" \
+    -f per_page=5 \
+    --jq 'map(select(any(.labels[]; .name == "dep-updater"))) | .[0].number // empty' \
+    2>/dev/null || true
+}
+
+# Used immediately after gt submit, before the dep-updater label has been applied.
+# Must not filter by label — the PR was just created and has no labels yet.
+gh_pr_number_for_new_branch() {
+  local -r branch="$1"
+  gh pr view "$branch" --repo "${repo_owner}/${repo_name}" \
+    --json number --jq '.number' 2>/dev/null || true
+}
+
+gh_pr_state_for_number() {
+  local -r pr_number="$1"
+  gh api "repos/${repo_owner}/${repo_name}/pulls/${pr_number}" \
+    --jq '.state // empty' 2>/dev/null || true
+}
+
+gh_pr_merged_for_number() {
+  local -r pr_number="$1"
+  gh api "repos/${repo_owner}/${repo_name}/pulls/${pr_number}" \
+    --jq '(.merged_at != null)' 2>/dev/null || true
+}
+
+add_merge_it_label() {
+  local -r pr_number="$1"
+  gh api "repos/${repo_owner}/${repo_name}/issues/${pr_number}/labels" \
+    --method POST \
+    -f labels[]=merge-it >/dev/null
+  # Add merge-mq label for repos that use a merge queue.
+  if [[ "$repo_name" == 'my-tracks' ]]; then
+    gh api "repos/${repo_owner}/${repo_name}/issues/${pr_number}/labels" \
+      --method POST \
+      -f labels[]=merge-mq >/dev/null 2>/dev/null || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage:
+  dep-update [OPTIONS]
+  dep-update --cleanup [--dir <path>]
+  dep-update --rebase [--dir <path>]
+
+Modes:
+  (no flags)        Update: create worktree, stack PRs, wait for merge, cleanup
+  --dry-run         Preview exact per-PR plan and scope; no git or worktree changes
+  --cleanup         Read saved state and clean up after stack is merged
+  --rebase          Rebase existing stack on top of newest main
+
+Options:
+  --dir <path>      Project root (default: current directory)
+  --ecosystem <e>   Force: npm | python | auto  (default: auto)
+  --semver-only     npm: respect existing semver range (omit --latest)
+  --no-wait-ci      Skip CI polling between PRs
+  --no-wait-merge   Exit after stack is submitted; print cleanup command
+  --security-only   Only create CVE-fix PRs; skip regular version bumps
+  --batch           Combine all updates into a single PR instead of one per package
+  --merge-timeout <min>  Minutes to wait for all PRs to merge (default: 15)
+  -h, --help        Print this help and exit
+
+Supported ecosystems:
+  npm      package.json present  → pnpm outdated + pnpm update
+  uv       uv.lock present       → uv pip list --outdated + uv add
+  poetry   poetry.lock present   → poetry show --outdated + poetry add
+  pipenv   Pipfile.lock present  → pipenv run pip list + pipenv install
+  pip      requirements.txt or pyproject.toml → pip list + pip freeze
+USAGE
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        dry_run=1
+        ;;
+      --cleanup)
+        cleanup_mode=1
+        ;;
+      --rebase)
+        rebase_mode=1
+        ;;
+      --dir)
+        shift
+        [[ $# -eq 0 ]] && die "--dir requires a path argument."
+        dir="$1"
+        ;;
+      --ecosystem)
+        shift
+        [[ $# -eq 0 ]] && die "--ecosystem requires a value: npm | python | auto"
+        ecosystem="$1"
+        ;;
+      --semver-only)
+        semver_only=1
+        ;;
+      --no-wait-ci)
+        no_wait_ci=1
+        ;;
+      --no-wait-merge)
+        no_wait_merge=1
+        ;;
+      --security-only)
+        security_only=1
+        ;;
+      --batch)
+        batch=1
+        ;;
+      --merge-timeout)
+        shift
+        [[ $# -eq 0 ]] && die "--merge-timeout requires a number of minutes."
+        merge_timeout_min="$1"
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown option: '$1'. Use -h for help."
+        ;;
+    esac
+    shift
+  done
+
+  case "$ecosystem" in
+    npm|python|auto) : ;;
+    *) die "Invalid --ecosystem: '$ecosystem'. Valid values: npm | python | auto" ;;
+  esac
+
+  local resolved_dir
+  if [[ -n "$dir" ]]; then
+    resolved_dir="$(cd "$dir" && pwd)"
+  else
+    resolved_dir="$(git rev-parse --show-toplevel 2>/dev/null)" \
+      || die "Not inside a git repository and --dir was not specified."
+  fi
+  dir="$resolved_dir"
+
+  # shellcheck disable=SC2034  # cleanup_mode, rebase_mode, merge_timeout_min used in main() dispatch
+  readonly dry_run cleanup_mode rebase_mode dir ecosystem semver_only no_wait_ci no_wait_merge security_only batch merge_timeout_min
+}
+
+# ---------------------------------------------------------------------------
+# Prerequisite checks — Phase 1: core tools (always required)
+# ---------------------------------------------------------------------------
+
+check_core_prereqs() {
+  local missing=0
+
+  log "[tooling]"
+  for tool in git gt gh jq rg; do
+    local tool_path
+    tool_path="$(command -v "$tool" 2>/dev/null || true)"
+    if [[ -z "$tool_path" ]]; then
+      case "$tool" in
+        gt)  log "  ERROR: 'gt' (Graphite CLI) not found. Install: https://graphite.dev/docs/install" ;;
+        gh)  log "  ERROR: 'gh' (GitHub CLI) not found.    Install: https://cli.github.com" ;;
+        jq)  log "  ERROR: 'jq' not found.                 Install: https://jqlang.github.io/jq/download/" ;;
+        rg)  log "  ERROR: 'rg' (ripgrep) not found.       Install: https://github.com/BurntSushi/ripgrep#installation" ;;
+        *)   log "  ERROR: '${tool}' is required but not found in PATH." ;;
+      esac
+      missing=$(( missing + 1 ))
+    else
+      local version
+      version="$("$tool" --version 2>/dev/null | head -1 || echo '?')"
+      log "  ${tool}: ${tool_path} (${version})"
+    fi
+  done
+
+  if (( missing > 0 )); then
+    die "Install the missing tool(s) above and retry."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Prerequisite checks — auth (skipped in dry-run)
+# ---------------------------------------------------------------------------
+
+check_auth_prereqs() {
+  log "[auth]"
+
+  local gh_user
+  if ! gh_user="$(gh auth status 2>&1 | grep -oP '(?<=account )\S+' | head -1)"; then
+    die "'gh' is not authenticated. Run: gh auth login"
+  fi
+  if [[ -z "$gh_user" ]]; then
+    die "'gh' is not authenticated. Run: gh auth login"
+  fi
+  log "  gh: logged in as ${gh_user}"
+
+  local gt_out
+  if ! gt_out="$(gt auth 2>&1)"; then
+    die "'gt' is not authenticated. Run: gt auth"
+  fi
+  local gt_user
+  gt_user="$(printf '%s' "$gt_out" | grep -oP '(?<=Authenticated as: )\S+' | head -1 || true)"
+  if [[ -n "$gt_user" ]]; then
+    log "  gt: authenticated as ${gt_user}"
+  else
+    log "  gt: authenticated"
+  fi
+
+  # Reconfigure git's credential helper to point at the gh binary currently in
+  # PATH (idempotent). This fixes stale absolute paths like /usr/bin/gh that
+  # were written when gh was first installed at a different location.
+  gh auth setup-git
+  log "  git credential helper: updated to current gh path"
+}
+
+# ---------------------------------------------------------------------------
+# Prerequisite checks — Phase 2: ecosystem tools (checked after detection)
+# ---------------------------------------------------------------------------
+
+check_ecosystem_prereqs() {
+  local -r chk_npm="$1"
+  local -r chk_py="$2"
+  local missing=0
+
+  if [[ "$chk_npm" == '1' ]]; then
+    local tool_to_check="$npm_tool"
+    [[ -z "$tool_to_check" ]] && tool_to_check="pnpm"
+    if ! command -v "$tool_to_check" &>/dev/null; then
+      log "ERROR: '${tool_to_check}' is required for npm projects."
+      case "$tool_to_check" in
+        pnpm) log "       Install: npm install -g pnpm" ;;
+        yarn) log "       Install: npm install -g yarn" ;;
+        npm)  log "       'npm' should be installed with Node.js: https://nodejs.org" ;;
+      esac
+      missing=$(( missing + 1 ))
+    fi
+  fi
+
+  if [[ -n "$chk_py" ]]; then
+    if [[ "$chk_py" == 'pip' ]]; then
+      if ! command -v pip &>/dev/null && ! command -v pip3 &>/dev/null; then
+        log "ERROR: 'pip' (or 'pip3') is required for Python projects."
+        missing=$(( missing + 1 ))
+      elif ! command -v pip &>/dev/null && command -v pip3 &>/dev/null; then
+        py_tool="pip3"  # promote pip3 globally
+      fi
+    elif ! command -v "$chk_py" &>/dev/null; then
+      case "$chk_py" in
+        uv)     log "ERROR: 'uv' not found.     Install: https://docs.astral.sh/uv/" ;;
+        poetry) log "ERROR: 'poetry' not found. Install: https://python-poetry.org/docs/" ;;
+        pipenv) log "ERROR: 'pipenv' not found. Run: pip install pipenv" ;;
+        *)      log "ERROR: '${chk_py}' is required but not found." ;;
+      esac
+      missing=$(( missing + 1 ))
+    fi
+  fi
+
+  if (( missing > 0 )); then
+    die "Install the missing tool(s) above and retry."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Ecosystem detection
+# ---------------------------------------------------------------------------
+
+detect_ecosystem() {
+  if [[ "$ecosystem" == 'npm' || "$ecosystem" == 'auto' ]]; then
+    if [[ -f "$dir/package.json" ]]; then
+      has_npm=1
+      # Detect the package manager from the lockfile present in the project.
+      if [[ -f "$dir/pnpm-lock.yaml" ]]; then
+        npm_tool="pnpm"
+      elif [[ -f "$dir/yarn.lock" ]]; then
+        npm_tool="yarn"
+      else
+        # package-lock.json or no lockfile at all — default to npm.
+        npm_tool="npm"
+      fi
+    fi
+  fi
+
+  if [[ "$ecosystem" == 'python' || "$ecosystem" == 'auto' ]]; then
+    if [[ -f "$dir/uv.lock" ]]; then
+      py_tool="uv"
+    elif [[ -f "$dir/poetry.lock" ]]; then
+      py_tool="poetry"
+    elif [[ -f "$dir/Pipfile.lock" ]]; then
+      py_tool="pipenv"
+    elif [[ -f "$dir/requirements.txt" || -f "$dir/pyproject.toml" ]]; then
+      py_tool="pip"
+    fi
+  fi
+
+  if [[ "$has_npm" == '0' && -z "$py_tool" ]]; then
+    die "No supported ecosystem detected in: $dir"
+  fi
+
+  readonly has_npm npm_tool py_tool
+
+  local eco_msg=""
+  if [[ "$has_npm" == '1' ]]; then
+    eco_msg="npm (${npm_tool})"
+  fi
+  if [[ -n "$py_tool" ]]; then
+    if [[ -n "$eco_msg" ]]; then
+      eco_msg="${eco_msg}, python/${py_tool}"
+    else
+      eco_msg="python/${py_tool}"
+    fi
+  fi
+  log "Detected: ${eco_msg}"
+
+  # Log ecosystem tool paths and versions alongside core tooling.
+  log "[ecosystem tooling]"
+  local eco_tools=()
+  if [[ "$has_npm" == '1' ]]; then
+    eco_tools+=("$npm_tool")
+  fi
+  if [[ -n "$py_tool" ]]; then
+    eco_tools+=("$py_tool")
+    if [[ "$py_tool" == 'uv' ]]; then
+      # pip-audit runs via uv; log it too if present.
+      if command -v pip-audit &>/dev/null || uv run --no-project --with pip-audit pip-audit --version &>/dev/null 2>&1; then
+        eco_tools+=("pip-audit")
+      fi
+    else
+      if command -v pip-audit &>/dev/null; then
+        eco_tools+=("pip-audit")
+      fi
+    fi
+  fi
+  local et
+  for et in "${eco_tools[@]}"; do
+    local et_path et_version
+    if [[ "$et" == 'pip-audit' && "$py_tool" == 'uv' ]]; then
+      et_path="(via uv run)"
+      et_version="$(uv run --no-project --with pip-audit pip-audit --version 2>/dev/null | head -1 || echo '?')"
+    else
+      et_path="$(command -v "$et" 2>/dev/null || echo '(not found)')"
+      et_version="$("$et" --version 2>/dev/null | head -1 || echo '?')"
+    fi
+    log "  ${et}: ${et_path} (${et_version})"
+  done
+}
+
+# Discover which workflows in .github/workflows/ are triggered on pull_request
+# events, and store their names in the global ci_workflow_names (newline-
+# separated).  Used by wait_for_ci and friends so they match the real CI
+# workflow name(s) instead of relying on a hardcoded string.
+detect_ci_workflows() {
+  local workflows_dir="${dir}/.github/workflows"
+  if [[ ! -d "$workflows_dir" ]]; then
+    log "[ci] No .github/workflows/ directory found; will monitor all workflow runs."
+    return
+  fi
+
+  local names=() f name
+  for f in "${workflows_dir}"/*.yml "${workflows_dir}"/*.yaml; do
+    [[ -f "$f" ]] || continue
+    # Skip workflows without a pull_request trigger.
+    grep -qE '^[[:space:]]*(pull_request|pull_request_target)[[:space:]]*[:$]' "$f" 2>/dev/null \
+      || grep -qE 'pull_request(_target)?[^_]' "$f" 2>/dev/null \
+      || continue
+    name="$(grep -m1 '^name:' "$f" | sed 's/^name:[[:space:]]*//' | tr -d "\"'")"
+    [[ -n "$name" ]] && names+=("$name")
+  done
+
+  if [[ ${#names[@]} -gt 0 ]]; then
+    ci_workflow_names="$(printf '%s\n' "${names[@]}")"
+    log "[ci] PR workflows: $(printf '%s, ' "${names[@]}" | sed 's/, $//')"
+  else
+    log "[ci] No PR-triggered workflows found; will monitor all workflow runs."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Working directory state note
+# ---------------------------------------------------------------------------
+
+warn_if_dirty_workdir() {
+  if ! git -C "$dir" diff --quiet 2>/dev/null \
+    || ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
+    log "Working directory has local changes."
+    log "dep-update runs in a clean dep-update worktree from 'main' (created or reused); uncommitted local changes are not included."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Branch name sanitization
+# ---------------------------------------------------------------------------
+
+sanitize_branch_name() {
+  local -r input="$1"
+  printf '%s' "$input" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's|[@/._]|-|g; s|-\+|-|g; s|^-||; s|-$||'
+}
+
+# ---------------------------------------------------------------------------
+# Run a command inside the worktree (subshell with cd)
+# ---------------------------------------------------------------------------
+
+run_in_worktree() {
+  (cd "$worktree_path" && "$@")
+}
+
+# ---------------------------------------------------------------------------
+# State file helpers
+# ---------------------------------------------------------------------------
+
+init_state_file() {
+  state_file="${dir}/.dep-update-state"
+  readonly state_file
+}
+
+state_get() {
+  local -r key="$1"
+  rg -m1 "^${key}=" "$state_file" 2>/dev/null | cut -d= -f2- || true
+}
+
+state_set() {
+  local -r key="$1"
+  local -r value="$2"
+  if rg -q "^${key}=" "$state_file" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${value}|" "$state_file"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$state_file"
+  fi
+}
+
+state_append() {
+  local -r key="$1"
+  local -r value="$2"
+  local current
+  current="$(state_get "$key")"
+  if [[ -z "$current" ]]; then
+    state_set "$key" "$value"
+  else
+    state_set "$key" "${current},${value}"
+  fi
+}
+
+is_valid_pr_number() {
+  local -r value="$1"
+  [[ "$value" =~ ^[0-9]+$ ]]
+}
+
+state_append_pr() {
+  local -r pr_number="$1"
+  if ! is_valid_pr_number "$pr_number"; then
+    log "Warning: skipping invalid PR number in state append: '${pr_number}'"
+    return 0
+  fi
+  state_append "prs" "$pr_number"
+}
+
+sanitize_state_prs() {
+  [[ ! -f "$state_file" ]] && return 0
+
+  local prs_csv
+  prs_csv="$(state_get "prs")"
+  [[ -z "$prs_csv" ]] && return 0
+
+  local cleaned="" removed_any=0 token
+  IFS=',' read -ra pr_list <<< "$prs_csv"
+  for token in "${pr_list[@]}"; do
+    [[ -z "$token" ]] && continue
+    if is_valid_pr_number "$token"; then
+      if [[ -z "$cleaned" ]]; then
+        cleaned="$token"
+      else
+        cleaned="${cleaned},${token}"
+      fi
+    else
+      removed_any=1
+      log "Warning: removing invalid PR token from state: '${token}'"
+    fi
+  done
+
+  if [[ "$removed_any" == '1' ]]; then
+    state_set "prs" "$cleaned"
+  fi
+}
+
+csv_contains() {
+  local -r csv="$1"
+  local -r needle="$2"
+  [[ ",${csv}," == *",${needle},"* ]]
+}
+
+csv_last() {
+  local -r csv="$1"
+  if [[ -z "$csv" ]]; then
+    printf ''
+  else
+    awk -F',' '{print $NF}' <<< "$csv"
+  fi
+}
+
+csv_pretty() {
+  local -r csv="$1"
+  if [[ -z "$csv" ]]; then
+    printf ''
+  else
+    printf '%s' "$csv" | sed 's/,/, /g'
+  fi
+}
+
+collect_tracked_prs_csv() {
+  local branches_csv prs_csv collected=""
+  branches_csv="$(state_get "branches")"
+  prs_csv="$(state_get "prs")"
+
+  if [[ -n "$branches_csv" ]]; then
+    local b pr
+    IFS=',' read -ra b_list <<< "$branches_csv"
+    for b in "${b_list[@]}"; do
+      [[ -z "$b" ]] && continue
+      pr="$(gh_pr_number_for_branch "$b")"
+      if [[ -n "$pr" ]] && is_valid_pr_number "$pr" && ! csv_contains "$collected" "$pr"; then
+        if [[ -z "$collected" ]]; then
+          collected="$pr"
+        else
+          collected="${collected},${pr}"
+        fi
+      fi
+    done
+  fi
+
+  if [[ -n "$prs_csv" ]]; then
+    local p
+    IFS=',' read -ra p_list <<< "$prs_csv"
+    for p in "${p_list[@]}"; do
+      [[ -z "$p" ]] && continue
+      if is_valid_pr_number "$p" && ! csv_contains "$collected" "$p"; then
+        if [[ -z "$collected" ]]; then
+          collected="$p"
+        else
+          collected="${collected},${p}"
+        fi
+      fi
+    done
+  fi
+
+  printf '%s' "$collected"
+}
+
+write_initial_state() {
+  local -r wt="$1"
+  local timestamp
+  timestamp="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'worktree=%s\nbase_branch=main\nwt_branch=%s\ncreated_at=%s\nbranches=\nprs=\n' \
+    "$wt" "$wt_base_branch" "$timestamp" > "$state_file"
+}
+
+# ---------------------------------------------------------------------------
+# .gitignore helper
+# ---------------------------------------------------------------------------
+
+ensure_gitignore() {
+  local -r gitignore="${dir}/.gitignore"
+  if [[ ! -f "$gitignore" ]] || ! rg -qx --fixed-strings '.dep-update-state' "$gitignore"; then
+    printf '.dep-update-state\n' >> "$gitignore"
+    log "Appended .dep-update-state to .gitignore"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Worktree management
+# ---------------------------------------------------------------------------
+
+create_worktree() {
+  # Fetch origin/main first so the worktree starts from exactly what GitHub sees.
+  # Using a stale local 'main' that diverges from origin/main causes the first
+  # PR to show as conflicting immediately.
+  log "Fetching origin/main…"
+  git -C "$dir" fetch origin main 2>/dev/null || true
+
+  # Create a uniquely-named local branch at origin/main's commit. Using 'main'
+  # directly fails with "fatal: 'main' is already used by worktree at …" when
+  # main is already checked out in the primary clone. A named branch is also
+  # required by gt, which refuses to operate on a detached HEAD.
+  local main_sha
+  main_sha="$(git -C "$dir" rev-parse origin/main)"
+  # Fast-forward local main to origin/main so that `gt submit` doesn't abort
+  # with "trunk branch is out of date". git update-ref is used instead of
+  # `git branch -f` because `main` is typically checked out in the primary
+  # clone and `git branch -f` refuses to move a checked-out branch.
+  git -C "$dir" update-ref refs/heads/main "$main_sha"
+  wt_base_branch="dep-update-wt-${timestamp}-$$"
+  git -C "$dir" worktree add -b "$wt_base_branch" "$worktree_path" "$main_sha"
+  readonly worktree_path
+
+  # Always install dependencies in the new worktree to ensure environment is in sync
+  if [[ -f "$worktree_path/pnpm-lock.yaml" ]]; then
+    (cd "$worktree_path" && pnpm install --prefer-offline --frozen-lockfile)
+  elif [[ -f "$worktree_path/package-lock.json" ]]; then
+    (cd "$worktree_path" && npm ci --prefer-offline --no-audit --no-fund)
+  elif [[ -f "$worktree_path/requirements.txt" && -x "$(command -v uv 2>/dev/null)" ]]; then
+    # Ensure a uv virtual environment exists in the worktree before installing
+    if [[ ! -d "$worktree_path/.venv" ]]; then
+      (cd "$worktree_path" && uv venv)
+    fi
+    (cd "$worktree_path" && uv pip install -r requirements.txt)
+  fi
+  log "[worktree] Worktree created: $worktree_path"
+}
+
+# ---------------------------------------------------------------------------
+# Worktree reset helper — delete a broken worktree and start fresh
+# ---------------------------------------------------------------------------
+
+offer_worktree_reset() {
+  local current_branch
+  current_branch="$(git -C "$worktree_path" branch --show-current 2>/dev/null || echo '(detached)')"
+
+  local branches_csv
+  branches_csv="$(state_get "branches")"
+
+  log "Worktree is unusable: branch '${current_branch}' is not tracked by Graphite."
+  log "  Worktree: ${worktree_path}"
+  if [[ -n "$branches_csv" ]]; then
+    log "  Note: existing stack branches will NOT be deleted ($(csv_pretty "$branches_csv"))."
+    log "  To clean up those PRs and branches later, run: $0 --cleanup --dir ${dir}"
+  fi
+
+  if ! prompt_yes_no "Delete this worktree and start fresh?" "y"; then
+    die "Cannot proceed with unusable worktree. To clean up manually, run: $0 --cleanup --dir ${dir}"
+  fi
+
+  # Remove the broken worktree
+  log "[worktree] Removing worktree: $worktree_path"
+  git -C "$dir" worktree remove --force "$worktree_path" 2>/dev/null \
+    || log "Note: worktree directory already removed."
+
+  # Delete the throwaway wt_base_branch (it has no PRs stacked on it)
+  local wt_branch
+  wt_branch="$(state_get "wt_branch")"
+  if [[ -n "$wt_branch" ]]; then
+    log "[worktree] Deleting branch: $wt_branch"
+    git -C "$dir" branch -D "$wt_branch" 2>/dev/null \
+      || log "Note: wt_branch '${wt_branch}' not found; skipping deletion."
+  fi
+
+  # Clear state so create_worktree starts from scratch
+  rm -f "$state_file"
+  log "Broken worktree deleted. Creating a new worktree…"
+
+  # worktree_path is not yet readonly at this call site; reset before create_worktree assigns it.
+  worktree_path=""
+  create_worktree
+  write_initial_state "$worktree_path"
+  ensure_gitignore
+  log "New worktree ready: $worktree_path"
+}
+
+prepare_worktree() {
+  local existing_wt=""
+  if [[ -f "$state_file" ]]; then
+    existing_wt="$(state_get "worktree")"
+    if [[ -n "$existing_wt" && -d "$existing_wt" ]]; then
+      worktree_path="$existing_wt"
+      log "Reusing dep-update worktree: $worktree_path"
+
+      # Restore the wt_base_branch from state (may be absent for worktrees
+      # created before this field was introduced).
+      wt_base_branch="$(state_get "wt_branch")"
+
+      # If the worktree has a detached HEAD (legacy worktree or stale state),
+      # create a named branch so gt can operate — it refuses detached HEAD.
+      local wt_current_branch
+      wt_current_branch="$(git -C "$worktree_path" branch --show-current)"
+      if [[ -z "$wt_current_branch" ]]; then
+        local wt_ts wt_pid
+        wt_ts="$(date --utc +%Y%m%dT%H%M%S)"
+        wt_pid="$$"
+        wt_base_branch="dep-update-wt-${wt_ts}-${wt_pid}"
+        git -C "$worktree_path" checkout -b "$wt_base_branch"
+        state_set "wt_branch" "$wt_base_branch"
+        log "Attached detached HEAD to new branch: $wt_base_branch"
+        # Register the new branch with Graphite so gt create can stack on top of it.
+        # Use --force so Graphite auto-detects the trunk parent without us hardcoding 'main'.
+        run_in_worktree gt track --force \
+          || log "Warning: could not track '${wt_base_branch}' with Graphite."
+      fi
+
+      # Sanity check: verify Graphite can operate on the current branch.
+      # If not (e.g. gt track failed or state is corrupted), offer to delete
+      # this worktree and start fresh.
+      if ! run_in_worktree gt branch info &>/dev/null 2>&1; then
+        offer_worktree_reset
+        # offer_worktree_reset either dies or recreates the worktree via
+        # create_worktree, which marks worktree_path readonly.
+        return 0
+      fi
+
+      readonly worktree_path
+
+      # Fetch latest main in case upstream has moved
+      git -C "$worktree_path" fetch origin main >/dev/null 2>&1 \
+        || log "Note: could not fetch latest main; stack may be behind."
+      
+      # Check if stack needs rebase using Graphite's status
+      if stack_needs_rebase; then
+        log_stack_rebase_context
+        if prompt_yes_no "Rebase stack on main now?" "y"; then
+          log "Rebasing stack..."
+          rebase_stack_on_main
+        else
+          log "Skipped rebase. Stack will use current base."
+        fi
+      fi
+      
+      return 0
+    fi
+    log "State file exists but worktree is missing; starting a new dep-update worktree."
+  fi
+
+  create_worktree
+  write_initial_state "$worktree_path"
+  ensure_gitignore
+  log "Worktree ready: $worktree_path"
+}
+
+ensure_gt_tracked() {
+  local current_branch
+  current_branch="$(git -C "$worktree_path" branch --show-current)"
+  # On main — always known to Graphite; nothing to track.
+  if [[ "$current_branch" == 'main' ]]; then
+    return 0
+  fi
+  # For any other branch (including the throwaway wt_base_branch) — ensure
+  # Graphite tracks it so gt create can stack child branches on top of it.
+  # Use --force so Graphite auto-detects the trunk parent.
+  if ! run_in_worktree gt branch info &>/dev/null 2>&1; then
+    run_in_worktree gt track --force \
+      || die "Could not register '${current_branch}' with Graphite. Cannot create stack.\n  Try manually: (cd ${worktree_path} && gt track --parent main)"
+  fi
+}
+
+branch_exists_in_worktree() {
+  local -r branch="$1"
+  git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${branch}"
+}
+
+register_existing_branch_state() {
+  local -r branch="$1"
+
+  local branches_csv prs_csv
+  branches_csv="$(state_get "branches")"
+  prs_csv="$(state_get "prs")"
+
+  if ! csv_contains "$branches_csv" "$branch"; then
+    state_append "branches" "$branch"
+  fi
+
+  local pr_num
+  pr_num="$(gh_pr_number_for_branch "$branch")"
+  if [[ -n "$pr_num" ]] && ! csv_contains "$prs_csv" "$pr_num"; then
+    state_append_pr "$pr_num"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# npm helpers
+# ---------------------------------------------------------------------------
+
+# Prints one "name current latest" line per outdated package.
+npm_outdated() {
+  local -r tool="$npm_tool"
+
+  if [[ ! -d "$dir/node_modules" ]]; then
+    log "node_modules not found at git root — running install…"
+    case "$tool" in
+      pnpm) pnpm --dir "$dir" install --frozen-lockfile >&2 ;;
+      yarn) yarn --cwd "$dir" install --frozen-lockfile >&2 ;;
+      npm)  npm install --prefix "$dir" --prefer-offline >&2 ;;
+    esac
+  fi
+
+  local tmp_json exit_code
+  tmp_json="$(mktemp)"
+  set +e
+  case "$tool" in
+    pnpm) pnpm --dir "$dir" outdated --json > "$tmp_json" 2>/dev/null ;;
+    yarn) yarn --cwd "$dir" outdated --json > "$tmp_json" 2>/dev/null ;;
+    npm)  npm outdated --prefix "$dir" --json > "$tmp_json" 2>/dev/null ;;
+  esac
+  exit_code=$?
+  set -e
+
+  # Both pnpm and npm outdated exit 1 when outdated packages are found; >1 is an error.
+  if (( exit_code > 1 )); then
+    rm -f "$tmp_json"
+    die "'${tool} outdated' exited with unexpected code ${exit_code}"
+  fi
+
+  if [[ ! -s "$tmp_json" ]] || grep -qE '^\s*\{\s*\}\s*$' "$tmp_json" || grep -qE '^\s*null\s*$' "$tmp_json"; then
+    rm -f "$tmp_json"
+    return 0
+  fi
+
+  if [[ "$tool" == 'yarn' ]]; then
+    jq -r 'select(.type == "table")
+      | .data.body[]
+      | "\(.[0]) \(.[1]) \(.[3])"' "$tmp_json" 2>/dev/null \
+      | awk '{if(NF==3 && $1!="" && $2!="" && $3!="") print $0}'
+  else
+    jq -r '
+      to_entries[]
+      | select(
+          .key | test("^(latest|wanted|isDeprecated|name|type|homepage|description|author|license|repository|bugs|engines|_.*)$") | not
+        )
+      | select(.value.current != null and .value.current != .value.latest)
+      | "\(.key) \(.value.current) \(.value.latest)"' "$tmp_json" 2>/dev/null \
+      | awk '{if(NF==3 && $1!="" && $2!="" && $3!="") print $0}'
+  fi
+  rm -f "$tmp_json"
+}
+
+# Derives the grouping key for an npm package.
+# Scoped packages (@scope/name) group by @scope.
+# Unscoped 'pkg' groups with @pkg if any @pkg/* sibling exists in all_lines.
+npm_group_key() {
+  local -r pkg="$1"
+  local -r all_lines="$2"
+  if [[ "$pkg" == @*/* ]]; then
+    printf '%s' "${pkg%%/*}"
+  elif printf '%s\n' "$all_lines" | rg -q --fixed-strings "@${pkg}/"; then
+    printf '%s' "@${pkg}"
+  else
+    printf '%s' "$pkg"
+  fi
+}
+
+# Prints one group key per line, preserving first-seen order.
+list_npm_group_keys() {
+  local -r all_lines="$1"
+  local keys=""
+
+  while IFS=' ' read -r pkg _old _new; do
+    [[ -z "$pkg" ]] && continue
+    local key
+    key="$(npm_group_key "$pkg" "$all_lines")"
+    if ! printf '%s\n' "$keys" | rg -qx --fixed-strings "$key"; then
+      if [[ -z "$keys" ]]; then
+        keys="$key"
+      else
+        keys="${keys}
+${key}"
+      fi
+    fi
+  done <<< "$all_lines"
+
+  printf '%s' "$keys"
+}
+
+# Prints one "pkg old_ver new_ver" line per package in group_key.
+npm_entries_for_group() {
+  local -r group_key="$1"
+  local -r all_lines="$2"
+
+  while IFS=' ' read -r pkg old_ver new_ver; do
+    [[ -z "$pkg" ]] && continue
+    local key
+    key="$(npm_group_key "$pkg" "$all_lines")"
+    if [[ "$key" == "$group_key" ]]; then
+      printf '%s %s %s\n' "$pkg" "$old_ver" "$new_ver"
+    fi
+  done <<< "$all_lines"
+}
+
+# entries: newline-separated "pkg old_ver new_ver" for one group.
+npm_update_group() {
+  local -r group_key="$1"
+  local -r entries="$2"
+
+  local safe_key
+  safe_key="$(sanitize_branch_name "${group_key#@}")"
+  local -r branch="dep-updates/npm-${safe_key}"
+
+  if branch_exists_in_worktree "$branch"; then
+    log "Skipping existing branch: ${branch}"
+    register_existing_branch_state "$branch"
+    # A previous run may have created the branch but died before submitting the PR
+    # (e.g. killed by gh pr edit's non-zero exit). Submit it now if needed.
+    local existing_pr
+    existing_pr="$(gh_pr_number_for_branch "$branch")"
+    if [[ -z "$existing_pr" ]]; then
+      log "Branch ${branch} has no PR — submitting now."
+      git -C "$worktree_path" checkout "$branch"
+      run_in_worktree gt track -p main 2>/dev/null || true
+      run_in_worktree gt submit --no-interactive --publish --no-stack
+      existing_pr="$(gh_pr_number_for_branch "$branch")"
+      if [[ -n "$existing_pr" ]]; then
+        state_append_pr "$existing_pr"
+      fi
+    fi
+    # Position worktree on this branch so the next update stacks on top of it.
+    git -C "$worktree_path" checkout "$branch"
+    return 0
+  fi
+
+  local pkg_count=0 first_pkg="" first_old="" first_new=""
+  while IFS=' ' read -r pkg old_ver new_ver; do
+    [[ -z "$pkg" ]] && continue
+    pkg_count=$(( pkg_count + 1 ))
+    if [[ "$pkg_count" -eq 1 ]]; then
+      first_pkg="$pkg"; first_old="$old_ver"; first_new="$new_ver"
+    fi
+  done <<< "$entries"
+
+  local commit_msg
+  if [[ "$pkg_count" -eq 1 ]]; then
+    commit_msg="chore(deps): bump ${first_pkg} from ${first_old} to ${first_new}"
+    log "[${npm_tool}] ${first_pkg}: ${first_old} -> ${first_new}"
+  else
+    commit_msg="chore(deps): bump ${group_key} from ${first_old} to ${first_new}"
+    log "[${npm_tool}] ${group_key} (${pkg_count} packages): ${first_old} -> ${first_new}"
+  fi
+
+  # Restore manifest + lockfile to HEAD so a previous failed run cannot leave
+  # them in a half-updated state that causes peer-dependency conflicts.
+  # Restore each file independently: if the lockfile is not committed (common
+  # for npm projects that .gitignore package-lock.json), a combined checkout
+  # would fail silently via || true and leave package.json unrestored.
+  local lockfile
+  case "$npm_tool" in
+    pnpm) lockfile="pnpm-lock.yaml" ;;
+    yarn) lockfile="yarn.lock" ;;
+    npm)  lockfile="package-lock.json" ;;
+  esac
+  git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+  if [[ "$npm_tool" == 'npm' ]]; then
+    # For npm, delete the lockfile rather than restoring it.  The committed
+    # lockfile pins old versions; restoring it causes npm to read those pins
+    # and conflict them against the newly-patched package.json versions.
+    # With no lockfile, npm builds a fresh resolution tree from package.json.
+    rm -f "${worktree_path}/package-lock.json"
+  else
+    git -C "$worktree_path" checkout -- "$lockfile" 2>/dev/null || true
+  fi
+
+  # Remove any stale node_modules left by a previous failed npm run.
+  if [[ "$npm_tool" == 'npm' && -d "${worktree_path}/node_modules" ]]; then
+    log "[${npm_tool}] Removing stale node_modules in worktree before update…"
+    rm -rf "${worktree_path}/node_modules"
+  fi
+
+  # For pnpm/yarn (semver-only) and yarn (latest): pass package names to the
+  # update command.  For npm and pnpm (latest): patch package.json via jq and
+  # run install — avoids specifier/lockfile mismatches caused by `update --latest`.
+  local pkg_args=""
+  if [[ "$npm_tool" != 'npm' ]]; then
+    while IFS=' ' read -r pkg _old _new; do
+      [[ -z "$pkg" ]] && continue
+      pkg_args="${pkg_args} ${pkg}"
+    done <<< "$entries"
+    pkg_args="${pkg_args# }"
+  fi
+
+  case "$npm_tool" in
+    pnpm)
+      if [[ "$semver_only" == '1' ]]; then
+        # semver-only: stay within the existing range; pnpm resolves the latest
+        # version within that range without touching package.json specifiers.
+        # shellcheck disable=SC2086
+        pnpm --dir "$worktree_path" update $pkg_args
+      else
+        # pnpm update --latest writes exact versions (e.g. 8.58.2) to
+        # package.json but leaves pnpm-lock.yaml specifiers at the old range
+        # (e.g. ^8.58.1), causing a "specifiers don't match" error in CI.
+        # Instead, patch package.json directly (same strategy as npm) then
+        # let pnpm install regenerate the lockfile from the updated manifest.
+        local updates_json
+        updates_json='{}'
+        while IFS=' ' read -r pkg _old new_ver; do
+          [[ -z "$pkg" ]] && continue
+          updates_json="$(printf '%s' "$updates_json" \
+            | jq --arg k "$pkg" --arg v "$new_ver" '. + {($k): $v}')"
+        done <<< "$entries"
+
+        local tmp_pkg
+        tmp_pkg="$(mktemp)"
+        if ! jq --argjson updates "$updates_json" '
+          to_entries | map(
+            if (.key == "dependencies" or .key == "devDependencies" or .key == "peerDependencies")
+               and (.value != null) then
+              .value |= with_entries(
+                (.key) as $k |
+                if $updates | has($k) then .value = $updates[$k] else . end
+              )
+            else . end
+          ) | from_entries
+        ' "${worktree_path}/package.json" > "$tmp_pkg"; then
+          rm -f "$tmp_pkg"
+          die "jq failed to update package.json versions."
+        fi
+        mv "$tmp_pkg" "${worktree_path}/package.json"
+
+        # --no-frozen-lockfile lets pnpm rebuild pnpm-lock.yaml from the
+        # freshly patched package.json so specifiers are consistent.
+        pnpm --dir "$worktree_path" install --no-frozen-lockfile
+      fi
+      ;;
+    yarn)
+      # shellcheck disable=SC2086
+      yarn --cwd "$worktree_path" upgrade $pkg_args --latest
+      ;;
+    npm)
+      # Patch exact target versions into package.json using jq, then do a
+      # clean install.  npm install pkg@v rewrites package.json and builds an
+      # ideal tree that first resolves the old semver range as the baseline,
+      # causing ERESOLVE when interdependent grouped packages are updated.
+      local updates_json
+      updates_json='{}'
+      while IFS=' ' read -r pkg _old new_ver; do
+        [[ -z "$pkg" ]] && continue
+        updates_json="$(printf '%s' "$updates_json" \
+          | jq --arg k "$pkg" --arg v "$new_ver" '. + {($k): $v}')"
+      done <<< "$entries"
+
+      local tmp_pkg
+      tmp_pkg="$(mktemp)"
+      if ! jq --argjson updates "$updates_json" '
+        to_entries | map(
+          if (.key == "dependencies" or .key == "devDependencies" or .key == "peerDependencies")
+             and (.value != null) then
+            .value |= with_entries(
+              (.key) as $k |
+              if $updates | has($k) then .value = $updates[$k] else . end
+            )
+          else . end
+        ) | from_entries
+      ' "${worktree_path}/package.json" > "$tmp_pkg"; then
+        rm -f "$tmp_pkg"
+        die "jq failed to update package.json versions."
+      fi
+      mv "$tmp_pkg" "${worktree_path}/package.json"
+
+      npm install --prefix "$worktree_path"
+      ;;
+  esac
+
+  git -C "$worktree_path" add package.json
+  # Only stage the lockfile if the project tracks it (not gitignored).
+  if ! git -C "$worktree_path" check-ignore -q "$lockfile" 2>/dev/null; then
+    git -C "$worktree_path" add "$lockfile" 2>/dev/null || true
+  fi
+
+  # If the update made no changes, there is nothing to commit.
+  # Bail out to avoid creating an empty branch that gt submit will reject.
+  if git -C "$worktree_path" diff --cached --quiet; then
+    log "[${npm_tool}] ${group_key}: no file changes after update — already at latest. Skipping PR."
+    return 0
+  fi
+
+  # Record the current branch so we know whether to reparent in Graphite.
+  local parent_branch
+  parent_branch="$(git -C "$worktree_path" branch --show-current)"
+
+  # Create branch and commit with git directly so commit.gpgsign/user.signingkey
+  # from the global git config are respected. gt create -m bypasses GPG signing.
+  git -C "$worktree_path" checkout -b "$branch"
+  git -C "$worktree_path" commit -m "$commit_msg"
+  # Tell Graphite about the branch parentage.
+  if [[ "$parent_branch" == "$wt_base_branch" ]]; then
+    run_in_worktree gt track -p main
+  else
+    run_in_worktree gt track -p "$parent_branch"
+  fi
+  log "[gate] Submitting PR for '${branch}'…"
+  run_in_worktree gt submit --no-interactive --publish --no-stack
+
+  local submitted_head
+  submitted_head="$(git -C "$worktree_path" rev-parse "$branch")"
+  # Stay on $branch — the next dep-update branch will stack on top of it.
+
+  local pr_num
+  pr_num="$(gh_pr_number_for_new_branch "$branch")"
+  [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
+
+  write_npm_pr_body "$group_key" "$safe_key" "$entries"
+  # gh pr edit exits 1 due to a non-actionable GitHub GraphQL deprecation warning;
+  # the PR title and body are cosmetic — the PR itself was already created above.
+  gh pr edit "$pr_num" \
+    --title "$commit_msg" \
+    --body-file "/tmp/dep-update-pr-${safe_key}.md" \
+    --add-label "dep-updater" || true
+  if [[ "$repo_name" == 'my-tracks' ]]; then
+    gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
+  fi
+
+  state_append "branches" "$branch"
+  state_append_pr "$pr_num"
+  add_summary_line "npm" "$group_key" "$first_old" "$first_new" "$branch" "$pr_num"
+
+  if [[ "$no_wait_ci" == '0' ]]; then
+    log "[gate] Checking merge conflict status for PR #${pr_num} before waiting for CI…"
+    wait_for_mergeable_quick "$pr_num"
+    log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
+    wait_for_ci "$branch" "$submitted_head" "$pr_num"
+    log "[gate] CI passed. Final merge conflict check…"
+    wait_for_mergeable "$pr_num"
+    log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
+  fi
+}
+
+write_npm_pr_body() {
+  local -r group_key="$1"
+  local -r safe_key="$2"
+  local -r entries="$3"
+  local -r body_file="/tmp/dep-update-pr-${safe_key}.md"
+
+  {
+    printf '%s\n\n' '## Stack Context'
+    printf "Automated dependency updates via \`dep-update\`.\n"
+    printf '%s\n\n' 'Each PR bumps exactly one dependency. Merge the full stack to update all.'
+    printf '%s\n\n' '## Why?'
+    printf "\`%s\` has a newer version available.\n\n" "$pkg"
+    printf "- **From:** \`%s\`\n" "$from_ver"
+    printf "- **To:** \`%s\`\n" "$to_ver"
+    printf -- '- **Ecosystem:** %s\n' "$eco"
+    printf -- '- **Files changed:** %s\n' "$files"
+  } > "$body_file"
+}
+
+# ---------------------------------------------------------------------------
+# Security audit helpers
+# ---------------------------------------------------------------------------
+
+# Emits one "pkg current fix_version cve1,cve2,..." line per vulnerable Python
+# package that has a known fix version available. Packages with no fix are
+# silently skipped (nothing we can do in a dep-update PR).
+
+# py_audit(tool, dir): run pip-audit in the specified directory
+py_audit() {
+  local -r tool="$1"
+  local audit_dir="${2:-$dir}"
+  local raw exit_code
+
+  set +e
+  case "$tool" in
+    uv)
+      raw="$(cd "$audit_dir" && uv run --with pip-audit pip-audit --format=json 2>/dev/null)"
+      exit_code=$?
+      ;;
+    *)
+      if ! command -v pip-audit &>/dev/null; then
+        return 0  # pip-audit not installed — skip audit silently
+      fi
+      raw="$(cd "$audit_dir" && pip-audit --format=json 2>/dev/null)"
+      exit_code=$?
+      ;;
+  esac
+  set -e
+
+  [[ -z "$raw" || "$raw" == 'null' ]] && return 0
+  if ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then return 0; fi
+
+  printf '%s' "$raw" | jq -r '
+    .dependencies[]
+    | select(.vulns | length > 0)
+    | . as $dep
+    | .vulns
+      | map(select(.fix_versions | length > 0))
+      | select(length > 0)
+      | {
+          name: $dep.name,
+          version: $dep.version,
+          fix: (map(.fix_versions[]) | sort | last),
+          cves: (map(.id) | join(", "))
+        }
+    | "\(.name) \(.version) \(.fix) \(.cves)"
+  ' 2>/dev/null || true
+}
+
+# Emits one "pkg current fix_version cve1,cve2,..." line per vulnerable npm
+# package where a direct-dep fix is available. Transitive-only vulns are
+# skipped (package.json cannot address them without introducing breaking changes).
+npm_audit() {
+  local raw exit_code
+
+  set +e
+  case "$npm_tool" in
+    pnpm) raw="$(pnpm --dir "$dir" audit --json 2>/dev/null)" ;;
+    yarn) raw="$(yarn --cwd "$dir" audit --json 2>/dev/null)" ;;
+    npm)  raw="$(npm audit --prefix "$dir" --json 2>/dev/null)" ;;
+  esac
+  exit_code=$?
+  set -e
+
+  [[ -z "$raw" || "$raw" == '{}' || "$raw" == 'null' ]] && return 0
+  if ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then return 0; fi
+
+  # npm/pnpm JSON: .vulnerabilities.<name>.{ isDirect, fixAvailable: bool | {name,version} }
+  # yarn emits newline-delimited JSON events; filter to advisories.
+  if [[ "$npm_tool" == 'yarn' ]]; then
+    # yarn audit --json emits one JSON object per line; skip non-advisory lines.
+    printf '%s' "$raw" | jq -r '
+      select(.type == "auditAdvisory")
+      | .data.advisory
+      | select(.findings | any(.paths[]; . == "." or (test("^[^/]+$"))))
+      | select(.patched_versions != "<0.0.0")
+      | "\(.module_name) \(.findings[0].version) \(.patched_versions | ltrimstr(">=") | ltrimstr(">") | split(" ")[0]) \(.cves | if length > 0 then join(", ") else .id end)"
+    ' 2>/dev/null | sort -u || true
+  else
+    # npm and pnpm share the same audit JSON format.
+    printf '%s' "$raw" | jq -r '
+      .vulnerabilities
+      | to_entries[]
+      | select(.value.isDirect == true)
+      | select(.value.fixAvailable | type == "object")
+      | {
+          name: .key,
+          current: (.value.via | map(select(type == "object")) | .[0].range // "unknown"),
+          fix: .value.fixAvailable.version,
+          cves: (.value.via
+            | map(select(type == "object") | .url | split("/") | last)
+            | map(select(startswith("GHSA-") or (test("CVE-"))))
+            | unique | join(", "))
+        }
+      | "\(.name) \(.current) \(.fix) \(.cves)"
+    ' 2>/dev/null || true
+  fi
+}
+
+# Write the PR body for a combined security update PR.
+# Args: ecosystem  audit_lines  body_file
+write_security_pr_body() {
+  local -r eco="$1"
+  local -r audit_lines="$2"
+  local -r body_file="$3"
+  {
+    printf '## Security: CVE fixes\n\n'
+    printf "Automated security updates via \`dep-update\`.\n\n"
+    printf 'Patching all packages with known vulnerabilities that have a fix available.\n\n'
+    printf '## Vulnerabilities addressed\n\n'
+    printf '| Package | Current | Fixed | CVEs |\n'
+    printf '|---|---|---|---|\n'
+    while IFS=' ' read -r pkg current fix cves; do
+      [[ -z "$pkg" ]] && continue
+      printf "| \`%s\` | \`%s\` | \`%s\` | %s |\n" \
+        "$pkg" "$current" "$fix" "${cves/,/, }"
+    done <<< "$audit_lines"
+    printf '\n- **Ecosystem:** %s\n' "$eco"
+  } > "$body_file"
+}
+
+# Creates exactly ONE PR that bumps all npm packages with CVE fixes.
+npm_security_update() {
+  local -r audit_lines="$1"
+  [[ -z "$audit_lines" ]] && return 0
+
+  local -r branch="dep-updates/npm-security"
+  local -r body_file="/tmp/dep-update-pr-npm-security.md"
+
+  local pkg_list=""
+  while IFS=' ' read -r pkg _current _fix _cves; do
+    [[ -z "$pkg" ]] && continue
+    pkg_list="${pkg_list} ${pkg}"
+  done <<< "$audit_lines"
+  pkg_list="${pkg_list# }"
+
+  if branch_exists_in_worktree "$branch"; then
+    log "Skipping existing security branch: ${branch}"
+    register_existing_branch_state "$branch"
+    local existing_pr
+    existing_pr="$(gh_pr_number_for_branch "$branch")"
+    if [[ -z "$existing_pr" ]]; then
+      log "Branch ${branch} has no PR — submitting now."
+      git -C "$worktree_path" checkout "$branch"
+      run_in_worktree gt track -p main 2>/dev/null || true
+      run_in_worktree gt submit --no-interactive --publish --no-stack
+      existing_pr="$(gh_pr_number_for_branch "$branch")"
+      if [[ -n "$existing_pr" ]]; then state_append_pr "$existing_pr"; fi
+    fi
+    git -C "$worktree_path" checkout "$branch"
+    return 0
+  fi
+
+  log "[${npm_tool}] Security: patching CVE vulnerabilities in ${pkg_list}…"
+
+  # Restore manifest + lockfile to a clean state.
+  local lockfile
+  case "$npm_tool" in
+    pnpm) lockfile="pnpm-lock.yaml" ;;
+    yarn) lockfile="yarn.lock" ;;
+    npm)  lockfile="package-lock.json" ;;
+  esac
+  git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+  git -C "$worktree_path" checkout -- "$lockfile" 2>/dev/null || true
+
+  # Apply audit fixes. npm/pnpm patch manifests + lockfiles in one step.
+  case "$npm_tool" in
+    pnpm)
+      pnpm --dir "$worktree_path" audit --fix 2>/dev/null \
+        || pnpm --dir "$worktree_path" install --no-frozen-lockfile
+      ;;
+    yarn)
+      # yarn has no native audit --fix; upgrade the vulnerable packages directly.
+      local yarn_args=""
+      while IFS=' ' read -r pkg _current fix _cves; do
+        [[ -z "$pkg" ]] && continue
+        yarn_args="${yarn_args} ${pkg}@${fix}"
+      done <<< "$audit_lines"
+      # shellcheck disable=SC2086
+      yarn --cwd "$worktree_path" upgrade $yarn_args
+      ;;
+    npm)
+      npm audit fix --prefix "$worktree_path" 2>/dev/null || true
+      ;;
+  esac
+
+  git -C "$worktree_path" add package.json
+  # Only stage the lockfile if the project tracks it (not gitignored).
+  if ! git -C "$worktree_path" check-ignore -q "$lockfile" 2>/dev/null; then
+    git -C "$worktree_path" add "$lockfile" 2>/dev/null || true
+  fi
+
+  if git -C "$worktree_path" diff --cached --quiet; then
+    log "[${npm_tool}] Security: no file changes after audit fix — already patched or indirect only. Skipping PR."
+    return 0
+  fi
+
+  local parent_branch
+  parent_branch="$(git -C "$worktree_path" branch --show-current)"
+
+  local commit_msg="fix(deps): patch CVE vulnerabilities in npm dependencies"
+  git -C "$worktree_path" checkout -b "$branch"
+  git -C "$worktree_path" commit -m "$commit_msg"
+
+  if [[ "$parent_branch" == "$wt_base_branch" ]]; then
+    run_in_worktree gt track -p main
+  else
+    run_in_worktree gt track -p "$parent_branch"
+  fi
+  log "[gate] Submitting security PR for '${branch}'…"
+  run_in_worktree gt submit --no-interactive --publish --no-stack
+
+  local submitted_head
+  submitted_head="$(git -C "$worktree_path" rev-parse "$branch")"
+
+  local pr_num
+  pr_num="$(gh_pr_number_for_new_branch "$branch")"
+  [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
+
+  write_security_pr_body "${npm_tool}" "$audit_lines" "$body_file"
+  gh pr edit "$pr_num" \
+    --title "$commit_msg" \
+    --body-file "$body_file" \
+    --add-label "dep-updater" \
+    --add-label "security" || true
+  if [[ "$repo_name" == 'my-tracks' ]]; then
+    gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
+  fi
+
+  state_append "branches" "$branch"
+  state_append_pr "$pr_num"
+  add_summary_line "npm" "npm-security (CVEs)" "" "" "$branch" "$pr_num"
+
+  if [[ "$no_wait_ci" == '0' ]]; then
+    log "[gate] Checking merge conflict status for PR #${pr_num} before waiting for CI…"
+    wait_for_mergeable_quick "$pr_num"
+    log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
+    wait_for_ci "$branch" "$submitted_head" "$pr_num"
+    log "[gate] CI passed. Final merge conflict check…"
+    wait_for_mergeable "$pr_num"
+    log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
+  fi
+}
+
+# Creates exactly ONE PR that bumps all Python packages with CVE fixes.
+py_security_update() {
+  local -r audit_lines="$1"
+  local -r tool="$2"
+  [[ -z "$audit_lines" ]] && return 0
+
+  local -r branch="dep-updates/py-security"
+  local -r body_file="/tmp/dep-update-pr-py-security.md"
+
+  if branch_exists_in_worktree "$branch"; then
+    log "Skipping existing Python security branch: ${branch}"
+    register_existing_branch_state "$branch"
+    local existing_pr
+    existing_pr="$(gh_pr_number_for_branch "$branch")"
+    if [[ -z "$existing_pr" ]]; then
+      log "Branch ${branch} has no PR — submitting now."
+      git -C "$worktree_path" checkout "$branch"
+      run_in_worktree gt track -p main 2>/dev/null || true
+      run_in_worktree gt submit --no-interactive --publish --no-stack
+      existing_pr="$(gh_pr_number_for_branch "$branch")"
+      if [[ -n "$existing_pr" ]]; then state_append_pr "$existing_pr"; fi
+    fi
+    git -C "$worktree_path" checkout "$branch"
+    return 0
+  fi
+
+  log "[python/${tool}] Security: patching CVE vulnerabilities…"
+
+  local files_changed=""
+  while IFS=' ' read -r pkg _current fix _cves; do
+    [[ -z "$pkg" ]] && continue
+    log "[python/${tool}] Security: bumping ${pkg} to ${fix}…"
+    case "$tool" in
+      uv)
+        uv --directory "$worktree_path" add "${pkg}==${fix}"
+        files_changed="pyproject.toml + uv.lock"
+        ;;
+      poetry)
+        run_in_worktree poetry add "${pkg}@${fix}"
+        files_changed="pyproject.toml + poetry.lock"
+        ;;
+      pipenv)
+        run_in_worktree pipenv install "${pkg}==${fix}"
+        files_changed="Pipfile + Pipfile.lock"
+        ;;
+      pip|pip3)
+        "$tool" install "${pkg}==${fix}"
+        "$tool" freeze > "${worktree_path}/requirements.txt"
+        files_changed="requirements.txt"
+        ;;
+      *)
+        die "Unknown Python tool: '$tool'"
+        ;;
+    esac
+  done <<< "$audit_lines"
+
+  case "$tool" in
+    uv)      git -C "$worktree_path" add pyproject.toml uv.lock ;;
+    poetry)  git -C "$worktree_path" add pyproject.toml poetry.lock ;;
+    pipenv)  git -C "$worktree_path" add Pipfile Pipfile.lock ;;
+    pip|pip3) git -C "$worktree_path" add requirements.txt ;;
+  esac
+
+  if git -C "$worktree_path" diff --cached --quiet; then
+    log "[python/${tool}] Security: no file changes after patching — already fixed. Skipping PR."
+    return 0
+  fi
+
+  local parent_branch
+  parent_branch="$(git -C "$worktree_path" branch --show-current)"
+
+  local commit_msg="fix(deps): patch CVE vulnerabilities in Python dependencies"
+  git -C "$worktree_path" checkout -b "$branch"
+  git -C "$worktree_path" commit -m "$commit_msg"
+
+  if [[ "$parent_branch" == "$wt_base_branch" ]]; then
+    run_in_worktree gt track -p main
+  else
+    run_in_worktree gt track -p "$parent_branch"
+  fi
+  log "[gate] Submitting Python security PR for '${branch}'…"
+  run_in_worktree gt submit --no-interactive --publish --no-stack
+
+  local submitted_head
+  submitted_head="$(git -C "$worktree_path" rev-parse "$branch")"
+
+  local pr_num
+  pr_num="$(gh_pr_number_for_new_branch "$branch")"
+  [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
+
+  write_security_pr_body "python/${tool}" "$audit_lines" "$body_file"
+  gh pr edit "$pr_num" \
+    --title "$commit_msg" \
+    --body-file "$body_file" \
+    --add-label "dep-updater" \
+    --add-label "security" || true
+  if [[ "$repo_name" == 'my-tracks' ]]; then
+    gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
+  fi
+
+  state_append "branches" "$branch"
+  state_append_pr "$pr_num"
+  add_summary_line "python" "py-security (CVEs)" "" "" "$branch" "$pr_num"
+
+  if [[ "$no_wait_ci" == '0' ]]; then
+    log "[gate] Checking merge conflict status for PR #${pr_num} before waiting for CI…"
+    wait_for_mergeable_quick "$pr_num"
+    log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
+    wait_for_ci "$branch" "$submitted_head" "$pr_num"
+    log "[gate] CI passed. Final merge conflict check…"
+    wait_for_mergeable "$pr_num"
+    log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Python helpers
+# ---------------------------------------------------------------------------
+
+# Prints one "name current latest" line per outdated package.
+py_outdated() {
+  local -r tool="$1"
+  case "$tool" in
+    uv)
+      uv pip list --outdated --format=json 2>/dev/null \
+        | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"'
+      ;;
+    poetry)
+      # poetry show --outdated has no stable JSON output; parse the table instead
+      poetry --directory "$dir" show --outdated 2>/dev/null \
+        | awk '/^[a-zA-Z]/ { print $1, $2, $3 }'
+      ;;
+    pipenv)
+      pipenv run pip list --outdated --format=json 2>/dev/null \
+        | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"'
+      ;;
+    pip|pip3)
+      "$tool" list --outdated --format=json 2>/dev/null \
+        | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"'
+      ;;
+    *)
+      die "Unknown Python tool: '$tool'"
+      ;;
+  esac
+}
+
+py_update_one() {
+  local -r pkg="$1"
+  local -r old_ver="$2"
+  local -r new_ver="$3"
+  local -r tool="$4"
+  local safe_name
+  safe_name="$(sanitize_branch_name "$pkg")"
+  local -r branch="dep-updates/py-${safe_name}"
+  local -r commit_msg="chore(deps): bump ${pkg} from ${old_ver} to ${new_ver}"
+  local files_changed=""
+
+  if branch_exists_in_worktree "$branch"; then
+    log "Skipping existing branch: ${branch}"
+    register_existing_branch_state "$branch"
+    # A previous run may have created the branch but died before submitting the PR.
+    local existing_pr
+    existing_pr="$(gh_pr_number_for_branch "$branch")"
+    if [[ -z "$existing_pr" ]]; then
+      log "Branch ${branch} has no PR — submitting now."
+      git -C "$worktree_path" checkout "$branch"
+      run_in_worktree gt track -p main 2>/dev/null || true
+      run_in_worktree gt submit --no-interactive --publish --no-stack
+      existing_pr="$(gh_pr_number_for_branch "$branch")"
+      if [[ -n "$existing_pr" ]]; then
+        state_append_pr "$existing_pr"
+      fi
+    fi
+    # Position worktree on this branch so the next update stacks on top of it.
+    git -C "$worktree_path" checkout "$branch"
+    return 0
+  fi
+
+  log "[python/${tool}] ${pkg}: ${old_ver} → ${new_ver}"
+
+  case "$tool" in
+    uv)
+      uv --directory "$worktree_path" add "${pkg}==${new_ver}"
+      git -C "$worktree_path" add pyproject.toml uv.lock
+      files_changed="pyproject.toml + uv.lock"
+      ;;
+    poetry)
+      run_in_worktree poetry add "${pkg}@${new_ver}"
+      git -C "$worktree_path" add pyproject.toml poetry.lock
+      files_changed="pyproject.toml + poetry.lock"
+      ;;
+    pipenv)
+      run_in_worktree pipenv install "${pkg}==${new_ver}"
+      git -C "$worktree_path" add Pipfile Pipfile.lock
+      files_changed="Pipfile + Pipfile.lock"
+      ;;
+    pip|pip3)
+      "$tool" install "${pkg}==${new_ver}"
+      "$tool" freeze > "${worktree_path}/requirements.txt"
+      git -C "$worktree_path" add requirements.txt
+      files_changed="requirements.txt"
+      ;;
+    *)
+      die "Unknown Python tool: '$tool'"
+      ;;
+  esac
+
+  # If the update tool made no changes, there is nothing to commit.
+  # Bail out to avoid creating an empty branch that gt submit will reject.
+  if git -C "$worktree_path" diff --cached --quiet; then
+    log "[python/${tool}] ${pkg}: no file changes after update — already at latest. Skipping PR."
+    return 0
+  fi
+
+  # Record the current branch to determine whether reparenting is needed.
+  local parent_branch
+  parent_branch="$(git -C "$worktree_path" branch --show-current)"
+
+  # Create branch and commit with git directly so commit.gpgsign/user.signingkey
+  # from the global git config are respected. gt create -m bypasses GPG signing.
+  git -C "$worktree_path" checkout -b "$branch"
+  git -C "$worktree_path" commit -m "$commit_msg"
+  # Tell Graphite about the branch parentage.
+  if [[ "$parent_branch" == "$wt_base_branch" ]]; then
+    run_in_worktree gt track -p main
+  else
+    run_in_worktree gt track -p "$parent_branch"
+  fi
+  log "[gate] Submitting PR for '${branch}'…"
+  run_in_worktree gt submit --no-interactive --publish --no-stack
+
+  local submitted_head
+  submitted_head="$(git -C "$worktree_path" rev-parse "$branch")"
+  # Stay on $branch — the next dep-update branch will stack on top of it.
+
+  local pr_num
+  pr_num="$(gh_pr_number_for_new_branch "$branch")"
+  [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
+
+  write_pr_body "$pkg" "$old_ver" "$new_ver" "python/${tool}" "$files_changed"
+  # gh pr edit exits 1 due to a non-actionable GitHub GraphQL deprecation warning;
+  # the PR title and body are cosmetic — the PR itself was already created above.
+  gh pr edit "$pr_num" \
+    --title "$commit_msg" \
+    --body-file "/tmp/dep-update-pr-${safe_name}.md" \
+    --add-label "dep-updater" || true
+  if [[ "$repo_name" == 'my-tracks' ]]; then
+    gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
+  fi
+
+  state_append "branches" "$branch"
+  state_append_pr "$pr_num"
+  add_summary_line "python/${tool}" "$pkg" "$old_ver" "$new_ver" "$branch" "$pr_num"
+
+  if [[ "$no_wait_ci" == '0' ]]; then
+    log "[gate] Checking merge conflict status for PR #${pr_num} before waiting for CI…"
+    wait_for_mergeable_quick "$pr_num"
+    log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
+    wait_for_ci "$branch" "$submitted_head" "$pr_num"
+    log "[gate] CI passed. Final merge conflict check…"
+    wait_for_mergeable "$pr_num"
+    log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Batch update — one branch + one PR for all changes
+# ---------------------------------------------------------------------------
+
+# Applies all npm + Python updates (security and/or regular) onto a single
+# branch and creates a single PR.  Called instead of the per-group/per-package
+# loops when --batch is set.
+#
+# Args:
+#   $1  npm_audit_lines  (may be empty)
+#   $2  py_audit_lines   (may be empty)
+#   $3  npm_lines        (may be empty; ignored when security_only=1)
+#   $4  py_lines         (may be empty; ignored when security_only=1)
+batch_update_all() {
+  local -r npm_audit_lines_arg="$1"
+  local -r py_audit_lines_arg="$2"
+  local -r npm_lines_arg="$3"
+  local -r py_lines_arg="$4"
+
+  local -r branch="dep-updates/batch"
+  local any_npm=0 any_py=0
+
+  if branch_exists_in_worktree "$branch"; then
+    log "Skipping existing batch branch: ${branch}"
+    register_existing_branch_state "$branch"
+    local existing_pr
+    existing_pr="$(gh_pr_number_for_branch "$branch")"
+    if [[ -z "$existing_pr" ]]; then
+      log "Branch ${branch} has no PR — submitting now."
+      git -C "$worktree_path" checkout "$branch"
+      run_in_worktree gt track -p main 2>/dev/null || true
+      run_in_worktree gt submit --no-interactive --publish --no-stack
+      existing_pr="$(gh_pr_number_for_branch "$branch")"
+      if [[ -n "$existing_pr" ]]; then state_append_pr "$existing_pr"; fi
+    fi
+    git -C "$worktree_path" checkout "$branch"
+    return 0
+  fi
+
+  # ── npm ──────────────────────────────────────────────────────────────────
+  if [[ "$has_npm" == '1' ]]; then
+    local lockfile
+    case "$npm_tool" in
+      pnpm) lockfile="pnpm-lock.yaml" ;;
+      yarn) lockfile="yarn.lock" ;;
+      npm)  lockfile="package-lock.json" ;;
+    esac
+
+    git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+    if [[ "$npm_tool" == 'npm' ]]; then
+      rm -f "${worktree_path}/package-lock.json"
+      if [[ -d "${worktree_path}/node_modules" ]]; then
+        rm -rf "${worktree_path}/node_modules"
+      fi
+    else
+      git -C "$worktree_path" checkout -- "$lockfile" 2>/dev/null || true
+    fi
+
+    if [[ "$npm_tool" == 'yarn' ]]; then
+      # yarn has no patch-manifest path; build a combined upgrade arg list.
+      local yarn_args=""
+      if [[ -n "$npm_audit_lines_arg" ]]; then
+        while IFS=' ' read -r pkg _current fix _cves; do
+          [[ -z "$pkg" ]] && continue
+          yarn_args="${yarn_args} ${pkg}@${fix}"
+          log "[${npm_tool}] Security: ${pkg} → ${fix}"
+        done <<< "$npm_audit_lines_arg"
+        any_npm=1
+      fi
+      if [[ -n "$npm_lines_arg" && "$security_only" == '0' ]]; then
+        while IFS=' ' read -r pkg _old new_ver; do
+          [[ -z "$pkg" ]] && continue
+          yarn_args="${yarn_args} ${pkg}@${new_ver}"
+          log "[${npm_tool}] Update: ${pkg} → ${new_ver}"
+        done <<< "$npm_lines_arg"
+        any_npm=1
+      fi
+      if [[ -n "$yarn_args" ]]; then
+        # shellcheck disable=SC2086
+        yarn --cwd "$worktree_path" upgrade $yarn_args
+      fi
+    else
+      # npm / pnpm: patch package.json once with all target versions, then install.
+      local updates_json='{}'
+      if [[ -n "$npm_audit_lines_arg" ]]; then
+        while IFS=' ' read -r pkg _current fix _cves; do
+          [[ -z "$pkg" ]] && continue
+          updates_json="$(printf '%s' "$updates_json" \
+            | jq --arg k "$pkg" --arg v "$fix" '. + {($k): $v}')"
+          log "[${npm_tool}] Security: ${pkg} → ${fix}"
+        done <<< "$npm_audit_lines_arg"
+        any_npm=1
+      fi
+      if [[ -n "$npm_lines_arg" && "$security_only" == '0' ]]; then
+        while IFS=' ' read -r pkg _old new_ver; do
+          [[ -z "$pkg" ]] && continue
+          updates_json="$(printf '%s' "$updates_json" \
+            | jq --arg k "$pkg" --arg v "$new_ver" '. + {($k): $v}')"
+          log "[${npm_tool}] Update: ${pkg} → ${new_ver}"
+        done <<< "$npm_lines_arg"
+        any_npm=1
+      fi
+      if [[ "$updates_json" != '{}' ]]; then
+        local tmp_pkg
+        tmp_pkg="$(mktemp)"
+        if ! jq --argjson updates "$updates_json" '
+          to_entries | map(
+            if (.key == "dependencies" or .key == "devDependencies" or .key == "peerDependencies")
+               and (.value != null) then
+              .value |= with_entries(
+                (.key) as $k |
+                if $updates | has($k) then .value = $updates[$k] else . end
+              )
+            else . end
+          ) | from_entries
+        ' "${worktree_path}/package.json" > "$tmp_pkg"; then
+          rm -f "$tmp_pkg"
+          die "jq failed to update package.json versions."
+        fi
+        mv "$tmp_pkg" "${worktree_path}/package.json"
+        case "$npm_tool" in
+          pnpm) pnpm --dir "$worktree_path" install --no-frozen-lockfile ;;
+          npm)  npm install --prefix "$worktree_path" ;;
+        esac
+      fi
+    fi
+
+    if [[ "$any_npm" == '1' ]]; then
+      git -C "$worktree_path" add package.json
+      if ! git -C "$worktree_path" check-ignore -q "$lockfile" 2>/dev/null; then
+        git -C "$worktree_path" add "$lockfile" 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  # ── Python ───────────────────────────────────────────────────────────────
+  if [[ -n "$py_tool" ]]; then
+    if [[ -n "$py_audit_lines_arg" ]]; then
+      while IFS=' ' read -r pkg _current fix _cves; do
+        [[ -z "$pkg" ]] && continue
+        log "[python/${py_tool}] Security: ${pkg} → ${fix}"
+        case "$py_tool" in
+          uv)      uv --directory "$worktree_path" add "${pkg}==${fix}" ;;
+          poetry)  run_in_worktree poetry add "${pkg}@${fix}" ;;
+          pipenv)  run_in_worktree pipenv install "${pkg}==${fix}" ;;
+          pip|pip3) "$py_tool" install "${pkg}==${fix}" ;;
+        esac
+      done <<< "$py_audit_lines_arg"
+      any_py=1
+    fi
+    if [[ -n "$py_lines_arg" && "$security_only" == '0' ]]; then
+      while IFS=' ' read -r pkg _old new_ver; do
+        [[ -z "$pkg" ]] && continue
+        log "[python/${py_tool}] Update: ${pkg} → ${new_ver}"
+        case "$py_tool" in
+          uv)      uv --directory "$worktree_path" add "${pkg}==${new_ver}" ;;
+          poetry)  run_in_worktree poetry add "${pkg}@${new_ver}" ;;
+          pipenv)  run_in_worktree pipenv install "${pkg}==${new_ver}" ;;
+          pip|pip3) "$py_tool" install "${pkg}==${new_ver}" ;;
+        esac
+      done <<< "$py_lines_arg"
+      any_py=1
+    fi
+    if [[ "$any_py" == '1' ]]; then
+      case "$py_tool" in
+        uv)       git -C "$worktree_path" add pyproject.toml uv.lock ;;
+        poetry)   git -C "$worktree_path" add pyproject.toml poetry.lock ;;
+        pipenv)   git -C "$worktree_path" add Pipfile Pipfile.lock ;;
+        pip|pip3)
+          # pip freeze must be run from the project dir to produce correct output.
+          "$py_tool" freeze > "${worktree_path}/requirements.txt"
+          git -C "$worktree_path" add requirements.txt
+          ;;
+      esac
+    fi
+  fi
+
+  if git -C "$worktree_path" diff --cached --quiet; then
+    log "Batch: no file changes — all dependencies already up to date. Skipping PR."
+    return 0
+  fi
+
+  local commit_msg
+  if [[ "$security_only" == '1' ]]; then
+    commit_msg="fix(deps): patch all CVE vulnerabilities"
+  else
+    commit_msg="chore(deps): batch dependency updates"
+  fi
+
+  git -C "$worktree_path" checkout -b "$branch"
+  git -C "$worktree_path" commit -m "$commit_msg"
+  run_in_worktree gt track -p main
+  log "[gate] Submitting batch PR for '${branch}'…"
+  run_in_worktree gt submit --no-interactive --publish --no-stack
+
+  local submitted_head
+  submitted_head="$(git -C "$worktree_path" rev-parse "$branch")"
+
+  local pr_num
+  pr_num="$(gh_pr_number_for_new_branch "$branch")"
+  [[ -z "$pr_num" ]] && die "Could not determine PR number for batch branch '${branch}'"
+
+  # Build PR body
+  local body_file="/tmp/dep-update-pr-batch.md"
+  {
+    if [[ "$security_only" == '1' ]]; then
+      printf '## Security: CVE fixes\n\n'
+      printf "Automated security updates via \`dep-update --batch --security-only\`.\n\n"
+      printf 'Patching all packages with known vulnerabilities that have a fix available.\n\n'
+    else
+      printf '## Batch dependency updates\n\n'
+      printf "Automated dependency updates via \`dep-update --batch\`.\n\n"
+      printf 'All outdated packages and CVE fixes combined into a single PR.\n\n'
+    fi
+    if [[ -n "$npm_audit_lines_arg" ]]; then
+      printf '## npm CVEs addressed\n\n'
+      printf '| Package | Current | Fixed | CVEs |\n'
+      printf '|---|---|---|---|\n'
+      while IFS=' ' read -r pkg current fix cves; do
+        [[ -z "$pkg" ]] && continue
+        printf "| \`%s\` | \`%s\` | \`%s\` | %s |\n" "$pkg" "$current" "$fix" "${cves/,/, }"
+      done <<< "$npm_audit_lines_arg"
+      printf '\n'
+    fi
+    if [[ -n "$py_audit_lines_arg" ]]; then
+      printf '## Python CVEs addressed\n\n'
+      printf '| Package | Current | Fixed | CVEs |\n'
+      printf '|---|---|---|---|\n'
+      while IFS=' ' read -r pkg current fix cves; do
+        [[ -z "$pkg" ]] && continue
+        printf "| \`%s\` | \`%s\` | \`%s\` | %s |\n" "$pkg" "$current" "$fix" "${cves/,/, }"
+      done <<< "$py_audit_lines_arg"
+      printf '\n'
+    fi
+    if [[ "$security_only" == '0' ]]; then
+      if [[ -n "$npm_lines_arg" ]]; then
+        printf '## npm updates\n\n'
+        printf '| Package | From | To |\n'
+        printf '|---|---|---|\n'
+        while IFS=' ' read -r pkg old_ver new_ver; do
+          [[ -z "$pkg" ]] && continue
+          printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$pkg" "$old_ver" "$new_ver"
+        done <<< "$npm_lines_arg"
+        printf '\n'
+      fi
+      if [[ -n "$py_lines_arg" ]]; then
+        printf '## Python updates\n\n'
+        printf '| Package | From | To |\n'
+        printf '|---|---|---|\n'
+        while IFS=' ' read -r pkg old_ver new_ver; do
+          [[ -z "$pkg" ]] && continue
+          printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$pkg" "$old_ver" "$new_ver"
+        done <<< "$py_lines_arg"
+      fi
+    fi
+  } > "$body_file"
+
+  local has_cves=0
+  [[ -n "$npm_audit_lines_arg" || -n "$py_audit_lines_arg" ]] && has_cves=1
+
+  if [[ "$has_cves" == '1' ]]; then
+    gh pr edit "$pr_num" \
+      --title "$commit_msg" \
+      --body-file "$body_file" \
+      --add-label "dep-updater" \
+      --add-label "security" || true
+  else
+    gh pr edit "$pr_num" \
+      --title "$commit_msg" \
+      --body-file "$body_file" \
+      --add-label "dep-updater" || true
+  fi
+  if [[ "$repo_name" == 'my-tracks' ]]; then
+    gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
+  fi
+
+  state_append "branches" "$branch"
+  state_append_pr "$pr_num"
+  add_summary_line "batch" "batch" "" "" "$branch" "$pr_num"
+
+  if [[ "$no_wait_ci" == '0' ]]; then
+    log "[gate] Checking merge conflict status for PR #${pr_num} before waiting for CI…"
+    wait_for_mergeable_quick "$pr_num"
+    log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
+    wait_for_ci "$branch" "$submitted_head" "$pr_num"
+    log "[gate] CI passed. Final merge conflict check…"
+    wait_for_mergeable "$pr_num"
+    log "[gate] PR #${pr_num} is mergeable."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# CI polling
+# ---------------------------------------------------------------------------
+
+wait_for_ci() {
+  local -r branch="$1"
+  local -r target_sha="${2:-}"
+  local -r pr_num="${3:-}"
+  local -r timeout_min=20
+  local elapsed=0
+  # Check for merge conflicts every 4 cycles (~2 min) while CI runs.
+  local -r mergeable_check_interval=4
+  local cycles_since_mergeable_check=0
+
+  if [[ -n "$target_sha" ]]; then
+    log "Waiting for CI on '${branch}' (head ${target_sha:0:8})…"
+  else
+    log "Waiting for CI on '${branch}'…"
+  fi
+
+  while true; do
+    local status raw
+    raw="$(gh run list --branch "$branch" --limit 30 --json name,headSha,status,conclusion,createdAt 2>/dev/null || echo '[]')"
+
+    if [[ -n "$target_sha" ]]; then
+      status="$(printf '%s' "$raw" \
+        | jq -r --arg sha "$target_sha" --arg names "$ci_workflow_names" '
+            map(select(
+              .headSha == $sha and
+              ($names == "" or (.name as $n | $names | split("\n") | index($n) != null))
+            ))
+            | if length == 0 then "missing"
+              elif any(.[]; .conclusion == "failure" or .conclusion == "cancelled"
+                           or .conclusion == "timed_out" or .conclusion == "startup_failure") then "failure"
+              elif all(.[]; .conclusion != null) then "success"
+              else "pending"
+              end
+          ')"
+    else
+      status="$(printf '%s' "$raw" \
+        | jq -r --arg names "$ci_workflow_names" '
+            map(select($names == "" or (.name as $n | $names | split("\n") | index($n) != null)))
+            | if length == 0 then "missing"
+              elif any(.[]; .conclusion == "failure" or .conclusion == "cancelled"
+                         or .conclusion == "timed_out" or .conclusion == "startup_failure") then "failure"
+              elif all(.[]; .conclusion != null) then "success"
+              else "pending"
+              end
+          ')"
+    fi
+
+    case "$status" in
+      success)
+        log "CI passed on '${branch}'."
+        return 0
+        ;;
+      failure)
+        die "CI failed on '${branch}'. Fix the failure and re-run."
+        ;;
+      missing)
+        # GitHub hasn't scheduled CI yet — this is normal right after a push.
+        # Keep polling; the 20-minute timeout guards against CI never being scheduled.
+        log "Waiting for CI to be scheduled on '${branch}'…"
+        ;;
+      *)
+        : # pending — keep waiting
+        ;;
+    esac
+
+    # Periodically re-check for merge conflicts so a conflict that appears
+    # after the initial push (e.g. concurrent merge to main) is caught quickly.
+    cycles_since_mergeable_check=$(( cycles_since_mergeable_check + 1 ))
+    if [[ -n "$pr_num" && $cycles_since_mergeable_check -ge $mergeable_check_interval ]]; then
+      cycles_since_mergeable_check=0
+      local merge_state
+      merge_state="$(gh pr view "$pr_num" --json mergeable --jq '.mergeable' 2>/dev/null || echo 'UNKNOWN')"
+      if [[ "$merge_state" == 'CONFLICTING' ]]; then
+        die "PR #${pr_num} developed merge conflicts during CI wait. Rebase the stack and re-run."
+      fi
+    fi
+
+    sleep 15
+    elapsed=$(( elapsed + 1 ))
+    if (( elapsed * 15 >= timeout_min * 60 )); then
+      die "CI timed out after ${timeout_min} min on '${branch}'."
+    fi
+  done
+}
+
+ci_run_exists_for_head() {
+  local -r branch="$1"
+  local -r target_sha="$2"
+
+  gh run list --branch "$branch" --limit 30 --json name,headSha 2>/dev/null \
+    | jq -e --arg sha "$target_sha" --arg names "$ci_workflow_names" \
+        'any(.[]; .headSha == $sha and ($names == "" or (.name as $n | $names | split("\n") | index($n) != null)))' >/dev/null
+}
+
+ci_conclusion_for_head() {
+  local -r branch="$1"
+  local -r target_sha="$2"
+
+  gh run list --branch "$branch" --limit 30 --json name,headSha,status,conclusion,createdAt 2>/dev/null \
+    | jq -r --arg sha "$target_sha" --arg names "$ci_workflow_names" '
+        map(select(
+          .headSha == $sha and
+          ($names == "" or (.name as $n | $names | split("\n") | index($n) != null))
+        ))
+        # When we know the expected workflows, require all of them to have a run
+        # before declaring success — avoids "all done" on a partial set.
+        | . as $runs
+        | if length == 0 then "missing"
+          elif any(.[]; .conclusion == "failure" or .conclusion == "cancelled"
+                       or .conclusion == "timed_out" or .conclusion == "startup_failure") then "failure"
+          elif ($names != "" and ([$names | split("\n") | .[]] | length) > ($runs | length)) then "pending"
+          elif all(.[]; .conclusion != null) then "success"
+          else "pending"
+          end
+      '
+}
+
+wait_for_mergeable() {
+  local -r pr_num="$1"
+  local -r timeout_min=5
+  local elapsed=0
+
+  log "Checking merge conflict status for PR #${pr_num}…"
+  while true; do
+    local state
+    state="$(gh pr view "$pr_num" --json mergeable --jq '.mergeable' 2>/dev/null || echo 'UNKNOWN')"
+    case "$state" in
+      MERGEABLE)
+        log "PR #${pr_num} is mergeable."
+        return 0
+        ;;
+      CONFLICTING)
+        cleanup_on_error "PR #${pr_num} has merge conflicts"
+        die "PR #${pr_num} has merge conflicts. Rebase the stack and re-run."
+        ;;
+      UNKNOWN|'')
+        : # GitHub is still computing — keep polling
+        ;;
+    esac
+    sleep 10
+    elapsed=$(( elapsed + 1 ))
+    if (( elapsed * 10 >= timeout_min * 60 )); then
+      die "Timed out waiting for PR #${pr_num} mergeable state after ${timeout_min} min."
+    fi
+  done
+}
+
+# Quick mergeable pre-check: called right after gt submit, before initiating CI
+# wait. Polls for up to 60 s. Dies immediately on CONFLICTING (no point waiting
+# for CI that will never schedule). On MERGEABLE confirms early. On UNKNOWN
+# after timeout, proceeds — the final wait_for_mergeable after CI will catch it.
+wait_for_mergeable_quick() {
+  local -r pr_num="$1"
+  local -r timeout_sec=60
+  local elapsed=0
+
+  while true; do
+    local state
+    state="$(gh pr view "$pr_num" --json mergeable --jq '.mergeable' 2>/dev/null || echo 'UNKNOWN')"
+    case "$state" in
+      MERGEABLE)
+        log "PR #${pr_num}: no merge conflicts detected."
+        return 0
+        ;;
+      CONFLICTING)
+        cleanup_on_error "PR #${pr_num} has merge conflicts"
+        die "PR #${pr_num} has merge conflicts. Check that the worktree base matches origin/main and re-run."
+        ;;
+      UNKNOWN|'')
+        : # GitHub still computing
+        ;;
+    esac
+    sleep 5
+    elapsed=$(( elapsed + 5 ))
+    if (( elapsed >= timeout_sec )); then
+      log "PR #${pr_num}: merge conflict status still UNKNOWN after ${timeout_sec}s — proceeding to CI wait."
+      return 0
+    fi
+  done
+}
+
+ensure_dep_updater_label() {
+  # Create the 'dep-updater' label on the repo if it doesn't already exist.
+  # Idempotent: gh label create exits non-zero if the label exists; we ignore that.
+  gh label create 'dep-updater' \
+    --repo "${repo_owner}/${repo_name}" \
+    --color '0075ca' \
+    --description 'Automated dependency update via dep-update' \
+    2>/dev/null || true
+}
+
+require_resume_ci_gate() {
+  local -r branches_csv="$1"
+  local -r prs_csv="$2"
+
+  [[ "$no_wait_ci" == '1' ]] && return 0
+  [[ -z "$branches_csv" ]] && return 0
+
+  local last_branch last_pr
+  last_branch="$(csv_last "$branches_csv")"
+  [[ -z "$last_branch" ]] && return 0
+
+  # Resolve PR from branch directly; do not rely on parallel CSV position.
+  last_pr="$(gh_pr_number_for_branch "$last_branch")"
+  if [[ -z "$last_pr" && -n "$prs_csv" ]]; then
+    # Backward-compat fallback for older state files.
+    last_pr="$(csv_last "$prs_csv")"
+  fi
+  if [[ -n "$last_pr" ]] && ! is_valid_pr_number "$last_pr"; then
+    last_pr=""
+  fi
+  [[ -z "$last_pr" ]] && return 0
+
+  local pr_state pr_merged
+  pr_state="$(gh_pr_state_for_number "$last_pr")"
+  pr_merged="$(gh_pr_merged_for_number "$last_pr")"
+  if [[ "$pr_merged" == 'true' || "$pr_state" == 'closed' ]]; then
+    return 0
+  fi
+
+  if ! git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${last_branch}"; then
+    log "Resume CI gate skipped: local branch '${last_branch}' not found in worktree."
+    return 0
+  fi
+
+  local current_head
+  current_head="$(git -C "$worktree_path" rev-parse "$last_branch" 2>/dev/null || true)"
+  if [[ -z "$current_head" ]]; then
+    log "Resume CI gate skipped: could not resolve head SHA for '${last_branch}'."
+    return 0
+  fi
+
+  if ! ci_run_exists_for_head "$last_branch" "$current_head"; then
+    log "Resuming after existing PR #${last_pr} (${last_branch}); no CI run exists for current head ${current_head:0:8}."
+    log "Skipping CI wait; rebase/push this branch to trigger fresh CI, then re-run dep-update."
+    return 0
+  fi
+
+  log "Resuming after existing PR #${last_pr} (${last_branch}); waiting for CI before creating new PRs..."
+  wait_for_ci "$last_branch" "$current_head"
+}
+
+maybe_label_top_pr_for_merge() {
+  local branches_csv prs_csv top_branch top_pr
+  branches_csv="$(state_get "branches")"
+  prs_csv="$(state_get "prs")"
+  [[ -z "$branches_csv" ]] && return 0
+
+  top_branch="$(csv_last "$branches_csv")"
+  [[ -z "$top_branch" ]] && return 0
+
+  top_pr="$(gh_pr_number_for_branch "$top_branch")"
+  if [[ -z "$top_pr" && -n "$prs_csv" ]]; then
+    top_pr="$(csv_last "$prs_csv")"
+  fi
+  if [[ -n "$top_pr" ]] && ! is_valid_pr_number "$top_pr"; then
+    top_pr=""
+  fi
+  [[ -z "$top_pr" ]] && return 0
+
+  local pr_state pr_merged
+  pr_state="$(gh_pr_state_for_number "$top_pr")"
+  pr_merged="$(gh_pr_merged_for_number "$top_pr")"
+  if [[ "$pr_merged" == 'true' || "$pr_state" == 'closed' ]]; then
+    return 0
+  fi
+
+  if ! git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${top_branch}"; then
+    log "Top stack branch '${top_branch}' not found locally; skipping merge-it prompt."
+    return 0
+  fi
+
+  local top_head ci_status
+  top_head="$(git -C "$worktree_path" rev-parse "$top_branch" 2>/dev/null || true)"
+  [[ -z "$top_head" ]] && return 0
+
+  ci_status="$(ci_conclusion_for_head "$top_branch" "$top_head")"
+  case "$ci_status" in
+    success|skipped|neutral)
+      ;;
+    *)
+      log "Top PR #${top_pr} (${top_branch}) is not merge-ready yet (CI status: ${ci_status})."
+      return 0
+      ;;
+  esac
+
+  local has_label
+  has_label="$(gh api "repos/${repo_owner}/${repo_name}/issues/${top_pr}" --jq 'any(.labels[]?; .name == "merge-it")' 2>/dev/null || echo 'false')"
+  if [[ "$has_label" == 'true' ]]; then
+    log "Top PR #${top_pr} already has merge-it label."
+    return 0
+  fi
+
+  # Always add the merge-it label automatically when CI is clean
+  add_merge_it_label "$top_pr"
+  log "Added merge-it label to top PR #${top_pr}."
+}
+
+# ---------------------------------------------------------------------------
+# PR body writer
+# ---------------------------------------------------------------------------
+
+write_pr_body() {
+  local -r pkg="$1"
+  local -r from_ver="$2"
+  local -r to_ver="$3"
+  local -r eco="$4"
+  local -r files="$5"
+  local safe_name
+  safe_name="$(sanitize_branch_name "$pkg")"
+  local -r body_file="/tmp/dep-update-pr-${safe_name}.md"
+
+  # Write to a file and use --body-file to avoid heredoc escaping issues
+  {
+    printf '%s\n\n' '## Stack Context'
+    printf "Automated dependency updates via \`dep-update\`.\n"
+    printf '%s\n\n' 'Each PR bumps exactly one dependency. Merge the full stack to update all.'
+    printf '%s\n\n' '## Why?'
+    printf "\`%s\` has a newer version available.\n\n" "$pkg"
+    printf "- **From:** \`%s\`\n" "$from_ver"
+    printf "- **To:** \`%s\`\n" "$to_ver"
+    printf -- '- **Ecosystem:** %s\n' "$eco"
+    printf -- '- **Files changed:** %s\n' "$files"
+  } > "$body_file"
+}
+
+# ---------------------------------------------------------------------------
+# Summary table
+# ---------------------------------------------------------------------------
+
+add_summary_line() {
+  # Args: ecosystem pkg from to branch pr
+  local -r entry="$*"
+  if [[ -z "$summary_lines" ]]; then
+    summary_lines="$entry"
+  else
+    summary_lines="${summary_lines}
+${entry}"
+  fi
+}
+
+print_stack_urls() {
+  local -r prs_csv="$1"
+  [[ -z "$prs_csv" ]] && return 0
+
+  local first_pr
+  first_pr="${prs_csv%%,*}"
+  [[ -z "$first_pr" ]] && return 0
+
+  log ""
+  log "Stack URLs:"
+  log "  Graphite: https://app.graphite.com/github/pr/${repo_owner}/${repo_name}/${first_pr}"
+  local remaining="$prs_csv"
+  local pr
+  while [[ -n "$remaining" ]]; do
+    pr="${remaining%%,*}"
+    [[ -n "$pr" ]] && log "  GitHub:   https://github.com/${repo_owner}/${repo_name}/pull/${pr}"
+    if [[ "$remaining" == *,* ]]; then
+      remaining="${remaining#*,}"
+    else
+      break
+    fi
+  done
+}
+
+print_summary() {
+  if [[ -z "$summary_lines" ]]; then
+    log ""
+    log "Dependency update summary:"
+    log "  No new dependency PRs were created in this run."
+    return 0
+  fi
+
+  log ""
+  log "Dependency update summary:"
+
+  # summary_lines entries: ecosystem pkg from to branch pr
+  local -a rows=()
+  while IFS=' ' read -r eco pkg from to _branch pr; do
+    [[ -z "$pkg" ]] && continue
+    rows+=("${eco}|${pkg}|${from}|${to}|#${pr}")
+  done <<< "$summary_lines"
+
+  # Print header + rows using print_update_table variant with PR column
+  printf '%s|%s|%s|%s|%s\n' "ECOSYSTEM" "PACKAGE" "FROM" "TO" "PR"
+  printf '%s\n' "-----------------------------------------------------"
+  printf '%s\n' "${rows[@]}" | column -t -s '|'
+}
+
+# ---------------------------------------------------------------------------
+# Worktree cleanup helpers
+# ---------------------------------------------------------------------------
+
+cleanup_on_error() {
+  local -r reason="$1"
+  log "Cleaning up after error: ${reason}"
+  if [[ -n "$worktree_path" && -d "$worktree_path" ]]; then
+    log "[worktree] Removing worktree: $worktree_path"
+    git -C "$dir" worktree remove --force "$worktree_path" 2>/dev/null \
+      || log "Note: worktree directory already removed."
+    if [[ -n "$wt_base_branch" ]]; then
+      log "[worktree] Deleting branch: $wt_base_branch"
+      git -C "$dir" branch -D "$wt_base_branch" 2>/dev/null \
+        || log "Note: wt_base_branch '${wt_base_branch}' not found; skipping deletion."
+    fi
+  fi
+  rm -f "$state_file"
+}
+
+cleanup() {
+  log "Cleaning up worktree…"
+  if [[ -n "$worktree_path" && -d "$worktree_path" ]]; then
+    log "[worktree] Removing worktree: $worktree_path"
+    git -C "$dir" worktree remove --force "$worktree_path" 2>/dev/null \
+      || log "Note: worktree directory already removed."
+    log "[worktree] Worktree removed."
+  fi
+  if [[ -n "$wt_base_branch" ]]; then
+    log "[worktree] Deleting branch: $wt_base_branch"
+    git -C "$dir" branch -D "$wt_base_branch" 2>/dev/null \
+      || log "Note: wt_base_branch '${wt_base_branch}' not found."
+  fi
+  rm -f "$state_file"
+  log "Cleanup complete."
+}
+
+poll_until_merged() {
+  local -r prs_csv="$1"
+  local -r timeout_min="${merge_timeout_min}"
+  local elapsed=0
+  local interval=30
+
+  log "Waiting for all PRs to merge (timeout: ${timeout_min} min)…"
+  log "PRs: $(csv_pretty "$prs_csv")"
+
+  while true; do
+    local all_merged=1
+    local p
+    IFS=',' read -ra pr_list <<< "$prs_csv"
+    for p in "${pr_list[@]}"; do
+      [[ -z "$p" ]] && continue
+      local merged
+      merged="$(gh_pr_merged_for_number "$p")"
+      if [[ "$merged" != 'true' ]]; then
+        all_merged=0
+        break
+      fi
+    done
+
+    if [[ "$all_merged" == '1' ]]; then
+      log "All PRs merged."
+      return 0
+    fi
+
+    sleep "$interval"
+    elapsed=$(( elapsed + interval ))
+    if (( elapsed >= timeout_min * 60 )); then
+      log "Timed out after ${timeout_min} min waiting for PRs to merge."
+      log "Re-run with --cleanup once all PRs are merged."
+      return 1
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Dry-run table formatting helper
+# ---------------------------------------------------------------------------
+
+print_update_table() {
+  local -a rows=("$@")
+  if [[ ${#rows[@]} -eq 0 ]]; then
+    return 0
+  fi
+  printf '%s|%s|%s|%s\n' "ECOSYSTEM" "PACKAGE" "FROM" "TO"
+  printf '%s\n' "---------------------------------------------"
+  printf '%s\n' "${rows[@]}" | column -t -s '|'
+}
+
+# In print_dry_run_table, gather all rows and call print_update_table:
+print_dry_run_table() {
+  local -r eco="$1"
+  local -r lines="$2"
+  if [[ -z "$lines" ]]; then
+    return 0
+  fi
+  log ""
+  local -a table_lines=()
+  while IFS=' ' read -r pkg from to; do
+    [[ -z "$pkg" ]] && continue
+    local this_eco
+    if [[ "$pkg" == @* || "$pkg" == *eslint* || "$pkg" == esbuild || "$pkg" == jsdom || "$pkg" == typescript* || "$pkg" == vitest* || "$pkg" == globals ]]; then
+      this_eco="npm"
+    else
+      this_eco="python"
+    fi
+    table_lines+=("$this_eco|$pkg|$from|$to")
+  done <<< "$lines"
+  print_update_table "${table_lines[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# Rebase helper
+# ---------------------------------------------------------------------------
+
+rebase_stack_on_main() {
+  local branches_csv
+  branches_csv="$(state_get "branches")"
+  if [[ -z "$branches_csv" ]]; then
+    log "No stack branches found; nothing to rebase."
+    return 0
+  fi
+
+  git -C "$worktree_path" fetch origin main >/dev/null 2>&1 \
+    || log "Note: could not fetch latest main."
+
+  run_in_worktree gt sync --force 2>/dev/null \
+    || run_in_worktree gt restack \
+    || die "Rebase failed. Resolve conflicts manually and re-run."
+
+  run_in_worktree gt submit --no-interactive --publish --no-stack \
+    || log "Note: gt submit after restack returned non-zero (may be a no-op)."
+
+  log "Rebase complete."
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+main() {
+  parse_args "$@"
+  init_prompt_style
+  check_core_prereqs
+  init_repo_api_context
+  detect_ecosystem
+  check_ecosystem_prereqs "$has_npm" "$py_tool"
+  if [[ "$dry_run" == '0' ]]; then
+    check_auth_prereqs
+    detect_ci_workflows
+  fi
+
+  # ── --cleanup mode ──────────────────────────────────────────────────────
+  if [[ "$cleanup_mode" == '1' ]]; then
+    init_state_file
+    if [[ ! -f "$state_file" ]]; then
+      log "No state file found at: ${state_file}"
+      log "Nothing to clean up."
+      exit 0
+    fi
+    sanitize_state_prs
+    local wt
+    wt="$(state_get "worktree")"
+    worktree_path="$wt"
+    wt_base_branch="$(state_get "wt_branch")"
+    log "Running cleanup for worktree: ${worktree_path}"
+    cleanup
+    exit 0
+  fi
+
+  # ── --rebase mode ───────────────────────────────────────────────────────
+  if [[ "$rebase_mode" == '1' ]]; then
+    init_state_file
+    if [[ ! -f "$state_file" ]]; then
+      die "No state file found at: ${state_file}. Nothing to rebase."
+    fi
+    sanitize_state_prs
+    local wt
+    wt="$(state_get "worktree")"
+    if [[ -z "$wt" || ! -d "$wt" ]]; then
+      die "Worktree not found: ${wt}. Run without --rebase to create a new stack."
+    fi
+    worktree_path="$wt"
+    readonly worktree_path
+    wt_base_branch="$(state_get "wt_branch")"
+    log "Rebasing stack in worktree: ${worktree_path}"
+    rebase_stack_on_main
+    exit 0
+  fi
+
+  warn_if_dirty_workdir
+
+# ---------------------------------------------------------------------------
+# Dry-run mode: use a temporary worktree from origin/main ─────────────
+if [[ "$dry_run" == '1' ]]; then
+  local audit_dir
+  create_worktree
+  audit_dir="$worktree_path"
+  cd "$audit_dir" || die "Failed to cd to dry-run worktree: $audit_dir"
+  # Do NOT redeclare or reassign any readonly globals (has_npm, py_tool, etc.)
+  local npm_lines="" py_lines=""
+  local npm_audit_lines="" py_audit_lines=""
+
+  # Always run security audits in dry-run so CVEs are visible.
+
+  if [[ "$has_npm" == '1' ]]; then
+    npm_audit_lines="$(npm_audit)"
+  fi
+  if [[ -n "$py_tool" ]]; then
+    py_audit_lines="$(py_audit "$py_tool" "$audit_dir")"
+  fi
+
+  # Only print the CVE table if there is at least one real result (not just a placeholder or empty)
+  if [[ -n "$npm_audit_lines" ]] && grep -qE '^\S+' <<< "$npm_audit_lines"; then
+    real_cve_lines="$(printf '%s\n' "$npm_audit_lines" | grep -v '^ *$')"
+    if [[ -n "$real_cve_lines" && ! "$real_cve_lines" =~ \(\(cd ]]; then
+      printf '\n[npm] CVEs with available fixes:\n'
+      {
+        printf '%s\t%s\t%s\t%s\n' "PACKAGE" "CURRENT" "FIX" "CVEs"
+        while IFS=' ' read -r pkg cur fix cves; do
+          printf '%s\t%s\t%s\t%s\n' "$pkg" "$cur" "$fix" "$cves"
+        done <<< "$real_cve_lines"
+      } | column -t
+    fi
+  fi
+
+  if [[ -n "$py_audit_lines" ]]; then
+    printf '\n[python/%s] CVEs with available fixes:\n' "$py_tool"
+    {
+      printf '%s\t%s\t%s\t%s\n' "PACKAGE" "CURRENT" "FIX" "CVEs"
+      while IFS=' ' read -r pkg cur fix cves; do
+        printf '%s\t%s\t%s\t%s\n' "$pkg" "$cur" "$fix" "$cves"
+      done <<< "$py_audit_lines"
+    } | column -t
+  fi
+
+  if [[ -z "$npm_audit_lines" && -z "$py_audit_lines" ]]; then
+    log "No CVEs with direct fixes found."
+  fi
+
+  if [[ "$security_only" == '1' ]]; then
+    cd - >/dev/null 2>&1 || true
+    git worktree remove --force "$audit_dir" 2>/dev/null || true
+    exit 0
+  fi
+
+  if [[ "$has_npm" == '1' ]]; then
+    # Always use the npm_outdated helper to get clean tabular output
+    npm_lines="$(npm_outdated)"
+  fi
+  if [[ -n "$py_tool" ]]; then
+    py_lines="$(py_outdated "$py_tool" "$audit_dir")"
+  fi
+
+
+  # Treat empty, '{}' or 'null' as no updates for npm and Python
+  local no_npm_updates=0
+  local no_py_updates=0
+  if [[ -z "$npm_lines" || "$npm_lines" == '{}' || "$npm_lines" == 'null' ]]; then
+    no_npm_updates=1
+  fi
+  if [[ -z "$py_lines" || "$py_lines" == '{}' || "$py_lines" == 'null' ]]; then
+    no_py_updates=1
+  fi
+  if (( no_npm_updates == 1 && no_py_updates == 1 )); then
+    log "All dependencies are up to date."
+    cd - >/dev/null 2>&1 || true
+    git worktree remove --force "$audit_dir" 2>/dev/null || true
+    exit 0
+  fi
+
+  if [[ -n "$npm_lines" ]]; then
+    print_dry_run_table "npm" "$npm_lines"
+  fi
+  if [[ -n "$py_lines" ]]; then
+    print_dry_run_table "python/$py_tool" "$py_lines"
+  fi
+
+  # Only print the dry-run plan if there are actual updates
+  if [[ -n "$npm_lines" || -n "$py_lines" ]]; then
+    local -a all_rows=()
+    if [[ -n "$npm_lines" ]]; then
+      while IFS=' ' read -r pkg old_ver new_ver; do
+        [[ -z "$pkg" ]] && continue
+        all_rows+=("npm|$pkg|$old_ver|$new_ver")
+      done <<< "$npm_lines"
+    fi
+    if [[ -n "$py_lines" ]]; then
+      while IFS=' ' read -r pkg old_ver new_ver; do
+        [[ -z "$pkg" ]] && continue
+        all_rows+=("python|$pkg|$old_ver|$new_ver")
+      done <<< "$py_lines"
+    fi
+    print_update_table "${all_rows[@]}"
+  fi
+
+  cd - >/dev/null 2>&1 || true
+  git worktree remove --force "$audit_dir" 2>/dev/null || true
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Update mode ───────────────────────────────────────────────────────────
+warn_if_dirty_workdir
+
+# Collect outdated packages before creating any side effects
+local npm_lines="" py_lines=""
+if [[ "$has_npm" == '1' ]]; then
+  npm_lines="$(npm_outdated)"
+fi
+if [[ -n "$py_tool" ]]; then
+  py_lines="$(py_outdated "$py_tool")"
+fi
+
+if [[ -z "$npm_lines" && -z "$py_lines" ]]; then
+  log "All dependencies are up to date."
+  init_state_file
+  sanitize_state_prs
+  if [[ -f "$state_file" ]]; then
+    prepare_worktree
+    ensure_gt_tracked
+    # Fetch remote refs without touching the primary repo's working tree.
+    # (gt sync --force fails when the primary repo has local uncommitted changes.)
+    git -C "$worktree_path" fetch origin --prune 2>/dev/null || true
+    log "Working in: $worktree_path"
+
+    local existing_branches existing_prs
+    existing_branches="$(state_get "branches")"
+    existing_prs="$(state_get "prs")"
+    require_resume_ci_gate "$existing_branches" "$existing_prs"
+    maybe_label_top_pr_for_merge
+
+    if [[ "$no_wait_merge" == '1' ]]; then
+      log ""
+      log "Stack submitted. To clean up after all PRs are merged, run:"
+      log "  dep-updater --cleanup --dir ${dir}"
+      exit 0
+    fi
+
+    local final_prs
+    final_prs="$(collect_tracked_prs_csv)"
+    if [[ -n "$final_prs" ]]; then
+      poll_until_merged "$final_prs"
+    else
+      log "No tracked PRs found; nothing to monitor."
+    fi
+    # Always clean up the worktree when re-entering with no new deps — even
+    # if final_prs was empty (e.g. state file exists but worktree was gone
+    # and was just recreated, or all PRs already merged outside our tracking).
+    cleanup
+    exit 0
+  fi
+  exit 0
+fi
+
+# Create/reuse worktree, initialize state
+init_state_file
+sanitize_state_prs
+prepare_worktree
+ensure_gt_tracked
+
+# Worktree is live — any unexpected exit from here should trigger cleanup.
+_cleanup_trap_active=1
+  
+# Fetch remote refs without touching the primary repo's working tree.
+git -C "$worktree_path" fetch origin --prune 2>/dev/null || true
+
+log "Working in: $worktree_path"
+
+local existing_branches existing_prs
+existing_branches="$(state_get "branches")"
+existing_prs="$(state_get "prs")"
+require_resume_ci_gate "$existing_branches" "$existing_prs"
+ensure_dep_updater_label
+
+# ── Security PRs go first (bottom of the stack) ───────────────────────────
+# Run audits now, before any regular updates, so CVE fixes are baseline PRs.
+local npm_audit_lines="" py_audit_lines=""
+if [[ "$has_npm" == '1' ]]; then
+  log "Running npm security audit…"
+  npm_audit_lines="$(npm_audit)"
+  if [[ -n "$npm_audit_lines" ]]; then
+    local vuln_count
+    vuln_count="$(printf '%s\n' "$npm_audit_lines" | grep -c .)"
+    log "Found ${vuln_count} npm package(s) with CVEs that have fixes available."
+    if [[ "$batch" == '0' ]]; then
+      npm_security_update "$npm_audit_lines"
+    fi
+  else
+    log "No npm CVEs with direct fixes found."
+  fi
+fi
+if [[ -n "$py_tool" ]]; then
+  log "Running Python security audit…"
+  py_audit_lines="$(py_audit "$py_tool")"
+  if [[ -n "$py_audit_lines" ]]; then
+    local py_vuln_count
+    py_vuln_count="$(printf '%s\n' "$py_audit_lines" | grep -c .)"
+    log "Found ${py_vuln_count} Python package(s) with CVEs that have fixes available."
+    if [[ "$batch" == '0' ]]; then
+      py_security_update "$py_audit_lines" "$py_tool"
+    fi
+  else
+    log "No Python CVEs with direct fixes found."
+  fi
+fi
+
+# ── Regular updates follow (stacked on top of security PRs) ──────────────
+if [[ "$batch" == '1' ]]; then
+  # Batch mode: one branch + one PR for everything.
+  batch_update_all "$npm_audit_lines" "$py_audit_lines" "$npm_lines" "$py_lines"
+elif [[ "$security_only" == '1' ]]; then
+  log "--security-only: skipping regular version bumps."
+else
+  if [[ -n "$npm_lines" ]]; then
+    local group_keys
+    group_keys="$(list_npm_group_keys "$npm_lines")"
+    while IFS= read -r group_key; do
+      [[ -z "$group_key" ]] && continue
+      local entries
+      entries="$(npm_entries_for_group "$group_key" "$npm_lines")"
+      [[ -z "$entries" ]] && continue
+
+      local safe_group
+      safe_group="$(sanitize_branch_name "${group_key#@}")"
+      local branch="dep-updates/npm-${safe_group}"
+
+      local pkg_count=0 first_pkg="" first_old="" first_new=""
+      while IFS=' ' read -r pkg old_ver new_ver; do
+        [[ -z "$pkg" ]] && continue
+        pkg_count=$(( pkg_count + 1 ))
+        if [[ "$pkg_count" -eq 1 ]]; then
+          first_pkg="$pkg"
+          first_old="$old_ver"
+          first_new="$new_ver"
+        fi
+      done <<< "$entries"
+
+      local commit_msg scope_label
+      if [[ "$pkg_count" -eq 1 ]]; then
+        commit_msg="chore(deps): bump ${first_pkg} from ${first_old} to ${first_new}"
+        scope_label="npm/${first_pkg}"
+      else
+        commit_msg="chore(deps): bump ${group_key} from ${first_old} to ${first_new}"
+        scope_label="npm/${group_key} (${pkg_count} packages)"
+      fi
+
+      local lockfile
+      case "$npm_tool" in
+        pnpm) lockfile="pnpm-lock.yaml" ;;
+        yarn) lockfile="yarn.lock" ;;
+        npm)  lockfile="package-lock.json" ;;
+        *)    lockfile="lockfile" ;;
+      esac
+
+      local cmd_prefix
+      case "$npm_tool" in
+        pnpm)
+          if [[ "$semver_only" == '1' ]]; then
+            cmd_prefix="pnpm --dir <worktree> update"
+          else
+            cmd_prefix="pnpm --dir <worktree> update --latest"
+          fi
+          ;;
+        yarn) cmd_prefix="yarn --cwd <worktree> upgrade --latest" ;;
+        npm)
+          if [[ "$semver_only" == '1' ]]; then
+            cmd_prefix="npm update --prefix <worktree>"
+          else
+            cmd_prefix="npm install --prefix <worktree> __PKG__@latest"
+          fi
+          ;;
+        *) cmd_prefix="<unknown tool> update" ;;
+      esac
+
+      pr_index=$(( pr_index + 1 ))
+      print_dry_run_pr_plan \
+        "$pr_index" \
+        "$scope_label" \
+        "$branch" \
+        "$commit_msg" \
+        "package.json + ${lockfile}" \
+        "$entries" \
+        "$cmd_prefix"
+    done <<< "$group_keys"
+  fi
+
+  # Process Python packages
+  if [[ -n "$py_lines" ]]; then
+    while IFS=' ' read -r pkg old_ver new_ver; do
+      py_update_one "$pkg" "$old_ver" "$new_ver" "$py_tool"
+    done <<< "$py_lines"
+  fi
+fi
+
+print_summary
+local all_prs_csv
+all_prs_csv="$(collect_tracked_prs_csv)"
+print_stack_urls "$all_prs_csv"
+maybe_label_top_pr_for_merge
+
+if [[ "$no_wait_merge" == '1' ]]; then
+  log ""
+  log "Stack submitted. To clean up after all PRs are merged, run:"
+  log "  $0 --cleanup --dir ${dir}"
+  _cleanup_trap_active=0
+  exit 0
+fi
+
+if [[ -z "$all_prs_csv" ]]; then
+  # Nothing was created this run — skip merge polling and go straight to cleanup.
+  _cleanup_trap_active=0
+  cleanup
+  exit 0
+fi
+
+# Wait for merge and clean up automatically
+poll_until_merged "$all_prs_csv"
+_cleanup_trap_active=0
+cleanup
+exit 0
+}
+
+main "$@"
