@@ -1,4 +1,4 @@
-# AGENTS.md — Ground Rules for fpdf
+# AGENTS.md — Ground Rules for dep-updater
 
 This file defines the non-negotiable standards for all contributors (human or AI) working on this codebase. Every change must comply with these rules before it is considered complete.
 
@@ -6,71 +6,54 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ## Language & Runtime
 
-- TypeScript **strict mode** is always on — `"strict": true` in `tsconfig.json`, no exceptions.
-- Target Node.js LTS (≥ 20). No deprecated APIs.
-- Separate `tsconfig.web.json` for browser-targeted code. Never mix Node and browser globals in the same compilation unit.
-- All source files use `.ts` extension. No `.js` files in `src/`.
+- The project is a single **Bash** script (`dep-updater`) at the repository root.
+- Target **bash ≥ 5.x** (the script declares `#!/usr/bin/env bash` and uses `set -euo pipefail`).
+- External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`, `rg` (ripgrep), plus the ecosystem tools being managed (`pnpm`, `pip`, `uv`, `poetry`) as optional callees.
+- No Node.js helpers, no Python scripting. Keep the implementation pure Bash.
+- The test harness (`dep-updater.test`) is also plain Bash — no test framework installs required.
 
 ---
 
-## Formatting
+## Formatting & Style
 
-- **Prettier** is the single source of truth for formatting. No manual style debates.
-- Configuration is in `.prettierrc` at the repo root. Do not override it inline.
-- Required settings:
-  ```json
-  {
-    "semi": true,
-    "singleQuote": true,
-    "trailingComma": "all",
-    "printWidth": 100,
-    "tabWidth": 2,
-    "arrowParens": "always"
-  }
-  ```
-- Run `pnpm run format` before committing. A CI check will fail on unformatted files.
-- Do not suppress Prettier with `// prettier-ignore` unless the block is machine-generated (e.g. an embedded binary blob).
+- **No automated formatter.** Consistency is enforced by the conventions below and by `shellcheck`.
+- Indentation: **2 spaces**. Never tabs.
+- Line length: soft limit of **100 characters**; hard limit of **120**. Comments may exceed only when a long URL would otherwise be broken.
+- Function definitions use the `name() {` form (no `function` keyword).
+- Opening `{` stays on the same line as the function name or control keyword.
+- Always quote variable expansions: `"$var"`, `"${array[@]}"`.
+- Prefer `[[` over `[` for conditionals.
+- Use `$(...)` for command substitution, never backticks.
 
 ---
 
 ## Linting
 
-- **ESLint** with the TypeScript plugin is mandatory. Config lives in `eslint.config.ts` (flat config).
-- Required rule sets:
-  - `eslint:recommended`
-  - `plugin:@typescript-eslint/strict-type-checked`
-  - `plugin:@typescript-eslint/stylistic-type-checked`
-- Rules that are **errors** (never warnings):
-  - `@typescript-eslint/no-explicit-any`
-  - `@typescript-eslint/no-unsafe-assignment`
-  - `@typescript-eslint/no-unsafe-call`
-  - `@typescript-eslint/no-unsafe-member-access`
-  - `@typescript-eslint/no-unsafe-return`
-  - `@typescript-eslint/no-floating-promises`
-  - `@typescript-eslint/await-thenable`
-  - `@typescript-eslint/no-unused-vars`
-  - `no-console` (use a structured logger instead; see `src/logger.ts`)
-- Run `pnpm run lint` and resolve all errors before opening a PR. Do not use `eslint-disable` comments unless absolutely unavoidable, and every suppression must include a comment explaining why.
+- **`shellcheck`** is mandatory. CI runs `shellcheck -S info dep-updater dep-updater.test` on every push.
+- Zero findings at the `info` level is the bar. No `# shellcheck disable=` suppressions unless absolutely unavoidable; every suppression must have a comment explaining why.
+- Key rules that are always errors:
+  - **SC2155** — never combine `local`/`readonly` with a command substitution assignment; declare separately to preserve the exit code.
+  - **SC2015** — never use `A && B || C` as a substitute for `if/then/else`; C will run whenever B fails.
+  - **SC2086** — always double-quote expansions unless word-splitting is explicitly intended.
 
 ---
 
 ## Testing
 
-- **Vitest** is the test framework. All tests live under `src/__tests__/` or co-located as `*.test.ts`.
-- **Coverage threshold** (enforced in CI): lines ≥ 80%, branches ≥ 73%, functions ≥ 80%. The branch threshold is set to 73% (not 75%) because Node.js v8 coverage measures ~2% lower than Node 25 for the same code.
-- Every public function in `src/` must have at least one unit test.
-- Tests must be **deterministic**: no `Math.random()`, no un-mocked `Date.now()`, no real file I/O in unit tests (use `vi.mock` or in-memory fixtures).
-- Fixed-delay sleeps in tests are prohibited (e.g. `setTimeout(50)`, `await new Promise((r) => setTimeout(r, n))`) because they are a flake smell. Use condition-based synchronization (`vi.waitFor`, explicit events, observable state transitions) instead.
-- Use **real file fixtures** (stored in `src/__tests__/fixtures/`) only in integration tests, clearly marked with a `// integration` comment at the top of the file.
-- Test file naming: `<module>.test.ts` mirrors the source file it covers.
-- Each test must have a descriptive name that reads as a sentence: `it('returns an error when the PDF has no AcroForm', ...)`.
-- Do not write tests that only assert that a mock was called — assert the observable output or side effect.
+- The test file is `dep-updater.test` (no extension) at the repository root.
+- Run with: `bash dep-updater.test`
+- Tests are grouped into sections (`=== section name ===`). Each test prints `[PASS]` or `[FAIL]` and the suite exits non-zero if anything fails.
+- **Every new behaviour or bug fix must be accompanied by a test**, even if that test is a dry-run smoke test or a static-analysis assertion (`awk`/`grep` over the source).
+- Tests must be **deterministic**: no `sleep` for timing, no real network calls, no real git operations on remote state.
+- Static analysis tests (e.g. "no `local -r` inside loops") live in a dedicated `=== static: ... ===` section.
+- Test names must read as sentences: `output contains "[worktree] Creating worktree at:"`.
+- Do not write tests that only assert a function was reached — assert the observable output or exit code.
 
 ---
 
 ## Repository
 
-- Remote: `https://github.com/the-hcma/fpdf` (private).
+- Remote: `https://github.com/the-hcma/dep-updater` (private).
 - Do not make the repository public without explicit approval.
 - Never commit secrets, credentials, or API keys — use environment variables.
 
@@ -83,66 +66,54 @@ This file defines the non-negotiable standards for all contributors (human or AI
 - This project uses **Graphite** (`gt`) for branch stacking.
 - All work is done in stacked branches via `gt create`, `gt modify`, and `gt submit`.
 - Never work directly on `main`. Always create a stack branch: `gt create -m "feat: description"`.
-- Keep each branch in the stack focused on exactly one logical change. Stacks should map 1-to-1 with milestones or sub-tasks from [PLAN.md](./PLAN.md).
+- Keep each branch in the stack focused on exactly one logical change. Stacks should map 1-to-1 with milestones or sub-tasks from [dep-updater.plan.md](./dep-updater.plan.md).
 - Sync regularly: `gt sync` before starting new work; `gt restack` after upstream changes land.
 - Submit stacks with `gt submit` — do not open PRs manually via the GitHub UI.
 - To merge a PR, add the `merge-it` label: `gh pr edit <number> --add-label merge-it`. Never use `gh pr merge` directly.
 - Follow **Conventional Commits**: `feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`.
-- Each commit must pass `pnpm run check` (type-check + lint + format check) and `pnpm test`.
+- Each commit must pass all CI checks (see below) before being pushed.
 - Keep commits focused. One logical change per commit.
-- PR descriptions must reference the relevant milestone from [PLAN.md](./PLAN.md).
-- Before starting a new PR or branch, confirm the current PR is either merged or that all CI checks pass (lint, format, tests, coverage). Never start new work on a broken base.
+- PR descriptions must reference the relevant milestone from [dep-updater.plan.md](./dep-updater.plan.md).
+- Before starting a new PR or branch, confirm the current PR is either merged or that all CI checks pass. Never start new work on a broken base.
 
 ---
 
-## Shell Scripts
+## Shell Script Conventions
 
-- **No `.sh` extension.** Shell scripts in `scripts/` have no file extension (e.g. `scripts/fpdf`, not `scripts/fpdf.sh`). The shebang line declares the interpreter.
-- **`shellcheck`** is mandatory for all shell scripts. CI runs `shellcheck` against all extension-less files in `scripts/` on every push (relying on the no-extension convention to identify shell scripts).
-- **`readonly`** must be used for every script-level variable that is assigned once and never modified. Declare and assign separately to avoid masking exit codes (SC2155):
+- **No `.sh` extension.** The main script is `dep-updater` and the test harness is `dep-updater.test`. The shebang line declares the interpreter.
+- **`readonly`** must be used for every script-level variable that is assigned once and never modified. Declare and assign on separate lines to avoid SC2155:
   ```bash
   var="$(some_command)"
   readonly var
   ```
 - **Non-exported variables must be lowercase.** Uppercase is reserved for exported environment variables (`export FOO=bar`). Script-level constants, loop variables, and function locals all use `snake_case`.
-- **Use `local` for all function-scoped variables.** For parameters or literal assignments that won't change, prefer `local -r`:
+- **Use `local` for all function-scoped variables.** For parameters or literal assignments that won't change, prefer `local -r`. For command substitutions, always declare separately:
   ```bash
   my_func() {
     local -r mode="${1:-default}"   # parameter — safe to combine
     local result                    # command substitution — declare separately
-    result=$(some_command)          # assign after to preserve exit code
+    result="$(some_command)"        # assign after to preserve exit code
   }
   ```
-- Do not use `local -r var=$(cmd)` — shellcheck SC2155 flags it because `local` masks the command's exit code.
+- **Never declare `local -r` or plain `local` inside a loop body.** Hoist all `local` declarations to the top of the function. `local -r` inside a loop will crash on the second iteration with "readonly variable" because `local -r` both declares and sets, and re-entering the loop tries to re-declare an already-readonly name.
+- Do not use `A && B || C` as an if-then-else substitute (SC2015). Use a proper `if/then/else` block.
 
 ---
 
 ## Security
 
-- Never log, store, or transmit the raw contents of user PDF files beyond what is required to serve the local web UI.
-- The Express server **must** bind to `127.0.0.1` only — never `0.0.0.0`.
-- All file paths received from the CLI or the web UI must be validated and resolved with `path.resolve` before any file system operation. Reject paths that escape the working directory.
-- No dynamic `eval`, `new Function`, or `child_process.exec` with user-controlled strings.
-- Dependencies must be reviewed before adding. Run `pnpm audit` after every `pnpm install`.
-
----
-
-## Dependencies
-
-- Prefer well-maintained, typed packages. Avoid packages with no TypeScript types and no `@types/*` available.
-- Do not add a dependency for something trivially implementable in ~10 lines of TypeScript.
-- Separate `dependencies` (runtime) from `devDependencies` strictly.
-- Lock file (`pnpm-lock.yaml`) must always be committed.
+- All file paths received from the CLI must be validated and resolved with `realpath`/`readlink -f` before any file system operation. Reject paths that escape the working directory.
+- No dynamic `eval` or command construction from user-controlled strings.
+- Do not log, store, or transmit credential tokens beyond what is needed to invoke `gh`/`gt`.
 
 ---
 
 ## CI Checks (all must pass)
 
 ```
-pnpm run typecheck    # tsc --noEmit
-pnpm run lint         # eslint src/
-pnpm run format:check # prettier --check src/
-pnpm test             # vitest run --coverage
+bash -n dep-updater dep-updater.test            # syntax check
+shellcheck -S info dep-updater dep-updater.test  # lint
+bash dep-updater.test                            # tests
 ```
 
 No PR may be merged with a failing CI check. No exceptions.
