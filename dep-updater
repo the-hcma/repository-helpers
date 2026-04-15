@@ -2066,58 +2066,38 @@ batch_update_all() {
   local -r npm_lines_arg="$3"
   local -r py_lines_arg="$4"
 
-  local -r branch="dep-updates/batch"
+  # Use a timestamped branch name so each run gets a fresh Graphite identity.
+  # A fixed name like 'dep-updates/batch' caused repeated submit failures: Graphite
+  # persists the PR association and refuses to create a new PR for the same name
+  # even after the old PR is closed, and no combination of 'gt sync' / 'gt branch
+  # untrack' reliably clears this metadata without a checkout of the stale branch.
+  local batch_ts
+  batch_ts="$(date --utc +%Y%m%dT%H%M%S)"
+  local -r branch="dep-updates/batch-${batch_ts}"
   local any_npm=0 any_py=0
 
-  if branch_exists_in_worktree "$branch"; then
-    local existing_pr existing_pr_state existing_pr_merged
-    existing_pr="$(gh_pr_number_for_branch "$branch")"
-
-    # If the PR was closed or merged, the local branch is stale — delete it
-    # so this run can create a fresh one with the current updates.
-    if [[ -n "$existing_pr" ]]; then
-      existing_pr_state="$(gh_pr_state_for_number "$existing_pr")"
-      existing_pr_merged="$(gh_pr_merged_for_number "$existing_pr")"
-      if [[ "$existing_pr_merged" == 'true' || "$existing_pr_state" == 'closed' ]]; then
-        log "Batch branch '${branch}' has a closed/merged PR (#${existing_pr}); clearing Graphite metadata and deleting stale branch to start fresh."
-        # gt branch untrack must be run while checked out on the target branch.
-        # Graphite's sync does not remove the PR association when the ref still exists;
-        # only untrack (from the branch itself) correctly clears the metadata.
-        git -C "$worktree_path" checkout "$branch" 2>/dev/null || true
-        run_in_worktree gt branch untrack 2>/dev/null || true
-        git -C "$worktree_path" checkout "$wt_base_branch" 2>/dev/null
-        git -C "$worktree_path" branch -D "$branch" 2>/dev/null || true
-        git -C "$dir" branch -D "$branch" 2>/dev/null || true
-        git -C "$dir" push origin --delete "$branch" 2>/dev/null || true
-        git -C "$dir" fetch --prune 2>/dev/null || true
-        # Fall through to create the branch fresh below.
-      else
-        log "Skipping existing batch branch: ${branch}"
-        register_existing_branch_state "$branch"
-        if [[ -z "$existing_pr" ]]; then
-          log "Branch ${branch} has no PR — submitting now."
-          git -C "$worktree_path" checkout "$branch"
-          run_in_worktree gt track -p main 2>/dev/null || true
-          run_in_worktree gt submit --no-interactive --publish --no-stack
-          existing_pr="$(gh_pr_number_for_branch "$branch")"
-          if [[ -n "$existing_pr" ]]; then state_append_pr "$existing_pr"; fi
-        fi
-        git -C "$worktree_path" checkout "$branch"
-        return 0
-      fi
-    else
-      # No PR at all — try to submit the existing branch as-is.
-      log "Skipping existing batch branch: ${branch}"
-      register_existing_branch_state "$branch"
-      log "Branch ${branch} has no PR — submitting now."
-      git -C "$worktree_path" checkout "$branch"
-      run_in_worktree gt track -p main 2>/dev/null || true
-      run_in_worktree gt submit --no-interactive --publish --no-stack
-      existing_pr="$(gh_pr_number_for_branch "$branch")"
-      if [[ -n "$existing_pr" ]]; then state_append_pr "$existing_pr"; fi
-      git -C "$worktree_path" checkout "$branch"
-      return 0
+  # If a previous batch branch from this same worktree session exists and its PR
+  # is still open, reuse it rather than creating a duplicate.
+  local existing_batch_branch=""
+  local b
+  while IFS= read -r b; do
+    [[ "$b" == dep-updates/batch-* ]] || continue
+    local bpr bstate bmerged
+    bpr="$(gh_pr_number_for_branch "$b")"
+    [[ -z "$bpr" ]] && continue
+    bstate="$(gh_pr_state_for_number "$bpr")"
+    bmerged="$(gh_pr_merged_for_number "$bpr")"
+    if [[ "$bmerged" != 'true' && "$bstate" != 'closed' ]]; then
+      existing_batch_branch="$b"
+      break
     fi
+  done < <(git -C "$worktree_path" branch --format='%(refname:short)' 2>/dev/null)
+
+  if [[ -n "$existing_batch_branch" ]]; then
+    log "Reusing existing open batch branch: ${existing_batch_branch}"
+    register_existing_branch_state "$existing_batch_branch"
+    git -C "$worktree_path" checkout "$existing_batch_branch"
+    return 0
   fi
 
   # ── npm ──────────────────────────────────────────────────────────────────
