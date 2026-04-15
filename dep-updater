@@ -1067,7 +1067,6 @@ offer_worktree_reset() {
   create_worktree
   write_initial_state "$worktree_path"
   ensure_gitignore
-  log "New worktree ready: $worktree_path"
 }
 
 prepare_worktree() {
@@ -1135,7 +1134,6 @@ prepare_worktree() {
   create_worktree
   write_initial_state "$worktree_path"
   ensure_gitignore
-  log "Worktree ready: $worktree_path"
 }
 
 ensure_gt_tracked() {
@@ -1216,19 +1214,47 @@ npm_outdated() {
     return 0
   fi
 
+  # Read direct-dependency specifiers from package.json for pinning checks.
+  # Exact-pinned packages (e.g. "3.0.0", "=3.0.0") and local/git references
+  # are excluded from the update list regardless of what `outdated` reports.
+  local pkg_json_specs
+  if [[ -f "$dir/package.json" ]]; then
+    pkg_json_specs="$(jq -c \
+      '[.dependencies, .devDependencies, .peerDependencies, .optionalDependencies]
+       | map(select(. != null)) | add // {}' \
+      "$dir/package.json" 2>/dev/null || echo '{}')"
+  else
+    pkg_json_specs='{}'
+  fi
+
   if [[ "$tool" == 'yarn' ]]; then
     jq -r 'select(.type == "table")
       | .data.body[]
       | "\(.[0]) \(.[1]) \(.[3])"' "$tmp_json" 2>/dev/null \
       | awk '{if(NF==3 && $1!="" && $2!="" && $3!="") print $0}'
   else
-    jq -r '
+    jq -r --argjson specs "$pkg_json_specs" --arg semver_only "$semver_only" '
       to_entries[]
       | select(
           .key | test("^(latest|wanted|isDeprecated|name|type|homepage|description|author|license|repository|bugs|engines|_.*)$") | not
         )
-      | select(.value.current != null and .value.current != .value.latest)
-      | "\(.key) \(.value.current) \(.value.latest)"' "$tmp_json" 2>/dev/null \
+      | select(.value.current != null)
+      # Skip packages whose specifier is exact-pinned ("3.0.0", "=3.0.0") or a
+      # local/git reference.  Packages absent from package.json (transitive deps)
+      # are kept so they remain visible (same as before).
+      | select(
+          ($specs[.key] == null)
+          or ($specs[.key] | test("^[=]?[0-9]|^(workspace:|file:|link:|git)") | not)
+        )
+      # semver-only: only propose updates within the existing range (current → wanted).
+      # Default: propose updates to the latest published version.
+      | if $semver_only == "1" then
+          select(.value.wanted != null and .value.current != .value.wanted)
+          | "\(.key) \(.value.current) \(.value.wanted)"
+        else
+          select(.value.current != .value.latest)
+          | "\(.key) \(.value.current) \(.value.latest)"
+        end' "$tmp_json" 2>/dev/null \
       | awk '{if(NF==3 && $1!="" && $2!="" && $3!="") print $0}'
   fi
   rm -f "$tmp_json"
@@ -1402,7 +1428,10 @@ npm_update_group() {
                and (.value != null) then
               .value |= with_entries(
                 (.key) as $k |
-                if $updates | has($k) then .value = $updates[$k] else . end
+                if $updates | has($k) then
+                  (.value | capture("^(?P<prefix>[^0-9]*)") | .prefix) as $prefix |
+                  .value = ($prefix + $updates[$k])
+                else . end
               )
             else . end
           ) | from_entries
@@ -1441,7 +1470,10 @@ npm_update_group() {
              and (.value != null) then
             .value |= with_entries(
               (.key) as $k |
-              if $updates | has($k) then .value = $updates[$k] else . end
+              if $updates | has($k) then
+                (.value | capture("^(?P<prefix>[^0-9]*)") | .prefix) as $prefix |
+                .value = ($prefix + $updates[$k])
+              else . end
             )
           else . end
         ) | from_entries
@@ -1904,30 +1936,94 @@ py_security_update() {
 # ---------------------------------------------------------------------------
 
 # Prints one "name current latest" line per outdated package.
+# Returns 0 if the package is exactly-pinned in the project's dependency files.
+# An exactly-pinned package is intentionally locked to a specific version and
+# should not be automatically updated.
+#
+# Checked formats (per tool):
+#   pip/pip3/pipenv : requirements.txt — line matching `pkg==version`
+#   uv              : pyproject.toml project.dependencies — `"pkg==version"`
+#   poetry          : pyproject.toml tool.poetry.dependencies —
+#                     `pkg = "version"` (bare = exact) or `pkg = "==version"`
+py_is_pinned() {
+  local -r pkg="$1"
+  local -r tool="$2"
+
+  # Normalize: lowercase; treat hyphens and underscores as equivalent (PEP 508)
+  local norm_pkg us_pkg name_pat
+  norm_pkg="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+  us_pkg="$(printf '%s' "$norm_pkg" | tr '-' '_')"
+  name_pat="(${norm_pkg}|${us_pkg})"
+
+  case "$tool" in
+    pip|pip3|pipenv)
+      local req_file
+      for req_file in \
+          "$dir/requirements.txt" \
+          "$dir/requirements/base.txt" \
+          "$dir/requirements/common.txt" \
+          "$dir/requirements/main.txt"; do
+        [[ -f "$req_file" ]] || continue
+        if rg -qiP "^${name_pat}\s*==" "$req_file" 2>/dev/null; then
+          return 0
+        fi
+      done
+      ;;
+    uv)
+      # project.dependencies in pyproject.toml: '"pkg==version"'
+      if [[ -f "$dir/pyproject.toml" ]]; then
+        if rg -qiP "\"${name_pat}[^\"]*==[^\"]*\"" "$dir/pyproject.toml" 2>/dev/null; then
+          return 0
+        fi
+      fi
+      ;;
+    poetry)
+      # [tool.poetry.dependencies]: `pkg = "2.0.0"` (bare version = exact in poetry)
+      # or `pkg = "==2.0.0"` (explicit equality)
+      if [[ -f "$dir/pyproject.toml" ]]; then
+        if rg -qiP "^\s*${name_pat}\s*=\s*['\"](?:==)?\d" "$dir/pyproject.toml" 2>/dev/null; then
+          return 0
+        fi
+      fi
+      ;;
+  esac
+  return 1
+}
+
 py_outdated() {
   local -r tool="$1"
+  local raw_lines
   case "$tool" in
     uv)
-      uv pip list --outdated --format=json 2>/dev/null \
-        | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"'
+      raw_lines="$(uv pip list --outdated --format=json 2>/dev/null \
+        | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
       ;;
     poetry)
       # poetry show --outdated has no stable JSON output; parse the table instead
-      poetry --directory "$dir" show --outdated 2>/dev/null \
-        | awk '/^[a-zA-Z]/ { print $1, $2, $3 }'
+      raw_lines="$(poetry --directory "$dir" show --outdated 2>/dev/null \
+        | awk '/^[a-zA-Z]/ { print $1, $2, $3 }')"
       ;;
     pipenv)
-      pipenv run pip list --outdated --format=json 2>/dev/null \
-        | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"'
+      raw_lines="$(pipenv run pip list --outdated --format=json 2>/dev/null \
+        | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
       ;;
     pip|pip3)
-      "$tool" list --outdated --format=json 2>/dev/null \
-        | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"'
+      raw_lines="$("$tool" list --outdated --format=json 2>/dev/null \
+        | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
       ;;
     *)
       die "Unknown Python tool: '$tool'"
       ;;
   esac
+
+  while IFS=' ' read -r pkg cur new; do
+    [[ -z "$pkg" ]] && continue
+    if py_is_pinned "$pkg" "$tool"; then
+      log "[python/${tool}] Skipping exactly-pinned package: ${pkg} (${cur})"
+      continue
+    fi
+    printf '%s %s %s\n' "$pkg" "$cur" "$new"
+  done <<< "$raw_lines"
 }
 
 py_update_one() {
@@ -1966,12 +2062,24 @@ py_update_one() {
 
   case "$tool" in
     uv)
-      uv --directory "$worktree_path" add "${pkg}==${new_ver}"
+      local uv_out uv_exit
+      uv_out="$(uv --directory "$worktree_path" add "${pkg}==${new_ver}" 2>&1)" && uv_exit=0 || uv_exit=$?
+      if (( uv_exit != 0 )); then
+        log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
+        log "$uv_out"
+        return 0
+      fi
       git -C "$worktree_path" add pyproject.toml uv.lock
       files_changed="pyproject.toml + uv.lock"
       ;;
     poetry)
-      run_in_worktree poetry add "${pkg}@${new_ver}"
+      local poetry_out poetry_exit
+      poetry_out="$(run_in_worktree poetry add "${pkg}@${new_ver}" 2>&1)" && poetry_exit=0 || poetry_exit=$?
+      if (( poetry_exit != 0 )); then
+        log "[python/poetry] Skipping ${pkg} ${new_ver}: dependency resolution failed."
+        log "$poetry_out"
+        return 0
+      fi
       git -C "$worktree_path" add pyproject.toml poetry.lock
       files_changed="pyproject.toml + poetry.lock"
       ;;
@@ -2077,6 +2185,7 @@ batch_update_all() {
   batch_ts="$(date --utc +%Y%m%dT%H%M%S)"
   local -r branch="dep-updates/batch-${batch_ts}"
   local any_npm=0 any_py=0
+  local py_out py_exit
 
   # If a previous batch branch from this same worktree session exists and its PR
   # is still open, reuse it rather than creating a duplicate.
@@ -2230,8 +2339,22 @@ batch_update_all() {
         [[ -z "$pkg" ]] && continue
         log "[python/${py_tool}] Update: ${pkg} → ${new_ver}"
         case "$py_tool" in
-          uv)      uv --directory "$worktree_path" add "${pkg}==${new_ver}" ;;
-          poetry)  run_in_worktree poetry add "${pkg}@${new_ver}" ;;
+          uv)
+            py_out="$(uv --directory "$worktree_path" add "${pkg}==${new_ver}" 2>&1)" && py_exit=0 || py_exit=$?
+            if (( py_exit != 0 )); then
+              log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
+              log "$py_out"
+              continue
+            fi
+            ;;
+          poetry)
+            py_out="$(run_in_worktree poetry add "${pkg}@${new_ver}" 2>&1)" && py_exit=0 || py_exit=$?
+            if (( py_exit != 0 )); then
+              log "[python/poetry] Skipping ${pkg} ${new_ver}: dependency resolution failed."
+              log "$py_out"
+              continue
+            fi
+            ;;
           pipenv)  run_in_worktree pipenv install "${pkg}==${new_ver}" ;;
           pip|pip3) "$py_tool" install "${pkg}==${new_ver}" ;;
         esac
@@ -2398,7 +2521,7 @@ wait_for_ci() {
   # Check for merge conflicts every 4 cycles (~2 min) while CI runs.
   local -r mergeable_check_interval=4
   local cycles_since_mergeable_check=0
-  local status raw merge_state
+  local status raw merge_state already_merged
 
   if [[ -n "$target_sha" ]]; then
     log "Waiting for CI on '${branch}' (head ${target_sha:0:8})…"
@@ -2407,7 +2530,16 @@ wait_for_ci() {
   fi
 
   while true; do
-    raw="$(gh run list --branch "$branch" --limit 30 --json name,headSha,status,conclusion,createdAt 2>/dev/null || echo '[]')"
+    # Short-circuit: if the PR is already merged, CI obviously passed.
+    if [[ -n "$pr_num" ]]; then
+      already_merged="$(gh_pr_merged_for_number "$pr_num")"
+      if [[ "$already_merged" == 'true' ]]; then
+        log "PR #${pr_num} already merged — CI gate passed."
+        return 0
+      fi
+    fi
+
+    raw="$(gh run list --repo "${repo_owner}/${repo_name}" --branch "$branch" --limit 30 --json name,headSha,status,conclusion,createdAt 2>/dev/null || echo '[]')"
 
     if [[ -n "$target_sha" ]]; then
       status="$(printf '%s' "$raw" \
@@ -2489,7 +2621,7 @@ ci_run_exists_for_head() {
   local -r branch="$1"
   local -r target_sha="$2"
 
-  gh run list --branch "$branch" --limit 30 --json name,headSha 2>/dev/null \
+  gh run list --repo "${repo_owner}/${repo_name}" --branch "$branch" --limit 30 --json name,headSha 2>/dev/null \
     | jq -e --arg sha "$target_sha" --arg names "$ci_workflow_names" \
         'any(.[]; .headSha == $sha and ($names == "" or (.name as $n | $names | split("\n") | index($n) != null)))' >/dev/null
 }
@@ -2498,7 +2630,7 @@ ci_conclusion_for_head() {
   local -r branch="$1"
   local -r target_sha="$2"
 
-  gh run list --branch "$branch" --limit 30 --json name,headSha,status,conclusion,createdAt 2>/dev/null \
+  gh run list --repo "${repo_owner}/${repo_name}" --branch "$branch" --limit 30 --json name,headSha,status,conclusion,createdAt 2>/dev/null \
     | jq -r --arg sha "$target_sha" --arg names "$ci_workflow_names" '
         map(select(
           .headSha == $sha and
