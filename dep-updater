@@ -6,6 +6,12 @@
 #
 # See scripts/dep-update.plan.md for full design documentation.
 set -euo pipefail
+
+# uv's cache sits on the home filesystem while worktrees live in /tmp (a
+# separate filesystem).  Hardlinks can't cross filesystems, so uv falls back
+# to copying and emits a warning unless we tell it copy mode is expected.
+export UV_LINK_MODE=copy
+
 # Note: we intentionally do NOT use set -E (errtrace) because it causes the
 # ERR trap to be inherited by command substitution subshells.  That would fire
 # cleanup_on_error from inside a $(cmd) subshell, deleting the real worktree
@@ -357,7 +363,10 @@ add_merge_it_label() {
   gh api "repos/${repo_owner}/${repo_name}/issues/${pr_number}/labels" \
     --method POST \
     -f labels[]=merge-it >/dev/null
-  # Add merge-mq label for repos that use a merge queue.
+  # my-tracks uses Graphite's multi-partition merge queue, which requires the
+  # 'merge-mq' label (in addition to 'merge-it') to enqueue a PR.
+  # my-tracks uses Graphite's multi-partition merge queue, which requires the
+  # 'merge-mq' label (in addition to 'merge-it') to enqueue a PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
     gh api "repos/${repo_owner}/${repo_name}/issues/${pr_number}/labels" \
       --method POST \
@@ -719,9 +728,20 @@ detect_ci_workflows() {
   for f in "${workflows_dir}"/*.yml "${workflows_dir}"/*.yaml; do
     [[ -f "$f" ]] || continue
     # Skip workflows without a pull_request trigger.
+    # Match YAML trigger keys: `  pull_request:` or `  pull_request_target:`
+    # or inline array form: `on: [pull_request, ...]`
     grep -qE '^[[:space:]]*(pull_request|pull_request_target)[[:space:]]*[:$]' "$f" 2>/dev/null \
-      || grep -qE 'pull_request(_target)?[^_]' "$f" 2>/dev/null \
+      || grep -qE '^on:[[:space:]]*\[.*pull_request' "$f" 2>/dev/null \
       || continue
+    # Skip workflows whose pull_request trigger is restricted to types that
+    # never fire on a PR push (e.g. types: [closed]).  Only include workflows
+    # that can run when a PR is opened or updated.
+    # If there is any explicit types: list, require at least one push-relevant
+    # type (opened / synchronize / reopened / ready_for_review).
+    if grep -qE '^\s+types\s*:' "$f" 2>/dev/null; then
+      grep -qE '\b(opened|synchronize|reopened|ready_for_review)\b' "$f" 2>/dev/null \
+        || continue
+    fi
     name="$(grep -m1 '^name:' "$f" | sed 's/^name:[[:space:]]*//' | tr -d "\"'")"
     [[ -n "$name" ]] && names+=("$name")
   done
@@ -1316,6 +1336,7 @@ npm_entries_for_group() {
 npm_update_group() {
   local -r group_key="$1"
   local -r entries="$2"
+  local -r npm_audit_lines="${3:-}"  # optional: full audit lines to cross-reference CVEs
 
   local safe_key
   safe_key="$(sanitize_branch_name "${group_key#@}")"
@@ -1525,13 +1546,14 @@ npm_update_group() {
   pr_num="$(gh_pr_number_for_new_branch "$branch")"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
 
-  write_npm_pr_body "$group_key" "$safe_key" "$entries"
+  write_npm_pr_body "$group_key" "$safe_key" "$entries" "$npm_audit_lines"
   # gh pr edit exits 1 due to a non-actionable GitHub GraphQL deprecation warning;
   # the PR title and body are cosmetic — the PR itself was already created above.
   gh pr edit "$pr_num" \
     --title "$commit_msg" \
     --body-file "/tmp/dep-update-pr-${safe_key}.md" \
     --add-label "dep-updater" || true
+  # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
     gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
   fi
@@ -1545,9 +1567,11 @@ npm_update_group() {
     wait_for_mergeable_quick "$pr_num"
     log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
     wait_for_ci "$branch" "$submitted_head" "$pr_num"
-    log "[gate] CI passed. Final merge conflict check…"
-    wait_for_mergeable "$pr_num"
-    log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
+    if [[ "$(gh_pr_merged_for_number "$pr_num")" != 'true' ]]; then
+      log "[gate] CI passed. Final merge conflict check…"
+      wait_for_mergeable "$pr_num"
+      log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
+    fi
   fi
 }
 
@@ -1555,6 +1579,7 @@ write_npm_pr_body() {
   local -r group_key="$1"
   local -r safe_key="$2"
   local -r entries="$3"
+  local -r npm_audit_lines="${4:-}"  # optional: full audit lines to cross-reference CVEs
   local -r body_file="/tmp/dep-update-pr-${safe_key}.md"
 
   {
@@ -1569,6 +1594,33 @@ write_npm_pr_body() {
       printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$entry_pkg" "$entry_old" "$entry_new"
     done <<< "$entries"
     printf '\n- **Ecosystem:** npm (%s)\n' "$npm_tool"
+    # Render CVE table for any packages in this group that have known vulnerabilities.
+    if [[ -n "$npm_audit_lines" ]]; then
+      local cve_section=""
+      while IFS=' ' read -r entry_pkg _entry_old _entry_new; do
+        [[ -z "$entry_pkg" ]] && continue
+        local matched_cves=""
+        while IFS=' ' read -r ap _ac _af cves; do
+          [[ -z "$ap" ]] && continue
+          if [[ "${ap,,}" == "${entry_pkg,,}" && -n "$cves" ]]; then
+            matched_cves="$cves"
+            break
+          fi
+        done <<< "$npm_audit_lines"
+        if [[ -n "$matched_cves" ]]; then
+          local cve
+          for cve in ${matched_cves//,/ }; do
+            cve_section="${cve_section}| \`${entry_pkg}\` | ${cve} |"$'\n'
+          done
+        fi
+      done <<< "$entries"
+      if [[ -n "$cve_section" ]]; then
+        printf '\n## CVEs addressed\n\n'
+        printf '| Package | CVE |\n'
+        printf '|---|---|\n'
+        printf '%s' "$cve_section"
+      fi
+    fi
   } > "$body_file"
 }
 
@@ -1797,6 +1849,7 @@ npm_security_update() {
     --body-file "$body_file" \
     --add-label "dep-updater" \
     --add-label "security" || true
+  # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
     gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
   fi
@@ -1810,9 +1863,11 @@ npm_security_update() {
     wait_for_mergeable_quick "$pr_num"
     log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
     wait_for_ci "$branch" "$submitted_head" "$pr_num"
-    log "[gate] CI passed. Final merge conflict check…"
-    wait_for_mergeable "$pr_num"
-    log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
+    if [[ "$(gh_pr_merged_for_number "$pr_num")" != 'true' ]]; then
+      log "[gate] CI passed. Final merge conflict check…"
+      wait_for_mergeable "$pr_num"
+      log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
+    fi
   fi
 }
 
@@ -1912,6 +1967,7 @@ py_security_update() {
     --body-file "$body_file" \
     --add-label "dep-updater" \
     --add-label "security" || true
+  # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
     gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
   fi
@@ -1925,9 +1981,11 @@ py_security_update() {
     wait_for_mergeable_quick "$pr_num"
     log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
     wait_for_ci "$branch" "$submitted_head" "$pr_num"
-    log "[gate] CI passed. Final merge conflict check…"
-    wait_for_mergeable "$pr_num"
-    log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
+    if [[ "$(gh_pr_merged_for_number "$pr_num")" != 'true' ]]; then
+      log "[gate] CI passed. Final merge conflict check…"
+      wait_for_mergeable "$pr_num"
+      log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
+    fi
   fi
 }
 
@@ -1937,6 +1995,22 @@ py_security_update() {
 
 # Prints one "name current latest" line per outdated package.
 # Returns 0 if the package is exactly-pinned in the project's dependency files.
+# Returns the constraint operator (>=, ==, ~=) used for a package in
+# pyproject.toml.  Used by py_update_one to preserve the original operator
+# when bumping a dependency (e.g. keep >= instead of collapsing to ==).
+py_constraint_op() {
+  local -r pkg="$1"
+  local -r pyproject="${2:-${dir}/pyproject.toml}"
+  local norm_hyp norm_und
+  norm_hyp="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+  norm_und="$(printf '%s' "$norm_hyp" | tr '-' '_')"
+  # Find the first line in pyproject.toml that mentions the package and
+  # extract the constraint operator that follows (>=, ==, ~=).
+  grep -iE "\"(${norm_hyp}|${norm_und})(\[[^]]*\])?\s*(>=|==|~=)" "$pyproject" 2>/dev/null \
+    | grep -oE '>=|==|~=' \
+    | head -1 || true
+}
+
 # An exactly-pinned package is intentionally locked to a specific version and
 # should not be automatically updated.
 #
@@ -1992,7 +2066,7 @@ py_is_pinned() {
 
 py_outdated() {
   local -r tool="$1"
-  local raw_lines
+  local raw_lines pyproject installed_json ge_dep ge_pkg ge_floor ge_installed ge_lower
   case "$tool" in
     uv)
       raw_lines="$(uv pip list --outdated --format=json 2>/dev/null \
@@ -2016,6 +2090,50 @@ py_outdated() {
       ;;
   esac
 
+  # For uv projects: also detect stale >= constraint floors in pyproject.toml.
+  # uv pip list --outdated only flags packages where installed < latest on PyPI;
+  # it silently ignores the case where the declared floor is lower than the
+  # installed version (e.g. "django>=6.0" installed at 6.0.4 — the floor should
+  # be bumped to >=6.0.4 so the project always requires the patched minimum).
+  if [[ "$tool" == "uv" ]]; then
+    pyproject="${dir}/pyproject.toml"
+    if [[ -f "$pyproject" ]]; then
+      installed_json="$(uv pip list --format=json 2>/dev/null)"
+      while IFS= read -r ge_dep; do
+        [[ -z "$ge_dep" ]] && continue
+        # Strip extras ([...]) then >= and version to get the package name.
+        ge_pkg="$(printf '%s' "$ge_dep" \
+          | sed 's/[[:space:]]*>=[[:space:]]*.*//' \
+          | sed 's/\[.*//')"
+        # Extract just the floor version, stopping at any trailing specifier.
+        ge_floor="$(printf '%s' "$ge_dep" \
+          | sed 's/.*>=[[:space:]]*//' \
+          | sed 's/[,;[:space:]].*//')"
+        [[ -z "$ge_floor" || -z "$ge_pkg" ]] && continue
+        ge_installed="$(printf '%s' "$installed_json" \
+          | jq -r --arg n "$ge_pkg" \
+              '.[] | select(.name | ascii_downcase == ($n | ascii_downcase)) | .version')"
+        # Skip if not installed or floor already matches installed.
+        [[ -z "$ge_installed" || "$ge_floor" == "$ge_installed" ]] && continue
+        # Use sort -V: if the smaller of the two is the floor, the floor is stale.
+        ge_lower="$(printf '%s\n%s\n' "$ge_floor" "$ge_installed" | sort -V | head -1)"
+        if [[ "$ge_lower" == "$ge_floor" ]]; then
+          # Only add if not already present in raw_lines (e.g. from uv pip list).
+          if ! printf '%s\n' "$raw_lines" | grep -qi "^${ge_pkg} "; then
+            if [[ -n "$raw_lines" ]]; then
+              raw_lines="${raw_lines}
+${ge_pkg} ${ge_floor} ${ge_installed}"
+            else
+              raw_lines="${ge_pkg} ${ge_floor} ${ge_installed}"
+            fi
+          fi
+        fi
+      done < <(rg -o '"[A-Za-z0-9][A-Za-z0-9._-]*(\[[^\]]*\])?\s*>=\s*[0-9][^"]*"' \
+                   "$pyproject" 2>/dev/null \
+               | tr -d '"')
+    fi
+  fi
+
   while IFS=' ' read -r pkg cur new; do
     [[ -z "$pkg" ]] && continue
     if py_is_pinned "$pkg" "$tool"; then
@@ -2031,6 +2149,7 @@ py_update_one() {
   local -r old_ver="$2"
   local -r new_ver="$3"
   local -r tool="$4"
+  local -r py_audit_lines="${5:-}"  # optional: full audit lines to cross-reference CVEs
   local safe_name
   safe_name="$(sanitize_branch_name "$pkg")"
   local -r branch="dep-updates/py-${safe_name}"
@@ -2062,8 +2181,14 @@ py_update_one() {
 
   case "$tool" in
     uv)
-      local uv_out uv_exit
-      uv_out="$(uv --directory "$worktree_path" add "${pkg}==${new_ver}" 2>&1)" && uv_exit=0 || uv_exit=$?
+      local uv_out uv_exit uv_constraint_op uv_spec
+      uv_constraint_op="$(py_constraint_op "$pkg" "${dir}/pyproject.toml")"
+      if [[ "$uv_constraint_op" == ">=" ]]; then
+        uv_spec="${pkg}>=${new_ver}"
+      else
+        uv_spec="${pkg}==${new_ver}"
+      fi
+      uv_out="$(uv --directory "$worktree_path" add "$uv_spec" 2>&1)" && uv_exit=0 || uv_exit=$?
       if (( uv_exit != 0 )); then
         log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
         log "$uv_out"
@@ -2131,13 +2256,16 @@ py_update_one() {
   pr_num="$(gh_pr_number_for_new_branch "$branch")"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
 
-  write_pr_body "$pkg" "$old_ver" "$new_ver" "python/${tool}" "$files_changed"
+  write_pr_body "$pkg" "$old_ver" "$new_ver" "python/${tool}" "$files_changed" \
+    "$(printf '%s\n' "$py_audit_lines" \
+       | grep -i "^${pkg} " || true)"
   # gh pr edit exits 1 due to a non-actionable GitHub GraphQL deprecation warning;
   # the PR title and body are cosmetic — the PR itself was already created above.
   gh pr edit "$pr_num" \
     --title "$commit_msg" \
     --body-file "/tmp/dep-update-pr-${safe_name}.md" \
     --add-label "dep-updater" || true
+  # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
     gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
   fi
@@ -2151,9 +2279,11 @@ py_update_one() {
     wait_for_mergeable_quick "$pr_num"
     log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
     wait_for_ci "$branch" "$submitted_head" "$pr_num"
-    log "[gate] CI passed. Final merge conflict check…"
-    wait_for_mergeable "$pr_num"
-    log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
+    if [[ "$(gh_pr_merged_for_number "$pr_num")" != 'true' ]]; then
+      log "[gate] CI passed. Final merge conflict check…"
+      wait_for_mergeable "$pr_num"
+      log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
+    fi
   fi
 }
 
@@ -2185,7 +2315,7 @@ batch_update_all() {
   batch_ts="$(date --utc +%Y%m%dT%H%M%S)"
   local -r branch="dep-updates/batch-${batch_ts}"
   local any_npm=0 any_py=0
-  local py_out py_exit
+  local py_out py_exit b_constraint_op b_spec actual_py_lines
 
   # If a previous batch branch from this same worktree session exists and its PR
   # is still open, reuse it rather than creating a duplicate.
@@ -2340,7 +2470,13 @@ batch_update_all() {
         log "[python/${py_tool}] Update: ${pkg} → ${new_ver}"
         case "$py_tool" in
           uv)
-            py_out="$(uv --directory "$worktree_path" add "${pkg}==${new_ver}" 2>&1)" && py_exit=0 || py_exit=$?
+            b_constraint_op="$(py_constraint_op "$pkg" "${dir}/pyproject.toml")"
+            if [[ "$b_constraint_op" == ">=" ]]; then
+              b_spec="${pkg}>=${new_ver}"
+            else
+              b_spec="${pkg}==${new_ver}"
+            fi
+            py_out="$(uv --directory "$worktree_path" add "$b_spec" 2>&1)" && py_exit=0 || py_exit=$?
             if (( py_exit != 0 )); then
               log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
               log "$py_out"
@@ -2373,6 +2509,66 @@ batch_update_all() {
           ;;
       esac
     fi
+
+    # Compute actual_py_lines by parsing the staged pyproject.toml diff.
+    # py_lines_arg comes from py_outdated and includes transitive packages that are
+    # only updated in uv.lock — not direct constraint changes.  Diffing the staged
+    # file gives the ground truth: only entries whose specifier was actually modified.
+    actual_py_lines=""
+    if [[ "$any_py" == '1' ]]; then
+      actual_py_lines="$(
+        {
+          git -C "$worktree_path" diff --cached -- pyproject.toml 2>/dev/null || true
+          printf '%s\n' '__LISTED__'
+          printf '%s\n' "$py_lines_arg"
+          printf '%s\n' "$py_audit_lines_arg"
+        } | awk '
+          /^__LISTED__$/ { in_listed = 1; next }
+          in_listed {
+            split($0, f, " ")
+            if (f[1] == "") next
+            p = tolower(f[1])
+            fallback_old[p] = f[2]
+            fallback_name[p] = f[1]
+            next
+          }
+          /^---/ || /^[+][+][+]/ { next }
+          {
+            sign = substr($0, 1, 1)
+            if (sign != "+" && sign != "-") next
+            line = substr($0, 2)
+            gsub(/^[[:space:]"]+/, "", line)
+            gsub(/\\[[^]]*\\]/, "", line)
+            op = ""
+            i = index(line, ">=")
+            if (i > 0) { op = ">="; pkg = substr(line, 1, i-1); ver = substr(line, i+2) }
+            if (op == "") { i = index(line, "=="); if (i > 0) { op = "=="; pkg = substr(line, 1, i-1); ver = substr(line, i+2) } }
+            if (op == "") { i = index(line, "~="); if (i > 0) { op = "~="; pkg = substr(line, 1, i-1); ver = substr(line, i+2) } }
+            if (op == "") next
+            gsub(/[[:space:]]/, "", pkg)
+            gsub(/[",[:space:]].*/, "", ver)
+            if (pkg == "" || ver == "") next
+            pk = tolower(pkg)
+            if (sign == "-") { d_old[pk] = ver; d_old_name[pk] = pkg }
+            else              { d_new[pk] = ver; d_new_name[pk] = pkg }
+          }
+          END {
+            for (pk in d_new) {
+              nv = d_new[pk]
+              if (pk in d_old) {
+                if (d_old[pk] == nv) continue
+                ov = d_old[pk]
+                nm = d_old_name[pk]
+              } else if (pk in fallback_old) {
+                ov = fallback_old[pk]
+                nm = fallback_name[pk]
+              } else { continue }
+              print nm " " ov " " nv
+            }
+          }
+        ' 2>/dev/null || true
+      )"
+    fi
   fi
 
   # Determine which npm packages actually changed after install.
@@ -2397,9 +2593,14 @@ batch_update_all() {
     return 0
   fi
 
+  local has_cves=0
+  [[ -n "$npm_audit_lines_arg" || -n "$py_audit_lines_arg" ]] && has_cves=1
+
   local commit_msg
   if [[ "$security_only" == '1' ]]; then
     commit_msg="fix(deps): patch all CVE vulnerabilities"
+  elif [[ "$has_cves" == '1' ]]; then
+    commit_msg="fix(deps): batch updates including CVE fixes"
   else
     commit_msg="chore(deps): batch dependency updates"
   fi
@@ -2460,20 +2661,17 @@ batch_update_all() {
         done <<< "$actual_npm_lines"
         printf '\n'
       fi
-      if [[ -n "$py_lines_arg" ]]; then
+      if [[ -n "${actual_py_lines:-${py_lines_arg}}" ]]; then
         printf '## Python updates\n\n'
         printf '| Package | From | To |\n'
         printf '|---|---|---|\n'
         while IFS=' ' read -r pkg old_ver new_ver; do
           [[ -z "$pkg" ]] && continue
           printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$pkg" "$old_ver" "$new_ver"
-        done <<< "$py_lines_arg"
+        done <<< "${actual_py_lines:-${py_lines_arg}}"
       fi
     fi
   } > "$body_file"
-
-  local has_cves=0
-  [[ -n "$npm_audit_lines_arg" || -n "$py_audit_lines_arg" ]] && has_cves=1
 
   if [[ "$has_cves" == '1' ]]; then
     gh pr edit "$pr_num" \
@@ -2487,6 +2685,7 @@ batch_update_all() {
       --body-file "$body_file" \
       --add-label "dep-updater" || true
   fi
+  # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
     gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
   fi
@@ -2500,9 +2699,11 @@ batch_update_all() {
     wait_for_mergeable_quick "$pr_num"
     log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
     wait_for_ci "$branch" "$submitted_head" "$pr_num"
-    log "[gate] CI passed. Final merge conflict check…"
-    wait_for_mergeable "$pr_num"
-    log "[gate] PR #${pr_num} is mergeable."
+    if [[ "$(gh_pr_merged_for_number "$pr_num")" != 'true' ]]; then
+      log "[gate] CI passed. Final merge conflict check…"
+      wait_for_mergeable "$pr_num"
+      log "[gate] PR #${pr_num} is mergeable."
+    fi
   fi
 }
 
@@ -2593,8 +2794,28 @@ wait_for_ci() {
         log "Waiting for CI to be scheduled on '${branch}'… ${wait_suffix}"
         ;;
       *)
-        # CI is running — log progress so the terminal isn't silent for minutes.
-        log "CI running on '${branch}'… ${wait_suffix}"
+        # CI is running — log progress and break down per-workflow status.
+        local run_summary
+        run_summary="$(printf '%s' "$raw" \
+          | jq -r --arg sha "$target_sha" --arg names "$ci_workflow_names" '
+              map(select(
+                .headSha == $sha and
+                ($names == "" or (.name as $n | $names | split("\n") | index($n) != null))
+              ))
+              | map(
+                  if .conclusion == "success" then "\u2713 " + .name
+                  elif .conclusion != null then "\u2717 " + .name + " (" + .conclusion + ")"
+                  elif .status == "in_progress" then "\u23f3 " + .name
+                  else "\u23f3 " + .name + " (" + .status + ")"
+                  end
+                )
+              | join(", ")
+            ' 2>/dev/null || true)"
+        if [[ -n "$run_summary" ]]; then
+          log "CI running on '${branch}': ${run_summary} ${wait_suffix}"
+        else
+          log "CI running on '${branch}'… ${wait_suffix}"
+        fi
         ;;
     esac
 
@@ -2653,7 +2874,15 @@ wait_for_mergeable() {
   local -r pr_num="$1"
   local -r timeout_min=5
   local elapsed=0
-  local state
+  local state already_merged
+
+  # Skip the conflict check if the PR is already merged (GitHub sets mergeable
+  # to UNKNOWN on merged PRs, which would cause us to poll until timeout).
+  already_merged="$(gh_pr_merged_for_number "$pr_num")"
+  if [[ "$already_merged" == 'true' ]]; then
+    log "PR #${pr_num} already merged — skipping conflict check."
+    return 0
+  fi
 
   log "Checking merge conflict status for PR #${pr_num}…"
   while true; do
@@ -2895,6 +3124,7 @@ write_pr_body() {
   local -r to_ver="$3"
   local -r eco="$4"
   local -r files="$5"
+  local -r cve_lines="${6:-}"  # optional: "pkg current fix cve1,cve2" lines for this package
   local safe_name
   safe_name="$(sanitize_branch_name "$pkg")"
   local -r body_file="/tmp/dep-update-pr-${safe_name}.md"
@@ -2905,11 +3135,27 @@ write_pr_body() {
     printf "Automated dependency updates via \`dep-update\`.\n"
     printf '%s\n\n' 'Each PR bumps exactly one dependency. Merge the full stack to update all.'
     printf '%s\n\n' '## Why?'
-    printf "\`%s\` has a newer version available.\n\n" "$pkg"
+    if [[ -n "$cve_lines" ]]; then
+      printf "\`%s\` has known CVE(s) and a newer version is available.\n\n" "$pkg"
+    else
+      printf "\`%s\` has a newer version available.\n\n" "$pkg"
+    fi
     printf "- **From:** \`%s\`\n" "$from_ver"
     printf "- **To:** \`%s\`\n" "$to_ver"
     printf -- '- **Ecosystem:** %s\n' "$eco"
     printf -- '- **Files changed:** %s\n' "$files"
+    if [[ -n "$cve_lines" ]]; then
+      printf '\n## CVEs addressed\n\n'
+      printf '| CVE | Fixed in |\n'
+      printf '|---|---|\n'
+      while IFS=' ' read -r _p _cur fix cves; do
+        [[ -z "$cves" ]] && continue
+        local cve
+        for cve in ${cves//,/ }; do
+          printf "| %s | \`%s\` |\n" "$cve" "$fix"
+        done
+      done <<< "$cve_lines"
+    fi
   } > "$body_file"
 }
 
@@ -3506,14 +3752,14 @@ else
       local entries
       entries="$(npm_entries_for_group "$group_key" "$npm_lines")"
       [[ -z "$entries" ]] && continue
-      npm_update_group "$group_key" "$entries"
+      npm_update_group "$group_key" "$entries" "$npm_audit_lines"
     done <<< "$group_keys"
   fi
 
   # Process Python packages
   if [[ -n "$py_lines" ]]; then
     while IFS=' ' read -r pkg old_ver new_ver; do
-      py_update_one "$pkg" "$old_ver" "$new_ver" "$py_tool"
+      py_update_one "$pkg" "$old_ver" "$new_ver" "$py_tool" "$py_audit_lines"
     done <<< "$py_lines"
   fi
 fi
