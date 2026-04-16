@@ -168,6 +168,173 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Static: constraint-dependencies isolation
+# ---------------------------------------------------------------------------
+
+printf '\n=== static: constraint-dependencies isolation ===\n'
+
+# py_outdated ge-floor extraction must use awk section tracking, not rg -o, so
+# constraint-dependencies entries (which rg -o cannot filter from context) are excluded.
+if grep -q 'in_direct = 1' "$script"; then
+  printf '[PASS] py_outdated: uses awk section tracking to skip constraint-dependencies\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py_outdated: awk section tracking (in_direct) not found; constraint-dependencies may leak\n'
+  fail=$(( fail + 1 ))
+fi
+
+# The output loop in py_outdated must validate PEP 508 package names to drop
+# any mangled strings (e.g. "constraint-dependencies=[...") that slip through.
+if grep -A3 'while IFS=.*read.*pkg cur new' "$script" \
+    | grep -q 'A-Za-z0-9.*A-Za-z0-9\._-'; then
+  printf '[PASS] py_outdated: output loop validates PEP 508 package names\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py_outdated: PEP 508 name validation missing from output loop\n'
+  fail=$(( fail + 1 ))
+fi
+
+# py_outdated must probe resolvability with 'uv pip install --dry-run' so that
+# packages blocked by transitive constraints (e.g. amqtt pinning click<8.2) are
+# filtered from the report before being shown as available updates.
+if grep -q 'uv pip install --dry-run' "$script"; then
+  printf '[PASS] py_outdated: probes resolvability with uv pip install --dry-run\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py_outdated: uv pip install --dry-run probe missing\n'
+  fail=$(( fail + 1 ))
+fi
+
+# The probe must pass all installed packages as pinned requirements (not just
+# --constraint), so that the resolver sees transitive Requires-Dist from other
+# packages and fails when they conflict with the candidate upgrade.
+if grep -q -- '-r /dev/stdin' "$script"; then
+  printf '[PASS] py_outdated: probe uses -r /dev/stdin (requirements, not constraints)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py_outdated: probe must use -r /dev/stdin to catch Requires-Dist conflicts\n'
+  fail=$(( fail + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+# Behavioural: uv transitive-constraint probe
+# ---------------------------------------------------------------------------
+
+printf '\n=== behavioural: uv transitive-constraint probe ===\n'
+
+# The probe pipes all installed packages (with pkg replaced by new_ver) as
+# requirements to 'uv pip install --dry-run'.  Test the jq pipeline directly:
+# given a synthetic installed_json, it must emit pkg==new_ver for the target
+# package and name==current_ver for all others, with editable installs excluded.
+if ! command -v jq >/dev/null 2>&1; then
+  printf '[SKIP] jq not on PATH — skipping probe jq-pipeline test\n'
+else
+  synthetic_json='[
+    {"name":"click","version":"8.1.8"},
+    {"name":"typer","version":"0.15.4"},
+    {"name":"my-pkg","version":"0.1.0","editable_project_location":"/src/my-pkg"}
+  ]'
+  probe_output="$(printf '%s' "$synthetic_json" \
+    | jq -r --arg p "click" --arg v "8.3.2" \
+        '.[] | select(has("editable_project_location") | not)
+             | if (.name | ascii_downcase) == ($p | ascii_downcase)
+               then "\(.name)==" + $v
+               else "\(.name)==\(.version)"
+               end')"
+  expected="$(printf 'click==8.3.2\ntyper==0.15.4')"
+  if [[ "$probe_output" == "$expected" ]]; then
+    printf '[PASS] probe jq pipeline: target replaced, others pinned, editable excluded\n'
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] probe jq pipeline: unexpected output\n'
+    printf '       expected: %s\n' "$expected"
+    printf '       got:      %s\n' "$probe_output"
+    fail=$(( fail + 1 ))
+  fi
+fi
+
+# Live probe: run the real uv dry-run against the my-tracks venv if present.
+# This validates the full pipeline catches a transitive constraint violation
+# (amqtt→typer==0.15.4→click<8.2 blocks click 8.3.2).
+my_tracks_dir="${HOME}/work/ai/my-tracks"
+if ! command -v uv >/dev/null 2>&1; then
+  printf '[SKIP] uv not on PATH — skipping live probe test\n'
+elif [[ ! -d "${my_tracks_dir}/.venv" ]]; then
+  printf '[SKIP] my-tracks venv not found — skipping live probe test\n'
+else
+  if ! cd "$my_tracks_dir"; then
+    live_installed_json=""
+  else
+    live_installed_json="$(uv pip list --format=json 2>/dev/null || true)"
+  fi
+  if [[ -z "$live_installed_json" ]]; then
+    printf '[SKIP] uv pip list failed in my-tracks — skipping live probe test\n'
+  else
+    # click==8.3.2 must be blocked (typer==0.15.4 requires click<8.2)
+    live_blocked=0
+    if printf '%s' "$live_installed_json" \
+        | jq -r --arg p "click" --arg v "8.3.2" \
+            '.[] | select(has("editable_project_location") | not)
+                 | if (.name | ascii_downcase) == ($p | ascii_downcase)
+                   then "\(.name)==" + $v
+                   else "\(.name)==\(.version)"
+                   end' \
+        | (cd "$my_tracks_dir" && uv pip install --dry-run -r /dev/stdin >/dev/null 2>&1); then
+      live_blocked=1  # exit 0 = probe thinks it's fine — wrong
+    fi
+    if [[ "$live_blocked" -eq 0 ]]; then
+      printf '[PASS] live probe: click==8.3.2 blocked by my-tracks transitive constraints\n'
+      pass=$(( pass + 1 ))
+    else
+      printf '[FAIL] live probe: click==8.3.2 was NOT blocked — transitive constraint not detected\n'
+      fail=$(( fail + 1 ))
+    fi
+
+    # An unblocked upgrade (shellcheck-py) must pass through the probe.
+    live_sc_ver="$(printf '%s' "$live_installed_json" \
+      | jq -r '.[] | select(.name == "shellcheck-py") | .version' 2>/dev/null || true)"
+    if [[ -n "$live_sc_ver" ]]; then
+      live_sc_ok=0
+      if printf '%s' "$live_installed_json" \
+          | jq -r --arg p "shellcheck-py" --arg v "0.11.0.1" \
+              '.[] | select(has("editable_project_location") | not)
+                   | if (.name | ascii_downcase) == ($p | ascii_downcase)
+                     then "\(.name)==" + $v
+                     else "\(.name)==\(.version)"
+                     end' \
+          | (cd "$my_tracks_dir" && uv pip install --dry-run -r /dev/stdin >/dev/null 2>&1); then
+        live_sc_ok=1
+      fi
+      if [[ "$live_sc_ok" -eq 1 ]]; then
+        printf '[PASS] live probe: shellcheck-py==0.11.0.1 allowed in my-tracks\n'
+        pass=$(( pass + 1 ))
+      else
+        printf '[FAIL] live probe: shellcheck-py==0.11.0.1 was incorrectly rejected\n'
+        fail=$(( fail + 1 ))
+      fi
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Static: >= floor revert on failure
+# ---------------------------------------------------------------------------
+
+printf '\n=== static: >= floor revert on failure ===\n'
+
+# py_update_one must revert pyproject.toml when uv lock fails after a sed patch
+# so the file is not left dirty and does not corrupt subsequent update attempts.
+revert_count=0
+revert_count="$(grep -c 'checkout -- pyproject.toml' "$script" 2>/dev/null || true)"
+if (( revert_count >= 2 )); then
+  printf '[PASS] pyproject.toml revert: present in both py_update_one and batch_update_all\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] pyproject.toml revert: expected >=2 occurrences, found %d\n' "$revert_count"
+  fail=$(( fail + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
 # Static: uv >= constraint floor detection
 # ---------------------------------------------------------------------------
 

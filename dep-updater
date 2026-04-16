@@ -49,6 +49,8 @@ security_only=0
 batch=0
 merge_timeout_min=15
 wt_tmpdir=""
+quiet=0
+report_json=0
 
 # Newline-separated list of workflow names that trigger on pull_request events.
 # Populated by detect_ci_workflows(); empty means "all runs" (fallback).
@@ -239,6 +241,7 @@ log_stack_rebase_context() {
 # ---------------------------------------------------------------------------
 
 log() {
+  [[ "$quiet" == '1' ]] && return 0
   local ts
   ts="$(date '+%H:%M:%S.%3N')"
   if [[ -n "$log_color" ]]; then
@@ -464,6 +467,14 @@ parse_args() {
         [[ $# -eq 0 ]] && die "--tmpdir requires a path argument."
         wt_tmpdir="$1"
         ;;
+      --quiet)
+        quiet=1
+        ;;
+      --report-json)
+        report_json=1
+        dry_run=1
+        quiet=1
+        ;;
       -h|--help)
         usage
         exit 0
@@ -498,7 +509,7 @@ parse_args() {
   fi
 
   # shellcheck disable=SC2034  # cleanup_mode, rebase_mode, merge_timeout_min used in main() dispatch
-  readonly dry_run cleanup_mode rebase_mode dir ecosystem semver_only no_wait_ci no_wait_merge security_only batch merge_timeout_min wt_tmpdir
+  readonly dry_run cleanup_mode rebase_mode dir ecosystem semver_only no_wait_ci no_wait_merge security_only batch merge_timeout_min wt_tmpdir quiet report_json
 }
 
 # ---------------------------------------------------------------------------
@@ -990,7 +1001,7 @@ create_worktree() {
     git -C "$dir" update-ref refs/heads/main "$main_sha"
   fi
   wt_base_branch="dep-update-wt-${timestamp}-$$"
-  git -C "$dir" worktree add -b "$wt_base_branch" "$worktree_path" "$main_sha"
+  git -C "$dir" worktree add -b "$wt_base_branch" "$worktree_path" "$main_sha" >&2
   readonly worktree_path
   log "[worktree] Worktree created: $worktree_path"
 
@@ -1000,13 +1011,13 @@ create_worktree() {
   if [[ "$has_npm" == '1' ]]; then
     if [[ -f "$worktree_path/pnpm-lock.yaml" ]]; then
       log "[worktree] Installing dependencies (pnpm)…"
-      (cd "$worktree_path" && pnpm install --prefer-offline --frozen-lockfile)
+      (cd "$worktree_path" && pnpm install --prefer-offline --frozen-lockfile) >&2
     elif [[ -f "$worktree_path/package-lock.json" ]]; then
       log "[worktree] Installing dependencies (npm)…"
-      (cd "$worktree_path" && npm ci --prefer-offline --no-audit --no-fund)
+      (cd "$worktree_path" && npm ci --prefer-offline --no-audit --no-fund) >&2
     elif [[ -f "$worktree_path/yarn.lock" ]]; then
       log "[worktree] Installing dependencies (yarn)…"
-      (cd "$worktree_path" && yarn install --frozen-lockfile)
+      (cd "$worktree_path" && yarn install --frozen-lockfile) >&2
     fi
   fi
   if [[ -n "$py_tool" ]]; then
@@ -1015,24 +1026,24 @@ create_worktree() {
         if [[ -f "$worktree_path/uv.lock" || -f "$worktree_path/requirements.txt" ]]; then
           log "[worktree] Installing dependencies (uv)…"
           if [[ ! -d "$worktree_path/.venv" ]]; then
-            (cd "$worktree_path" && uv venv)
+            (cd "$worktree_path" && uv venv) >&2
           fi
           if [[ -f "$worktree_path/uv.lock" ]]; then
-            (cd "$worktree_path" && uv sync --frozen)
+            (cd "$worktree_path" && uv sync --frozen) >&2
           else
-            (cd "$worktree_path" && uv pip install -r requirements.txt)
+            (cd "$worktree_path" && uv pip install -r requirements.txt) >&2
           fi
         fi
         ;;
       poetry)
         [[ -f "$worktree_path/poetry.lock" ]] \
           && log "[worktree] Installing dependencies (poetry)…" \
-          && (cd "$worktree_path" && poetry install --no-root)
+          && (cd "$worktree_path" && poetry install --no-root) >&2
         ;;
       pipenv)
         [[ -f "$worktree_path/Pipfile.lock" ]] \
           && log "[worktree] Installing dependencies (pipenv)…" \
-          && (cd "$worktree_path" && pipenv install)
+          && (cd "$worktree_path" && pipenv install) >&2
         ;;
       *)
         : # pip/pip3: no lockfile install needed; packages resolved per-update
@@ -2066,23 +2077,27 @@ py_is_pinned() {
 
 py_outdated() {
   local -r tool="$1"
+  local -r target_dir="${2:-$dir}"
   local raw_lines pyproject installed_json ge_dep ge_pkg ge_floor ge_installed ge_lower
+  local installed_new
+  installed_json=""
+  installed_new=""
   case "$tool" in
     uv)
-      raw_lines="$(uv pip list --outdated --format=json 2>/dev/null \
+      raw_lines="$(cd "$target_dir" && uv pip list --outdated --format=json 2>/dev/null \
         | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
       ;;
     poetry)
       # poetry show --outdated has no stable JSON output; parse the table instead
-      raw_lines="$(poetry --directory "$dir" show --outdated 2>/dev/null \
+      raw_lines="$(poetry --directory "$target_dir" show --outdated 2>/dev/null \
         | awk '/^[a-zA-Z]/ { print $1, $2, $3 }')"
       ;;
     pipenv)
-      raw_lines="$(pipenv run pip list --outdated --format=json 2>/dev/null \
+      raw_lines="$(cd "$target_dir" && pipenv run pip list --outdated --format=json 2>/dev/null \
         | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
       ;;
     pip|pip3)
-      raw_lines="$("$tool" list --outdated --format=json 2>/dev/null \
+      raw_lines="$(cd "$target_dir" && "$tool" list --outdated --format=json 2>/dev/null \
         | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
       ;;
     *)
@@ -2096,9 +2111,9 @@ py_outdated() {
   # installed version (e.g. "django>=6.0" installed at 6.0.4 — the floor should
   # be bumped to >=6.0.4 so the project always requires the patched minimum).
   if [[ "$tool" == "uv" ]]; then
-    pyproject="${dir}/pyproject.toml"
+    pyproject="${target_dir}/pyproject.toml"
     if [[ -f "$pyproject" ]]; then
-      installed_json="$(uv pip list --format=json 2>/dev/null)"
+      installed_json="$(cd "$target_dir" && uv pip list --format=json 2>/dev/null)"
       while IFS= read -r ge_dep; do
         [[ -z "$ge_dep" ]] && continue
         # Strip extras ([...]) then >= and version to get the package name.
@@ -2110,6 +2125,8 @@ py_outdated() {
           | sed 's/.*>=[[:space:]]*//' \
           | sed 's/[,;[:space:]].*//')"
         [[ -z "$ge_floor" || -z "$ge_pkg" ]] && continue
+        # Validate PEP 508 package name — drop any mangled strings.
+        [[ "$ge_pkg" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
         ge_installed="$(printf '%s' "$installed_json" \
           | jq -r --arg n "$ge_pkg" \
               '.[] | select(.name | ascii_downcase == ($n | ascii_downcase)) | .version')"
@@ -2128,17 +2145,62 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
             fi
           fi
         fi
-      done < <(rg -o '"[A-Za-z0-9][A-Za-z0-9._-]*(\[[^\]]*\])?\s*>=\s*[0-9][^"]*"' \
-                   "$pyproject" 2>/dev/null \
-               | tr -d '"')
+      done < <(awk '
+        BEGIN { in_direct = 0 }
+        /^\[[[:space:]]*(project|project\.[^]]*)[[:space:]]*\]/ { in_direct = 1; next }
+        /^\[/ { in_direct = 0; next }
+        !in_direct { next }
+        /constraint-dependencies/ { next }
+        {
+          s = $0
+          while (1) {
+            if (match(s, /"[A-Za-z0-9][A-Za-z0-9._-]*[^"=<>!~,]*>=[^"]*"/)) {
+              print substr(s, RSTART+1, RLENGTH-2)
+              s = substr(s, RSTART+RLENGTH)
+            } else break
+          }
+        }
+      ' "$pyproject" 2>/dev/null)
     fi
   fi
 
   while IFS=' ' read -r pkg cur new; do
     [[ -z "$pkg" ]] && continue
+    # Validate PEP 508 package name — drop any mangled strings from raw_lines.
+    [[ "$pkg" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
     if py_is_pinned "$pkg" "$tool"; then
       log "[python/${tool}] Skipping exactly-pinned package: ${pkg} (${cur})"
       continue
+    fi
+    # For uv projects, probe whether the upgrade is actually resolvable before
+    # reporting it.  'uv pip list --outdated' reports PyPI availability only and
+    # does not check transitive constraints from other installed packages (e.g.
+    # amqtt pins typer==0.15.4 which requires click<8.2, so click 8.3.2 would
+    # show up as "outdated" even though the upgrade is impossible).
+    # Strategy: write all currently-installed packages at their current pinned
+    # versions (substituting pkg -> new_ver) as a requirements list and pass it
+    # to 'uv pip install --dry-run'.  The resolver sees typer==0.15.4 and knows
+    # its Requires-Dist includes click<8.2, so it rejects click==8.3.2 with
+    # exit 1.  Editable installs are excluded (local packages not on PyPI).
+    # Skip the probe for >= floor bumps (new == already-installed version).
+    if [[ "$tool" == "uv" && -n "$installed_json" ]]; then
+      installed_new="$(printf '%s' "$installed_json" \
+        | jq -r --arg n "$pkg" \
+            '.[] | select(.name | ascii_downcase == ($n | ascii_downcase)) | .version' \
+          2>/dev/null || true)"
+      if [[ "$new" != "$installed_new" ]]; then
+        if ! printf '%s' "$installed_json" \
+            | jq -r --arg p "$pkg" --arg v "$new" \
+                '.[] | select(has("editable_project_location") | not)
+                     | if (.name | ascii_downcase) == ($p | ascii_downcase)
+                       then "\(.name)==" + $v
+                       else "\(.name)==\(.version)"
+                       end' \
+            | (cd "$target_dir" && uv pip install --dry-run -r /dev/stdin >/dev/null 2>&1); then
+          log "[python/uv] Filtering ${pkg} ${new}: transitive constraint blocks this upgrade."
+          continue
+        fi
+      fi
     fi
     printf '%s %s %s\n' "$pkg" "$cur" "$new"
   done <<< "$raw_lines"
@@ -2181,15 +2243,27 @@ py_update_one() {
 
   case "$tool" in
     uv)
-      local uv_out uv_exit uv_constraint_op uv_spec
+      local uv_out uv_exit uv_constraint_op uv_spec sed_pkg
       uv_constraint_op="$(py_constraint_op "$pkg" "${dir}/pyproject.toml")"
       if [[ "$uv_constraint_op" == ">=" ]]; then
-        uv_spec="${pkg}>=${new_ver}"
+        # uv add pkg>=new_ver is a no-op when the lock already satisfies the
+        # existing >= constraint (uv sees 8.0.1 already satisfies >=7.0.0 and
+        # leaves pyproject.toml unchanged). Patch the floor with sed instead.
+        sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
+        sed -i -E \
+          "s/(\"${sed_pkg}([^\"=<>!~,]|\\[[^]]+\\])*[[:space:]]*)>=[[:space:]]*[0-9][0-9a-zA-Z.]*/\\1>=${new_ver}/" \
+          "${worktree_path}/pyproject.toml"
+        uv_out="$(uv --directory "$worktree_path" lock 2>&1)" && uv_exit=0 || uv_exit=$?
       else
         uv_spec="${pkg}==${new_ver}"
+        uv_out="$(uv --directory "$worktree_path" add "$uv_spec" 2>&1)" && uv_exit=0 || uv_exit=$?
       fi
-      uv_out="$(uv --directory "$worktree_path" add "$uv_spec" 2>&1)" && uv_exit=0 || uv_exit=$?
       if (( uv_exit != 0 )); then
+        # Revert pyproject.toml: sed already modified it for >= constraints but
+        # the lock failed, so the change must not accumulate into a future commit.
+        if [[ "$uv_constraint_op" == ">=" ]]; then
+          git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
+        fi
         log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
         log "$uv_out"
         return 0
@@ -2315,7 +2389,7 @@ batch_update_all() {
   batch_ts="$(date --utc +%Y%m%dT%H%M%S)"
   local -r branch="dep-updates/batch-${batch_ts}"
   local any_npm=0 any_py=0
-  local py_out py_exit b_constraint_op b_spec actual_py_lines
+  local py_out py_exit b_constraint_op b_spec actual_py_lines sed_pkg
 
   # If a previous batch branch from this same worktree session exists and its PR
   # is still open, reuse it rather than creating a duplicate.
@@ -2472,12 +2546,24 @@ batch_update_all() {
           uv)
             b_constraint_op="$(py_constraint_op "$pkg" "${dir}/pyproject.toml")"
             if [[ "$b_constraint_op" == ">=" ]]; then
-              b_spec="${pkg}>=${new_ver}"
+              # Direct floor bump: uv add pkg>=new_ver is a no-op when the lock
+              # already satisfies the constraint. Patch pyproject.toml with sed.
+              sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
+              sed -i -E \
+                "s/(\"${sed_pkg}([^\"=<>!~,]|\\[[^]]+\\])*[[:space:]]*)>=[[:space:]]*[0-9][0-9a-zA-Z.]*/\\1>=${new_ver}/" \
+                "${worktree_path}/pyproject.toml"
+              py_out="$(uv --directory "$worktree_path" lock 2>&1)" && py_exit=0 || py_exit=$?
             else
               b_spec="${pkg}==${new_ver}"
+              py_out="$(uv --directory "$worktree_path" add "$b_spec" 2>&1)" && py_exit=0 || py_exit=$?
             fi
-            py_out="$(uv --directory "$worktree_path" add "$b_spec" 2>&1)" && py_exit=0 || py_exit=$?
             if (( py_exit != 0 )); then
+              # Revert: sed patched pyproject.toml before the lock attempt for >=
+              # constraints. Restore the file so failed bumps don't accumulate
+              # and cause all subsequent packages to fail with phantom conflicts.
+              if [[ "$b_constraint_op" == ">=" ]]; then
+                git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
+              fi
               log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
               log "$py_out"
               continue
@@ -2546,7 +2632,10 @@ batch_update_all() {
             if (op == "") { i = index(line, "~="); if (i > 0) { op = "~="; pkg = substr(line, 1, i-1); ver = substr(line, i+2) } }
             if (op == "") next
             gsub(/[[:space:]]/, "", pkg)
-            gsub(/[",[:space:]].*/, "", ver)
+            # Validate: package names only contain letters, digits, hyphens, underscores, dots.
+            # Mangled names (e.g. constraint-dependencies=["pyyaml) are dropped.
+            if (pkg !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/) next
+            gsub(/[",:[:space:]].*/, "", ver)
             if (pkg == "" || ver == "") next
             pk = tolower(pkg)
             if (sign == "-") { d_old[pk] = ver; d_old_name[pk] = pkg }
@@ -2692,7 +2781,26 @@ batch_update_all() {
 
   state_append "branches" "$branch"
   state_append_pr "$pr_num"
-  add_summary_line "batch" "batch" "-" "-" "$branch" "$pr_num"
+  while IFS=' ' read -r pkg old_ver new_ver; do
+    [[ -z "$pkg" ]] && continue
+    add_summary_line "npm" "$pkg" "$old_ver" "$new_ver" "$branch" "$pr_num"
+  done <<< "${actual_npm_lines:-}"
+  while IFS=' ' read -r pkg _current fix _cves; do
+    [[ -z "$pkg" ]] && continue
+    add_summary_line "npm (CVE)" "$pkg" "$_current" "$fix" "$branch" "$pr_num"
+  done <<< "${npm_audit_lines_arg:-}"
+  while IFS=' ' read -r pkg old_ver new_ver; do
+    [[ -z "$pkg" ]] && continue
+    add_summary_line "python/${py_tool}" "$pkg" "$old_ver" "$new_ver" "$branch" "$pr_num"
+  done <<< "${actual_py_lines:-${py_lines_arg:-}}"
+  while IFS=' ' read -r pkg _current fix _cves; do
+    [[ -z "$pkg" ]] && continue
+    add_summary_line "python/${py_tool} (CVE)" "$pkg" "$_current" "$fix" "$branch" "$pr_num"
+  done <<< "${py_audit_lines_arg:-}"
+  if [[ -z "$actual_npm_lines" && -z "$npm_audit_lines_arg" && \
+        -z "${actual_py_lines:-${py_lines_arg:-}}" && -z "$py_audit_lines_arg" ]]; then
+    add_summary_line "batch" "$branch" "-" "-" "$branch" "$pr_num"
+  fi
 
   if [[ "$no_wait_ci" == '0' ]]; then
     log "[gate] Checking merge conflict status for PR #${pr_num} before waiting for CI…"
@@ -3229,6 +3337,24 @@ print_summary() {
 cleanup_on_error() {
   local -r reason="$1"
   log "Cleaning up after error: ${reason}"
+  # Close any open PRs created in this session so a subsequent run starts fresh.
+  if [[ -n "$state_file" && -f "$state_file" ]]; then
+    local saved_prs=""
+    saved_prs="$(state_get "prs" 2>/dev/null || true)"
+    if [[ -n "$saved_prs" ]]; then
+      local saved_p saved_merged saved_state
+      IFS=',' read -ra saved_prs_list <<< "$saved_prs"
+      for saved_p in "${saved_prs_list[@]}"; do
+        [[ -z "$saved_p" ]] && continue
+        saved_merged="$(gh_pr_merged_for_number "$saved_p" 2>/dev/null || true)"
+        saved_state="$(gh_pr_state_for_number "$saved_p" 2>/dev/null || true)"
+        if [[ "$saved_merged" != 'true' && "$saved_state" == 'open' ]]; then
+          log "Closing PR #${saved_p} (cleanup on error — re-run to submit a fresh PR)."
+          gh pr close "$saved_p" --repo "${repo_owner}/${repo_name}" 2>/dev/null || true
+        fi
+      done
+    fi
+  fi
   if [[ -n "$worktree_path" && -d "$worktree_path" ]]; then
     log "[worktree] Removing worktree: $worktree_path"
     git -C "$dir" worktree remove --force "$worktree_path" 2>/dev/null \
@@ -3264,22 +3390,44 @@ cleanup() {
 poll_until_merged() {
   local -r prs_csv="$1"
   local -r timeout_min="${merge_timeout_min}"
+  local -r poll_sec=30
   local elapsed=0
-  local interval=30
+  local elapsed_fmt wait_suffix remaining_sec remaining_fmt
 
   log "Waiting for all PRs to merge (timeout: ${timeout_min} min)…"
   log "PRs: $(csv_pretty "$prs_csv")"
 
-  local all_merged p merged
+  local all_merged p merged pending_list check_rollup failed_check
   while true; do
     all_merged=1
+    pending_list=""
     IFS=',' read -ra pr_list <<< "$prs_csv"
     for p in "${pr_list[@]}"; do
       [[ -z "$p" ]] && continue
       merged="$(gh_pr_merged_for_number "$p")"
       if [[ "$merged" != 'true' ]]; then
         all_merged=0
-        break
+        pending_list="${pending_list:+${pending_list}, }#${p}"
+
+        # Check statusCheckRollup: GitHub associates merge-queue CI runs back to
+        # the original PR's head commit, so failures from the merge queue appear
+        # here even though wait_for_ci only saw the initial push CI.
+        check_rollup="$(gh pr view "$p" \
+          --repo "${repo_owner}/${repo_name}" \
+          --json statusCheckRollup \
+          --jq '.statusCheckRollup // []' 2>/dev/null || echo '[]')"
+        failed_check="$(printf '%s' "$check_rollup" \
+          | jq -r '
+              map(select(
+                .conclusion == "FAILURE" or .conclusion == "ERROR" or
+                .conclusion == "CANCELLED" or .conclusion == "TIMED_OUT" or
+                .conclusion == "STARTUP_FAILURE" or .conclusion == "ACTION_REQUIRED"
+              )) | if length > 0 then .[0].name else "" end
+            ' 2>/dev/null || true)"
+        if [[ -n "$failed_check" ]]; then
+          cleanup_on_error "PR #${p}: CI check '${failed_check}' failed in the merge queue"
+          die "PR #${p}: CI check '${failed_check}' failed in the merge queue. Fix the failure and re-run."
+        fi
       fi
     done
 
@@ -3288,19 +3436,96 @@ poll_until_merged() {
       return 0
     fi
 
-    sleep "$interval"
-    elapsed=$(( elapsed + interval ))
     if (( elapsed >= timeout_min * 60 )); then
       log "Timed out after ${timeout_min} min waiting for PRs to merge."
       log "Re-run with --cleanup once all PRs are merged."
       return 1
     fi
+
+    # Format elapsed and remaining for progress display.
+    if (( elapsed < 60 )); then
+      elapsed_fmt="${elapsed}s"
+    else
+      elapsed_fmt="$(( elapsed / 60 ))m $(( elapsed % 60 ))s"
+    fi
+    remaining_sec=$(( timeout_min * 60 - elapsed ))
+    if (( remaining_sec < 60 )); then
+      remaining_fmt="${remaining_sec}s"
+    else
+      remaining_fmt="$(( remaining_sec / 60 ))m $(( remaining_sec % 60 ))s"
+    fi
+    wait_suffix="[waited ${elapsed_fmt} / ${timeout_min}m, ~${remaining_fmt} remaining, next check in ${poll_sec}s]"
+    log "Still waiting for: ${pending_list} ${wait_suffix}"
+
+    sleep "$poll_sec"
+    elapsed=$(( elapsed + poll_sec ))
   done
 }
 
 # ---------------------------------------------------------------------------
 # Dry-run output helpers
 # ---------------------------------------------------------------------------
+
+# Emit a JSON report to stdout for --report-json mode.
+# Args: npm_audit_lines  py_audit_lines  npm_lines  py_lines
+# All args may be empty strings.
+_emit_report_json() {
+  local npm_audit_lines="$1"
+  local py_audit_lines="$2"
+  local npm_lines="$3"
+  local py_lines="$4"
+
+  local cves_json="[]"
+  local updates_json="[]"
+
+  # Build CVE array.
+  if [[ -n "$npm_audit_lines" ]]; then
+    while IFS=' ' read -r pkg current fix cve_ids; do
+      [[ -z "$pkg" ]] && continue
+      cves_json="$(printf '%s' "$cves_json" \
+        | jq --arg p "$pkg" --arg c "$current" --arg f "$fix" --arg ids "$cve_ids" \
+            '. + [{"ecosystem":"npm","package":$p,"current":$c,"fix":$f,"cves":$ids}]')"
+    done <<< "$npm_audit_lines"
+  fi
+  if [[ -n "$py_audit_lines" ]]; then
+    while IFS=' ' read -r pkg current fix cve_ids; do
+      [[ -z "$pkg" ]] && continue
+      cves_json="$(printf '%s' "$cves_json" \
+        | jq --arg e "python/${py_tool}" --arg p "$pkg" --arg c "$current" --arg f "$fix" --arg ids "$cve_ids" \
+            '. + [{"ecosystem":$e,"package":$p,"current":$c,"fix":$f,"cves":$ids}]')"
+    done <<< "$py_audit_lines"
+  fi
+
+  # Build updates array.
+  if [[ -n "$npm_lines" ]]; then
+    while IFS=' ' read -r pkg old_ver new_ver; do
+      [[ -z "$pkg" ]] && continue
+      updates_json="$(printf '%s' "$updates_json" \
+        | jq --arg p "$pkg" --arg o "$old_ver" --arg n "$new_ver" \
+            '. + [{"ecosystem":"npm","package":$p,"from":$o,"to":$n}]')"
+    done <<< "$npm_lines"
+  fi
+  if [[ -n "$py_lines" ]]; then
+    while IFS=' ' read -r pkg old_ver new_ver; do
+      [[ -z "$pkg" ]] && continue
+      updates_json="$(printf '%s' "$updates_json" \
+        | jq --arg e "python/${py_tool}" --arg p "$pkg" --arg o "$old_ver" --arg n "$new_ver" \
+            '. + [{"ecosystem":$e,"package":$p,"from":$o,"to":$n}]')"
+    done <<< "$py_lines"
+  fi
+
+  jq -n \
+    --arg repo "$dir" \
+    --argjson cves "$cves_json" \
+    --argjson updates "$updates_json" \
+    '{
+      repo: $repo,
+      has_updates: (($updates | length) > 0),
+      has_cves: (($cves | length) > 0),
+      cves: $cves,
+      updates: $updates
+    }'
+}
 
 # Print a columnar table of ecosystem|package|from|to rows.
 # The header row is included in the column pipeline so widths align.
@@ -3431,7 +3656,7 @@ _dry_run_teardown() {
   log "[worktree] Removing: $wt"
   cd - >/dev/null 2>&1 || true
   git -C "$dir" worktree remove --force "$wt" 2>/dev/null || true
-  git -C "$dir" branch -D "$wt_base_branch" 2>/dev/null || true
+  git -C "$dir" branch -D "$wt_base_branch" >/dev/null 2>&1 || true
   log "[worktree] Removed: $wt"
 }
 
@@ -3445,6 +3670,9 @@ if [[ "$dry_run" == '1' ]]; then
   # ── No ecosystem detected ────────────────────────────────────────────
   if [[ "$has_npm" == '0' && -z "$py_tool" ]]; then
     log "No supported ecosystem detected — nothing to update."
+    if [[ "$report_json" == '1' ]]; then
+      _emit_report_json "" "" "" ""
+    fi
     _dry_run_teardown "$audit_dir"
     exit 0
   fi
@@ -3483,6 +3711,9 @@ if [[ "$dry_run" == '1' ]]; then
   fi
 
   if [[ "$security_only" == '1' ]]; then
+    if [[ "$report_json" == '1' ]]; then
+      _emit_report_json "$npm_audit_lines" "$py_audit_lines" "" ""
+    fi
     _dry_run_teardown "$audit_dir"
     exit 0
   fi
@@ -3502,11 +3733,15 @@ if [[ "$dry_run" == '1' ]]; then
 
   if [[ -z "$npm_lines" && -z "$py_lines" ]]; then
     log "All dependencies are up to date."
+    if [[ "$report_json" == '1' ]]; then
+      _emit_report_json "$npm_audit_lines" "$py_audit_lines" "" ""
+    fi
     _dry_run_teardown "$audit_dir"
     exit 0
   fi
 
-  # ── Summary table (all ecosystems, one table) ────────────────────────
+  # ── Summary table + per-PR plan (human-readable; skipped in --report-json) ──
+  if [[ "$report_json" == '0' ]]; then
   printf '\n'
   local -a all_rows=()
   if [[ -n "$npm_lines" ]]; then
@@ -3624,21 +3859,25 @@ if [[ "$dry_run" == '1' ]]; then
       done <<< "$py_lines"
     fi
   fi
+  fi  # end: report_json == 0
+
+  if [[ "$report_json" == '1' ]]; then
+    _emit_report_json "$npm_audit_lines" "$py_audit_lines" "$npm_lines" "$py_lines"
+  fi
 
   _dry_run_teardown "$audit_dir"
   exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# Update mode ───────────────────────────────────────────────────────────
-
-# Collect outdated packages before creating any side effects
+# Update mode
+# ---------------------------------------------------------------------------
 local npm_lines="" py_lines=""
 if [[ "$has_npm" == '1' ]]; then
   npm_lines="$(npm_outdated)"
 fi
 if [[ -n "$py_tool" ]]; then
-  py_lines="$(py_outdated "$py_tool")"
+  py_lines="$(py_outdated "$py_tool" "$dir")"
 fi
 
 if [[ -z "$npm_lines" && -z "$py_lines" ]]; then
