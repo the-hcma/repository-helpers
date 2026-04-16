@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# dep-updater-notifier — check configured repos for outdated/CVE deps and email a summary.
+#
+# Designed to be run from cron. Sends a single email listing every repo that
+# has pending updates, what's outdated, and whether any entries are CVE-related.
+# Uses dep-updater --report-json --quiet for clean, structured output.
+#
+# Usage:
+#   dep-updater-notifier [--print]    # write email to stdout instead of sending
+#   dep-updater-notifier [--verbose]  # show timestamped progress on stderr
+#
+# Flags can be combined: dep-updater-notifier --print --verbose
+#
+# By default all stderr output is suppressed (safe for cron).
+# Cron example (daily at 07:00):
+#   0 7 * * * /path/to/dep-updater-notifier
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+readonly dep_updater="${script_dir}/dep-updater"
+
+readonly repos=(
+  "${HOME}/work/ai/fpdf"
+  "${HOME}/work/ai/bunnify"
+  "${HOME}/work/ai/my-tracks"
+)
+
+readonly email_to="hcma@hcma.info"
+readonly email_subject_prefix="[dep-updater]"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+log() {
+  [[ "$verbose" == '1' ]] || return 0
+  local ts
+  ts="$(date '+%H:%M:%S.%3N')"
+  printf '%s %s\n' "$ts" "$*" >&2
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+print_only=0
+verbose=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --print)   print_only=1 ;;
+    --verbose) verbose=1 ;;
+    -h|--help)
+      sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) die "Unknown option: '$1'. Valid options: --print, --verbose, --help" ;;
+  esac
+  shift
+done
+
+[[ -x "$dep_updater" ]] || die "dep-updater not found or not executable: ${dep_updater}"
+
+scan_host="$(hostname -s 2>/dev/null || echo 'unknown')"
+report_lines=()
+notice_lines=()
+found_any=0
+found_cve=0
+
+for repo in "${repos[@]}"; do
+  repo_name="$(basename "$repo")"
+
+  if [[ ! -d "$repo" ]]; then
+    log "Skipping ${repo_name}: directory not found."
+    report_lines+=("=== ${repo_name} === (directory not found: ${repo})")
+    report_lines+=("")
+    continue
+  fi
+
+  log "Checking ${repo_name}…"
+  log "  cmd: ${dep_updater} --report-json --dir ${repo}"
+
+  json=""
+  exit_code=0
+  json="$("$dep_updater" --report-json --dir "$repo" 2>/dev/null)" || exit_code=$?
+
+  if [[ "$verbose" == '1' ]]; then
+    log "  json:"
+    (printf '%s' "$json" | jq . 2>/dev/null || printf '%s\n' "$json") | sed 's/^/  /' >&2
+  fi
+
+  if (( exit_code != 0 )) || ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
+    log "${repo_name}: scan failed (exit code ${exit_code})."
+    report_lines+=("=== ${repo_name} === (scan failed, exit code ${exit_code})")
+    report_lines+=("")
+    continue
+  fi
+
+  has_updates="$(printf '%s' "$json" | jq -r '.has_updates')"
+  has_cves="$(printf '%s' "$json" | jq -r '.has_cves')"
+
+  if [[ "$has_updates" != 'true' && "$has_cves" != 'true' ]]; then
+    log "${repo_name}: up to date."
+    continue
+  fi
+
+  found_any=1
+  [[ "$has_cves" == 'true' ]] && found_cve=1
+
+  cve_flag=""
+  [[ "$has_cves" == 'true' ]] && cve_flag=" [CVE]"
+
+  report_lines+=("=== ${repo_name}${cve_flag} ===")
+  report_lines+=("")
+
+  if [[ "$has_cves" == 'true' ]]; then
+    report_lines+=("Security vulnerabilities with available fixes:")
+    report_lines+=("  $(printf '%-24s  %-10s  %-10s  %s' 'PACKAGE' 'CURRENT' 'FIX' 'CVEs')")
+    while IFS= read -r row; do
+      pkg="$(printf '%s' "$row" | jq -r '.package')"
+      current="$(printf '%s' "$row" | jq -r '.current')"
+      fix="$(printf '%s' "$row" | jq -r '.fix')"
+      cves="$(printf '%s' "$row" | jq -r '.cves')"
+      report_lines+=("  $(printf '%-24s  %-10s  %-10s  %s' "$pkg" "$current" "$fix" "$cves")")
+    done < <(printf '%s' "$json" | jq -c '.cves[]')
+    report_lines+=("")
+  fi
+
+  if [[ "$has_updates" == 'true' ]]; then
+    report_lines+=("Outdated packages:")
+    report_lines+=("  $(printf '%-20s  %-24s  %-10s  %s' 'ECOSYSTEM' 'PACKAGE' 'FROM' 'TO')")
+    local_notice="${repo_name}${cve_flag}:"
+    local_count=0
+    local_pairs=""
+    while IFS= read -r row; do
+      ecosystem="$(printf '%s' "$row" | jq -r '.ecosystem')"
+      pkg="$(printf '%s' "$row" | jq -r '.package')"
+      from="$(printf '%s' "$row" | jq -r '.from')"
+      to="$(printf '%s' "$row" | jq -r '.to')"
+      report_lines+=("  $(printf '%-20s  %-24s  %-10s  %s' "$ecosystem" "$pkg" "$from" "$to")")
+      local_count=$(( local_count + 1 ))
+      if (( local_count <= 3 )); then
+        local_pairs="${local_pairs:+${local_pairs}, }${pkg} ${from}→${to}"
+      fi
+    done < <(printf '%s' "$json" | jq -c '.updates[]')
+    if (( local_count > 3 )); then
+      local_pairs="${local_pairs} (+$(( local_count - 3 )) more)"
+    fi
+    notice_lines+=("${local_notice} ${local_pairs}")
+    report_lines+=("")
+  fi
+done
+
+if (( found_any == 0 )); then
+  # Cron-silent: no output when nothing to do.
+  exit 0
+fi
+
+for notice_line in "${notice_lines[@]}"; do
+  printf '%s\n' "$notice_line" >&2
+done
+
+# ---------------------------------------------------------------------------
+# Build email
+# ---------------------------------------------------------------------------
+
+subject_tag=""
+(( found_cve == 1 )) && subject_tag=" ⚠ CVE fixes available"
+readonly subject="${email_subject_prefix} dependency updates needed${subject_tag}"
+
+body_lines=()
+body_lines+=("Dependency updates are available for one or more of your repos.")
+body_lines+=("Run dep-updater in the relevant directory to create PRs automatically.")
+body_lines+=("")
+body_lines+=("Scanned:  $(date '+%Y-%m-%d %H:%M %Z')")
+body_lines+=("Host:     ${scan_host}  (user: $(id -un 2>/dev/null || echo '?'))")
+body_lines+=("Script:   ${BASH_SOURCE[0]}")
+body_lines+=("dep-updater: ${dep_updater}")
+body_lines+=("")
+body_lines+=("────────────────────────────────────────────────────────────────")
+body_lines+=("")
+for line in "${report_lines[@]}"; do
+  body_lines+=("$line")
+done
+body_lines+=("────────────────────────────────────────────────────────────────")
+body_lines+=("To update:  cd <repo> && dep-updater [--batch] [--security-only]")
+
+body="$(printf '%s\n' "${body_lines[@]}")"
+
+if (( print_only == 1 )); then
+  printf 'To: %s\n' "$email_to"
+  printf 'Subject: %s\n\n' "$subject"
+  printf '%s\n' "$body"
+  exit 0
+fi
+
+# Build a MIME multipart/alternative email so the HTML part can use a
+# monospace <pre> block, preserving column alignment in the report table.
+# Plain-text is kept as the first (fallback) part for clients that prefer it.
+boundary="dep-updater-$(date +%s%N | md5sum | head -c16)"
+html_body="$(printf '%s' "$body" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')"
+
+{
+  printf 'To: %s\n' "$email_to"
+  printf 'Subject: %s\n' "$subject"
+  printf 'MIME-Version: 1.0\n'
+  printf 'Content-Type: multipart/alternative; boundary="%s"\n' "$boundary"
+  printf '\n'
+  printf -- '--%s\n' "$boundary"
+  printf 'Content-Type: text/plain; charset="utf-8"\n'
+  printf 'Content-Transfer-Encoding: 8bit\n'
+  printf '\n'
+  printf '%s\n' "$body"
+  printf '\n'
+  printf -- '--%s\n' "$boundary"
+  printf 'Content-Type: text/html; charset="utf-8"\n'
+  printf 'Content-Transfer-Encoding: 8bit\n'
+  printf '\n'
+  printf '<!DOCTYPE html><html><body>\n'
+  printf '<pre style="font-family:monospace,monospace;font-size:13px;line-height:1.4">\n'
+  printf '%s\n' "$html_body"
+  printf '</pre>\n'
+  printf '</body></html>\n'
+  printf '\n'
+  printf -- '--%s--\n' "$boundary"
+} | sendmail -t -oi \
+  || die "sendmail failed — is a mail transfer agent configured?"
