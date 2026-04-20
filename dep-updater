@@ -1461,7 +1461,10 @@ npm_update_group() {
               .value |= with_entries(
                 (.key) as $k |
                 if $updates | has($k) then
-                  (.value | capture("^(?P<prefix>[^0-9]*)") | .prefix) as $prefix |
+                  # Find the semver range prefix (e.g. ^, ~, >=) by locating
+                  # the first ASCII digit (48="0" .. 57="9") in the value.
+                  (.value | explode | map(. >= 48 and . <= 57) | index(true) // 0) as $di |
+                  (.value[0:$di]) as $prefix |
                   .value = ($prefix + $updates[$k])
                 else . end
               )
@@ -1503,7 +1506,10 @@ npm_update_group() {
             .value |= with_entries(
               (.key) as $k |
               if $updates | has($k) then
-                (.value | capture("^(?P<prefix>[^0-9]*)") | .prefix) as $prefix |
+                # Find the semver range prefix (e.g. ^, ~, >=) by locating
+                # the first ASCII digit (48="0" .. 57="9") in the value.
+                (.value | explode | map(. >= 48 and . <= 57) | index(true) // 0) as $di |
+                (.value[0:$di]) as $prefix |
                 .value = ($prefix + $updates[$k])
               else . end
             )
@@ -1549,8 +1555,6 @@ npm_update_group() {
   log "[gate] Submitting PR for '${branch}'…"
   run_in_worktree gt submit --no-interactive --publish --no-stack
 
-  local submitted_head
-  submitted_head="$(git -C "$worktree_path" rev-parse "$branch")"
   # Stay on $branch — the next dep-update branch will stack on top of it.
 
   local pr_num
@@ -1572,18 +1576,6 @@ npm_update_group() {
   state_append "branches" "$branch"
   state_append_pr "$pr_num"
   add_summary_line "npm" "$group_key" "$first_old" "$first_new" "$branch" "$pr_num"
-
-  if [[ "$no_wait_ci" == '0' ]]; then
-    log "[gate] Checking merge conflict status for PR #${pr_num} before waiting for CI…"
-    wait_for_mergeable_quick "$pr_num"
-    log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
-    wait_for_ci "$branch" "$submitted_head" "$pr_num"
-    if [[ "$(gh_pr_merged_for_number "$pr_num")" != 'true' ]]; then
-      log "[gate] CI passed. Final merge conflict check…"
-      wait_for_mergeable "$pr_num"
-      log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
-    fi
-  fi
 }
 
 write_npm_pr_body() {
@@ -2322,8 +2314,6 @@ py_update_one() {
   log "[gate] Submitting PR for '${branch}'…"
   run_in_worktree gt submit --no-interactive --publish --no-stack
 
-  local submitted_head
-  submitted_head="$(git -C "$worktree_path" rev-parse "$branch")"
   # Stay on $branch — the next dep-update branch will stack on top of it.
 
   local pr_num
@@ -2347,18 +2337,6 @@ py_update_one() {
   state_append "branches" "$branch"
   state_append_pr "$pr_num"
   add_summary_line "python/${tool}" "$pkg" "$old_ver" "$new_ver" "$branch" "$pr_num"
-
-  if [[ "$no_wait_ci" == '0' ]]; then
-    log "[gate] Checking merge conflict status for PR #${pr_num} before waiting for CI…"
-    wait_for_mergeable_quick "$pr_num"
-    log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
-    wait_for_ci "$branch" "$submitted_head" "$pr_num"
-    if [[ "$(gh_pr_merged_for_number "$pr_num")" != 'true' ]]; then
-      log "[gate] CI passed. Final merge conflict check…"
-      wait_for_mergeable "$pr_num"
-      log "[gate] PR #${pr_num} is mergeable. Proceeding to next update."
-    fi
-  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -2700,9 +2678,6 @@ batch_update_all() {
   log "[gate] Submitting batch PR for '${branch}'…"
   run_in_worktree gt submit --no-interactive --publish --no-stack
 
-  local submitted_head
-  submitted_head="$(git -C "$worktree_path" rev-parse "$branch")"
-
   local pr_num
   pr_num="$(gh_pr_number_for_new_branch "$branch")"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for batch branch '${branch}'"
@@ -2800,18 +2775,6 @@ batch_update_all() {
   if [[ -z "$actual_npm_lines" && -z "$npm_audit_lines_arg" && \
         -z "${actual_py_lines:-${py_lines_arg:-}}" && -z "$py_audit_lines_arg" ]]; then
     add_summary_line "batch" "$branch" "-" "-" "$branch" "$pr_num"
-  fi
-
-  if [[ "$no_wait_ci" == '0' ]]; then
-    log "[gate] Checking merge conflict status for PR #${pr_num} before waiting for CI…"
-    wait_for_mergeable_quick "$pr_num"
-    log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
-    wait_for_ci "$branch" "$submitted_head" "$pr_num"
-    if [[ "$(gh_pr_merged_for_number "$pr_num")" != 'true' ]]; then
-      log "[gate] CI passed. Final merge conflict check…"
-      wait_for_mergeable "$pr_num"
-      log "[gate] PR #${pr_num} is mergeable."
-    fi
   fi
 }
 
@@ -3164,6 +3127,42 @@ require_resume_ci_gate() {
       fi
       ;;
   esac
+}
+
+# Gates on CI and mergeability for every branch that has been created so far
+# in this run.  Called once after all PRs are created so that no individual
+# PR is visible as "CI-passed + labelled" before the full stack is assembled.
+# Security PRs gate themselves before regular PRs are stacked; this function
+# handles the regular (and batch) PRs, and is a fast no-op for branches whose
+# CI already passed (wait_for_ci returns success on the first poll).
+gate_all_created_prs() {
+  local branches_csv branch pr_num head_sha already_merged
+  local -a gate_list
+
+  [[ "$no_wait_ci" == '0' ]] || return 0
+
+  branches_csv="$(state_get "branches")"
+  [[ -z "$branches_csv" ]] && return 0
+
+  IFS=',' read -ra gate_list <<< "$branches_csv"
+  for branch in "${gate_list[@]}"; do
+    [[ -z "$branch" ]] && continue
+    pr_num="$(gh_pr_number_for_branch "$branch")"
+    [[ -z "$pr_num" ]] && continue
+    already_merged="$(gh_pr_merged_for_number "$pr_num" 2>/dev/null || true)"
+    [[ "$already_merged" == 'true' ]] && continue
+    head_sha="$(git -C "$worktree_path" rev-parse "$branch" 2>/dev/null || true)"
+    [[ -z "$head_sha" ]] && continue
+    log "[gate] Checking merge conflict status for PR #${pr_num} before waiting for CI…"
+    wait_for_mergeable_quick "$pr_num"
+    log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
+    wait_for_ci "$branch" "$head_sha" "$pr_num"
+    if [[ "$(gh_pr_merged_for_number "$pr_num")" != 'true' ]]; then
+      log "[gate] CI passed. Final merge conflict check…"
+      wait_for_mergeable "$pr_num"
+      log "[gate] PR #${pr_num} is mergeable."
+    fi
+  done
 }
 
 maybe_label_top_pr_for_merge() {
@@ -3896,6 +3895,7 @@ if [[ -z "$npm_lines" && -z "$py_lines" ]]; then
     existing_branches="$(state_get "branches")"
     existing_prs="$(state_get "prs")"
     require_resume_ci_gate "$existing_branches" "$existing_prs"
+    gate_all_created_prs
     maybe_label_top_pr_for_merge
 
     if [[ "$no_wait_merge" == '1' ]]; then
@@ -4007,6 +4007,7 @@ print_summary
 local all_prs_csv
 all_prs_csv="$(collect_tracked_prs_csv)"
 print_stack_urls "$all_prs_csv"
+gate_all_created_prs
 maybe_label_top_pr_for_merge
 
 if [[ "$no_wait_merge" == '1' ]]; then
