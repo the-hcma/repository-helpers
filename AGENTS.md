@@ -60,6 +60,29 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ---
 
+## Starting New Work
+
+Before creating any branch or writing any code, run the session initialization script from the repository root:
+
+```bash
+scripts/dev/start-development
+```
+
+This script:
+- Prunes stale worktrees and merged branches
+- Syncs Graphite (`gt sync`)
+- Creates a new worktree under `.worktrees/` (or resumes an existing one with `--resume`)
+
+Do **not** manually create worktrees or run `gt sync` separately — `start-development` is the single entry point for all new work.
+
+Use `--refresh` to pull the latest `main` and ensure the service is running without opening a new worktree:
+
+```bash
+scripts/dev/start-development --refresh
+```
+
+---
+
 ## Commits, Stacking & Pull Requests
 
 > See [GRAPHITE.md](./GRAPHITE.md) for the full Graphite workflow reference (branch naming, stack creation, navigation, submission, troubleshooting, and advanced rebasing).
