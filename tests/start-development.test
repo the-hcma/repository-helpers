@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Smoke tests for scripts/dev/start-development.
+#
+# start-development interacts with git remotes, gh, gt, and systemd — full
+# integration tests are not feasible in CI. These tests cover:
+#   1. --help exits 0 and prints expected content.
+#   2. Unknown argument exits non-zero with an informative message.
+#   3. Static analysis: no 'local -r' inside loop bodies.
+#   4. Static analysis: shebang is '#!/usr/bin/env bash'.
+#   5. Static analysis: 'set -euo pipefail' is present.
+#   6. Static analysis: script uses $() not backticks for command substitution.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+script="${script_dir}/../scripts/dev/start-development"
+readonly script
+
+pass=0
+fail=0
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+assert_exit_0() {
+  local -r label="$1"
+  local -r output="$2"
+  local -r exit_code="$3"
+  if [[ "$exit_code" -eq 0 ]]; then
+    printf '[PASS] %s: exits 0\n' "$label"
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] %s: expected exit 0, got %d\n' "$label" "$exit_code"
+    printf '       output:\n%s\n' "$output"
+    fail=$(( fail + 1 ))
+  fi
+}
+
+assert_exit_nonzero() {
+  local -r label="$1"
+  local -r output="$2"
+  local -r exit_code="$3"
+  if [[ "$exit_code" -ne 0 ]]; then
+    printf '[PASS] %s: exits non-zero (%d)\n' "$label" "$exit_code"
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] %s: expected non-zero exit, got 0\n' "$label"
+    printf '       output:\n%s\n' "$output"
+    fail=$(( fail + 1 ))
+  fi
+}
+
+assert_contains() {
+  local -r label="$1"
+  local -r output="$2"
+  local -r needle="$3"
+  if printf '%s' "$output" | grep -qF -- "$needle"; then
+    printf '[PASS] %s: output contains "%s"\n' "$label" "$needle"
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] %s: output does NOT contain "%s"\n' "$label" "$needle"
+    printf '       output:\n%s\n' "$output"
+    fail=$(( fail + 1 ))
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Test: --help
+# ---------------------------------------------------------------------------
+
+printf '\n=== --help ===\n'
+help_output=""
+help_exit=0
+help_output="$(bash "$script" --help 2>&1)" || help_exit=$?
+
+assert_exit_0   "--help" "$help_output" "$help_exit"
+assert_contains "--help" "$help_output" "Usage:"
+assert_contains "--help" "$help_output" "--refresh"
+assert_contains "--help" "$help_output" "--resume"
+
+# ---------------------------------------------------------------------------
+# Test: unknown argument
+# ---------------------------------------------------------------------------
+
+printf '\n=== unknown argument ===\n'
+unknown_output=""
+unknown_exit=0
+unknown_output="$(bash "$script" --not-a-real-argument 2>&1)" || unknown_exit=$?
+
+assert_exit_nonzero "unknown argument" "$unknown_output" "$unknown_exit"
+assert_contains     "unknown argument" "$unknown_output" "Unknown argument"
+
+# ---------------------------------------------------------------------------
+# Static: no 'local -r' inside loop bodies
+# ---------------------------------------------------------------------------
+
+printf '\n=== static: local -r in loops ===\n'
+local_r_in_loops="$(awk '
+  /^[[:space:]]*(while|for|until)[[:space:]]/ { depth++ }
+  /^[[:space:]]*done\b/ { if (depth > 0) depth-- }
+  /^}/ { depth=0 }
+  /[[:space:]]local[[:space:]]+-[a-zA-Z]*r/ && depth > 0 { print NR": "$0 }
+' "$script")"
+if [[ -n "$local_r_in_loops" ]]; then
+  printf '[FAIL] local-r-in-loops: local -r inside a loop body crashes on 2nd iteration:\n%s\n' \
+    "$local_r_in_loops"
+  fail=$(( fail + 1 ))
+else
+  printf '[PASS] local-r-in-loops: no local -r declarations inside loops\n'
+  pass=$(( pass + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+# Static: shebang and safety flags
+# ---------------------------------------------------------------------------
+
+printf '\n=== static: shebang and safety flags ===\n'
+
+if head -1 "$script" | grep -qF '#!/usr/bin/env bash'; then
+  printf '[PASS] shebang: uses #!/usr/bin/env bash\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] shebang: expected #!/usr/bin/env bash, got: %s\n' "$(head -1 "$script")"
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'set -euo pipefail' "$script"; then
+  printf '[PASS] safety-flags: set -euo pipefail is present\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] safety-flags: set -euo pipefail is missing\n'
+  fail=$(( fail + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+# Static: no backtick command substitution
+# ---------------------------------------------------------------------------
+
+printf '\n=== static: no backtick substitution ===\n'
+backtick_count="$(grep -c '`' "$script" || true)"
+if [[ "$backtick_count" -eq 0 ]]; then
+  printf '[PASS] no-backticks: command substitution uses dollar-paren form\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] no-backticks: found %d backtick(s) — use dollar-paren form instead\n' "$backtick_count"
+  fail=$(( fail + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+
+printf '\n=== results ===\n'
+printf 'Passed: %d  Failed: %d\n' "$pass" "$fail"
+if [[ "$fail" -gt 0 ]]; then
+  exit 1
+fi
