@@ -53,7 +53,7 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ## Repository
 
-- Remote: `https://github.com/the-hcma/dep-updater` (private).
+- Remote: `https://github.com/the-hcma/repository-helpers` (private).
 - Do not make the repository public without explicit approval.
 - Never commit secrets, credentials, or API keys — use environment variables.
 
