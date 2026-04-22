@@ -6,11 +6,12 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ## Language & Runtime
 
-- The project is a single **Bash** script (`dep-updater`) at the repository root.
-- Target **bash ≥ 5.x** (the script declares `#!/usr/bin/env bash` and uses `set -euo pipefail`).
+- Scripts live in `scripts/` (e.g. `scripts/dep-updater`, `scripts/setup-service`). Sub-directories are allowed (e.g. `scripts/dev/start-development`).
+- Tests live in `tests/` and mirror the script name (e.g. `tests/dep-updater.test`).
+- Target **bash ≥ 5.x** (every script declares `#!/usr/bin/env bash` and uses `set -euo pipefail`).
 - External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`, `rg` (ripgrep), plus the ecosystem tools being managed (`pnpm`, `pip`, `uv`, `poetry`) as optional callees.
 - No Node.js helpers, no Python scripting. Keep the implementation pure Bash.
-- The test harness (`dep-updater.test`) is also plain Bash — no test framework installs required.
+- Test harnesses are plain Bash — no test framework installs required.
 
 ---
 
@@ -40,8 +41,8 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ## Testing
 
-- The test file is `dep-updater.test` (no extension) at the repository root.
-- Run with: `bash dep-updater.test`
+- Test files live in `tests/` with no extension (e.g. `tests/dep-updater.test`).
+- Run with: `bash tests/<script-name>.test`
 - Tests are grouped into sections (`=== section name ===`). Each test prints `[PASS]` or `[FAIL]` and the suite exits non-zero if anything fails.
 - **Every new behaviour or bug fix must be accompanied by a test**, even if that test is a dry-run smoke test or a static-analysis assertion (`awk`/`grep` over the source).
 - Tests must be **deterministic**: no `sleep` for timing, no real network calls, no real git operations on remote state.
@@ -80,7 +81,7 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ## Shell Script Conventions
 
-- **No `.sh` extension.** The main script is `dep-updater` and the test harness is `dep-updater.test`. The shebang line declares the interpreter.
+- **No `.sh` extension.** Scripts live in `scripts/` and test harnesses in `tests/`. The shebang line declares the interpreter.
 - **`readonly`** must be used for every script-level variable that is assigned once and never modified. Declare and assign on separate lines to avoid SC2155:
   ```bash
   var="$(some_command)"
@@ -111,9 +112,9 @@ This file defines the non-negotiable standards for all contributors (human or AI
 ## CI Checks (all must pass)
 
 ```
-bash -n dep-updater dep-updater.test            # syntax check
-shellcheck -S info dep-updater dep-updater.test  # lint
-bash dep-updater.test                            # tests
+bash -n scripts/* tests/*            # syntax check (add new files here)
+shellcheck -S info scripts/* tests/* # lint (add new files here)
+bash tests/<script-name>.test        # run individual test suite
 ```
 
 No PR may be merged with a failing CI check. No exceptions.
