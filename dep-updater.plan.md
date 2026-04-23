@@ -1,8 +1,8 @@
-# `dep-update` Script — Implementation Plan
+# `dep-updater` Script — Implementation Plan
 
 ## Goal
 
-A single, portable Bash script (`scripts/dep-update`) that:
+A single, portable Bash script (`scripts/dep-updater`) that:
 
 1. **Discovers** outdated dependencies for npm/pnpm and/or Python projects
 2. **Reports** them in dry-run mode (no side effects)
@@ -16,9 +16,9 @@ A single, portable Bash script (`scripts/dep-update`) that:
 ## CLI Interface
 
 ```
-scripts/dep-update [OPTIONS]
-scripts/dep-update --cleanup [--dir <path>]
-scripts/dep-update --rebase [--dir <path>]
+scripts/dep-updater [OPTIONS]
+scripts/dep-updater --cleanup [--dir <path>]
+scripts/dep-updater --rebase [--dir <path>]
 
 Modes:
   (no flags)          Update: create/reuse worktree, stack PRs, wait for merge, cleanup
@@ -161,25 +161,25 @@ check_ecosystem_prereqs() {
 
 ```bash
 # Adjacent sibling — avoids build-tool interference (node_modules, dist, etc.)
-# e.g. /home/user/project/../project-dep-update-20260413T141800
-worktree_name="${repo_name}-dep-update-$(date --utc +%Y%m%dT%H%M%S)-$$"
+# e.g. /home/user/project/../project-dep-updater-20260413T141800
+worktree_name="${repo_name}-dep-updater-$(date --utc +%Y%m%dT%H%M%S)-$$"
 worktree_path="$(dirname "$project_root")/${worktree_name}"
 # If path exists, append numeric suffix (-1, -2, ...) until unique
 git -C "$project_root" worktree add "$worktree_path" main
 ```
 
 All subsequent `git`, `gt`, `pnpm`, `pip`/`uv`/`poetry` commands run **within `$worktree_path`**.
-On rerun, if `.dep-update-state` points to an existing worktree, that worktree is reused instead of creating another one.
+On rerun, if `.dep-updater-state` points to an existing worktree, that worktree is reused instead of creating another one.
 
 ### State File
 
 Written to the original project root after worktree creation. Used by `--cleanup`.
 
-**Path:** `<project_root>/.dep-update-state`
+**Path:** `<project_root>/.dep-updater-state`
 
 **Format** (plain key=value — no JSON, no jq):
 ```
-worktree=/abs/path/to/project-dep-update-20260413T141800
+worktree=/abs/path/to/project-dep-updater-20260413T141800
 base_branch=main
 created_at=2026-04-13T14:18:00Z
 branches=dep-updates/npm-commander,dep-updates/npm-express,dep-updates/py-requests
@@ -188,13 +188,13 @@ prs=45,46,47
 
 Read with `rg "^key=" | cut -d= -f2-`; updated with `sed -i`.
 
-> `.dep-update-state` is appended to `.gitignore` automatically if not already present.
+> `.dep-updater-state` is appended to `.gitignore` automatically if not already present.
 
 ### Cleanup
 
-Runs automatically at end of update mode, or on demand via `dep-update --cleanup`:
+Runs automatically at end of update mode, or on demand via `dep-updater --cleanup`:
 
 ```
-→ Read .dep-update-state
+→ Read .dep-updater-state
 → For each PR number:
   gh api repos/<owner>/<repo>/pulls/<N> --jq '.state, .merged_at'
