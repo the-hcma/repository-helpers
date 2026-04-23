@@ -987,6 +987,20 @@ create_worktree() {
     # `git branch -f` because `main` is typically checked out in the primary
     # clone and `git branch -f` refuses to move a checked-out branch.
     git -C "$dir" update-ref refs/heads/main "$main_sha"
+    # Also update the working tree when main is checked out and clean.
+    # Without this, update-ref fast-forwards the branch pointer but leaves the
+    # working tree at the old commit, making it appear dirty relative to HEAD.
+    local checked_out_branch
+    checked_out_branch="$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || true)"
+    if [[ "$checked_out_branch" == 'main' ]] \
+        && git -C "$dir" diff --quiet 2>/dev/null \
+        && git -C "$dir" diff --cached --quiet 2>/dev/null; then
+      if git -C "$dir" reset --hard "$main_sha" >/dev/null 2>&1; then
+        log "[worktree] Fast-forwarded working tree at ${dir} to origin/main"
+      else
+        log "[worktree] Warning: could not fast-forward working tree at ${dir}"
+      fi
+    fi
   fi
   wt_base_branch="dep-updater-wt-${timestamp}-$$"
   git -C "$dir" worktree add -b "$wt_base_branch" "$worktree_path" "$main_sha" >&2
@@ -1547,13 +1561,16 @@ npm_update_group() {
   pr_num="$(gh_pr_number_for_new_branch "$branch")"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
 
-  write_npm_pr_body "$group_key" "$safe_key" "$entries" "$npm_audit_lines"
+  local npm_body_file
+  npm_body_file="$(mktemp)"
+  write_npm_pr_body "$group_key" "$safe_key" "$entries" "$npm_audit_lines" "$npm_body_file"
   # gh pr edit exits 1 due to a non-actionable GitHub GraphQL deprecation warning;
   # the PR title and body are cosmetic — the PR itself was already created above.
   gh pr edit "$pr_num" \
     --title "$commit_msg" \
-    --body-file "/tmp/dep-update-pr-${safe_key}.md" \
+    --body-file "$npm_body_file" \
     --add-label "dep-updater" || true
+  rm -f "$npm_body_file"
   # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
     gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
@@ -1569,7 +1586,7 @@ write_npm_pr_body() {
   local -r safe_key="$2"
   local -r entries="$3"
   local -r npm_audit_lines="${4:-}"  # optional: full audit lines to cross-reference CVEs
-  local -r body_file="/tmp/dep-updater-pr-${safe_key}.md"
+  local -r body_file="$5"           # caller-provided path (use mktemp)
 
   {
     printf '%s\n\n' '## Stack Context'
@@ -1630,7 +1647,10 @@ py_audit() {
   set +e
   case "$tool" in
     uv)
-      raw="$(cd "$audit_dir" && uv run --with pip-audit pip-audit --format=json 2>/dev/null)"
+      # --frozen prevents uv from syncing the project environment (which can
+      # write uv.lock) before running pip-audit.  The audit is read-only: we
+      # only need to inspect already-installed packages, not update them.
+      raw="$(cd "$audit_dir" && uv run --frozen --with pip-audit pip-audit --format=json 2>/dev/null)"
       exit_code=$?
       ;;
     *)
@@ -1741,7 +1761,8 @@ npm_security_update() {
   [[ -z "$audit_lines" ]] && return 0
 
   local -r branch="dep-updates/npm-security"
-  local -r body_file="/tmp/dep-update-pr-npm-security.md"
+  local body_file
+  body_file="$(mktemp)"
 
   local pkg_list=""
   while IFS=' ' read -r pkg _current _fix _cves; do
@@ -1838,6 +1859,7 @@ npm_security_update() {
     --body-file "$body_file" \
     --add-label "dep-updater" \
     --add-label "security" || true
+  rm -f "$body_file"
   # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
     gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
@@ -1867,7 +1889,8 @@ py_security_update() {
   [[ -z "$audit_lines" ]] && return 0
 
   local -r branch="dep-updates/py-security"
-  local -r body_file="/tmp/dep-update-pr-py-security.md"
+  local body_file
+  body_file="$(mktemp)"
 
   if branch_exists_in_worktree "$branch"; then
     log "Skipping existing Python security branch: ${branch}"
@@ -1956,6 +1979,7 @@ py_security_update() {
     --body-file "$body_file" \
     --add-label "dep-updater" \
     --add-label "security" || true
+  rm -f "$body_file"
   # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
     gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
@@ -2306,15 +2330,19 @@ py_update_one() {
   pr_num="$(gh_pr_number_for_new_branch "$branch")"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
 
+  local py_body_file
+  py_body_file="$(mktemp)"
   write_pr_body "$pkg" "$old_ver" "$new_ver" "python/${tool}" "$files_changed" \
     "$(printf '%s\n' "$py_audit_lines" \
-       | grep -i "^${pkg} " || true)"
+       | grep -i "^${pkg} " || true)" \
+    "$py_body_file"
   # gh pr edit exits 1 due to a non-actionable GitHub GraphQL deprecation warning;
   # the PR title and body are cosmetic — the PR itself was already created above.
   gh pr edit "$pr_num" \
     --title "$commit_msg" \
-    --body-file "/tmp/dep-update-pr-${safe_name}.md" \
+    --body-file "$py_body_file" \
     --add-label "dep-updater" || true
+  rm -f "$py_body_file"
   # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
     gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
@@ -2669,7 +2697,8 @@ batch_update_all() {
   [[ -z "$pr_num" ]] && die "Could not determine PR number for batch branch '${branch}'"
 
   # Build PR body
-  local body_file="/tmp/dep-updater-pr-batch.md"
+  local body_file
+  body_file="$(mktemp)"
   {
     if [[ "$security_only" == '1' ]]; then
       printf '## Security: CVE fixes\n\n'
@@ -2735,6 +2764,7 @@ batch_update_all() {
       --body-file "$body_file" \
       --add-label "dep-updater" || true
   fi
+  rm -f "$body_file"
   # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
     gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
@@ -3218,9 +3248,7 @@ write_pr_body() {
   local -r eco="$4"
   local -r files="$5"
   local -r cve_lines="${6:-}"  # optional: "pkg current fix cve1,cve2" lines for this package
-  local safe_name
-  safe_name="$(sanitize_branch_name "$pkg")"
-  local -r body_file="/tmp/dep-update-pr-${safe_name}.md"
+  local -r body_file="$7"       # caller-provided path (use mktemp)
 
   # Write to a file and use --body-file to avoid heredoc escaping issues
   {
