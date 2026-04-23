@@ -190,6 +190,79 @@ Read with `rg "^key=" | cut -d= -f2-`; updated with `sed -i`.
 
 > `.dep-updater-state` is appended to `.gitignore` automatically if not already present.
 
+---
+
+## Known Pitfalls
+
+Bugs that were found in production and fixed. Recorded here so the same mistakes are not reintroduced.
+
+### 1. `git update-ref` leaves the working tree stale (PR #18)
+
+**Symptom:** After a dep-updater run, `$dir` (the source repo) has uncommitted changes to
+`pyproject.toml`, `uv.lock`, `package.json`, `pnpm-lock.yaml`, etc. — even though dep-updater
+ran all its writes inside a separate worktree at `$worktree_path`.
+
+**Root cause:** `create_worktree` calls:
+```bash
+git -C "$dir" update-ref refs/heads/main "$main_sha"
+```
+to fast-forward the local `main` branch so `gt submit` does not abort with "trunk branch is
+out of date". `update-ref` moves the branch pointer but does **not** update the working tree.
+If `origin/main` had new merged commits since the last `git pull`, the working tree now differs
+from `HEAD`, and every file changed by those commits shows up as "modified".
+
+**Fix:** After `update-ref`, if `main` is the currently checked-out branch and the working tree
+is clean, run `git -C "$dir" reset --hard "$main_sha"` to also advance the working tree.
+Skip the reset if a different branch is checked out or if there are uncommitted changes.
+
+**Test:** `=== static: create_worktree fast-forwards working tree after update-ref ===`
+
+---
+
+### 2. `py_audit` rewrites `uv.lock` in `$dir` (PR #18)
+
+**Symptom:** `uv.lock` in the source repo is modified after a dep-updater run.
+
+**Root cause:** `py_audit` called `uv run --with pip-audit pip-audit --format=json` without
+`--frozen`. In update mode, `py_audit` runs against `$dir`. `uv run` syncs the project
+environment before running (resolving and rewriting `uv.lock`) even though the goal is
+just to read vulnerability data.
+
+**Fix:** Pass `--frozen` → `uv run --frozen --with pip-audit ...`. With `--frozen`, uv uses
+the existing lockfile as-is and skips the sync step. If `uv.lock` is genuinely stale, the
+command fails silently (py_audit has `set +e`) and returns no audit results — an acceptable
+tradeoff since dep-updater must never touch source-repo tracked files.
+
+**Test:** `=== static: py_audit runs uv with --frozen ===`
+
+---
+
+### 3. PR body-file leakage and name mismatch (PR #18)
+
+**Symptom:** `/tmp/dep-updat*-pr-*.md` files accumulate and are never cleaned up.
+`gh pr edit` in `npm_update_group` silently uses the wrong body file (file not found).
+
+**Root cause:** Five call sites hardcoded `/tmp/dep-updat(e|er)-pr-${key}.md` paths that
+were never removed. `write_npm_pr_body` wrote to `dep-updater-pr-${safe_key}.md` but
+`npm_update_group` passed `dep-update-pr-${safe_key}.md` (missing trailing `r`) to `gh pr edit`.
+
+**Fix:** All five sites replaced with `mktemp` + `rm -f` after use. `write_npm_pr_body` and
+`write_pr_body` accept the body file path as a parameter (5th and 7th arg respectively)
+rather than deriving it internally.
+
+**Test:** `=== static: no hardcoded /tmp/ PR body-file paths ===`
+
+---
+
+### 4. `npm install` can write `package-lock.json` to `$dir` (open)
+
+**Location:** `npm_outdated()` — when `node_modules` is absent for a bare-npm project:
+```bash
+npm install --prefix "$dir" --prefer-offline
+```
+This is not frozen and can write or update `package-lock.json` in `$dir`. Only triggered
+for bare-npm projects (not pnpm/yarn). Not yet fixed.
+
 ### Cleanup
 
 Runs automatically at end of update mode, or on demand via `dep-updater --cleanup`:
