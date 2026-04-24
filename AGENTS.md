@@ -87,9 +87,20 @@ scripts/dev/start-development --refresh
 
 - **Service name** is derived from the git remote URL (not the directory name), so it is stable across all worktrees.
 - **`on-deploy`** must use `BASH_SOURCE[0]` to locate itself and must `cd` into its own directory's parent — never hardcode absolute paths or assume a fixed working directory.
-- **SQLite database**: services that use SQLite in development must point feature worktrees at the primary worktree's database. In `on-deploy`, detect whether `repo_dir` differs from the primary worktree and, if so, write `DATABASE_URL=sqlite:///<primary_dir>/db.sqlite3` into the worktree's `.env`. This ensures the feature branch server shares the same live data rather than starting with an empty database. The block is a no-op when called from the primary worktree. Example pattern:
+- **`.env` and SQLite database for feature worktrees**: services that use SQLite in development must handle two concerns when `on-deploy` runs from a feature worktree:
+  1. **Copy the primary `.env`** so that all accumulated settings (extra `ALLOWED_HOSTS` entries, `SECRET_KEY`, etc.) carry over without needing to be re-entered.
+  2. **Set `DATABASE_URL`** pointing at the primary worktree's `db.sqlite3` so all worktrees share the same live data.
+  
+  Detect worktree status before any `.env` work, copy if needed, then handle `DATABASE_URL`. Example pattern:
   ```bash
   primary_dir="$(git -C "$repo_dir" worktree list --porcelain | awk 'NR==1{print $2}')"
+  env_file="$repo_dir/.env"
+  primary_env="$primary_dir/.env"
+  if [[ "$repo_dir" != "$primary_dir" ]] && [[ -f "$primary_env" ]]; then
+      cp "$primary_env" "$env_file"
+      echo "  Copied .env from primary worktree (settings carry over)."
+  fi
+  # ... normal .env setup (will see existing settings and skip updates) ...
   if [[ "$repo_dir" != "$primary_dir" ]]; then
       db_url="sqlite:///${primary_dir}/db.sqlite3"
       if ! grep -q '^DATABASE_URL=' "$env_file"; then
@@ -97,6 +108,7 @@ scripts/dev/start-development --refresh
       elif ! grep -qF "DATABASE_URL=${db_url}" "$env_file"; then
           sed -i "s|^DATABASE_URL=.*|DATABASE_URL=${db_url}|" "$env_file"
       fi
+      echo "  Using database from main worktree: ${primary_dir}/db.sqlite3"
   fi
   ```
 
