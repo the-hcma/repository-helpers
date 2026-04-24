@@ -81,6 +81,25 @@ Use `--refresh` to pull the latest `main` and ensure the service is running with
 scripts/dev/start-development --refresh
 ```
 
+## Worktree-aware Scripts
+
+`setup-service` and `scripts/on-deploy` are **worktree-aware**: all paths (service template at `etc/systemd/`, `@@REPO_DIR@@` substitution in the generated unit file, and the `on-deploy` hook itself) are resolved from whichever worktree the script is invoked from. Calling `setup-service` from a feature worktree therefore deploys that worktree's code — this is intentional and is the primary mechanism for testing feature branches locally.
+
+- **Service name** is derived from the git remote URL (not the directory name), so it is stable across all worktrees.
+- **`on-deploy`** must use `BASH_SOURCE[0]` to locate itself and must `cd` into its own directory's parent — never hardcode absolute paths or assume a fixed working directory.
+- **SQLite database**: services that use SQLite in development must point feature worktrees at the primary worktree's database. In `on-deploy`, detect whether `repo_dir` differs from the primary worktree and, if so, write `DATABASE_URL=sqlite:///<primary_dir>/db.sqlite3` into the worktree's `.env`. This ensures the feature branch server shares the same live data rather than starting with an empty database. The block is a no-op when called from the primary worktree. Example pattern:
+  ```bash
+  primary_dir="$(git -C "$repo_dir" worktree list --porcelain | awk 'NR==1{print $2}')"
+  if [[ "$repo_dir" != "$primary_dir" ]]; then
+      db_url="sqlite:///${primary_dir}/db.sqlite3"
+      if ! grep -q '^DATABASE_URL=' "$env_file"; then
+          echo "DATABASE_URL=${db_url}" >> "$env_file"
+      elif ! grep -qF "DATABASE_URL=${db_url}" "$env_file"; then
+          sed -i "s|^DATABASE_URL=.*|DATABASE_URL=${db_url}|" "$env_file"
+      fi
+  fi
+  ```
+
 ---
 
 ## Commits, Stacking & Pull Requests
