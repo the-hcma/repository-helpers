@@ -21,6 +21,28 @@ readonly service_name
 service_unit="${HOME}/.config/systemd/user/${service_name}.service"
 readonly service_unit
 
+# gh_pr_state <branch>
+# Queries GitHub for the PR state of a branch, retrying up to 3 times on transient
+# failures. Prints the state (e.g. OPEN, MERGED, CLOSED, NOT_FOUND) to stdout.
+# Warnings for retry attempts are written to stderr so callers can capture stdout cleanly.
+gh_pr_state() {
+  local -r branch="$1"
+  local attempt
+  local result
+  for attempt in 1 2 3; do
+    if result=$(timeout 15 gh --repo "$gh_repo" pr list --head "$branch" --state all \
+        --json state --jq 'if length > 0 then .[0].state else "NOT_FOUND" end' 2>/dev/null); then
+      echo "$result"
+      return 0
+    fi
+    if [[ "$attempt" -lt 3 ]]; then
+      echo "   [~] gh API call failed (attempt $attempt/3); retrying..." >&2
+    fi
+  done
+  echo "   [~] gh API call failed after 3 attempts; treating as NOT_FOUND." >&2
+  echo "NOT_FOUND"
+}
+
 # Parse arguments
 resume=false
 refresh=false
@@ -71,9 +93,9 @@ while IFS= read -r line; do
         fi
 
         echo " - Checking worktree: $current_branch ($current_path)..."
+        echo "   Querying GitHub: gh pr list --head '$current_branch' --state all"
 
-        pr_state=$(timeout 15 gh --repo "$gh_repo" pr list --head "$current_branch" --state all \
-            --json state --jq 'if length > 0 then .[0].state else "NOT_FOUND" end' 2>/dev/null || echo "NOT_FOUND")
+        pr_state=$(gh_pr_state "$current_branch")
 
         if [[ "$pr_state" == "MERGED" || "$pr_state" == "CLOSED" ]]; then
             if [[ "$current_path" == "$this_worktree" ]]; then
@@ -96,7 +118,7 @@ while IFS= read -r line; do
 done <<< "$wt_info"
 
 # 3. Synchronize Graphite and prune merged branches
-echo "Synchronizing Graphite (gt sync -f -d)..."
+echo "Synchronizing Graphite (gt sync --force --quiet)..."
 
 # Only stash *tracked* changes (ignore untracked files like .vscode/ or .worktrees/
 # which cannot be stashed without --include-untracked and would cause stash pop to fail).
@@ -108,7 +130,8 @@ if [[ -n "$has_changes" ]]; then
     stashed=true
 fi
 
-(cd "$main_repo" && gt sync -q -f -d)
+(cd "$main_repo" && gt sync --quiet --force)
+echo "Graphite sync complete."
 
 if [[ "$stashed" == "true" ]]; then
     echo "Restoring local changes in main repo..."
@@ -135,8 +158,9 @@ while IFS= read -r branch; do
     done
     [[ "$in_worktree" == "true" ]] && continue
 
-    orphan_state=$(timeout 15 gh --repo "$gh_repo" pr list --head "$branch" --state all \
-        --json state --jq 'if length > 0 then .[0].state else "NOT_FOUND" end' 2>/dev/null || echo "NOT_FOUND")
+    echo " - Checking branch: $branch..."
+    echo "   Querying GitHub: gh pr list --head '$branch' --state all"
+    orphan_state=$(gh_pr_state "$branch")
 
     if [[ "$orphan_state" == "MERGED" || "$orphan_state" == "CLOSED" ]]; then
         echo "   [!] Deleting $branch (PR: $orphan_state)..."
