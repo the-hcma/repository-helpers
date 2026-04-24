@@ -121,6 +121,7 @@ scripts/dev/start-development --refresh
   ```
 - **Never declare `local -r` or plain `local` inside a loop body.** Hoist all `local` declarations to the top of the function. `local -r` inside a loop will crash on the second iteration with "readonly variable" because `local -r` both declares and sets, and re-entering the loop tries to re-declare an already-readonly name.
 - Do not use `A && B || C` as an if-then-else substitute (SC2015). Use a proper `if/then/else` block.
+- **Prefer long-form flags** for all command invocations (e.g. `--follow=name` not `-f`, `--all` not `-a`). Short flags are allowed only when no long form exists.
 
 ---
 
