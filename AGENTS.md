@@ -62,9 +62,10 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ## dep-updater Behavioral Invariants
 
-- **Never introduce `==` pins.** dep-updater always writes `>=` floor constraints when bumping a dependency. It must never lock a package to an exact version.
+- **Never introduce `==` pins (Python).** dep-updater always writes `>=` floor constraints when bumping a Python dependency. It must never lock a package to an exact version.
 - **Respect existing pins for pip / pipenv / poetry.** For these ecosystems, `==` signals a deliberate user decision to lock a specific version. dep-updater skips those packages entirely (`py_is_pinned`).
 - **uv `==` pins are not treated as intentional freezes.** dep-updater updates them and promotes the constraint to `>=` on bump. The transitive constraint check (`uv pip install --dry-run`) still gates upgrades that would violate real transitive constraints.
+- **npm exact pins are updated in place, not skipped.** An exact version in `package.json` (e.g. `"vitest": "4.1.4"`) is bumped to the new version while preserving the exact style (no promotion to `^`). This matches Dependabot's behaviour. Local/git references (`workspace:`, `file:`, `link:`, `git`) are still skipped.
 
 ---
 
