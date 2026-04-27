@@ -2024,14 +2024,18 @@ py_constraint_op() {
     | head -1 || true
 }
 
-# An exactly-pinned package is intentionally locked to a specific version and
-# should not be automatically updated.
-#
-# Checked formats (per tool):
+# Invariant: dep-updater never introduces == pins; it only bumps >= floors.
+# However, it respects existing pins for ecosystems where == signals an
+# intentional user decision to lock a specific version:
 #   pip/pip3/pipenv : requirements.txt — line matching `pkg==version`
-#   uv              : pyproject.toml project.dependencies — `"pkg==version"`
-#   poetry          : pyproject.toml tool.poetry.dependencies —
+#   poetry          : pyproject.toml [tool.poetry.dependencies] —
 #                     `pkg = "version"` (bare = exact) or `pkg = "==version"`
+#
+# uv is intentionally excluded: == in pyproject.toml project.dependencies does
+# not represent a deliberate freeze. dep-updater updates those packages and
+# promotes the constraint to >= on bump (see py_update_one). The transitive
+# constraint check (uv pip install --dry-run) still gates upgrades that would
+# violate real transitive constraints.
 py_is_pinned() {
   local -r pkg="$1"
   local -r tool="$2"
@@ -2055,14 +2059,6 @@ py_is_pinned() {
           return 0
         fi
       done
-      ;;
-    uv)
-      # project.dependencies in pyproject.toml: '"pkg==version"'
-      if [[ -f "$dir/pyproject.toml" ]]; then
-        if rg -qiP "\"${name_pat}[^\"]*==[^\"]*\"" "$dir/pyproject.toml" 2>/dev/null; then
-          return 0
-        fi
-      fi
       ;;
     poetry)
       # [tool.poetry.dependencies]: `pkg = "2.0.0"` (bare version = exact in poetry)
@@ -2247,13 +2243,15 @@ py_update_one() {
     uv)
       local uv_out uv_exit uv_constraint_op uv_spec sed_pkg
       uv_constraint_op="$(py_constraint_op "$pkg" "${dir}/pyproject.toml")"
-      if [[ "$uv_constraint_op" == ">=" ]]; then
+      # Invariant: always write >= (never ==) — dep-updater must not re-pin.
+      if [[ "$uv_constraint_op" == ">=" || "$uv_constraint_op" == "==" ]]; then
         # uv add pkg>=new_ver is a no-op when the lock already satisfies the
         # existing >= constraint (uv sees 8.0.1 already satisfies >=7.0.0 and
         # leaves pyproject.toml unchanged). Patch the floor with sed instead.
+        # For == constraints, convert to >= so dep-updater never introduces pins.
         sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
         sed -i -E \
-          "s/(\"${sed_pkg}([^\"=<>!~,]|\\[[^]]+\\])*[[:space:]]*)>=[[:space:]]*[0-9][0-9a-zA-Z.]*/\\1>=${new_ver}/" \
+          "s/(\"${sed_pkg}([^\"=<>!~,]|\\[[^]]+\\])*[[:space:]]*)(?:>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*/\\1>=${new_ver}/" \
           "${worktree_path}/pyproject.toml"
         uv_out="$(uv --directory "$worktree_path" lock 2>&1)" && uv_exit=0 || uv_exit=$?
       else
@@ -2261,9 +2259,9 @@ py_update_one() {
         uv_out="$(uv --directory "$worktree_path" add "$uv_spec" 2>&1)" && uv_exit=0 || uv_exit=$?
       fi
       if (( uv_exit != 0 )); then
-        # Revert pyproject.toml: sed already modified it for >= constraints but
-        # the lock failed, so the change must not accumulate into a future commit.
-        if [[ "$uv_constraint_op" == ">=" ]]; then
+        # Revert pyproject.toml: sed already modified it for >= or == constraints
+        # but the lock failed, so the change must not accumulate into a future commit.
+        if [[ "$uv_constraint_op" == ">=" || "$uv_constraint_op" == "==" ]]; then
           git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
         fi
         log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
