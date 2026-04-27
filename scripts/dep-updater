@@ -60,6 +60,7 @@ ci_workflow_names=""
 has_npm=0
 npm_tool=""
 py_tool=""
+has_gha=0
 
 # Set after create_worktree / init_state_file
 worktree_path=""
@@ -396,7 +397,7 @@ Modes:
 
 Options:
   --dir <path>      Project root (default: current directory)
-  --ecosystem <e>   Force: npm | python | auto  (default: auto)
+  --ecosystem <e>   Force: npm | python | gha | auto  (default: auto)
   --semver-only     npm: respect existing semver range (omit --latest)
   --no-wait-ci      Skip CI polling between PRs
   --no-wait-merge   Exit after stack is submitted; print cleanup command
@@ -408,11 +409,12 @@ Options:
   -h, --help        Print this help and exit
 
 Supported ecosystems:
-  npm      package.json present  → pnpm outdated + pnpm update
-  uv       uv.lock present       → uv pip list --outdated + uv add
-  poetry   poetry.lock present   → poetry show --outdated + poetry add
-  pipenv   Pipfile.lock present  → pipenv run pip list + pipenv install
-  pip      requirements.txt or pyproject.toml → pip list + pip freeze
+  npm           package.json present  → pnpm outdated + pnpm update
+  uv            uv.lock present       → uv pip list --outdated + uv add
+  poetry        poetry.lock present   → poetry show --outdated + poetry add
+  pipenv        Pipfile.lock present  → pipenv run pip list + pipenv install
+  pip           requirements.txt or pyproject.toml → pip list + pip freeze
+  gha             .github/workflows/*.yml present  → gh api releases/latest + sed patch
 USAGE
 }
 
@@ -487,8 +489,8 @@ parse_args() {
   done
 
   case "$ecosystem" in
-    npm|python|auto) : ;;
-    *) die "Invalid --ecosystem: '$ecosystem'. Valid values: npm | python | auto" ;;
+    npm|python|gha|auto) : ;;
+    *) die "Invalid --ecosystem: '$ecosystem'. Valid values: npm | python | gha | auto" ;;
   esac
 
   local resolved_dir
@@ -668,7 +670,14 @@ detect_ecosystem() {
     fi
   fi
 
-  if [[ "$has_npm" == '0' && -z "$py_tool" ]]; then
+  if [[ "$ecosystem" == 'gha' || "$ecosystem" == 'auto' ]]; then
+    if grep -rql --include='*.yml' --include='*.yaml' 'uses:' \
+        "${dir}/.github/workflows/" 2>/dev/null; then
+      has_gha=1
+    fi
+  fi
+
+  if [[ "$has_npm" == '0' && -z "$py_tool" && "$has_gha" == '0' ]]; then
     if [[ "$dry_run" == '1' ]]; then
       log "No supported ecosystem detected in: $dir"
     else
@@ -676,7 +685,7 @@ detect_ecosystem() {
     fi
   fi
 
-  readonly has_npm npm_tool py_tool
+  readonly has_npm npm_tool py_tool has_gha
 
   local eco_msg=""
   if [[ "$has_npm" == '1' ]]; then
@@ -687,6 +696,13 @@ detect_ecosystem() {
       eco_msg="${eco_msg}, python/${py_tool}"
     else
       eco_msg="python/${py_tool}"
+    fi
+  fi
+  if [[ "$has_gha" == '1' ]]; then
+    if [[ -n "$eco_msg" ]]; then
+      eco_msg="${eco_msg}, github-actions"
+    else
+      eco_msg="github-actions"
     fi
   fi
   log "Detected: ${eco_msg}"
@@ -2356,23 +2372,200 @@ py_update_one() {
 }
 
 # ---------------------------------------------------------------------------
+# GitHub Actions ecosystem
+# ---------------------------------------------------------------------------
+
+# Query the GitHub API for the latest release of a GitHub Actions action and
+# compare to the currently pinned ref.  Returns newline-separated lines of:
+#   owner/repo  current_ref  new_ref
+# Only emits a line when the latest release is newer than the pinned ref.
+#
+# Pin-style semantics:
+#   Major-only  (@v6)         — updated only when the latest major increments
+#   Full semver (@v1.7.12 or @0.36.0) — updated on any newer version
+#   Commit SHA  (@abc123...)  — skipped (not managed here)
+gha_outdated() {
+  local -a seen_actions=()
+  local line action ref
+
+  while IFS= read -r line; do
+    # Extract the value after `uses:`, strip surrounding quotes/whitespace.
+    action="$(printf '%s' "$line" \
+      | sed -E 's/^[[:space:]]*uses:[[:space:]]*//' \
+      | tr -d '"'"'")"
+    # Skip local actions (relative paths like ./path/to/action).
+    [[ "$action" == ./* ]] && continue
+    # Skip entries without an @ ref.
+    [[ "$action" != *@* ]] && continue
+    ref="${action##*@}"
+    action="${action%%@*}"
+    # Skip commit-SHA pins (exactly 40 hex chars).
+    if [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
+      continue
+    fi
+    # Deduplicate: process each unique action only once.
+    local already_seen=0
+    local seen_entry
+    for seen_entry in "${seen_actions[@]}"; do
+      if [[ "$seen_entry" == "$action" ]]; then
+        already_seen=1
+        break
+      fi
+    done
+    [[ "$already_seen" == '1' ]] && continue
+    seen_actions+=("$action")
+
+    # Query the latest published release tag.
+    local latest_tag
+    latest_tag="$(gh api "repos/${action}/releases/latest" \
+      --jq '.tag_name' 2>/dev/null || true)"
+    if [[ -z "$latest_tag" ]]; then
+      log "[github-actions] No release found for ${action} — skipping."
+      continue
+    fi
+
+    # Determine the new ref based on the current pin style.
+    local new_ref=""
+    if [[ "$ref" =~ ^v[0-9]+$ ]]; then
+      # Major-only pin: bump only when the latest major is greater.
+      local current_major latest_major
+      current_major="${ref#v}"
+      latest_major="$(printf '%s' "$latest_tag" \
+        | sed -E 's/^v?([0-9]+).*/\1/')"
+      if (( latest_major > current_major )); then
+        new_ref="v${latest_major}"
+      fi
+    else
+      # Full semver pin: bump when any newer version is available.
+      local current_ver latest_ver
+      current_ver="${ref#v}"
+      latest_ver="${latest_tag#v}"
+      if [[ "$current_ver" != "$latest_ver" ]]; then
+        # Only advance — never downgrade.
+        local sort_winner
+        sort_winner="$(printf '%s\n%s\n' "$current_ver" "$latest_ver" \
+          | sort -V | tail -1)"
+        if [[ "$sort_winner" == "$latest_ver" ]]; then
+          # Preserve leading 'v' from the current pin if present.
+          if [[ "$ref" == v* ]]; then
+            new_ref="v${latest_ver}"
+          else
+            new_ref="$latest_ver"
+          fi
+        fi
+      fi
+    fi
+
+    if [[ -n "$new_ref" ]]; then
+      printf '%s %s %s\n' "$action" "$ref" "$new_ref"
+    fi
+  done < <(grep -rh --include='*.yml' --include='*.yaml' \
+    'uses:' "${dir}/.github/workflows/" 2>/dev/null)
+}
+
+# Update a single GitHub Actions action across all workflow files in the
+# .github/workflows/ directory, then create a stacked PR.
+# Args: $1=action (owner/repo), $2=current_ref, $3=new_ref
+gha_update_one() {
+  local -r action="$1"
+  local -r current_ref="$2"
+  local -r new_ref="$3"
+  local safe_name
+  safe_name="$(sanitize_branch_name "${action}")"
+  local -r branch="dep-updates/gha-${safe_name}"
+  local -r commit_msg="chore(deps): bump ${action} from ${current_ref} to ${new_ref}"
+
+  if branch_exists_in_worktree "$branch"; then
+    log "Skipping existing branch: ${branch}"
+    register_existing_branch_state "$branch"
+    local existing_pr
+    existing_pr="$(gh_pr_number_for_branch "$branch")"
+    if [[ -z "$existing_pr" ]]; then
+      log "Branch ${branch} has no PR — submitting now."
+      git -C "$worktree_path" checkout "$branch"
+      run_in_worktree gt track -p main 2>/dev/null || true
+      run_in_worktree gt submit --no-interactive --publish --no-stack
+      existing_pr="$(gh_pr_number_for_branch "$branch")"
+      if [[ -n "$existing_pr" ]]; then
+        state_append_pr "$existing_pr"
+      fi
+    fi
+    git -C "$worktree_path" checkout "$branch"
+    return 0
+  fi
+
+  log "[github-actions] ${action}: ${current_ref} → ${new_ref}"
+
+  # Patch all workflow files: replace `uses: action@current_ref` with
+  # `uses: action@new_ref`.  The sed delimiter is | to avoid escaping /.
+  find "${worktree_path}/.github/workflows" -maxdepth 1 \
+    \( -name '*.yml' -o -name '*.yaml' \) \
+    -exec sed -i \
+      "s|uses: ${action}@${current_ref}|uses: ${action}@${new_ref}|g" \
+      {} +
+
+  git -C "$worktree_path" add .github/workflows/
+
+  if git -C "$worktree_path" diff --cached --quiet; then
+    log "[github-actions] ${action}: no file changes — already at latest. Skipping PR."
+    return 0
+  fi
+
+  local parent_branch
+  parent_branch="$(git -C "$worktree_path" branch --show-current)"
+
+  git -C "$worktree_path" checkout -b "$branch"
+  _worktree_commit "$commit_msg"
+  if [[ "$parent_branch" == "$wt_base_branch" ]]; then
+    run_in_worktree gt track -p main
+  else
+    run_in_worktree gt track -p "$parent_branch"
+  fi
+  log "[gate] Submitting PR for '${branch}'…"
+  run_in_worktree gt submit --no-interactive --publish --no-stack
+
+  local pr_num
+  pr_num="$(gh_pr_number_for_new_branch "$branch")"
+  [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
+
+  local gha_body_file
+  gha_body_file="$(mktemp)"
+  write_pr_body "$action" "$current_ref" "$new_ref" \
+    "github-actions" ".github/workflows/" "" "$gha_body_file"
+  gh pr edit "$pr_num" \
+    --title "$commit_msg" \
+    --body-file "$gha_body_file" \
+    --add-label "dep-updater" || true
+  rm -f "$gha_body_file"
+  if [[ "$repo_name" == 'my-tracks' ]]; then
+    gh pr edit "$pr_num" --add-label "merge-mq" 2>/dev/null || true
+  fi
+
+  state_append "branches" "$branch"
+  state_append_pr "$pr_num"
+  add_summary_line "github-actions" "$action" "$current_ref" "$new_ref" "$branch" "$pr_num"
+}
+
+# ---------------------------------------------------------------------------
 # Batch update — one branch + one PR for all changes
 # ---------------------------------------------------------------------------
 
-# Applies all npm + Python updates (security and/or regular) onto a single
-# branch and creates a single PR.  Called instead of the per-group/per-package
-# loops when --batch is set.
+# Applies all npm + Python + GitHub Actions updates (security and/or regular)
+# onto a single branch and creates a single PR.  Called instead of the
+# per-group/per-package loops when --batch is set.
 #
 # Args:
 #   $1  npm_audit_lines  (may be empty)
 #   $2  py_audit_lines   (may be empty)
 #   $3  npm_lines        (may be empty; ignored when security_only=1)
 #   $4  py_lines         (may be empty; ignored when security_only=1)
+#   $5  gha_lines        (may be empty; ignored when security_only=1)
 batch_update_all() {
   local -r npm_audit_lines_arg="$1"
   local -r py_audit_lines_arg="$2"
   local -r npm_lines_arg="$3"
   local -r py_lines_arg="$4"
+  local -r gha_lines_arg="${5:-}"
 
   # Use a timestamped branch name so each run gets a fresh Graphite identity.
   # A fixed name like 'dep-updates/batch' caused repeated submit failures: Graphite
@@ -2654,6 +2847,24 @@ batch_update_all() {
     fi
   fi
 
+  # ── GitHub Actions ───────────────────────────────────────────────────────
+  local any_gha=0
+  if [[ "$has_gha" == '1' && -n "$gha_lines_arg" && "$security_only" == '0' ]]; then
+    while IFS=' ' read -r action cur_ref new_ref; do
+      [[ -z "$action" ]] && continue
+      log "[github-actions] Batch update: ${action} ${cur_ref} → ${new_ref}"
+      find "${worktree_path}/.github/workflows" -maxdepth 1 \
+        \( -name '*.yml' -o -name '*.yaml' \) \
+        -exec sed -i \
+          "s|uses: ${action}@${cur_ref}|uses: ${action}@${new_ref}|g" \
+          {} +
+    done <<< "$gha_lines_arg"
+    git -C "$worktree_path" add .github/workflows/ 2>/dev/null || true
+    if ! git -C "$worktree_path" diff --cached --quiet -- .github/; then
+      any_gha=1
+    fi
+  fi
+
   # Determine which npm packages actually changed after install.
   # pnpm outdated can report packages whose lockfile already resolves them to
   # the latest version (node_modules was stale).  Using the pre/post package.json
@@ -2751,6 +2962,15 @@ batch_update_all() {
           printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$pkg" "$old_ver" "$new_ver"
         done <<< "${actual_py_lines:-${py_lines_arg}}"
       fi
+      if [[ "$any_gha" == '1' && -n "$gha_lines_arg" ]]; then
+        printf '## GitHub Actions updates\n\n'
+        printf '| Action | From | To |\n'
+        printf '|---|---|---|\n'
+        while IFS=' ' read -r action cur_ref new_ref; do
+          [[ -z "$action" ]] && continue
+          printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$action" "$cur_ref" "$new_ref"
+        done <<< "$gha_lines_arg"
+      fi
     fi
   } > "$body_file"
 
@@ -2790,8 +3010,15 @@ batch_update_all() {
     [[ -z "$pkg" ]] && continue
     add_summary_line "python/${py_tool} (CVE)" "$pkg" "$_current" "$fix" "$branch" "$pr_num"
   done <<< "${py_audit_lines_arg:-}"
+  if [[ "$any_gha" == '1' ]]; then
+    while IFS=' ' read -r action cur_ref new_ref; do
+      [[ -z "$action" ]] && continue
+      add_summary_line "github-actions" "$action" "$cur_ref" "$new_ref" "$branch" "$pr_num"
+    done <<< "${gha_lines_arg:-}"
+  fi
   if [[ -z "$actual_npm_lines" && -z "$npm_audit_lines_arg" && \
-        -z "${actual_py_lines:-${py_lines_arg:-}}" && -z "$py_audit_lines_arg" ]]; then
+        -z "${actual_py_lines:-${py_lines_arg:-}}" && -z "$py_audit_lines_arg" && \
+        "$any_gha" == '0' ]]; then
     add_summary_line "batch" "$branch" "-" "-" "$branch" "$pr_num"
   fi
 }
@@ -3482,13 +3709,14 @@ poll_until_merged() {
 # ---------------------------------------------------------------------------
 
 # Emit a JSON report to stdout for --report-json mode.
-# Args: npm_audit_lines  py_audit_lines  npm_lines  py_lines
+# Args: npm_audit_lines  py_audit_lines  npm_lines  py_lines  gha_lines
 # All args may be empty strings.
 _emit_report_json() {
   local npm_audit_lines="$1"
   local py_audit_lines="$2"
   local npm_lines="$3"
   local py_lines="$4"
+  local gha_lines="${5:-}"
 
   local cves_json="[]"
   local updates_json="[]"
@@ -3527,6 +3755,14 @@ _emit_report_json() {
         | jq --arg e "python/${py_tool}" --arg p "$pkg" --arg o "$old_ver" --arg n "$new_ver" \
             '. + [{"ecosystem":$e,"package":$p,"from":$o,"to":$n}]')"
     done <<< "$py_lines"
+  fi
+  if [[ -n "$gha_lines" ]]; then
+    while IFS=' ' read -r action cur_ref new_ref; do
+      [[ -z "$action" ]] && continue
+      updates_json="$(printf '%s' "$updates_json" \
+        | jq --arg p "$action" --arg o "$cur_ref" --arg n "$new_ref" \
+            '. + [{"ecosystem":"github-actions","package":$p,"from":$o,"to":$n}]')"
+    done <<< "$gha_lines"
   fi
 
   jq -n \
@@ -3736,22 +3972,25 @@ if [[ "$dry_run" == '1' ]]; then
   fi
 
   # ── Outdated packages ────────────────────────────────────────────────
-  local npm_lines="" py_lines=""
+  local npm_lines="" py_lines="" gha_lines=""
   if [[ "$has_npm" == '1' ]]; then
     npm_lines="$(npm_outdated)"
   fi
   if [[ -n "$py_tool" ]]; then
     py_lines="$(py_outdated "$py_tool" "$audit_dir")"
   fi
+  if [[ "$has_gha" == '1' ]]; then
+    gha_lines="$(gha_outdated)"
+  fi
 
   # Normalize empty/null/'{}'
   [[ "$npm_lines" == '{}' || "$npm_lines" == 'null' ]] && npm_lines=""
   [[ "$py_lines"  == '{}' || "$py_lines"  == 'null' ]] && py_lines=""
 
-  if [[ -z "$npm_lines" && -z "$py_lines" ]]; then
+  if [[ -z "$npm_lines" && -z "$py_lines" && -z "$gha_lines" ]]; then
     log "All dependencies are up to date."
     if [[ "$report_json" == '1' ]]; then
-      _emit_report_json "$npm_audit_lines" "$py_audit_lines" "" ""
+      _emit_report_json "$npm_audit_lines" "$py_audit_lines" "" "" ""
     fi
     _dry_run_teardown "$audit_dir"
     exit 0
@@ -3772,6 +4011,12 @@ if [[ "$dry_run" == '1' ]]; then
       [[ -z "$pkg" ]] && continue
       all_rows+=("python/${py_tool}|$pkg|$old_ver|$new_ver")
     done <<< "$py_lines"
+  fi
+  if [[ -n "$gha_lines" ]]; then
+    while IFS=' ' read -r action cur_ref new_ref; do
+      [[ -z "$action" ]] && continue
+      all_rows+=("github-actions|$action|$cur_ref|$new_ref")
+    done <<< "$gha_lines"
   fi
   print_update_table "${all_rows[@]}"
 
@@ -3875,11 +4120,30 @@ if [[ "$dry_run" == '1' ]]; then
           "$py_cmd"
       done <<< "$py_lines"
     fi
+
+    if [[ -n "$gha_lines" ]]; then
+      while IFS=' ' read -r action cur_ref new_ref; do
+        [[ -z "$action" ]] && continue
+        local safe_gha gha_branch gha_commit
+        safe_gha="$(sanitize_branch_name "$action")"
+        gha_branch="dep-updates/gha-${safe_gha}"
+        gha_commit="chore(deps): bump ${action} from ${cur_ref} to ${new_ref}"
+        pr_index=$(( pr_index + 1 ))
+        print_dry_run_pr_plan \
+          "$pr_index" \
+          "github-actions/${action}" \
+          "$gha_branch" \
+          "$gha_commit" \
+          ".github/workflows/" \
+          "${action} ${cur_ref} ${new_ref}" \
+          "sed -i 's|uses: ${action}@${cur_ref}|uses: ${action}@${new_ref}|g' .github/workflows/*.yml"
+      done <<< "$gha_lines"
+    fi
   fi
   fi  # end: report_json == 0
 
   if [[ "$report_json" == '1' ]]; then
-    _emit_report_json "$npm_audit_lines" "$py_audit_lines" "$npm_lines" "$py_lines"
+    _emit_report_json "$npm_audit_lines" "$py_audit_lines" "$npm_lines" "$py_lines" "$gha_lines"
   fi
 
   _dry_run_teardown "$audit_dir"
@@ -3889,15 +4153,18 @@ fi
 # ---------------------------------------------------------------------------
 # Update mode
 # ---------------------------------------------------------------------------
-local npm_lines="" py_lines=""
+local npm_lines="" py_lines="" gha_lines=""
 if [[ "$has_npm" == '1' ]]; then
   npm_lines="$(npm_outdated)"
 fi
 if [[ -n "$py_tool" ]]; then
   py_lines="$(py_outdated "$py_tool" "$dir")"
 fi
+if [[ "$has_gha" == '1' ]]; then
+  gha_lines="$(gha_outdated)"
+fi
 
-if [[ -z "$npm_lines" && -z "$py_lines" ]]; then
+if [[ -z "$npm_lines" && -z "$py_lines" && -z "$gha_lines" ]]; then
   log "All dependencies are up to date."
   init_state_file
   sanitize_state_prs
@@ -3998,7 +4265,7 @@ fi
 # ── Regular updates follow (stacked on top of security PRs) ──────────────
 if [[ "$batch" == '1' ]]; then
   # Batch mode: one branch + one PR for everything.
-  batch_update_all "$npm_audit_lines" "$py_audit_lines" "$npm_lines" "$py_lines"
+  batch_update_all "$npm_audit_lines" "$py_audit_lines" "$npm_lines" "$py_lines" "$gha_lines"
 elif [[ "$security_only" == '1' ]]; then
   log "--security-only: skipping regular version bumps."
 else
@@ -4019,6 +4286,14 @@ else
     while IFS=' ' read -r pkg old_ver new_ver; do
       py_update_one "$pkg" "$old_ver" "$new_ver" "$py_tool" "$py_audit_lines"
     done <<< "$py_lines"
+  fi
+
+  # Process GitHub Actions
+  if [[ -n "$gha_lines" ]]; then
+    while IFS=' ' read -r action cur_ref new_ref; do
+      [[ -z "$action" ]] && continue
+      gha_update_one "$action" "$cur_ref" "$new_ref"
+    done <<< "$gha_lines"
   fi
 fi
 
