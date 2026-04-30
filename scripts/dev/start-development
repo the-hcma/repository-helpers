@@ -46,24 +46,64 @@ gh_pr_state() {
 # Parse arguments
 resume=false
 refresh=false
-for arg in "$@"; do
-    case "$arg" in
+no_interactive=false
+worktree_name=""
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
         --help)
-            echo "Usage: scripts/dev/start-development [--help] [--refresh] [--resume]"
+            echo "Usage: scripts/dev/start-development [--help] [--refresh] [--resume] [--no-interactive] [--worktree <name>]"
             echo ""
             echo "Options:"
-            echo "  --help     Show this help message"
-            echo "  --refresh  Pull latest main; run setup-service (for on-deploy + restart), or start service if setup-service is absent"
-            echo "  --resume   Resume an existing in-progress worktree (or create a new one)"
+            echo "  --help           Show this help message"
+            echo "  --no-interactive Fail instead of prompting for input"
+            echo "  --refresh        Pull latest main; run setup-service (for on-deploy + restart), or start service if setup-service is absent"
+            echo "  --resume         Resume an existing in-progress worktree (or create a new one)"
+            echo "  --worktree <n>   Non-interactive: create/use stack name <n> (creates branch '<n>-wt' at '.worktrees/<n>-wt')"
+            echo ""
+            echo "Examples:"
+            echo "  scripts/dev/start-development --worktree auth-bugfix --no-interactive"
+            echo "  scripts/dev/start-development --refresh"
             exit 0
             ;;
-        --refresh) refresh=true ;;
-        --resume) resume=true ;;
-        *) echo "Unknown argument: $arg" >&2
-           echo "Run 'scripts/dev/start-development --help' for usage." >&2
-           exit 1 ;;
+        --refresh)
+            refresh=true
+            shift
+            ;;
+        --resume)
+            resume=true
+            shift
+            ;;
+        --no-interactive)
+            no_interactive=true
+            shift
+            ;;
+        --worktree|--name)
+            if [[ "$#" -lt 2 ]]; then
+                echo "Missing value for $1" >&2
+                exit 2
+            fi
+            worktree_name="$2"
+            shift 2
+            ;;
+        --worktree=*|--name=*)
+            worktree_name="${1#*=}"
+            shift
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            echo "Run 'scripts/dev/start-development --help' for usage." >&2
+            exit 1
+            ;;
     esac
 done
+
+# In --no-interactive mode, never prompt. If a new worktree name is required but
+# missing, fail fast before running any networked / side-effectful operations.
+if [[ "$no_interactive" == "true" && "$refresh" == "false" && -z "$worktree_name" ]]; then
+    echo "No stack name provided (--worktree <name>). Exiting due to --no-interactive." >&2
+    exit 2
+fi
 
 echo "=========================================="
 echo "   $service_name Session Initialization   "
@@ -255,11 +295,30 @@ fi
 # Create a new worktree if nothing was selected (default mode, or user chose new work)
 if [[ -z "$selected_path" ]]; then
     echo ""
-    read -rp "New stack name (e.g. 'auth-bugfix'): " stack_name
+    if [[ -n "$worktree_name" ]]; then
+        stack_name="$worktree_name"
+        echo "New stack name: $stack_name"
+    elif [[ "$no_interactive" == "true" ]]; then
+        # Should have been caught by the early --no-interactive guard above, but keep as a
+        # defensive fallback in case future refactors change control flow.
+        echo "No stack name provided (--worktree <name>). Exiting due to --no-interactive." >&2
+        exit 2
+    else
+        read -rp "New stack name (e.g. 'auth-bugfix'): " stack_name
+    fi
 
     if [[ -z "$stack_name" ]]; then
         echo "No stack name provided. Exiting." >&2
         exit 1
+    fi
+
+    if [[ "$stack_name" =~ [[:space:]] ]]; then
+        echo "Invalid stack name '$stack_name': whitespace is not allowed." >&2
+        exit 2
+    fi
+    if [[ "$stack_name" == *"/"* ]]; then
+        echo "Invalid stack name '$stack_name': '/' is not allowed." >&2
+        exit 2
     fi
 
     selected_path="$worktrees_dir/${stack_name}-wt"
@@ -267,6 +326,36 @@ if [[ -z "$selected_path" ]]; then
 
     echo ""
     echo "Creating worktree '$branch_name' at $selected_path..."
+    # Validate against existing worktrees (even if the directory was deleted manually, Git may
+    # still consider it registered until pruned/removed).
+    existing_worktree_path="$(
+        git -C "$main_repo" worktree list --porcelain \
+            | awk -v b="refs/heads/$branch_name" '
+                $1 == "worktree" { wt=$2 }
+                $1 == "branch" && $2 == b { print wt; exit }
+              '
+    )"
+    if [[ -n "$existing_worktree_path" ]]; then
+        echo "Worktree branch already in use: $branch_name" >&2
+        echo "Existing worktree path: $existing_worktree_path" >&2
+        echo "Choose a different name, or remove the existing worktree first." >&2
+        exit 2
+    fi
+    if git -C "$main_repo" worktree list --porcelain | awk -v p="$selected_path" '$1=="worktree" && $2==p { found=1 } END { exit found?0:1 }'; then
+        echo "Worktree path already registered with git: $selected_path" >&2
+        echo "Choose a different name, or remove/prune the existing worktree first." >&2
+        exit 2
+    fi
+    if [[ -e "$selected_path" ]]; then
+        echo "Worktree path already exists: $selected_path" >&2
+        echo "Choose a different name, or remove the directory/worktree first." >&2
+        exit 2
+    fi
+    if git -C "$main_repo" show-ref --verify --quiet "refs/heads/$branch_name"; then
+        echo "Branch already exists: $branch_name" >&2
+        echo "Choose a different name, or delete the branch/worktree first." >&2
+        exit 2
+    fi
     git -C "$main_repo" worktree add -b "$branch_name" "$selected_path" main
     (cd "$selected_path" && gt track --parent main)
 
