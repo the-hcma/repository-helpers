@@ -163,6 +163,11 @@ scripts/dev/start-development --refresh
 - **Never declare `local -r` or plain `local` inside a loop body.** Hoist all `local` declarations to the top of the function. `local -r` inside a loop will crash on the second iteration with "readonly variable" because `local -r` both declares and sets, and re-entering the loop tries to re-declare an already-readonly name.
 - Do not use `A && B || C` as an if-then-else substitute (SC2015). Use a proper `if/then/else` block.
 - **Prefer long-form flags** for all command invocations (e.g. `--follow=name` not `-f`, `--all` not `-a`). Short flags are allowed only when no long form exists.
+- **Cron environment is minimal.** Any script designed to run under cron must not assume interactive shell init (e.g. PATH modifications that make `gt` visible). Prefer one (or both) of:
+  - Setting a safe PATH at the top of the script (include at least `${HOME}/.local/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`).
+  - Documenting a cron pattern like `bash -lc '<command>'` when shell init is required.
+  
+  Additionally, avoid patterns where failures are silently dropped under cron (e.g. redirecting tool stderr to `/dev/null` without surfacing errors elsewhere). If a cron job can fail to scan/act due to missing tooling, it must emit an observable report (email/log) rather than exiting 0 silently.
 
 ---
 
