@@ -6,10 +6,10 @@
 # Uses dep-updater --report-json --quiet for clean, structured output.
 #
 # Usage:
-#   dep-updater-notifier [--print]    # write email to stdout instead of sending
-#   dep-updater-notifier [--verbose]  # show timestamped progress on stderr
+#   dep-updater-notifier [-p|--print]    # write email to stdout instead of sending
+#   dep-updater-notifier [-v|--verbose]  # show timestamped progress on stderr
 #
-# Flags can be combined: dep-updater-notifier --print --verbose
+# Flags can be combined: dep-updater-notifier -p -v
 #
 # By default all stderr output is suppressed (safe for cron).
 # Cron example (daily at 07:00):
@@ -20,18 +20,20 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Cron runs with a minimal PATH. Ensure common install locations are included so
+# dep-updater's prerequisite checks behave the same as an interactive shell.
+PATH="${HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
 
 readonly dep_updater="${script_dir}/dep-updater"
 
-readonly repos=(
-  "${HOME}/work/ai/fpdf"
-  "${HOME}/work/ai/bunnify"
-  "${HOME}/work/ai/my-tracks"
-)
+readonly default_repo_root="${HOME}/work/ai"
 
 readonly email_to="hcma@hcma.info"
+readonly email_from="dep-updater-notifier-no-reply@hcma.info"
+readonly email_reply_to="dep-updater-notifier-no-reply@hcma.info"
 readonly email_subject_prefix="[dep-updater]"
 
 # ---------------------------------------------------------------------------
@@ -43,11 +45,71 @@ die() {
   exit 1
 }
 
+warn() {
+  printf 'ERROR: %s\n' "$*" >&2
+}
+
 log() {
   [[ "$verbose" == '1' ]] || return 0
   local ts
   ts="$(date '+%H:%M:%S.%3N')"
   printf '%s %s\n' "$ts" "$*" >&2
+}
+
+append_report() {
+  local -r line="$1"
+  report_lines+=("$line")
+}
+
+discover_repos() {
+  local -r roots_csv="${DEP_UPDATER_NOTIFIER_ROOTS:-$default_repo_root}"
+  local -r repos_csv="${DEP_UPDATER_NOTIFIER_REPOS:-}"
+  local root
+  local child
+
+  if [[ -n "$repos_csv" ]]; then
+    tr ':' '\n' <<<"$repos_csv" | sed '/^$/d'
+    return 0
+  fi
+
+  while IFS= read -r root; do
+    [[ -n "$root" ]] || continue
+    if [[ ! -d "$root" ]]; then
+      continue
+    fi
+    for child in "$root"/*; do
+      [[ -d "$child" ]] || continue
+      [[ -e "$child/.git" ]] || continue
+      printf '%s\n' "$child"
+    done
+  done < <(tr ':' '\n' <<<"$roots_csv" | sed '/^$/d')
+}
+
+check_notifier_prereqs() {
+  local missing=0
+  local tool
+  for tool in git jq rg gh gt; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      missing=$(( missing + 1 ))
+      warn "Missing required tool in PATH: ${tool}"
+      append_report "=== notifier prerequisites ==="
+      append_report "Missing required tool in PATH: ${tool}"
+      append_report ""
+    fi
+  done
+  if (( print_only == 0 )); then
+    if ! command -v sendmail >/dev/null 2>&1; then
+      missing=$(( missing + 1 ))
+      warn "Missing required tool in PATH: sendmail (MTA)"
+      append_report "=== notifier prerequisites ==="
+      append_report "Missing required tool in PATH: sendmail (MTA)"
+      append_report ""
+    fi
+  fi
+
+  if (( missing > 0 )); then
+    found_failure=1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -58,13 +120,13 @@ print_only=0
 verbose=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --print)   print_only=1 ;;
-    --verbose) verbose=1 ;;
+    -p|--print)   print_only=1 ;;
+    -v|--verbose) verbose=1 ;;
     -h|--help)
       sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
-    *) die "Unknown option: '$1'. Valid options: --print, --verbose, --help" ;;
+    *) die "Unknown option: '$1'. Valid options: -p/--print, -v/--verbose, -h/--help" ;;
   esac
   shift
 done
@@ -77,14 +139,31 @@ notice_lines=()
 update_repos_paths=()
 found_any=0
 found_cve=0
+found_failure=0
+
+check_notifier_prereqs
+
+repos=()
+while IFS= read -r repo; do
+  repos+=("$repo")
+done < <(discover_repos | sort -u)
+
+if (( ${#repos[@]} == 0 )); then
+  found_failure=1
+  warn "No git repos discovered (set DEP_UPDATER_NOTIFIER_ROOTS/DEP_UPDATER_NOTIFIER_REPOS)."
+  append_report "=== notifier ==="
+  append_report "No git repos discovered."
+  append_report "Set DEP_UPDATER_NOTIFIER_ROOTS (colon-separated) and/or DEP_UPDATER_NOTIFIER_REPOS."
+  append_report ""
+fi
 
 for repo in "${repos[@]}"; do
   repo_name="$(basename "$repo")"
 
   if [[ ! -d "$repo" ]]; then
     log "Skipping ${repo_name}: directory not found."
-    report_lines+=("=== ${repo_name} === (directory not found: ${repo})")
-    report_lines+=("")
+    append_report "=== ${repo_name} === (directory not found: ${repo})"
+    append_report ""
     continue
   fi
 
@@ -93,7 +172,11 @@ for repo in "${repos[@]}"; do
 
   json=""
   exit_code=0
-  json="$("$dep_updater" --report-json --dir "$repo" 2>/dev/null)" || exit_code=$?
+  dep_err_file="$(mktemp)"
+  dep_err=""
+  json="$("$dep_updater" --report-json --dir "$repo" 2>"$dep_err_file")" || exit_code=$?
+  dep_err="$(cat "$dep_err_file" 2>/dev/null || true)"
+  rm -f "$dep_err_file" 2>/dev/null || true
 
   if [[ "$verbose" == '1' ]]; then
     log "  json:"
@@ -102,8 +185,16 @@ for repo in "${repos[@]}"; do
 
   if (( exit_code != 0 )) || ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
     log "${repo_name}: scan failed (exit code ${exit_code})."
-    report_lines+=("=== ${repo_name} === (scan failed, exit code ${exit_code})")
-    report_lines+=("")
+    found_failure=1
+    warn "${repo_name}: scan failed (exit code ${exit_code})."
+    append_report "=== ${repo_name} === (scan failed, exit code ${exit_code})"
+    append_report "Hint: cron often has a minimal PATH; ensure 'gt' and 'gh' are available."
+    if [[ -n "$dep_err" ]]; then
+      append_report ""
+      append_report "stderr:"
+      append_report "$dep_err"
+    fi
+    append_report ""
     continue
   fi
 
@@ -163,7 +254,7 @@ for repo in "${repos[@]}"; do
   fi
 done
 
-if (( found_any == 0 )); then
+if (( found_any == 0 && found_failure == 0 )); then
   # Cron-silent: no output when nothing to do.
   exit 0
 fi
@@ -178,7 +269,11 @@ done
 
 subject_tag=""
 (( found_cve == 1 )) && subject_tag=" ⚠ CVE fixes available"
-readonly subject="${email_subject_prefix} dependency updates needed${subject_tag}"
+if (( found_any == 1 )); then
+  readonly subject="${email_subject_prefix} dependency updates needed${subject_tag}"
+else
+  readonly subject="${email_subject_prefix} notifier failed (no results)"
+fi
 
 body_lines=()
 body_lines+=("Dependency updates are available for one or more of your repos.")
@@ -205,8 +300,13 @@ body="$(printf '%s\n' "${body_lines[@]}")"
 
 if (( print_only == 1 )); then
   printf 'To: %s\n' "$email_to"
+  printf 'From: %s\n' "$email_from"
+  printf 'Reply-To: %s\n' "$email_reply_to"
   printf 'Subject: %s\n\n' "$subject"
   printf '%s\n' "$body"
+  if (( found_failure == 1 )); then
+    exit 1
+  fi
   exit 0
 fi
 
@@ -218,6 +318,8 @@ html_body="$(printf '%s' "$body" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
 
 {
   printf 'To: %s\n' "$email_to"
+  printf 'From: %s\n' "$email_from"
+  printf 'Reply-To: %s\n' "$email_reply_to"
   printf 'Subject: %s\n' "$subject"
   printf 'MIME-Version: 1.0\n'
   printf 'Content-Type: multipart/alternative; boundary="%s"\n' "$boundary"
@@ -239,5 +341,9 @@ html_body="$(printf '%s' "$body" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
   printf '</body></html>\n'
   printf '\n'
   printf -- '--%s--\n' "$boundary"
-} | sendmail -t -oi \
+} | sendmail -t -oi -f "$email_from" \
   || die "sendmail failed — is a mail transfer agent configured?"
+
+if (( found_failure == 1 )); then
+  exit 1
+fi
