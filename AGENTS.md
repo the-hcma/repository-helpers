@@ -134,9 +134,11 @@ scripts/dev/start-development --refresh
 - Keep each branch in the stack focused on exactly one logical change. Stacks should map 1-to-1 with milestones or sub-tasks from [dep-updater.plan.md](./dep-updater.plan.md).
 - Sync regularly: `gt sync` before starting new work; `gt restack` after upstream changes land.
 - Submit stacks with `gt submit` — do not open PRs manually via the GitHub UI.
+- PRs must be **published (not draft)** so reviewers see them normally. If using non-interactive submit, pass `gt submit --publish` (and avoid `--draft`).
 - To merge a PR, add the `merge-it` label: `gh pr edit <number> --add-label merge-it`. Never use `gh pr merge` directly.
 - Follow **Conventional Commits**: `feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`.
 - Each commit must pass all CI checks (see below) before being pushed.
+- Never merge a PR until **all checks have run and are green** (no skipped required checks).
 - Keep commits focused. One logical change per commit.
 - PR descriptions must reference the relevant milestone from [dep-updater.plan.md](./dep-updater.plan.md).
 - Before starting a new PR or branch, confirm the current PR is either merged or that all CI checks pass. Never start new work on a broken base.
