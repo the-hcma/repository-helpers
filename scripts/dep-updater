@@ -77,6 +77,9 @@ no_wait_ci=0
 no_wait_merge=0
 security_only=0
 batch=0
+batch_all=0
+scan_roots_csv=""
+dir_explicit=0
 merge_timeout_min=15
 wt_tmpdir=""
 quiet=0
@@ -421,21 +424,31 @@ Usage:
 
 Modes:
   (no flags)        Update: create worktree, stack PRs, wait for merge, cleanup
-  --dry-run         Preview exact per-PR plan and scope; no git or worktree changes
   --cleanup         Read saved state and clean up after stack is merged
+  --dry-run         Preview exact per-PR plan and scope; no git or worktree changes
   --rebase          Rebase existing stack on top of newest main
 
 Options:
+  --all             With --batch: run batch updates for every git repo discovered
+                    under the top-level scan directories (see --scan-root). Prints
+                    each resolved top-level directory before running. For quick runs,
+                    combine with --no-wait-ci --no-wait-merge.
+  --batch           Combine all updates into a single PR instead of one per package
   --dir <path>      Project root (default: current directory)
   --ecosystem <e>   Force: npm | python | gha | auto  (default: auto)
-  --semver-only     npm: respect existing semver range (omit --latest)
+  --merge-timeout <min>  Minutes to wait for all PRs to merge (default: 15)
   --no-wait-ci      Skip CI polling between PRs
   --no-wait-merge   Exit after stack is submitted; print cleanup command
+  --quiet           Suppress non-error log lines
+  --report-json     Emit JSON scan report on stdout (implies --dry-run --quiet)
+  --scan-root <path>  Parent directory whose immediate child folders are git clones
+                    (--batch --all only; repeat). If omitted, defaults to $HOME/work/ai
+                    or $DEP_UPDATER_BATCH_ALL_ROOTS (colon-separated; legacy:
+                    $DEP_UPDATER_FAST_BATCH_ROOTS still honored when BATCH_ALL unset).
   --security-only   Only create CVE-fix PRs; skip regular version bumps
-  --batch           Combine all updates into a single PR instead of one per package
-  --merge-timeout <min>  Minutes to wait for all PRs to merge (default: 15)
+  --semver-only     npm: respect existing semver range (omit --latest)
   --tmpdir <path>   Directory under which to create the dep-updater worktree
-                    (default: \$TMPDIR or /tmp)
+                    (default: $TMPDIR or /tmp)
   -h, --help        Print this help and exit
 
 Supported ecosystems:
@@ -455,27 +468,33 @@ USAGE
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --dry-run)
-        dry_run=1
+      --all)
+        batch_all=1
+        ;;
+      --batch)
+        batch=1
         ;;
       --cleanup)
         cleanup_mode=1
         ;;
-      --rebase)
-        rebase_mode=1
-        ;;
       --dir)
         shift
         [[ $# -eq 0 ]] && die "--dir requires a path argument."
+        dir_explicit=1
         dir="$1"
+        ;;
+      --dry-run)
+        dry_run=1
         ;;
       --ecosystem)
         shift
         [[ $# -eq 0 ]] && die "--ecosystem requires a value: npm | python | auto"
         ecosystem="$1"
         ;;
-      --semver-only)
-        semver_only=1
+      --merge-timeout)
+        shift
+        [[ $# -eq 0 ]] && die "--merge-timeout requires a number of minutes."
+        merge_timeout_min="$1"
         ;;
       --no-wait-ci)
         no_wait_ci=1
@@ -483,29 +502,36 @@ parse_args() {
       --no-wait-merge)
         no_wait_merge=1
         ;;
-      --security-only)
-        security_only=1
-        ;;
-      --batch)
-        batch=1
-        ;;
-      --merge-timeout)
-        shift
-        [[ $# -eq 0 ]] && die "--merge-timeout requires a number of minutes."
-        merge_timeout_min="$1"
-        ;;
-      --tmpdir)
-        shift
-        [[ $# -eq 0 ]] && die "--tmpdir requires a path argument."
-        wt_tmpdir="$1"
-        ;;
       --quiet)
         quiet=1
+        ;;
+      --rebase)
+        rebase_mode=1
         ;;
       --report-json)
         report_json=1
         dry_run=1
         quiet=1
+        ;;
+      --scan-root)
+        shift
+        [[ $# -eq 0 ]] && die "--scan-root requires a path argument."
+        if [[ -z "$scan_roots_csv" ]]; then
+          scan_roots_csv="$1"
+        else
+          scan_roots_csv="${scan_roots_csv}:$1"
+        fi
+        ;;
+      --security-only)
+        security_only=1
+        ;;
+      --semver-only)
+        semver_only=1
+        ;;
+      --tmpdir)
+        shift
+        [[ $# -eq 0 ]] && die "--tmpdir requires a path argument."
+        wt_tmpdir="$1"
         ;;
       -h|--help)
         usage
@@ -523,14 +549,35 @@ parse_args() {
     *) die "Invalid --ecosystem: '$ecosystem'. Valid values: npm | python | gha | auto" ;;
   esac
 
-  local resolved_dir
-  if [[ -n "$dir" ]]; then
-    resolved_dir="$(cd "$dir" && pwd)"
+  [[ "$batch_all" == '1' && "$batch" != '1' ]] \
+    && die "--all requires --batch."
+
+  [[ -n "$scan_roots_csv" && ( "$batch_all" != '1' || "$batch" != '1' ) ]] \
+    && die "--scan-root requires --batch --all."
+
+  if [[ "$batch_all" == '1' ]]; then
+    [[ "$dir_explicit" == '1' ]] \
+      && die "--batch --all cannot be combined with --dir; use --scan-root instead."
+    [[ "$cleanup_mode" == '1' ]] \
+      && die "--batch --all cannot be used with --cleanup."
+    [[ "$rebase_mode" == '1' ]] \
+      && die "--batch --all cannot be used with --rebase."
+    [[ "$report_json" == '1' ]] \
+      && die "--batch --all cannot be used with --report-json."
+    if [[ -z "$scan_roots_csv" ]]; then
+      scan_roots_csv="${DEP_UPDATER_BATCH_ALL_ROOTS:-${DEP_UPDATER_FAST_BATCH_ROOTS:-${HOME}/work/ai}}"
+    fi
+    dir=""
   else
-    resolved_dir="$(git rev-parse --show-toplevel 2>/dev/null)" \
-      || die "Not inside a git repository and --dir was not specified."
+    local resolved_dir
+    if [[ -n "$dir" ]]; then
+      resolved_dir="$(cd "$dir" && pwd)"
+    else
+      resolved_dir="$(git rev-parse --show-toplevel 2>/dev/null)" \
+        || die "Not inside a git repository and --dir was not specified."
+    fi
+    dir="$resolved_dir"
   fi
-  dir="$resolved_dir"
 
   if [[ -n "$wt_tmpdir" ]]; then
     if [[ ! -d "$wt_tmpdir" ]]; then
@@ -541,7 +588,7 @@ parse_args() {
   fi
 
   # shellcheck disable=SC2034  # cleanup_mode, rebase_mode, merge_timeout_min used in main() dispatch
-  readonly dry_run cleanup_mode rebase_mode dir ecosystem semver_only no_wait_ci no_wait_merge security_only batch merge_timeout_min wt_tmpdir quiet report_json
+  readonly dry_run cleanup_mode rebase_mode dir ecosystem semver_only no_wait_ci no_wait_merge security_only batch batch_all merge_timeout_min wt_tmpdir quiet report_json scan_roots_csv
 }
 
 # ---------------------------------------------------------------------------
@@ -3935,12 +3982,115 @@ rebase_stack_on_main() {
 }
 
 # ---------------------------------------------------------------------------
+# Multi-repo --batch --all (one --batch run per discovered git clone)
+# ---------------------------------------------------------------------------
+
+# Log each resolved top-level scan directory (configured default, env, or --scan-root).
+log_batch_all_top_level_dirs() {
+  local root resolved_root
+  log "[batch-all] Top-level scan directories:"
+  while IFS= read -r root; do
+    [[ -n "$root" ]] || continue
+    resolved_root=""
+    resolved_root="$(realpath "$root" 2>/dev/null)" || {
+      log "[batch-all]   (skipped — unreadable path: ${root})"
+      continue
+    }
+    log "[batch-all]   ${resolved_root}"
+  done < <(tr ':' '\n' <<<"$scan_roots_csv" | sed '/^$/d')
+}
+
+discover_batch_all_repos() {
+  local root resolved_root child resolved_child
+
+  while IFS= read -r root; do
+    [[ -n "$root" ]] || continue
+    resolved_root=""
+    resolved_root="$(realpath "$root" 2>/dev/null)" || {
+      log "[batch-all] Skipping unreadable scan root: ${root}"
+      continue
+    }
+    [[ -d "$resolved_root" ]] || continue
+
+    while IFS= read -r child; do
+      [[ -e "$child/.git" ]] || continue
+      resolved_child=""
+      resolved_child="$(realpath "$child" 2>/dev/null)" || continue
+      printf '%s\n' "$resolved_child"
+    done < <(find "$resolved_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+  done < <(tr ':' '\n' <<<"$scan_roots_csv" | sed '/^$/d')
+}
+
+batch_all_dispatch() {
+  local dep_self repo child_exit worst_exit
+  local -a child_args repos_found
+
+  dep_self=""
+  dep_self="$(realpath "${BASH_SOURCE[0]}")" \
+    || die "Could not resolve dep-updater script path."
+
+  log_batch_all_top_level_dirs
+
+  readarray -t repos_found < <(discover_batch_all_repos | sort -u)
+
+  if [[ ${#repos_found[@]} -eq 0 ]]; then
+    log "[batch-all] No git repositories found under scan roots."
+    return 0
+  fi
+
+  worst_exit=0
+
+  for repo in "${repos_found[@]}"; do
+    [[ -z "$repo" ]] && continue
+
+    log "[batch-all] --- $(basename "$repo") (${repo}) ---"
+
+    child_args=()
+    [[ "$dry_run" == '1' ]] && child_args+=(--dry-run)
+    child_args+=(--batch)
+    [[ "$quiet" == '1' ]] && child_args+=(--quiet)
+    [[ "$semver_only" == '1' ]] && child_args+=(--semver-only)
+    [[ "$no_wait_ci" == '1' ]] && child_args+=(--no-wait-ci)
+    [[ "$no_wait_merge" == '1' ]] && child_args+=(--no-wait-merge)
+    [[ "$security_only" == '1' ]] && child_args+=(--security-only)
+    [[ -n "$wt_tmpdir" ]] && child_args+=(--tmpdir "$wt_tmpdir")
+    child_args+=(--merge-timeout "$merge_timeout_min")
+    [[ "$ecosystem" != 'auto' ]] && child_args+=(--ecosystem "$ecosystem")
+    child_args+=(--dir "$repo")
+
+    child_exit=0
+    "$dep_self" "${child_args[@]}" || child_exit=$?
+
+    if [[ "$child_exit" -ne 0 ]]; then
+      log "[batch-all] FAILED (${repo}) exit ${child_exit}"
+      if [[ "$worst_exit" -eq 0 ]] || [[ "$child_exit" -gt "$worst_exit" ]]; then
+        worst_exit="$child_exit"
+      fi
+    fi
+  done
+
+  if [[ "$worst_exit" -ne 0 ]]; then
+    log "[batch-all] Finished with failures (exit ${worst_exit})."
+  else
+    log "[batch-all] All repos completed successfully."
+  fi
+
+  return "$worst_exit"
+}
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 main() {
   parse_args "$@"
   init_prompt_style
+
+  if [[ "$batch_all" == '1' ]]; then
+    check_core_prereqs
+    batch_all_dispatch
+    exit $?
+  fi
 
   if [[ "$report_json" == '1' ]]; then
     check_report_prereqs
