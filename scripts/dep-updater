@@ -1325,15 +1325,19 @@ register_existing_branch_state() {
 # ---------------------------------------------------------------------------
 
 # Prints one "name current latest" line per outdated package.
+# Optional $1: project root to scan (defaults to $dir). Live updates should pass
+# $worktree_path so the plan matches manifests synced from origin/main; the
+# primary clone may have stale node_modules relative to the lockfile.
 npm_outdated() {
   local -r tool="$npm_tool"
+  local -r scan_root="${1:-$dir}"
 
-  if [[ ! -d "$dir/node_modules" ]]; then
+  if [[ ! -d "${scan_root}/node_modules" ]]; then
     log "node_modules not found at git root — running install…"
     case "$tool" in
-      pnpm) pnpm --dir "$dir" install --frozen-lockfile >&2 ;;
-      yarn) yarn --cwd "$dir" install --frozen-lockfile >&2 ;;
-      npm)  npm install --prefix "$dir" --prefer-offline >&2 ;;
+      pnpm) pnpm --dir "$scan_root" install --frozen-lockfile >&2 ;;
+      yarn) yarn --cwd "$scan_root" install --frozen-lockfile >&2 ;;
+      npm)  npm install --prefix "$scan_root" --prefer-offline >&2 ;;
     esac
   fi
 
@@ -1341,9 +1345,9 @@ npm_outdated() {
   tmp_json="$(mktemp)"
   set +e
   case "$tool" in
-    pnpm) pnpm --dir "$dir" outdated --json > "$tmp_json" 2>/dev/null ;;
-    yarn) yarn --cwd "$dir" outdated --json > "$tmp_json" 2>/dev/null ;;
-    npm)  npm outdated --prefix "$dir" --json > "$tmp_json" 2>/dev/null ;;
+    pnpm) pnpm --dir "$scan_root" outdated --json > "$tmp_json" 2>/dev/null ;;
+    yarn) yarn --cwd "$scan_root" outdated --json > "$tmp_json" 2>/dev/null ;;
+    npm)  npm outdated --prefix "$scan_root" --json > "$tmp_json" 2>/dev/null ;;
   esac
   exit_code=$?
   set -e
@@ -1365,11 +1369,11 @@ npm_outdated() {
   # "=3.0.0") are NOT excluded: dep-updater updates them in place, preserving the exact
   # style (no promotion to ^), matching Dependabot behaviour.
   local pkg_json_specs
-  if [[ -f "$dir/package.json" ]]; then
+  if [[ -f "${scan_root}/package.json" ]]; then
     pkg_json_specs="$(jq -c \
       '[.dependencies, .devDependencies, .peerDependencies, .optionalDependencies]
        | map(select(. != null)) | add // {}' \
-      "$dir/package.json" 2>/dev/null || echo '{}')"
+      "${scan_root}/package.json" 2>/dev/null || echo '{}')"
   else
     pkg_json_specs='{}'
   fi
@@ -1818,14 +1822,17 @@ py_audit() {
 # Emits one "pkg current fix_version cve1,cve2,..." line per vulnerable npm
 # package where a direct-dep fix is available. Transitive-only vulns are
 # skipped (package.json cannot address them without introducing breaking changes).
+# Optional $1: project root (defaults to $dir). Pass $worktree_path or dry-run
+# audit dir so results align with the tree batch updates apply to.
 npm_audit() {
   local raw exit_code
+  local -r scan_root="${1:-$dir}"
 
   set +e
   case "$npm_tool" in
-    pnpm) raw="$(pnpm --dir "$dir" audit --json 2>/dev/null)" ;;
-    yarn) raw="$(yarn --cwd "$dir" audit --json 2>/dev/null)" ;;
-    npm)  raw="$(npm audit --prefix "$dir" --json 2>/dev/null)" ;;
+    pnpm) raw="$(pnpm --dir "$scan_root" audit --json 2>/dev/null)" ;;
+    yarn) raw="$(yarn --cwd "$scan_root" audit --json 2>/dev/null)" ;;
+    npm)  raw="$(npm audit --prefix "$scan_root" --json 2>/dev/null)" ;;
   esac
   exit_code=$?
   set -e
@@ -2496,7 +2503,10 @@ py_update_one() {
 #   Major-only  (@v6)         — updated only when the latest major increments
 #   Full semver (@v1.7.12 or @0.36.0) — updated on any newer version
 #   Commit SHA  (@abc123...)  — skipped (not managed here)
+#
+# Optional $1: repository root containing .github/workflows (defaults to $dir).
 gha_outdated() {
+  local -r scan_root="${1:-$dir}"
   local -a seen_actions=()
   local line action ref
 
@@ -2601,7 +2611,7 @@ gha_outdated() {
       printf '%s %s %s\n' "$action" "$ref" "$new_ref"
     fi
   done < <(grep -rh --include='*.yml' --include='*.yaml' \
-    'uses:' "${dir}/.github/workflows/" 2>/dev/null)
+    'uses:' "${scan_root}/.github/workflows/" 2>/dev/null)
 }
 
 # Update a single GitHub Actions action across all workflow files in the
@@ -4206,7 +4216,7 @@ if [[ "$dry_run" == '1' ]]; then
   # ── Security audit ───────────────────────────────────────────────────
   local npm_audit_lines="" py_audit_lines=""
   if [[ "$has_npm" == '1' ]]; then
-    npm_audit_lines="$(npm_audit)"
+    npm_audit_lines="$(npm_audit "$audit_dir")"
   fi
   if [[ -n "$py_tool" ]]; then
     py_audit_lines="$(py_audit "$py_tool" "$audit_dir")"
@@ -4247,13 +4257,13 @@ if [[ "$dry_run" == '1' ]]; then
   # ── Outdated packages ────────────────────────────────────────────────
   local npm_lines="" py_lines="" gha_lines=""
   if [[ "$has_npm" == '1' ]]; then
-    npm_lines="$(npm_outdated)"
+    npm_lines="$(npm_outdated "$audit_dir")"
   fi
   if [[ -n "$py_tool" ]]; then
     py_lines="$(py_outdated "$py_tool" "$audit_dir")"
   fi
   if [[ "$has_gha" == '1' ]]; then
-    gha_lines="$(gha_outdated)"
+    gha_lines="$(gha_outdated "$audit_dir")"
   fi
 
   # Normalize empty/null/'{}'
@@ -4426,21 +4436,35 @@ fi
 # ---------------------------------------------------------------------------
 # Update mode
 # ---------------------------------------------------------------------------
+init_state_file
+sanitize_state_prs
+# Read any open-PR state from a prior interrupted run BEFORE prepare_worktree
+# can overwrite the state file.  cleanup_on_error intentionally preserves the
+# state file so these values survive a SIGINT.
+local existing_branches existing_prs
+existing_branches="$(state_get "branches")"
+existing_prs="$(state_get "prs")"
+
+# Cheap scan on the primary clone: skip creating a worktree when nothing looks
+# outdated and there is no dep-updater state to resume (fast path).
 local npm_lines="" py_lines="" gha_lines=""
 if [[ "$has_npm" == '1' ]]; then
-  npm_lines="$(npm_outdated)"
+  npm_lines="$(npm_outdated "$dir")"
 fi
 if [[ -n "$py_tool" ]]; then
   py_lines="$(py_outdated "$py_tool" "$dir")"
 fi
 if [[ "$has_gha" == '1' ]]; then
-  gha_lines="$(gha_outdated)"
+  gha_lines="$(gha_outdated "$dir")"
 fi
 
-if [[ -z "$npm_lines" && -z "$py_lines" && -z "$gha_lines" ]]; then
+local deps_maybe_outdated=0
+if [[ -n "$npm_lines" || -n "$py_lines" || -n "$gha_lines" ]]; then
+  deps_maybe_outdated=1
+fi
+
+if [[ "$deps_maybe_outdated" == '0' ]]; then
   log "All dependencies are up to date."
-  init_state_file
-  sanitize_state_prs
   if [[ -f "$state_file" ]]; then
     prepare_worktree
     ensure_gt_tracked
@@ -4450,9 +4474,6 @@ if [[ -z "$npm_lines" && -z "$py_lines" && -z "$gha_lines" ]]; then
     git -C "$worktree_path" fetch origin --prune 2>/dev/null || true
     log "Working in: $worktree_path"
 
-    local existing_branches existing_prs
-    existing_branches="$(state_get "branches")"
-    existing_prs="$(state_get "prs")"
     require_resume_ci_gate "$existing_branches" "$existing_prs"
     gate_all_created_prs
     maybe_label_top_pr_for_merge
@@ -4480,25 +4501,54 @@ if [[ -z "$npm_lines" && -z "$py_lines" && -z "$gha_lines" ]]; then
   exit 0
 fi
 
-# Create/reuse worktree, initialize state
-init_state_file
-sanitize_state_prs
-# Read any open-PR state from a prior interrupted run BEFORE prepare_worktree
-# can overwrite the state file.  cleanup_on_error intentionally preserves the
-# state file so these values survive a SIGINT.
-local existing_branches existing_prs
-existing_branches="$(state_get "branches")"
-existing_prs="$(state_get "prs")"
 prepare_worktree
 ensure_gt_tracked
 
 # Worktree is live — any unexpected exit from here should trigger cleanup.
 _cleanup_trap_active=1
-  
+
 # Fetch remote refs without touching the primary repo's working tree.
 git -C "$worktree_path" fetch origin --prune 2>/dev/null || true
 
 log "Working in: $worktree_path"
+
+# Authoritative scan from the worktree (same tree batch_update applies to).
+npm_lines=""
+py_lines=""
+gha_lines=""
+if [[ "$has_npm" == '1' ]]; then
+  npm_lines="$(npm_outdated "$worktree_path")"
+fi
+if [[ -n "$py_tool" ]]; then
+  py_lines="$(py_outdated "$py_tool" "$worktree_path")"
+fi
+if [[ "$has_gha" == '1' ]]; then
+  gha_lines="$(gha_outdated "$worktree_path")"
+fi
+
+if [[ -z "$npm_lines" && -z "$py_lines" && -z "$gha_lines" ]]; then
+  log "All dependencies are up to date."
+  require_resume_ci_gate "$existing_branches" "$existing_prs"
+  gate_all_created_prs
+  maybe_label_top_pr_for_merge
+
+  if [[ "$no_wait_merge" == '1' ]]; then
+    log ""
+    log "Stack submitted. To clean up after all PRs are merged, run:"
+    log "  dep-updater --cleanup --dir ${dir}"
+    exit 0
+  fi
+
+  local final_prs_wt
+  final_prs_wt="$(collect_tracked_prs_csv)"
+  if [[ -n "$final_prs_wt" ]]; then
+    poll_until_merged "$final_prs_wt"
+  else
+    log "No tracked PRs found; nothing to monitor."
+  fi
+  cleanup
+  exit 0
+fi
 
 require_resume_ci_gate "$existing_branches" "$existing_prs"
 ensure_dep_updater_label
@@ -4508,7 +4558,7 @@ ensure_dep_updater_label
 local npm_audit_lines="" py_audit_lines=""
 if [[ "$has_npm" == '1' ]]; then
   log "Running npm security audit…"
-  npm_audit_lines="$(npm_audit)"
+  npm_audit_lines="$(npm_audit "$worktree_path")"
   if [[ -n "$npm_audit_lines" ]]; then
     local vuln_count
     vuln_count="$(printf '%s\n' "$npm_audit_lines" | grep -c .)"
@@ -4522,7 +4572,7 @@ if [[ "$has_npm" == '1' ]]; then
 fi
 if [[ -n "$py_tool" ]]; then
   log "Running Python security audit…"
-  py_audit_lines="$(py_audit "$py_tool")"
+  py_audit_lines="$(py_audit "$py_tool" "$worktree_path")"
   if [[ -n "$py_audit_lines" ]]; then
     local py_vuln_count
     py_vuln_count="$(printf '%s\n' "$py_audit_lines" | grep -c .)"
