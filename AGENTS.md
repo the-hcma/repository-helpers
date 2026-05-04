@@ -85,6 +85,12 @@ This script:
 
 Do **not** manually create worktrees or run `gt sync` separately — `start-development` is the single entry point for all new work.
 
+When `start-development` is invoked by an AI agent, it must be run **non-interactively** (never prompting):
+
+```bash
+scripts/dev/start-development --worktree <stack-name> --no-interactive
+```
+
 Use `--refresh` to pull the latest `main` and ensure the service is running without opening a new worktree:
 
 ```bash
