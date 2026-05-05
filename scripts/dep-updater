@@ -383,6 +383,26 @@ gh_pr_number_for_new_branch() {
     --json number --jq '.number' 2>/dev/null || true
 }
 
+wait_for_pr_number_for_new_branch() {
+  local -r branch="$1"
+  local -r timeout_sec=60
+  local -r poll_sec=2
+  local elapsed=0
+  local pr_num=""
+
+  while (( elapsed < timeout_sec )); do
+    pr_num="$(gh_pr_number_for_new_branch "$branch")"
+    if [[ -n "$pr_num" ]]; then
+      printf '%s' "$pr_num"
+      return 0
+    fi
+    sleep "$poll_sec"
+    elapsed=$(( elapsed + poll_sec ))
+  done
+
+  return 1
+}
+
 gh_pr_state_for_number() {
   local -r pr_number="$1"
   gh api "repos/${repo_owner}/${repo_name}/pulls/${pr_number}" \
@@ -1694,7 +1714,7 @@ npm_update_group() {
   # Stay on $branch — the next dep-updater branch will stack on top of it.
 
   local pr_num
-  pr_num="$(gh_pr_number_for_new_branch "$branch")"
+  pr_num="$(wait_for_pr_number_for_new_branch "$branch" || true)"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
 
   local npm_body_file
@@ -1990,7 +2010,7 @@ npm_security_update() {
   submitted_head="$(git -C "$worktree_path" rev-parse "$branch")"
 
   local pr_num
-  pr_num="$(gh_pr_number_for_new_branch "$branch")"
+  pr_num="$(wait_for_pr_number_for_new_branch "$branch" || true)"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
 
   write_security_pr_body "${npm_tool}" "$audit_lines" "$body_file"
@@ -2111,7 +2131,7 @@ py_security_update() {
   submitted_head="$(git -C "$worktree_path" rev-parse "$branch")"
 
   local pr_num
-  pr_num="$(gh_pr_number_for_new_branch "$branch")"
+  pr_num="$(wait_for_pr_number_for_new_branch "$branch" || true)"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
 
   write_security_pr_body "python/${tool}" "$audit_lines" "$body_file"
@@ -2467,7 +2487,7 @@ py_update_one() {
   # Stay on $branch — the next dep-updater branch will stack on top of it.
 
   local pr_num
-  pr_num="$(gh_pr_number_for_new_branch "$branch")"
+  pr_num="$(wait_for_pr_number_for_new_branch "$branch" || true)"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
 
   local py_body_file
@@ -2680,7 +2700,7 @@ gha_update_one() {
   run_in_worktree gt submit --no-interactive --publish --no-stack
 
   local pr_num
-  pr_num="$(gh_pr_number_for_new_branch "$branch")"
+  pr_num="$(wait_for_pr_number_for_new_branch "$branch" || true)"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
 
   local gha_body_file
@@ -3062,7 +3082,7 @@ batch_update_all() {
   run_in_worktree gt submit --no-interactive --publish --no-stack
 
   local pr_num
-  pr_num="$(gh_pr_number_for_new_branch "$branch")"
+  pr_num="$(wait_for_pr_number_for_new_branch "$branch" || true)"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for batch branch '${branch}'"
 
   # Build PR body
@@ -3204,47 +3224,20 @@ wait_for_ci() {
     log "Waiting for CI on '${branch}'…"
   fi
 
+  [[ -n "$pr_num" ]] || die "CI gate requires a PR number for '${branch}'. Expected PR to exist after gt submit."
+
   while true; do
     # Short-circuit: if the PR is already merged, CI obviously passed.
-    if [[ -n "$pr_num" ]]; then
-      already_merged="$(gh_pr_merged_for_number "$pr_num")"
-      if [[ "$already_merged" == 'true' ]]; then
-        log "PR #${pr_num} already merged — CI gate passed."
-        return 0
-      fi
+    already_merged="$(gh_pr_merged_for_number "$pr_num")"
+    if [[ "$already_merged" == 'true' ]]; then
+      log "PR #${pr_num} already merged — CI gate passed."
+      return 0
     fi
 
-    raw="$(gh run list --repo "${repo_owner}/${repo_name}" --branch "$branch" --limit 30 --json name,headSha,status,conclusion,createdAt 2>/dev/null || echo '[]')"
-
-    if [[ -n "$target_sha" ]]; then
-      status="$(printf '%s' "$raw" \
-        | jq -r --arg sha "$target_sha" --arg names "$ci_workflow_names" '
-            map(select(
-              .headSha == $sha and
-              ($names == "" or (.name as $n | $names | split("\n") | index($n) != null))
-            )) as $filtered
-            | if ($filtered | length) == 0 then "missing"
-              elif ($names != "" and
-                    (($names | split("\n")) | any(.[]; . as $n |
-                      ($filtered | map(.name) | index($n)) == null))) then "pending"
-              elif any($filtered[]; .conclusion == "failure" or .conclusion == "cancelled"
-                           or .conclusion == "timed_out" or .conclusion == "startup_failure") then "failure"
-              elif all($filtered[]; .conclusion != null) then "success"
-              else "pending"
-              end
-          ')"
-    else
-      status="$(printf '%s' "$raw" \
-        | jq -r --arg names "$ci_workflow_names" '
-            map(select($names == "" or (.name as $n | $names | split("\n") | index($n) != null)))
-            | if length == 0 then "missing"
-              elif any(.[]; .conclusion == "failure" or .conclusion == "cancelled"
-                         or .conclusion == "timed_out" or .conclusion == "startup_failure") then "failure"
-              elif all(.[]; .conclusion != null) then "success"
-              else "pending"
-              end
-          ')"
-    fi
+    # Gate CI on the PR check rollup (not workflow runs) to avoid false positives
+    # before checks are attached to the PR head.
+    status="$(ci_conclusion_for_pr "$pr_num")"
+    [[ -n "$status" ]] || die "Could not determine CI status from PR #${pr_num} statusCheckRollup."
 
     # Format elapsed time for display.
     if (( elapsed_sec < 60 )); then
@@ -3269,27 +3262,7 @@ wait_for_ci() {
         ;;
       *)
         # CI is running — log progress and break down per-workflow status.
-        local run_summary
-        run_summary="$(printf '%s' "$raw" \
-          | jq -r --arg sha "$target_sha" --arg names "$ci_workflow_names" '
-              map(select(
-                .headSha == $sha and
-                ($names == "" or (.name as $n | $names | split("\n") | index($n) != null))
-              ))
-              | map(
-                  if .conclusion == "success" then "\u2713 " + .name
-                  elif .conclusion != null then "\u2717 " + .name + " (" + .conclusion + ")"
-                  elif .status == "in_progress" then "\u23f3 " + .name
-                  else "\u23f3 " + .name + " (" + .status + ")"
-                  end
-                )
-              | join(", ")
-            ' 2>/dev/null || true)"
-        if [[ -n "$run_summary" ]]; then
-          log "CI running on '${branch}': ${run_summary} ${wait_suffix}"
-        else
-          log "CI running on '${branch}'… ${wait_suffix}"
-        fi
+        log "CI running on '${branch}'… ${wait_suffix}"
         ;;
     esac
 
@@ -3342,6 +3315,24 @@ ci_conclusion_for_head() {
           else "pending"
           end
       '
+}
+
+ci_conclusion_for_pr() {
+  local -r pr_num="$1"
+  # statusCheckRollup is the most reliable signal for "is the PR green?" since it
+  # reflects checks GitHub associates with the PR head, rather than any workflow
+  # runs that happen to share the same commit SHA.
+  gh pr view "$pr_num" \
+    --repo "${repo_owner}/${repo_name}" \
+    --json statusCheckRollup \
+    --jq "(.statusCheckRollup // []) as \$r
+      | if (\$r | length) == 0 then \"missing\"
+        elif any(\$r[]; (.status != \"COMPLETED\") or (.conclusion == null)) then \"pending\"
+        elif any(\$r[]; (.conclusion == \"FAILURE\") or (.conclusion == \"ERROR\") or
+                     (.conclusion == \"CANCELLED\") or (.conclusion == \"TIMED_OUT\") or
+                     (.conclusion == \"STARTUP_FAILURE\") or (.conclusion == \"ACTION_REQUIRED\")) then \"failure\"
+        else \"success\"
+        end" 2>/dev/null || true
 }
 
 wait_for_mergeable() {
