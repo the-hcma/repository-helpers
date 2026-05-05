@@ -140,6 +140,11 @@ scripts/dev/start-development --refresh
 - Keep each branch in the stack focused on exactly one logical change. Stacks should map 1-to-1 with milestones or sub-tasks from [dep-updater.plan.md](./dep-updater.plan.md).
 - Sync regularly: `gt sync` before starting new work; `gt restack` after upstream changes land.
 - Submit stacks with `gt submit` — do not open PRs manually via the GitHub UI.
+- Before opening/submitting a PR, run local checks (for the relevant files) and ensure they pass:
+  - `bash -n scripts/* tests/*`
+  - `shellcheck -S info scripts/* tests/*`
+  - `bash tests/<script-name>.test` (and any other relevant suite)
+- Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).
 - PRs must be **published (not draft)** so reviewers see them normally. If using non-interactive submit, pass `gt submit --publish` (and avoid `--draft`).
 - To merge a PR, add the `merge-it` label: `gh pr edit <number> --add-label merge-it`. Never use `gh pr merge` directly.
 - Follow **Conventional Commits**: `feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`.
