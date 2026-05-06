@@ -62,6 +62,13 @@ append_report() {
   report_lines+=("$line")
 }
 
+cleanup_files=()
+cleanup_tmpfiles() {
+  [[ ${#cleanup_files[@]} -gt 0 ]] || return 0
+  rm -f "${cleanup_files[@]}" 2>/dev/null || true
+}
+trap cleanup_tmpfiles EXIT INT TERM
+
 discover_repos() {
   local -r roots_csv="${DEP_UPDATER_NOTIFIER_ROOTS:-$default_repo_root}"
   local -r repos_csv="${DEP_UPDATER_NOTIFIER_REPOS:-}"
@@ -168,36 +175,47 @@ for repo in "${repos[@]}"; do
   log "Checking ${repo_name}…"
   log "  cmd: ${dep_updater} --report-json --dir ${repo}"
 
-  json=""
   exit_code=0
+  dep_out_file="$(mktemp)"
   dep_err_file="$(mktemp)"
-  dep_err=""
-  json="$("$dep_updater" --report-json --dir "$repo" 2>"$dep_err_file")" || exit_code=$?
-  dep_err="$(cat "$dep_err_file" 2>/dev/null || true)"
-  rm -f "$dep_err_file" 2>/dev/null || true
+  cleanup_files+=("$dep_out_file" "$dep_err_file")
+  "$dep_updater" --report-json --dir "$repo" >"$dep_out_file" 2>"$dep_err_file" || exit_code=$?
 
   if [[ "$verbose" == '1' ]]; then
     log "  json:"
-    (printf '%s' "$json" | jq . 2>/dev/null || printf '%s\n' "$json") | sed 's/^/  /' >&2
+    (jq . <"$dep_out_file" 2>/dev/null || tail -n 80 "$dep_out_file") | sed 's/^/  /' >&2
   fi
 
-  if (( exit_code != 0 )) || ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
-    log "${repo_name}: scan failed (exit code ${exit_code})."
+  json_ok=0
+  if jq -e . <"$dep_out_file" >/dev/null 2>&1; then
+    json_ok=1
+  fi
+
+  if (( exit_code != 0 )) || (( json_ok == 0 )); then
+    fail_reason="exit code ${exit_code}"
+    if (( exit_code == 0 )) && (( json_ok == 0 )); then
+      fail_reason="invalid JSON on stdout (exit code 0)"
+    fi
+
+    log "${repo_name}: scan failed (${fail_reason})."
     found_failure=1
-    warn "${repo_name}: scan failed (exit code ${exit_code})."
-    append_report "=== ${repo_name} === (scan failed, exit code ${exit_code})"
-    append_report "Hint: cron often has a minimal PATH; ensure 'gt' and 'gh' are available."
-    if [[ -n "$dep_err" ]]; then
+    warn "${repo_name}: scan failed (${fail_reason})."
+    append_report "=== ${repo_name} === (scan failed, ${fail_reason})"
+    append_report "Hint: dep-updater --report-json must emit valid JSON on stdout."
+    append_report ""
+    append_report "stderr (last 80 lines):"
+    append_report "$(tail -n 80 "$dep_err_file" 2>/dev/null || true)"
+    if (( json_ok == 0 )); then
       append_report ""
-      append_report "stderr:"
-      append_report "$dep_err"
+      append_report "stdout (last 80 lines):"
+      append_report "$(tail -n 80 "$dep_out_file" 2>/dev/null || true)"
     fi
     append_report ""
     continue
   fi
 
-  has_updates="$(printf '%s' "$json" | jq -r '.has_updates')"
-  has_cves="$(printf '%s' "$json" | jq -r '.has_cves')"
+  has_updates="$(jq -r '.has_updates' <"$dep_out_file" 2>/dev/null || echo "")"
+  has_cves="$(jq -r '.has_cves' <"$dep_out_file" 2>/dev/null || echo "")"
 
   if [[ "$has_updates" != 'true' && "$has_cves" != 'true' ]]; then
     log "${repo_name}: up to date."
@@ -223,7 +241,7 @@ for repo in "${repos[@]}"; do
       fix="$(printf '%s' "$row" | jq -r '.fix')"
       cves="$(printf '%s' "$row" | jq -r '.cves')"
       report_lines+=("  $(printf '%-24s  %-10s  %-10s  %s' "$pkg" "$current" "$fix" "$cves")")
-    done < <(printf '%s' "$json" | jq -c '.cves[]')
+    done < <(jq -c '.cves[]' <"$dep_out_file")
     report_lines+=("")
   fi
 
@@ -256,7 +274,7 @@ for repo in "${repos[@]}"; do
       if (( local_count <= 3 )); then
         local_pairs="${local_pairs:+${local_pairs}, }${pkg} ${from}→${to}"
       fi
-    done < <(printf '%s' "$json" | jq -c '.updates[]')
+    done < <(jq -c '.updates[]' <"$dep_out_file")
 
     # Compute widths (cap PACKAGE to avoid huge lines in mail clients).
     for i in "${!ecosystems[@]}"; do
@@ -382,8 +400,5 @@ html_body="$(printf '%s' "$body" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
   || die "sendmail failed — is a mail transfer agent configured?"
 
 if (( found_failure == 1 )); then
-  if [[ "$verbose" != '1' ]]; then
-    printf '%s\n' "ERROR: dep-updater-notifier failed (see email for details)" >&2
-  fi
   exit 1
 fi
