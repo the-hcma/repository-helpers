@@ -278,8 +278,24 @@ log_stack_rebase_context() {
 
 log() {
   [[ "$quiet" == '1' ]] && return 0
-  local ts
-  ts="$(date '+%H:%M:%S.%3N')"
+  local ts ts_base tz epoch_real frac_us ms
+
+  # Timestamp goals:
+  # - local timezone (cron-safe, human interpretable)
+  # - milliseconds
+  # - do NOT rely on `date` nanosecond formats (like %N), which vary across platforms
+  ts_base="$(date '+%Y-%m-%d %H:%M:%S')"
+  tz="$(date '+%z')"
+
+  ms="000"
+  epoch_real="${EPOCHREALTIME:-}"
+  if [[ -n "$epoch_real" ]]; then
+    # EPOCHREALTIME is "<seconds>.<microseconds>" (Bash 5+). Use the first 3 digits as ms.
+    frac_us="${epoch_real#*.}"
+    ms="${frac_us:0:3}"
+  fi
+
+  ts="${ts_base}.${ms} ${tz}"
   if [[ -n "$log_color" ]]; then
     printf '%b%s  %s%b\n' "$log_color" "$ts" "$*" "$log_reset" >&2
   else
@@ -3472,9 +3488,9 @@ wait_for_ci() {
   local status raw merge_state already_merged
 
   if [[ -n "$target_sha" ]]; then
-    log "Waiting for CI on '${branch}' (head ${target_sha:0:8})…"
+    log "Waiting for CI: pr=#${pr_num} branch='${branch}' head=${target_sha:0:8}"
   else
-    log "Waiting for CI on '${branch}'…"
+    log "Waiting for CI: pr=#${pr_num} branch='${branch}'"
   fi
 
   [[ -n "$pr_num" ]] || die "CI gate requires a PR number for '${branch}'. Expected PR to exist after gt submit."
@@ -3502,20 +3518,20 @@ wait_for_ci() {
 
     case "$status" in
       success)
-        log "CI passed on '${branch}'."
+        log "CI passed: pr=#${pr_num} branch='${branch}'"
         return 0
         ;;
       failure)
-        die "CI failed on '${branch}'. Fix the failure and re-run."
+        die "CI failed: pr=#${pr_num} branch='${branch}'. Fix the failure and re-run."
         ;;
       missing)
         # GitHub hasn't scheduled CI yet — this is normal right after a push.
         # Keep polling; the 20-minute timeout guards against CI never being scheduled.
-        log "Waiting for CI to be scheduled on '${branch}'… ${wait_suffix}"
+        log "Still waiting for CI scheduling: pr=#${pr_num} branch='${branch}' status=${status} ${wait_suffix}"
         ;;
       *)
         # CI is running — log progress and break down per-workflow status.
-        log "CI running on '${branch}'… ${wait_suffix}"
+        log "Still waiting for CI completion: pr=#${pr_num} branch='${branch}' status=${status} ${wait_suffix}"
         ;;
     esac
 
@@ -3621,7 +3637,7 @@ wait_for_mergeable() {
         die "PR #${pr_num} has merge conflicts. Rebase the stack and re-run."
         ;;
       UNKNOWN|'')
-        : # GitHub is still computing — keep polling
+        log "Still waiting for merge conflict status: pr=#${pr_num} mergeable=${state}"
         ;;
     esac
     sleep 10
@@ -3642,6 +3658,7 @@ wait_for_mergeable_quick() {
   local elapsed=0
   local state
 
+  log "Checking merge conflict status (quick): pr=#${pr_num}"
   while true; do
     state="$(gh pr view "$pr_num" --repo "${repo_owner}/${repo_name}" --json mergeable --jq '.mergeable' 2>/dev/null || echo 'UNKNOWN')"
     case "$state" in
@@ -3654,7 +3671,7 @@ wait_for_mergeable_quick() {
         die "PR #${pr_num} has merge conflicts. Check that the worktree base matches origin/main and re-run."
         ;;
       UNKNOWN|'')
-        : # GitHub still computing
+        log "Still waiting for merge conflict status (quick): pr=#${pr_num} mergeable=${state} waited=${elapsed}s/${timeout_sec}s"
         ;;
     esac
     sleep 5
@@ -3867,7 +3884,6 @@ maybe_label_top_pr_for_merge() {
   local has_label
   has_label="$(gh api "repos/${repo_owner}/${repo_name}/issues/${top_pr}" --jq 'any(.labels[]?; .name == "merge-it")' 2>/dev/null || echo 'false')"
   if [[ "$has_label" == 'true' ]]; then
-    log "Top PR #${top_pr} already has merge-it label."
     return 0
   fi
 
@@ -4067,6 +4083,7 @@ poll_until_merged() {
   log "PRs: $(csv_pretty "$prs_csv")"
 
   local all_merged p merged pending_list check_rollup failed_check
+  local branches_csv top_branch top_pr top_has_label top_ci_status top_head wait_context
   while true; do
     # If we're waiting for merges, CI may finish after initial submission; ensure
     # the top PR gets merge-it (and my-tracks merge-mq) as soon as it becomes
@@ -4129,7 +4146,24 @@ poll_until_merged() {
       remaining_fmt="$(( remaining_sec / 60 ))m $(( remaining_sec % 60 ))s"
     fi
     wait_suffix="[waited ${elapsed_fmt} / ${timeout_min}m, ~${remaining_fmt} remaining, next check in ${poll_sec}s]"
-    log "Still waiting for: ${pending_list} ${wait_suffix}"
+    wait_context=""
+    branches_csv="$(state_get "branches" 2>/dev/null || true)"
+    top_branch="$(csv_last "$branches_csv")"
+    if [[ -n "$top_branch" ]]; then
+      top_pr="$(gh_pr_number_for_branch "$top_branch" 2>/dev/null || true)"
+      if [[ -n "$top_pr" ]] && is_valid_pr_number "$top_pr"; then
+        top_has_label="$(gh api "repos/${repo_owner}/${repo_name}/issues/${top_pr}" --jq 'any(.labels[]?; .name == "merge-it")' 2>/dev/null || echo 'unknown')"
+        top_ci_status="unknown"
+        if git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${top_branch}"; then
+          top_head="$(git -C "$worktree_path" rev-parse "$top_branch" 2>/dev/null || true)"
+          if [[ -n "$top_head" ]]; then
+            top_ci_status="$(ci_conclusion_for_head "$top_branch" "$top_head" 2>/dev/null || echo 'unknown')"
+          fi
+        fi
+        wait_context="(top=#${top_pr} merge-it=${top_has_label} ci=${top_ci_status})"
+      fi
+    fi
+    log "Still waiting for merge: ${pending_list} ${wait_context} ${wait_suffix}"
 
     sleep "$poll_sec"
     elapsed=$(( elapsed + poll_sec ))
@@ -4381,7 +4415,11 @@ batch_all_dispatch() {
 
     log "[batch-all] --- $(basename "$repo") (${repo}) ---"
     local repo_started_ms
-    repo_started_ms="$(date +%s%3N 2>/dev/null || date +%s000)"
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+      repo_started_ms="$(( ${EPOCHREALTIME/./} / 1000 ))"
+    else
+      repo_started_ms="$(date +%s000)"
+    fi
 
     child_args=()
     [[ "$dry_run" == '1' ]] && child_args+=(--dry-run)
@@ -4471,7 +4509,11 @@ batch_all_dispatch() {
       fi
     else
       local repo_finished_ms repo_elapsed_s
-      repo_finished_ms="$(date +%s%3N 2>/dev/null || date +%s000)"
+      if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        repo_finished_ms="$(( ${EPOCHREALTIME/./} / 1000 ))"
+      else
+        repo_finished_ms="$(date +%s000)"
+      fi
       repo_elapsed_s="$(( (repo_finished_ms - repo_started_ms) / 1000 ))"
       log "[batch-all] OK ($(basename "$repo")) (${repo_elapsed_s}s)"
     fi
