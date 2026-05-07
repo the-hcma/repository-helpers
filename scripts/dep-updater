@@ -4283,11 +4283,53 @@ discover_batch_all_repos() {
   done < <(tr ':' '\n' <<<"$scan_roots_csv" | sed '/^$/d')
 }
 
+_batch_all_interrupted=0
+_batch_all_active_child_pid=""
+_batch_all_active_child_fifo=""
+_batch_all_active_child_log=""
+
+# shellcheck disable=SC2317
+batch_all_cleanup_on_interrupt() {
+  _batch_all_interrupted=1
+
+  # Best-effort cleanup: kill active child and remove temp files.
+  if [[ -n "${_batch_all_active_child_pid:-}" ]]; then
+    kill -TERM "$_batch_all_active_child_pid" 2>/dev/null || true
+
+    # Give the child a moment to clean up (worktrees, tempfiles, etc.) before SIGKILL.
+    local tries
+    tries=0
+    while kill -0 "$_batch_all_active_child_pid" 2>/dev/null; do
+      tries=$((tries + 1))
+      [[ "$tries" -ge 5 ]] && break
+      sleep 0.2
+    done
+
+    if kill -0 "$_batch_all_active_child_pid" 2>/dev/null; then
+      kill -KILL "$_batch_all_active_child_pid" 2>/dev/null || true
+    fi
+  fi
+
+  if [[ -n "${_batch_all_active_child_fifo:-}" ]]; then
+    rm -f "$_batch_all_active_child_fifo" 2>/dev/null || true
+  fi
+  if [[ -n "${_batch_all_active_child_log:-}" ]]; then
+    rm -f "$_batch_all_active_child_log" 2>/dev/null || true
+  fi
+
+  log "[batch-all] Interrupted."
+}
+
 batch_all_dispatch() {
   local dep_self repo child_exit worst_exit
   local -a child_args repos_found
   local -a failure_summaries=()
   local -a failure_details=()
+  _batch_all_interrupted=0
+  _batch_all_active_child_pid=""
+  _batch_all_active_child_fifo=""
+  _batch_all_active_child_log=""
+  trap batch_all_cleanup_on_interrupt INT TERM
 
   dep_self=""
   dep_self="$(realpath "${BASH_SOURCE[0]}")" \
@@ -4306,8 +4348,11 @@ batch_all_dispatch() {
 
   for repo in "${repos_found[@]}"; do
     [[ -z "$repo" ]] && continue
+    [[ "$_batch_all_interrupted" == '1' ]] && break
 
     log "[batch-all] --- $(basename "$repo") (${repo}) ---"
+    local repo_started_ms
+    repo_started_ms="$(date +%s%3N 2>/dev/null || date +%s000)"
 
     child_args=()
     [[ "$dry_run" == '1' ]] && child_args+=(--dry-run)
@@ -4327,31 +4372,33 @@ batch_all_dispatch() {
     child_log="$(mktemp)"
     child_fifo="$(mktemp -u)"
     mkfifo "$child_fifo"
+    _batch_all_active_child_log="$child_log"
+    _batch_all_active_child_fifo="$child_fifo"
 
-    # Stream child output into a file, but only surface specific warnings live.
-    # (This avoids holding up all batch-all output until the child finishes.)
+    # Stream ALL child output live, while also capturing it for concise failure summaries.
+    # Use a fifo so we also have a child PID to kill on Ctrl-C.
     set +e
     "$dep_self" "${child_args[@]}" >"$child_fifo" 2>&1 &
     child_pid=$!
-    set -e
+    _batch_all_active_child_pid="$child_pid"
 
-    local line pnpm_warned
-    pnpm_warned=0
+    local line
     while IFS= read -r line; do
+      printf '%s\n' "$line"
       printf '%s\n' "$line" >>"$child_log"
-      # Surface only pnpm ignored-build warnings as they happen.
-      if [[ "$line" == *"ERR_PNPM_IGNORED_BUILDS"* ]] || [[ "$line" == *"[pnpm] WARNING:"* ]]; then
-        # Strip ANSI for clean output.
-        line="$(printf '%s' "$line" | sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g')"
-        if [[ "$pnpm_warned" == '0' ]]; then
-          log "[batch-all] pnpm blocked dependency build scripts in $(basename "$repo") (ERR_PNPM_IGNORED_BUILDS)."
-          pnpm_warned=1
-        fi
-        log "[batch-all] ${line}"
-      fi
     done <"$child_fifo"
+
     wait "$child_pid" || child_exit=$?
     rm -f "$child_fifo"
+    _batch_all_active_child_pid=""
+    _batch_all_active_child_fifo=""
+    set -e
+
+    if [[ "$_batch_all_interrupted" == '1' ]]; then
+      rm -f "$child_log"
+      _batch_all_active_child_log=""
+      break
+    fi
 
     if [[ "$child_exit" -ne 0 ]]; then
       log "[batch-all] FAILED (${repo}) exit ${child_exit}"
@@ -4388,9 +4435,20 @@ batch_all_dispatch() {
       if [[ "$worst_exit" -eq 0 ]] || [[ "$child_exit" -gt "$worst_exit" ]]; then
         worst_exit="$child_exit"
       fi
+    else
+      local repo_finished_ms repo_elapsed_s
+      repo_finished_ms="$(date +%s%3N 2>/dev/null || date +%s000)"
+      repo_elapsed_s="$(( (repo_finished_ms - repo_started_ms) / 1000 ))"
+      log "[batch-all] OK ($(basename "$repo")) (${repo_elapsed_s}s)"
     fi
     rm -f "$child_log"
+    _batch_all_active_child_log=""
   done
+
+  if [[ "$_batch_all_interrupted" == '1' ]]; then
+    trap - INT TERM
+    return 130
+  fi
 
   if [[ "$worst_exit" -ne 0 ]]; then
     log "[batch-all] Finished with failures (exit ${worst_exit})."
