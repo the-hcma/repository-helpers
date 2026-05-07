@@ -115,6 +115,10 @@ log_reset=""
 repo_owner=""
 repo_name=""
 
+# If pnpm install hits ERR_PNPM_IGNORED_BUILDS, we can continue by re-running
+# installs with --ignore-scripts (dependency updates can still be committed).
+pnpm_use_ignore_scripts=0
+
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
@@ -643,6 +647,71 @@ check_core_prereqs() {
   fi
 }
 
+# Detect pnpm's "ignored builds" safety gate in output.
+pnpm_output_has_ignored_builds() {
+  local -r output_file="$1"
+  [[ -f "$output_file" ]] || return 1
+  rg -q 'ERR_PNPM_IGNORED_BUILDS|pnpm approve-builds|approve-builds' "$output_file"
+}
+
+pnpm_install_worktree() {
+  local -r mode="$1" # frozen | no-frozen
+  local -r workdir="$2"
+
+  local -a args=()
+  args+=(install --prefer-offline)
+  if [[ "$mode" == 'frozen' ]]; then
+    args+=(--frozen-lockfile)
+  else
+    args+=(--no-frozen-lockfile)
+  fi
+  if [[ "$pnpm_use_ignore_scripts" == '1' ]]; then
+    args+=(--ignore-scripts)
+  fi
+
+  local pnpm_log pnpm_exit
+  pnpm_log="$(mktemp)"
+
+  set +e
+  (cd "$workdir" && pnpm "${args[@]}") >"$pnpm_log" 2>&1
+  pnpm_exit=$?
+  set -e
+
+  if (( pnpm_exit == 0 )); then
+    rm -f "$pnpm_log"
+    return 0
+  fi
+
+  # If pnpm is blocking builds, offer an alternate path: ignore scripts for this run.
+  if pnpm_output_has_ignored_builds "$pnpm_log"; then
+    log "[pnpm] WARNING: pnpm refused to run build scripts (ERR_PNPM_IGNORED_BUILDS)."
+    log "[pnpm] WARNING: This is a supply-chain safety gate. You can resolve it permanently with:"
+    log "[pnpm] WARNING:   pnpm approve-builds   (interactive)"
+    log "[pnpm] WARNING:   pnpm approve-builds --all   (non-interactive)"
+    if [[ "$pnpm_use_ignore_scripts" == '0' ]]; then
+      if is_interactive; then
+        if prompt_yes_no "Proceed with pnpm installs using --ignore-scripts for this run?" "y"; then
+          pnpm_use_ignore_scripts=1
+          rm -f "$pnpm_log"
+          pnpm_install_worktree "$mode" "$workdir"
+          return $?
+        fi
+      else
+        pnpm_use_ignore_scripts=1
+        log "[pnpm] Non-interactive mode: continuing with --ignore-scripts so other updates can proceed."
+        rm -f "$pnpm_log"
+        pnpm_install_worktree "$mode" "$workdir"
+        return $?
+      fi
+    fi
+  fi
+
+  printf '%s\n' "pnpm install failed (exit ${pnpm_exit}). Last output:" >&2
+  tail -n 80 "$pnpm_log" | sed 's/^/  /' >&2
+  rm -f "$pnpm_log"
+  return "$pnpm_exit"
+}
+
 # ---------------------------------------------------------------------------
 # Prerequisite checks — report-only mode (no PR creation)
 # ---------------------------------------------------------------------------
@@ -1147,7 +1216,8 @@ create_worktree() {
   if [[ "$has_npm" == '1' ]]; then
     if [[ -f "$worktree_path/pnpm-lock.yaml" ]]; then
       log "[worktree] Installing dependencies (pnpm)…"
-      (cd "$worktree_path" && pnpm install --prefer-offline --frozen-lockfile) >&2
+      pnpm_install_worktree frozen "$worktree_path" \
+        || die "pnpm install failed."
     elif [[ -f "$worktree_path/package-lock.json" ]]; then
       log "[worktree] Installing dependencies (npm)…"
       (cd "$worktree_path" && npm ci --prefer-offline --no-audit --no-fund) >&2
@@ -1688,7 +1758,8 @@ npm_update_group() {
 
         # --no-frozen-lockfile lets pnpm rebuild pnpm-lock.yaml from the
         # freshly patched package.json so specifiers are consistent.
-        pnpm --dir "$worktree_path" install --no-frozen-lockfile
+        pnpm_install_worktree no-frozen "$worktree_path" \
+          || die "pnpm install failed."
       fi
       ;;
     yarn)
@@ -2018,7 +2089,7 @@ npm_security_update() {
   case "$npm_tool" in
     pnpm)
       pnpm --dir "$worktree_path" audit --fix 2>/dev/null \
-        || pnpm --dir "$worktree_path" install --no-frozen-lockfile
+        || pnpm_install_worktree no-frozen "$worktree_path"
       ;;
     yarn)
       # yarn has no native audit --fix; upgrade the vulnerable packages directly.
@@ -2947,7 +3018,7 @@ batch_update_all() {
         fi
         mv "$tmp_pkg" "${worktree_path}/package.json"
         case "$npm_tool" in
-          pnpm) pnpm --dir "$worktree_path" install --no-frozen-lockfile ;;
+          pnpm) pnpm_install_worktree no-frozen "$worktree_path" ;;
           npm)  npm install --prefix "$worktree_path" ;;
         esac
       fi
@@ -4166,6 +4237,7 @@ discover_batch_all_repos() {
 batch_all_dispatch() {
   local dep_self repo child_exit worst_exit
   local -a child_args repos_found
+  local -a failure_summaries=()
 
   dep_self=""
   dep_self="$(realpath "${BASH_SOURCE[0]}")" \
@@ -4201,18 +4273,37 @@ batch_all_dispatch() {
     child_args+=(--dir "$repo")
 
     child_exit=0
-    "$dep_self" "${child_args[@]}" || child_exit=$?
+    local child_log
+    child_log="$(mktemp)"
+    set +e
+    "$dep_self" "${child_args[@]}" >"$child_log" 2>&1
+    child_exit=$?
+    set -e
 
     if [[ "$child_exit" -ne 0 ]]; then
       log "[batch-all] FAILED (${repo}) exit ${child_exit}"
+      log "[batch-all] Failure tail (last 80 lines):"
+      tail -n 80 "$child_log" | sed 's/^/[batch-all]   /' >&2
+      if pnpm_output_has_ignored_builds "$child_log"; then
+        log "[batch-all] Hint: pnpm blocked dependency build scripts in this repo. Run pnpm approve-builds (or --all)."
+      fi
+      failure_summaries+=("$(basename "$repo"): exit ${child_exit}")
       if [[ "$worst_exit" -eq 0 ]] || [[ "$child_exit" -gt "$worst_exit" ]]; then
         worst_exit="$child_exit"
       fi
     fi
+    rm -f "$child_log"
   done
 
   if [[ "$worst_exit" -ne 0 ]]; then
     log "[batch-all] Finished with failures (exit ${worst_exit})."
+    if [[ ${#failure_summaries[@]} -gt 0 ]]; then
+      log "[batch-all] Failure summary:"
+      local fs
+      for fs in "${failure_summaries[@]}"; do
+        log "[batch-all]   ${fs}"
+      done
+    fi
   else
     log "[batch-all] All repos completed successfully."
   fi
