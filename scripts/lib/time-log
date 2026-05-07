@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Shared time + TZ warning helpers for scripts/*.
+#
+# Requirements:
+# - bash >= 5 (EPOCHREALTIME)
+# - no GNU-specific `date` nanosecond formatting (%N/%3N)
+set -euo pipefail
+
+time_log_detect_system_tz() {
+  # Best-effort detection of the machine's configured IANA timezone.
+  # Emits the timezone (e.g. "America/New_York") or an empty string.
+  local tz
+  tz=""
+
+  if command -v timedatectl >/dev/null 2>&1; then
+    tz="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+    if [[ -n "$tz" ]]; then
+      printf '%s\n' "$tz"
+      return 0
+    fi
+  fi
+
+  if [[ -f /etc/timezone ]]; then
+    tz="$(tr -d ' \t\r\n' </etc/timezone 2>/dev/null || true)"
+    if [[ -n "$tz" ]]; then
+      printf '%s\n' "$tz"
+      return 0
+    fi
+  fi
+
+  # Try to derive from /etc/localtime → .../zoneinfo/<Region>/<City>
+  if command -v readlink >/dev/null 2>&1; then
+    local tz_link
+    tz_link="$(readlink -f /etc/localtime 2>/dev/null || true)"
+    if [[ -n "$tz_link" && "$tz_link" == */zoneinfo/* ]]; then
+      tz="${tz_link##*/zoneinfo/}"
+      if [[ -n "$tz" ]]; then
+        printf '%s\n' "$tz"
+        return 0
+      fi
+    fi
+  fi
+
+  printf '\n'
+}
+
+time_log_timestamp() {
+  local ts_base tz epoch_real frac_us ms
+  ts_base="$(date '+%Y-%m-%d %H:%M:%S')"
+  tz="$(date '+%z')"
+
+  ms="000"
+  epoch_real="${EPOCHREALTIME:-}"
+  if [[ -n "$epoch_real" ]]; then
+    frac_us="${epoch_real#*.}"
+    ms="${frac_us:0:3}"
+  fi
+
+  printf '%s.%s %s\n' "$ts_base" "$ms" "$tz"
+}
+
+log() {
+  # Shared logger for scripts/*.
+  #
+  # Config (all optional):
+  # - TIME_LOG_ENABLED=0|1 (default: 1)
+  # - TIME_LOG_WARN_TZ=0|1 (default: 0) — emit POSIX-TZ-treated-as-UTC warning once
+  # - TIME_LOG_WARN_PREFIX (default: "WARNING:")
+  # - TIME_LOG_COLOR_START / TIME_LOG_COLOR_RESET (default: empty)
+  local -r msg="$*"
+  local ts
+
+  [[ "${TIME_LOG_ENABLED:-1}" == '1' ]] || return 0
+
+  if [[ "${TIME_LOG_WARN_TZ:-0}" == '1' ]]; then
+    time_log_warn_posix_tz_treated_as_utc 1 "${TIME_LOG_WARN_PREFIX:-WARNING:}"
+  fi
+
+  ts="$(time_log_timestamp)"
+  if [[ -n "${TIME_LOG_COLOR_START:-}" ]]; then
+    printf '%b%s  %s%b\n' "${TIME_LOG_COLOR_START}" "$ts" "$msg" "${TIME_LOG_COLOR_RESET:-}" >&2
+  else
+    printf '%s  %s\n' "$ts" "$msg" >&2
+  fi
+}
+
+time_log_warn_posix_tz_treated_as_utc() {
+  # Args:
+  #   enabled (0/1): whether to emit warnings at all
+  #   warn_prefix: "WARNING:" style prefix (include colon)
+  # Emits at most once per process.
+  local -r enabled="${1:-0}"
+  local -r warn_prefix="${2:-WARNING:}"
+
+  [[ "$enabled" == '1' ]] || return 0
+
+  # Avoid repeat spam when called from per-line logging.
+  if [[ "${__time_log_warned_posix_tz:-0}" == '1' ]]; then
+    return 0
+  fi
+
+  local tz_val date_zone
+  tz_val="${TZ:-}"
+  [[ -n "$tz_val" ]] || return 0
+  [[ "$tz_val" != 'UTC' && "$tz_val" != 'Etc/UTC' ]] || return 0
+
+  # POSIX TZ strings look like: EST5EDT, CST6CDT, etc.
+  if [[ ! "$tz_val" =~ ^[A-Za-z]{3,}[0-9]+[A-Za-z]{3,}$ ]]; then
+    return 0
+  fi
+
+  date_zone="$(date '+%z %Z' 2>/dev/null || echo '')"
+  if [[ "$date_zone" == '+0000 UTC' ]]; then
+    __time_log_warned_posix_tz=1
+    printf "%s TZ='%s' looks like an outdated POSIX timezone string, and your 'date' is treating it as UTC.\n" \
+      "$warn_prefix" "$tz_val" >&2
+    printf "%s Falling back to UTC timestamps. Fix: set TZ to an IANA zone (e.g. America/New_York) or pass --tz.\n" \
+      "$warn_prefix" >&2
+  fi
+}
+
