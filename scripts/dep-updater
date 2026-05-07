@@ -85,6 +85,7 @@ wt_tmpdir=""
 quiet=0
 report_json=0
 log_tz="${TZ:-}"
+print_tz_only=0
 
 # Newline-separated list of workflow names that trigger on pull_request events.
 # Populated by detect_ci_workflows(); empty means "all runs" (fallback).
@@ -484,6 +485,7 @@ Options:
   --merge-timeout <min>  Minutes to wait for all PRs to merge (default: 15)
   --no-wait-ci      Skip CI polling between PRs
   --no-wait-merge   Exit after stack is submitted; print cleanup command
+  --print-tz        Print effective timezone info and exit
   --quiet           Suppress non-error log lines
   --report-json     Emit JSON scan report on stdout (implies --dry-run --quiet)
   --scan-root <path>  Parent directory whose immediate child folders are git clones
@@ -547,6 +549,9 @@ parse_args() {
         ;;
       --no-wait-merge)
         no_wait_merge=1
+        ;;
+      --print-tz)
+        print_tz_only=1
         ;;
       --quiet)
         quiet=1
@@ -638,12 +643,33 @@ parse_args() {
     wt_tmpdir="$(cd "$wt_tmpdir" && pwd)"
   fi
 
+  # Ensure logs use the user's local timezone even when TZ isn't exported (common in
+  # minimal environments). `--tz` / $TZ still take precedence.
   if [[ -n "$log_tz" ]]; then
     export TZ="$log_tz"
+  elif [[ -z "${TZ:-}" ]]; then
+    local detected_tz=""
+    if command -v timedatectl >/dev/null 2>&1; then
+      detected_tz="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+    fi
+    if [[ -z "$detected_tz" && -f /etc/timezone ]]; then
+      detected_tz="$(tr -d ' \t\r\n' </etc/timezone 2>/dev/null || true)"
+    fi
+    if [[ -z "$detected_tz" ]] && command -v readlink >/dev/null 2>&1; then
+      local tz_link=""
+      tz_link="$(readlink -f /etc/localtime 2>/dev/null || true)"
+      if [[ -n "$tz_link" && "$tz_link" == */zoneinfo/* ]]; then
+        detected_tz="${tz_link##*/zoneinfo/}"
+      fi
+    fi
+    if [[ -n "$detected_tz" ]]; then
+      export TZ="$detected_tz"
+      log_tz="$detected_tz"
+    fi
   fi
 
   # shellcheck disable=SC2034  # cleanup_mode, rebase_mode, merge_timeout_min used in main() dispatch
-  readonly dry_run cleanup_mode rebase_mode dir ecosystem semver_only no_wait_ci no_wait_merge security_only batch batch_all merge_timeout_min wt_tmpdir quiet report_json scan_roots_csv log_tz
+  readonly dry_run cleanup_mode rebase_mode dir ecosystem semver_only no_wait_ci no_wait_merge security_only batch batch_all merge_timeout_min wt_tmpdir quiet report_json scan_roots_csv log_tz print_tz_only
 }
 
 # ---------------------------------------------------------------------------
@@ -4567,6 +4593,19 @@ batch_all_dispatch() {
 main() {
   parse_args "$@"
   init_prompt_style
+
+  if [[ "$print_tz_only" == '1' ]]; then
+    printf 'dep-updater tz debug:\n' >&2
+    printf '  env.TZ=%s\n' "${TZ-<unset>}" >&2
+    printf '  log_tz=%s\n' "${log_tz-<unset>}" >&2
+    printf '  date=%s\n' "$(date '+%Y-%m-%d %H:%M:%S %z %Z' 2>/dev/null || echo '<date failed>')" >&2
+    if command -v timedatectl >/dev/null 2>&1; then
+      printf '  timedatectl.Timezone=%s\n' "$(timedatectl show -p Timezone --value 2>/dev/null || echo '<unknown>')" >&2
+    else
+      printf '  timedatectl.Timezone=%s\n' "<timedatectl missing>" >&2
+    fi
+    exit 0
+  fi
 
   if [[ "$batch_all" == '1' ]]; then
     check_core_prereqs
