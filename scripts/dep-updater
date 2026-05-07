@@ -1361,6 +1361,60 @@ npm_outdated() {
     esac
   fi
 
+  # pnpm outdated can miss updates that are allowed by package.json ranges but
+  # not yet captured in pnpm-lock.yaml (e.g. react ^19.2.5 when 19.2.6 exists).
+  # In "latest" mode, compute direct-dependency updates by comparing the
+  # installed version (pnpm list) to the registry's latest (pnpm view).
+  if [[ "$tool" == 'pnpm' && "$semver_only" == '0' ]]; then
+    local pkg_json_specs
+    if [[ -f "${scan_root}/package.json" ]]; then
+      pkg_json_specs="$(jq -c \
+        '[.dependencies, .devDependencies, .peerDependencies, .optionalDependencies]
+         | map(select(. != null)) | add // {}' \
+        "${scan_root}/package.json" 2>/dev/null || echo '{}')"
+    else
+      pkg_json_specs='{}'
+    fi
+
+    local tmp_list
+    tmp_list="$(mktemp)"
+    if ! pnpm --dir "$scan_root" list --depth 0 --json >"$tmp_list" 2>/dev/null; then
+      rm -f "$tmp_list"
+      die "pnpm list failed (needed for outdated detection)."
+    fi
+
+    local pkgs_json
+    pkgs_json="$(printf '%s' "$pkg_json_specs" | jq -c 'keys' 2>/dev/null || echo '[]')"
+
+    local pkg spec current latest sort_winner
+    while IFS= read -r pkg; do
+      [[ -z "$pkg" ]] && continue
+      spec="$(printf '%s' "$pkg_json_specs" | jq -r --arg p "$pkg" '.[$p] // ""' 2>/dev/null || echo "")"
+      # Skip packages whose specifier is a local/git reference; those are never version-bumped.
+      if [[ -n "$spec" ]] && [[ "$spec" =~ ^(workspace:|file:|link:|git) ]]; then
+        continue
+      fi
+      current="$(jq -r --arg p "$pkg" '
+        .[0] as $root
+        | ($root.dependencies[$p].version // $root.devDependencies[$p].version // $root.optionalDependencies[$p].version // $root.peerDependencies[$p].version // "")
+      ' "$tmp_list" 2>/dev/null || echo "")"
+      [[ -z "$current" ]] && continue
+
+      latest="$(pnpm view "$pkg" version 2>/dev/null || true)"
+      [[ -z "$latest" ]] && continue
+      [[ "$current" == "$latest" ]] && continue
+
+      # Only advance — never downgrade.
+      sort_winner="$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -1)"
+      if [[ "$sort_winner" == "$latest" ]]; then
+        printf '%s %s %s\n' "$pkg" "$current" "$latest"
+      fi
+    done < <(printf '%s' "$pkgs_json" | jq -r '.[]' 2>/dev/null || true)
+
+    rm -f "$tmp_list"
+    return 0
+  fi
+
   local tmp_json exit_code
   tmp_json="$(mktemp)"
   set +e
@@ -2534,6 +2588,23 @@ gha_outdated() {
   local -a seen_actions=()
   local line action ref
 
+    _gha_latest_semver_tag() {
+      local -r action="$1"
+      local tags_json
+      tags_json="$(gh api "repos/${action}/tags?per_page=100" 2>/dev/null || true)"
+      if [[ -z "$tags_json" ]]; then
+        return 0
+      fi
+      local best
+      best="$(printf '%s' "$tags_json" \
+        | jq -r '.[].name' 2>/dev/null \
+        | awk '/^v?[0-9]+([.][0-9]+){0,3}([-.].*)?$/ {print}' \
+        | sed -E 's/^v//' \
+        | sort -V | tail -1)"
+      [[ -z "$best" ]] && return 0
+      printf 'v%s' "$best"
+    }
+
   _gha_latest_major_tag() {
     local -r action="$1"
     local tags_json
@@ -2588,8 +2659,12 @@ gha_outdated() {
     # Guard against 404 / API errors: the response may be a JSON error object
     # rather than a bare tag string when the repo has no releases.
     if [[ -z "$latest_tag" ]] || [[ ! "$latest_tag" =~ ^v?[0-9] ]]; then
-      log "[github-actions] No release found for ${action} — skipping."
-      continue
+      # Many actions do not publish GitHub Releases; fall back to the latest semver-ish tag.
+      latest_tag="$(_gha_latest_semver_tag "$action")"
+      if [[ -z "$latest_tag" ]] || [[ ! "$latest_tag" =~ ^v?[0-9] ]]; then
+        log "[github-actions] No release or semver tag found for ${action} — skipping."
+        continue
+      fi
     fi
 
     # Determine the new ref based on the current pin style.
