@@ -4288,6 +4288,25 @@ batch_all_dispatch() {
   local -a child_args repos_found
   local -a failure_summaries=()
   local -a failure_details=()
+  local batch_all_interrupted
+  batch_all_interrupted=0
+  local active_child_pid active_child_fifo active_child_log
+  active_child_pid=""
+  active_child_fifo=""
+  active_child_log=""
+
+  batch_all_cleanup_on_interrupt() {
+    batch_all_interrupted=1
+    # Best-effort cleanup: kill active child and remove temp files.
+    if [[ -n "${active_child_pid:-}" ]]; then
+      kill -TERM "$active_child_pid" 2>/dev/null || true
+      kill -KILL "$active_child_pid" 2>/dev/null || true
+    fi
+    [[ -n "${active_child_fifo:-}" ]] && rm -f "$active_child_fifo" 2>/dev/null || true
+    [[ -n "${active_child_log:-}" ]] && rm -f "$active_child_log" 2>/dev/null || true
+    log "[batch-all] Interrupted."
+  }
+  trap batch_all_cleanup_on_interrupt INT TERM
 
   dep_self=""
   dep_self="$(realpath "${BASH_SOURCE[0]}")" \
@@ -4306,6 +4325,7 @@ batch_all_dispatch() {
 
   for repo in "${repos_found[@]}"; do
     [[ -z "$repo" ]] && continue
+    [[ "$batch_all_interrupted" == '1' ]] && break
 
     log "[batch-all] --- $(basename "$repo") (${repo}) ---"
     local repo_started_ms
@@ -4325,14 +4345,37 @@ batch_all_dispatch() {
     child_args+=(--dir "$repo")
 
     child_exit=0
-    local child_log
+    local child_log child_fifo child_pid
     child_log="$(mktemp)"
+    child_fifo="$(mktemp -u)"
+    mkfifo "$child_fifo"
+    active_child_log="$child_log"
+    active_child_fifo="$child_fifo"
 
-    # Stream child output live as usual, while also capturing it for concise failure summaries.
+    # Stream ALL child output live, while also capturing it for concise failure summaries.
+    # Use a fifo so we also have a child PID to kill on Ctrl-C.
     set +e
-    "$dep_self" "${child_args[@]}" 2>&1 | tee "$child_log"
-    child_exit="${PIPESTATUS[0]}"
+    "$dep_self" "${child_args[@]}" >"$child_fifo" 2>&1 &
+    child_pid=$!
+    active_child_pid="$child_pid"
+
+    local line
+    while IFS= read -r line; do
+      printf '%s\n' "$line"
+      printf '%s\n' "$line" >>"$child_log"
+    done <"$child_fifo"
+
+    wait "$child_pid" || child_exit=$?
+    rm -f "$child_fifo"
+    active_child_pid=""
+    active_child_fifo=""
     set -e
+
+    if [[ "$batch_all_interrupted" == '1' ]]; then
+      rm -f "$child_log"
+      active_child_log=""
+      break
+    fi
 
     if [[ "$child_exit" -ne 0 ]]; then
       log "[batch-all] FAILED (${repo}) exit ${child_exit}"
@@ -4376,7 +4419,13 @@ batch_all_dispatch() {
       log "[batch-all] OK ($(basename "$repo")) (${repo_elapsed_s}s)"
     fi
     rm -f "$child_log"
+    active_child_log=""
   done
+
+  if [[ "$batch_all_interrupted" == '1' ]]; then
+    trap - INT TERM
+    return 130
+  fi
 
   if [[ "$worst_exit" -ne 0 ]]; then
     log "[batch-all] Finished with failures (exit ${worst_exit})."
