@@ -115,9 +115,7 @@ log_reset=""
 repo_owner=""
 repo_name=""
 
-# If pnpm install hits ERR_PNPM_IGNORED_BUILDS, we can continue by re-running
-# installs with --ignore-scripts (dependency updates can still be committed).
-pnpm_use_ignore_scripts=0
+pnpm_ignored_build_pkgs=""
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -654,6 +652,40 @@ pnpm_output_has_ignored_builds() {
   rg -q 'ERR_PNPM_IGNORED_BUILDS|pnpm approve-builds|approve-builds' "$output_file"
 }
 
+pnpm_record_ignored_build_pkgs() {
+  local -r output_file="$1"
+  [[ -f "$output_file" ]] || return 0
+
+  # Example:
+  #   [ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: esbuild@0.27.7, esbuild@0.28.0
+  local ignored_line
+  ignored_line="$(rg -m 1 -o 'Ignored build scripts:.*' "$output_file" 2>/dev/null || true)"
+  [[ -z "$ignored_line" ]] && return 0
+  ignored_line="${ignored_line#Ignored build scripts: }"
+
+  local pkg_item pkg_name
+  while IFS= read -r pkg_item; do
+    pkg_item="$(printf '%s' "$pkg_item" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -z "$pkg_item" ]] && continue
+    pkg_name="${pkg_item%%@*}"
+    [[ -z "$pkg_name" ]] && continue
+    if [[ -z "$pnpm_ignored_build_pkgs" ]]; then
+      pnpm_ignored_build_pkgs="$pkg_name"
+    else
+      if ! printf '%s\n' "$pnpm_ignored_build_pkgs" | rg -qx --fixed-strings "$pkg_name"; then
+        pnpm_ignored_build_pkgs="${pnpm_ignored_build_pkgs}
+${pkg_name}"
+      fi
+    fi
+  done < <(tr ',' '\n' <<<"$ignored_line")
+}
+
+pnpm_pkg_is_ignored_build() {
+  local -r pkg="$1"
+  [[ -z "$pnpm_ignored_build_pkgs" ]] && return 1
+  printf '%s\n' "$pnpm_ignored_build_pkgs" | rg -qx --fixed-strings "$pkg"
+}
+
 pnpm_install_worktree() {
   local -r mode="$1" # frozen | no-frozen
   local -r workdir="$2"
@@ -664,9 +696,6 @@ pnpm_install_worktree() {
     args+=(--frozen-lockfile)
   else
     args+=(--no-frozen-lockfile)
-  fi
-  if [[ "$pnpm_use_ignore_scripts" == '1' ]]; then
-    args+=(--ignore-scripts)
   fi
 
   local pnpm_log pnpm_exit
@@ -682,28 +711,24 @@ pnpm_install_worktree() {
     return 0
   fi
 
-  # If pnpm is blocking builds, offer an alternate path: ignore scripts for this run.
+  # If pnpm is blocking builds, record the package(s) and continue.
   if pnpm_output_has_ignored_builds "$pnpm_log"; then
+    pnpm_record_ignored_build_pkgs "$pnpm_log"
     log "[pnpm] WARNING: pnpm refused to run build scripts (ERR_PNPM_IGNORED_BUILDS)."
-    log "[pnpm] WARNING: This is a supply-chain safety gate. You can resolve it permanently with:"
-    log "[pnpm] WARNING:   pnpm approve-builds   (interactive)"
-    log "[pnpm] WARNING:   pnpm approve-builds --all   (non-interactive)"
-    if [[ "$pnpm_use_ignore_scripts" == '0' ]]; then
-      if is_interactive; then
-        if prompt_yes_no "Proceed with pnpm installs using --ignore-scripts for this run?" "y"; then
-          pnpm_use_ignore_scripts=1
-          rm -f "$pnpm_log"
-          pnpm_install_worktree "$mode" "$workdir"
-          return $?
-        fi
-      else
-        pnpm_use_ignore_scripts=1
-        log "[pnpm] Non-interactive mode: continuing with --ignore-scripts so other updates can proceed."
-        rm -f "$pnpm_log"
-        pnpm_install_worktree "$mode" "$workdir"
-        return $?
-      fi
+    log "[pnpm] WARNING: This is a supply-chain safety gate. To resolve permanently, run:"
+    log "[pnpm] WARNING:   pnpm approve-builds"
+    log "[pnpm] WARNING: Or one-shot non-interactive:"
+    log "[pnpm] WARNING:   pnpm approve-builds --all"
+    if [[ -n "$pnpm_ignored_build_pkgs" ]]; then
+      log "[pnpm] WARNING: Skipping updates for packages requiring build approval:"
+      local p
+      while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        log "[pnpm] WARNING:   ${p}"
+      done <<< "$pnpm_ignored_build_pkgs"
     fi
+    rm -f "$pnpm_log"
+    return 0
   fi
 
   printf '%s\n' "pnpm install failed (exit ${pnpm_exit}). Last output:" >&2
@@ -1459,6 +1484,9 @@ npm_outdated() {
     local pkg spec current latest sort_winner
     while IFS= read -r pkg; do
       [[ -z "$pkg" ]] && continue
+      if pnpm_pkg_is_ignored_build "$pkg"; then
+        continue
+      fi
       spec="$(printf '%s' "$pkg_json_specs" | jq -r --arg p "$pkg" '.[$p] // ""' 2>/dev/null || echo "")"
       # Skip packages whose specifier is a local/git reference; those are never version-bumped.
       if [[ -n "$spec" ]] && [[ "$spec" =~ ^(workspace:|file:|link:|git) ]]; then
