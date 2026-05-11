@@ -716,6 +716,49 @@ pnpm_pkg_is_ignored_build() {
   printf '%s\n' "$pnpm_ignored_build_pkgs" | rg -qx --fixed-strings "$pkg"
 }
 
+# install_with_net_retry <label> <workdir> <cmd> [args…]
+# Runs <cmd> in <workdir> up to 4 times (30 / 60 / 90 s linear backoff) when
+# the output suggests a transient network error.  On success or a non-transient
+# failure, returns immediately.  Captures all output; prints the tail on error.
+install_with_net_retry() {
+  local -r label="$1"
+  local -r workdir="$2"
+  shift 2
+
+  local install_log attempt delay exit_code
+  install_log="$(mktemp)"
+  exit_code=0
+
+  for attempt in 1 2 3 4; do
+    set +e
+    (cd "$workdir" && "$@") >"$install_log" 2>&1
+    exit_code=$?
+    set -e
+
+    if (( exit_code == 0 )); then
+      rm -f "$install_log"
+      return 0
+    fi
+
+    if grep -qiE \
+         'ECONNRESET|ETIMEDOUT|ENOTFOUND|network error|fetch failed|connection reset|connection refused|Read timed out|ConnectTimeout|connection error' \
+         "$install_log" \
+       && [[ "$attempt" -lt 4 ]]; then
+      delay=$(( attempt * 30 ))
+      log "[${label}] WARNING: transient network error; attempt ${attempt}/3, retrying in ${delay}s…"
+      sleep "$delay"
+      continue
+    fi
+
+    break
+  done
+
+  printf '%s\n' "${label} install failed (exit ${exit_code}). Last output:" >&2
+  tail -n 80 "$install_log" | sed 's/^/  /' >&2
+  rm -f "$install_log"
+  return "$exit_code"
+}
+
 pnpm_install_worktree() {
   local -r mode="$1" # frozen | no-frozen
   local -r workdir="$2"
@@ -728,38 +771,56 @@ pnpm_install_worktree() {
     args+=(--no-frozen-lockfile)
   fi
 
-  local pnpm_log pnpm_exit
+  local pnpm_log pnpm_exit attempt delay p retryable
   pnpm_log="$(mktemp)"
 
-  set +e
-  (cd "$workdir" && pnpm "${args[@]}") >"$pnpm_log" 2>&1
-  pnpm_exit=$?
-  set -e
+  for attempt in 1 2 3 4; do
+    set +e
+    (cd "$workdir" && pnpm "${args[@]}") >"$pnpm_log" 2>&1
+    pnpm_exit=$?
+    set -e
 
-  if (( pnpm_exit == 0 )); then
-    rm -f "$pnpm_log"
-    return 0
-  fi
-
-  # If pnpm is blocking builds, record the package(s) and continue.
-  if pnpm_output_has_ignored_builds "$pnpm_log"; then
-    pnpm_record_ignored_build_pkgs "$pnpm_log"
-    log "[pnpm] WARNING: pnpm refused to run build scripts (ERR_PNPM_IGNORED_BUILDS)."
-    log "[pnpm] WARNING: This is a supply-chain safety gate. To resolve permanently, run:"
-    log "[pnpm] WARNING:   pnpm approve-builds"
-    log "[pnpm] WARNING: Or one-shot non-interactive:"
-    log "[pnpm] WARNING:   pnpm approve-builds --all"
-    if [[ -n "$pnpm_ignored_build_pkgs" ]]; then
-      log "[pnpm] WARNING: Skipping updates for packages requiring build approval:"
-      local p
-      while IFS= read -r p; do
-        [[ -z "$p" ]] && continue
-        log "[pnpm] WARNING:   ${p}"
-      done <<< "$pnpm_ignored_build_pkgs"
+    if (( pnpm_exit == 0 )); then
+      rm -f "$pnpm_log"
+      return 0
     fi
-    rm -f "$pnpm_log"
-    return 0
-  fi
+
+    # If pnpm is blocking builds, record the package(s) and continue.
+    if pnpm_output_has_ignored_builds "$pnpm_log"; then
+      pnpm_record_ignored_build_pkgs "$pnpm_log"
+      log "[pnpm] WARNING: pnpm refused to run build scripts (ERR_PNPM_IGNORED_BUILDS)."
+      log "[pnpm] WARNING: This is a supply-chain safety gate. To resolve permanently, run:"
+      log "[pnpm] WARNING:   pnpm approve-builds"
+      log "[pnpm] WARNING: Or one-shot non-interactive:"
+      log "[pnpm] WARNING:   pnpm approve-builds --all"
+      if [[ -n "$pnpm_ignored_build_pkgs" ]]; then
+        log "[pnpm] WARNING: Skipping updates for packages requiring build approval:"
+        while IFS= read -r p; do
+          [[ -z "$p" ]] && continue
+          log "[pnpm] WARNING:   ${p}"
+        done <<< "$pnpm_ignored_build_pkgs"
+      fi
+      rm -f "$pnpm_log"
+      return 0
+    fi
+
+    # Retry on transient network errors or version-propagation lag
+    # (a version found by pnpm view/outdated may not yet be on all mirrors).
+    retryable=0
+    if grep -qF 'ERR_PNPM_NO_MATCHING_VERSION' "$pnpm_log"; then
+      retryable=1
+    elif grep -qiE 'ECONNRESET|ETIMEDOUT|ENOTFOUND|network error|fetch failed' "$pnpm_log"; then
+      retryable=1
+    fi
+    if (( retryable )) && [[ "$attempt" -lt 4 ]]; then
+      delay=$(( attempt * 30 ))
+      log "[pnpm] WARNING: transient install error; attempt ${attempt}/3, retrying in ${delay}s…"
+      sleep "$delay"
+      continue
+    fi
+
+    break
+  done
 
   printf '%s\n' "pnpm install failed (exit ${pnpm_exit}). Last output:" >&2
   tail -n 80 "$pnpm_log" | sed 's/^/  /' >&2
@@ -1275,10 +1336,12 @@ create_worktree() {
         || die "pnpm install failed."
     elif [[ -f "$worktree_path/package-lock.json" ]]; then
       log "[worktree] Installing dependencies (npm)…"
-      (cd "$worktree_path" && npm ci --prefer-offline --no-audit --no-fund) >&2
+      install_with_net_retry npm "$worktree_path" \
+        npm ci --prefer-offline --no-audit --no-fund
     elif [[ -f "$worktree_path/yarn.lock" ]]; then
       log "[worktree] Installing dependencies (yarn)…"
-      (cd "$worktree_path" && yarn install --frozen-lockfile) >&2
+      install_with_net_retry yarn "$worktree_path" \
+        yarn install --frozen-lockfile
     fi
   fi
   if [[ -n "$py_tool" ]]; then
@@ -1290,21 +1353,25 @@ create_worktree() {
             (cd "$worktree_path" && uv venv) >&2
           fi
           if [[ -f "$worktree_path/uv.lock" ]]; then
-            (cd "$worktree_path" && uv sync --frozen) >&2
+            install_with_net_retry uv "$worktree_path" \
+              uv sync --frozen
           else
-            (cd "$worktree_path" && uv pip install -r requirements.txt) >&2
+            install_with_net_retry uv "$worktree_path" \
+              uv pip install -r requirements.txt
           fi
         fi
         ;;
       poetry)
         [[ -f "$worktree_path/poetry.lock" ]] \
           && log "[worktree] Installing dependencies (poetry)…" \
-          && (cd "$worktree_path" && poetry install --no-root) >&2
+          && install_with_net_retry poetry "$worktree_path" \
+               poetry install --no-root
         ;;
       pipenv)
         [[ -f "$worktree_path/Pipfile.lock" ]] \
           && log "[worktree] Installing dependencies (pipenv)…" \
-          && (cd "$worktree_path" && pipenv install) >&2
+          && install_with_net_retry pipenv "$worktree_path" \
+               pipenv install
         ;;
       *)
         : # pip/pip3: no lockfile install needed; packages resolved per-update
