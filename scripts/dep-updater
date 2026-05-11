@@ -857,6 +857,18 @@ pnpm_install_worktree() {
     break
   done
 
+  # A "no matching version" error means the registry doesn't have this exact
+  # version — possibly a race where the version was briefly published then yanked,
+  # or pnpm view returned a stale cached result.  Signal the caller (exit 2) so
+  # it can skip this group and continue with other packages, rather than aborting
+  # the entire run.
+  if grep -qF 'ERR_PNPM_NO_MATCHING_VERSION' "$pnpm_log"; then
+    log "[pnpm] WARNING: a requested version was not found in the registry; signalling caller to skip this group."
+    tail -n 20 "$pnpm_log" | sed 's/^/  /' >&2
+    rm -f "$pnpm_log"
+    return 2
+  fi
+
   printf '%s\n' "pnpm install failed (exit ${pnpm_exit}). Last output:" >&2
   tail -n 80 "$pnpm_log" | sed 's/^/  /' >&2
   rm -f "$pnpm_log"
@@ -1948,8 +1960,18 @@ npm_update_group() {
 
         # --no-frozen-lockfile lets pnpm rebuild pnpm-lock.yaml from the
         # freshly patched package.json so specifiers are consistent.
-        pnpm_install_worktree no-frozen "$worktree_path" \
-          || die "pnpm install failed."
+        local pnpm_rc=0
+        pnpm_install_worktree no-frozen "$worktree_path" || pnpm_rc=$?
+        if [[ "$pnpm_rc" -eq 2 ]]; then
+          # A version in this group is not available on the registry — restore
+          # manifests and skip the group so other packages can still update.
+          git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+          git -C "$worktree_path" checkout -- pnpm-lock.yaml 2>/dev/null || true
+          log "[${npm_tool}] WARNING: ${group_key}: skipping — one or more versions not available in registry."
+          return 0
+        elif [[ "$pnpm_rc" -ne 0 ]]; then
+          die "pnpm install failed."
+        fi
       fi
       ;;
     yarn)
