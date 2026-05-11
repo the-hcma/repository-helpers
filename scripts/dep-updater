@@ -716,6 +716,34 @@ pnpm_pkg_is_ignored_build() {
   printf '%s\n' "$pnpm_ignored_build_pkgs" | rg -qx --fixed-strings "$pkg"
 }
 
+# npm_version_prefetch <pkg> <version>
+# Confirms an exact package version is resolvable in the npm registry and
+# pre-populates the pnpm content-addressable store so subsequent installs can
+# use --prefer-offline.  Retries up to 3 times with 15 s backoff.
+# Returns 0 when the version is confirmed available and prefetched.
+# Returns 1 when it cannot be confirmed after all retries (caller should skip).
+npm_version_prefetch() {
+  local -r pkg="$1"
+  local -r version="$2"
+  local attempt resolved
+
+  for attempt in 1 2 3; do
+    resolved="$(pnpm view "${pkg}@${version}" version 2>/dev/null || true)"
+    if [[ "$resolved" == "$version" ]]; then
+      # Version confirmed — pre-fetch into the pnpm store so install is offline.
+      pnpm store add "${pkg}@${version}" >/dev/null 2>&1 || true
+      return 0
+    fi
+    if [[ "$attempt" -lt 3 ]]; then
+      log "[pnpm] WARNING: ${pkg}@${version} not yet resolvable in registry; attempt ${attempt}/2, retrying in 15s…"
+      sleep 15
+    fi
+  done
+
+  log "[pnpm] WARNING: ${pkg}@${version} could not be confirmed in registry after 3 attempts; skipping."
+  return 1
+}
+
 # install_with_net_retry <label> <workdir> <cmd> [args…]
 # Runs <cmd> in <workdir> up to 4 times (30 / 60 / 90 s linear backoff) when
 # the output suggests a transient network error.  On success or a non-transient
@@ -1619,7 +1647,10 @@ npm_outdated() {
       # Only advance — never downgrade.
       sort_winner="$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -1)"
       if [[ "$sort_winner" == "$latest" ]]; then
-        printf '%s %s %s\n' "$pkg" "$current" "$latest"
+        # Verify the version is actually resolvable and pre-warm the pnpm store.
+        if npm_version_prefetch "$pkg" "$latest"; then
+          printf '%s %s %s\n' "$pkg" "$current" "$latest"
+        fi
       fi
     done < <(printf '%s' "$pkgs_json" | jq -r '.[]' 2>/dev/null || true)
 
@@ -1668,7 +1699,12 @@ npm_outdated() {
     jq -r 'select(.type == "table")
       | .data.body[]
       | "\(.[0]) \(.[1]) \(.[3])"' "$tmp_json" 2>/dev/null \
-      | awk '{if(NF==3 && $1!="" && $2!="" && $3!="") print $0}'
+      | awk '{if(NF==3 && $1!="" && $2!="" && $3!="") print $0}' \
+      | while IFS=' ' read -r _ypkg _ycur _ynew; do
+          if npm_version_prefetch "$_ypkg" "$_ynew"; then
+            printf '%s %s %s\n' "$_ypkg" "$_ycur" "$_ynew"
+          fi
+        done
   else
     jq -r --argjson specs "$pkg_json_specs" --arg semver_only "$semver_only" '
       to_entries[]
@@ -1708,7 +1744,12 @@ npm_outdated() {
             )
           | "\(.key) \(.value.current) \(.value.latest)"
         end' "$tmp_json" 2>/dev/null \
-      | awk '{if(NF==3 && $1!="" && $2!="" && $3!="") print $0}'
+      | awk '{if(NF==3 && $1!="" && $2!="" && $3!="") print $0}' \
+      | while IFS=' ' read -r _npkg _ncur _nnew; do
+          if npm_version_prefetch "$_npkg" "$_nnew"; then
+            printf '%s %s %s\n' "$_npkg" "$_ncur" "$_nnew"
+          fi
+        done
   fi
   rm -f "$tmp_json"
 }
