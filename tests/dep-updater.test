@@ -297,6 +297,10 @@ JSON
     esac
     exit 2
     ;;
+  store)
+    # store add <pkg>@<ver> — simulate a successful tarball fetch
+    exit 0
+    ;;
   --version|-v|version)
     echo "11.0.8"
     exit 0
@@ -1489,22 +1493,25 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Static: ERR_PNPM_NO_MATCHING_VERSION retry with backoff
+# Static: pnpm install retry behaviour
 # ---------------------------------------------------------------------------
 
-printf '\n=== static: pnpm no-matching-version retry ===\n'
+printf '\n=== static: pnpm install retry behaviour ===\n'
 
-# pnpm_install_worktree must detect ERR_PNPM_NO_MATCHING_VERSION and retry.
-if grep -qF 'ERR_PNPM_NO_MATCHING_VERSION' "$script"; then
-  printf '[PASS] pnpm-retry: ERR_PNPM_NO_MATCHING_VERSION detection present\n'
+# pnpm_install_worktree must NOT retry ERR_PNPM_NO_MATCHING_VERSION.
+# That error is not transient — the version does not exist and retrying wastes
+# minutes.  npm_version_prefetch is the gatekeeper: it verifies downloadability
+# before the package is ever added to the update list.
+pnpm_install_fn="$(awk '/^pnpm_install_worktree\(\)/,/^\}/' "$script")"
+if ! printf '%s' "$pnpm_install_fn" | grep -qF 'ERR_PNPM_NO_MATCHING_VERSION'; then
+  printf '[PASS] pnpm-retry: pnpm_install_worktree does not retry ERR_PNPM_NO_MATCHING_VERSION (gated by prefetch)\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] pnpm-retry: ERR_PNPM_NO_MATCHING_VERSION detection missing\n'
+  printf '[FAIL] pnpm-retry: pnpm_install_worktree retries ERR_PNPM_NO_MATCHING_VERSION (should be caught by npm_version_prefetch instead)\n'
   fail=$(( fail + 1 ))
 fi
 
 # The retry must use sleep for backoff (not just re-invoke pnpm immediately).
-pnpm_install_fn="$(awk '/^pnpm_install_worktree\(\)/,/^\}/' "$script")"
 if printf '%s' "$pnpm_install_fn" | grep -qF 'sleep'; then
   printf '[PASS] pnpm-retry: sleep backoff present in pnpm_install_worktree\n'
   pass=$(( pass + 1 ))
@@ -1608,6 +1615,29 @@ if printf '%s' "$prefetch_fn" | grep -qF 'pnpm store add'; then
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] npm-prefetch: does not call "pnpm store add" to pre-warm the store\n'
+  fail=$(( fail + 1 ))
+fi
+
+# pnpm store add must gate the return — its exit code must be checked so that a
+# failed download (tarball not yet on the mirror) causes a retry or skip, not a
+# silent success.  The old bug was "pnpm store add ... || true" which swallowed
+# download failures and let undownloadable versions reach pnpm install.
+if printf '%s' "$prefetch_fn" | grep -qE 'if pnpm store add'; then
+  printf '[PASS] npm-prefetch: pnpm store add exit code is checked (gates return 0)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] npm-prefetch: pnpm store add exit code is not checked — wrap in "if pnpm store add"\n'
+  fail=$(( fail + 1 ))
+fi
+
+# Specifically: "pnpm store add" must not be followed by "|| true".
+# (pnpm view ... || true is fine — it handles unknown packages gracefully.)
+if ! printf '%s' "$prefetch_fn" | grep -qF 'pnpm store add.*|| true' \
+   && ! printf '%s' "$prefetch_fn" | grep -E 'pnpm store add.+$' | grep -qF '|| true'; then
+  printf '[PASS] npm-prefetch: "pnpm store add" exit code is not suppressed with "|| true"\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] npm-prefetch: "pnpm store add" uses "|| true" — download failures are silenced\n'
   fail=$(( fail + 1 ))
 fi
 
