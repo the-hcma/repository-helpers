@@ -717,9 +717,10 @@ pnpm_pkg_is_ignored_build() {
 }
 
 # npm_version_prefetch <pkg> <version>
-# Confirms an exact package version is resolvable in the npm registry and
-# pre-populates the pnpm content-addressable store so subsequent installs can
-# use --prefer-offline.  Retries up to 3 times with 15 s backoff.
+# Confirms an exact package version is resolvable in the npm registry AND
+# actually downloadable (tarball present), pre-populating the pnpm
+# content-addressable store so subsequent installs can use --prefer-offline.
+# Retries up to 3 times with 15 s backoff.
 # Returns 0 when the version is confirmed available and prefetched.
 # Returns 1 when it cannot be confirmed after all retries (caller should skip).
 npm_version_prefetch() {
@@ -730,12 +731,17 @@ npm_version_prefetch() {
   for attempt in 1 2 3; do
     resolved="$(pnpm view "${pkg}@${version}" version 2>/dev/null || true)"
     if [[ "$resolved" == "$version" ]]; then
-      # Version confirmed — pre-fetch into the pnpm store so install is offline.
-      pnpm store add "${pkg}@${version}" >/dev/null 2>&1 || true
-      return 0
+      # Registry metadata confirms the version — now verify the tarball is
+      # actually downloadable by fetching it into the pnpm content-addressable
+      # store.  This catches races where pnpm view returns a stale cached value
+      # for a version whose tarball has not yet propagated to all mirrors.
+      if pnpm store add "${pkg}@${version}" >/dev/null 2>&1; then
+        return 0
+      fi
+      # Store add failed: tarball not yet downloadable — fall through to retry.
     fi
     if [[ "$attempt" -lt 3 ]]; then
-      log "[pnpm] WARNING: ${pkg}@${version} not yet resolvable in registry; attempt ${attempt}/2, retrying in 15s…"
+      log "[pnpm] WARNING: ${pkg}@${version} not yet downloadable from registry; attempt ${attempt}/2, retrying in 15s…"
       sleep 15
     fi
   done
@@ -832,12 +838,13 @@ pnpm_install_worktree() {
       return 0
     fi
 
-    # Retry on transient network errors or version-propagation lag
-    # (a version found by pnpm view/outdated may not yet be on all mirrors).
+    # Retry only on transient network errors.  A "no matching version" error is
+    # not transient — the version genuinely does not exist on the registry and
+    # retrying will not fix it.  npm_version_prefetch gates the outdated list
+    # to only downloadable versions; if a non-existent version still reaches
+    # this point, fail fast rather than waste minutes retrying.
     retryable=0
-    if grep -qF 'ERR_PNPM_NO_MATCHING_VERSION' "$pnpm_log"; then
-      retryable=1
-    elif grep -qiE 'ECONNRESET|ETIMEDOUT|ENOTFOUND|network error|fetch failed' "$pnpm_log"; then
+    if grep -qiE 'ECONNRESET|ETIMEDOUT|ENOTFOUND|network error|fetch failed' "$pnpm_log"; then
       retryable=1
     fi
     if (( retryable )) && [[ "$attempt" -lt 4 ]]; then
