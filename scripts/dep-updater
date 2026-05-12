@@ -717,31 +717,41 @@ pnpm_pkg_is_ignored_build() {
 }
 
 # npm_version_prefetch <pkg> <version>
-# Confirms an exact package version is resolvable in the npm registry AND
-# actually downloadable (tarball present), pre-populating the pnpm
-# content-addressable store so subsequent installs can use --prefer-offline.
+# Confirms an exact package version is actually published in the registry by
+# querying the registry HTTP API directly (no pnpm metadata cache), then
+# pre-populating the pnpm content-addressable store.
 # Retries up to 3 times with 15 s backoff.
 # Returns 0 when the version is confirmed available and prefetched.
 # Returns 1 when it cannot be confirmed after all retries (caller should skip).
 npm_version_prefetch() {
   local -r pkg="$1"
   local -r version="$2"
-  local attempt resolved
+  local attempt registry http_status encoded_pkg
+
+  # Read the registry URL from .npmrc / pnpmrc (default: registry.npmjs.org).
+  registry="$(pnpm config get registry 2>/dev/null | tr -d '[:space:]' || echo 'https://registry.npmjs.org/')"
+  # Ensure trailing slash.
+  [[ "$registry" != */ ]] && registry="${registry}/"
 
   for attempt in 1 2 3; do
-    resolved="$(pnpm view "${pkg}@${version}" version 2>/dev/null || true)"
-    if [[ "$resolved" == "$version" ]]; then
-      # Registry metadata confirms the version — now verify the tarball is
-      # actually downloadable by fetching it into the pnpm content-addressable
-      # store.  This catches races where pnpm view returns a stale cached value
-      # for a version whose tarball has not yet propagated to all mirrors.
+    # Query the registry directly for this exact version to bypass pnpm's
+    # metadata cache, which can return stale results for versions that were
+    # briefly published but then yanked or not yet fully propagated.
+    # Encode the package name: replace leading @ and / with URL-safe form.
+    encoded_pkg="${pkg//@/%40}"
+    encoded_pkg="${encoded_pkg//\//%2F}"
+    http_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      --max-time 10 \
+      "${registry}${encoded_pkg}/${version}" 2>/dev/null || echo '000')"
+    if [[ "$http_status" == "200" ]]; then
+      # Registry confirms the version — pre-fetch into the pnpm store.
       if pnpm store add "${pkg}@${version}" >/dev/null 2>&1; then
         return 0
       fi
-      # Store add failed: tarball not yet downloadable — fall through to retry.
+      # Store add failed despite registry confirming — fall through to retry.
     fi
     if [[ "$attempt" -lt 3 ]]; then
-      log "[pnpm] WARNING: ${pkg}@${version} not yet downloadable from registry; attempt ${attempt}/2, retrying in 15s…"
+      log "[pnpm] WARNING: ${pkg}@${version} not yet available in registry (HTTP ${http_status}); attempt ${attempt}/2, retrying in 15s…"
       sleep 15
     fi
   done
