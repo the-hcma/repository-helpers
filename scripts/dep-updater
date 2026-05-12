@@ -27,6 +27,8 @@ readonly dep_script_dir
 
 # shellcheck disable=SC1091  # shared helper sourced at runtime; CI shellcheck doesn't use -x
 source "${dep_script_dir}/lib/time-log"
+# shellcheck disable=SC1091
+source "${dep_script_dir}/lib/runner"
 
 # Prefer user-local installs (e.g. gh, gt installed via their official installers
 # under ~/.local/bin) over system-wide ones that may be stale or absent.
@@ -284,6 +286,7 @@ log_stack_rebase_context() {
 # ---------------------------------------------------------------------------
 
 die() {
+  record_first_failure "$*"
   printf 'ERROR: %s\n' "$*" >&2
   exit 1
 }
@@ -329,8 +332,15 @@ _on_exit() {
   trap - EXIT
   # Only run cleanup if the worktree phase was reached and the exit is non-zero.
   if [[ "$_cleanup_trap_active" == '1' && $exit_code -ne 0 ]]; then
-    cleanup_on_error "script exited unexpectedly (exit code ${exit_code})"
+    # Use the first recorded failure reason if available — it contains the real
+    # error (e.g. "pnpm: no matching version") rather than a generic wrapper.
+    local reason="script exited unexpectedly (exit code ${exit_code})"
+    if [[ -n "${RUNNER_FIRST_FAILURE_FILE:-}" && -s "${RUNNER_FIRST_FAILURE_FILE}" ]]; then
+      reason="$(cat "${RUNNER_FIRST_FAILURE_FILE}")"
+    fi
+    cleanup_on_error "$reason"
   fi
+  rm -f "${RUNNER_FIRST_FAILURE_FILE:-}"
 }
 
 # shellcheck disable=SC2317  # invoked via INT/TERM traps, not directly
@@ -799,6 +809,7 @@ install_with_net_retry() {
 
   printf '%s\n' "${label} install failed (exit ${exit_code}). Last output:" >&2
   tail -n 80 "$install_log" | sed 's/^/  /' >&2
+  record_first_failure "${label} install failed (exit ${exit_code})"
   rm -f "$install_log"
   return "$exit_code"
 }
@@ -873,6 +884,9 @@ pnpm_install_worktree() {
   # it can skip this group and continue with other packages, rather than aborting
   # the entire run.
   if grep -qF 'ERR_PNPM_NO_MATCHING_VERSION' "$pnpm_log"; then
+    local no_match_line
+    no_match_line="$(grep -m1 'No matching version found for' "$pnpm_log" || true)"
+    record_first_failure "${no_match_line:-pnpm: ERR_PNPM_NO_MATCHING_VERSION}"
     log "[pnpm] WARNING: a requested version was not found in the registry; signalling caller to skip this group."
     tail -n 20 "$pnpm_log" | sed 's/^/  /' >&2
     rm -f "$pnpm_log"
@@ -881,6 +895,7 @@ pnpm_install_worktree() {
 
   printf '%s\n' "pnpm install failed (exit ${pnpm_exit}). Last output:" >&2
   tail -n 80 "$pnpm_log" | sed 's/^/  /' >&2
+  record_first_failure "pnpm install failed (exit ${pnpm_exit})"
   rm -f "$pnpm_log"
   return "$pnpm_exit"
 }
@@ -4631,12 +4646,18 @@ batch_all_dispatch() {
       # Strip common ANSI escape sequences (colors, cursor movement).
       sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' "$child_log" >"$child_clean" 2>/dev/null || cp "$child_log" "$child_clean"
 
-      # Root-cause: pick the last "actionable" looking line from the child's log.
-      # Keep it concise (single line) but avoid unhelpful "exit 1" style summaries.
+      # Root-cause: the "Cleaning up after error:" line is now the authoritative
+      # source of truth — dep-updater records the first failure reason via
+      # record_first_failure() (from lib/runner) and the EXIT trap uses it.
+      # Fall back to explicit ERROR: lines, then last non-empty line.
       local root_cause
-      root_cause="$(rg -n '(^.*ERROR: |^fatal: |^Timed out after |Cleaning up after error: |^Traceback|panic:|^Error: )' "$child_clean" \
-        | tail -n 1 \
-        | sed 's/^[0-9]+://')"
+      root_cause="$(grep 'Cleaning up after error: ' "$child_clean" | tail -n 1)"
+
+      if [[ -z "$root_cause" ]]; then
+        root_cause="$(rg -n '(^.*ERROR: |^fatal: |^Timed out after |^Traceback|panic:|^Error: )' "$child_clean" \
+          | tail -n 1 \
+          | sed 's/^[0-9]+://')"
+      fi
 
       if [[ -z "$root_cause" ]]; then
         # Last resort: last non-empty line.
@@ -4711,6 +4732,13 @@ batch_all_dispatch() {
 main() {
   parse_args "$@"
   init_prompt_style
+
+  # Set up first-failure tracking so _on_exit can emit the real reason
+  # rather than "script exited unexpectedly". The file is read by _on_exit
+  # and populated by record_first_failure() (from lib/runner), die(), and
+  # the install functions.
+  RUNNER_FIRST_FAILURE_FILE="$(mktemp)"
+  export RUNNER_FIRST_FAILURE_FILE
 
   if [[ "$batch_all" == '1' ]]; then
     check_core_prereqs
