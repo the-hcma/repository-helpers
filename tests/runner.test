@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Tests for scripts/lib/runner helpers.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+
+lib="${script_dir}/../scripts/lib/runner"
+readonly lib
+
+test_init
+pass=0
+fail=0
+
+# ---------------------------------------------------------------------------
+# Static: structure
+# ---------------------------------------------------------------------------
+
+printf '\n=== static: runner structure ===\n'
+
+lib_text="$(cat "$lib")"
+assert_contains "declares run_command"         "$lib_text" "run_command()"
+assert_contains "declares run_command_or_die"  "$lib_text" "run_command_or_die()"
+assert_contains "delegates to run_command"     "$lib_text" 'run_command "$@"'
+assert_not_contains "run_command does not call exit" \
+  "$(awk '/^run_command\(\) \{/{found=1; next} found && /^\}$/{exit} found' "$lib" \
+      | grep -E '^\s+exit\b' || true)" \
+  "exit"
+
+# Temp file must be cleaned up via RETURN trap, not inline rm
+assert_contains "uses RETURN trap for cleanup" "$lib_text" 'trap "rm -f '
+assert_contains "RETURN trap fires on return"  "$lib_text" 'RETURN'
+assert_not_contains "no inline rm after command" \
+  "$(awk '/^run_command\(\) \{/{found=1; next} found && /^\}$/{exit} found' "$lib" \
+      | grep -E '^\s+rm -f' || true)" \
+  "rm -f"
+
+# ---------------------------------------------------------------------------
+# Behavioural: source the lib
+# ---------------------------------------------------------------------------
+
+# shellcheck disable=SC1090  # dynamic path; resolved at runtime
+source "$lib"
+
+# ---------------------------------------------------------------------------
+# run_command: success path
+# ---------------------------------------------------------------------------
+
+printf '\n=== run_command: success ===\n'
+
+rc=0
+out="$(run_command "success test" echo "hello")" || rc=$?
+assert_exit_0 "run_command success" "$out" "$rc"
+assert_contains "stdout passes through" "$out" "hello"
+
+# No stderr output on success
+stderr_out="$(run_command "success quiet" true 2>&1)"
+if [[ -z "$stderr_out" ]]; then
+  pass_case "run_command: no stderr on success"
+else
+  printf '[FAIL] run_command: unexpected stderr on success: %s\n' "$stderr_out"
+  fail=$(( fail + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+# run_command: failure path
+# ---------------------------------------------------------------------------
+
+printf '\n=== run_command: failure ===\n'
+
+rc=0
+stderr_out="$(run_command "failure test" bash -c 'echo "diag message" >&2; exit 3' 2>&1)" || rc=$?
+assert_exit_nonzero "run_command failure" "$stderr_out" "$rc"
+
+if [[ "$rc" -eq 3 ]]; then
+  pass_case "run_command: preserves original exit code (3)"
+else
+  printf '[FAIL] run_command: expected exit 3, got %d\n' "$rc"
+  fail=$(( fail + 1 ))
+fi
+
+assert_contains "prints label"      "$stderr_out" "[FAIL] failure test"
+assert_contains "prints exit code"  "$stderr_out" "exit code: 3"
+assert_contains "prints stderr"     "$stderr_out" "diag message"
+
+# ---------------------------------------------------------------------------
+# run_command: empty stderr on failure still prints block
+# ---------------------------------------------------------------------------
+
+printf '\n=== run_command: failure with no stderr ===\n'
+
+rc=0
+stderr_out="$(run_command "silent fail" bash -c 'exit 2' 2>&1)" || rc=$?
+assert_exit_nonzero "run_command silent fail" "$stderr_out" "$rc"
+assert_contains "prints label on silent fail"     "$stderr_out" "[FAIL] silent fail"
+assert_contains "prints exit code on silent fail" "$stderr_out" "exit code: 2"
+
+# ---------------------------------------------------------------------------
+# run_command: stdout passes through (caller can redirect)
+# ---------------------------------------------------------------------------
+
+printf '\n=== run_command: stdout redirection ===\n'
+
+tmp_out="$(mktemp)"
+rc=0
+run_command "stdout redirect" bash -c 'echo "captured"' >"$tmp_out" || rc=$?
+assert_exit_0 "stdout redirect: exits 0" "" "$rc"
+out_content="$(cat "$tmp_out")"
+assert_contains "stdout redirected to file" "$out_content" "captured"
+rm -f "$tmp_out"
+
+# ---------------------------------------------------------------------------
+# run_command_or_die: success path
+# ---------------------------------------------------------------------------
+
+printf '\n=== run_command_or_die: success ===\n'
+
+rc=0
+out="$(run_command_or_die "die success" echo "ok")" || rc=$?
+assert_exit_0     "run_command_or_die success" "$out" "$rc"
+assert_contains   "run_command_or_die stdout"  "$out" "ok"
+
+# ---------------------------------------------------------------------------
+# run_command_or_die: failure path (run in subshell to catch exit)
+# ---------------------------------------------------------------------------
+
+printf '\n=== run_command_or_die: failure exits ===\n'
+
+rc=0
+stderr_out="$(
+  bash -c "
+    source \"$lib\"
+    run_command_or_die \"die label\" bash -c 'echo boom >&2; exit 5'
+  " 2>&1
+)" || rc=$?
+
+assert_exit_nonzero "run_command_or_die exits on failure" "$stderr_out" "$rc"
+if [[ "$rc" -eq 5 ]]; then
+  pass_case "run_command_or_die: exits with original code (5)"
+else
+  printf '[FAIL] run_command_or_die: expected exit 5, got %d\n' "$rc"
+  fail=$(( fail + 1 ))
+fi
+assert_contains "run_command_or_die: prints label"     "$stderr_out" "[FAIL] die label"
+assert_contains "run_command_or_die: prints exit code" "$stderr_out" "exit code: 5"
+assert_contains "run_command_or_die: prints stderr"    "$stderr_out" "boom"
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+
+printf '\n=== results ===\n'
+printf 'Passed: %d  Failed: %d\n' "$pass" "$fail"
+test_summary
