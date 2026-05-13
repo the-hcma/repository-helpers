@@ -2851,6 +2851,26 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
   done <<< "$raw_lines"
 }
 
+# py_uv_rewrite_version_floor <pyproject_path> <pkg> <new_ver>
+# Rewrites a PEP 508 dependency floor in [project].dependencies-style entries:
+#   "pkg>=1.0.0" / "pkg[extra]>=1.0.0" (bundled) or "pkg[extra]" >= 1.0.0 / "pkg" >= 1.0.0
+# Two sed passes (bundled before split). Converts == and ~= to >=. Returns
+# non-zero only when sed itself fails (invalid regexp).
+py_uv_rewrite_version_floor() {
+  local -r path="$1"
+  local -r pkg="$2"
+  local -r new_ver="$3"
+  local sed_pkg sed_new_ver
+
+  sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
+  sed_new_ver="$(printf '%s' "$new_ver" | sed 's/[\\&#]/\\&/g')"
+  sed -i -E \
+    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?)(~=|>=|==)([0-9][0-9a-zA-Z.]*)\\\"#\\1>=${sed_new_ver}\\\"#" \
+    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?\")[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*#\\1 >= ${sed_new_ver}#" \
+    "$path" 2>/dev/null || return 1
+  return 0
+}
+
 py_update_one() {
   local -r pkg="$1"
   local -r old_ver="$2"
@@ -2888,19 +2908,15 @@ py_update_one() {
 
   case "$tool" in
     uv)
-      local uv_out uv_exit uv_constraint_op uv_spec sed_pkg sed_new_ver
+      local uv_out uv_exit uv_constraint_op uv_spec
       uv_constraint_op="$(py_constraint_op "$pkg" "${dir}/pyproject.toml")"
       # Invariant: always write >= (never ==) — dep-updater must not re-pin.
-      if [[ "$uv_constraint_op" == ">=" || "$uv_constraint_op" == "==" ]]; then
+      if [[ "$uv_constraint_op" == ">=" || "$uv_constraint_op" == "==" || "$uv_constraint_op" == "~=" ]]; then
         # uv add pkg>=new_ver is a no-op when the lock already satisfies the
         # existing >= constraint (uv sees 8.0.1 already satisfies >=7.0.0 and
         # leaves pyproject.toml unchanged). Patch the floor with sed instead.
-        # For == constraints, convert to >= so dep-updater never introduces pins.
-        sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
-        sed_new_ver="$(printf '%s' "$new_ver" | sed 's/[\\&#]/\\&/g')"
-        if ! sed -i -E \
-          "s#(\"${sed_pkg}([^\"=<>!~,]|\\[[a-zA-Z0-9,_=.-]+\\])*[[:space:]]*)(?:>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*)#\\1>=${sed_new_ver}#" \
-          "${worktree_path}/pyproject.toml"; then
+        # For == / ~= constraints, convert to >= so dep-updater never introduces pins.
+        if ! py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$pkg" "$new_ver"; then
           log "[python/uv] ERROR: sed could not rewrite ${pkg} constraint — skipping."
           dep_updater_append_ecosystem_failure "python|sed failed for ${pkg}"
           return 0
@@ -2911,9 +2927,9 @@ py_update_one() {
         uv_out="$(uv --directory "$worktree_path" add "$uv_spec" 2>&1)" && uv_exit=0 || uv_exit=$?
       fi
       if (( uv_exit != 0 )); then
-        # Revert pyproject.toml: sed already modified it for >= or == constraints
+        # Revert pyproject.toml: sed already modified it for >= / == / ~= constraints
         # but the lock failed, so the change must not accumulate into a future commit.
-        if [[ "$uv_constraint_op" == ">=" || "$uv_constraint_op" == "==" ]]; then
+        if [[ "$uv_constraint_op" == ">=" || "$uv_constraint_op" == "==" || "$uv_constraint_op" == "~=" ]]; then
           git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
         fi
         log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
@@ -3263,7 +3279,7 @@ batch_update_all() {
   batch_ts="$(date --utc +%Y%m%dT%H%M%S)"
   local -r branch="dep-updates/batch-${batch_ts}"
   local any_npm=0 any_py=0
-  local py_out py_exit b_constraint_op b_spec actual_py_lines sed_pkg sed_new_ver
+  local py_out py_exit b_constraint_op b_spec actual_py_lines
 
   dep_updater_ensure_eco_fail_file
 
@@ -3448,13 +3464,9 @@ batch_update_all() {
         case "$py_tool" in
           uv)
             b_constraint_op="$(py_constraint_op "$pkg" "${dir}/pyproject.toml")"
-            if [[ "$b_constraint_op" == ">=" || "$b_constraint_op" == "==" ]]; then
-              # Direct floor bump: match py_update_one (sed + uv lock).
-              sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
-              sed_new_ver="$(printf '%s' "$new_ver" | sed 's/[\\&#]/\\&/g')"
-              if ! sed -i -E \
-                "s#(\"${sed_pkg}([^\"=<>!~,]|\\[[a-zA-Z0-9,_=.-]+\\])*[[:space:]]*)(?:>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*)#\\1>=${sed_new_ver}#" \
-                "${worktree_path}/pyproject.toml"; then
+            if [[ "$b_constraint_op" == ">=" || "$b_constraint_op" == "==" || "$b_constraint_op" == "~=" ]]; then
+              # Direct floor bump: match py_update_one (py_uv_rewrite_version_floor + uv lock).
+              if ! py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$pkg" "$new_ver"; then
                 log "[python/uv] ERROR: batch sed failed for ${pkg} — skipping."
                 dep_updater_append_ecosystem_failure "python|batch sed failed for ${pkg}"
                 continue
@@ -3466,9 +3478,9 @@ batch_update_all() {
             fi
             if (( py_exit != 0 )); then
               # Revert: sed patched pyproject.toml before the lock attempt for >=
-              # constraints. Restore the file so failed bumps don't accumulate
+              # / == / ~= constraints. Restore the file so failed bumps don't accumulate
               # and cause all subsequent packages to fail with phantom conflicts.
-              if [[ "$b_constraint_op" == ">=" || "$b_constraint_op" == "==" ]]; then
+              if [[ "$b_constraint_op" == ">=" || "$b_constraint_op" == "==" || "$b_constraint_op" == "~=" ]]; then
                 git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
               fi
               log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
