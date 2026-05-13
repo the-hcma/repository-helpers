@@ -51,6 +51,140 @@ gh_pr_info() {
   echo "NOT_FOUND"
 }
 
+# print_pr_urls_github_graphite <pr_number>
+# Emits clickable GitHub + Graphite URLs for an open PR (same shape as the Graphite app).
+print_pr_urls_github_graphite() {
+  local -r num="$1"
+  [[ -z "$num" ]] && return 0
+  printf '   GitHub:   https://github.com/%s/pull/%s\n' "$gh_repo" "$num"
+  printf '   Graphite: https://app.graphite.com/github/pr/%s/%s\n' "$gh_repo" "$num"
+}
+
+# secondary_worktree_head_epoch <worktree_path>
+# Best-effort Unix time of HEAD in the worktree (fallback: directory mtime).
+secondary_worktree_head_epoch() {
+  local -r path="$1"
+  local ts
+  ts="$(git -C "$path" log -1 --format=%ct HEAD 2>/dev/null || true)"
+  if [[ -n "$ts" ]]; then
+    printf '%s' "$ts"
+    return 0
+  fi
+  stat -c %Y "$path" 2>/dev/null || printf '0'
+}
+
+# worktree_has_dirty_tree <worktree_path>
+# Exit 0 when there is any local change (tracked or untracked) — caller must not auto-delete.
+worktree_has_dirty_tree() {
+  local -r path="$1"
+  local st
+  st="$(git -C "$path" status --porcelain 2>/dev/null || true)"
+  [[ -n "$st" ]]
+}
+
+# remove_secondary_worktree <main_repo> <path> <branch> <human_reason_one_line>
+remove_secondary_worktree() {
+  local -r repo="$1"
+  local -r path="$2"
+  local -r branch="$3"
+  local -r reason="$4"
+  printf '   [!] %s\n' "$reason"
+  git -C "$repo" worktree remove --force "$path" 2>/dev/null || true
+  rm -rf "$path" 2>/dev/null \
+    || echo "   [~] Could not fully remove '$path' (files may be busy); continuing."
+  git -C "$repo" worktree prune
+  git -C "$repo" branch -D "$branch" 2>/dev/null || true
+}
+
+# handle_secondary_worktree <mode> <current_path> <current_branch>
+# mode=full  — initial scan: merged/closed removal, stale no-PR removal, OPEN URLs, pending list.
+# mode=post_sync_merged_only — after gt sync: remove merged/closed secondaries (GitHub mergedAt is truth).
+handle_secondary_worktree() {
+  local -r mode="$1"
+  local -r current_path="$2"
+  local -r current_branch="$3"
+
+  local pr_info pr_state pr_number pr_label
+  local head_epoch now age stale_threshold
+
+  if [[ "$mode" != 'post_sync_merged_only' ]]; then
+    printf ' - Checking worktree: %s (%s)...\n' "$current_branch" "$current_path"
+    printf '   Querying GitHub: gh pr list --head '\''%s'\'' --state all\n' "$current_branch"
+  fi
+
+  pr_info="$(gh_pr_info "$current_branch")"
+  pr_state="$pr_info"
+  pr_number=""
+  if [[ "$pr_info" != "NOT_FOUND" ]]; then
+    read -r pr_state pr_number <<< "$pr_info"
+  fi
+  pr_label="$pr_state"
+  if [[ -n "$pr_number" ]]; then
+    pr_label="${pr_label} (#${pr_number})"
+  fi
+
+  if [[ "$mode" == 'post_sync_merged_only' ]]; then
+    if [[ "$pr_state" != "MERGED" && "$pr_state" != "CLOSED" ]]; then
+      return 0
+    fi
+    printf ' - Post-sync: %s (%s) — PR %s (merged on GitHub); removing worktree…\n' \
+      "$current_branch" "$current_path" "$pr_label"
+    if [[ "$current_path" == "$this_worktree" ]]; then
+      printf '   [~] This is the running worktree; skipping removal.\n'
+      return 0
+    fi
+    remove_secondary_worktree "$main_repo" "$current_path" "$current_branch" \
+      "PR is ${pr_label} (GitHub mergedAt). Removing worktree after Graphite sync…"
+    return 0
+  fi
+
+  if [[ "$pr_state" == "MERGED" || "$pr_state" == "CLOSED" ]]; then
+    printf '   PR status: %s (GitHub: mergedAt when present is authoritative)\n' "$pr_label"
+    if [[ -n "$pr_number" ]]; then
+      printf '   GitHub:   https://github.com/%s/pull/%s\n' "$gh_repo" "$pr_number"
+    fi
+    if [[ "$current_path" == "$this_worktree" ]]; then
+      echo "   [~] This is the running worktree; skipping removal."
+      pending_worktrees+=("$current_path|$current_branch")
+      return 0
+    fi
+    remove_secondary_worktree "$main_repo" "$current_path" "$current_branch" \
+      "PR is ${pr_label}. Removing worktree…"
+    return 0
+  fi
+
+  if [[ "$pr_state" == "OPEN" ]]; then
+    printf '   [+] PR is %s. Keeping worktree.\n' "$pr_label"
+    print_pr_urls_github_graphite "$pr_number"
+    pending_worktrees+=("$current_path|$current_branch")
+    return 0
+  fi
+
+  # NOT_FOUND (or unexpected empty): optional stale cleanup, else keep.
+  if [[ "$pr_state" == "NOT_FOUND" ]]; then
+    if ! worktree_has_dirty_tree "$current_path"; then
+      head_epoch="$(secondary_worktree_head_epoch "$current_path")"
+      now="$(date +%s)"
+      stale_threshold=$(( 12 * 60 * 60 ))
+      if [[ "$head_epoch" =~ ^[0-9]+$ ]] && (( head_epoch > 0 )) \
+        && (( now - head_epoch >= stale_threshold )); then
+        if [[ "$current_path" == "$this_worktree" ]]; then
+          printf '   [~] No PR and worktree is stale, but this is the running worktree; skipping removal.\n'
+          pending_worktrees+=("$current_path|$current_branch")
+          return 0
+        fi
+        age=$(( now - head_epoch ))
+        remove_secondary_worktree "$main_repo" "$current_path" "$current_branch" \
+          "No PR for branch; last HEAD activity was ${age}s ago (>= ${stale_threshold}s). Removing stale worktree…"
+        return 0
+      fi
+    fi
+  fi
+
+  printf '   [+] PR is %s. Keeping worktree.\n' "$pr_label"
+  pending_worktrees+=("$current_path|$current_branch")
+}
+
 # Parse arguments
 resume=false
 refresh=false
@@ -140,37 +274,7 @@ while IFS= read -r line; do
             continue
         fi
 
-        echo " - Checking worktree: $current_branch ($current_path)..."
-        echo "   Querying GitHub: gh pr list --head '$current_branch' --state all"
-
-        pr_info="$(gh_pr_info "$current_branch")"
-        pr_state="$pr_info"
-        pr_number=""
-        if [[ "$pr_info" != "NOT_FOUND" ]]; then
-            read -r pr_state pr_number <<< "$pr_info"
-        fi
-        pr_label="$pr_state"
-        if [[ -n "$pr_number" ]]; then
-            pr_label="${pr_label} (#${pr_number})"
-        fi
-
-        if [[ "$pr_state" == "MERGED" || "$pr_state" == "CLOSED" ]]; then
-            if [[ "$current_path" == "$this_worktree" ]]; then
-                echo "   [~] PR is $pr_label but this is the running worktree; skipping removal."
-                pending_worktrees+=("$current_path|$current_branch")
-                continue
-            fi
-            echo "   [!] PR is $pr_label. Removing worktree..."
-            git -C "$main_repo" worktree remove --force "$current_path" 2>/dev/null || true
-            # Best-effort: some files (NFS locks, running scripts) may resist removal.
-            # Don't let a partial failure abort the entire session startup.
-            rm -rf "$current_path" 2>/dev/null || echo "   [~] Could not fully remove '$current_path' (files may be busy); continuing."
-            git -C "$main_repo" worktree prune
-            git -C "$main_repo" branch -D "$current_branch" 2>/dev/null || true
-        else
-            echo "   [+] PR is $pr_label. Keeping worktree."
-            pending_worktrees+=("$current_path|$current_branch")
-        fi
+        handle_secondary_worktree "full" "$current_path" "$current_branch"
     fi
 done <<< "$wt_info"
 
@@ -194,6 +298,44 @@ if [[ "$stashed" == "true" ]]; then
     echo "Restoring local changes in main repo..."
     git -C "$main_repo" stash pop
 fi
+
+# 3a. Re-query GitHub after Graphite sync so mergedAt / merge state matches what gt sync just reconciled.
+echo "Re-checking worktrees after Graphite sync (merged or closed PRs)..."
+wt_info_post=""
+wt_info_post="$(git -C "$main_repo" worktree list --porcelain)"
+current_path=""
+current_branch=""
+while IFS= read -r line; do
+    if [[ "$line" =~ ^worktree\ (.*) ]]; then
+        current_path="${BASH_REMATCH[1]}"
+        current_branch=""
+    elif [[ "$line" =~ ^branch\ refs/heads/(.*) ]]; then
+        current_branch="${BASH_REMATCH[1]}"
+        if [[ "$current_path" == "$main_repo" ]]; then
+            continue
+        fi
+        handle_secondary_worktree "post_sync_merged_only" "$current_path" "$current_branch"
+    fi
+done <<< "$wt_info_post"
+
+# Rebuild pending worktrees from the live worktree list (removals above shrink the set).
+pending_worktrees=()
+wt_info_pending=""
+wt_info_pending="$(git -C "$main_repo" worktree list --porcelain)"
+current_path=""
+current_branch=""
+while IFS= read -r line; do
+    if [[ "$line" =~ ^worktree\ (.*) ]]; then
+        current_path="${BASH_REMATCH[1]}"
+        current_branch=""
+    elif [[ "$line" =~ ^branch\ refs/heads/(.*) ]]; then
+        current_branch="${BASH_REMATCH[1]}"
+        if [[ "$current_path" == "$main_repo" ]]; then
+            continue
+        fi
+        pending_worktrees+=("$current_path|$current_branch")
+    fi
+done <<< "$wt_info_pending"
 
 # 3b. Prune orphaned local branches:
 #   - PR is MERGED/CLOSED (remote branch still exists), OR
