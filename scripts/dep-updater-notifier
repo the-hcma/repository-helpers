@@ -16,6 +16,9 @@
 #   0 7 * * * /path/to/dep-updater-notifier
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -23,10 +26,12 @@ set -euo pipefail
 # Cron runs with a minimal PATH. Ensure common install locations are included so
 # dep-updater's prerequisite checks behave the same as an interactive shell.
 # pnpm's standalone install uses ~/.local/share/pnpm; ripgrep/cargo often use ~/.cargo/bin.
+# NVM-managed Node (pnpm via corepack) lives under ~/.nvm/versions/node/<ver>/bin.
 PATH="${HOME}/.local/bin:${HOME}/.local/share/pnpm:${HOME}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly script_dir
+# shellcheck disable=SC1091
+source "${script_dir}/lib/cron-interactive-path"
+prepend_nvm_default_node_bin_for_cron
 
 readonly dep_updater="${script_dir}/dep-updater"
 
@@ -35,9 +40,6 @@ source "${script_dir}/lib/time-log"
 
 # shellcheck disable=SC1091  # shared helper sourced at runtime; CI shellcheck doesn't use -x
 source "${script_dir}/lib/sendmail"
-
-# shellcheck disable=SC1091  # shared helper sourced at runtime; CI shellcheck doesn't use -x
-source "${script_dir}/lib/runner"
 
 readonly default_repo_root="${HOME}/work/ai"
 
@@ -185,9 +187,24 @@ for repo in "${repos[@]}"; do
 
   exit_code=0
   dep_out_file="$(mktemp)"
-  cleanup_files+=("$dep_out_file")
-  run_command "dep-updater: ${repo_name}" \
-    "$dep_updater" --report-json --dir "$repo" >"$dep_out_file" || exit_code=$?
+  dep_err_file="$(mktemp)"
+  cleanup_files+=("$dep_out_file" "$dep_err_file")
+
+  set +e
+  "$dep_updater" --report-json --dir "$repo" >"$dep_out_file" 2>"$dep_err_file"
+  exit_code=$?
+  set -e
+
+  if [[ "$exit_code" -ne 0 ]]; then
+    printf '[FAIL] dep-updater: %s\n' "$repo_name" >&2
+    printf '  command:   %s --report-json --dir %s\n' "$dep_updater" "$repo" >&2
+    printf '  exit code: %d\n' "$exit_code" >&2
+    if [[ -s "$dep_err_file" ]]; then
+      printf '  --- stderr ---\n' >&2
+      sed 's/^/  /' "$dep_err_file" >&2
+      printf '  --- end stderr ---\n' >&2
+    fi
+  fi
 
   if [[ "$verbose" == '1' ]]; then
     log "  json:"
@@ -207,7 +224,23 @@ for repo in "${repos[@]}"; do
 
     log "${repo_name}: scan failed (${fail_reason})."
     found_failure=1
-    append_report "=== ${repo_name} === (scan failed)"
+    append_report "=== ${repo_name} === (scan failed: ${fail_reason})"
+    if [[ -s "$dep_err_file" ]]; then
+      append_report "dep-updater stderr:"
+      while IFS= read -r eline || [[ -n "$eline" ]]; do
+        append_report "  ${eline}"
+      done <"$dep_err_file"
+    else
+      append_report "(no stderr from dep-updater)"
+    fi
+    if (( exit_code == 0 )) && (( json_ok == 0 )); then
+      append_report "dep-updater stdout (first 800 bytes, invalid JSON):"
+      ohead=""
+      ohead="$(head -c 800 "$dep_out_file" 2>/dev/null || true)"
+      while IFS= read -r oline || [[ -n "$oline" ]]; do
+        append_report "  ${oline}"
+      done <<<"$ohead"
+    fi
     append_report ""
     continue
   fi
@@ -329,10 +362,15 @@ else
 fi
 
 body_lines=()
-body_lines+=("Dependency updates are available for one or more of your repos.")
-body_lines+=("Run dep-updater in the relevant directory to create PRs automatically.")
+if (( found_any == 1 )); then
+  body_lines+=("Dependency updates are available for one or more of your repos.")
+  body_lines+=("Run dep-updater in the relevant directory to create PRs automatically.")
+else
+  body_lines+=("One or more repository scans failed or produced nothing to report.")
+  body_lines+=("See each repo section below for dep-updater stderr; cron PATH is often smaller than a login shell (install tools under ~/.local/bin or widen PATH).")
+fi
 body_lines+=("")
-  body_lines+=("Scanned:  $(date '+%Y-%m-%d %H:%M %z %Z')")
+body_lines+=("Scanned:  $(date '+%Y-%m-%d %H:%M %z %Z')")
 body_lines+=("Host:     ${scan_host}  (user: $(id -un 2>/dev/null || echo '?'))")
 body_lines+=("Script:   ${BASH_SOURCE[0]}")
 body_lines+=("dep-updater: ${dep_updater}")
