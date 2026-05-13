@@ -51,6 +51,72 @@ gh_pr_info() {
   echo "NOT_FOUND"
 }
 
+# resolve_pr_state_for_branch <branch>
+# Prints the same format as gh_pr_info: NOT_FOUND | <STATE> <NUMBER>.
+# Graphite is authoritative for merge/close: gt info --branch reflects merged stacks
+# immediately, while GitHub's REST view can still list the PR as OPEN until caches catch up.
+resolve_pr_state_for_branch() {
+  local -r branch="$1"
+  local gt_out first_line pr_from_gt gh_line gh_num
+
+  if [[ "${START_DEV_SKIP_GRAPHITE:-0}" == '1' ]]; then
+    gh_pr_info "$branch"
+    return 0
+  fi
+
+  if ! command -v gt >/dev/null 2>&1; then
+    gh_pr_info "$branch"
+    return 0
+  fi
+
+  gt_out=""
+  if gt_out="$(cd "$main_repo" && timeout 25 gt info --branch "$branch" --no-interactive 2>/dev/null)"; then
+    :
+  else
+    gt_out=""
+  fi
+  first_line="$(printf '%s\n' "$gt_out" | head -1)"
+
+  if printf '%s' "$first_line" | grep -qiE ' \(merged\)$' \
+    || printf '%s\n' "$gt_out" | head -25 | grep -qE 'PR #[0-9]+ \(Merged\)'; then
+    pr_from_gt=""
+    pr_from_gt="$(printf '%s\n' "$gt_out" | grep -oiE 'PR #[0-9]+' | head -1 | sed 's/^PR #//')"
+    if [[ -z "$pr_from_gt" ]]; then
+      gh_line="$(gh_pr_info "$branch")"
+      if [[ "$gh_line" != "NOT_FOUND" ]]; then
+        read -r _gh_state gh_num <<< "$gh_line"
+        pr_from_gt="$gh_num"
+      fi
+    fi
+    if [[ -n "$pr_from_gt" ]]; then
+      printf 'MERGED %s\n' "$pr_from_gt"
+    else
+      printf 'MERGED\n'
+    fi
+    return 0
+  fi
+
+  if printf '%s\n' "$gt_out" | head -25 | grep -qE 'PR #[0-9]+ \(Closed\)'; then
+    pr_from_gt=""
+    pr_from_gt="$(printf '%s\n' "$gt_out" | grep -oiE 'PR #[0-9]+' | head -1 | sed 's/^PR #//')"
+    if [[ -z "$pr_from_gt" ]]; then
+      gh_line="$(gh_pr_info "$branch")"
+      if [[ "$gh_line" != "NOT_FOUND" ]]; then
+        read -r _gh_state gh_num <<< "$gh_line"
+        pr_from_gt="$gh_num"
+      fi
+    fi
+    if [[ -n "$pr_from_gt" ]]; then
+      printf 'CLOSED %s\n' "$pr_from_gt"
+    else
+      printf 'CLOSED\n'
+    fi
+    return 0
+  fi
+
+  gh_pr_info "$branch"
+}
+
 # print_pr_urls_github_graphite <pr_number>
 # Emits clickable GitHub + Graphite URLs for an open PR (same shape as the Graphite app).
 print_pr_urls_github_graphite() {
@@ -98,7 +164,7 @@ remove_secondary_worktree() {
 
 # handle_secondary_worktree <mode> <current_path> <current_branch>
 # mode=full  — initial scan: merged/closed removal, stale no-PR removal, OPEN URLs, pending list.
-# mode=post_sync_merged_only — after gt sync: remove merged/closed secondaries (GitHub mergedAt is truth).
+# mode=post_sync_merged_only — after gt sync: remove merged/closed secondaries (Graphite-first).
 handle_secondary_worktree() {
   local -r mode="$1"
   local -r current_path="$2"
@@ -109,10 +175,13 @@ handle_secondary_worktree() {
 
   if [[ "$mode" != 'post_sync_merged_only' ]]; then
     printf ' - Checking worktree: %s (%s)...\n' "$current_branch" "$current_path"
+    if command -v gt >/dev/null 2>&1; then
+      printf '   Querying Graphite: gt info --branch '\''%s'\''\n' "$current_branch"
+    fi
     printf '   Querying GitHub: gh pr list --head '\''%s'\'' --state all\n' "$current_branch"
   fi
 
-  pr_info="$(gh_pr_info "$current_branch")"
+  pr_info="$(resolve_pr_state_for_branch "$current_branch")"
   pr_state="$pr_info"
   pr_number=""
   if [[ "$pr_info" != "NOT_FOUND" ]]; then
@@ -127,19 +196,19 @@ handle_secondary_worktree() {
     if [[ "$pr_state" != "MERGED" && "$pr_state" != "CLOSED" ]]; then
       return 0
     fi
-    printf ' - Post-sync: %s (%s) — PR %s (merged on GitHub); removing worktree…\n' \
+    printf ' - Post-sync: %s (%s) — PR %s (merged per Graphite); removing worktree…\n' \
       "$current_branch" "$current_path" "$pr_label"
     if [[ "$current_path" == "$this_worktree" ]]; then
       printf '   [~] This is the running worktree; skipping removal.\n'
       return 0
     fi
     remove_secondary_worktree "$main_repo" "$current_path" "$current_branch" \
-      "PR is ${pr_label} (GitHub mergedAt). Removing worktree after Graphite sync…"
+      "PR is ${pr_label} (Graphite merged). Removing worktree after Graphite sync…"
     return 0
   fi
 
   if [[ "$pr_state" == "MERGED" || "$pr_state" == "CLOSED" ]]; then
-    printf '   PR status: %s (GitHub: mergedAt when present is authoritative)\n' "$pr_label"
+    printf '   PR status: %s (Graphite gt info when available; else GitHub mergedAt)\n' "$pr_label"
     if [[ -n "$pr_number" ]]; then
       printf '   GitHub:   https://github.com/%s/pull/%s\n' "$gh_repo" "$pr_number"
     fi
@@ -291,7 +360,14 @@ if [[ -n "$has_changes" ]]; then
     stashed=true
 fi
 
+set +e
 (cd "$main_repo" && gt sync --quiet --force)
+gt_sync_exit=$?
+set -e
+if [[ "$gt_sync_exit" -ne 0 ]]; then
+  printf '   [~] gt sync exited with code %s (often: Graphite deletes a branch that git already removed). Continuing with post-sync cleanup.\n' \
+    "$gt_sync_exit" >&2
+fi
 echo "Graphite sync complete."
 
 if [[ "$stashed" == "true" ]]; then
@@ -299,7 +375,7 @@ if [[ "$stashed" == "true" ]]; then
     git -C "$main_repo" stash pop
 fi
 
-# 3a. Re-query GitHub after Graphite sync so mergedAt / merge state matches what gt sync just reconciled.
+# 3a. Re-check worktrees after Graphite sync (Graphite-first merged/closed cleanup).
 echo "Re-checking worktrees after Graphite sync (merged or closed PRs)..."
 wt_info_post=""
 wt_info_post="$(git -C "$main_repo" worktree list --porcelain)"
@@ -358,8 +434,11 @@ while IFS= read -r branch; do
     [[ "$in_worktree" == "true" ]] && continue
 
     echo " - Checking branch: $branch..."
+    if command -v gt >/dev/null 2>&1; then
+      echo "   Querying Graphite: gt info --branch '$branch'"
+    fi
     echo "   Querying GitHub: gh pr list --head '$branch' --state all"
-    orphan_info="$(gh_pr_info "$branch")"
+    orphan_info="$(resolve_pr_state_for_branch "$branch")"
     orphan_state="$orphan_info"
     orphan_number=""
     if [[ "$orphan_info" != "NOT_FOUND" ]]; then
