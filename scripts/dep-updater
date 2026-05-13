@@ -783,6 +783,67 @@ npm_version_prefetch() {
   return 1
 }
 
+# npm_registry_dist_tag_latest <pkg>
+# Prints dist-tags.latest from the npm packument (HTTPS), using the same registry
+# base URL as npm_version_prefetch. Prefer this over `pnpm view`, which can
+# return stale cached metadata that disagrees with install-time resolution.
+# Returns 1 when latest is missing or the packument cannot be fetched.
+npm_registry_dist_tag_latest() {
+  local -r pkg="$1"
+  local registry encoded_pkg body latest
+
+  # Tests set DEP_UPDATER_SKIP_NPM_REGISTRY=1 so packument fetch does not depend
+  # on live registry contents (report-json integration uses stubbed pnpm only).
+  if [[ "${DEP_UPDATER_SKIP_NPM_REGISTRY:-0}" == '1' ]]; then
+    return 1
+  fi
+
+  registry="$(pnpm config get registry 2>/dev/null | tr -d '[:space:]' || echo 'https://registry.npmjs.org/')"
+  [[ "$registry" != */ ]] && registry="${registry}/"
+  encoded_pkg="${pkg//@/%40}"
+  encoded_pkg="${encoded_pkg//\//%2F}"
+  body=""
+  body="$(curl --silent --max-time 15 "${registry}${encoded_pkg}" 2>/dev/null || true)"
+  latest=""
+  latest="$(printf '%s' "$body" | jq -r '.["dist-tags"].latest // empty' 2>/dev/null || true)"
+  if [[ -z "$latest" || "$latest" == 'null' ]]; then
+    return 1
+  fi
+  printf '%s' "$latest"
+  return 0
+}
+
+# Optional: DEP_UPDATER_ECO_FAIL_FILE is a temp file listing non-fatal ecosystem
+# errors (one line each) so the run can continue and still exit non-zero.
+dep_updater_append_ecosystem_failure() {
+  if [[ -n "${DEP_UPDATER_ECO_FAIL_FILE:-}" ]]; then
+    printf '%s\n' "$*" >> "${DEP_UPDATER_ECO_FAIL_FILE}"
+  fi
+}
+
+dep_updater_ecosystem_failures_present() {
+  [[ -n "${DEP_UPDATER_ECO_FAIL_FILE:-}" && -s "${DEP_UPDATER_ECO_FAIL_FILE}" ]]
+}
+
+dep_updater_print_ecosystem_failure_banner() {
+  if ! dep_updater_ecosystem_failures_present; then
+    return 0
+  fi
+  log ""
+  log "[ecosystem-failures] One or more ecosystem update steps failed (other work continued):"
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    log "  - ${line}"
+  done < "${DEP_UPDATER_ECO_FAIL_FILE}"
+}
+
+dep_updater_ensure_eco_fail_file() {
+  if [[ -z "${DEP_UPDATER_ECO_FAIL_FILE:-}" ]]; then
+    DEP_UPDATER_ECO_FAIL_FILE="$(mktemp)"
+    export DEP_UPDATER_ECO_FAIL_FILE
+  fi
+}
+
 # install_with_net_retry <label> <workdir> <cmd> [args…]
 # Runs <cmd> in <workdir> up to 4 times (30 / 60 / 90 s linear backoff) when
 # the output suggests a transient network error.  On success or a non-transient
@@ -897,9 +958,6 @@ pnpm_install_worktree() {
   # it can skip this group and continue with other packages, rather than aborting
   # the entire run.
   if grep -qF 'ERR_PNPM_NO_MATCHING_VERSION' "$pnpm_log"; then
-    local no_match_line
-    no_match_line="$(grep -m1 'No matching version found for' "$pnpm_log" || true)"
-    record_first_failure "${no_match_line:-pnpm: ERR_PNPM_NO_MATCHING_VERSION}"
     log "[pnpm] WARNING: a requested version was not found in the registry; signalling caller to skip this group."
     tail -n 20 "$pnpm_log" | sed 's/^/  /' >&2
     rm -f "$pnpm_log"
@@ -1658,7 +1716,8 @@ npm_outdated() {
   # pnpm outdated can miss updates that are allowed by package.json ranges but
   # not yet captured in pnpm-lock.yaml (e.g. react ^19.2.5 when 19.2.6 exists).
   # In "latest" mode, compute direct-dependency updates by comparing the
-  # installed version (pnpm list) to the registry's latest (pnpm view).
+  # installed version (pnpm list) to pnpm view, clamping with the npm packument
+  # dist-tags.latest when pnpm metadata is stale-high.
   if [[ "$tool" == 'pnpm' && "$semver_only" == '0' ]]; then
     local pkg_json_specs
     if [[ -f "${scan_root}/package.json" ]]; then
@@ -1680,7 +1739,7 @@ npm_outdated() {
     local pkgs_json
     pkgs_json="$(printf '%s' "$pkg_json_specs" | jq -c 'keys' 2>/dev/null || echo '[]')"
 
-    local pkg spec current latest sort_winner
+    local pkg spec current latest sort_winner pv reg higher
     while IFS= read -r pkg; do
       [[ -z "$pkg" ]] && continue
       if pnpm_pkg_is_ignored_build "$pkg"; then
@@ -1697,7 +1756,26 @@ npm_outdated() {
       ' "$tmp_list" 2>/dev/null || echo "")"
       [[ -z "$current" ]] && continue
 
-      latest="$(pnpm view "$pkg" version 2>/dev/null || true)"
+      # Combine pnpm metadata with the npm packument dist-tags.latest (same HTTPS
+      # source as npm_version_prefetch). When pnpm's cached view claims a version
+      # strictly above registry latest, clamp to registry — otherwise take the
+      # higher of the two so we still advance when pnpm is merely behind.
+      pv="$(pnpm view "$pkg" version 2>/dev/null || true)"
+      reg="$(npm_registry_dist_tag_latest "$pkg" 2>/dev/null || true)"
+      if [[ -n "$reg" && -n "$pv" ]]; then
+        higher="$(printf '%s\n%s\n' "$reg" "$pv" | sort -V | tail -1)"
+        if [[ "$higher" == "$pv" && "$pv" != "$reg" ]]; then
+          latest="$reg"
+        else
+          latest="$higher"
+        fi
+      elif [[ -n "$reg" ]]; then
+        latest="$reg"
+      elif [[ -n "$pv" ]]; then
+        latest="$pv"
+      else
+        continue
+      fi
       [[ -z "$latest" ]] && continue
       [[ "$current" == "$latest" ]] && continue
 
@@ -1992,7 +2070,9 @@ npm_update_group() {
           ) | from_entries
         ' "${worktree_path}/package.json" > "$tmp_pkg"; then
           rm -f "$tmp_pkg"
-          die "jq failed to update package.json versions."
+          dep_updater_append_ecosystem_failure "npm|jq failed for group ${group_key} (${npm_tool})"
+          log "[${npm_tool}] ERROR: jq failed to patch package.json for '${group_key}' — skipping group."
+          return 0
         fi
         mv "$tmp_pkg" "${worktree_path}/package.json"
 
@@ -2006,14 +2086,27 @@ npm_update_group() {
           git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
           git -C "$worktree_path" checkout -- pnpm-lock.yaml 2>/dev/null || true
           log "[${npm_tool}] WARNING: ${group_key}: skipping — one or more versions not available in registry."
+          dep_updater_append_ecosystem_failure "npm|${group_key}: version not in registry (pnpm ERR_PNPM_NO_MATCHING_VERSION)"
           return 0
         elif [[ "$pnpm_rc" -ne 0 ]]; then
-          die "pnpm install failed."
+          git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+          git -C "$worktree_path" checkout -- pnpm-lock.yaml 2>/dev/null || true
+          dep_updater_append_ecosystem_failure "npm|pnpm install failed for ${group_key} (exit ${pnpm_rc})"
+          log "[${npm_tool}] ERROR: pnpm install failed for '${group_key}' (exit ${pnpm_rc}) — skipping group."
+          return 0
         fi
       fi
       ;;
     yarn)
-      yarn --cwd "$worktree_path" upgrade "${pkg_args[@]}" --latest
+      local yarn_rc=0
+      yarn --cwd "$worktree_path" upgrade "${pkg_args[@]}" --latest || yarn_rc=$?
+      if [[ "$yarn_rc" -ne 0 ]]; then
+        git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+        git -C "$worktree_path" checkout -- yarn.lock 2>/dev/null || true
+        dep_updater_append_ecosystem_failure "npm|yarn upgrade failed for ${group_key} (exit ${yarn_rc})"
+        log "[${npm_tool}] ERROR: yarn upgrade failed for '${group_key}' (exit ${yarn_rc}) — skipping group."
+        return 0
+      fi
       ;;
     npm)
       # Patch exact target versions into package.json using jq, then do a
@@ -2048,12 +2141,20 @@ npm_update_group() {
         ) | from_entries
       ' "${worktree_path}/package.json" > "$tmp_pkg"; then
         rm -f "$tmp_pkg"
-        die "jq failed to update package.json versions."
+        dep_updater_append_ecosystem_failure "npm|jq failed for group ${group_key} (${npm_tool})"
+        log "[${npm_tool}] ERROR: jq failed to patch package.json for '${group_key}' — skipping group."
+        return 0
       fi
       mv "$tmp_pkg" "${worktree_path}/package.json"
 
-      npm install --prefix "$worktree_path"
-      ;;
+      local npm_inst_rc=0
+      npm install --prefix "$worktree_path" || npm_inst_rc=$?
+      if [[ "$npm_inst_rc" -ne 0 ]]; then
+        git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+        dep_updater_append_ecosystem_failure "npm|npm install failed for ${group_key} (exit ${npm_inst_rc})"
+        log "[${npm_tool}] ERROR: npm install failed for '${group_key}' (exit ${npm_inst_rc}) — skipping group."
+        return 0
+      fi
   esac
 
   git -C "$worktree_path" add package.json
@@ -2787,7 +2888,7 @@ py_update_one() {
 
   case "$tool" in
     uv)
-      local uv_out uv_exit uv_constraint_op uv_spec sed_pkg
+      local uv_out uv_exit uv_constraint_op uv_spec sed_pkg sed_new_ver
       uv_constraint_op="$(py_constraint_op "$pkg" "${dir}/pyproject.toml")"
       # Invariant: always write >= (never ==) — dep-updater must not re-pin.
       if [[ "$uv_constraint_op" == ">=" || "$uv_constraint_op" == "==" ]]; then
@@ -2796,9 +2897,14 @@ py_update_one() {
         # leaves pyproject.toml unchanged). Patch the floor with sed instead.
         # For == constraints, convert to >= so dep-updater never introduces pins.
         sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
-        sed -i -E \
-          "s/(\"${sed_pkg}([^\"=<>!~,]|\\[[^]]+\\])*[[:space:]]*)(?:>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*/\\1>=${new_ver}/" \
-          "${worktree_path}/pyproject.toml"
+        sed_new_ver="$(printf '%s' "$new_ver" | sed 's/[\\&#]/\\&/g')"
+        if ! sed -i -E \
+          "s#(\"${sed_pkg}([^\"=<>!~,]|\\[[a-zA-Z0-9,_=.-]+\\])*[[:space:]]*)(?:>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*)#\\1>=${sed_new_ver}#" \
+          "${worktree_path}/pyproject.toml"; then
+          log "[python/uv] ERROR: sed could not rewrite ${pkg} constraint — skipping."
+          dep_updater_append_ecosystem_failure "python|sed failed for ${pkg}"
+          return 0
+        fi
         uv_out="$(uv --directory "$worktree_path" lock 2>&1)" && uv_exit=0 || uv_exit=$?
       else
         uv_spec="${pkg}==${new_ver}"
@@ -3157,7 +3263,9 @@ batch_update_all() {
   batch_ts="$(date --utc +%Y%m%dT%H%M%S)"
   local -r branch="dep-updates/batch-${batch_ts}"
   local any_npm=0 any_py=0
-  local py_out py_exit b_constraint_op b_spec actual_py_lines sed_pkg
+  local py_out py_exit b_constraint_op b_spec actual_py_lines sed_pkg sed_new_ver
+
+  dep_updater_ensure_eco_fail_file
 
   # If a previous batch branch from this same worktree session exists and its PR
   # is still open, reuse it rather than creating a duplicate.
@@ -3235,7 +3343,14 @@ batch_update_all() {
         any_npm=1
       fi
       if [[ "${#yarn_args[@]}" -gt 0 ]]; then
-        yarn --cwd "$worktree_path" upgrade "${yarn_args[@]}"
+        local yarn_batch_rc=0
+        yarn --cwd "$worktree_path" upgrade "${yarn_args[@]}" || yarn_batch_rc=$?
+        if [[ "$yarn_batch_rc" -ne 0 ]]; then
+          git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+          git -C "$worktree_path" checkout -- yarn.lock 2>/dev/null || true
+          dep_updater_append_ecosystem_failure "npm|batch yarn upgrade failed (exit ${yarn_batch_rc})"
+          log "[${npm_tool}] WARNING: batch yarn upgrade failed (exit ${yarn_batch_rc}); continuing."
+        fi
       fi
     else
       # npm / pnpm: patch package.json once with all target versions, then install.
@@ -3273,13 +3388,33 @@ batch_update_all() {
           ) | from_entries
         ' "${worktree_path}/package.json" > "$tmp_pkg"; then
           rm -f "$tmp_pkg"
-          die "jq failed to update package.json versions."
+          git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+          dep_updater_append_ecosystem_failure "npm|batch jq failed to patch package.json"
+          log "[batch] ERROR: jq failed to patch package.json — npm batch section skipped."
+        else
+          mv "$tmp_pkg" "${worktree_path}/package.json"
+          case "$npm_tool" in
+            pnpm)
+              local pnpm_batch_rc=0
+              pnpm_install_worktree no-frozen "$worktree_path" || pnpm_batch_rc=$?
+              if [[ "$pnpm_batch_rc" -ne 0 ]]; then
+                git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+                git -C "$worktree_path" checkout -- pnpm-lock.yaml 2>/dev/null || true
+                dep_updater_append_ecosystem_failure "npm|batch pnpm install failed (exit ${pnpm_batch_rc})"
+                log "[${npm_tool}] WARNING: batch pnpm install failed (exit ${pnpm_batch_rc}); continuing."
+              fi
+              ;;
+            npm)
+              local npm_batch_rc=0
+              npm install --prefix "$worktree_path" || npm_batch_rc=$?
+              if [[ "$npm_batch_rc" -ne 0 ]]; then
+                git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+                dep_updater_append_ecosystem_failure "npm|batch npm install failed (exit ${npm_batch_rc})"
+                log "[${npm_tool}] WARNING: batch npm install failed (exit ${npm_batch_rc}); continuing."
+              fi
+              ;;
+          esac
         fi
-        mv "$tmp_pkg" "${worktree_path}/package.json"
-        case "$npm_tool" in
-          pnpm) pnpm_install_worktree no-frozen "$worktree_path" ;;
-          npm)  npm install --prefix "$worktree_path" ;;
-        esac
       fi
     fi
 
@@ -3313,13 +3448,17 @@ batch_update_all() {
         case "$py_tool" in
           uv)
             b_constraint_op="$(py_constraint_op "$pkg" "${dir}/pyproject.toml")"
-            if [[ "$b_constraint_op" == ">=" ]]; then
-              # Direct floor bump: uv add pkg>=new_ver is a no-op when the lock
-              # already satisfies the constraint. Patch pyproject.toml with sed.
+            if [[ "$b_constraint_op" == ">=" || "$b_constraint_op" == "==" ]]; then
+              # Direct floor bump: match py_update_one (sed + uv lock).
               sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
-              sed -i -E \
-                "s/(\"${sed_pkg}([^\"=<>!~,]|\\[[^]]+\\])*[[:space:]]*)>=[[:space:]]*[0-9][0-9a-zA-Z.]*/\\1>=${new_ver}/" \
-                "${worktree_path}/pyproject.toml"
+              sed_new_ver="$(printf '%s' "$new_ver" | sed 's/[\\&#]/\\&/g')"
+              if ! sed -i -E \
+                "s#(\"${sed_pkg}([^\"=<>!~,]|\\[[a-zA-Z0-9,_=.-]+\\])*[[:space:]]*)(?:>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*)#\\1>=${sed_new_ver}#" \
+                "${worktree_path}/pyproject.toml"; then
+                log "[python/uv] ERROR: batch sed failed for ${pkg} — skipping."
+                dep_updater_append_ecosystem_failure "python|batch sed failed for ${pkg}"
+                continue
+              fi
               py_out="$(uv --directory "$worktree_path" lock 2>&1)" && py_exit=0 || py_exit=$?
             else
               b_spec="${pkg}==${new_ver}"
@@ -3329,7 +3468,7 @@ batch_update_all() {
               # Revert: sed patched pyproject.toml before the lock attempt for >=
               # constraints. Restore the file so failed bumps don't accumulate
               # and cause all subsequent packages to fail with phantom conflicts.
-              if [[ "$b_constraint_op" == ">=" ]]; then
+              if [[ "$b_constraint_op" == ">=" || "$b_constraint_op" == "==" ]]; then
                 git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
               fi
               log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
@@ -4252,6 +4391,7 @@ cleanup() {
       || log "Note: wt_base_branch '${wt_base_branch}' not found."
   fi
   rm -f "$state_file"
+  rm -f "${DEP_UPDATER_ECO_FAIL_FILE:-}"
   log "Cleanup complete."
 }
 
@@ -4869,6 +5009,7 @@ if [[ "$dry_run" == '1' ]]; then
   # Always create (and destroy) the worktree so lifecycle is exercised even
   # when no ecosystem is present — this is the main testable invariant.
   create_worktree
+  dep_updater_ensure_eco_fail_file
   _cleanup_trap_active=1
   local audit_dir="$worktree_path"
   cd "$audit_dir" || die "Failed to cd to dry-run worktree: $audit_dir"
@@ -5138,6 +5279,7 @@ if [[ "$deps_maybe_outdated" == '0' ]]; then
   if [[ -f "$state_file" ]]; then
     prepare_worktree
     ensure_gt_tracked
+    dep_updater_ensure_eco_fail_file
     _cleanup_trap_active=1
     # Fetch remote refs without touching the primary repo's working tree.
     # (gt sync --force fails when the primary repo has local uncommitted changes.)
@@ -5175,6 +5317,7 @@ prepare_worktree
 ensure_gt_tracked
 
 # Worktree is live — any unexpected exit from here should trigger cleanup.
+dep_updater_ensure_eco_fail_file
 _cleanup_trap_active=1
 
 # Fetch remote refs without touching the primary repo's working tree.
@@ -5301,6 +5444,11 @@ if [[ -n "$pnpm_ignored_build_pkgs" ]]; then
   done <<< "$pnpm_ignored_build_pkgs"
   log "[pnpm] To resolve permanently, run: pnpm approve-builds (or pnpm approve-builds --all)"
 fi
+dep_updater_print_ecosystem_failure_banner
+local dep_updater_final_rc=0
+if dep_updater_ecosystem_failures_present; then
+  dep_updater_final_rc=1
+fi
 local all_prs_csv
 all_prs_csv="$(collect_tracked_prs_csv)"
 print_stack_urls "$all_prs_csv"
@@ -5312,21 +5460,21 @@ if [[ "$no_wait_merge" == '1' ]]; then
   log "Stack submitted. To clean up after all PRs are merged, run:"
   log "  $0 --cleanup --dir ${dir}"
   _cleanup_trap_active=0
-  exit 0
+  exit "$dep_updater_final_rc"
 fi
 
 if [[ -z "$all_prs_csv" ]]; then
   # Nothing was created this run — skip merge polling and go straight to cleanup.
   _cleanup_trap_active=0
   cleanup
-  exit 0
+  exit "$dep_updater_final_rc"
 fi
 
 # Wait for merge and clean up automatically
 poll_until_merged "$all_prs_csv"
 _cleanup_trap_active=0
 cleanup
-exit 0
+exit "$dep_updater_final_rc"
 }
 
 main "$@"
