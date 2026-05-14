@@ -192,6 +192,34 @@ Read with `rg "^key=" | cut -d= -f2-`; updated with `sed -i`.
 
 ---
 
+## Batch-all child run report (`DEP_UPDATER_RUN_REPORT`)
+
+When `dep-updater` runs as **`--batch --all`**, the parent process spawns one child per
+repository. The parent sets **`DEP_UPDATER_RUN_REPORT`** to an absolute path of a fresh
+empty file for that child only (via the child’s environment on the exec line — the
+parent’s shell does not retain the variable).
+
+On **non-zero exit**, the child’s **`EXIT` trap** (`_on_exit`) writes **one JSON object**
+to that path (single write, no partial-file protocol — the parent only reads the file
+after `wait`). The parent then loads **`primary`** and **`details`** with **`jq`** for
+`[batch-all] Root cause:` and the failure summary. If the file is missing or invalid
+(e.g. crash before the trap), the parent falls back to the **last line** of the
+ANSI-stripped log copy.
+
+**Object shape (stable keys, no version field):**
+
+| Key | Type | Meaning |
+|-----|------|--------|
+| `exit_code` | number | Process exit code |
+| `dir` | string | `--dir` project root passed to the child |
+| `primary` | string | One-line headline (first recorded failure, else first ecosystem failure line, else generic) |
+| `details` | string[] | Lines from `DEP_UPDATER_ECO_FAIL_FILE` when present (ecosystem soft-failures) |
+
+Interactive runs and non-batch-all children never set this variable, so behavior is
+unchanged.
+
+---
+
 ## Known Pitfalls
 
 Bugs that were found in production and fixed. Recorded here so the same mistakes are not reintroduced.
