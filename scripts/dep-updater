@@ -344,19 +344,27 @@ _worktree_commit() {
 # shellcheck disable=SC2317  # invoked via EXIT trap, not directly
 _on_exit() {
   local exit_code=$?
+  local first_fail_for_report reason
+  first_fail_for_report=""
   # Reset the EXIT trap immediately so cleanup_on_error can't re-trigger it.
   trap - EXIT
+  if [[ -n "${RUNNER_FIRST_FAILURE_FILE:-}" && -s "${RUNNER_FIRST_FAILURE_FILE}" ]]; then
+    first_fail_for_report="$(cat "${RUNNER_FIRST_FAILURE_FILE}")"
+  fi
   # Only run cleanup if the worktree phase was reached and the exit is non-zero.
   if [[ "$_cleanup_trap_active" == '1' && $exit_code -ne 0 ]]; then
     # Use the first recorded failure reason if available — it contains the real
     # error (e.g. "pnpm: no matching version") rather than a generic wrapper.
-    local reason="script exited unexpectedly (exit code ${exit_code})"
-    if [[ -n "${RUNNER_FIRST_FAILURE_FILE:-}" && -s "${RUNNER_FIRST_FAILURE_FILE}" ]]; then
-      reason="$(cat "${RUNNER_FIRST_FAILURE_FILE}")"
+    reason="script exited unexpectedly (exit code ${exit_code})"
+    if [[ -n "$first_fail_for_report" ]]; then
+      reason="$first_fail_for_report"
     fi
     cleanup_on_error "$reason"
   fi
   rm -f "${RUNNER_FIRST_FAILURE_FILE:-}"
+  if [[ -n "${DEP_UPDATER_RUN_REPORT:-}" && "$exit_code" -ne 0 ]]; then
+    dep_updater_write_batch_child_report_json "$exit_code" "$first_fail_for_report"
+  fi
 }
 
 # shellcheck disable=SC2317  # invoked via INT/TERM traps, not directly
@@ -845,6 +853,44 @@ dep_updater_ensure_eco_fail_file() {
     DEP_UPDATER_ECO_FAIL_FILE="$(mktemp)"
     export DEP_UPDATER_ECO_FAIL_FILE
   fi
+}
+
+# When the parent sets DEP_UPDATER_RUN_REPORT to a temp path (batch-all child
+# invocations only), write one JSON object the parent reads with jq — no log
+# scraping. Keys: exit_code, dir, primary, details (array of strings).
+# shellcheck disable=SC2317  # invoked indirectly from _on_exit
+dep_updater_write_batch_child_report_json() {
+  local -r exit_code="${1:?}"
+  local -r first_failure="${2:-}"
+  local out_file primary details_json
+
+  out_file="${DEP_UPDATER_RUN_REPORT:?}"
+  primary="$first_failure"
+  details_json='[]'
+
+  if [[ -n "${DEP_UPDATER_ECO_FAIL_FILE:-}" && -s "${DEP_UPDATER_ECO_FAIL_FILE}" ]]; then
+    details_json="$(jq -Rs 'split("\n") | map(select(length > 0))' \
+      "${DEP_UPDATER_ECO_FAIL_FILE}" 2>/dev/null || true)"
+    [[ -z "$details_json" ]] && details_json='[]'
+    if [[ -z "$primary" ]]; then
+      primary="$(head -n 1 "${DEP_UPDATER_ECO_FAIL_FILE}" 2>/dev/null || true)"
+    fi
+  fi
+
+  if [[ -z "$primary" ]]; then
+    primary="dep-updater exited with code ${exit_code}"
+  fi
+
+  jq -n \
+    --argjson exit_code "$exit_code" \
+    --arg dir "$dir" \
+    --arg primary "$primary" \
+    --argjson details "${details_json}" \
+    '{exit_code: $exit_code, dir: $dir, primary: $primary, details: $details}' \
+    >"$out_file" 2>/dev/null \
+    || jq -n --argjson exit_code "$exit_code" --arg primary "$primary" \
+         '{exit_code: $exit_code, dir: "", primary: $primary, details: []}' \
+         >"$out_file" 2>/dev/null || true
 }
 
 # install_with_net_retry <label> <workdir> <cmd> [args…]
@@ -4798,7 +4844,6 @@ batch_all_dispatch() {
   local -a child_args repos_found
   local -a failure_summaries=()
   local -a failure_details=()
-  local root_cause eco_bullet child_clean
 
   # Palette of ANSI colors cycled across repos so each project's header is visually distinct.
   # Only active when stderr is a TTY (same condition as init_prompt_style).
@@ -4872,8 +4917,10 @@ batch_all_dispatch() {
     child_args+=(--dir "$repo")
 
     child_exit=0
-    local child_log child_fifo child_pid
+    local child_log child_fifo child_pid child_report
+    local root_cause child_clean report_line detail_count
     child_log="$(mktemp)"
+    child_report="$(mktemp)"
     child_fifo="$(mktemp -u)"
     mkfifo "$child_fifo"
     _batch_all_active_child_log="$child_log"
@@ -4881,8 +4928,10 @@ batch_all_dispatch() {
 
     # Stream ALL child output live, while also capturing it for concise failure summaries.
     # Use a fifo so we also have a child PID to kill on Ctrl-C.
+    # DEP_UPDATER_RUN_REPORT: child writes structured JSON on non-zero exit for
+    # batch-all to read (see dep_updater_write_batch_child_report_json).
     set +e
-    "$dep_self" "${child_args[@]}" >"$child_fifo" 2>&1 &
+    DEP_UPDATER_RUN_REPORT="$child_report" "$dep_self" "${child_args[@]}" >"$child_fifo" 2>&1 &
     child_pid=$!
     _batch_all_active_child_pid="$child_pid"
 
@@ -4899,7 +4948,7 @@ batch_all_dispatch() {
     set -e
 
     if [[ "$_batch_all_interrupted" == '1' ]]; then
-      rm -f "$child_log"
+      rm -f "$child_log" "$child_report"
       _batch_all_active_child_log=""
       break
     fi
@@ -4907,46 +4956,30 @@ batch_all_dispatch() {
     if [[ "$child_exit" -ne 0 ]]; then
       TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
         log "[batch-all] FAILED (${repo}) exit ${child_exit}"
-      # Keep batch-all output actionable: strip ANSI noise and print a short root-cause summary.
-      # (Full child output is intentionally not dumped here.)
+      root_cause=""
+      detail_count=0
+      if [[ -s "$child_report" ]] \
+        && jq -e 'has("primary") and has("details") and has("exit_code")' "$child_report" >/dev/null 2>&1; then
+        root_cause="$(jq -r '.primary // empty' "$child_report" 2>/dev/null || true)"
+        while IFS= read -r report_line; do
+          [[ -z "$report_line" ]] && continue
+          failure_details+=("$(basename "$repo"): ${report_line}")
+          detail_count=$((detail_count + 1))
+        done < <(jq -r '.details[]? // empty' "$child_report" 2>/dev/null || true)
+      fi
+      # Keep batch-all output actionable: strip ANSI noise; use log tail only if
+      # no structured report (e.g. older child or crash before write).
       child_clean="$(mktemp)"
-      # Strip common ANSI escape sequences (colors, cursor movement).
       sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' "$child_log" >"$child_clean" 2>/dev/null || cp "$child_log" "$child_clean"
 
-      # Root-cause: prefer explicit dep-updater signals, then generic errors.
-      # Suffix pipelines with "|| true" so set -o pipefail cannot abort batch-all
-      # mid-loop when a child exits without "Cleaning up after error:" (for
-      # example ecosystem failures with no PRs clear _cleanup_trap_active before
-      # exit 1, so _on_exit skips cleanup_on_error and that line is never logged).
-      root_cause=""
-      root_cause="$(grep -F 'Cleaning up after error: ' "$child_clean" | tail -n 1 || true)"
-
       if [[ -z "$root_cause" ]]; then
-        # Soft failures log "[ecosystem-failures]" bullets without cleanup_on_error.
-        eco_bullet="$(grep -E '^  - ' "$child_clean" | tail -n 1 || true)"
-        if [[ -n "$eco_bullet" ]]; then
-          root_cause="${eco_bullet#  - }"
+        root_cause="$(tail -n 1 "$child_clean" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
+      fi
+
+      if [[ -n "$root_cause" ]]; then
+        if [[ "$detail_count" -eq 0 ]]; then
+          failure_details+=("$(basename "$repo"): ${root_cause}")
         fi
-      fi
-
-      if [[ -z "$root_cause" ]]; then
-        root_cause="$(grep -F '[ecosystem-failures]' "$child_clean" | tail -n 1 || true)"
-      fi
-
-      if [[ -z "$root_cause" ]]; then
-        root_cause="$(rg -n '(^.*ERROR: |^fatal: |^Timed out after |^Traceback|panic:|^Error: |ERR_PNPM_)' "$child_clean" \
-          | tail -n 1 \
-          | sed -E 's/^[0-9]+://' || true)"
-      fi
-
-      if [[ -z "$root_cause" ]]; then
-        # Last resort: last non-empty line.
-        root_cause="$(rg -n '.' "$child_clean" | tail -n 1 | sed -E 's/^[0-9]+://' || true)"
-      fi
-      if [[ -n "$root_cause" ]]; then
-        failure_details+=("$(basename "$repo"): ${root_cause}")
-      fi
-      if [[ -n "$root_cause" ]]; then
         log "[batch-all] Root cause: ${root_cause}"
       fi
 
@@ -4958,7 +4991,7 @@ batch_all_dispatch() {
         log "[batch-all] Fix: run pnpm approve-builds (or pnpm approve-builds --all) in that repo."
       fi
 
-      rm -f "$child_clean"
+      rm -f "$child_clean" "$child_report"
       failure_summaries+=("$(basename "$repo"): exit ${child_exit}")
       if [[ "$worst_exit" -eq 0 ]] || [[ "$child_exit" -gt "$worst_exit" ]]; then
         worst_exit="$child_exit"
@@ -4974,7 +5007,7 @@ batch_all_dispatch() {
       TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
         log "[batch-all] OK ($(basename "$repo")) (${repo_elapsed_s}s)"
     fi
-    rm -f "$child_log"
+    rm -f "$child_log" "$child_report"
     _batch_all_active_child_log=""
   done
 
