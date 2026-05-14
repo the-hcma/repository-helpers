@@ -107,6 +107,9 @@ ci_workflow_names=""
 # Set after detect_ecosystem
 has_npm=0
 npm_tool=""
+# When set, npm manifests live under "${dir}/${npm_project_prefix}/" (single
+# nested project, e.g. web/package.json with Python at repo root).
+npm_project_prefix=""
 py_tool=""
 has_gha=0
 
@@ -1075,13 +1078,71 @@ check_ecosystem_prereqs() {
 }
 
 # ---------------------------------------------------------------------------
+# npm project directory helpers (root or nested, e.g. web/)
+# ---------------------------------------------------------------------------
+
+npm_project_root() {
+  local -r base="$1"
+  if [[ -z "${npm_project_prefix:-}" ]]; then
+    printf '%s' "$base"
+  else
+    printf '%s/%s' "$base" "$npm_project_prefix"
+  fi
+}
+
+npm_repo_rel_path() {
+  local -r file="$1"
+  if [[ -z "${npm_project_prefix:-}" ]]; then
+    printf '%s' "$file"
+  else
+    printf '%s/%s' "$npm_project_prefix" "$file"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Ecosystem detection
 # ---------------------------------------------------------------------------
 
 detect_ecosystem() {
+  has_npm=0
+  npm_tool=""
+  npm_project_prefix=""
+  py_tool=""
+  has_gha=0
+
   if [[ "$ecosystem" == 'npm' || "$ecosystem" == 'auto' ]]; then
     if [[ -f "$dir/package.json" ]]; then
       has_npm=1
+    elif [[ "$ecosystem" == 'auto' || "$ecosystem" == 'npm' ]]; then
+      # Python-first repos often ship the browser bundle under a single child
+      # directory (e.g. web/package.json). Enable only when there is exactly one
+      # immediate */package.json — multiple matches are ambiguous.
+      local nested_count nested_parent child_pkg parent_dir base_name
+      nested_count=0
+      nested_parent=""
+      shopt -s nullglob
+      for child_pkg in "$dir"/*/package.json; do
+        [[ -f "$child_pkg" ]] || continue
+        parent_dir="$(dirname "$child_pkg")"
+        base_name="$(basename "$parent_dir")"
+        case "$base_name" in
+          node_modules|vendor|dist|build|coverage|tmp|out)
+            continue ;;
+        esac
+        nested_count=$((nested_count + 1))
+        nested_parent="$parent_dir"
+      done
+      shopt -u nullglob
+      if [[ "$nested_count" -eq 1 ]]; then
+        has_npm=1
+        npm_project_prefix="$(basename "$nested_parent")"
+        log "[npm] Using nested package.json at: ${npm_project_prefix}/package.json"
+      elif [[ "$nested_count" -gt 1 ]]; then
+        log "[npm] Skipping nested npm scan: multiple */package.json candidates (ambiguous)."
+      fi
+    fi
+
+    if [[ "$has_npm" == '1' ]]; then
       # Detect the package manager from the lockfile.  Check both the current
       # working tree AND origin/main (the worktree base), because a feature branch
       # may predate the project's adoption of pnpm/yarn and therefore lack the
@@ -1089,8 +1150,12 @@ detect_ecosystem() {
       # a wrong-tool lockfile (e.g. package-lock.json on a pnpm project).
       _lockfile_in_main() {
         local f="$1"
-        [[ -f "$dir/$f" ]] \
-          || git -C "$dir" ls-tree --name-only origin/main -- "$f" 2>/dev/null | grep -q .
+        local prefixed="$f"
+        if [[ -n "$npm_project_prefix" ]]; then
+          prefixed="${npm_project_prefix}/${f}"
+        fi
+        [[ -f "$dir/${prefixed}" ]] \
+          || git -C "$dir" ls-tree --name-only origin/main -- "$prefixed" 2>/dev/null | grep -q .
       }
       if _lockfile_in_main "pnpm-lock.yaml"; then
         npm_tool="pnpm"
@@ -1131,7 +1196,7 @@ detect_ecosystem() {
     fi
   fi
 
-  readonly has_npm npm_tool py_tool has_gha
+  readonly has_npm npm_tool py_tool has_gha npm_project_prefix
 
   local eco_msg=""
   if [[ "$has_npm" == '1' ]]; then
@@ -1473,17 +1538,19 @@ create_worktree() {
   # Gated on has_npm / py_tool (set by detect_ecosystem) to avoid running
   # a full pnpm install when the user passed --ecosystem python, for example.
   if [[ "$has_npm" == '1' ]]; then
-    if [[ -f "$worktree_path/pnpm-lock.yaml" ]]; then
+    local npm_wt
+    npm_wt="$(npm_project_root "$worktree_path")"
+    if [[ -f "${npm_wt}/pnpm-lock.yaml" ]]; then
       log "[worktree] Installing dependencies (pnpm)…"
-      pnpm_install_worktree frozen "$worktree_path" \
+      pnpm_install_worktree frozen "$npm_wt" \
         || die "pnpm install failed."
-    elif [[ -f "$worktree_path/package-lock.json" ]]; then
+    elif [[ -f "${npm_wt}/package-lock.json" ]]; then
       log "[worktree] Installing dependencies (npm)…"
-      install_with_net_retry npm "$worktree_path" \
+      install_with_net_retry npm "$npm_wt" \
         npm ci --prefer-offline --no-audit --no-fund
-    elif [[ -f "$worktree_path/yarn.lock" ]]; then
+    elif [[ -f "${npm_wt}/yarn.lock" ]]; then
       log "[worktree] Installing dependencies (yarn)…"
-      install_with_net_retry yarn "$worktree_path" \
+      install_with_net_retry yarn "$npm_wt" \
         yarn install --frozen-lockfile
     fi
   fi
@@ -1991,6 +2058,9 @@ npm_update_group() {
     log "[${npm_tool}] ${group_key} (${pkg_count} packages): ${first_old} -> ${first_new}"
   fi
 
+  local npm_root
+  npm_root="$(npm_project_root "$worktree_path")"
+
   # Restore manifest + lockfile to HEAD so a previous failed run cannot leave
   # them in a half-updated state that causes peer-dependency conflicts.
   # Restore each file independently: if the lockfile is not committed (common
@@ -2002,21 +2072,21 @@ npm_update_group() {
     yarn) lockfile="yarn.lock" ;;
     npm)  lockfile="package-lock.json" ;;
   esac
-  git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+  git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
   if [[ "$npm_tool" == 'npm' ]]; then
     # For npm, delete the lockfile rather than restoring it.  The committed
     # lockfile pins old versions; restoring it causes npm to read those pins
     # and conflict them against the newly-patched package.json versions.
     # With no lockfile, npm builds a fresh resolution tree from package.json.
-    rm -f "${worktree_path}/package-lock.json"
+    rm -f "${npm_root}/package-lock.json"
   else
-    git -C "$worktree_path" checkout -- "$lockfile" 2>/dev/null || true
+    git -C "$worktree_path" checkout -- "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
   fi
 
   # Remove any stale node_modules left by a previous failed npm run.
-  if [[ "$npm_tool" == 'npm' && -d "${worktree_path}/node_modules" ]]; then
+  if [[ "$npm_tool" == 'npm' && -d "${npm_root}/node_modules" ]]; then
     log "[${npm_tool}] Removing stale node_modules in worktree before update…"
-    rm -rf "${worktree_path}/node_modules"
+    rm -rf "${npm_root}/node_modules"
   fi
 
   # For pnpm/yarn (semver-only) and yarn (latest): pass package names to the
@@ -2035,7 +2105,7 @@ npm_update_group() {
       if [[ "$semver_only" == '1' ]]; then
         # semver-only: stay within the existing range; pnpm resolves the latest
         # version within that range without touching package.json specifiers.
-        pnpm --dir "$worktree_path" update "${pkg_args[@]}"
+        pnpm --dir "$npm_root" update "${pkg_args[@]}"
       else
         # pnpm update --latest writes exact versions (e.g. 8.58.2) to
         # package.json but leaves pnpm-lock.yaml specifiers at the old range
@@ -2068,29 +2138,29 @@ npm_update_group() {
               )
             else . end
           ) | from_entries
-        ' "${worktree_path}/package.json" > "$tmp_pkg"; then
+        ' "${npm_root}/package.json" > "$tmp_pkg"; then
           rm -f "$tmp_pkg"
           dep_updater_append_ecosystem_failure "npm|jq failed for group ${group_key} (${npm_tool})"
           log "[${npm_tool}] ERROR: jq failed to patch package.json for '${group_key}' — skipping group."
           return 0
         fi
-        mv "$tmp_pkg" "${worktree_path}/package.json"
+        mv "$tmp_pkg" "${npm_root}/package.json"
 
         # --no-frozen-lockfile lets pnpm rebuild pnpm-lock.yaml from the
         # freshly patched package.json so specifiers are consistent.
         local pnpm_rc=0
-        pnpm_install_worktree no-frozen "$worktree_path" || pnpm_rc=$?
+        pnpm_install_worktree no-frozen "$npm_root" || pnpm_rc=$?
         if [[ "$pnpm_rc" -eq 2 ]]; then
           # A version in this group is not available on the registry — restore
           # manifests and skip the group so other packages can still update.
-          git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
-          git -C "$worktree_path" checkout -- pnpm-lock.yaml 2>/dev/null || true
+          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path pnpm-lock.yaml)" 2>/dev/null || true
           log "[${npm_tool}] WARNING: ${group_key}: skipping — one or more versions not available in registry."
           dep_updater_append_ecosystem_failure "npm|${group_key}: version not in registry (pnpm ERR_PNPM_NO_MATCHING_VERSION)"
           return 0
         elif [[ "$pnpm_rc" -ne 0 ]]; then
-          git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
-          git -C "$worktree_path" checkout -- pnpm-lock.yaml 2>/dev/null || true
+          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path pnpm-lock.yaml)" 2>/dev/null || true
           dep_updater_append_ecosystem_failure "npm|pnpm install failed for ${group_key} (exit ${pnpm_rc})"
           log "[${npm_tool}] ERROR: pnpm install failed for '${group_key}' (exit ${pnpm_rc}) — skipping group."
           return 0
@@ -2099,10 +2169,10 @@ npm_update_group() {
       ;;
     yarn)
       local yarn_rc=0
-      yarn --cwd "$worktree_path" upgrade "${pkg_args[@]}" --latest || yarn_rc=$?
+      yarn --cwd "$npm_root" upgrade "${pkg_args[@]}" --latest || yarn_rc=$?
       if [[ "$yarn_rc" -ne 0 ]]; then
-        git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
-        git -C "$worktree_path" checkout -- yarn.lock 2>/dev/null || true
+        git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+        git -C "$worktree_path" checkout -- "$(npm_repo_rel_path yarn.lock)" 2>/dev/null || true
         dep_updater_append_ecosystem_failure "npm|yarn upgrade failed for ${group_key} (exit ${yarn_rc})"
         log "[${npm_tool}] ERROR: yarn upgrade failed for '${group_key}' (exit ${yarn_rc}) — skipping group."
         return 0
@@ -2139,28 +2209,28 @@ npm_update_group() {
             )
           else . end
         ) | from_entries
-      ' "${worktree_path}/package.json" > "$tmp_pkg"; then
+      ' "${npm_root}/package.json" > "$tmp_pkg"; then
         rm -f "$tmp_pkg"
         dep_updater_append_ecosystem_failure "npm|jq failed for group ${group_key} (${npm_tool})"
         log "[${npm_tool}] ERROR: jq failed to patch package.json for '${group_key}' — skipping group."
         return 0
       fi
-      mv "$tmp_pkg" "${worktree_path}/package.json"
+      mv "$tmp_pkg" "${npm_root}/package.json"
 
       local npm_inst_rc=0
-      npm install --prefix "$worktree_path" || npm_inst_rc=$?
+      npm install --prefix "$npm_root" || npm_inst_rc=$?
       if [[ "$npm_inst_rc" -ne 0 ]]; then
-        git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+        git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
         dep_updater_append_ecosystem_failure "npm|npm install failed for ${group_key} (exit ${npm_inst_rc})"
         log "[${npm_tool}] ERROR: npm install failed for '${group_key}' (exit ${npm_inst_rc}) — skipping group."
         return 0
       fi
   esac
 
-  git -C "$worktree_path" add package.json
+  git -C "$worktree_path" add "$(npm_repo_rel_path package.json)"
   # Only stage the lockfile if the project tracks it (not gitignored).
-  if ! git -C "$worktree_path" check-ignore -q "$lockfile" 2>/dev/null; then
-    git -C "$worktree_path" add "$lockfile" 2>/dev/null || true
+  if ! git -C "$worktree_path" check-ignore -q "$(npm_repo_rel_path "$lockfile")" 2>/dev/null; then
+    git -C "$worktree_path" add "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
   fi
 
   # If the update made no changes, there is nothing to commit.
@@ -2435,6 +2505,9 @@ npm_security_update() {
 
   log "[${npm_tool}] Security: patching CVE vulnerabilities in ${pkg_list}…"
 
+  local npm_root
+  npm_root="$(npm_project_root "$worktree_path")"
+
   # Restore manifest + lockfile to a clean state.
   local lockfile
   case "$npm_tool" in
@@ -2442,14 +2515,14 @@ npm_security_update() {
     yarn) lockfile="yarn.lock" ;;
     npm)  lockfile="package-lock.json" ;;
   esac
-  git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
-  git -C "$worktree_path" checkout -- "$lockfile" 2>/dev/null || true
+  git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+  git -C "$worktree_path" checkout -- "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
 
   # Apply audit fixes. npm/pnpm patch manifests + lockfiles in one step.
   case "$npm_tool" in
     pnpm)
-      pnpm --dir "$worktree_path" audit --fix 2>/dev/null \
-        || pnpm_install_worktree no-frozen "$worktree_path"
+      pnpm --dir "$npm_root" audit --fix 2>/dev/null \
+        || pnpm_install_worktree no-frozen "$npm_root"
       ;;
     yarn)
       # yarn has no native audit --fix; upgrade the vulnerable packages directly.
@@ -2458,17 +2531,17 @@ npm_security_update() {
         [[ -z "$pkg" ]] && continue
         yarn_args+=("${pkg}@${fix}")
       done <<< "$audit_lines"
-      yarn --cwd "$worktree_path" upgrade "${yarn_args[@]}"
+      yarn --cwd "$npm_root" upgrade "${yarn_args[@]}"
       ;;
     npm)
-      npm audit fix --prefix "$worktree_path" 2>/dev/null || true
+      npm audit fix --prefix "$npm_root" 2>/dev/null || true
       ;;
   esac
 
-  git -C "$worktree_path" add package.json
+  git -C "$worktree_path" add "$(npm_repo_rel_path package.json)"
   # Only stage the lockfile if the project tracks it (not gitignored).
-  if ! git -C "$worktree_path" check-ignore -q "$lockfile" 2>/dev/null; then
-    git -C "$worktree_path" add "$lockfile" 2>/dev/null || true
+  if ! git -C "$worktree_path" check-ignore -q "$(npm_repo_rel_path "$lockfile")" 2>/dev/null; then
+    git -C "$worktree_path" add "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
   fi
 
   if git -C "$worktree_path" diff --cached --quiet; then
@@ -3317,8 +3390,10 @@ batch_update_all() {
   # Capture the old package.json text so we can later diff against the
   # installed result to determine which packages actually changed.
   local old_pkg_json=""
+  local npm_root=""
   if [[ "$has_npm" == '1' ]]; then
-    old_pkg_json="$(cat "${worktree_path}/package.json" 2>/dev/null || true)"
+    npm_root="$(npm_project_root "$worktree_path")"
+    old_pkg_json="$(cat "${npm_root}/package.json" 2>/dev/null || true)"
   fi
 
   if [[ "$has_npm" == '1' ]]; then
@@ -3329,14 +3404,14 @@ batch_update_all() {
       npm)  lockfile="package-lock.json" ;;
     esac
 
-    git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+    git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
     if [[ "$npm_tool" == 'npm' ]]; then
-      rm -f "${worktree_path}/package-lock.json"
-      if [[ -d "${worktree_path}/node_modules" ]]; then
-        rm -rf "${worktree_path}/node_modules"
+      rm -f "${npm_root}/package-lock.json"
+      if [[ -d "${npm_root}/node_modules" ]]; then
+        rm -rf "${npm_root}/node_modules"
       fi
     else
-      git -C "$worktree_path" checkout -- "$lockfile" 2>/dev/null || true
+      git -C "$worktree_path" checkout -- "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
     fi
 
     if [[ "$npm_tool" == 'yarn' ]]; then
@@ -3360,10 +3435,10 @@ batch_update_all() {
       fi
       if [[ "${#yarn_args[@]}" -gt 0 ]]; then
         local yarn_batch_rc=0
-        yarn --cwd "$worktree_path" upgrade "${yarn_args[@]}" || yarn_batch_rc=$?
+        yarn --cwd "$npm_root" upgrade "${yarn_args[@]}" || yarn_batch_rc=$?
         if [[ "$yarn_batch_rc" -ne 0 ]]; then
-          git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
-          git -C "$worktree_path" checkout -- yarn.lock 2>/dev/null || true
+          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path yarn.lock)" 2>/dev/null || true
           dep_updater_append_ecosystem_failure "npm|batch yarn upgrade failed (exit ${yarn_batch_rc})"
           log "[${npm_tool}] WARNING: batch yarn upgrade failed (exit ${yarn_batch_rc}); continuing."
         fi
@@ -3402,29 +3477,29 @@ batch_update_all() {
               )
             else . end
           ) | from_entries
-        ' "${worktree_path}/package.json" > "$tmp_pkg"; then
+        ' "${npm_root}/package.json" > "$tmp_pkg"; then
           rm -f "$tmp_pkg"
-          git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
           dep_updater_append_ecosystem_failure "npm|batch jq failed to patch package.json"
           log "[batch] ERROR: jq failed to patch package.json — npm batch section skipped."
         else
-          mv "$tmp_pkg" "${worktree_path}/package.json"
+          mv "$tmp_pkg" "${npm_root}/package.json"
           case "$npm_tool" in
             pnpm)
               local pnpm_batch_rc=0
-              pnpm_install_worktree no-frozen "$worktree_path" || pnpm_batch_rc=$?
+              pnpm_install_worktree no-frozen "$npm_root" || pnpm_batch_rc=$?
               if [[ "$pnpm_batch_rc" -ne 0 ]]; then
-                git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
-                git -C "$worktree_path" checkout -- pnpm-lock.yaml 2>/dev/null || true
+                git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+                git -C "$worktree_path" checkout -- "$(npm_repo_rel_path pnpm-lock.yaml)" 2>/dev/null || true
                 dep_updater_append_ecosystem_failure "npm|batch pnpm install failed (exit ${pnpm_batch_rc})"
                 log "[${npm_tool}] WARNING: batch pnpm install failed (exit ${pnpm_batch_rc}); continuing."
               fi
               ;;
             npm)
               local npm_batch_rc=0
-              npm install --prefix "$worktree_path" || npm_batch_rc=$?
+              npm install --prefix "$npm_root" || npm_batch_rc=$?
               if [[ "$npm_batch_rc" -ne 0 ]]; then
-                git -C "$worktree_path" checkout -- package.json 2>/dev/null || true
+                git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
                 dep_updater_append_ecosystem_failure "npm|batch npm install failed (exit ${npm_batch_rc})"
                 log "[${npm_tool}] WARNING: batch npm install failed (exit ${npm_batch_rc}); continuing."
               fi
@@ -3435,9 +3510,9 @@ batch_update_all() {
     fi
 
     if [[ "$any_npm" == '1' ]]; then
-      git -C "$worktree_path" add package.json
-      if ! git -C "$worktree_path" check-ignore -q "$lockfile" 2>/dev/null; then
-        git -C "$worktree_path" add "$lockfile" 2>/dev/null || true
+      git -C "$worktree_path" add "$(npm_repo_rel_path package.json)"
+      if ! git -C "$worktree_path" check-ignore -q "$(npm_repo_rel_path "$lockfile")" 2>/dev/null; then
+        git -C "$worktree_path" add "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
       fi
     fi
   fi
@@ -3611,7 +3686,7 @@ batch_update_all() {
           | to_entries[]
           | select($old_deps[.key] != .value)
           | "\(.key) \($old_deps[.key] // "-") \(.value)"
-      ' "${worktree_path}/package.json" 2>/dev/null || true)"
+      ' "${npm_root}/package.json" 2>/dev/null || true)"
   fi
 
   if git -C "$worktree_path" diff --cached --quiet; then
@@ -5052,7 +5127,7 @@ if [[ "$dry_run" == '1' ]]; then
   # ── Security audit ───────────────────────────────────────────────────
   local npm_audit_lines="" py_audit_lines=""
   if [[ "$has_npm" == '1' ]]; then
-    npm_audit_lines="$(npm_audit "$audit_dir")"
+    npm_audit_lines="$(npm_audit "$(npm_project_root "$audit_dir")")"
   fi
   if [[ -n "$py_tool" ]]; then
     py_audit_lines="$(py_audit "$py_tool" "$audit_dir")"
@@ -5093,7 +5168,7 @@ if [[ "$dry_run" == '1' ]]; then
   # ── Outdated packages ────────────────────────────────────────────────
   local npm_lines="" py_lines="" gha_lines=""
   if [[ "$has_npm" == '1' ]]; then
-    npm_lines="$(npm_outdated "$audit_dir")"
+    npm_lines="$(npm_outdated "$(npm_project_root "$audit_dir")")"
   fi
   if [[ -n "$py_tool" ]]; then
     py_lines="$(py_outdated "$py_tool" "$audit_dir")"
@@ -5285,7 +5360,7 @@ existing_prs="$(state_get "prs")"
 # outdated and there is no dep-updater state to resume (fast path).
 local npm_lines="" py_lines="" gha_lines=""
 if [[ "$has_npm" == '1' ]]; then
-  npm_lines="$(npm_outdated "$dir")"
+    npm_lines="$(npm_outdated "$(npm_project_root "$dir")")"
 fi
 if [[ -n "$py_tool" ]]; then
   py_lines="$(py_outdated "$py_tool" "$dir")"
@@ -5355,7 +5430,7 @@ npm_lines=""
 py_lines=""
 gha_lines=""
 if [[ "$has_npm" == '1' ]]; then
-  npm_lines="$(npm_outdated "$worktree_path")"
+  npm_lines="$(npm_outdated "$(npm_project_root "$worktree_path")")"
 fi
 if [[ -n "$py_tool" ]]; then
   py_lines="$(py_outdated "$py_tool" "$worktree_path")"
@@ -5396,7 +5471,7 @@ ensure_dep_updater_label
 local npm_audit_lines="" py_audit_lines=""
 if [[ "$has_npm" == '1' ]]; then
   log "Running npm security audit…"
-  npm_audit_lines="$(npm_audit "$worktree_path")"
+  npm_audit_lines="$(npm_audit "$(npm_project_root "$worktree_path")")"
   if [[ -n "$npm_audit_lines" ]]; then
     local vuln_count
     vuln_count="$(printf '%s\n' "$npm_audit_lines" | grep -c .)"
