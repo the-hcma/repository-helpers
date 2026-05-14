@@ -4723,6 +4723,7 @@ batch_all_dispatch() {
   local -a child_args repos_found
   local -a failure_summaries=()
   local -a failure_details=()
+  local root_cause eco_bullet child_clean
 
   # Palette of ANSI colors cycled across repos so each project's header is visually distinct.
   # Only active when stderr is a TTY (same condition as init_prompt_style).
@@ -4833,27 +4834,39 @@ batch_all_dispatch() {
         log "[batch-all] FAILED (${repo}) exit ${child_exit}"
       # Keep batch-all output actionable: strip ANSI noise and print a short root-cause summary.
       # (Full child output is intentionally not dumped here.)
-      local child_clean
       child_clean="$(mktemp)"
       # Strip common ANSI escape sequences (colors, cursor movement).
       sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' "$child_log" >"$child_clean" 2>/dev/null || cp "$child_log" "$child_clean"
 
-      # Root-cause: the "Cleaning up after error:" line is now the authoritative
-      # source of truth — dep-updater records the first failure reason via
-      # record_first_failure() (from lib/runner) and the EXIT trap uses it.
-      # Fall back to explicit ERROR: lines, then last non-empty line.
-      local root_cause
-      root_cause="$(grep 'Cleaning up after error: ' "$child_clean" | tail -n 1)"
+      # Root-cause: prefer explicit dep-updater signals, then generic errors.
+      # Suffix pipelines with "|| true" so set -o pipefail cannot abort batch-all
+      # mid-loop when a child exits without "Cleaning up after error:" (for
+      # example ecosystem failures with no PRs clear _cleanup_trap_active before
+      # exit 1, so _on_exit skips cleanup_on_error and that line is never logged).
+      root_cause=""
+      root_cause="$(grep -F 'Cleaning up after error: ' "$child_clean" | tail -n 1 || true)"
 
       if [[ -z "$root_cause" ]]; then
-        root_cause="$(rg -n '(^.*ERROR: |^fatal: |^Timed out after |^Traceback|panic:|^Error: )' "$child_clean" \
+        # Soft failures log "[ecosystem-failures]" bullets without cleanup_on_error.
+        eco_bullet="$(grep -E '^  - ' "$child_clean" | tail -n 1 || true)"
+        if [[ -n "$eco_bullet" ]]; then
+          root_cause="${eco_bullet#  - }"
+        fi
+      fi
+
+      if [[ -z "$root_cause" ]]; then
+        root_cause="$(grep -F '[ecosystem-failures]' "$child_clean" | tail -n 1 || true)"
+      fi
+
+      if [[ -z "$root_cause" ]]; then
+        root_cause="$(rg -n '(^.*ERROR: |^fatal: |^Timed out after |^Traceback|panic:|^Error: |ERR_PNPM_)' "$child_clean" \
           | tail -n 1 \
-          | sed 's/^[0-9]+://')"
+          | sed -E 's/^[0-9]+://' || true)"
       fi
 
       if [[ -z "$root_cause" ]]; then
         # Last resort: last non-empty line.
-        root_cause="$(rg -n '.' "$child_clean" | tail -n 1 | sed 's/^[0-9]+://')"
+        root_cause="$(rg -n '.' "$child_clean" | tail -n 1 | sed -E 's/^[0-9]+://' || true)"
       fi
       if [[ -n "$root_cause" ]]; then
         failure_details+=("$(basename "$repo"): ${root_cause}")
@@ -4866,7 +4879,7 @@ batch_all_dispatch() {
       if pnpm_output_has_ignored_builds "$child_clean"; then
         log "[batch-all] pnpm blocked dependency build scripts (ERR_PNPM_IGNORED_BUILDS)."
         log "[batch-all] Skipped package(s):"
-        rg -n '^.*\\[pnpm\\]   ' "$child_clean" | tail -n 20 | sed 's/^[0-9]+://' | sed 's/^/[batch-all]   /' >&2
+        { rg -n '^.*\\[pnpm\\]   ' "$child_clean" || true; } | tail -n 20 | sed -E 's/^[0-9]+://' | sed 's/^/[batch-all]   /' >&2
         log "[batch-all] Fix: run pnpm approve-builds (or pnpm approve-builds --all) in that repo."
       fi
 
