@@ -98,6 +98,20 @@ check_status() {
         return 0
     fi
 
+    if [[ "$kernel_name" == "Darwin" ]]; then
+        echo "🔍 Verifying ${service_name} service configuration..."
+        echo "----------------------------------------"
+        echo "ℹ️  macOS:   systemd user services are not installed on this platform."
+        local desired_sha
+        desired_sha="$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || true)"
+        if [[ -n "$desired_sha" ]]; then
+            echo "   Desired commit: ${desired_sha}  (${repo_dir})"
+        fi
+        echo "----------------------------------------"
+        echo "✨ ${service_name}: no systemd setup on macOS (use Linux or run the app manually)."
+        return 0
+    fi
+
     local all_good=true
     echo "🔍 Verifying ${service_name} service configuration..."
     echo "----------------------------------------"
@@ -193,12 +207,60 @@ if [[ $# -gt 0 ]]; then
     esac
 fi
 
+# run_on_deploy_hook
+# Invokes scripts/on-deploy when executable. Exit 0 → code changed; 1 → unchanged; 2+ → abort.
+run_on_deploy_hook() {
+    local on_deploy_exit on_deploy_stderr
+
+    if [[ ! -x "${repo_dir}/scripts/on-deploy" ]]; then
+        return 0
+    fi
+
+    on_deploy_exit=0
+    on_deploy_stderr="$(mktemp)"
+    "${repo_dir}/scripts/on-deploy" 2>"$on_deploy_stderr" || on_deploy_exit=$?
+    if [[ "$on_deploy_exit" -eq 0 ]]; then
+        rm -f "$on_deploy_stderr"
+        return 0
+    fi
+    if [[ "$on_deploy_exit" -ge 2 ]]; then
+        echo "❌ Error: on-deploy exited with code ${on_deploy_exit}" >&2
+        if [[ -s "$on_deploy_stderr" ]]; then
+            echo "--- on-deploy stderr ---" >&2
+            cat "$on_deploy_stderr" >&2
+        fi
+        rm -f "$on_deploy_stderr"
+        exit "$on_deploy_exit"
+    fi
+    rm -f "$on_deploy_stderr"
+    return 1
+}
+
 # Main installation flow
 echo "Setting up ${service_name} systemd service..."
 
 # 1. Verify source service file exists
 if [[ ! -f "$source_service" ]]; then
     echo "ℹ️  No service template found at $source_service — this repo is not a systemd service. Skipping."
+    exit 0
+fi
+
+# macOS has no systemd user units — skip install entirely (on-deploy may still run).
+if [[ "$kernel_name" == "Darwin" ]]; then
+    echo "ℹ️  macOS: skipping systemd user service installation (Linux hosts only)."
+    mkdir -p "$log_dir"
+    echo "✅ Log directory: $log_dir"
+    desired_sha="$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || true)"
+    if [[ -n "$desired_sha" ]]; then
+        echo "   Desired commit: ${desired_sha}  (${repo_dir})"
+    fi
+    if run_on_deploy_hook; then
+        echo "✅ on-deploy: completed (code may have changed)."
+    else
+        echo "⏭️  on-deploy: nothing changed."
+    fi
+    echo ""
+    echo "✨ ${service_name}: systemd setup skipped on macOS."
     exit 0
 fi
 
@@ -246,32 +308,10 @@ if [[ -n "$desired_sha" ]]; then
 fi
 print_running_commit
 
-# 6. Run repo-specific deploy hook if present.
-# scripts/on-deploy is an optional executable that handles any build/compile
-# steps required before the service can start (e.g. pnpm build, cargo build).
-#
-# Exit code contract (must be respected by every on-deploy implementation):
-#   0  — code was rebuilt; service must be restarted to pick up changes.
-#   1  — nothing changed; skip the restart (service is already up to date).
-#   2+ — unexpected failure; setup-service will abort.
+# 6. Run repo-specific deploy hook if present (see run_on_deploy_hook).
 code_changed=false
-if [[ -x "${repo_dir}/scripts/on-deploy" ]]; then
-    on_deploy_exit=0
-    on_deploy_stderr="$(mktemp)"
-    "${repo_dir}/scripts/on-deploy" 2>"$on_deploy_stderr" || on_deploy_exit=$?
-    if [[ "$on_deploy_exit" -eq 0 ]]; then
-        code_changed=true
-    elif [[ "$on_deploy_exit" -ge 2 ]]; then
-        echo "❌ Error: on-deploy exited with code ${on_deploy_exit}" >&2
-        if [[ -s "$on_deploy_stderr" ]]; then
-            echo "--- on-deploy stderr ---" >&2
-            cat "$on_deploy_stderr" >&2
-        fi
-        rm -f "$on_deploy_stderr"
-        exit "$on_deploy_exit"
-    fi
-    rm -f "$on_deploy_stderr"
-    # exit 1 → nothing changed; fall through with code_changed=false
+if run_on_deploy_hook; then
+    code_changed=true
 fi
 
 # 7. Reload daemon only if service file changed
