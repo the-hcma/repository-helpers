@@ -1,0 +1,152 @@
+# shellcheck shell=bash
+# tooling-path — PATH helpers for cron, NVM, fnm, pnpm, and Node/pnpm alignment.
+#
+# Mutates PATH in the sourcing shell. Requires HOME for NVM/fnm lookups.
+#
+# Defines:
+#   tooling_path_prepend_dir
+#   tooling_path_prepend_local_bin
+#   tooling_path_prepend_pnpm_standalone
+#   tooling_path_try_prepend_fnm
+#   tooling_path_prepend_nvm_default_node
+#   tooling_path_align_node_with_pnpm
+#   tooling_path_bootstrap_cron_minimal
+#   tooling_path_bootstrap_node_ecosystem
+
+# tooling_path_prepend_dir <directory>
+# Prepends directory to PATH when it exists and is not already present.
+tooling_path_prepend_dir() {
+  local -r dir="$1"
+
+  [[ -n "$dir" && -d "$dir" ]] || return 0
+  case ":${PATH}:" in
+    *":${dir}:"*) return 0 ;;
+  esac
+  PATH="${dir}:${PATH:-}"
+}
+
+# tooling_path_prepend_local_bin
+# Prefer user-local installs (gh, gt, uv, etc.) over stale system paths.
+tooling_path_prepend_local_bin() {
+  if [[ -n "${HOME:-}" && -d "${HOME}/.local/bin" ]]; then
+    tooling_path_prepend_dir "${HOME}/.local/bin"
+  fi
+}
+
+# tooling_path_prepend_pnpm_standalone
+# Official pnpm install location when pnpm is not already on PATH.
+tooling_path_prepend_pnpm_standalone() {
+  if command -v pnpm >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ -n "${HOME:-}" && -x "${HOME}/.local/share/pnpm/pnpm" ]]; then
+    tooling_path_prepend_dir "${HOME}/.local/share/pnpm"
+  fi
+}
+
+# tooling_path_try_prepend_fnm
+# When pnpm or gt is missing, prepend fnm's Node bin directory (no eval).
+tooling_path_try_prepend_fnm() {
+  local fnm_bin fnm_env fnm_path_prefix
+
+  fnm_bin=""
+  if [[ -n "${HOME:-}" && -x "${HOME}/.local/share/fnm/fnm" ]]; then
+    fnm_bin="${HOME}/.local/share/fnm/fnm"
+  else
+    fnm_bin="$(command -v fnm 2>/dev/null || true)"
+  fi
+  [[ -n "$fnm_bin" ]] || return 0
+
+  fnm_env="$("$fnm_bin" env --shell bash 2>/dev/null | head -1 || true)"
+  if [[ "$fnm_env" =~ ^export[[:space:]]+PATH=\"([^\"]+)\":\"\$PATH\" ]]; then
+    fnm_path_prefix="${BASH_REMATCH[1]}"
+    if [[ -n "$fnm_path_prefix" ]]; then
+      PATH="${fnm_path_prefix}:${PATH:-}"
+    fi
+  fi
+}
+
+# tooling_path_prepend_nvm_default_node
+# NVM-managed Node (and often pnpm via corepack) is on PATH in login shells but not cron.
+tooling_path_prepend_nvm_default_node() {
+  local nvm_root ver lts_file lts_name latest_ver bin_prefix
+
+  [[ -n "${HOME:-}" ]] || return 0
+
+  nvm_root="${HOME}/.nvm/versions/node"
+  [[ -d "$nvm_root" ]] || return 0
+
+  ver=""
+  if [[ -f "${HOME}/.nvm/alias/default" ]]; then
+    ver="$(tr -d '[:space:]' <"${HOME}/.nvm/alias/default" 2>/dev/null || true)"
+  fi
+
+  if [[ "$ver" == lts/* ]]; then
+    lts_name="${ver#lts/}"
+    lts_file="${HOME}/.nvm/alias/lts/${lts_name}"
+    if [[ -f "$lts_file" ]]; then
+      ver="$(tr -d '[:space:]' <"$lts_file" 2>/dev/null || true)"
+    fi
+  fi
+
+  if [[ "$ver" == 'system' ]]; then
+    ver=""
+  fi
+
+  bin_prefix=""
+  if [[ -n "$ver" && -d "${nvm_root}/${ver}/bin" ]]; then
+    bin_prefix="${nvm_root}/${ver}/bin"
+  else
+    latest_ver=""
+    latest_ver="$(for d in "$nvm_root"/v*; do
+      [[ -d "$d" ]] || continue
+      printf '%s\n' "${d##*/}"
+    done | sort -V 2>/dev/null | tail -1 || true)"
+    if [[ -n "$latest_ver" && -d "${nvm_root}/${latest_ver}/bin" ]]; then
+      bin_prefix="${nvm_root}/${latest_ver}/bin"
+    fi
+  fi
+
+  if [[ -n "$bin_prefix" ]]; then
+    tooling_path_prepend_dir "$bin_prefix"
+  fi
+}
+
+# tooling_path_align_node_with_pnpm
+# pnpm is often on PATH from NVM while node comes from elsewhere (IDE agent, cron).
+# Prepend the NVM bin that owns pnpm, or fall back to the default NVM node.
+tooling_path_align_node_with_pnpm() {
+  local pnpm_path node_bin
+
+  pnpm_path="$(command -v pnpm 2>/dev/null || true)"
+  if [[ -n "$pnpm_path" && -n "${HOME:-}" \
+      && "$pnpm_path" == "${HOME}/.nvm/versions/node/"*"/bin/pnpm" ]]; then
+    node_bin="$(dirname "$pnpm_path")"
+    tooling_path_prepend_dir "$node_bin"
+    return 0
+  fi
+  if [[ -n "$pnpm_path" \
+      && ( "$pnpm_path" == *"/.fnm/"* || "$pnpm_path" == *"/fnm_multishells/"* ) ]]; then
+    return 0
+  fi
+  tooling_path_prepend_nvm_default_node
+}
+
+# tooling_path_bootstrap_cron_minimal
+# Seed PATH for cron jobs, then prepend NVM default Node when available.
+tooling_path_bootstrap_cron_minimal() {
+  PATH="${HOME}/.local/bin:${HOME}/.local/share/pnpm:${HOME}/.cargo/bin:\
+/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+  tooling_path_prepend_nvm_default_node
+}
+
+# tooling_path_bootstrap_node_ecosystem
+# Interactive / dep-updater PATH: local bin, pnpm, fnm (when needed), Node/pnpm alignment.
+tooling_path_bootstrap_node_ecosystem() {
+  tooling_path_prepend_local_bin
+  tooling_path_prepend_pnpm_standalone
+  if ! command -v pnpm >/dev/null 2>&1 || ! command -v gt >/dev/null 2>&1; then
+    tooling_path_try_prepend_fnm
+  fi
+  tooling_path_align_node_with_pnpm
+}
