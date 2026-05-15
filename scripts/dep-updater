@@ -68,9 +68,23 @@ if ! command -v pnpm >/dev/null 2>&1 || ! command -v gt >/dev/null 2>&1; then
   fi
 fi
 
-if ! command -v pnpm >/dev/null 2>&1; then
+# pnpm is often on PATH from NVM while node comes from elsewhere (IDE agent,
+# cron). Align node with the pnpm install, or fall back to the default NVM node.
+dep_updater_prepend_node_for_pnpm() {
+  local pnpm_path node_bin
+
+  pnpm_path="$(command -v pnpm 2>/dev/null || true)"
+  if [[ -n "$pnpm_path" && "$pnpm_path" == "${HOME}/.nvm/versions/node/"*"/bin/pnpm" ]]; then
+    node_bin="$(dirname "$pnpm_path")"
+    PATH="${node_bin}:${PATH}"
+    return 0
+  fi
+  if [[ -n "$pnpm_path" && ( "$pnpm_path" == *"/.fnm/"* || "$pnpm_path" == *"/fnm_multishells/"* ) ]]; then
+    return 0
+  fi
   prepend_nvm_default_node_bin_for_cron
-fi
+}
+dep_updater_prepend_node_for_pnpm
 
 # ---------------------------------------------------------------------------
 # Script-level constants
@@ -1145,6 +1159,14 @@ npm_repo_rel_path() {
   fi
 }
 
+# Run pnpm with cwd in the npm project root. "pnpm --dir" fails when
+# package.json declares packageManager (corepack needs the project cwd).
+pnpm_in_project() {
+  local -r project_root="$1"
+  shift
+  (cd "$project_root" && pnpm "$@")
+}
+
 # ---------------------------------------------------------------------------
 # Ecosystem detection
 # ---------------------------------------------------------------------------
@@ -1818,9 +1840,9 @@ npm_outdated() {
   local -r scan_root="${1:-$dir}"
 
   if [[ ! -d "${scan_root}/node_modules" ]]; then
-    log "node_modules not found at git root — running install…"
+    log "node_modules not found in npm project root — running install…"
     case "$tool" in
-      pnpm) pnpm --dir "$scan_root" install --frozen-lockfile >&2 ;;
+      pnpm) pnpm_in_project "$scan_root" install --frozen-lockfile >&2 ;;
       yarn) yarn --cwd "$scan_root" install --frozen-lockfile >&2 ;;
       npm)  npm install --prefix "$scan_root" --prefer-offline >&2 ;;
     esac
@@ -1842,12 +1864,18 @@ npm_outdated() {
       pkg_json_specs='{}'
     fi
 
-    local tmp_list
+    local tmp_list tmp_list_err
     tmp_list="$(mktemp)"
-    if ! pnpm --dir "$scan_root" list --depth 0 --json >"$tmp_list" 2>/dev/null; then
-      rm -f "$tmp_list"
+    tmp_list_err="$(mktemp)"
+    if ! pnpm_in_project "$scan_root" list --depth 0 --json >"$tmp_list" 2>"$tmp_list_err"; then
+      if [[ -s "$tmp_list_err" ]]; then
+        printf '%s\n' 'pnpm list failed (needed for outdated detection). Last output:' >&2
+        tail -n 15 "$tmp_list_err" | sed 's/^/  /' >&2
+      fi
+      rm -f "$tmp_list" "$tmp_list_err"
       die "pnpm list failed (needed for outdated detection)."
     fi
+    rm -f "$tmp_list_err"
 
     local pkgs_json
     pkgs_json="$(printf '%s' "$pkg_json_specs" | jq -c 'keys' 2>/dev/null || echo '[]')"
@@ -1910,7 +1938,7 @@ npm_outdated() {
   tmp_json="$(mktemp)"
   set +e
   case "$tool" in
-    pnpm) pnpm --dir "$scan_root" outdated --json > "$tmp_json" 2>/dev/null ;;
+    pnpm) pnpm_in_project "$scan_root" outdated --json > "$tmp_json" 2>/dev/null ;;
     yarn) yarn --cwd "$scan_root" outdated --json > "$tmp_json" 2>/dev/null ;;
     npm)  npm outdated --prefix "$scan_root" --json > "$tmp_json" 2>/dev/null ;;
   esac
@@ -2151,7 +2179,7 @@ npm_update_group() {
       if [[ "$semver_only" == '1' ]]; then
         # semver-only: stay within the existing range; pnpm resolves the latest
         # version within that range without touching package.json specifiers.
-        pnpm --dir "$npm_root" update "${pkg_args[@]}"
+        pnpm_in_project "$npm_root" update "${pkg_args[@]}"
       else
         # pnpm update --latest writes exact versions (e.g. 8.58.2) to
         # package.json but leaves pnpm-lock.yaml specifiers at the old range
@@ -2452,7 +2480,7 @@ npm_audit() {
 
   set +e
   case "$npm_tool" in
-    pnpm) raw="$(pnpm --dir "$scan_root" audit --json 2>/dev/null)" ;;
+    pnpm) raw="$(pnpm_in_project "$scan_root" audit --json 2>/dev/null)" ;;
     yarn) raw="$(yarn --cwd "$scan_root" audit --json 2>/dev/null)" ;;
     npm)  raw="$(npm audit --prefix "$scan_root" --json 2>/dev/null)" ;;
   esac
@@ -2567,7 +2595,7 @@ npm_security_update() {
   # Apply audit fixes. npm/pnpm patch manifests + lockfiles in one step.
   case "$npm_tool" in
     pnpm)
-      pnpm --dir "$npm_root" audit --fix 2>/dev/null \
+      pnpm_in_project "$npm_root" audit --fix 2>/dev/null \
         || pnpm_install_worktree no-frozen "$npm_root"
       ;;
     yarn)
@@ -5296,9 +5324,9 @@ if [[ "$dry_run" == '1' ]]; then
         case "$npm_tool" in
           pnpm)
             if [[ "$semver_only" == '1' ]]; then
-              cmd_prefix="pnpm --dir <worktree> update"
+              cmd_prefix="pnpm (in worktree) update"
             else
-              cmd_prefix="pnpm --dir <worktree> update --latest"
+              cmd_prefix="pnpm (in worktree) update --latest"
             fi
             ;;
           yarn) cmd_prefix="yarn --cwd <worktree> upgrade --latest" ;;
