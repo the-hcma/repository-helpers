@@ -774,6 +774,235 @@ npm_registry_dist_tag_latest() {
   return 0
 }
 
+# npm_registry_fetch_version_json <pkg> <version>
+# Prints the version document from the registry (empty on failure).
+npm_registry_fetch_version_json() {
+  local -r pkg="$1"
+  local -r version="$2"
+  local registry encoded_pkg
+
+  if [[ "${DEP_UPDATER_SKIP_NPM_REGISTRY:-0}" == '1' ]]; then
+    return 0
+  fi
+
+  registry="$(pnpm config get registry 2>/dev/null | tr -d '[:space:]' || echo 'https://registry.npmjs.org/')"
+  [[ "$registry" != */ ]] && registry="${registry}/"
+  encoded_pkg="${pkg//@/%40}"
+  encoded_pkg="${encoded_pkg//\//%2F}"
+  curl --silent --max-time 15 "${registry}${encoded_pkg}/${version}" 2>/dev/null || true
+}
+
+# npm_version_prefetch_closure <pkg> <version>
+# Like npm_version_prefetch, but also requires exact-semver dependencies and peers
+# from the version manifest to be published (catches partial monorepo publishes).
+npm_version_prefetch_closure() {
+  local -r pkg="$1"
+  local -r version="$2"
+  local manifest dep depver
+
+  if ! npm_version_prefetch "$pkg" "$version"; then
+    return 1
+  fi
+
+  if [[ "${DEP_UPDATER_SKIP_NPM_REGISTRY:-0}" == '1' ]]; then
+    return 0
+  fi
+
+  manifest="$(npm_registry_fetch_version_json "$pkg" "$version")"
+  if [[ -z "$manifest" ]]; then
+    return 0
+  fi
+
+  while IFS= read -r dep depver; do
+    [[ -z "$dep" ]] && continue
+    if ! npm_version_prefetch "$dep" "$depver"; then
+      log "[pnpm] Filtering ${pkg} → ${version}: dependency ${dep}@${depver} is not published."
+      return 1
+    fi
+  done < <(printf '%s' "$manifest" | jq -r '
+    (.dependencies // {}), (.peerDependencies // {})
+    | to_entries[]
+    | select(.value | test("^[0-9]"))
+    | "\(.key) \(.value)"
+  ' 2>/dev/null || true)
+
+  return 0
+}
+
+# npm_pnpm_parse_blame_direct_dep <logfile>
+# Prints the direct dependency whose install pulled in a missing version (empty if unknown).
+npm_pnpm_parse_blame_direct_dep() {
+  local -r log_file="$1"
+  local line blame
+
+  line="$(grep -E 'installing the dependencies of ' "$log_file" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$line" ]]; then
+    return 1
+  fi
+  blame="$(printf '%s' "$line" | sed -n 's/.*installing the dependencies of \([^ ]*\)@.*/\1/p')"
+  if [[ -z "$blame" ]]; then
+    return 1
+  fi
+  printf '%s' "$blame"
+  return 0
+}
+
+# npm_pnpm_try_lockfile_with_updates <scan_root> <updates_json> <logfile>
+# Patches package.json, runs pnpm install --lockfile-only, restores originals.
+# Returns 0 when the lockfile resolves.
+npm_pnpm_try_lockfile_with_updates() {
+  local -r scan_root="$1"
+  local -r updates_json="$2"
+  local -r log_file="$3"
+  local pkg_json lockfile bak_pkg bak_lock tmp_pkg
+
+  if [[ "$updates_json" == '{}' ]]; then
+    return 0
+  fi
+
+  pkg_json="${scan_root}/package.json"
+  lockfile="${scan_root}/pnpm-lock.yaml"
+  if [[ ! -f "$pkg_json" ]]; then
+    return 1
+  fi
+
+  bak_pkg="$(mktemp)"
+  cp "$pkg_json" "$bak_pkg"
+  bak_lock=""
+  if [[ -f "$lockfile" ]]; then
+    bak_lock="$(mktemp)"
+    cp "$lockfile" "$bak_lock"
+  fi
+
+  tmp_pkg="$(mktemp)"
+  if ! jq --argjson updates "$updates_json" '
+    to_entries | map(
+      if (.key == "dependencies" or .key == "devDependencies" or .key == "peerDependencies")
+         and (.value != null) then
+        .value |= with_entries(
+          (.key) as $k |
+          if $updates | has($k) then .value = $updates[$k] else . end
+        )
+      else . end
+    ) | from_entries
+  ' "$pkg_json" >"$tmp_pkg"; then
+    cp "$bak_pkg" "$pkg_json"
+    rm -f "$bak_pkg" "$tmp_pkg" "$bak_lock"
+    return 1
+  fi
+  mv "$tmp_pkg" "$pkg_json"
+
+  local rc
+  set +e
+  pnpm_in_project "$scan_root" install --lockfile-only --no-frozen-lockfile >"$log_file" 2>&1
+  rc=$?
+  set -e
+
+  cp "$bak_pkg" "$pkg_json"
+  rm -f "$bak_pkg"
+  if [[ -n "$bak_lock" ]]; then
+    cp "$bak_lock" "$lockfile"
+    rm -f "$bak_lock"
+  fi
+
+  return "$rc"
+}
+
+# npm_lines_to_updates_json <line>...
+# Builds a JSON object { "pkg": "version", ... } from "pkg current latest" lines.
+npm_lines_to_updates_json() {
+  local line pkg _cur latest updates='{}'
+  for line in "$@"; do
+    [[ -z "$line" ]] && continue
+    read -r pkg _cur latest <<<"$line"
+    [[ -z "$pkg" || -z "$latest" ]] && continue
+    updates="$(printf '%s' "$updates" | jq --arg k "$pkg" --arg v "$latest" '. + {($k): $v}')"
+  done
+  printf '%s' "$updates"
+}
+
+# npm_pnpm_filter_outdated_lines <scan_root> <line>...
+# Drops proposed updates that cannot be resolved together (batch lockfile dry-run).
+npm_pnpm_filter_outdated_lines() {
+  local -r scan_root="$1"
+  shift
+  local -a pending_outdated=("$@")
+  local -a next_outdated filtered_lines
+  local log_file updates_json all_lines blame_pkg removed_ver gk
+  local line pkg _cur lat
+
+  if [[ ${#pending_outdated[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  # Integration tests stub the registry; lockfile dry-run needs a real resolution graph.
+  if [[ "${DEP_UPDATER_SKIP_NPM_REGISTRY:-0}" == '1' ]]; then
+    printf '%s\n' "${pending_outdated[@]}"
+    return 0
+  fi
+
+  log_file="$(mktemp)"
+  all_lines="$(printf '%s\n' "${pending_outdated[@]}")"
+
+  while [[ ${#pending_outdated[@]} -gt 0 ]]; do
+    updates_json="$(npm_lines_to_updates_json "${pending_outdated[@]}")"
+    if npm_pnpm_try_lockfile_with_updates "$scan_root" "$updates_json" "$log_file"; then
+      filtered_lines=("${pending_outdated[@]}")
+      rm -f "$log_file"
+      printf '%s\n' "${filtered_lines[@]}"
+      return 0
+    fi
+
+    if ! grep -qF 'ERR_PNPM_NO_MATCHING_VERSION' "$log_file"; then
+      log "[pnpm] WARNING: could not verify proposed updates against lockfile; skipping npm updates for this scan."
+      rm -f "$log_file"
+      return 0
+    fi
+
+    blame_pkg="$(npm_pnpm_parse_blame_direct_dep "$log_file" 2>/dev/null || true)"
+    if [[ -z "$blame_pkg" ]]; then
+      log "[pnpm] WARNING: lockfile verification failed (unparsed ERR_PNPM_NO_MATCHING_VERSION); skipping npm updates."
+      rm -f "$log_file"
+      return 0
+    fi
+
+    next_outdated=()
+    removed_ver=""
+    for line in "${pending_outdated[@]}"; do
+      read -r pkg _cur lat <<<"$line"
+      if [[ "$pkg" == "$blame_pkg" ]]; then
+        removed_ver="$lat"
+        log "[pnpm] Filtering ${pkg} → ${lat}: install resolution failed (missing transitive version)."
+        continue
+      fi
+      next_outdated+=("$line")
+    done
+
+    if [[ -n "$removed_ver" ]]; then
+      gk="$(npm_group_key "$blame_pkg" "$all_lines")"
+      pending_outdated=()
+      for line in "${next_outdated[@]}"; do
+        read -r pkg _cur lat <<<"$line"
+        if [[ "$(npm_group_key "$pkg" "$all_lines")" == "$gk" && "$lat" == "$removed_ver" ]]; then
+          log "[pnpm] Filtering ${pkg} → ${lat}: same update group as ${blame_pkg} (unresolvable together)."
+          continue
+        fi
+        pending_outdated+=("$line")
+      done
+    else
+      pending_outdated=("${next_outdated[@]}")
+    fi
+
+    if [[ ${#pending_outdated[@]} -eq 0 ]]; then
+      rm -f "$log_file"
+      return 0
+    fi
+  done
+
+  rm -f "$log_file"
+  return 0
+}
+
 # Optional: DEP_UPDATER_ECO_FAIL_FILE is a temp file listing non-fatal ecosystem
 # errors (one line each) so the run can continue and still exit non-zero.
 dep_updater_append_ecosystem_failure() {
@@ -1789,6 +2018,7 @@ npm_outdated() {
     local pkgs_json
     pkgs_json="$(printf '%s' "$pkg_json_specs" | jq -c 'keys' 2>/dev/null || echo '[]')"
 
+    local -a candidate_lines=()
     local pkg spec current latest sort_winner pv reg higher
     while IFS= read -r pkg; do
       [[ -z "$pkg" ]] && continue
@@ -1832,12 +2062,19 @@ npm_outdated() {
       # Only advance — never downgrade.
       sort_winner="$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -1)"
       if [[ "$sort_winner" == "$latest" ]]; then
-        # Verify the version is actually resolvable and pre-warm the pnpm store.
-        if npm_version_prefetch "$pkg" "$latest"; then
-          printf '%s %s %s\n' "$pkg" "$current" "$latest"
+        # Verify the version and its exact-semver deps exist; batch lockfile check follows.
+        if npm_version_prefetch_closure "$pkg" "$latest"; then
+          candidate_lines+=("$pkg $current $latest")
         fi
       fi
     done < <(printf '%s' "$pkgs_json" | jq -r '.[]' 2>/dev/null || true)
+
+    if [[ ${#candidate_lines[@]} -gt 0 ]]; then
+      mapfile -t candidate_lines < <(npm_pnpm_filter_outdated_lines "$scan_root" "${candidate_lines[@]}")
+    fi
+    if [[ ${#candidate_lines[@]} -gt 0 ]]; then
+      printf '%s\n' "${candidate_lines[@]}"
+    fi
 
     rm -f "$tmp_list"
     return 0
@@ -1891,7 +2128,17 @@ npm_outdated() {
           fi
         done
   else
-    jq -r --argjson specs "$pkg_json_specs" --arg semver_only "$semver_only" '
+    local -a candidate_lines=()
+    while IFS= read -r _npkg _ncur _nnew; do
+      [[ -z "$_npkg" ]] && continue
+      if [[ "$tool" == 'pnpm' ]]; then
+        if npm_version_prefetch_closure "$_npkg" "$_nnew"; then
+          candidate_lines+=("$_npkg $_ncur $_nnew")
+        fi
+      elif npm_version_prefetch "$_npkg" "$_nnew"; then
+        candidate_lines+=("$_npkg $_ncur $_nnew")
+      fi
+    done < <(jq -r --argjson specs "$pkg_json_specs" --arg semver_only "$semver_only" '
       to_entries[]
       | select(
           .key | test("^(latest|wanted|isDeprecated|name|type|homepage|description|author|license|repository|bugs|engines|_.*)$") | not
@@ -1929,12 +2176,14 @@ npm_outdated() {
             )
           | "\(.key) \(.value.current) \(.value.latest)"
         end' "$tmp_json" 2>/dev/null \
-      | awk '{if(NF==3 && $1!="" && $2!="" && $3!="") print $0}' \
-      | while IFS=' ' read -r _npkg _ncur _nnew; do
-          if npm_version_prefetch "$_npkg" "$_nnew"; then
-            printf '%s %s %s\n' "$_npkg" "$_ncur" "$_nnew"
-          fi
-        done
+      | awk '{if(NF==3 && $1!="" && $2!="" && $3!="") print $0}')
+
+    if [[ ${#candidate_lines[@]} -gt 0 ]]; then
+      if [[ "$tool" == 'pnpm' ]]; then
+        mapfile -t candidate_lines < <(npm_pnpm_filter_outdated_lines "$scan_root" "${candidate_lines[@]}")
+      fi
+      printf '%s\n' "${candidate_lines[@]}"
+    fi
   fi
   rm -f "$tmp_json"
 }
