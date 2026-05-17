@@ -42,7 +42,7 @@ Requires `git`, `gh`, and `gt` (Graphite CLI) on `PATH`.
 
 Automates dependency version bumps across npm, pip, uv, and poetry ecosystems. Creates stacked Graphite PRs for each updated dependency.
 
-See [dep-updater.plan.md](dep-updater.plan.md) for the full feature roadmap.
+See [dep-updater.plan.md](dep-updater.plan.md) for the full feature roadmap, and [dep-updater-hybrid-architecture.plan.md](dep-updater-hybrid-architecture.plan.md) for the Bash + Python extraction proposal.
 
 ---
 
