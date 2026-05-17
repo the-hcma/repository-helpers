@@ -275,6 +275,7 @@ source "${dep_script_dir}/lib/tooling-prereqs"
 wait_timeout_error() {
   # Emit a single concise line suitable for batch-all postprocessing.
   # Example: "ERROR: WAIT_TIMEOUT ci pr=#123 branch=foo waited=20m0s timeout=20m status=pending"
+  record_first_failure "WAIT_TIMEOUT $*"
   log "ERROR: WAIT_TIMEOUT $*"
 }
 
@@ -316,6 +317,11 @@ _on_exit() {
   if [[ -n "${RUNNER_FIRST_FAILURE_FILE:-}" && -s "${RUNNER_FIRST_FAILURE_FILE}" ]]; then
     first_fail_for_report="$(cat "${RUNNER_FIRST_FAILURE_FILE}")"
   fi
+  # Write the batch-all child report before any cleanup that deletes eco-failure state.
+  if [[ -n "${DEP_UPDATER_RUN_REPORT:-}" ]]; then
+    dep_updater_write_batch_child_report_json "$exit_code" "$first_fail_for_report"
+  fi
+  rm -f "${DEP_UPDATER_ECO_FAIL_FILE:-}"
   # Only run cleanup if the worktree phase was reached and the exit is non-zero.
   if [[ "$_cleanup_trap_active" == '1' && $exit_code -ne 0 ]]; then
     # Use the first recorded failure reason if available — it contains the real
@@ -327,9 +333,6 @@ _on_exit() {
     cleanup_on_error "$reason"
   fi
   rm -f "${RUNNER_FIRST_FAILURE_FILE:-}"
-  if [[ -n "${DEP_UPDATER_RUN_REPORT:-}" && "$exit_code" -ne 0 ]]; then
-    dep_updater_write_batch_child_report_json "$exit_code" "$first_fail_for_report"
-  fi
 }
 
 # shellcheck disable=SC2317  # invoked via INT/TERM traps, not directly
@@ -826,6 +829,10 @@ dep_updater_write_batch_child_report_json() {
 
   if [[ -z "$primary" ]]; then
     primary="dep-updater exited with code ${exit_code}"
+  elif [[ "$primary" == "dep-updater exited with code ${exit_code}" ]] \
+    && [[ "$details_json" != '[]' ]]; then
+    primary="$(jq -r '.[0] // empty' <<<"$details_json" 2>/dev/null || true)"
+    [[ -z "$primary" ]] && primary="dep-updater exited with code ${exit_code}"
   fi
 
   jq -n \
@@ -838,6 +845,21 @@ dep_updater_write_batch_child_report_json() {
     || jq -n --argjson exit_code "$exit_code" --arg primary "$primary" \
          '{exit_code: $exit_code, dir: "", primary: $primary, details: []}' \
          >"$out_file" 2>/dev/null || true
+}
+
+# When batch-all sets DEP_UPDATER_RUN_REPORT, emit structured failure JSON before
+# cleanup() removes DEP_UPDATER_ECO_FAIL_FILE (success-path exits use this).
+dep_updater_emit_batch_child_report() {
+  local -r exit_code="${1:?}"
+  local first_fail=""
+
+  if [[ -z "${DEP_UPDATER_RUN_REPORT:-}" ]]; then
+    return 0
+  fi
+  if [[ -n "${RUNNER_FIRST_FAILURE_FILE:-}" && -s "${RUNNER_FIRST_FAILURE_FILE}" ]]; then
+    first_fail="$(cat "${RUNNER_FIRST_FAILURE_FILE}")"
+  fi
+  dep_updater_write_batch_child_report_json "$exit_code" "$first_fail"
 }
 
 # install_with_net_retry <label> <workdir> <cmd> [args…]
@@ -4439,7 +4461,6 @@ cleanup() {
       || log "Note: wt_base_branch '${wt_base_branch}' not found."
   fi
   rm -f "$state_file"
-  rm -f "${DEP_UPDATER_ECO_FAIL_FILE:-}"
   log "Cleanup complete."
 }
 
@@ -4754,6 +4775,37 @@ batch_all_cleanup_on_interrupt() {
   log "[batch-all] Interrupted."
 }
 
+# When the child JSON report is missing or generic, pull one actionable line from its log.
+batch_all_scrape_actionable_from_log() {
+  local -r log_file="$1"
+  local line stripped
+
+  line="$(grep -E 'ERROR: WAIT_TIMEOUT ' "$log_file" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$line" ]]; then
+    stripped="${line#*ERROR: }"
+    printf '%s' "$stripped"
+    return 0
+  fi
+
+  line="$(grep -E '  - (npm|python|github-actions)\|' "$log_file" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$line" ]]; then
+    stripped="${line##*  - }"
+    printf '%s' "$stripped"
+    return 0
+  fi
+
+  line="$(grep -E 'ERR_PNPM_NO_MATCHING_VERSION|No matching version found for ' \
+    "$log_file" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$line" ]]; then
+    stripped="${line#*  }"
+    stripped="${stripped#*  }"
+    printf '%s' "$stripped"
+    return 0
+  fi
+
+  return 1
+}
+
 batch_all_dispatch() {
   local dep_self repo child_exit worst_exit
   local -a child_args repos_found
@@ -4886,6 +4938,19 @@ batch_all_dispatch() {
       # no structured report (e.g. older child or crash before write).
       child_clean="$(mktemp)"
       sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' "$child_log" >"$child_clean" 2>/dev/null || cp "$child_log" "$child_clean"
+
+      if [[ -z "$root_cause" ]] \
+        || [[ "$root_cause" =~ ^dep-updater\ exited\ with\ code ]]; then
+        scraped=""
+        scraped="$(batch_all_scrape_actionable_from_log "$child_clean" 2>/dev/null || true)"
+        if [[ -n "$scraped" ]]; then
+          root_cause="$scraped"
+          if [[ "$detail_count" -eq 0 ]]; then
+            failure_details+=("$(basename "$repo"): ${scraped}")
+            detail_count=1
+          fi
+        fi
+      fi
 
       if [[ -z "$root_cause" ]]; then
         root_cause="$(tail -n 1 "$child_clean" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
@@ -5503,26 +5568,37 @@ print_stack_urls "$all_prs_csv"
 gate_all_created_prs
 maybe_label_top_pr_for_merge
 
+local run_exit_rc="$dep_updater_final_rc"
+
 if [[ "$no_wait_merge" == '1' ]]; then
   log ""
   log "Stack submitted. To clean up after all PRs are merged, run:"
   log "  $0 --cleanup --dir ${dir}"
   _cleanup_trap_active=0
-  exit "$dep_updater_final_rc"
+  dep_updater_emit_batch_child_report "$run_exit_rc"
+  exit "$run_exit_rc"
 fi
 
 if [[ -z "$all_prs_csv" ]]; then
   # Nothing was created this run — skip merge polling and go straight to cleanup.
   _cleanup_trap_active=0
+  dep_updater_emit_batch_child_report "$run_exit_rc"
   cleanup
-  exit "$dep_updater_final_rc"
+  exit "$run_exit_rc"
 fi
 
 # Wait for merge and clean up automatically
+set +e
 poll_until_merged "$all_prs_csv"
+poll_rc=$?
+set -e
+if (( poll_rc != 0 )); then
+  run_exit_rc=1
+fi
 _cleanup_trap_active=0
+dep_updater_emit_batch_child_report "$run_exit_rc"
 cleanup
-exit "$dep_updater_final_rc"
+exit "$run_exit_rc"
 }
 
 main "$@"
