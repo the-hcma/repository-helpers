@@ -1,5 +1,7 @@
 # `dep-updater` Script — Implementation Plan
 
+> **Related:** [dep-updater-hybrid-architecture.plan.md](./dep-updater-hybrid-architecture.plan.md) — proposal to keep Bash orchestration and extract policy/planning logic to Python incrementally.
+
 ## Goal
 
 A single, portable Bash script (`scripts/dep-updater`) that:
