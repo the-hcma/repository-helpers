@@ -139,6 +139,67 @@ die() {
     exit 1
 }
 
+# resolve_service_log_file
+# Prints the service log path from the installed unit, source template, or scratch default.
+resolve_service_log_file() {
+    local unit_text exec_start log_file args
+
+    unit_text="$(systemctl --user cat "${service_filename}" 2>/dev/null || true)"
+    if [[ -z "$unit_text" && -f "$target_service" ]]; then
+        unit_text="$(cat "$target_service")"
+    elif [[ -z "$unit_text" && -f "$source_service" ]]; then
+        unit_text="$(sed "s|@@REPO_DIR@@|${repo_dir}|g" "$source_service")"
+    fi
+
+    log_file=""
+    exec_start="$(printf '%s\n' "$unit_text" | grep '^ExecStart=' | sed 's/^ExecStart=//' | head -n1 || true)"
+    if [[ -n "$exec_start" ]]; then
+        args="$(printf '%s\n' "$exec_start" | cut -d' ' -f2-)"
+        log_file="$(printf '%s\n' "$args" | grep -oP -- '--log-file \K\S+' | sed "s|%h|${HOME}|g" || true)"
+    fi
+    if [[ -z "$log_file" ]]; then
+        log_file="$(
+            printf '%s\n' "$unit_text" \
+                | grep -E '^Standard(Output|Error)=' \
+                | head -n1 \
+                | grep -oP 'append:\K\S+' \
+                | sed "s|%h|${HOME}|g" \
+                || true
+        )"
+    fi
+    if [[ -z "$log_file" ]]; then
+        log_file="${log_dir}/${service_name}.log"
+    fi
+    printf '%s\n' "$log_file"
+}
+
+# print_service_failure_hint
+# After a failed systemctl start/restart, point the operator at service logs.
+print_service_failure_hint() {
+    local log_file
+
+    log_file="$(resolve_service_log_file)"
+    echo "" >&2
+    echo "❌ ${service_filename} failed to start or restart." >&2
+    echo "   Service log:  tail --follow=name --retry ${log_file}" >&2
+    if [[ "$kernel_name" != "Darwin" ]]; then
+        echo "   systemd:      journalctl --user -xeu ${service_filename}" >&2
+    fi
+}
+
+# systemctl_user_or_fail <action> [systemctl args...]
+# Runs systemctl --user; on failure prints log hints and returns non-zero.
+systemctl_user_or_fail() {
+    local action="$1"
+    shift
+
+    if systemctl --user "$action" "$@"; then
+        return 0
+    fi
+    print_service_failure_hint
+    return 1
+}
+
 # Function to display help
 show_help() {
     cat << EOF
@@ -240,12 +301,11 @@ check_status() {
     # 4. Show how the service is invoked
     local unit_text exec_start exec_post args port log_file
     unit_text="$(systemctl --user cat "${service_filename}" 2>/dev/null)"
-    exec_start="$(echo "$unit_text" | grep '^ExecStart=' | sed 's/^ExecStart=//')"
-    exec_post="$(echo "$unit_text" | grep '^ExecStartPost=' | sed 's/^ExecStartPost=//')"
+    exec_start="$(printf '%s\n' "$unit_text" | grep '^ExecStart=' | sed 's/^ExecStart=//' | head -n1 || true)"
+    exec_post="$(printf '%s\n' "$unit_text" | grep '^ExecStartPost=' | sed 's/^ExecStartPost=//')"
     if [[ -n "$exec_start" ]]; then
-        args="$(echo "$exec_start" | cut -d' ' -f2-)"
-        port="$(echo "$args" | grep -oP -- '--(http-)?port \K\d+' || true)"
-        log_file="$(echo "$args" | grep -oP -- '--log-file \K\S+' | sed "s|%h|${HOME}|g" || true)"
+        args="$(printf '%s\n' "$exec_start" | cut -d' ' -f2-)"
+        port="$(printf '%s\n' "$args" | grep -oP -- '--(http-)?port \K\d+' || true)"
         echo "✅ Starts:    $exec_start"
     fi
     if [[ -n "$exec_post" ]]; then
@@ -254,11 +314,8 @@ check_status() {
     if [[ -n "${port:-}" ]]; then
         echo "   URL:       http://localhost:${port}"
     fi
-    if [[ -n "${log_file:-}" ]]; then
-        echo "   Logs:      tail --follow=name --retry ${log_file}"
-    else
-        echo "   Logs:      tail --follow=name --retry ${log_dir}/${service_name}.log"
-    fi
+    log_file="$(resolve_service_log_file)"
+    echo "   Logs:      tail --follow=name --retry ${log_file}"
 
     echo "----------------------------------------"
     if $all_good; then
@@ -432,17 +489,17 @@ fi
 systemctl --user enable "$service_filename"
 if [[ "$service_changed" == "true" ]]; then
     echo "🔄 Restarting ${service_filename} (config changed)..."
-    systemctl --user restart "$service_filename"
+    systemctl_user_or_fail restart "$service_filename" || exit 1
 elif [[ "$code_changed" == "true" ]]; then
     if [[ "$deploy_refresh_needed" == "1" ]]; then
         echo "🔄 Restarting ${service_filename} (deploy refresh)..."
     else
         echo "🔄 Restarting ${service_filename} (code changed)..."
     fi
-    systemctl --user restart "$service_filename"
+    systemctl_user_or_fail restart "$service_filename" || exit 1
 elif ! systemctl --user is-active --quiet "$service_filename"; then
     echo "🚀 Starting ${service_filename} (was not running)..."
-    systemctl --user start "$service_filename"
+    systemctl_user_or_fail start "$service_filename" || exit 1
 else
     echo "⏭️  Service file and code unchanged — no restart needed."
 fi
