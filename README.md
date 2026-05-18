@@ -31,7 +31,7 @@ Repos with a systemd service should provide an executable `scripts/on-deploy` ho
 
 **Dependency expectations** (use `scripts/lib/on-deploy-deps` from this repo):
 
-1. **Resolve the library** from the deploying repo: `on_deploy_deps_source_from_repo "$repo_dir"` (sibling `../repository-helpers`, `REPOSITORY_HELPERS_DIR`, or `~/work/ai/repository-helpers`).
+1. **Load the library** via `scripts/lib/on-deploy-deps-bootstrap` (copy the block from `scripts/lib/on-deploy-deps-load.snippet` into `on-deploy`; do not call library functions before `source`).
 2. **Before skipping** on an unchanged commit, check staleness with `on_deploy_deps_python_env_stale` and, when the repo has a `package.json`, `on_deploy_deps_pnpm_modules_stale` (pass a subdir such as `web` for nested frontends).
 3. **Bootstrap** a missing or broken `.venv` with `on_deploy_deps_bootstrap_python_venv` when the service uses uv.
 4. **On a full deploy** (exit `0` path), run `on_deploy_deps_sync_python_frozen` and `on_deploy_deps_install_pnpm_frozen` before migrations, asset builds, or import smoke tests.
