@@ -1,0 +1,201 @@
+# shellcheck shell=bash
+# on-deploy-deps — shared dependency staleness checks and sync helpers for scripts/on-deploy.
+#
+# Used by service repos invoked via setup-service. Source after set -euo pipefail:
+#
+#   on_deploy_deps_source_from_repo "$repo_dir"
+#
+# Environment:
+#   REPOSITORY_HELPERS_DIR  Optional path to a repository-helpers checkout root.
+
+# on_deploy_deps_resolve_lib_path <repo_dir>
+# Prints the path to this library file. Returns 1 when not found.
+on_deploy_deps_resolve_lib_path() {
+  local repo_dir="$1"
+  local candidate rh_root
+
+  if [[ -n "${REPOSITORY_HELPERS_DIR:-}" ]]; then
+    candidate="${REPOSITORY_HELPERS_DIR}/scripts/lib/on-deploy-deps"
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  rh_root="$(cd "${repo_dir}/../repository-helpers" 2>/dev/null && pwd || true)"
+  if [[ -n "$rh_root" ]]; then
+    candidate="${rh_root}/scripts/lib/on-deploy-deps"
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  if [[ -n "${HOME:-}" ]]; then
+    candidate="${HOME}/work/ai/repository-helpers/scripts/lib/on-deploy-deps"
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+# on_deploy_deps_source_from_repo <repo_dir>
+# Sources this library or prints a fatal message and returns 1.
+on_deploy_deps_source_from_repo() {
+  local repo_dir="$1"
+  local lib_path
+
+  lib_path="$(on_deploy_deps_resolve_lib_path "$repo_dir")" || {
+    echo "on-deploy: repository-helpers scripts/lib/on-deploy-deps not found" >&2
+    echo "  Clone https://github.com/the-hcma/repository-helpers as a sibling of this repo," >&2
+    echo "  set REPOSITORY_HELPERS_DIR, or install at ~/work/ai/repository-helpers." >&2
+    return 1
+  }
+  # shellcheck source=/dev/null
+  source "$lib_path"
+}
+
+# on_deploy_deps_npm_root <repo_dir> [subdir]
+# Prints the directory containing package.json (repo root or e.g. web/).
+on_deploy_deps_npm_root() {
+  local repo="$1"
+  local subdir="${2:-}"
+
+  if [[ -z "$subdir" ]]; then
+    printf '%s\n' "$repo"
+  else
+    printf '%s\n' "${repo}/${subdir}"
+  fi
+}
+
+# on_deploy_deps_python_env_stale <repo_dir> [venv_relpath=.venv]
+# Returns 0 when uv.lock/pyproject.toml is newer than the venv or the venv is missing.
+on_deploy_deps_python_env_stale() {
+  local repo="$1"
+  local venv_rel="${2:-.venv}"
+  local lock="${repo}/uv.lock"
+  local project="${repo}/pyproject.toml"
+  local venv="${repo}/${venv_rel}"
+  local newest_input input_mtime venv_mtime lock_mtime
+
+  if [[ ! -d "$venv" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$lock" ]]; then
+    return 1
+  fi
+
+  newest_input="$lock"
+  if [[ -f "$project" ]]; then
+    input_mtime="$(stat -c '%Y' "$project")"
+    lock_mtime="$(stat -c '%Y' "$lock")"
+    if (( input_mtime > lock_mtime )); then
+      newest_input="$project"
+    fi
+  fi
+
+  venv_mtime="$(stat -c '%Y' "$venv")"
+  input_mtime="$(stat -c '%Y' "$newest_input")"
+  if (( input_mtime > venv_mtime )); then
+    return 0
+  fi
+  return 1
+}
+
+# on_deploy_deps_pnpm_modules_stale <repo_dir> [npm_subdir]
+# Returns 0 when pnpm-lock.yaml/package.json is newer than node_modules or modules missing.
+# npm_subdir is empty for repo root, or e.g. "web" for repo/web/.
+on_deploy_deps_pnpm_modules_stale() {
+  local repo="$1"
+  local subdir="${2:-}"
+  local root lock project modules
+  local newest_input input_mtime modules_mtime lock_mtime
+
+  root="$(on_deploy_deps_npm_root "$repo" "$subdir")"
+  lock="${root}/pnpm-lock.yaml"
+  project="${root}/package.json"
+  modules="${root}/node_modules"
+
+  if [[ ! -f "$project" ]]; then
+    return 1
+  fi
+  if [[ ! -d "$modules" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$lock" ]]; then
+    return 1
+  fi
+
+  newest_input="$lock"
+  if [[ -f "$project" ]]; then
+    input_mtime="$(stat -c '%Y' "$project")"
+    lock_mtime="$(stat -c '%Y' "$lock")"
+    if (( input_mtime > lock_mtime )); then
+      newest_input="$project"
+    fi
+  fi
+
+  modules_mtime="$(stat -c '%Y' "$modules")"
+  input_mtime="$(stat -c '%Y' "$newest_input")"
+  if (( input_mtime > modules_mtime )); then
+    return 0
+  fi
+  return 1
+}
+
+# on_deploy_deps_bootstrap_python_venv <repo_dir>
+# Creates or recreates .venv when missing or broken. Uses unfrozen uv sync for bootstrap only.
+on_deploy_deps_bootstrap_python_venv() {
+  local repo="$1"
+  local venv="${repo}/.venv"
+
+  if [[ ! -d "$venv" ]]; then
+    echo "  .venv missing — running 'uv sync'..."
+    (cd "$repo" && uv sync)
+    return 0
+  fi
+  if [[ ! -x "${venv}/bin/python3" ]] && [[ ! -x "${venv}/bin/python" ]]; then
+    echo "  .venv has no usable interpreter — recreating..."
+    rm -rf "$venv"
+    (cd "$repo" && uv sync)
+  fi
+}
+
+# on_deploy_deps_sync_python_frozen <repo_dir>
+# Aligns .venv with the committed uv.lock without mutating the lockfile.
+on_deploy_deps_sync_python_frozen() {
+  local repo="$1"
+  echo "  uv sync --frozen"
+  (cd "$repo" && uv sync --frozen)
+}
+
+# on_deploy_deps_install_pnpm_frozen <repo_dir> [npm_subdir]
+# Installs Node dependencies from the committed lockfile. Enables corepack when available.
+on_deploy_deps_install_pnpm_frozen() {
+  local repo="$1"
+  local subdir="${2:-}"
+  local root
+
+  root="$(on_deploy_deps_npm_root "$repo" "$subdir")"
+  if [[ ! -f "${root}/package.json" ]]; then
+    return 0
+  fi
+
+  if command -v corepack >/dev/null 2>&1; then
+    corepack enable pnpm >/dev/null
+  fi
+  if ! command -v pnpm >/dev/null 2>&1; then
+    echo "on-deploy: pnpm is required on PATH (enable via corepack or install pnpm)" >&2
+    return 1
+  fi
+
+  if [[ -n "$subdir" ]]; then
+    echo "  pnpm install --frozen-lockfile (${subdir}/)"
+  else
+    echo "  pnpm install --frozen-lockfile"
+  fi
+  (cd "$root" && pnpm install --frozen-lockfile)
+}
