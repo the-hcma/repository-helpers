@@ -8,6 +8,10 @@
 # service file) are resolved from the worktree this script is called from.
 # Calling setup-service from a feature worktree therefore deploys that worktree's
 # code and template, which is the intended behaviour for local development.
+#
+# Running commit: the generated unit sets Environment=DEPLOYED_COMMIT=<sha> from
+# HEAD at setup time. The running process inherits that value until restart; it is
+# not inferred from git HEAD at the process cwd (which changes on pull).
 
 set -euo pipefail
 
@@ -27,35 +31,112 @@ log_dir="${HOME}/scratch/${service_name}"
 readonly log_dir
 kernel_name="$(uname -s)"
 readonly kernel_name
+readonly deployed_commit_env_name="DEPLOYED_COMMIT"
 
-# print_running_commit
-# Best-effort: infer the git commit currently running by looking at the service
-# MainPID working directory. This reflects the deployed worktree the service was
-# started from (even if the current worktree has moved on).
-print_running_commit() {
+# generate_service_unit
+# Substitute @@REPO_DIR@@ and inject DEPLOYED_COMMIT into the [Service] section.
+generate_service_unit() {
+    local deployed_sha
+    local generated
+
+    deployed_sha="$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || true)"
+    if [[ -z "$deployed_sha" ]]; then
+        die "Could not resolve HEAD in: ${repo_dir}"
+    fi
+
+    generated="$(sed "s|@@REPO_DIR@@|${repo_dir}|g" "$source_service")"
+    if grep -qF '@@DEPLOYED_COMMIT@@' <<<"$generated"; then
+        generated="$(sed "s|@@DEPLOYED_COMMIT@@|${deployed_sha}|g" <<<"$generated")"
+    fi
+    if grep -q "^Environment=${deployed_commit_env_name}=" <<<"$generated"; then
+        generated="$(
+            printf '%s\n' "$generated" \
+                | sed "s|^Environment=${deployed_commit_env_name}=.*|Environment=${deployed_commit_env_name}=${deployed_sha}|"
+        )"
+    else
+        generated="$(
+            awk -v var="$deployed_commit_env_name" -v sha="$deployed_sha" '
+                /^\[Service\]/ && !inserted {
+                    print
+                    print "Environment=" var "=" sha
+                    inserted = 1
+                    next
+                }
+                { print }
+            ' <<<"$generated"
+        )"
+    fi
+    printf '%s' "$generated"
+}
+
+# read_deployed_commit_from_pid <main_pid>
+# Reads DEPLOYED_COMMIT from the process environment (set by systemd at start).
+read_deployed_commit_from_pid() {
+    local -r main_pid="$1"
+    local env_line sha
+
+    env_line="$(
+        tr '\0' '\n' <"/proc/${main_pid}/environ" 2>/dev/null \
+            | grep "^${deployed_commit_env_name}=" \
+            | head -n1 \
+            || true
+    )"
+    if [[ -z "$env_line" ]]; then
+        return 1
+    fi
+    sha="${env_line#"${deployed_commit_env_name}"=}"
+    if [[ -z "$sha" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$sha"
+}
+
+# service_main_pid
+# Prints systemd MainPID or empty when the service is not running.
+service_main_pid() {
     local main_pid
-    local cwd
-    local sha
-
     main_pid="$(systemctl --user show "$service_filename" --property=MainPID --value 2>/dev/null || true)"
     if [[ -z "$main_pid" || "$main_pid" == "0" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$main_pid"
+}
+
+# installed_unit_lacks_deployed_commit_env
+# True when the installed user unit has no DEPLOYED_COMMIT Environment line.
+installed_unit_lacks_deployed_commit_env() {
+    [[ -f "$target_service" ]] \
+        && ! grep -q "^Environment=${deployed_commit_env_name}=" "$target_service"
+}
+
+# running_service_lacks_deployed_commit_env <main_pid>
+running_service_lacks_deployed_commit_env() {
+    local -r main_pid="$1"
+    ! read_deployed_commit_from_pid "$main_pid" >/dev/null 2>&1
+}
+
+# print_running_commit
+# Report DEPLOYED_COMMIT from the running service MainPID (never git HEAD at cwd).
+print_running_commit() {
+    local main_pid
+    local deployed_sha
+
+    if ! main_pid="$(service_main_pid)"; then
         echo "   Running commit: (service not running)"
         return 0
     fi
 
-    cwd="$(readlink -f "/proc/${main_pid}/cwd" 2>/dev/null || true)"
-    if [[ -z "$cwd" ]]; then
-        echo "   Running commit: (unknown; cannot read /proc/${main_pid}/cwd)"
+    if deployed_sha="$(read_deployed_commit_from_pid "$main_pid")"; then
+        echo "   Running commit: ${deployed_sha:0:7}  (from ${deployed_commit_env_name})"
         return 0
     fi
 
-    sha="$(git -C "$cwd" rev-parse --short HEAD 2>/dev/null || true)"
-    if [[ -z "$sha" ]]; then
-        echo "   Running commit: (unknown; not a git worktree: ${cwd})"
-        return 0
-    fi
+    echo "   Running commit: (unknown; ${deployed_commit_env_name} not set — will refresh)"
+}
 
-    echo "   Running commit: ${sha}  (${cwd})"
+die() {
+    echo "❌ Error: $*" >&2
+    exit 1
 }
 
 # Function to display help
@@ -120,7 +201,7 @@ check_status() {
     if [[ ! -f "$target_service" ]]; then
         echo "❌ Service:  Not installed (Run setup to install it)"
         all_good=false
-    elif diff --brief <(sed "s|@@REPO_DIR@@|${repo_dir}|g" "$source_service") "$target_service" > /dev/null 2>&1; then
+    elif diff --brief <(generate_service_unit) "$target_service" > /dev/null 2>&1; then
         echo "✅ Service:  Up to date ($target_service)"
     else
         echo "❌ Service:  Outdated (Run setup to update it)"
@@ -267,24 +348,55 @@ fi
 # 2. Ensure target directory exists
 mkdir -p "$target_dir"
 
-# 3. Generate service file with repo path substituted
-generated=$(sed "s|@@REPO_DIR@@|${repo_dir}|g" "$source_service")
+# Print current vs running commit before updating the unit (running = old process env).
+deploy_refresh_needed=0
+desired_sha="$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || true)"
+desired_full="$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || true)"
+if [[ -n "$desired_sha" ]]; then
+    echo "   Desired commit: ${desired_sha}  (${repo_dir})"
+fi
+print_running_commit
+
+main_pid=""
+if main_pid="$(service_main_pid)"; then
+    running_full=""
+    if running_full="$(read_deployed_commit_from_pid "$main_pid")"; then
+        if [[ -n "$desired_full" && "$running_full" != "$desired_full" ]]; then
+            deploy_refresh_needed=1
+            echo "⚠️  Running commit (${running_full:0:7}) differs from desired (${desired_sha}) — will refresh."
+        fi
+    else
+        deploy_refresh_needed=1
+        echo "⚠️  Running service lacks ${deployed_commit_env_name}; treating as stale (will refresh)."
+    fi
+fi
+if installed_unit_lacks_deployed_commit_env; then
+    deploy_refresh_needed=1
+    echo "⚠️  Installed unit lacks ${deployed_commit_env_name}; updating unit (conservative refresh)."
+fi
+
+# 3. Generate service file with repo path and DEPLOYED_COMMIT substituted
+generated="$(generate_service_unit)"
 service_changed=true
 
 if [[ -L "$target_service" ]]; then
     echo "🔗 Removing old symlink..."
     rm "$target_service"
 elif [[ -f "$target_service" ]]; then
-    if diff --brief <(echo "$generated") "$target_service" > /dev/null 2>&1; then
-        echo "✅ Service file unchanged: $target_service"
-        service_changed=false
+    if diff --brief <(printf '%s' "$generated") "$target_service" > /dev/null 2>&1; then
+        if [[ "$deploy_refresh_needed" == "1" ]]; then
+            echo "🔄 Service file needs ${deployed_commit_env_name}; updating..."
+        else
+            echo "✅ Service file unchanged: $target_service"
+            service_changed=false
+        fi
     else
         echo "🔄 Service file changed. Updating..."
     fi
 fi
 
 if [[ "$service_changed" == "true" ]]; then
-    echo "$generated" > "$target_service"
+    printf '%s' "$generated" > "$target_service"
     echo "✅ Service file generated: $target_service (repo: $repo_dir)"
 fi
 
@@ -301,16 +413,12 @@ else
     loginctl enable-linger "$current_user"
 fi
 
-# Print current vs running commit for clarity.
-desired_sha="$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || true)"
-if [[ -n "$desired_sha" ]]; then
-    echo "   Desired commit: ${desired_sha}  (${repo_dir})"
-fi
-print_running_commit
-
 # 6. Run repo-specific deploy hook if present (see run_on_deploy_hook).
 code_changed=false
 if run_on_deploy_hook; then
+    code_changed=true
+fi
+if [[ "$deploy_refresh_needed" == "1" ]]; then
     code_changed=true
 fi
 
@@ -326,7 +434,11 @@ if [[ "$service_changed" == "true" ]]; then
     echo "🔄 Restarting ${service_filename} (config changed)..."
     systemctl --user restart "$service_filename"
 elif [[ "$code_changed" == "true" ]]; then
-    echo "🔄 Restarting ${service_filename} (code changed)..."
+    if [[ "$deploy_refresh_needed" == "1" ]]; then
+        echo "🔄 Restarting ${service_filename} (deploy refresh)..."
+    else
+        echo "🔄 Restarting ${service_filename} (code changed)..."
+    fi
     systemctl --user restart "$service_filename"
 elif ! systemctl --user is-active --quiet "$service_filename"; then
     echo "🚀 Starting ${service_filename} (was not running)..."
