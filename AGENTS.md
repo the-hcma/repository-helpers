@@ -129,6 +129,33 @@ scripts/dev/start-development --refresh
   fi
   ```
 
+## on-deploy hooks
+
+Service repositories install via `scripts/setup-service` and optionally implement `scripts/on-deploy`. Shared dependency logic lives in **`scripts/lib/on-deploy-deps`** — do not copy staleness checks into each repo.
+
+### Exit codes (required)
+
+| Code | Meaning |
+|------|---------|
+| `0` | Steps ran; unit must restart |
+| `1` | No change; restart optional |
+| `2+` | Error; abort deploy |
+
+### Required behaviour
+
+1. Resolve `repo_dir` from `BASH_SOURCE[0]`; never assume `$PWD`.
+2. Source the library: `on_deploy_deps_source_from_repo "$repo_dir"` (fails clearly if repository-helpers is not on disk).
+3. **Skip decision:** if caching “already deployed at commit X”, also call `on_deploy_deps_python_env_stale "$repo_dir"` and, when applicable, `on_deploy_deps_pnpm_modules_stale "$repo_dir" [subdir]`. Do not skip when either returns stale (exit status `0`).
+4. **Bootstrap:** `on_deploy_deps_bootstrap_python_venv "$repo_dir"` before `uv run` when the service uses uv.
+5. **Full deploy path:** `on_deploy_deps_sync_python_frozen "$repo_dir"`; `on_deploy_deps_install_pnpm_frozen "$repo_dir" [subdir]` before `pnpm run build`; then repo-specific migrations, bundles, and smoke imports.
+6. Do not invoke bare `python3` for utility work before the venv exists (see domesti-bot `docs/AGENTS.md` for the exception after `uv sync`).
+
+### Library resolution order
+
+1. `$REPOSITORY_HELPERS_DIR/scripts/lib/on-deploy-deps`
+2. `$repo_dir/../repository-helpers/scripts/lib/on-deploy-deps`
+3. `$HOME/work/ai/repository-helpers/scripts/lib/on-deploy-deps`
+
 ---
 
 ## Commits, Stacking & Pull Requests
