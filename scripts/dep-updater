@@ -84,6 +84,13 @@ summary_lines=""
 # Set to 1 once the worktree is live so the EXIT trap knows cleanup is needed.
 _cleanup_trap_active=0
 
+# Primary clone ($dir) snapshot — create_worktree may fast-forward refs/heads/main.
+_primary_snapshot_taken=0
+_pri_main_sha=""
+_pri_head_sha=""
+_pri_head_symref=""
+_pri_reset_hard=0
+
 prompt_color=""
 prompt_color_reset=""
 
@@ -1330,29 +1337,75 @@ detect_ecosystem() {
   py_tool=""
   has_gha=0
 
+  # Prefer origin/main manifests when available so detection matches what we scan
+  # and bump (feature branches may lack lockfiles or workflows that exist on main).
+  local detect_ref="worktree"
+  git -C "$dir" fetch origin main 2>/dev/null || true
+  if git -C "$dir" rev-parse origin/main >/dev/null 2>&1; then
+    detect_ref="origin/main"
+  fi
+
+  _repo_file_exists() {
+    local rel="$1"
+    if [[ "$detect_ref" == "origin/main" ]]; then
+      git -C "$dir" cat-file -e "origin/main:${rel}" 2>/dev/null
+    else
+      [[ -f "$dir/${rel}" ]]
+    fi
+  }
+
+  _lockfile_present() {
+    local f="$1"
+    local prefixed="$f"
+    if [[ -n "$npm_project_prefix" ]]; then
+      prefixed="${npm_project_prefix}/${f}"
+    fi
+    if [[ "$detect_ref" == "origin/main" ]]; then
+      git -C "$dir" cat-file -e "origin/main:${prefixed}" 2>/dev/null \
+        || git -C "$dir" ls-tree --name-only origin/main -- "$prefixed" 2>/dev/null \
+          | grep -q .
+    else
+      [[ -f "$dir/${prefixed}" ]]
+    fi
+  }
+
   if [[ "$ecosystem" == 'npm' || "$ecosystem" == 'auto' ]]; then
-    if [[ -f "$dir/package.json" ]]; then
+    if _repo_file_exists "package.json"; then
       has_npm=1
     elif [[ "$ecosystem" == 'auto' || "$ecosystem" == 'npm' ]]; then
       # Python-first repos often ship the browser bundle under a single child
       # directory (e.g. web/package.json). Enable only when there is exactly one
       # immediate */package.json — multiple matches are ambiguous.
-      local nested_count nested_parent child_pkg parent_dir base_name
+      local nested_count nested_parent child_pkg parent_dir base_name top_entry
       nested_count=0
       nested_parent=""
-      shopt -s nullglob
-      for child_pkg in "$dir"/*/package.json; do
-        [[ -f "$child_pkg" ]] || continue
-        parent_dir="$(dirname "$child_pkg")"
-        base_name="$(basename "$parent_dir")"
-        case "$base_name" in
-          node_modules|vendor|dist|build|coverage|tmp|out)
-            continue ;;
-        esac
-        nested_count=$((nested_count + 1))
-        nested_parent="$parent_dir"
-      done
-      shopt -u nullglob
+      if [[ "$detect_ref" == "origin/main" ]]; then
+        while IFS= read -r top_entry; do
+          [[ -z "$top_entry" ]] && continue
+          case "$top_entry" in
+            node_modules|vendor|dist|build|coverage|tmp|out)
+              continue ;;
+          esac
+          if _repo_file_exists "${top_entry}/package.json"; then
+            nested_count=$((nested_count + 1))
+            nested_parent="$top_entry"
+          fi
+        done < <(git -C "$dir" ls-tree --name-only origin/main 2>/dev/null || true)
+      else
+        shopt -s nullglob
+        for child_pkg in "$dir"/*/package.json; do
+          [[ -f "$child_pkg" ]] || continue
+          parent_dir="$(dirname "$child_pkg")"
+          base_name="$(basename "$parent_dir")"
+          case "$base_name" in
+            node_modules|vendor|dist|build|coverage|tmp|out)
+              continue ;;
+          esac
+          nested_count=$((nested_count + 1))
+          nested_parent="$parent_dir"
+        done
+        shopt -u nullglob
+      fi
       if [[ "$nested_count" -eq 1 ]]; then
         has_npm=1
         npm_project_prefix="$(basename "$nested_parent")"
@@ -1363,50 +1416,41 @@ detect_ecosystem() {
     fi
 
     if [[ "$has_npm" == '1' ]]; then
-      # Detect the package manager from the lockfile.  Check both the current
-      # working tree AND origin/main (the worktree base), because a feature branch
-      # may predate the project's adoption of pnpm/yarn and therefore lack the
-      # lockfile that exists on main.  Checking origin/main avoids committing
-      # a wrong-tool lockfile (e.g. package-lock.json on a pnpm project).
-      _lockfile_in_main() {
-        local f="$1"
-        local prefixed="$f"
-        if [[ -n "$npm_project_prefix" ]]; then
-          prefixed="${npm_project_prefix}/${f}"
-        fi
-        [[ -f "$dir/${prefixed}" ]] \
-          || git -C "$dir" ls-tree --name-only origin/main -- "$prefixed" 2>/dev/null | grep -q .
-      }
-      if _lockfile_in_main "pnpm-lock.yaml"; then
+      if _lockfile_present "pnpm-lock.yaml"; then
         npm_tool="pnpm"
-      elif _lockfile_in_main "yarn.lock"; then
+      elif _lockfile_present "yarn.lock"; then
         npm_tool="yarn"
       else
         # package-lock.json or no lockfile at all — default to npm.
         npm_tool="npm"
       fi
-      unset -f _lockfile_in_main
     fi
   fi
 
   if [[ "$ecosystem" == 'python' || "$ecosystem" == 'auto' ]]; then
-    if [[ -f "$dir/uv.lock" ]]; then
+    if _repo_file_exists "uv.lock"; then
       py_tool="uv"
-    elif [[ -f "$dir/poetry.lock" ]]; then
+    elif _repo_file_exists "poetry.lock"; then
       py_tool="poetry"
-    elif [[ -f "$dir/Pipfile.lock" ]]; then
+    elif _repo_file_exists "Pipfile.lock"; then
       py_tool="pipenv"
-    elif [[ -f "$dir/requirements.txt" || -f "$dir/pyproject.toml" ]]; then
+    elif _repo_file_exists "requirements.txt" || _repo_file_exists "pyproject.toml"; then
       py_tool="pip"
     fi
   fi
 
   if [[ "$ecosystem" == 'gha' || "$ecosystem" == 'auto' ]]; then
-    if grep -rql --include='*.yml' --include='*.yaml' 'uses:' \
+    if [[ "$detect_ref" == "origin/main" ]]; then
+      if git -C "$dir" grep -q 'uses:' origin/main -- .github/workflows/ 2>/dev/null; then
+        has_gha=1
+      fi
+    elif grep -rql --include='*.yml' --include='*.yaml' 'uses:' \
         "${dir}/.github/workflows/" 2>/dev/null; then
       has_gha=1
     fi
   fi
+
+  unset -f _repo_file_exists _lockfile_present
 
   if [[ "$has_npm" == '0' && -z "$py_tool" && "$has_gha" == '0' ]]; then
     if [[ "$dry_run" == '1' ]]; then
@@ -1681,6 +1725,64 @@ write_initial_state() {
 }
 
 # ---------------------------------------------------------------------------
+# Primary clone ($dir) — snapshot before create_worktree, restore on teardown
+# ---------------------------------------------------------------------------
+
+primary_repo_snapshot() {
+  if [[ "$_primary_snapshot_taken" == '1' ]]; then
+    return 0
+  fi
+  _primary_snapshot_taken=1
+  _pri_reset_hard=0
+  _pri_main_sha="$(git -C "$dir" rev-parse refs/heads/main 2>/dev/null || true)"
+  _pri_head_sha="$(git -C "$dir" rev-parse HEAD)"
+  _pri_head_symref="$(git -C "$dir" symbolic-ref -q HEAD 2>/dev/null || true)"
+}
+
+primary_repo_restore() {
+  if [[ "$_primary_snapshot_taken" != '1' ]]; then
+    return 0
+  fi
+  _primary_snapshot_taken=0
+  if [[ -n "$_pri_main_sha" ]]; then
+    git -C "$dir" update-ref refs/heads/main "$_pri_main_sha" 2>/dev/null \
+      || log "[worktree] Note: could not restore refs/heads/main on primary clone."
+  fi
+  if [[ "$_pri_reset_hard" == '1' && -n "$_pri_head_sha" ]]; then
+    if [[ -n "$_pri_head_symref" ]]; then
+      git -C "$dir" checkout "${_pri_head_symref#refs/heads/}" 2>/dev/null \
+        || log "[worktree] Note: could not checkout primary clone branch after restore."
+    fi
+    git -C "$dir" reset --hard "$_pri_head_sha" 2>/dev/null \
+      || log "[worktree] Note: could not reset primary clone working tree after restore."
+  fi
+}
+
+# Before scanning for outdated packages, align the dep-updater worktree with
+# origin/main when no stack branches exist yet (fresh or idle worktree).
+sync_worktree_to_origin_main_for_scan() {
+  local -r branches_csv="${1:-}"
+  if [[ -n "$branches_csv" ]]; then
+    return 0
+  fi
+  local main_sha cur
+  git -C "$worktree_path" fetch origin main 2>/dev/null || true
+  if ! main_sha="$(git -C "$worktree_path" rev-parse origin/main 2>/dev/null)"; then
+    return 0
+  fi
+  cur="$(git -C "$worktree_path" rev-parse HEAD)"
+  if [[ "$cur" == "$main_sha" ]]; then
+    return 0
+  fi
+  log "[worktree] Syncing scan tree to origin/main (${main_sha:0:8})…"
+  if [[ -n "$wt_base_branch" ]]; then
+    git -C "$worktree_path" checkout "$wt_base_branch" 2>/dev/null \
+      || git -C "$worktree_path" checkout -B "$wt_base_branch" "$main_sha"
+  fi
+  git -C "$worktree_path" reset --hard "$main_sha"
+}
+
+# ---------------------------------------------------------------------------
 # Worktree management
 # ---------------------------------------------------------------------------
 
@@ -1715,6 +1817,7 @@ create_worktree() {
       || die "Could not resolve origin/main or HEAD in: $dir"
     log "[worktree] origin/main not available; using local HEAD as base"
   else
+    primary_repo_snapshot
     # Fast-forward local main to origin/main so that `gt submit` doesn't abort
     # with "trunk branch is out of date". git update-ref is used instead of
     # `git branch -f` because `main` is typically checked out in the primary
@@ -1729,6 +1832,7 @@ create_worktree() {
         && git -C "$dir" diff --quiet 2>/dev/null \
         && git -C "$dir" diff --cached --quiet 2>/dev/null; then
       if git -C "$dir" reset --hard "$main_sha" >/dev/null 2>&1; then
+        _pri_reset_hard=1
         log "[worktree] Fast-forwarded working tree at ${dir} to origin/main"
       else
         log "[worktree] Warning: could not fast-forward working tree at ${dir}"
@@ -1970,9 +2074,8 @@ register_existing_branch_state() {
 # ---------------------------------------------------------------------------
 
 # Prints one "name current latest" line per outdated package.
-# Optional $1: project root to scan (defaults to $dir). Live updates should pass
-# $worktree_path so the plan matches manifests synced from origin/main; the
-# primary clone may have stale node_modules relative to the lockfile.
+# Optional $1: project root to scan (defaults to $dir). Update and dry-run modes
+# always pass the dep-updater worktree (synced to origin/main before scanning).
 npm_outdated() {
   local -r tool="$npm_tool"
   local -r scan_root="${1:-$dir}"
@@ -4661,6 +4764,7 @@ print_summary() {
 cleanup_on_error() {
   local -r reason="$1"
   log "Cleaning up after error: ${reason}"
+  primary_repo_restore
   # Close any open PRs created in this session so a subsequent run starts fresh.
   if [[ -n "$state_file" && -f "$state_file" ]]; then
     local saved_prs=""
@@ -4698,6 +4802,7 @@ cleanup_on_error() {
 
 cleanup() {
   log "Cleaning up worktree…"
+  primary_repo_restore
   if [[ -n "$worktree_path" && -d "$worktree_path" ]]; then
     log "[worktree] Removing worktree: $worktree_path"
     git -C "$dir" worktree remove --force "$worktree_path" 2>/dev/null \
@@ -5360,6 +5465,7 @@ main() {
 _dry_run_teardown() {
   local -r wt="$1"
   _cleanup_trap_active=0
+  primary_repo_restore
   log "[worktree] Removing: $wt"
   cd - >/dev/null 2>&1 || true
   git -C "$dir" worktree remove --force "$wt" 2>/dev/null || true
@@ -5618,63 +5724,6 @@ local existing_branches existing_prs
 existing_branches="$(state_get "branches")"
 existing_prs="$(state_get "prs")"
 
-# Cheap scan on the primary clone: skip creating a worktree when nothing looks
-# outdated and there is no dep-updater state to resume (fast path).
-local npm_lines="" py_lines="" gha_lines=""
-if [[ "$has_npm" == '1' ]]; then
-    npm_lines="$(npm_outdated "$(npm_project_root "$dir")")"
-fi
-if [[ -n "$py_tool" ]]; then
-  py_lines="$(py_outdated "$py_tool" "$dir")"
-fi
-if [[ "$has_gha" == '1' ]]; then
-  gha_lines="$(gha_outdated "$dir")"
-fi
-
-local deps_maybe_outdated=0
-if [[ -n "$npm_lines" || -n "$py_lines" || -n "$gha_lines" ]]; then
-  deps_maybe_outdated=1
-fi
-
-if [[ "$deps_maybe_outdated" == '0' ]]; then
-  log "All dependencies are up to date."
-  if [[ -f "$state_file" ]]; then
-    prepare_worktree
-    ensure_gt_tracked
-    dep_updater_ensure_eco_fail_file
-    _cleanup_trap_active=1
-    # Fetch remote refs without touching the primary repo's working tree.
-    # (gt sync --force fails when the primary repo has local uncommitted changes.)
-    git -C "$worktree_path" fetch origin --prune 2>/dev/null || true
-    log "Working in: $worktree_path"
-
-    require_resume_ci_gate "$existing_branches" "$existing_prs"
-    gate_all_created_prs
-    maybe_label_top_pr_for_merge
-
-    if [[ "$no_wait_merge" == '1' ]]; then
-      log ""
-      log "Stack submitted. To clean up after all PRs are merged, run:"
-      log "  dep-updater --cleanup --dir ${dir}"
-      exit 0
-    fi
-
-    local final_prs
-    final_prs="$(collect_tracked_prs_csv)"
-    if [[ -n "$final_prs" ]]; then
-      poll_until_merged "$final_prs"
-    else
-      log "No tracked PRs found; nothing to monitor."
-    fi
-    # Always clean up the worktree when re-entering with no new deps — even
-    # if final_prs was empty (e.g. state file exists but worktree was gone
-    # and was just recreated, or all PRs already merged outside our tracking).
-    cleanup
-    exit 0
-  fi
-  exit 0
-fi
-
 prepare_worktree
 ensure_gt_tracked
 
@@ -5682,15 +5731,13 @@ ensure_gt_tracked
 dep_updater_ensure_eco_fail_file
 _cleanup_trap_active=1
 
-# Fetch remote refs without touching the primary repo's working tree.
 git -C "$worktree_path" fetch origin --prune 2>/dev/null || true
-
 log "Working in: $worktree_path"
 
-# Authoritative scan from the worktree (same tree batch_update applies to).
-npm_lines=""
-py_lines=""
-gha_lines=""
+# Scan only from a tree aligned with origin/main (never the primary clone).
+sync_worktree_to_origin_main_for_scan "$existing_branches"
+
+local npm_lines="" py_lines="" gha_lines=""
 if [[ "$has_npm" == '1' ]]; then
   npm_lines="$(npm_outdated "$(npm_project_root "$worktree_path")")"
 fi
@@ -5711,6 +5758,7 @@ if [[ -z "$npm_lines" && -z "$py_lines" && -z "$gha_lines" ]]; then
     log ""
     log "Stack submitted. To clean up after all PRs are merged, run:"
     log "  dep-updater --cleanup --dir ${dir}"
+    primary_repo_restore
     exit 0
   fi
 
@@ -5824,6 +5872,7 @@ if [[ "$no_wait_merge" == '1' ]]; then
   log "Stack submitted. To clean up after all PRs are merged, run:"
   log "  $0 --cleanup --dir ${dir}"
   _cleanup_trap_active=0
+  primary_repo_restore
   dep_updater_emit_batch_child_report "$run_exit_rc"
   exit "$run_exit_rc"
 fi
