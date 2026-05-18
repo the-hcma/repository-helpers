@@ -19,6 +19,25 @@ Options:
 
 Reads a service unit template from `etc/systemd/<repo-name>.service` and expands `@@REPO_DIR@@` to the resolved repository path. Runs `scripts/on-deploy` (exit 0 = rebuilt, exit 1 = unchanged) if present, and restarts the service only when needed.
 
+#### `scripts/on-deploy` contract
+
+Repos with a systemd service should provide an executable `scripts/on-deploy` hook. `setup-service` calls it before (re)starting the unit:
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Build or sync steps ran; the service must be restarted |
+| `1` | Nothing changed; restart may be skipped |
+| `2+` | Failure; `setup-service` aborts |
+
+**Dependency expectations** (use `scripts/lib/on-deploy-deps` from this repo):
+
+1. **Resolve the library** from the deploying repo: `on_deploy_deps_source_from_repo "$repo_dir"` (sibling `../repository-helpers`, `REPOSITORY_HELPERS_DIR`, or `~/work/ai/repository-helpers`).
+2. **Before skipping** on an unchanged commit, check staleness with `on_deploy_deps_python_env_stale` and, when the repo has a `package.json`, `on_deploy_deps_pnpm_modules_stale` (pass a subdir such as `web` for nested frontends).
+3. **Bootstrap** a missing or broken `.venv` with `on_deploy_deps_bootstrap_python_venv` when the service uses uv.
+4. **On a full deploy** (exit `0` path), run `on_deploy_deps_sync_python_frozen` and `on_deploy_deps_install_pnpm_frozen` before migrations, asset builds, or import smoke tests.
+
+Commit-only skip caches must not ignore lockfile changes at the same SHA. See [AGENTS.md](AGENTS.md#on-deploy-hooks) for worktree and `.env` patterns.
+
 ---
 
 ### `scripts/dev/start-development`
@@ -59,6 +78,7 @@ Each script has a corresponding smoke test in `tests/`:
 ```bash
 bash tests/setup-service.test
 bash tests/start-development.test
+bash tests/on-deploy-deps.test
 bash tests/dep-updater.test
 ```
 
