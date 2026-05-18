@@ -17,7 +17,11 @@ Options:
   --help         Show usage information
 ```
 
-Reads a service unit template from `etc/systemd/<repo-name>.service` and expands `@@REPO_DIR@@` to the resolved repository path. Runs `scripts/on-deploy` (exit 0 = rebuilt, exit 1 = unchanged) if present, and restarts the service only when needed.
+Reads a service unit template from `etc/systemd/<repo-name>.service` and expands `@@REPO_DIR@@` to the resolved repository path. The generated unit also sets `Environment=DEPLOYED_COMMIT=<git HEAD>` (injected automatically; templates may use `@@DEPLOYED_COMMIT@@` optionally).
+
+**Running vs desired commit:** Before deploy, `setup-service` prints both. *Running* is read from `DEPLOYED_COMMIT` in the service process environment (set at last start), not from `git HEAD` in the repo directory (which changes on `git pull` before restart). If the running process lacks `DEPLOYED_COMMIT`, or it differs from the current checkout, `setup-service` conservatively runs `on-deploy` and restarts even when the hook would otherwise skip.
+
+Runs `scripts/on-deploy` (exit 0 = rebuilt, exit 1 = unchanged) if present, and restarts the service when the unit changed, code changed, or a deploy refresh is required.
 
 #### `scripts/on-deploy` contract
 
