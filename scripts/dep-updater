@@ -1218,6 +1218,17 @@ pnpm_install_worktree() {
     return 2
   fi
 
+  # Stale lockfile metadata (e.g. overrides dropped from package.json but still in
+  # pnpm-lock.yaml) breaks --frozen-lockfile. Retry once without frozen in the
+  # throwaway worktree so --report-json scans can proceed.
+  if [[ "$mode" == 'frozen' ]] \
+      && grep -qF 'ERR_PNPM_LOCKFILE_CONFIG_MISMATCH' "$pnpm_log"; then
+    log "[pnpm] WARNING: lockfile config mismatch; retrying install with --no-frozen-lockfile…"
+    rm -f "$pnpm_log"
+    pnpm_install_worktree no-frozen "$workdir"
+    return $?
+  fi
+
   printf '%s\n' "pnpm install failed (exit ${pnpm_exit}). Last output:" >&2
   tail -n 80 "$pnpm_log" | sed 's/^/  /' >&2
   record_first_failure "pnpm install failed (exit ${pnpm_exit})"
@@ -1745,15 +1756,15 @@ primary_repo_restore() {
   fi
   _primary_snapshot_taken=0
   if [[ -n "$_pri_main_sha" ]]; then
-    git -C "$dir" update-ref refs/heads/main "$_pri_main_sha" 2>/dev/null \
+    git -C "$dir" update-ref refs/heads/main "$_pri_main_sha" >/dev/null 2>&1 \
       || log "[worktree] Note: could not restore refs/heads/main on primary clone."
   fi
   if [[ "$_pri_reset_hard" == '1' && -n "$_pri_head_sha" ]]; then
     if [[ -n "$_pri_head_symref" ]]; then
-      git -C "$dir" checkout "${_pri_head_symref#refs/heads/}" 2>/dev/null \
+      git -C "$dir" checkout "${_pri_head_symref#refs/heads/}" >/dev/null 2>&1 \
         || log "[worktree] Note: could not checkout primary clone branch after restore."
     fi
-    git -C "$dir" reset --hard "$_pri_head_sha" 2>/dev/null \
+    git -C "$dir" reset --hard "$_pri_head_sha" >/dev/null 2>&1 \
       || log "[worktree] Note: could not reset primary clone working tree after restore."
   fi
 }
@@ -1779,7 +1790,7 @@ sync_worktree_to_origin_main_for_scan() {
     git -C "$worktree_path" checkout "$wt_base_branch" 2>/dev/null \
       || git -C "$worktree_path" checkout -B "$wt_base_branch" "$main_sha"
   fi
-  git -C "$worktree_path" reset --hard "$main_sha"
+  git -C "$worktree_path" reset --hard "$main_sha" >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -1817,25 +1828,29 @@ create_worktree() {
       || die "Could not resolve origin/main or HEAD in: $dir"
     log "[worktree] origin/main not available; using local HEAD as base"
   else
-    primary_repo_snapshot
-    # Fast-forward local main to origin/main so that `gt submit` doesn't abort
-    # with "trunk branch is out of date". git update-ref is used instead of
-    # `git branch -f` because `main` is typically checked out in the primary
-    # clone and `git branch -f` refuses to move a checked-out branch.
-    git -C "$dir" update-ref refs/heads/main "$main_sha"
-    # Also update the working tree when main is checked out and clean.
-    # Without this, update-ref fast-forwards the branch pointer but leaves the
-    # working tree at the old commit, making it appear dirty relative to HEAD.
-    local checked_out_branch
-    checked_out_branch="$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || true)"
-    if [[ "$checked_out_branch" == 'main' ]] \
-        && git -C "$dir" diff --quiet 2>/dev/null \
-        && git -C "$dir" diff --cached --quiet 2>/dev/null; then
-      if git -C "$dir" reset --hard "$main_sha" >/dev/null 2>&1; then
-        _pri_reset_hard=1
-        log "[worktree] Fast-forwarded working tree at ${dir} to origin/main"
-      else
-        log "[worktree] Warning: could not fast-forward working tree at ${dir}"
+    # --report-json (notifier/cron) only needs a throwaway worktree; never move the
+    # primary clone's main or restore it afterward (restore git output leaked to stdout).
+    if [[ "$report_json" != '1' ]]; then
+      primary_repo_snapshot
+      # Fast-forward local main to origin/main so that `gt submit` doesn't abort
+      # with "trunk branch is out of date". git update-ref is used instead of
+      # `git branch -f` because `main` is typically checked out in the primary
+      # clone and `git branch -f` refuses to move a checked-out branch.
+      git -C "$dir" update-ref refs/heads/main "$main_sha" >/dev/null 2>&1
+      # Also update the working tree when main is checked out and clean.
+      # Without this, update-ref fast-forwards the branch pointer but leaves the
+      # working tree at the old commit, making it appear dirty relative to HEAD.
+      local checked_out_branch
+      checked_out_branch="$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || true)"
+      if [[ "$checked_out_branch" == 'main' ]] \
+          && git -C "$dir" diff --quiet 2>/dev/null \
+          && git -C "$dir" diff --cached --quiet 2>/dev/null; then
+        if git -C "$dir" reset --hard "$main_sha" >/dev/null 2>&1; then
+          _pri_reset_hard=1
+          log "[worktree] Fast-forwarded working tree at ${dir} to origin/main"
+        else
+          log "[worktree] Warning: could not fast-forward working tree at ${dir}"
+        fi
       fi
     fi
   fi
@@ -5468,7 +5483,7 @@ _dry_run_teardown() {
   primary_repo_restore
   log "[worktree] Removing: $wt"
   cd - >/dev/null 2>&1 || true
-  git -C "$dir" worktree remove --force "$wt" 2>/dev/null || true
+  git -C "$dir" worktree remove --force "$wt" >/dev/null 2>&1 || true
   git -C "$dir" branch -D "$wt_base_branch" >/dev/null 2>&1 || true
   log "[worktree] Removed: $wt"
 }
