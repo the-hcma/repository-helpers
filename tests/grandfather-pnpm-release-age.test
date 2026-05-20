@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for pnpm minimumReleaseAge grandfather + prune scripts.
+# Tests for scripts/grandfather-pnpm-release-age (cutover wildcard only).
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,8 +9,7 @@ readonly rh_root
 
 lib="${rh_root}/scripts/lib/pnpm-release-age"
 grandfather="${rh_root}/scripts/grandfather-pnpm-release-age"
-prune="${rh_root}/scripts/prune-pnpm-release-age-grandfather"
-readonly lib grandfather prune
+readonly lib grandfather
 
 pass=0
 fail=0
@@ -18,76 +17,69 @@ fail=0
 # shellcheck disable=SC1090,SC1091
 source "$lib"
 
-printf '\n=== static: scripts and library exist ===\n'
-for f in "$lib" "$grandfather" "$prune"; do
-  if [[ -f "$f" ]]; then
-    printf '[PASS] found %s\n' "$f"
-    pass=$(( pass + 1 ))
-  else
-    printf '[FAIL] missing %s\n' "$f"
-    fail=$(( fail + 1 ))
-  fi
-done
-
-printf '\n=== static: prune script sources library ===\n'
-# shellcheck disable=SC2016  # intentional literal grep for source line in script
-if grep -qF 'source "${script_dir}/lib/pnpm-release-age"' "$prune" \
-  && grep -qF 'pnpm_release_age_entry_is_aged_out' "$prune"; then
-  printf '[PASS] prune-pnpm-release-age-grandfather uses shared library helpers\n'
+printf '\n=== static: scripts exist; prune removed ===\n'
+if [[ -f "$lib" && -f "$grandfather" ]]; then
+  printf '[PASS] grandfather script and library are present\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] prune script must source pnpm-release-age library\n'
+  printf '[FAIL] missing grandfather script or library\n'
+  fail=$(( fail + 1 ))
+fi
+if [[ ! -f "${rh_root}/scripts/prune-pnpm-release-age-grandfather" ]]; then
+  printf '[PASS] prune-pnpm-release-age-grandfather was removed\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] prune script should be removed for cutover-only policy\n'
+  fail=$(( fail + 1 ))
+fi
+if ! grep -qE -- '--tracked|--wildcard|grandfather\.tsv' "$grandfather"; then
+  printf '[PASS] grandfather script has no TSV or tracked-mode options\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] grandfather script should not reference TSV or --tracked\n'
   fail=$(( fail + 1 ))
 fi
 
-printf '\n=== static: grandfather documents tracked and wildcard modes ===\n'
-if grep -qE -- '--wildcard' "$grandfather" && grep -qE -- '--tracked' "$grandfather"; then
-  printf '[PASS] grandfather-pnpm-release-age supports --wildcard and --tracked\n'
-  pass=$(( pass + 1 ))
-else
-  printf '[FAIL] grandfather script must document both modes\n'
-  fail=$(( fail + 1 ))
-fi
-
-printf '\n=== functional: aged-out entry is removed from grandfather tsv ===\n'
+printf '\n=== functional: writes wildcard workspace yaml ===\n'
 tmp_repo="$(mktemp -d)"
 printf 'lockfileVersion: 9.0\n\npackages:\n\nsnapshots:\n' >"${tmp_repo}/pnpm-lock.yaml"
-printf '  foo@1.0.0:\n    resolution: {integrity: x}\n' >>"${tmp_repo}/pnpm-lock.yaml"
-tsv_path="$(pnpm_release_age_grandfather_path "$tmp_repo")"
-# Epoch 1 is far older than any minimumReleaseAge window.
-pnpm_release_age_write_grandfather_file "$tsv_path" 14400 tracked "foo@1.0.0	1"
-pnpm_release_age_sync_workspace "$tmp_repo" 14400 tracked "foo@1.0.0"
-PNPM_RELEASE_AGE_SKIP_REGISTRY=1 bash "$prune" "$tmp_repo" >/dev/null
-if grep -qE '^foo@1\.0\.0' "$tsv_path" 2>/dev/null; then
-  printf '[FAIL] prune should remove entry with epoch 1 (aged out)\n'
-  fail=$(( fail + 1 ))
-else
-  printf '[PASS] prune removes matured pkg@version from grandfather tsv\n'
+printf '  sample@1.0.0:\n    resolution: {integrity: x}\n' >>"${tmp_repo}/pnpm-lock.yaml"
+bash "$grandfather" "$tmp_repo" >/dev/null
+if grep -q 'minimumReleaseAge: 14400' "${tmp_repo}/pnpm-workspace.yaml" \
+  && grep -qF '  - "*"' "${tmp_repo}/pnpm-workspace.yaml"; then
+  printf '[PASS] grandfather writes minimumReleaseAge and wildcard exclude\n'
   pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected minimumReleaseAge 14400 and exclude "*"\n'
+  fail=$(( fail + 1 ))
 fi
-if grep -q 'minimumReleaseAgeExclude:' "${tmp_repo}/pnpm-workspace.yaml" 2>/dev/null; then
-  printf '[FAIL] workspace should omit exclude block when all entries aged out\n'
-  fail=$(( fail + 1 ))
-else
-  printf '[PASS] prune drops minimumReleaseAgeExclude when no entries remain\n'
+if [[ ! -f "${tmp_repo}/pnpm-release-age-grandfather.tsv" ]]; then
+  printf '[PASS] grandfather does not create a TSV registry file\n'
   pass=$(( pass + 1 ))
+else
+  printf '[FAIL] grandfather must not write pnpm-release-age-grandfather.tsv\n'
+  fail=$(( fail + 1 ))
 fi
 rm -rf "$tmp_repo"
 
-printf '\n=== functional: immature entry is kept ===\n'
+printf '\n=== functional: preserves allowBuilds block ===\n'
 tmp_repo="$(mktemp -d)"
-now_epoch="$(time_log_now_utc_epoch)"
 printf 'lockfileVersion: 9.0\n\npackages:\n\nsnapshots:\n' >"${tmp_repo}/pnpm-lock.yaml"
-printf '  bar@2.0.0:\n    resolution: {integrity: x}\n' >>"${tmp_repo}/pnpm-lock.yaml"
-tsv_path="$(pnpm_release_age_grandfather_path "$tmp_repo")"
-pnpm_release_age_write_grandfather_file "$tsv_path" 14400 tracked "bar@2.0.0	${now_epoch}"
-pnpm_release_age_sync_workspace "$tmp_repo" 14400 tracked "bar@2.0.0"
-PNPM_RELEASE_AGE_SKIP_REGISTRY=1 bash "$prune" "$tmp_repo" >/dev/null
-if grep -qE '^bar@2\.0\.0' "$tsv_path"; then
-  printf '[PASS] prune keeps entry younger than minimumReleaseAge\n'
+printf '  x@1.0.0:\n    resolution: {integrity: x}\n' >>"${tmp_repo}/pnpm-lock.yaml"
+{
+  printf '%s\n' 'packages:'
+  printf '%s\n' "  - '.'"
+  printf '%s\n' 'allowBuilds:'
+  printf '%s\n' '  esbuild: true'
+} >"${tmp_repo}/pnpm-workspace.yaml"
+bash "$grandfather" "$tmp_repo" >/dev/null
+if grep -q '^allowBuilds:' "${tmp_repo}/pnpm-workspace.yaml" \
+  && grep -q 'esbuild: true' "${tmp_repo}/pnpm-workspace.yaml" \
+  && grep -qF '  - "*"' "${tmp_repo}/pnpm-workspace.yaml"; then
+  printf '[PASS] grandfather preserves allowBuilds and writes wildcard exclude\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] prune should keep recently published entry\n'
+  printf '[FAIL] allowBuilds block missing or duplicate excludes in workspace yaml\n'
   fail=$(( fail + 1 ))
 fi
 rm -rf "$tmp_repo"
