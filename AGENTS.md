@@ -169,12 +169,10 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 - Keep each branch in the stack focused on exactly one logical change. Stacks should map 1-to-1 with milestones or sub-tasks from [dep-updater.plan.md](./dep-updater.plan.md).
 - Sync regularly: `gt sync` before starting new work; `gt restack` after upstream changes land.
 - Submit stacks with `gt submit` — do not open PRs manually via the GitHub UI.
-- Before opening/submitting a PR, run local checks (for the relevant files) and ensure they pass:
-  - `bash -n scripts/* tests/*`
-  - `shellcheck -S info scripts/* tests/*`
-  - `bash tests/<script-name>.test` (and any other relevant suite)
+- **Before opening/submitting a PR**, run **`scripts/dev/pre-pr-checks`** from your feature worktree (or use **`scripts/dev/submit-stack`**, which runs checks then `gt submit --publish --no-interactive`). Do not run bare `gt submit` without passing pre-pr-checks first.
+- `pre-pr-checks` mirrors CI: `bash -n`, `shellcheck -S info` (all `scripts/*`, `scripts/dev/*`, `scripts/lib/*`, `tests/*`, `tests/lib/*`), and **every** `tests/*.test` must pass. It also verifies the **primary worktree** is unchanged when checks finish (auto-stash/restore any pre-existing local changes on main).
 - Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).
-- PRs must be **published (not draft)** so reviewers see them normally. If using non-interactive submit, pass `gt submit --publish` (and avoid `--draft`).
+- PRs must be **published (not draft)** so reviewers see them normally. Prefer `scripts/dev/submit-stack` for non-interactive submit (implies `--publish`).
 - To merge a PR, add the `merge-it` label: `gh pr edit <number> --add-label merge-it`. Never use `gh pr merge` directly.
 - Follow **Conventional Commits**: `feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`.
 - Each commit must pass all CI checks (see below) before being pushed.
@@ -224,10 +222,14 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 
 ## CI Checks (all must pass)
 
+Run locally via **`scripts/dev/pre-pr-checks`** before every PR (same commands as CI):
+
 ```
-bash -n scripts/* tests/*            # syntax check (add new files here)
-shellcheck -S info scripts/* tests/* # lint (add new files here)
-bash tests/<script-name>.test        # run individual test suite
+scripts/dev/pre-pr-checks            # preferred: all checks + main worktree guard
+# or manually:
+bash -n scripts/* scripts/dev/* scripts/lib/* tests/* tests/lib/*
+shellcheck -S info scripts/* scripts/dev/* scripts/lib/* tests/* tests/lib/*
+bash tests/*.test                    # every test harness
 ```
 
 No PR may be merged with a failing CI check. No exceptions.
