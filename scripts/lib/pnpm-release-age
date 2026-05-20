@@ -1,0 +1,266 @@
+# shellcheck shell=bash
+# Shared helpers for pnpm minimumReleaseAge grandfathering and aging-out.
+#
+# Grandfather registry: <repo>/pnpm-release-age-grandfather.tsv
+#   Header comments (# format-version, # minimumReleaseAge, # mode: wildcard|tracked)
+#   Tracked data lines:  pkg@version<TAB>published_epoch
+#
+# Source from repository-helpers scripts; requires bash 5+, curl, jq, pnpm (for registry URL).
+
+pnpm_release_age_default_minutes=14400
+pnpm_release_age_grandfather_basename="pnpm-release-age-grandfather.tsv"
+
+pnpm_release_age_grandfather_path() {
+  local -r repo_root="$1"
+  printf '%s/%s' "$repo_root" "$pnpm_release_age_grandfather_basename"
+}
+
+# pnpm_release_age_parse_iso8601_to_epoch <iso8601>
+pnpm_release_age_parse_iso8601_to_epoch() {
+  local -r iso="$1"
+  local trimmed epoch
+
+  [[ -z "$iso" ]] && return 1
+  trimmed="${iso}"
+  trimmed="${trimmed%Z}"
+  trimmed="${trimmed%%.*}"
+  if epoch="$(date --utc -d "${trimmed}Z" +%s 2>/dev/null)"; then
+    printf '%s' "$epoch"
+    return 0
+  fi
+  if epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%S' "${trimmed}" +%s 2>/dev/null)"; then
+    printf '%s' "$epoch"
+    return 0
+  fi
+  return 1
+}
+
+# pnpm_release_age_registry_epoch <pkg> <version>
+# Prints publish-time epoch from the npm registry, or empty when unknown.
+pnpm_release_age_registry_epoch() {
+  local -r pkg="$1"
+  local -r version="$2"
+  local registry encoded_pkg body published_iso published_epoch
+
+  if [[ "${PNPM_RELEASE_AGE_SKIP_REGISTRY:-0}" == '1' ]]; then
+    return 1
+  fi
+
+  registry="$(pnpm config get registry 2>/dev/null | tr -d '[:space:]' || echo 'https://registry.npmjs.org/')"
+  [[ "$registry" != */ ]] && registry="${registry}/"
+  encoded_pkg="${pkg//@/%40}"
+  encoded_pkg="${encoded_pkg//\//%2F}"
+  body="$(curl --silent --max-time 15 "${registry}${encoded_pkg}" 2>/dev/null || true)"
+  published_iso="$(printf '%s' "$body" | jq -r --arg v "$version" '.time[$v] // empty' 2>/dev/null || true)"
+  if [[ -z "$published_iso" || "$published_iso" == 'null' ]]; then
+    return 1
+  fi
+  published_epoch="$(pnpm_release_age_parse_iso8601_to_epoch "$published_iso" 2>/dev/null || true)"
+  if [[ -z "$published_epoch" ]]; then
+    return 1
+  fi
+  printf '%s' "$published_epoch"
+  return 0
+}
+
+# pnpm_release_age_spec_split <pkg@version>
+# Prints "pkg<TAB>version", or returns 1 when spec is invalid.
+pnpm_release_age_spec_split() {
+  local -r spec="$1"
+  local pkg version
+
+  pkg="${spec%@*}"
+  version="${spec##*@}"
+  if [[ -z "$pkg" || -z "$version" || "$pkg" == "$spec" ]]; then
+    return 1
+  fi
+  printf '%s\t%s\n' "$pkg" "$version"
+  return 0
+}
+
+# pnpm_release_age_lockfile_specs <lockfile_path>
+# Prints one normalized pkg@version per line from packages/snapshots sections.
+pnpm_release_age_lockfile_specs() {
+  local -r lockfile="$1"
+  awk '
+    /^packages:$/ { inpkg=1; insnap=0; next }
+    /^snapshots:$/ { insnap=1; inpkg=0; next }
+    (inpkg || insnap) && /^  / {
+      line=$0
+      sub(/^  /, "", line)
+      sub(/:$/, "", line)
+      gsub(/^'\''|'\''$/, "", line)
+      sub(/\([^)]*\)$/, "", line)
+      if (line ~ /@[0-9]+(\.[0-9A-Za-z-]+)*$/) print line
+    }
+  ' "$lockfile" | sort -u
+}
+
+# pnpm_release_age_read_grandfather_header <tsv_path>
+# Prints "minutes<TAB>mode" (defaults when header fields are missing).
+pnpm_release_age_read_grandfather_header() {
+  local -r tsv="$1"
+  local line minutes mode
+
+  minutes="$pnpm_release_age_default_minutes"
+  mode="tracked"
+
+  if [[ -f "$tsv" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" != \#* ]] && break
+      line="${line#\# }"
+      line="${line#\#}"
+      if [[ "$line" =~ ^minimumReleaseAge:[[:space:]]*([0-9]+) ]]; then
+        minutes="${BASH_REMATCH[1]}"
+      elif [[ "$line" =~ ^mode:[[:space:]]*(wildcard|tracked) ]]; then
+        mode="${BASH_REMATCH[1]}"
+      fi
+    done <"$tsv"
+  fi
+  printf '%s\t%s\n' "$minutes" "$mode"
+}
+
+# pnpm_release_age_read_grandfather_entries <tsv_path>
+# Prints spec<TAB>epoch for tracked data lines (skips comments and blank lines).
+pnpm_release_age_read_grandfather_entries() {
+  local -r tsv="$1"
+  local line spec epoch
+
+  [[ -f "$tsv" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    spec="${line%%$'\t'*}"
+    epoch="${line#*$'\t'}"
+    if [[ "$epoch" == "$line" ]]; then
+      epoch=""
+    fi
+    printf '%s\t%s\n' "$spec" "$epoch"
+  done <"$tsv"
+}
+
+# pnpm_release_age_write_grandfather_file <tsv_path> <minutes> <mode> [entry_lines...]
+# entry_lines are spec<TAB>epoch (epoch may be empty).
+pnpm_release_age_write_grandfather_file() {
+  local -r tsv="$1"
+  local -r minutes="$2"
+  local -r mode="$3"
+  shift 3
+  local tmp line ts_generated
+
+  ts_generated="$(date --utc +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' '# pnpm-release-age-grandfather — managed by repository-helpers scripts.'
+    printf '%s\n' '# format-version: 1'
+    printf '%s\n' "# minimumReleaseAge: ${minutes}"
+    printf '%s\n' "# mode: ${mode}"
+    printf '%s\n' "# generated: ${ts_generated}"
+    printf '%s\n' '# Prune aged entries: scripts/prune-pnpm-release-age-grandfather'
+    if [[ "$mode" == 'wildcard' ]]; then
+      printf '%s\n' '# Wildcard excludes all packages until you run prune --expand-wildcard.'
+    fi
+    for line in "$@"; do
+      [[ -n "$line" ]] && printf '%s\n' "$line"
+    done
+  } >"$tmp"
+  mv "$tmp" "$tsv"
+}
+
+# pnpm_release_age_workspace_allow_builds_block <workspace_path>
+# Prints allowBuilds: stanza (if any) including trailing newline.
+pnpm_release_age_workspace_allow_builds_block() {
+  local -r workspace="$1"
+  if [[ -f "$workspace" ]] && grep -q '^allowBuilds:' "$workspace"; then
+    awk '/^allowBuilds:/{found=1} found{print} found && /^[^[:space:]]/ && !/^allowBuilds:/{exit}' \
+      "$workspace"
+    printf '\n'
+  fi
+}
+
+# pnpm_release_age_sync_workspace <repo_root> <minutes> <mode> [exclude_specs...]
+# mode: wildcard — writes minimumReleaseAgeExclude: ["*"]
+# mode: tracked — writes per-spec excludes; omits exclude block when no specs given.
+pnpm_release_age_sync_workspace() {
+  local -r repo_root="$1"
+  local -r minutes="$2"
+  local -r mode="$3"
+  shift 3
+  local -a exclude_specs=("$@")
+  local workspace tmp allow_block lockfile_entries spec
+
+  workspace="${repo_root}/pnpm-workspace.yaml"
+  lockfile="${repo_root}/pnpm-lock.yaml"
+  lockfile_entries=0
+  if [[ -f "$lockfile" ]]; then
+    lockfile_entries="$(pnpm_release_age_lockfile_specs "$lockfile" | wc -l | tr -d ' ')"
+  fi
+
+  allow_block="$(pnpm_release_age_workspace_allow_builds_block "$workspace")"
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' '# Supply-chain: 10-day minimum release age for new resolutions.'
+    if [[ "$mode" == 'wildcard' ]]; then
+      printf '%s\n' '# Grandfather: "*" skips age checks until tracked excludes are built.'
+    else
+      printf '%s\n' '# Grandfather: per-package excludes in pnpm-release-age-grandfather.tsv.'
+    fi
+    printf '%s\n' "# Lockfile had ${lockfile_entries} pinned package@version entries when last synced."
+    printf '%s\n' '# Regenerate: scripts/grandfather-pnpm-release-age'
+    printf '%s\n' '# Age out excludes: scripts/prune-pnpm-release-age-grandfather'
+    printf '%s\n' '# Dependabot cooldown + dep-updater enforce 10 days on new non-CVE bumps.'
+    printf '\n'
+    printf '%s\n' 'packages:'
+    printf '%s\n' "  - '.'"
+    printf '\n'
+    printf 'minimumReleaseAge: %s\n' "$minutes"
+    printf '%s\n' 'minimumReleaseAgeStrict: false'
+    if [[ -n "$allow_block" ]]; then
+      printf '%s' "$allow_block"
+    fi
+    if [[ "$mode" == 'wildcard' ]]; then
+      printf '%s\n' 'minimumReleaseAgeExclude:'
+      printf '%s\n' '  - "*"'
+    elif [[ ${#exclude_specs[@]} -gt 0 ]]; then
+      printf '%s\n' 'minimumReleaseAgeExclude:'
+      for spec in "${exclude_specs[@]}"; do
+        [[ -z "$spec" ]] && continue
+        printf '  - %s\n' "$spec"
+      done
+    fi
+  } >"$tmp"
+  mv "$tmp" "$workspace"
+}
+
+# pnpm_release_age_build_tracked_entries_from_lockfile <lockfile_path>
+# Prints spec<TAB>epoch lines (fetches registry when epoch unknown).
+pnpm_release_age_build_tracked_entries_from_lockfile() {
+  local -r lockfile="$1"
+  local spec pkg version epoch
+
+  while IFS= read -r spec; do
+    [[ -z "$spec" ]] && continue
+    if ! IFS=$'\t' read -r pkg version < <(pnpm_release_age_spec_split "$spec"); then
+      printf 'WARN: skipping invalid lockfile spec: %s\n' "$spec" >&2
+      continue
+    fi
+    epoch="$(pnpm_release_age_registry_epoch "$pkg" "$version" 2>/dev/null || true)"
+    printf '%s\t%s\n' "$spec" "$epoch"
+  done < <(pnpm_release_age_lockfile_specs "$lockfile")
+}
+
+# pnpm_release_age_entry_is_aged_out <published_epoch> <minutes>
+# Returns 0 when the version is old enough that it no longer needs an exclude.
+pnpm_release_age_entry_is_aged_out() {
+  local -r published_epoch="$1"
+  local -r minutes="$2"
+  local now_epoch age_minutes
+
+  [[ -z "$published_epoch" ]] && return 1
+  now_epoch="$(date --utc +%s 2>/dev/null || date -u +%s)"
+  age_minutes=$(( (now_epoch - published_epoch) / 60 ))
+  if (( age_minutes >= minutes )); then
+    return 0
+  fi
+  return 1
+}
