@@ -1,26 +1,31 @@
 #!/usr/bin/env bash
-# Populate minimumReleaseAgeExclude from the current pnpm-lock.yaml so existing
-# pins are grandfathered when enabling minimumReleaseAge. Also adds registry
-# "latest" for direct package.json dependencies so pnpm 11.1.3+ lockfile
-# verification does not flag semver-allowed versions that are not yet locked.
+# Populate pnpm-workspace.yaml for a 10-day minimumReleaseAge policy while
+# grandfathering the current lockfile via pnpm-release-age-grandfather.tsv.
+#
+# Default (--wildcard): minimumReleaseAgeExclude: ["*"] for pnpm 11.1.3+ CI.
+# --tracked: per pkg@version excludes with publish epochs (age out via prune).
 set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/pnpm-release-age
+source "${script_dir}/lib/pnpm-release-age"
 
 usage() {
   cat <<'EOF'
 Usage: scripts/grandfather-pnpm-release-age [OPTIONS] [repo_root]
 
-Writes or updates pnpm-workspace.yaml with:
-  minimumReleaseAge (default 14400 = 10 days)
-  minimumReleaseAgeStrict: false
-  minimumReleaseAgeExclude: lockfile packages/snapshots + registry latest for direct deps
+Writes pnpm-workspace.yaml and pnpm-release-age-grandfather.tsv.
 
 Options:
+  --wildcard      Grandfather with minimumReleaseAgeExclude: ["*"] (default)
+  --tracked       Grandfather each lockfile pkg@version (enables aging out)
   --minutes <n>   minimumReleaseAge in minutes (default: 14400)
   -h, --help      Show this help
 EOF
 }
 
-minutes=14400
+minutes="$pnpm_release_age_default_minutes"
+mode="wildcard"
 repo_root="."
 
 while [[ $# -gt 0 ]]; do
@@ -28,6 +33,14 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       usage
       exit 0
+      ;;
+    --wildcard)
+      mode="wildcard"
+      shift
+      ;;
+    --tracked)
+      mode="tracked"
+      shift
       ;;
     --minutes)
       minutes="${2:?--minutes requires a value}"
@@ -56,76 +69,37 @@ fi
 
 repo_root="$(cd "$repo_root" && pwd)"
 lockfile="${repo_root}/pnpm-lock.yaml"
-workspace="${repo_root}/pnpm-workspace.yaml"
-pkg_json="${repo_root}/package.json"
+tsv="$(pnpm_release_age_grandfather_path "$repo_root")"
 
 if [[ ! -f "$lockfile" ]]; then
   printf 'ERROR: no pnpm-lock.yaml under %s\n' "$repo_root" >&2
   exit 1
 fi
 
-declare -a excludes=()
+entry_lines=()
+exclude_specs=()
 
-while IFS= read -r line; do
-  excludes+=("$line")
-done < <(
-  awk '
-    /^packages:$/ { inpkg=1; insnap=0; next }
-    /^snapshots:$/ { insnap=1; inpkg=0; next }
-    (inpkg || insnap) && /^  / {
-      line=$0
-      sub(/^  /, "", line)
-      sub(/:$/, "", line)
-      gsub(/^'\''|'\''$/, "", line)
-      sub(/\([^)]*\)$/, "", line)
-      if (line ~ /@[0-9]+(\.[0-9A-Za-z-]+)*$/) print line
-    }
-  ' "$lockfile"
-)
-
-if [[ ${#excludes[@]} -eq 0 ]]; then
-  printf 'ERROR: found no package@version entries in %s\n' "$lockfile" >&2
-  exit 1
-fi
-
-if [[ -f "$pkg_json" ]] && command -v jq >/dev/null 2>&1; then
-  pkg=""
-  latest=""
-  while IFS= read -r pkg; do
-    [[ -z "$pkg" ]] && continue
-    latest=""
-    latest="$(cd "$repo_root" && pnpm view "$pkg" version 2>/dev/null || true)"
-    if [[ -n "$latest" ]]; then
-      excludes+=("${pkg}@${latest}")
-    fi
-  done < <(jq -r '
-    [.dependencies, .devDependencies, .optionalDependencies, .peerDependencies]
-    | map(select(. != null)) | add // {}
-    | keys[]
-  ' "$pkg_json" 2>/dev/null || true)
-fi
-
-mapfile -t excludes < <(printf '%s\n' "${excludes[@]}" | LC_ALL=C sort -u)
-
-tmp="$(mktemp)"
-{
-  printf '%s\n' '# Supply-chain: 10-day minimum release age for new resolutions.'
-  printf '%s\n' '# Existing lockfile pins are grandfathered via minimumReleaseAgeExclude below.'
-  printf '%s\n' "# Regenerate after major lockfile refreshes: scripts/grandfather-pnpm-release-age"
-  printf '\n'
-  printf 'minimumReleaseAge: %s\n' "$minutes"
-  printf '%s\n' 'minimumReleaseAgeStrict: false'
-  if [[ -f "$workspace" ]] && grep -q '^allowBuilds:' "$workspace"; then
-    awk '/^allowBuilds:/{found=1} found{print} found && /^[^[:space:]]/ && !/^allowBuilds:/{exit}' \
-      "$workspace"
-    printf '\n'
+if [[ "$mode" == 'tracked' ]]; then
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    entry_lines+=("$line")
+    exclude_specs+=("${line%%$'\t'*}")
+  done < <(pnpm_release_age_build_tracked_entries_from_lockfile "$lockfile")
+  if [[ ${#exclude_specs[@]} -eq 0 ]]; then
+    printf 'ERROR: no pkg@version entries found in %s\n' "$lockfile" >&2
+    exit 1
   fi
-  printf '%s\n' 'minimumReleaseAgeExclude:'
-  for item in "${excludes[@]}"; do
-    printf '  - "%s"\n' "$item"
-  done
-} >"$tmp"
+fi
 
-mv "$tmp" "$workspace"
-printf 'Wrote %s (%d grandfathered entries, minimumReleaseAge=%s).\n' \
-  "$workspace" "${#excludes[@]}" "$minutes"
+pnpm_release_age_write_grandfather_file "$tsv" "$minutes" "$mode" "${entry_lines[@]}"
+pnpm_release_age_sync_workspace "$repo_root" "$minutes" "$mode" "${exclude_specs[@]}"
+
+if [[ "$mode" == 'wildcard' ]]; then
+  printf 'Wrote %s and pnpm-workspace.yaml (wildcard "*", minimumReleaseAge=%s).\n' \
+    "$tsv" "$minutes"
+  printf 'To age out entries later: scripts/prune-pnpm-release-age-grandfather --expand-wildcard\n'
+else
+  printf 'Wrote %s (%s tracked entries) and pnpm-workspace.yaml (minimumReleaseAge=%s).\n' \
+    "$tsv" "${#exclude_specs[@]}" "$minutes"
+  printf 'Age out matured excludes: scripts/prune-pnpm-release-age-grandfather\n'
+fi

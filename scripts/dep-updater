@@ -112,6 +112,9 @@ pnpm_ignored_build_pkgs=""
 _merge_it_poll_pr=""
 _merge_it_poll_had_label=""
 
+# Populated before npm_outdated (format: pkg current fix cve1,cve2,...).
+npm_cve_fix_audit_lines=""
+
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
@@ -872,9 +875,28 @@ npm_registry_version_published_epoch() {
   return 0
 }
 
+# npm_pkg_has_cve_fix_in_audit <pkg>
+# True when npm audit reported CVEs with an available fix for this package.
+npm_pkg_has_cve_fix_in_audit() {
+  local -r pkg="$1"
+  local ap _ac _af cves
+
+  [[ -z "$npm_cve_fix_audit_lines" ]] && return 1
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    read -r ap _ac _af cves <<< "$line"
+    [[ -z "$ap" ]] && continue
+    if [[ "${ap,,}" == "${pkg,,}" && -n "$cves" ]]; then
+      return 0
+    fi
+  done <<< "$npm_cve_fix_audit_lines"
+  return 1
+}
+
 # npm_version_meets_minimum_release_age <pkg> <version> [scan_root]
 # Returns 0 when the version is old enough to install under minimumReleaseAge policy.
 # When publish time is unknown, allow (matches pnpm minimumReleaseAgeIgnoreMissingTime).
+# CVE-marked packages (npm audit with fix + CVE ids) bypass the age gate in dep-updater.
 npm_version_meets_minimum_release_age() {
   local -r pkg="$1"
   local -r version="$2"
@@ -882,6 +904,10 @@ npm_version_meets_minimum_release_age() {
   local min_minutes published_epoch now_epoch age_minutes
 
   if [[ "${DEP_UPDATER_SKIP_NPM_REGISTRY:-0}" == '1' ]]; then
+    return 0
+  fi
+
+  if npm_pkg_has_cve_fix_in_audit "$pkg"; then
     return 0
   fi
 
@@ -5659,6 +5685,7 @@ if [[ "$dry_run" == '1' ]]; then
   if [[ -n "$py_tool" ]]; then
     py_audit_lines="$(py_audit "$py_tool" "$audit_dir")"
   fi
+  npm_cve_fix_audit_lines="$npm_audit_lines"
 
   if [[ -n "$npm_audit_lines" ]]; then
     printf '\n[npm] CVEs with available fixes:\n'
@@ -5896,6 +5923,32 @@ log "Working in: $worktree_path"
 # Scan only from a tree aligned with origin/main (never the primary clone).
 sync_worktree_to_origin_main_for_scan "$existing_branches"
 
+# Audit before outdated so CVE-marked packages bypass the minimum release age gate.
+local npm_audit_lines="" py_audit_lines=""
+if [[ "$has_npm" == '1' ]]; then
+  log "Running npm security audit…"
+  npm_audit_lines="$(npm_audit "$(npm_project_root "$worktree_path")")"
+  npm_cve_fix_audit_lines="$npm_audit_lines"
+  if [[ -n "$npm_audit_lines" ]]; then
+    local vuln_count
+    vuln_count="$(printf '%s\n' "$npm_audit_lines" | grep -c .)"
+    log "Found ${vuln_count} npm package(s) with CVEs that have fixes available."
+  else
+    log "No npm CVEs with direct fixes found."
+  fi
+fi
+if [[ -n "$py_tool" ]]; then
+  log "Running Python security audit…"
+  py_audit_lines="$(py_audit "$py_tool" "$worktree_path")"
+  if [[ -n "$py_audit_lines" ]]; then
+    local py_vuln_count
+    py_vuln_count="$(printf '%s\n' "$py_audit_lines" | grep -c .)"
+    log "Found ${py_vuln_count} Python package(s) with CVEs that have fixes available."
+  else
+    log "No Python CVEs with direct fixes found."
+  fi
+fi
+
 local npm_lines="" py_lines="" gha_lines=""
 if [[ "$has_npm" == '1' ]]; then
   npm_lines="$(npm_outdated "$(npm_project_root "$worktree_path")")"
@@ -5936,35 +5989,12 @@ require_resume_ci_gate "$existing_branches" "$existing_prs"
 ensure_dep_updater_label
 
 # ── Security PRs go first (bottom of the stack) ───────────────────────────
-# Run audits now, before any regular updates, so CVE fixes are baseline PRs.
-local npm_audit_lines="" py_audit_lines=""
-if [[ "$has_npm" == '1' ]]; then
-  log "Running npm security audit…"
-  npm_audit_lines="$(npm_audit "$(npm_project_root "$worktree_path")")"
-  if [[ -n "$npm_audit_lines" ]]; then
-    local vuln_count
-    vuln_count="$(printf '%s\n' "$npm_audit_lines" | grep -c .)"
-    log "Found ${vuln_count} npm package(s) with CVEs that have fixes available."
-    if [[ "$batch" == '0' ]]; then
-      npm_security_update "$npm_audit_lines"
-    fi
-  else
-    log "No npm CVEs with direct fixes found."
-  fi
+# Audits already ran above (before outdated) for CVE release-age bypass.
+if [[ "$has_npm" == '1' && -n "$npm_audit_lines" && "$batch" == '0' ]]; then
+  npm_security_update "$npm_audit_lines"
 fi
-if [[ -n "$py_tool" ]]; then
-  log "Running Python security audit…"
-  py_audit_lines="$(py_audit "$py_tool" "$worktree_path")"
-  if [[ -n "$py_audit_lines" ]]; then
-    local py_vuln_count
-    py_vuln_count="$(printf '%s\n' "$py_audit_lines" | grep -c .)"
-    log "Found ${py_vuln_count} Python package(s) with CVEs that have fixes available."
-    if [[ "$batch" == '0' ]]; then
-      py_security_update "$py_audit_lines" "$py_tool"
-    fi
-  else
-    log "No Python CVEs with direct fixes found."
-  fi
+if [[ -n "$py_tool" && -n "$py_audit_lines" && "$batch" == '0' ]]; then
+  py_security_update "$py_audit_lines" "$py_tool"
 fi
 
 # ── Regular updates follow (stacked on top of security PRs) ──────────────
