@@ -103,6 +103,10 @@ repo_name=""
 
 pnpm_ignored_build_pkgs=""
 
+# Last merge-it observation from poll_until_merged (used to explain re-applies).
+_merge_it_poll_pr=""
+_merge_it_poll_had_label=""
+
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
@@ -442,6 +446,18 @@ add_merge_it_label() {
       --method POST \
       -f labels[]=merge-mq >/dev/null 2>/dev/null || true
   fi
+}
+
+# Prints exactly one of: true, false, unknown (never guess on API failure).
+pr_has_merge_it_label() {
+  local -r pr_number="$1"
+  local raw
+  raw="$(gh api "repos/${repo_owner}/${repo_name}/issues/${pr_number}" \
+    --jq 'any(.labels[]?; .name == "merge-it")' 2>/dev/null || true)"
+  case "$raw" in
+    true|false) printf '%s' "$raw" ;;
+    *) printf 'unknown' ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -4641,14 +4657,22 @@ maybe_label_top_pr_for_merge() {
   esac
 
   local has_label
-  has_label="$(gh api "repos/${repo_owner}/${repo_name}/issues/${top_pr}" --jq 'any(.labels[]?; .name == "merge-it")' 2>/dev/null || echo 'false')"
+  has_label="$(pr_has_merge_it_label "$top_pr")"
   if [[ "$has_label" == 'true' ]]; then
     return 0
   fi
+  if [[ "$has_label" == 'unknown' ]]; then
+    log "Could not verify merge-it label on top PR #${top_pr}; skipping apply this cycle."
+    return 0
+  fi
 
-  # Always add the merge-it label automatically when CI is clean
+  # has_label is definitively false — safe to apply.
   add_merge_it_label "$top_pr"
-  log "Added merge-it label to top PR #${top_pr}."
+  if [[ "$_merge_it_poll_pr" == "$top_pr" && "$_merge_it_poll_had_label" == 'true' ]]; then
+    log "Re-applying merge-it label to top PR #${top_pr} (label was present last poll, now absent)."
+  else
+    log "Added merge-it label to top PR #${top_pr}."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -4843,6 +4867,9 @@ poll_until_merged() {
   log "Waiting for all PRs to merge (timeout: ${timeout_min} min)…"
   log "PRs: $(csv_pretty "$prs_csv")"
 
+  _merge_it_poll_pr=""
+  _merge_it_poll_had_label=""
+
   local all_merged p merged pending_list check_rollup failed_check
   local branches_csv top_branch top_pr top_has_label top_ci_status top_head wait_context
   while true; do
@@ -4913,7 +4940,7 @@ poll_until_merged() {
     if [[ -n "$top_branch" ]]; then
       top_pr="$(gh_pr_number_for_branch "$top_branch" 2>/dev/null || true)"
       if [[ -n "$top_pr" ]] && is_valid_pr_number "$top_pr"; then
-        top_has_label="$(gh api "repos/${repo_owner}/${repo_name}/issues/${top_pr}" --jq 'any(.labels[]?; .name == "merge-it")' 2>/dev/null || echo 'unknown')"
+        top_has_label="$(pr_has_merge_it_label "$top_pr")"
         top_ci_status="unknown"
         if git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${top_branch}"; then
           top_head="$(git -C "$worktree_path" rev-parse "$top_branch" 2>/dev/null || true)"
@@ -4922,6 +4949,8 @@ poll_until_merged() {
           fi
         fi
         wait_context="(top=#${top_pr} merge-it=${top_has_label} ci=${top_ci_status})"
+        _merge_it_poll_pr="$top_pr"
+        _merge_it_poll_had_label="$top_has_label"
       fi
     fi
     log "Still waiting for merge: ${pending_list} ${wait_context} ${wait_suffix}"
