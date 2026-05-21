@@ -6,6 +6,9 @@
 
 rp_DEFAULT_ORG='the-hcma'
 rp_GRAPHITE_APP_ACTOR_ID=158384
+rp_GRAPHITE_APP_SLUG='graphite-app'
+rp_DEPENDABOT_APP_SLUG='dependabot'
+rp_ORG_OWNER_BYPASS_USER='thehcma'
 rp_THIS_REPO_NAME='repository-helpers'
 
 rp_org="$rp_DEFAULT_ORG"
@@ -24,13 +27,17 @@ Usage:
   scripts/${prog} --new-repo --repo OWNER/NAME
   scripts/${prog} --all [--org ORG]
   scripts/${prog} --suggest [--repo OWNER/NAME ...]
-  scripts/${prog} --apply [--repo ...]          # repo squash settings + protect-main ruleset
+  scripts/${prog} --apply [--repo ...]          # squash settings, protect-main, classic main BP
 
 Audits GitHub conventions for org repositories:
 
   protect-main ruleset (when merge-it or release-please.yml exists):
     - squash-only allowed_merge_methods on main
     - Graphite App bypass (Integration actor_id 158384)
+
+  Classic branch protection on main (same repos; template: my-tracks):
+    - CODEOWNERS reviews, dismiss stale, Graphite + Dependabot bypass, owner bypass
+    - push restricted to Graphite App; required CI contexts from ci.yml; strict checks
 
   Branch hygiene (strict repos):
     - cleanup-branch-on-merge.yml (delete head branch when PR merges)
@@ -256,6 +263,231 @@ rp_expected_enqueue_labels() {
   fi
 }
 
+rp_repo_has_dependabot() {
+  rp_gh_path_exists "$1" '.github/dependabot.yml'
+}
+
+rp_fetch_ci_workflow_text() {
+  local slug="$1"
+  if ! rp_gh_path_exists "$slug" '.github/workflows/ci.yml'; then
+    return 1
+  fi
+  gh api "repos/${slug}/contents/.github/workflows/ci.yml" --jq '.content' | base64 -d
+}
+
+# Emit CI check context names for branch protection (job display name, else job id).
+# Skips guard/changed-files/secret-scan/workflow-lint (my-tracks does not require the latter).
+rp_discover_ci_status_contexts() {
+  local slug="$1"
+  local text
+  text="$(rp_fetch_ci_workflow_text "$slug" 2>/dev/null || true)"
+  if [[ -z "$text" ]]; then
+    return 0
+  fi
+  awk '
+    function emit() {
+      if (job == "" || job == "guard" || job == "changed-files" || job == "secret-scan" \
+          || job == "workflow-lint") {
+        return
+      }
+      if (disp != "") {
+        print disp
+      } else {
+        print job
+      }
+    }
+    BEGIN { in_jobs = 0; job = ""; disp = "" }
+    /^jobs:/ { in_jobs = 1; next }
+    !in_jobs { next }
+    /^  [a-zA-Z0-9_-]+:/ {
+      emit()
+      job = $1
+      sub(/^  /, "", job)
+      sub(/:$/, "", job)
+      disp = ""
+      next
+    }
+    job != "" && /^    name:/ {
+      sub(/^    name: /, "")
+      disp = $0
+      next
+    }
+    END { emit() }
+  ' <<<"$text"
+}
+
+rp_fetch_classic_main_protection_json() {
+  local slug="$1"
+  gh api "repos/${slug}/branches/main/protection" 2>/dev/null || return 1
+}
+
+rp_classic_protection_bypass_apps_json() {
+  local slug="$1"
+  local apps
+  apps='["'"${rp_GRAPHITE_APP_SLUG}"'"]'
+  if rp_repo_has_dependabot "$slug"; then
+    apps='["'"${rp_GRAPHITE_APP_SLUG}"'","'"${rp_DEPENDABOT_APP_SLUG}"'"]'
+  fi
+  printf '%s' "$apps"
+}
+
+rp_validate_classic_main_protection_json() {
+  local slug="$1"
+  local protection_json="$2"
+  local fail=0
+  local expected
+  local -a expected_contexts=()
+  local ctx
+
+  if jq -e '.allow_force_pushes.enabled == true' >/dev/null <<<"$protection_json"; then
+    rp_log_fail "${slug}: classic main protection must disallow force-push"
+    fail=1
+  fi
+  if jq -e '.allow_deletions.enabled == true' >/dev/null <<<"$protection_json"; then
+    rp_log_fail "${slug}: classic main protection must disallow branch deletion"
+    fail=1
+  fi
+  if ! jq -e '.required_pull_request_reviews.dismiss_stale_reviews == true' \
+    >/dev/null <<<"$protection_json"; then
+    rp_log_fail "${slug}: classic main protection must dismiss stale reviews"
+    fail=1
+  fi
+  if ! jq -e '.required_pull_request_reviews.require_code_owner_reviews == true' \
+    >/dev/null <<<"$protection_json"; then
+    rp_log_fail "${slug}: classic main protection must require CODEOWNERS review"
+    fail=1
+  fi
+  if ! jq -e --arg slug "${rp_GRAPHITE_APP_SLUG}" '
+    [.required_pull_request_reviews.bypass_pull_request_allowances.apps[]?.slug]
+    | index($slug) != null
+  ' >/dev/null <<<"$protection_json"; then
+    rp_log_fail "${slug}: classic main protection must bypass ${rp_GRAPHITE_APP_SLUG} for reviews"
+    fail=1
+  fi
+  if rp_repo_has_dependabot "$slug"; then
+    if ! jq -e --arg slug "${rp_DEPENDABOT_APP_SLUG}" '
+      [.required_pull_request_reviews.bypass_pull_request_allowances.apps[]?.slug]
+      | index($slug) != null
+    ' >/dev/null <<<"$protection_json"; then
+      rp_log_fail "${slug}: classic main protection must bypass dependabot when dependabot.yml exists"
+      fail=1
+    fi
+  fi
+  if ! jq -e --arg slug "${rp_GRAPHITE_APP_SLUG}" '
+    [.restrictions.apps[]?.slug] | index($slug) != null
+  ' >/dev/null <<<"$protection_json"; then
+    rp_log_fail "${slug}: classic main protection must restrict pushes on main to ${rp_GRAPHITE_APP_SLUG}"
+    fail=1
+  fi
+  if ! jq -e '.required_status_checks.strict == true' >/dev/null <<<"$protection_json"; then
+    rp_log_fail "${slug}: classic main protection must require branches up to date (strict)"
+    fail=1
+  fi
+
+  while IFS= read -r expected; do
+    [[ -n "$expected" ]] || continue
+    expected_contexts+=("$expected")
+  done < <(rp_discover_ci_status_contexts "$slug")
+
+  if [[ "${#expected_contexts[@]}" -eq 0 ]]; then
+    if rp_gh_path_exists "$slug" '.github/workflows/ci.yml'; then
+      rp_log_fail "${slug}: could not discover CI status contexts from ci.yml"
+      fail=1
+    fi
+  else
+    for ctx in "${expected_contexts[@]}"; do
+      if ! jq -e --arg ctx "$ctx" '
+        [.required_status_checks.contexts[]?] | index($ctx) != null
+      ' >/dev/null <<<"$protection_json"; then
+        rp_log_fail "${slug}: classic main protection missing required status check: ${ctx}"
+        if [[ "$rp_suggest" -eq 1 ]]; then
+          rp_log_suggest "${slug}: add CI context ${ctx} (from ci.yml) to main branch protection"
+        fi
+        fail=1
+      fi
+    done
+  fi
+
+  if jq -e '.enforce_admins.enabled == true' >/dev/null <<<"$protection_json"; then
+    rp_log_warn "${slug}: enforce_admins is enabled (org default is false, per my-tracks)"
+  fi
+
+  return "$fail"
+}
+
+rp_apply_classic_main_protection() {
+  local slug="$1"
+  local -a contexts=()
+  local ctx
+  local bypass_apps_json payload
+
+  while IFS= read -r ctx; do
+    [[ -n "$ctx" ]] || continue
+    contexts+=("$ctx")
+  done < <(rp_discover_ci_status_contexts "$slug")
+
+  bypass_apps_json="$(rp_classic_protection_bypass_apps_json "$slug")"
+
+  if [[ "${#contexts[@]}" -eq 0 ]]; then
+    payload="$(jq -n \
+      --arg owner "${rp_ORG_OWNER_BYPASS_USER}" \
+      --argjson bypass_apps "$bypass_apps_json" \
+      '{
+        required_status_checks: null,
+        enforce_admins: false,
+        required_pull_request_reviews: {
+          dismiss_stale_reviews: true,
+          require_code_owner_reviews: true,
+          required_approving_review_count: 0,
+          bypass_pull_request_allowances: {
+            users: [$owner],
+            teams: [],
+            apps: $bypass_apps
+          }
+        },
+        restrictions: {
+          users: [],
+          teams: [],
+          apps: ["graphite-app"]
+        },
+        allow_force_pushes: false,
+        allow_deletions: false
+      }')"
+  else
+    payload="$(jq -n \
+      --arg owner "${rp_ORG_OWNER_BYPASS_USER}" \
+      --argjson bypass_apps "$bypass_apps_json" \
+      --argjson contexts "$(printf '%s\n' "${contexts[@]}" | jq -R . | jq -s .)" \
+      '{
+        required_status_checks: {
+          strict: true,
+          contexts: $contexts
+        },
+        enforce_admins: false,
+        required_pull_request_reviews: {
+          dismiss_stale_reviews: true,
+          require_code_owner_reviews: true,
+          required_approving_review_count: 0,
+          bypass_pull_request_allowances: {
+            users: [$owner],
+            teams: [],
+            apps: $bypass_apps
+          }
+        },
+        restrictions: {
+          users: [],
+          teams: [],
+          apps: ["graphite-app"]
+        },
+        allow_force_pushes: false,
+        allow_deletions: false
+      }')"
+  fi
+
+  rp_log_warn "${slug}: applying classic main branch protection (my-tracks template)"
+  gh api -X PUT "repos/${slug}/branches/main/protection" --input - <<<"$payload" >/dev/null
+}
+
 rp_dependabot_auto_merge_workflow_path() {
   local slug="$1"
   if rp_gh_path_exists "$slug" '.github/workflows/dependabot-auto-merge.yml'; then
@@ -289,6 +521,7 @@ rp_print_new_repo_checklist() {
 
     Branch protection (required when using merge-it or Release Please):
       [ ] protect-main ruleset on refs/heads/main (squash-only + Graphite App bypass)
+      [ ] classic main protection (CODEOWNERS, CI contexts, push via Graphite only)
 
     Release Please (optional):
       [ ] release-please.yml + squash-only repo settings (scripts/check-repo-practices --apply)
@@ -719,6 +952,52 @@ rp_check_protect_main_ruleset() {
   return "$repo_fail"
 }
 
+rp_check_classic_main_protection() {
+  local slug="$1"
+  local repo_fail=0
+  local protection_json
+
+  if ! rp_repo_requires_protect_main_ruleset "$slug"; then
+    return 0
+  fi
+
+  protection_json="$(rp_fetch_classic_main_protection_json "$slug" 2>/dev/null || true)"
+  if [[ -z "$protection_json" ]]; then
+    rp_log_fail "${slug}: classic main branch protection is required (see AGENTS.md)"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: enable classic protection on main or run --apply"
+    fi
+    if [[ "$rp_apply" -eq 1 ]]; then
+      rp_apply_classic_main_protection "$slug"
+      protection_json="$(rp_fetch_classic_main_protection_json "$slug" 2>/dev/null || true)"
+    else
+      return 1
+    fi
+  elif [[ "$rp_apply" -eq 1 ]]; then
+    if ! rp_validate_classic_main_protection_json "$slug" "$protection_json"; then
+      rp_apply_classic_main_protection "$slug"
+      protection_json="$(rp_fetch_classic_main_protection_json "$slug" 2>/dev/null || true)"
+    fi
+  fi
+
+  if [[ -z "$protection_json" ]]; then
+    rp_log_fail "${slug}: classic main branch protection missing after --apply"
+    return 1
+  fi
+
+  if ! rp_validate_classic_main_protection_json "$slug" "$protection_json"; then
+    repo_fail=1
+  fi
+
+  if [[ "$repo_fail" -eq 0 ]]; then
+    rp_log_ok "${slug}: classic main branch protection (my-tracks template)"
+  else
+    rp_log_fail "${slug}: classic main branch protection (fix with --apply; see AGENTS.md)"
+  fi
+
+  return "$repo_fail"
+}
+
 rp_check_graphite_merge_queue() {
   local slug="$1"
   local repo_fail=0
@@ -786,6 +1065,11 @@ rp_check_one_repo() {
   fi
   if ! rp_check_protect_main_ruleset "$slug"; then
     total_fail=$(( total_fail + 1 ))
+  fi
+  if [[ "$rp_merge_only" -eq 0 ]]; then
+    if ! rp_check_classic_main_protection "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
   fi
   if ! rp_check_graphite_merge_queue "$slug"; then
     total_fail=$(( total_fail + 1 ))
