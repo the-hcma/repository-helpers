@@ -1,0 +1,733 @@
+# shellcheck shell=bash
+# repo-practices — shared checks for org repository GitHub conventions.
+#
+# Sourced by scripts/check-repo-practices and scripts/check-merge-settings.
+# Do not execute directly.
+
+rp_DEFAULT_ORG='the-hcma'
+rp_GRAPHITE_APP_ACTOR_ID=158384
+rp_THIS_REPO_NAME='repository-helpers'
+
+rp_org="$rp_DEFAULT_ORG"
+rp_apply=0
+rp_suggest=0
+rp_new_repo=0
+rp_audit_all=0
+rp_merge_only=0
+declare -a rp_repo_slugs=()
+
+rp_usage() {
+  local -r prog="${1:-check-repo-practices}"
+  cat >&2 <<USAGE
+Usage:
+  scripts/${prog} [--org ORG] [--repo OWNER/NAME ...]
+  scripts/${prog} --new-repo --repo OWNER/NAME
+  scripts/${prog} --all [--org ORG]
+  scripts/${prog} --suggest [--repo OWNER/NAME ...]
+  scripts/${prog} --apply [--repo ...]          # Release Please squash settings only
+
+Audits GitHub conventions for org repositories:
+
+  Branch hygiene (strict repos):
+    - cleanup-branch-on-merge.yml (delete head branch when PR merges)
+    - cleanup-merged-branches.yml (daily sweep + workflow_dispatch)
+
+  Graphite merge queue (when merge-it label exists):
+    - enqueue labels, merged-pr-closer, ci gtmq skip, dependabot auto-merge
+    - protect-main Graphite App bypass when ruleset exists
+
+  Release Please (when release-please.yml exists):
+    - squash-only settings; squash_merge_commit_message=BLANK
+
+--new-repo: audit a single repo with SUGGEST hints and a setup checklist (requires --repo).
+--all: audit every repository in the org (not only merge-it / release-please).
+--suggest: print SUGGEST lines with remediation hints (non-zero exit still on FAIL).
+
+Requires: gh (authenticated), jq.
+USAGE
+}
+
+rp_die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+rp_log_ok() {
+  printf 'OK: %s\n' "$*" >&2
+}
+
+rp_log_warn() {
+  printf 'WARN: %s\n' "$*" >&2
+}
+
+rp_log_fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+}
+
+rp_log_suggest() {
+  printf 'SUGGEST: %s\n' "$*" >&2
+}
+
+rp_require_tools() {
+  command -v gh >/dev/null 2>&1 || rp_die "'gh' not found (https://cli.github.com)"
+  command -v jq >/dev/null 2>&1 || rp_die "'jq' not found"
+  gh auth status >/dev/null 2>&1 || rp_die "'gh' is not authenticated (run: gh auth login)"
+}
+
+rp_repo_short_name() {
+  printf '%s' "${1#*/}"
+}
+
+rp_is_strict_repo() {
+  [[ "$(rp_repo_short_name "$1")" != "$rp_THIS_REPO_NAME" ]] || [[ "$rp_new_repo" -eq 1 ]]
+}
+
+rp_gh_path_exists() {
+  local slug="$1"
+  local path="$2"
+  gh api "repos/${slug}/contents/${path}" >/dev/null 2>&1
+}
+
+rp_fetch_github_text_file() {
+  local slug="$1"
+  local path="$2"
+  local response encoded
+  response="$(gh api "repos/${slug}/contents/${path}" 2>/dev/null || true)"
+  if [[ -z "$response" ]]; then
+    return 1
+  fi
+  encoded="$(jq -r '.content // empty' <<<"$response")"
+  if [[ -z "$encoded" || "$encoded" == 'null' ]]; then
+    return 1
+  fi
+  printf '%s' "$encoded" | base64 -d 2>/dev/null || return 1
+}
+
+rp_repo_has_release_please() {
+  local slug="$1"
+  rp_gh_path_exists "$slug" '.github/workflows/release-please.yml'
+}
+
+rp_repo_has_merge_it_label() {
+  local slug="$1"
+  local labels_json
+  labels_json="$(rp_fetch_repo_labels_json "$slug")"
+  jq -e 'index("merge-it") != null' >/dev/null <<<"$labels_json"
+}
+
+rp_repo_should_audit_default() {
+  local slug="$1"
+  if rp_repo_has_release_please "$slug"; then
+    return 0
+  fi
+  if rp_repo_has_merge_it_label "$slug"; then
+    return 0
+  fi
+  return 1
+}
+
+rp_discover_org_repos() {
+  local owner="$1"
+  gh api "orgs/${owner}/repos" --paginate --jq '.[].name'
+}
+
+rp_discover_audit_repos() {
+  local owner="$1"
+  local name slug
+  if [[ "$rp_audit_all" -eq 1 ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      printf '%s\n' "${owner}/${name}"
+    done < <(rp_discover_org_repos "$owner")
+    return 0
+  fi
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    slug="${owner}/${name}"
+    if rp_repo_should_audit_default "$slug"; then
+      printf '%s\n' "$slug"
+    fi
+  done < <(rp_discover_org_repos "$owner")
+}
+
+rp_fetch_repo_settings() {
+  local slug="$1"
+  gh api "repos/${slug}" \
+    --jq '{
+      allow_merge_commit,
+      allow_rebase_merge,
+      allow_squash_merge,
+      squash_merge_commit_message,
+      squash_merge_commit_title
+    }'
+}
+
+rp_fetch_protect_main_ruleset() {
+  local slug="$1"
+  local owner name ruleset_id
+  owner="${slug%%/*}"
+  name="${slug#*/}"
+  ruleset_id="$(gh api "repos/${owner}/${name}/rulesets" \
+    --jq '.[] | select(.name == "protect-main") | .id' 2>/dev/null | head -n1 || true)"
+  if [[ -z "$ruleset_id" ]]; then
+    return 1
+  fi
+  gh api "repos/${owner}/${name}/rulesets/${ruleset_id}"
+}
+
+rp_fetch_protect_main_merge_methods() {
+  local ruleset_json="$1"
+  jq '[.rules[] | select(.type == "pull_request") | .parameters.allowed_merge_methods // []] | add // []' \
+    <<<"$ruleset_json"
+}
+
+rp_fetch_repo_labels_json() {
+  local slug="$1"
+  gh api "repos/${slug}/labels" --jq '[.[].name]'
+}
+
+rp_expected_enqueue_labels() {
+  local labels_json="$1"
+  printf '%s\n' 'merge-it'
+  if jq -e 'index("merge-mq") != null' >/dev/null <<<"$labels_json"; then
+    printf '%s\n' 'merge-mq'
+  fi
+}
+
+rp_dependabot_auto_merge_workflow_path() {
+  local slug="$1"
+  if rp_gh_path_exists "$slug" '.github/workflows/dependabot-auto-merge.yml'; then
+    printf '%s' '.github/workflows/dependabot-auto-merge.yml'
+    return 0
+  fi
+  if rp_gh_path_exists "$slug" '.github/workflows/auto-merge-dependabot.yml'; then
+    printf '%s' '.github/workflows/auto-merge-dependabot.yml'
+    return 0
+  fi
+  return 1
+}
+
+rp_print_new_repo_checklist() {
+  local slug="$1"
+  cat >&2 <<CHECKLIST
+
+==> New repository checklist for ${slug}
+    Run: scripts/check-repo-practices --repo ${slug} --suggest
+
+    GitHub labels:
+      [ ] merge-it (Graphite merge queue enqueue)
+      [ ] merge-mq (only if using multi-partition merge queue)
+
+    Workflows under .github/workflows/:
+      [ ] ci.yml with gtmq_merge_* skip in a guard job
+      [ ] merged-pr-closer.yml (graphite-app merge-queue comment detection)
+      [ ] cleanup-branch-on-merge.yml (delete branch on PR merge)
+      [ ] cleanup-merged-branches.yml (daily stale-branch sweep)
+      [ ] dependabot-auto-merge.yml OR auto-merge-dependabot.yml (when dependabot.yml exists)
+
+    Release Please (optional):
+      [ ] release-please.yml + squash-only repo settings (scripts/check-repo-practices --apply)
+
+    Graphite (manual in app.graphite.com):
+      [ ] Enable merge queue on main, strategy squash, enqueue label merge-it
+
+    Docs in the service repo:
+      [ ] GRAPHITE.md (stacked PRs, merge-it flow)
+      [ ] RELEASING.md when using Release Please
+
+CHECKLIST
+}
+
+rp_parse_args() {
+  local prog="$1"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)
+        rp_usage "$prog"
+        exit 0
+        ;;
+      --org)
+        [[ $# -ge 2 ]] || rp_die "--org requires a value"
+        rp_org="$2"
+        shift 2
+        ;;
+      --repo)
+        [[ $# -ge 2 ]] || rp_die "--repo requires OWNER/NAME"
+        rp_repo_slugs+=("$2")
+        shift 2
+        ;;
+      --apply)
+        rp_apply=1
+        shift
+        ;;
+      --suggest)
+        rp_suggest=1
+        shift
+        ;;
+      --new-repo)
+        rp_new_repo=1
+        rp_suggest=1
+        shift
+        ;;
+      --all)
+        rp_audit_all=1
+        shift
+        ;;
+      --merge-only)
+        rp_merge_only=1
+        shift
+        ;;
+      *)
+        rp_die "Unknown argument: $1 (see --help)"
+        ;;
+    esac
+  done
+
+  if [[ "$rp_new_repo" -eq 1 ]]; then
+    if [[ "${#rp_repo_slugs[@]}" -ne 1 ]]; then
+      rp_die "--new-repo requires exactly one --repo OWNER/NAME"
+    fi
+    return 0
+  fi
+
+  if [[ "${#rp_repo_slugs[@]}" -eq 0 ]]; then
+    local slug
+    while IFS= read -r slug; do
+      [[ -n "$slug" ]] || continue
+      rp_repo_slugs+=("$slug")
+    done < <(rp_discover_audit_repos "$rp_org")
+    if [[ "${#rp_repo_slugs[@]}" -eq 0 ]]; then
+      rp_die "No repositories to audit under ${rp_org} (use --all or --repo)"
+    fi
+  fi
+}
+
+rp_validate_repo_settings_json() {
+  local slug="$1"
+  local settings_json="$2"
+  local fail=0
+  local v
+
+  v="$(jq -r '.allow_merge_commit' <<<"$settings_json")"
+  if [[ "$v" != 'false' ]]; then
+    rp_log_fail "${slug}: allow_merge_commit must be false (got ${v})"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: run scripts/check-repo-practices --repo ${slug} --apply (Release Please repos)"
+    fi
+    fail=1
+  fi
+
+  v="$(jq -r '.allow_rebase_merge' <<<"$settings_json")"
+  if [[ "$v" != 'false' ]]; then
+    rp_log_fail "${slug}: allow_rebase_merge must be false (got ${v})"
+    fail=1
+  fi
+
+  v="$(jq -r '.allow_squash_merge' <<<"$settings_json")"
+  if [[ "$v" != 'true' ]]; then
+    rp_log_fail "${slug}: allow_squash_merge must be true (got ${v})"
+    fail=1
+  fi
+
+  v="$(jq -r '.squash_merge_commit_message' <<<"$settings_json")"
+  if [[ "$v" != 'BLANK' ]]; then
+    rp_log_fail "${slug}: squash_merge_commit_message must be BLANK (got ${v})"
+    fail=1
+  fi
+
+  v="$(jq -r '.squash_merge_commit_title' <<<"$settings_json")"
+  if [[ "$v" != 'PR_TITLE' ]]; then
+    rp_log_fail "${slug}: squash_merge_commit_title must be PR_TITLE (got ${v})"
+    fail=1
+  fi
+
+  return "$fail"
+}
+
+rp_validate_ruleset_methods_json() {
+  local slug="$1"
+  local methods_json="$2"
+  local count methods_line
+
+  count="$(jq 'length' <<<"$methods_json")"
+  if [[ "$count" -eq 0 ]]; then
+    rp_log_warn "${slug}: no protect-main ruleset (repo settings only; consider adding squash-only ruleset)"
+    if [[ "$rp_suggest" -eq 1 ]] && rp_repo_has_release_please "$slug"; then
+      rp_log_suggest "${slug}: add protect-main ruleset with allowed_merge_methods [squash] (see AGENTS.md)"
+    fi
+    return 0
+  fi
+
+  methods_line="$(jq -r 'join(", ")' <<<"$methods_json")"
+  if [[ "$count" -eq 1 ]] && jq -e '.[0] == "squash"' >/dev/null <<<"$methods_json"; then
+    return 0
+  fi
+
+  rp_log_fail "${slug}: protect-main allowed_merge_methods must be [squash] (got: ${methods_line})"
+  return 1
+}
+
+rp_validate_graphite_bypass_json() {
+  local slug="$1"
+  local ruleset_json="$2"
+
+  if [[ -z "$ruleset_json" ]]; then
+    if rp_is_strict_repo "$slug"; then
+      rp_log_warn "${slug}: no protect-main ruleset (Graphite MQ needs bypass for graphite-app)"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: add protect-main with Graphite App (actor_id ${rp_GRAPHITE_APP_ACTOR_ID}) on bypass list"
+      fi
+    fi
+    return 0
+  fi
+
+  if jq -e --argjson id "$rp_GRAPHITE_APP_ACTOR_ID" '
+    .bypass_actors // []
+    | any(
+        .actor_id == $id
+        and .actor_type == "Integration"
+        and (.bypass_mode == "always" or .bypass_mode == "pull_request")
+      )
+  ' >/dev/null <<<"$ruleset_json"; then
+    return 0
+  fi
+
+  rp_log_fail "${slug}: protect-main must bypass Graphite App (Integration actor_id ${rp_GRAPHITE_APP_ACTOR_ID})"
+  return 1
+}
+
+rp_validate_graphite_enqueue_labels() {
+  local slug="$1"
+  local labels_json="$2"
+  local label fail=0
+
+  while IFS= read -r label; do
+    [[ -n "$label" ]] || continue
+    if jq -e --arg name "$label" 'index($name) != null' >/dev/null <<<"$labels_json"; then
+      continue
+    fi
+    rp_log_fail "${slug}: missing Graphite enqueue label '${label}'"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: create GitHub label '${label}' and wire it in Graphite merge queue settings"
+    fi
+    fail=1
+  done < <(rp_expected_enqueue_labels "$labels_json")
+
+  return "$fail"
+}
+
+rp_validate_graphite_workflows() {
+  local slug="$1"
+  local strict="$2"
+  local labels_json="$3"
+  local fail=0
+  local ci_text closer_text dependabot_workflow dependabot_auto_text
+
+  if ! rp_gh_path_exists "$slug" '.github/workflows/merged-pr-closer.yml'; then
+    if [[ "$strict" == '1' ]]; then
+      rp_log_fail "${slug}: missing .github/workflows/merged-pr-closer.yml"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: add merged-pr-closer.yml (closes open PRs already on main via Graphite MQ)"
+      fi
+      fail=1
+    else
+      rp_log_warn "${slug}: missing merged-pr-closer.yml (optional for ${rp_THIS_REPO_NAME})"
+    fi
+  else
+    closer_text="$(rp_fetch_github_text_file "$slug" '.github/workflows/merged-pr-closer.yml' || true)"
+    if [[ -z "$closer_text" ]] \
+      || ! grep -qF 'graphite-app' <<<"$closer_text" \
+      || ! grep -qF 'Graphite merge queue' <<<"$closer_text"; then
+      rp_log_fail "${slug}: merged-pr-closer.yml must detect graphite-app Graphite merge queue comments"
+      fail=1
+    fi
+  fi
+
+  if rp_gh_path_exists "$slug" '.github/workflows/ci.yml'; then
+    ci_text="$(rp_fetch_github_text_file "$slug" '.github/workflows/ci.yml' || true)"
+    if [[ -z "$ci_text" ]] || ! grep -qF 'gtmq_merge_' <<<"$ci_text"; then
+      if [[ "$strict" == '1' ]]; then
+        rp_log_fail "${slug}: ci.yml must skip gtmq_merge_* merge-queue staging branches"
+        if [[ "$rp_suggest" -eq 1 ]]; then
+          rp_log_suggest "${slug}: add a guard job that sets skip=true when head_ref matches gtmq_merge_*"
+        fi
+        fail=1
+      else
+        rp_log_warn "${slug}: ci.yml does not skip gtmq_merge_* (recommended when using Graphite MQ)"
+      fi
+    fi
+  elif [[ "$strict" == '1' ]]; then
+    rp_log_fail "${slug}: missing .github/workflows/ci.yml"
+    fail=1
+  fi
+
+  if rp_gh_path_exists "$slug" '.github/dependabot.yml'; then
+    dependabot_workflow="$(rp_dependabot_auto_merge_workflow_path "$slug" || true)"
+    if [[ -z "$dependabot_workflow" ]]; then
+      if [[ "$strict" == '1' ]]; then
+        rp_log_fail "${slug}: dependabot.yml present but no dependabot auto-merge workflow"
+        if [[ "$rp_suggest" -eq 1 ]]; then
+          rp_log_suggest "${slug}: add dependabot-auto-merge.yml (labels merge-it for Graphite MQ)"
+        fi
+        fail=1
+      fi
+    else
+      dependabot_auto_text="$(rp_fetch_github_text_file "$slug" "$dependabot_workflow" || true)"
+      if [[ -z "$dependabot_auto_text" ]] || ! grep -qF 'merge-it' <<<"$dependabot_auto_text"; then
+        rp_log_fail "${slug}: ${dependabot_workflow} must add merge-it label"
+        fail=1
+      fi
+      if jq -e 'index("merge-mq") != null' >/dev/null <<<"$labels_json" \
+        && ! grep -qF 'merge-mq' <<<"$dependabot_auto_text"; then
+        rp_log_fail "${slug}: ${dependabot_workflow} must add merge-mq when merge-mq label exists"
+        fail=1
+      fi
+    fi
+  elif [[ "$rp_suggest" -eq 1 ]] && [[ "$strict" == '1' ]]; then
+    rp_log_suggest "${slug}: consider .github/dependabot.yml for automated dependency PRs"
+  fi
+
+  return "$fail"
+}
+
+rp_validate_branch_cleanup_workflows() {
+  local slug="$1"
+  local strict="$2"
+  local fail=0
+  local sweep_text
+
+  if ! rp_gh_path_exists "$slug" '.github/workflows/cleanup-branch-on-merge.yml'; then
+    if [[ "$strict" == '1' ]]; then
+      rp_log_fail "${slug}: missing .github/workflows/cleanup-branch-on-merge.yml"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: add cleanup-branch-on-merge.yml (delete head branch when PR merges)"
+      fi
+      fail=1
+    fi
+  fi
+
+  if ! rp_gh_path_exists "$slug" '.github/workflows/cleanup-merged-branches.yml'; then
+    if [[ "$strict" == '1' ]]; then
+      rp_log_fail "${slug}: missing .github/workflows/cleanup-merged-branches.yml"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: add cleanup-merged-branches.yml (daily sweep of merged/stale branches)"
+      fi
+      fail=1
+    fi
+  else
+    sweep_text="$(rp_fetch_github_text_file "$slug" '.github/workflows/cleanup-merged-branches.yml' || true)"
+    if [[ -z "$sweep_text" ]] || ! grep -qF 'schedule:' <<<"$sweep_text"; then
+      rp_log_fail "${slug}: cleanup-merged-branches.yml should include a schedule trigger"
+      fail=1
+    fi
+  fi
+
+  return "$fail"
+}
+
+rp_apply_repo_settings() {
+  local slug="$1"
+  rp_log_warn "${slug}: applying squash-only repository settings"
+  gh api -X PATCH "repos/${slug}" \
+    -f allow_merge_commit=false \
+    -f allow_rebase_merge=false \
+    -f allow_squash_merge=true \
+    -f squash_merge_commit_message=BLANK \
+    -f squash_merge_commit_title=PR_TITLE >/dev/null
+}
+
+rp_apply_protect_main_squash_methods() {
+  local slug="$1"
+  local owner name ruleset_id payload
+  owner="${slug%%/*}"
+  name="${slug#*/}"
+  ruleset_id="$(gh api "repos/${owner}/${name}/rulesets" \
+    --jq '.[] | select(.name == "protect-main") | .id' 2>/dev/null | head -n1 || true)"
+  if [[ -z "$ruleset_id" ]]; then
+    rp_log_warn "${slug}: no protect-main ruleset to patch (skipped)"
+    return 0
+  fi
+
+  payload="$(gh api "repos/${owner}/${name}/rulesets/${ruleset_id}")"
+  payload="$(jq '
+    .rules |= map(
+      if .type == "pull_request" then
+        .parameters.allowed_merge_methods = ["squash"]
+      else .
+      end
+    )
+    | {
+        name,
+        target,
+        enforcement,
+        conditions,
+        bypass_actors,
+        rules
+      }
+  ' <<<"$payload")"
+
+  rp_log_warn "${slug}: patching protect-main ruleset ${ruleset_id} (squash-only)"
+  gh api -X PUT "repos/${owner}/${name}/rulesets/${ruleset_id}" --input - <<<"$payload" >/dev/null
+}
+
+rp_check_release_please() {
+  local slug="$1"
+  local repo_fail=0
+  local settings_json ruleset_json methods_json
+
+  if ! rp_repo_has_release_please "$slug"; then
+    if [[ "$rp_new_repo" -eq 1 ]] && [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: add release-please.yml only if you publish versioned releases"
+    fi
+    return 0
+  fi
+
+  settings_json="$(rp_fetch_repo_settings "$slug")"
+  ruleset_json="$(rp_fetch_protect_main_ruleset "$slug" 2>/dev/null || true)"
+  if [[ -n "$ruleset_json" ]]; then
+    methods_json="$(rp_fetch_protect_main_merge_methods "$ruleset_json")"
+  else
+    methods_json='[]'
+  fi
+
+  if [[ "$rp_apply" -eq 1 ]]; then
+    if ! rp_validate_repo_settings_json "$slug" "$settings_json"; then
+      rp_apply_repo_settings "$slug"
+      settings_json="$(rp_fetch_repo_settings "$slug")"
+    fi
+    if ! rp_validate_ruleset_methods_json "$slug" "$methods_json"; then
+      rp_apply_protect_main_squash_methods "$slug"
+      ruleset_json="$(rp_fetch_protect_main_ruleset "$slug" 2>/dev/null || true)"
+      if [[ -n "$ruleset_json" ]]; then
+        methods_json="$(rp_fetch_protect_main_merge_methods "$ruleset_json")"
+      fi
+    fi
+  fi
+
+  if ! rp_validate_repo_settings_json "$slug" "$settings_json"; then
+    repo_fail=1
+  fi
+  if ! rp_validate_ruleset_methods_json "$slug" "$methods_json"; then
+    repo_fail=1
+  fi
+
+  if [[ "$repo_fail" -eq 0 ]]; then
+    rp_log_ok "${slug}: release-please merge settings"
+  else
+    rp_log_fail "${slug}: release-please settings (fix with --apply; see AGENTS.md)"
+  fi
+
+  return "$repo_fail"
+}
+
+rp_check_graphite_merge_queue() {
+  local slug="$1"
+  local repo_fail=0
+  local strict=0
+  local labels_json ruleset_json
+
+  if ! rp_repo_has_merge_it_label "$slug"; then
+    if [[ "$rp_new_repo" -eq 1 ]]; then
+      rp_log_suggest "${slug}: create merge-it label and enable Graphite merge queue on main"
+    fi
+    return 0
+  fi
+
+  if rp_is_strict_repo "$slug"; then
+    strict=1
+  fi
+
+  labels_json="$(rp_fetch_repo_labels_json "$slug")"
+  ruleset_json="$(rp_fetch_protect_main_ruleset "$slug" 2>/dev/null || true)"
+
+  if ! rp_validate_graphite_enqueue_labels "$slug" "$labels_json"; then
+    repo_fail=1
+  fi
+  if ! rp_validate_graphite_bypass_json "$slug" "$ruleset_json"; then
+    repo_fail=1
+  fi
+  if ! rp_validate_graphite_workflows "$slug" "$strict" "$labels_json"; then
+    repo_fail=1
+  fi
+
+  if [[ "$repo_fail" -eq 0 ]]; then
+    rp_log_ok "${slug}: Graphite merge queue GitHub wiring"
+    printf '     Confirm MQ is enabled with squash strategy in Graphite settings.\n' >&2
+  else
+    rp_log_fail "${slug}: Graphite merge queue setup (see AGENTS.md and GRAPHITE.md)"
+  fi
+
+  return "$repo_fail"
+}
+
+rp_check_branch_hygiene() {
+  local slug="$1"
+  local repo_fail=0
+  local strict=0
+
+  if rp_is_strict_repo "$slug"; then
+    strict=1
+  fi
+
+  if ! rp_validate_branch_cleanup_workflows "$slug" "$strict"; then
+    repo_fail=1
+  fi
+
+  if [[ "$repo_fail" -eq 0 ]]; then
+    rp_log_ok "${slug}: branch cleanup workflows"
+  else
+    rp_log_fail "${slug}: branch cleanup workflows"
+  fi
+
+  return "$repo_fail"
+}
+
+rp_check_one_repo() {
+  local slug="$1"
+  local total_fail=0
+
+  if ! rp_check_release_please "$slug"; then
+    total_fail=$(( total_fail + 1 ))
+  fi
+  if ! rp_check_graphite_merge_queue "$slug"; then
+    total_fail=$(( total_fail + 1 ))
+  fi
+  if [[ "$rp_merge_only" -eq 0 ]]; then
+    if ! rp_check_branch_hygiene "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+  fi
+
+  return "$total_fail"
+}
+
+rp_main() {
+  local prog="$1"
+  shift
+  local slug
+  local total_fail=0
+
+  rp_parse_args "$prog" "$@"
+  rp_require_tools
+
+  if [[ "$rp_new_repo" -eq 1 ]]; then
+    rp_print_new_repo_checklist "${rp_repo_slugs[0]}"
+  fi
+
+  for slug in "${rp_repo_slugs[@]}"; do
+    if [[ "$slug" != */* ]]; then
+      rp_die "Invalid --repo (expected OWNER/NAME): ${slug}"
+    fi
+    printf '\n==> %s\n' "$slug" >&2
+    if ! rp_check_one_repo "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+  done
+
+  if [[ "$total_fail" -gt 0 ]]; then
+    rp_die "${total_fail} repository/repositories failed practices check"
+  fi
+
+  rp_log_ok "all ${#rp_repo_slugs[@]} repository/repositories passed"
+}

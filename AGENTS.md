@@ -74,17 +74,37 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ---
 
-## Merge settings and Graphite merge queue
+## Repository practices (new and existing repos)
 
-Run **`scripts/check-merge-settings`** to audit GitHub merge configuration. With no `--repo`, the script discovers org repositories that have `release-please.yml` or a **`merge-it`** label, then checks each.
+Run **`scripts/check-repo-practices`** to audit or onboard a GitHub repository against org conventions (merge settings, Graphite merge queue, branch cleanup, Dependabot auto-merge).
 
 ```bash
-scripts/check-merge-settings                      # discover and audit under --org
-scripts/check-merge-settings --repo OWNER/NAME    # audit one repository
-scripts/check-merge-settings --apply              # patch Release Please squash settings only
+scripts/check-repo-practices --new-repo --repo OWNER/NAME   # checklist + SUGGEST hints
+scripts/check-repo-practices --repo OWNER/NAME --suggest    # audit one repo with remediation lines
+scripts/check-repo-practices --all --org the-hcma             # every repo in the org
+scripts/check-repo-practices --apply --repo OWNER/NAME      # patch Release Please squash settings
 ```
 
+**`scripts/check-merge-settings`** is a thin wrapper (merge + Graphite only). Prefer **`check-repo-practices`** for full coverage including branch cleanup workflows.
+
 See [GRAPHITE.md](./GRAPHITE.md) for stacked PRs, the merge queue, and the **`merge-it`** label.
+
+### Branch hygiene
+
+| Workflow | Purpose |
+| --- | --- |
+| `cleanup-branch-on-merge.yml` | Delete the PR head branch when a PR merges |
+| `cleanup-merged-branches.yml` | Daily sweep (+ `workflow_dispatch`) for merged and stale branches |
+
+### Merge settings and Graphite merge queue
+
+With no `--repo`, discovery includes repositories that have `release-please.yml` or a **`merge-it`** label (use `--all` to scan every org repo).
+
+```bash
+scripts/check-merge-settings                      # discover and audit (merge + Graphite only)
+scripts/check-merge-settings --repo OWNER/NAME
+scripts/check-merge-settings --apply              # patch Release Please squash settings only
+```
 
 ### Release Please
 
