@@ -74,6 +74,35 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ---
 
+## Release Please merge settings (sibling repos)
+
+Repositories that ship with [Release Please](https://github.com/googleapis/release-please) (`/.github/workflows/release-please.yml`) must use **squash merge only** on `main`. Merge commits duplicate changelog lines in release PRs (branch tip plus merge-commit body repeats the same conventional message). See [release-please#2476](https://github.com/googleapis/release-please/issues/2476) and `fpdf/RELEASING.md`.
+
+**Required GitHub settings** (enforced for `the-hcma/domesti-bot`, `the-hcma/fpdf`, `the-hcma/tsp-maximizer`):
+
+| Setting | Value |
+| --- | --- |
+| Merge commits | disabled |
+| Rebase merge | disabled |
+| Squash merge | enabled |
+| Squash commit message | `BLANK` (PR title only) |
+| Squash commit title | `PR_TITLE` |
+| Ruleset `protect-main` (when present) | `allowed_merge_methods`: `["squash"]` only |
+
+**Graphite merge queue** must also use **squash** as its merge strategy (repo settings alone do not control the queue).
+
+**Audit script:** from this repository, run:
+
+```bash
+scripts/check-release-merge-settings              # default org repos
+scripts/check-release-merge-settings --repo the-hcma/OWNER/NAME
+scripts/check-release-merge-settings --apply      # patch repo + protect-main ruleset
+```
+
+Repos without Release Please (`repository-helpers`, `bunnify`, `my-tracks`, …) do not need these settings unless they add `release-please.yml`.
+
+---
+
 ## Starting New Work
 
 Before creating any branch or writing any code, run the session initialization script from the repository root:

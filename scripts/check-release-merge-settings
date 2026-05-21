@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# check-release-merge-settings — Verify GitHub merge settings for Release Please repos.
+#
+# Release Please walks every commit on main since the last tag. Merge commits duplicate
+# changelog lines (branch tip + merge commit body). Repos with release-please.yml need
+# squash-only merges and squash_merge_commit_message=BLANK (see fpdf/RELEASING.md).
+#
+# Usage:
+#   scripts/check-release-merge-settings
+#   scripts/check-release-merge-settings --org the-hcma
+#   scripts/check-release-merge-settings --repo the-hcma/domesti-bot
+#   scripts/check-release-merge-settings --org the-hcma --apply
+set -euo pipefail
+
+readonly DEFAULT_ORG='the-hcma'
+readonly -a DEFAULT_RELEASE_REPOS=(
+  'domesti-bot'
+  'fpdf'
+  'tsp-maximizer'
+)
+
+org="$DEFAULT_ORG"
+apply=0
+declare -a repo_slugs=()
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage:
+  scripts/check-release-merge-settings [--org ORG] [--repo OWNER/NAME ...]
+  scripts/check-release-merge-settings --apply [--org ORG] [--repo ...]
+
+Checks GitHub settings for repositories that use Release Please:
+  - allow_merge_commit=false, allow_rebase_merge=false, allow_squash_merge=true
+  - squash_merge_commit_message=BLANK, squash_merge_commit_title=PR_TITLE
+  - ruleset protect-main (if present): allowed_merge_methods is squash only
+
+Without --repo, scans DEFAULT_RELEASE_REPOS under --org (the-hcma by default).
+
+--apply patches repo settings and protect-main rulesets to the expected values.
+Graphite merge queue strategy must still be set to squash in Graphite settings.
+
+Requires: gh (authenticated), jq.
+USAGE
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+log_ok() {
+  printf 'OK: %s\n' "$*" >&2
+}
+
+log_warn() {
+  printf 'WARN: %s\n' "$*" >&2
+}
+
+log_fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+}
+
+require_tools() {
+  command -v gh >/dev/null 2>&1 || die "'gh' not found (https://cli.github.com)"
+  command -v jq >/dev/null 2>&1 || die "'jq' not found"
+  gh auth status >/dev/null 2>&1 || die "'gh' is not authenticated (run: gh auth login)"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --org)
+        [[ $# -ge 2 ]] || die "--org requires a value"
+        org="$2"
+        shift 2
+        ;;
+      --repo)
+        [[ $# -ge 2 ]] || die "--repo requires OWNER/NAME"
+        repo_slugs+=("$2")
+        shift 2
+        ;;
+      --apply)
+        apply=1
+        shift
+        ;;
+      *)
+        die "Unknown argument: $1 (see --help)"
+        ;;
+    esac
+  done
+
+  if [[ "${#repo_slugs[@]}" -eq 0 ]]; then
+    local name
+    for name in "${DEFAULT_RELEASE_REPOS[@]}"; do
+      repo_slugs+=("${org}/${name}")
+    done
+  fi
+}
+
+repo_has_release_please() {
+  local slug="$1"
+  local owner name
+  owner="${slug%%/*}"
+  name="${slug#*/}"
+  gh api "repos/${owner}/${name}/contents/.github/workflows/release-please.yml" >/dev/null 2>&1
+}
+
+fetch_repo_settings() {
+  local slug="$1"
+  gh api "repos/${slug}" \
+    --jq '{
+      allow_merge_commit,
+      allow_rebase_merge,
+      allow_squash_merge,
+      squash_merge_commit_message,
+      squash_merge_commit_title
+    }'
+}
+
+fetch_protect_main_merge_methods() {
+  local slug="$1"
+  local owner name ruleset_id methods_json
+  owner="${slug%%/*}"
+  name="${slug#*/}"
+  ruleset_id="$(gh api "repos/${owner}/${name}/rulesets" \
+    --jq '.[] | select(.name == "protect-main") | .id' 2>/dev/null | head -n1 || true)"
+  if [[ -z "$ruleset_id" ]]; then
+    printf '%s' '[]'
+    return 0
+  fi
+  methods_json="$(gh api "repos/${owner}/${name}/rulesets/${ruleset_id}" \
+    --jq '[.rules[] | select(.type == "pull_request") | .parameters.allowed_merge_methods // []] | add // []' \
+    2>/dev/null || true)"
+  if [[ -z "$methods_json" ]]; then
+    printf '%s' '[]'
+    return 0
+  fi
+  printf '%s' "$methods_json"
+}
+
+validate_repo_settings_json() {
+  local slug="$1"
+  local settings_json="$2"
+  local fail=0
+  local v
+
+  v="$(jq -r '.allow_merge_commit' <<<"$settings_json")"
+  if [[ "$v" != 'false' ]]; then
+    log_fail "${slug}: allow_merge_commit must be false (got ${v})"
+    fail=1
+  fi
+
+  v="$(jq -r '.allow_rebase_merge' <<<"$settings_json")"
+  if [[ "$v" != 'false' ]]; then
+    log_fail "${slug}: allow_rebase_merge must be false (got ${v})"
+    fail=1
+  fi
+
+  v="$(jq -r '.allow_squash_merge' <<<"$settings_json")"
+  if [[ "$v" != 'true' ]]; then
+    log_fail "${slug}: allow_squash_merge must be true (got ${v})"
+    fail=1
+  fi
+
+  v="$(jq -r '.squash_merge_commit_message' <<<"$settings_json")"
+  if [[ "$v" != 'BLANK' ]]; then
+    log_fail "${slug}: squash_merge_commit_message must be BLANK (got ${v})"
+    fail=1
+  fi
+
+  v="$(jq -r '.squash_merge_commit_title' <<<"$settings_json")"
+  if [[ "$v" != 'PR_TITLE' ]]; then
+    log_fail "${slug}: squash_merge_commit_title must be PR_TITLE (got ${v})"
+    fail=1
+  fi
+
+  return "$fail"
+}
+
+validate_ruleset_methods_json() {
+  local slug="$1"
+  local methods_json="$2"
+  local count methods_line
+
+  count="$(jq 'length' <<<"$methods_json")"
+  if [[ "$count" -eq 0 ]]; then
+    log_warn "${slug}: no protect-main ruleset (repo settings only; consider adding squash-only ruleset)"
+    return 0
+  fi
+
+  methods_line="$(jq -r 'join(", ")' <<<"$methods_json")"
+  if [[ "$count" -eq 1 ]] && jq -e '.[0] == "squash"' >/dev/null <<<"$methods_json"; then
+    return 0
+  fi
+
+  log_fail "${slug}: protect-main allowed_merge_methods must be [squash] (got: ${methods_line})"
+  return 1
+}
+
+apply_repo_settings() {
+  local slug="$1"
+  log_warn "${slug}: applying squash-only repository settings"
+  gh api -X PATCH "repos/${slug}" \
+    -f allow_merge_commit=false \
+    -f allow_rebase_merge=false \
+    -f allow_squash_merge=true \
+    -f squash_merge_commit_message=BLANK \
+    -f squash_merge_commit_title=PR_TITLE >/dev/null
+}
+
+apply_protect_main_ruleset() {
+  local slug="$1"
+  local owner name ruleset_id payload
+  owner="${slug%%/*}"
+  name="${slug#*/}"
+  ruleset_id="$(gh api "repos/${owner}/${name}/rulesets" \
+    --jq '.[] | select(.name == "protect-main") | .id' 2>/dev/null | head -n1 || true)"
+  if [[ -z "$ruleset_id" ]]; then
+    log_warn "${slug}: no protect-main ruleset to patch (skipped)"
+    return 0
+  fi
+
+  payload="$(gh api "repos/${owner}/${name}/rulesets/${ruleset_id}")"
+  payload="$(jq '
+    .rules |= map(
+      if .type == "pull_request" then
+        .parameters.allowed_merge_methods = ["squash"]
+      else .
+      end
+    )
+    | {
+        name,
+        target,
+        enforcement,
+        conditions,
+        bypass_actors,
+        rules
+      }
+  ' <<<"$payload")"
+
+  if [[ -z "$payload" || "$payload" == 'null' ]]; then
+    log_warn "${slug}: could not build ruleset payload; update protect-main manually"
+    return 0
+  fi
+
+  log_warn "${slug}: patching protect-main ruleset ${ruleset_id}"
+  gh api -X PUT "repos/${owner}/${name}/rulesets/${ruleset_id}" --input - <<<"$payload" >/dev/null
+}
+
+check_one_repo() {
+  local slug="$1"
+  local repo_fail=0
+  local settings_json methods_json
+
+  if ! repo_has_release_please "$slug"; then
+    log_warn "${slug}: no .github/workflows/release-please.yml — skipping"
+    return 0
+  fi
+
+  settings_json="$(fetch_repo_settings "$slug")"
+  methods_json="$(fetch_protect_main_merge_methods "$slug")"
+
+  if [[ "$apply" -eq 1 ]]; then
+    if ! validate_repo_settings_json "$slug" "$settings_json"; then
+      apply_repo_settings "$slug"
+      settings_json="$(fetch_repo_settings "$slug")"
+    fi
+    if ! validate_ruleset_methods_json "$slug" "$methods_json"; then
+      apply_protect_main_ruleset "$slug"
+      methods_json="$(fetch_protect_main_merge_methods "$slug")"
+    fi
+  fi
+
+  if validate_repo_settings_json "$slug" "$settings_json"; then
+    :
+  else
+    repo_fail=1
+  fi
+
+  if ! validate_ruleset_methods_json "$slug" "$methods_json"; then
+    repo_fail=1
+  fi
+
+  if [[ "$repo_fail" -eq 0 ]]; then
+    log_ok "${slug}: release-please merge settings"
+    printf '     Also confirm Graphite merge queue uses squash for %s.\n' "${slug#*/}" >&2
+    return 0
+  fi
+
+  log_fail "${slug}: fix with --apply or match fpdf/domesti-bot (see repository-helpers AGENTS.md)"
+  return 1
+}
+
+main() {
+  local slug
+  local total_fail=0
+
+  parse_args "$@"
+  require_tools
+
+  for slug in "${repo_slugs[@]}"; do
+    if [[ "$slug" != */* ]]; then
+      die "Invalid --repo (expected OWNER/NAME): ${slug}"
+    fi
+    if ! check_one_repo "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+  done
+
+  if [[ "$total_fail" -gt 0 ]]; then
+    die "${total_fail} repository/repositories failed merge-settings check"
+  fi
+
+  log_ok "all ${#repo_slugs[@]} repository/repositories passed"
+}
+
+main "$@"
