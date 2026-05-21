@@ -74,11 +74,19 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ---
 
-## Release Please merge settings (sibling repos)
+## Merge settings and Graphite merge queue (sibling repos)
 
-Repositories that ship with [Release Please](https://github.com/googleapis/release-please) (`/.github/workflows/release-please.yml`) must use **squash merge only** on `main`. Merge commits duplicate changelog lines in release PRs (branch tip plus merge-commit body repeats the same conventional message). See [release-please#2476](https://github.com/googleapis/release-please/issues/2476) and `fpdf/RELEASING.md`.
+Run **`scripts/check-merge-settings`** to audit org repos (default: `bunnify`, `domesti-bot`, `fpdf`, `my-tracks`, `repository-helpers`, `tsp-maximizer`).
 
-**Required GitHub settings** (enforced for `the-hcma/domesti-bot`, `the-hcma/fpdf`, `the-hcma/tsp-maximizer`):
+```bash
+scripts/check-merge-settings                      # audit all default repos
+scripts/check-merge-settings --repo the-hcma/OWNER/NAME
+scripts/check-merge-settings --apply              # patch Release Please squash settings only
+```
+
+### Release Please
+
+Repositories with `/.github/workflows/release-please.yml` must use **squash merge only** on `main`. Merge commits duplicate changelog lines in release PRs (branch tip plus merge-commit body repeats the same conventional message). See [release-please#2476](https://github.com/googleapis/release-please/issues/2476) and `fpdf/RELEASING.md`.
 
 | Setting | Value |
 | --- | --- |
@@ -89,17 +97,20 @@ Repositories that ship with [Release Please](https://github.com/googleapis/relea
 | Squash commit title | `PR_TITLE` |
 | Ruleset `protect-main` (when present) | `allowed_merge_methods`: `["squash"]` only |
 
-**Graphite merge queue** must also use **squash** as its merge strategy (repo settings alone do not control the queue).
+### Graphite merge queue
 
-**Audit script:** from this repository, run:
+The script verifies GitHub-side wiring (not Graphite app UI settings):
 
-```bash
-scripts/check-release-merge-settings              # default org repos
-scripts/check-release-merge-settings --repo the-hcma/OWNER/NAME
-scripts/check-release-merge-settings --apply      # patch repo + protect-main ruleset
-```
+| Check | Strict repos | `repository-helpers` |
+| --- | --- | --- |
+| Label `merge-it` | required | required |
+| Label `merge-mq` | required on `my-tracks` only | — |
+| `merged-pr-closer.yml` detects `graphite-app` / merge queue | required | warn if missing |
+| `ci.yml` skips `gtmq_merge_*` | required | warn if missing |
+| `dependabot-auto-merge.yml` with `merge-it` when `dependabot.yml` exists | required | warn |
+| `protect-main` bypass for Graphite App (`actor_id` **158384**) | required when ruleset exists | warn |
 
-Repos without Release Please (`repository-helpers`, `bunnify`, `my-tracks`, …) do not need these settings unless they add `release-please.yml`.
+**Manual (not checked via `gh`):** enable the repo in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue), set merge strategy to **squash**, and wire the enqueue label (`merge-it`, or `merge-mq` on `my-tracks`). See `domesti-bot/docs/GRAPHITE.md`.
 
 ---
 
