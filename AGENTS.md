@@ -89,18 +89,20 @@ scripts/check-repo-practices --apply --repo OWNER/NAME      # patch Release Plea
 
 See [GRAPHITE.md](./GRAPHITE.md) for stacked PRs, the merge queue, and the **`merge-it`** label.
 
-### Protection tiers
+### `protect-main` ruleset (required)
 
-Repos use one of two **main** protection models. `check-repo-practices` enforces the tier that applies.
+Any repo with **`merge-it`** (Graphite merge queue) or **`release-please.yml`** must use the ruleset **`protect-main`** on `refs/heads/main`. Classic branch protection alone is **not** sufficient — the checker requires the ruleset.
 
-| Tier | When | `main` protection | Enqueue label |
-| --- | --- | --- | --- |
-| **Tier 1** | Default (no Release Please) | Classic branch protection with **Graphite App** (`graphite-app`) on PR review bypass | **`merge-it`** |
-| **Tier 2** | `release-please.yml` present | Ruleset **`protect-main`** on `refs/heads/main`: squash-only merges + Graphite Integration bypass (`actor_id` **158384**) | **`merge-it`** |
+| Ruleset rule | Purpose |
+| --- | --- |
+| `deletion` | Block branch deletion |
+| `non_fast_forward` | Block force-push |
+| `pull_request` with `allowed_merge_methods: ["squash"]` | Squash-only merges (Release Please + Graphite MQ) |
+| `bypass_actors`: Graphite App (`actor_id` **158384**, Integration, `always`) | Merge queue can land on `main` |
 
-**`merge-mq`** is not used org-wide. Only **`my-tracks`** keeps that label (Graphite MQ is wired to `merge-mq` there). Other repos must not create `merge-mq`; dependabot auto-merge only needs **`merge-it`**.
+Classic branch protection may remain for required reviews and status checks; **`protect-main`** enforces merge method and Graphite bypass. Create or repair with `scripts/check-repo-practices --repo OWNER/NAME --apply`.
 
-Tier-2 template: copy **`protect-main`** from **`domesti-bot`** (deletion + non-fast-forward + pull request with `allowed_merge_methods: ["squash"]`). Classic branch protection can remain for required reviews and status checks.
+**`merge-mq`** is not used org-wide. Only **`my-tracks`** keeps that label (Graphite MQ wired to `merge-mq` there). Other repos use **`merge-it`** only.
 
 ### Branch hygiene
 
@@ -130,7 +132,7 @@ Repositories with `/.github/workflows/release-please.yml` must use **squash merg
 | Squash merge | enabled |
 | Squash commit message | `BLANK` (PR title only) |
 | Squash commit title | `PR_TITLE` |
-| Ruleset `protect-main` (tier 2) | `allowed_merge_methods`: `["squash"]` only |
+| Ruleset `protect-main` | `allowed_merge_methods`: `["squash"]` only |
 
 ### Graphite merge queue
 
@@ -143,8 +145,7 @@ The script verifies GitHub-side wiring (not Graphite app UI settings) when a **`
 | `merged-pr-closer.yml` detects `graphite-app` / merge queue | required | warn if missing |
 | `ci.yml` skips `gtmq_merge_*` | required | warn if missing |
 | `dependabot-auto-merge.yml` with `merge-it` when `dependabot.yml` exists | required | warn |
-| Tier 2 `protect-main` bypass for Graphite App (`actor_id` **158384**) | required | — |
-| Tier 1 classic `main` bypass for **graphite-app** | required when no tier-2 ruleset | warn |
+| `protect-main` bypass for Graphite App (`actor_id` **158384**) | required when `merge-it` or Release Please | warn |
 
 **Manual (not checked via `gh`):** enable the repo in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue), set merge strategy to **squash**, and wire enqueue labels (`merge-it`, or `merge-mq` on **my-tracks** only).
 

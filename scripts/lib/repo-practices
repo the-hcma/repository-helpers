@@ -24,9 +24,13 @@ Usage:
   scripts/${prog} --new-repo --repo OWNER/NAME
   scripts/${prog} --all [--org ORG]
   scripts/${prog} --suggest [--repo OWNER/NAME ...]
-  scripts/${prog} --apply [--repo ...]          # Release Please squash settings only
+  scripts/${prog} --apply [--repo ...]          # repo squash settings + protect-main ruleset
 
 Audits GitHub conventions for org repositories:
+
+  protect-main ruleset (when merge-it or release-please.yml exists):
+    - squash-only allowed_merge_methods on main
+    - Graphite App bypass (Integration actor_id 158384)
 
   Branch hygiene (strict repos):
     - cleanup-branch-on-merge.yml (delete head branch when PR merges)
@@ -34,10 +38,9 @@ Audits GitHub conventions for org repositories:
 
   Graphite merge queue (when merge-it label exists):
     - enqueue labels, merged-pr-closer, ci gtmq skip, dependabot auto-merge
-    - protect-main Graphite App bypass when ruleset exists
 
   Release Please (when release-please.yml exists):
-    - squash-only settings; squash_merge_commit_message=BLANK
+    - squash-only repo settings; squash_merge_commit_message=BLANK
 
 --new-repo: audit a single repo with SUGGEST hints and a setup checklist (requires --repo).
 --all: audit every repository in the org (not only merge-it / release-please).
@@ -186,21 +189,62 @@ rp_fetch_repo_labels_json() {
   gh api "repos/${slug}/labels" --jq '[.[].name]'
 }
 
-rp_repo_uses_tier2_protection() {
-  rp_repo_has_release_please "$1"
-}
-
-rp_fetch_classic_main_protection_json() {
+rp_repo_requires_protect_main_ruleset() {
   local slug="$1"
-  gh api "repos/${slug}/branches/main/protection" 2>/dev/null || return 1
+  if rp_repo_has_release_please "$slug"; then
+    return 0
+  fi
+  if rp_repo_has_merge_it_label "$slug"; then
+    return 0
+  fi
+  return 1
 }
 
-rp_classic_protection_has_graphite_bypass() {
-  local protection_json="$1"
-  jq -e '
-    [.required_pull_request_reviews.bypass_pull_request_allowances.apps // []
-     | any(.slug == "graphite-app" or .id == 158384)]
-  ' >/dev/null <<<"$protection_json"
+rp_protect_main_create_payload() {
+  cat <<'RULESET'
+{
+  "name": "protect-main",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "exclude": [],
+      "include": ["refs/heads/main"]
+    }
+  },
+  "bypass_actors": [
+    {
+      "actor_id": 158384,
+      "actor_type": "Integration",
+      "bypass_mode": "always"
+    }
+  ],
+  "rules": [
+    {"type": "deletion"},
+    {"type": "non_fast_forward"},
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 0,
+        "dismiss_stale_reviews_on_push": false,
+        "required_reviewers": [],
+        "require_code_owner_review": false,
+        "require_last_push_approval": false,
+        "required_review_thread_resolution": false,
+        "allowed_merge_methods": ["squash"]
+      }
+    }
+  ]
+}
+RULESET
+}
+
+rp_apply_protect_main_create() {
+  local slug="$1"
+  local payload
+  payload="$(rp_protect_main_create_payload)"
+  rp_log_warn "${slug}: creating protect-main ruleset (squash-only + Graphite bypass)"
+  gh api --method POST "repos/${slug}/rulesets" --input - <<<"$payload" >/dev/null
 }
 
 rp_expected_enqueue_labels() {
@@ -242,6 +286,9 @@ rp_print_new_repo_checklist() {
       [ ] cleanup-branch-on-merge.yml (delete branch on PR merge)
       [ ] cleanup-merged-branches.yml (daily stale-branch sweep)
       [ ] dependabot-auto-merge.yml OR auto-merge-dependabot.yml (when dependabot.yml exists)
+
+    Branch protection (required when using merge-it or Release Please):
+      [ ] protect-main ruleset on refs/heads/main (squash-only + Graphite App bypass)
 
     Release Please (optional):
       [ ] release-please.yml + squash-only repo settings (scripts/check-repo-practices --apply)
@@ -370,10 +417,10 @@ rp_validate_ruleset_methods_json() {
 
   count="$(jq 'length' <<<"$methods_json")"
   if [[ "$count" -eq 0 ]]; then
-    if rp_repo_uses_tier2_protection "$slug"; then
-      rp_log_fail "${slug}: tier-2 Release Please repo requires protect-main ruleset (squash-only)"
+    if rp_repo_requires_protect_main_ruleset "$slug"; then
+      rp_log_fail "${slug}: missing protect-main ruleset (squash-only merges on main)"
       if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_suggest "${slug}: add protect-main ruleset (see AGENTS.md tier-2 template)"
+        rp_log_suggest "${slug}: add protect-main ruleset (see AGENTS.md) or run --apply"
       fi
       return 1
     fi
@@ -392,22 +439,13 @@ rp_validate_ruleset_methods_json() {
 rp_validate_graphite_bypass_json() {
   local slug="$1"
   local ruleset_json="$2"
-  local classic_json
 
   if [[ -z "$ruleset_json" ]]; then
-    classic_json="$(rp_fetch_classic_main_protection_json "$slug" 2>/dev/null || true)"
-    if [[ -n "$classic_json" ]] && rp_classic_protection_has_graphite_bypass "$classic_json"; then
-      return 0
+    rp_log_fail "${slug}: protect-main ruleset required (classic branch protection is not sufficient)"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: create protect-main ruleset with Graphite App bypass (actor_id ${rp_GRAPHITE_APP_ACTOR_ID})"
     fi
-    if rp_repo_uses_tier2_protection "$slug"; then
-      rp_log_fail "${slug}: tier-2 repo requires protect-main ruleset with Graphite App bypass"
-      return 1
-    fi
-    if rp_is_strict_repo "$slug"; then
-      rp_log_fail "${slug}: tier-1 repo needs classic main protection bypass for graphite-app"
-      return 1
-    fi
-    return 0
+    return 1
   fi
 
   if jq -e --argjson id "$rp_GRAPHITE_APP_ACTOR_ID" '
@@ -573,7 +611,7 @@ rp_apply_protect_main_squash_methods() {
   ruleset_id="$(gh api "repos/${owner}/${name}/rulesets" \
     --jq '.[] | select(.name == "protect-main") | .id' 2>/dev/null | head -n1 || true)"
   if [[ -z "$ruleset_id" ]]; then
-    rp_log_warn "${slug}: no protect-main ruleset to patch (skipped)"
+    rp_apply_protect_main_create "$slug"
     return 0
   fi
 
@@ -602,7 +640,7 @@ rp_apply_protect_main_squash_methods() {
 rp_check_release_please() {
   local slug="$1"
   local repo_fail=0
-  local settings_json ruleset_json methods_json
+  local settings_json
 
   if ! rp_repo_has_release_please "$slug"; then
     if [[ "$rp_new_repo" -eq 1 ]] && [[ "$rp_suggest" -eq 1 ]]; then
@@ -612,31 +650,15 @@ rp_check_release_please() {
   fi
 
   settings_json="$(rp_fetch_repo_settings "$slug")"
-  ruleset_json="$(rp_fetch_protect_main_ruleset "$slug" 2>/dev/null || true)"
-  if [[ -n "$ruleset_json" ]]; then
-    methods_json="$(rp_fetch_protect_main_merge_methods "$ruleset_json")"
-  else
-    methods_json='[]'
-  fi
 
   if [[ "$rp_apply" -eq 1 ]]; then
     if ! rp_validate_repo_settings_json "$slug" "$settings_json"; then
       rp_apply_repo_settings "$slug"
       settings_json="$(rp_fetch_repo_settings "$slug")"
     fi
-    if ! rp_validate_ruleset_methods_json "$slug" "$methods_json"; then
-      rp_apply_protect_main_squash_methods "$slug"
-      ruleset_json="$(rp_fetch_protect_main_ruleset "$slug" 2>/dev/null || true)"
-      if [[ -n "$ruleset_json" ]]; then
-        methods_json="$(rp_fetch_protect_main_merge_methods "$ruleset_json")"
-      fi
-    fi
   fi
 
   if ! rp_validate_repo_settings_json "$slug" "$settings_json"; then
-    repo_fail=1
-  fi
-  if ! rp_validate_ruleset_methods_json "$slug" "$methods_json"; then
     repo_fail=1
   fi
 
@@ -649,11 +671,59 @@ rp_check_release_please() {
   return "$repo_fail"
 }
 
+rp_check_protect_main_ruleset() {
+  local slug="$1"
+  local repo_fail=0
+  local ruleset_json methods_json
+
+  if ! rp_repo_requires_protect_main_ruleset "$slug"; then
+    return 0
+  fi
+
+  ruleset_json="$(rp_fetch_protect_main_ruleset "$slug" 2>/dev/null || true)"
+  if [[ -n "$ruleset_json" ]]; then
+    methods_json="$(rp_fetch_protect_main_merge_methods "$ruleset_json")"
+  else
+    methods_json='[]'
+  fi
+
+  if [[ "$rp_apply" -eq 1 ]]; then
+    if [[ -z "$ruleset_json" ]]; then
+      rp_apply_protect_main_create "$slug"
+      ruleset_json="$(rp_fetch_protect_main_ruleset "$slug" 2>/dev/null || true)"
+      if [[ -n "$ruleset_json" ]]; then
+        methods_json="$(rp_fetch_protect_main_merge_methods "$ruleset_json")"
+      fi
+    elif ! rp_validate_ruleset_methods_json "$slug" "$methods_json"; then
+      rp_apply_protect_main_squash_methods "$slug"
+      ruleset_json="$(rp_fetch_protect_main_ruleset "$slug" 2>/dev/null || true)"
+      if [[ -n "$ruleset_json" ]]; then
+        methods_json="$(rp_fetch_protect_main_merge_methods "$ruleset_json")"
+      fi
+    fi
+  fi
+
+  if ! rp_validate_ruleset_methods_json "$slug" "$methods_json"; then
+    repo_fail=1
+  fi
+  if ! rp_validate_graphite_bypass_json "$slug" "$ruleset_json"; then
+    repo_fail=1
+  fi
+
+  if [[ "$repo_fail" -eq 0 ]]; then
+    rp_log_ok "${slug}: protect-main ruleset (squash-only + Graphite bypass)"
+  else
+    rp_log_fail "${slug}: protect-main ruleset (see AGENTS.md; fix with --apply)"
+  fi
+
+  return "$repo_fail"
+}
+
 rp_check_graphite_merge_queue() {
   local slug="$1"
   local repo_fail=0
   local strict=0
-  local labels_json ruleset_json
+  local labels_json
 
   if ! rp_repo_has_merge_it_label "$slug"; then
     if [[ "$rp_new_repo" -eq 1 ]]; then
@@ -667,12 +737,8 @@ rp_check_graphite_merge_queue() {
   fi
 
   labels_json="$(rp_fetch_repo_labels_json "$slug")"
-  ruleset_json="$(rp_fetch_protect_main_ruleset "$slug" 2>/dev/null || true)"
 
   if ! rp_validate_graphite_enqueue_labels "$slug" "$labels_json"; then
-    repo_fail=1
-  fi
-  if ! rp_validate_graphite_bypass_json "$slug" "$ruleset_json"; then
     repo_fail=1
   fi
   if ! rp_validate_graphite_workflows "$slug" "$strict" "$labels_json"; then
@@ -716,6 +782,9 @@ rp_check_one_repo() {
   local total_fail=0
 
   if ! rp_check_release_please "$slug"; then
+    total_fail=$(( total_fail + 1 ))
+  fi
+  if ! rp_check_protect_main_ruleset "$slug"; then
     total_fail=$(( total_fail + 1 ))
   fi
   if ! rp_check_graphite_merge_queue "$slug"; then
