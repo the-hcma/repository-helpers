@@ -81,22 +81,67 @@ on_deploy_deps_npm_root() {
   fi
 }
 
+# _on_deploy_deps_python_lock_fingerprint <uv.lock> [pyproject.toml]
+# Prints a stable hash of the committed Python lock inputs.
+_on_deploy_deps_python_lock_fingerprint() {
+  local lock="$1"
+  local project="${2:-}"
+
+  if [[ -f "$project" ]]; then
+    sha256sum "$lock" "$project" | sha256sum | awk '{print $1}'
+  else
+    sha256sum "$lock" | sha256sum | awk '{print $1}'
+  fi
+}
+
+# _on_deploy_deps_python_sync_stamp_path <repo_dir> [venv_relpath]
+_on_deploy_deps_python_sync_stamp_path() {
+  printf '%s/%s/.on-deploy-uv-lock-sha\n' "$1" "${2:-.venv}"
+}
+
+# on_deploy_deps_record_python_sync_stamp <repo_dir> [venv_relpath=.venv]
+# Writes a post-sync marker so staleness checks do not re-run uv against the lockfile.
+on_deploy_deps_record_python_sync_stamp() {
+  local repo="$1"
+  local venv_rel="${2:-.venv}"
+  local lock="${repo}/uv.lock"
+  local project="${repo}/pyproject.toml"
+  local venv="${repo}/${venv_rel}"
+  local stamp fp
+
+  if [[ ! -f "$lock" || ! -d "$venv" ]]; then
+    return 0
+  fi
+  stamp="$(_on_deploy_deps_python_sync_stamp_path "$repo" "$venv_rel")"
+  fp="$(_on_deploy_deps_python_lock_fingerprint "$lock" "$project")"
+  printf '%s\n' "$fp" >"$stamp"
+}
+
 # on_deploy_deps_python_env_stale <repo_dir> [venv_relpath=.venv]
 # Returns 0 when the venv is missing or out of sync with uv.lock/pyproject.toml.
-# Uses `uv sync --frozen --check` when uv is available (directory mtimes are unreliable:
-# a successful sync often does not bump the .venv directory timestamp).
+# Prefers a post-sync stamp in .venv (uv sync --check falsely reports stale for many
+# editable local packages and must not be used as the sole signal).
 on_deploy_deps_python_env_stale() {
   local repo="$1"
   local venv_rel="${2:-.venv}"
   local lock="${repo}/uv.lock"
   local project="${repo}/pyproject.toml"
   local venv="${repo}/${venv_rel}"
-  local newest_input input_mtime venv_mtime lock_mtime
+  local stamp fp newest_input input_mtime venv_mtime lock_mtime
 
   if [[ ! -f "$lock" ]]; then
     return 1
   fi
   if [[ ! -d "$venv" ]]; then
+    return 0
+  fi
+
+  stamp="$(_on_deploy_deps_python_sync_stamp_path "$repo" "$venv_rel")"
+  fp="$(_on_deploy_deps_python_lock_fingerprint "$lock" "$project")"
+  if [[ -f "$stamp" ]]; then
+    if [[ "$(<"$stamp")" == "$fp" ]]; then
+      return 1
+    fi
     return 0
   fi
 
@@ -106,7 +151,7 @@ on_deploy_deps_python_env_stale() {
     if [[ "$check_rc" -eq 0 ]]; then
       return 1
     fi
-    if [[ "$check_out" == *"outdated"* || "$check_out" == *"Would create"* || "$check_out" == *"Would install"* ]]; then
+    if [[ "$check_out" == *"Would create project environment"* || "$check_out" == *"Would create virtual environment"* ]]; then
       return 0
     fi
   fi
@@ -129,18 +174,20 @@ on_deploy_deps_python_env_stale() {
 }
 
 # on_deploy_deps_pnpm_modules_stale <repo_dir> [npm_subdir]
-# Returns 0 when pnpm-lock.yaml/package.json is newer than node_modules or modules missing.
+# Returns 0 when pnpm-lock.yaml/package.json is out of sync with node_modules or modules missing.
+# Compares lockfiles to node_modules/.modules.yaml when present (directory mtimes are unreliable).
 # npm_subdir is empty for repo root, or e.g. "web" for repo/web/.
 on_deploy_deps_pnpm_modules_stale() {
   local repo="$1"
   local subdir="${2:-}"
-  local root lock project modules
+  local root lock project modules modules_marker
   local newest_input input_mtime modules_mtime lock_mtime
 
   root="$(on_deploy_deps_npm_root "$repo" "$subdir")"
   lock="${root}/pnpm-lock.yaml"
   project="${root}/package.json"
   modules="${root}/node_modules"
+  modules_marker="${modules}/.modules.yaml"
 
   if [[ ! -f "$project" ]]; then
     return 1
@@ -161,7 +208,11 @@ on_deploy_deps_pnpm_modules_stale() {
     fi
   fi
 
-  modules_mtime="$(stat -c '%Y' "$modules")"
+  if [[ -f "$modules_marker" ]]; then
+    modules_mtime="$(stat -c '%Y' "$modules_marker")"
+  else
+    modules_mtime="$(stat -c '%Y' "$modules")"
+  fi
   input_mtime="$(stat -c '%Y' "$newest_input")"
   if (( input_mtime > modules_mtime )); then
     return 0
@@ -170,20 +221,32 @@ on_deploy_deps_pnpm_modules_stale() {
 }
 
 # on_deploy_deps_bootstrap_python_venv <repo_dir>
-# Creates or recreates .venv when missing or broken. Uses unfrozen uv sync for bootstrap only.
+# Creates or recreates .venv when missing or broken. Never mutates uv.lock when it exists.
 on_deploy_deps_bootstrap_python_venv() {
   local repo="$1"
   local venv="${repo}/.venv"
+  local lock="${repo}/uv.lock"
 
   if [[ ! -d "$venv" ]]; then
-    echo "  .venv missing — running 'uv sync'..."
-    (cd "$repo" && uv sync)
+    if [[ -f "$lock" ]]; then
+      echo "  .venv missing — running 'uv sync --frozen'..."
+      (cd "$repo" && uv sync --frozen)
+    else
+      echo "  .venv missing — running 'uv sync'..."
+      (cd "$repo" && uv sync)
+    fi
+    on_deploy_deps_record_python_sync_stamp "$repo"
     return 0
   fi
   if [[ ! -x "${venv}/bin/python3" ]] && [[ ! -x "${venv}/bin/python" ]]; then
     echo "  .venv has no usable interpreter — recreating..."
     rm -rf "$venv"
-    (cd "$repo" && uv sync)
+    if [[ -f "$lock" ]]; then
+      (cd "$repo" && uv sync --frozen)
+    else
+      (cd "$repo" && uv sync)
+    fi
+    on_deploy_deps_record_python_sync_stamp "$repo"
   fi
 }
 
@@ -193,6 +256,7 @@ on_deploy_deps_sync_python_frozen() {
   local repo="$1"
   echo "  uv sync --frozen"
   (cd "$repo" && uv sync --frozen)
+  on_deploy_deps_record_python_sync_stamp "$repo"
 }
 
 # on_deploy_deps_install_pnpm_frozen <repo_dir> [npm_subdir]
