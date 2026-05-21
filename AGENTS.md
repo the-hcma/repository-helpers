@@ -100,12 +100,12 @@ Any repo with **`merge-it`** (Graphite merge queue) or **`release-please.yml`** 
 | `pull_request` with `allowed_merge_methods: ["squash"]` | Squash-only merges (Release Please + Graphite MQ) |
 | `bypass_actors`: Graphite App (`actor_id` **158384**, Integration, `always`) | Merge queue can land on `main` |
 
-Classic branch protection on **`main`** is also required (template: **my-tracks**). It complements the ruleset — reviews, CI, and push restrictions — while **`protect-main`** enforces squash-only merges and ruleset-level Graphite bypass.
+Classic branch protection on **`main`** is also required (org standard). It complements the ruleset — reviews, CI, and push restrictions — while **`protect-main`** enforces squash-only merges and ruleset-level Graphite bypass.
 
 | Classic setting | Value |
 | --- | --- |
 | Required reviews | CODEOWNERS (`require_code_owner_reviews`), dismiss stale; **0** GitHub approvals (Graphite owns review flow) |
-| Bypass (reviews) | **graphite-app**; **dependabot** when `dependabot.yml` exists; **thehcma** (repo owner emergency bypass) |
+| Bypass (reviews) | **graphite-app**; **dependabot** when `dependabot.yml` exists; org owner login (emergency bypass) |
 | Push restrictions | **graphite-app** only (merge queue lands on `main`) |
 | Required status checks | All `ci.yml` job contexts except `guard`, `changed-files`, `secret-scan`, `workflow-lint` |
 | Strict | `true` (branch must be up to date) |
@@ -114,7 +114,7 @@ Classic branch protection on **`main`** is also required (template: **my-tracks*
 
 Create or repair ruleset + classic settings with `scripts/check-repo-practices --repo OWNER/NAME --apply`.
 
-**`merge-mq`** is not used org-wide. Only **`my-tracks`** keeps that label (Graphite MQ wired to `merge-mq` there). Other repos use **`merge-it`** only.
+**`merge-mq`** is not the default enqueue label. Use it only when Graphite MQ for that repo is wired to **`merge-mq`**; otherwise use **`merge-it`** only.
 
 ### Branch hygiene
 
@@ -125,10 +125,10 @@ Create or repair ruleset + classic settings with `scripts/check-repo-practices -
 
 ### Merge settings and Graphite merge queue
 
-With no `--repo`, discovery includes repositories that have `release-please.yml` or a **`merge-it`** label (use `--all` to scan every org repo).
+With no `--repo`, the script audits the **current git repository** when run inside a clone (from `origin`). Outside a clone, discovery includes repositories that have `release-please.yml` or a **`merge-it`** label (use `--all` to scan every org repo).
 
 ```bash
-scripts/check-merge-settings                      # discover and audit (merge + Graphite only)
+scripts/check-merge-settings                      # current repo in a clone; else discover
 scripts/check-merge-settings --repo OWNER/NAME
 scripts/check-merge-settings --apply              # patch Release Please squash settings only
 ```
@@ -153,14 +153,14 @@ The script verifies GitHub-side wiring (not Graphite app UI settings) when a **`
 | Check | Other audited repos | This repo (`repository-helpers`) |
 | --- | --- | --- |
 | Label `merge-it` | required | required |
-| Label `merge-mq` | only **my-tracks** (when label exists on repo) | — |
+| Label `merge-mq` | required only when that label exists on the repo (MQ wired to `merge-mq`) | — |
 | `merged-pr-closer.yml` detects `graphite-app` / merge queue | required | warn if missing |
 | `ci.yml` skips `gtmq_merge_*` | required | warn if missing |
 | `dependabot-auto-merge.yml` with `merge-it` when `dependabot.yml` exists | required | warn |
 | `protect-main` bypass for Graphite App (`actor_id` **158384**) | required when `merge-it` or Release Please | warn |
-| Classic `main` protection (my-tracks template) | required when `merge-it` or Release Please | warn |
+| Classic `main` protection (org standard) | required when `merge-it` or Release Please | warn |
 
-**Manual (not checked via `gh`):** enable the repo in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue), set merge strategy to **squash**, and wire enqueue labels (`merge-it`, or `merge-mq` on **my-tracks** only).
+**Manual (not checked via `gh`):** enable the repo in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue), set merge strategy to **squash**, and wire enqueue labels (`merge-it`, or `merge-mq` when that repo uses it).
 
 ---
 
