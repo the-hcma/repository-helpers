@@ -1,26 +1,19 @@
 #!/usr/bin/env bash
 # check-merge-settings — Audit GitHub merge settings and Graphite merge-queue wiring.
 #
-# Release Please repos need squash-only merges (see fpdf/RELEASING.md). Graphite merge
-# queue repos need enqueue labels, CI gtmq skips, merged-pr-closer, and (when present)
-# protect-main bypass for the Graphite App.
+# Release Please repos need squash-only merges on main (one conventional commit per PR).
+# Graphite merge queue repos need enqueue labels, CI gtmq skips, merged-pr-closer, and
+# (when present) protect-main bypass for the Graphite App.
 #
 # Usage:
 #   scripts/check-merge-settings
-#   scripts/check-merge-settings --repo the-hcma/domesti-bot
+#   scripts/check-merge-settings --repo OWNER/NAME
 #   scripts/check-merge-settings --apply
 set -euo pipefail
 
 readonly DEFAULT_ORG='the-hcma'
 readonly GRAPHITE_APP_ACTOR_ID=158384
-readonly -a DEFAULT_REPOS=(
-  'bunnify'
-  'domesti-bot'
-  'fpdf'
-  'my-tracks'
-  'repository-helpers'
-  'tsp-maximizer'
-)
+readonly THIS_REPO_NAME='repository-helpers'
 
 org="$DEFAULT_ORG"
 apply=0
@@ -32,14 +25,15 @@ Usage:
   scripts/check-merge-settings [--org ORG] [--repo OWNER/NAME ...]
   scripts/check-merge-settings --apply [--org ORG] [--repo ...]
 
-Without --repo, audits DEFAULT_REPOS under --org (the-hcma by default).
+Without --repo, discovers org repositories that have release-please.yml or a merge-it
+label, then audits each.
 
 Release Please (when .github/workflows/release-please.yml exists):
   - squash-only repo settings; squash_merge_commit_message=BLANK
   - protect-main ruleset (if present): allowed_merge_methods is squash only
 
-Graphite merge queue (all default repos):
-  - enqueue label merge-it (my-tracks also requires merge-mq)
+Graphite merge queue (when merge-it label is present):
+  - enqueue label merge-it; merge-mq as well when that label exists on the repo
   - .github/workflows/merged-pr-closer.yml references graphite-app / merge queue
   - .github/workflows/ci.yml skips gtmq_merge_* branches (strict repos)
   - dependabot.yml implies dependabot-auto-merge.yml with merge-it (strict repos)
@@ -103,10 +97,14 @@ parse_args() {
   done
 
   if [[ "${#repo_slugs[@]}" -eq 0 ]]; then
-    local name
-    for name in "${DEFAULT_REPOS[@]}"; do
-      repo_slugs+=("${org}/${name}")
-    done
+    local slug
+    while IFS= read -r slug; do
+      [[ -n "$slug" ]] || continue
+      repo_slugs+=("$slug")
+    done < <(discover_org_audit_repos "$org")
+    if [[ "${#repo_slugs[@]}" -eq 0 ]]; then
+      die "No auditable repositories under ${org} (need merge-it label or release-please.yml)"
+    fi
   fi
 }
 
@@ -115,7 +113,36 @@ repo_short_name() {
 }
 
 is_strict_graphite_repo() {
-  [[ "$(repo_short_name "$1")" != 'repository-helpers' ]]
+  [[ "$(repo_short_name "$1")" != "$THIS_REPO_NAME" ]]
+}
+
+repo_has_merge_it_label() {
+  local slug="$1"
+  local labels_json
+  labels_json="$(fetch_repo_labels_json "$slug")"
+  jq -e 'index("merge-it") != null' >/dev/null <<<"$labels_json"
+}
+
+repo_should_audit() {
+  local slug="$1"
+  if repo_has_release_please "$slug"; then
+    return 0
+  fi
+  if repo_has_merge_it_label "$slug"; then
+    return 0
+  fi
+  return 1
+}
+
+discover_org_audit_repos() {
+  local owner="$1"
+  local slug
+  while IFS= read -r slug; do
+    [[ -n "$slug" ]] || continue
+    if repo_should_audit "${owner}/${slug}"; then
+      printf '%s\n' "${owner}/${slug}"
+    fi
+  done < <(gh api "orgs/${owner}/repos" --paginate --jq '.[].name')
 }
 
 repo_has_release_please() {
@@ -181,11 +208,10 @@ fetch_repo_labels_json() {
 }
 
 expected_enqueue_labels() {
-  local repo_name="$1"
-  if [[ "$repo_name" == 'my-tracks' ]]; then
-    printf '%s\n' 'merge-it' 'merge-mq'
-  else
-    printf '%s\n' 'merge-it'
+  local labels_json="$1"
+  printf '%s\n' 'merge-it'
+  if jq -e 'index("merge-mq") != null' >/dev/null <<<"$labels_json"; then
+    printf '%s\n' 'merge-mq'
   fi
 }
 
@@ -251,9 +277,7 @@ validate_ruleset_methods_json() {
 validate_graphite_bypass_json() {
   local slug="$1"
   local ruleset_json="$2"
-  local repo_name fail=0
 
-  repo_name="$(repo_short_name "$slug")"
   if [[ -z "$ruleset_json" ]]; then
     if is_strict_graphite_repo "$slug"; then
       log_warn "${slug}: no protect-main ruleset (Graphite MQ needs bypass for graphite-app on protect-main)"
@@ -279,9 +303,8 @@ validate_graphite_bypass_json() {
 validate_graphite_enqueue_labels() {
   local slug="$1"
   local labels_json="$2"
-  local repo_name label fail=0
+  local label fail=0
 
-  repo_name="$(repo_short_name "$slug")"
   while IFS= read -r label; do
     [[ -n "$label" ]] || continue
     if jq -e --arg name "$label" 'index($name) != null' >/dev/null <<<"$labels_json"; then
@@ -289,7 +312,7 @@ validate_graphite_enqueue_labels() {
     fi
     log_fail "${slug}: missing Graphite enqueue label '${label}' (create in GitHub; wire in Graphite MQ settings)"
     fail=1
-  done < <(expected_enqueue_labels "$repo_name")
+  done < <(expected_enqueue_labels "$labels_json")
 
   return "$fail"
 }
@@ -305,7 +328,7 @@ validate_graphite_workflows() {
       log_fail "${slug}: missing .github/workflows/merged-pr-closer.yml"
       fail=1
     else
-      log_warn "${slug}: missing merged-pr-closer.yml (optional for repository-helpers)"
+      log_warn "${slug}: missing merged-pr-closer.yml (optional for ${THIS_REPO_NAME})"
     fi
   else
     closer_text="$(fetch_github_text_file "$slug" '.github/workflows/merged-pr-closer.yml' || true)"
@@ -436,7 +459,7 @@ check_release_please() {
   if [[ "$repo_fail" -eq 0 ]]; then
     log_ok "${slug}: release-please merge settings"
   else
-    log_fail "${slug}: release-please settings (fix with --apply or see fpdf/RELEASING.md)"
+    log_fail "${slug}: release-please settings (fix with --apply; see AGENTS.md merge-settings section)"
   fi
 
   return "$repo_fail"
@@ -447,6 +470,10 @@ check_graphite_merge_queue() {
   local repo_fail=0
   local strict=0
   local labels_json ruleset_json
+
+  if ! repo_has_merge_it_label "$slug"; then
+    return 0
+  fi
 
   if is_strict_graphite_repo "$slug"; then
     strict=1
@@ -470,7 +497,7 @@ check_graphite_merge_queue() {
     printf '     Confirm MQ is enabled with squash strategy in Graphite settings for %s.\n' \
       "$(repo_short_name "$slug")" >&2
   else
-    log_fail "${slug}: Graphite merge queue setup (see domesti-bot/docs/GRAPHITE.md)"
+    log_fail "${slug}: Graphite merge queue setup (see AGENTS.md and GRAPHITE.md in this repo)"
   fi
 
   return "$repo_fail"

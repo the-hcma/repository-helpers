@@ -74,19 +74,21 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ---
 
-## Merge settings and Graphite merge queue (sibling repos)
+## Merge settings and Graphite merge queue
 
-Run **`scripts/check-merge-settings`** to audit org repos (default: `bunnify`, `domesti-bot`, `fpdf`, `my-tracks`, `repository-helpers`, `tsp-maximizer`).
+Run **`scripts/check-merge-settings`** to audit GitHub merge configuration. With no `--repo`, the script discovers org repositories that have `release-please.yml` or a **`merge-it`** label, then checks each.
 
 ```bash
-scripts/check-merge-settings                      # audit all default repos
-scripts/check-merge-settings --repo the-hcma/OWNER/NAME
+scripts/check-merge-settings                      # discover and audit under --org
+scripts/check-merge-settings --repo OWNER/NAME    # audit one repository
 scripts/check-merge-settings --apply              # patch Release Please squash settings only
 ```
 
+See [GRAPHITE.md](./GRAPHITE.md) for stacked PRs, the merge queue, and the **`merge-it`** label.
+
 ### Release Please
 
-Repositories with `/.github/workflows/release-please.yml` must use **squash merge only** on `main`. Merge commits duplicate changelog lines in release PRs (branch tip plus merge-commit body repeats the same conventional message). See [release-please#2476](https://github.com/googleapis/release-please/issues/2476) and `fpdf/RELEASING.md`.
+Repositories with `/.github/workflows/release-please.yml` must use **squash merge only** on `main`. Merge commits duplicate changelog lines in release PRs (branch tip plus merge-commit body repeats the same conventional message). See [release-please#2476](https://github.com/googleapis/release-please/issues/2476).
 
 | Setting | Value |
 | --- | --- |
@@ -99,18 +101,18 @@ Repositories with `/.github/workflows/release-please.yml` must use **squash merg
 
 ### Graphite merge queue
 
-The script verifies GitHub-side wiring (not Graphite app UI settings):
+The script verifies GitHub-side wiring (not Graphite app UI settings) when a **`merge-it`** label exists:
 
-| Check | Strict repos | `repository-helpers` |
+| Check | Other audited repos | This repo (`repository-helpers`) |
 | --- | --- | --- |
 | Label `merge-it` | required | required |
-| Label `merge-mq` | required on `my-tracks` only | — |
+| Label `merge-mq` | required when that label already exists on the repo | — |
 | `merged-pr-closer.yml` detects `graphite-app` / merge queue | required | warn if missing |
 | `ci.yml` skips `gtmq_merge_*` | required | warn if missing |
 | `dependabot-auto-merge.yml` with `merge-it` when `dependabot.yml` exists | required | warn |
 | `protect-main` bypass for Graphite App (`actor_id` **158384**) | required when ruleset exists | warn |
 
-**Manual (not checked via `gh`):** enable the repo in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue), set merge strategy to **squash**, and wire the enqueue label (`merge-it`, or `merge-mq` on `my-tracks`). See `domesti-bot/docs/GRAPHITE.md`.
+**Manual (not checked via `gh`):** enable the repo in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue), set merge strategy to **squash**, and wire enqueue labels to match the repo (`merge-it`, plus `merge-mq` when used).
 
 ---
 
@@ -192,7 +194,7 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 3. **Skip decision:** if caching “already deployed at commit X”, also call `on_deploy_deps_python_env_stale "$repo_dir"` and, when applicable, `on_deploy_deps_pnpm_modules_stale "$repo_dir" [subdir]`. Do not skip when either returns stale (exit status `0`).
 4. **Bootstrap:** `on_deploy_deps_bootstrap_python_venv "$repo_dir"` before `uv run` when the service uses uv.
 5. **Full deploy path:** `on_deploy_deps_sync_python_frozen "$repo_dir"`; `on_deploy_deps_install_pnpm_frozen "$repo_dir" [subdir]` before `pnpm run build`; then repo-specific migrations, bundles, and smoke imports.
-6. Do not invoke bare `python3` for utility work before the venv exists (see domesti-bot `docs/AGENTS.md` for the exception after `uv sync`).
+6. Do not invoke bare `python3` for utility work before the venv exists (consuming services may document an exception after `uv sync` in their own AGENTS.md).
 
 ### Library resolution order
 
