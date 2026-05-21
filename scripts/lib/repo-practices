@@ -186,9 +186,27 @@ rp_fetch_repo_labels_json() {
   gh api "repos/${slug}/labels" --jq '[.[].name]'
 }
 
+rp_repo_uses_tier2_protection() {
+  rp_repo_has_release_please "$1"
+}
+
+rp_fetch_classic_main_protection_json() {
+  local slug="$1"
+  gh api "repos/${slug}/branches/main/protection" 2>/dev/null || return 1
+}
+
+rp_classic_protection_has_graphite_bypass() {
+  local protection_json="$1"
+  jq -e '
+    [.required_pull_request_reviews.bypass_pull_request_allowances.apps // []
+     | any(.slug == "graphite-app" or .id == 158384)]
+  ' >/dev/null <<<"$protection_json"
+}
+
 rp_expected_enqueue_labels() {
   local labels_json="$1"
   printf '%s\n' 'merge-it'
+  # merge-mq is org-exceptional (my-tracks MQ wiring only)
   if jq -e 'index("merge-mq") != null' >/dev/null <<<"$labels_json"; then
     printf '%s\n' 'merge-mq'
   fi
@@ -215,8 +233,8 @@ rp_print_new_repo_checklist() {
     Run: scripts/check-repo-practices --repo ${slug} --suggest
 
     GitHub labels:
-      [ ] merge-it (Graphite merge queue enqueue)
-      [ ] merge-mq (only if using multi-partition merge queue)
+      [ ] merge-it (Graphite merge queue enqueue; default for org repos)
+      [ ] merge-mq (only my-tracks — special MQ enqueue label)
 
     Workflows under .github/workflows/:
       [ ] ci.yml with gtmq_merge_* skip in a guard job
@@ -352,9 +370,12 @@ rp_validate_ruleset_methods_json() {
 
   count="$(jq 'length' <<<"$methods_json")"
   if [[ "$count" -eq 0 ]]; then
-    rp_log_warn "${slug}: no protect-main ruleset (repo settings only; consider adding squash-only ruleset)"
-    if [[ "$rp_suggest" -eq 1 ]] && rp_repo_has_release_please "$slug"; then
-      rp_log_suggest "${slug}: add protect-main ruleset with allowed_merge_methods [squash] (see AGENTS.md)"
+    if rp_repo_uses_tier2_protection "$slug"; then
+      rp_log_fail "${slug}: tier-2 Release Please repo requires protect-main ruleset (squash-only)"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: add protect-main ruleset (see AGENTS.md tier-2 template)"
+      fi
+      return 1
     fi
     return 0
   fi
@@ -371,13 +392,20 @@ rp_validate_ruleset_methods_json() {
 rp_validate_graphite_bypass_json() {
   local slug="$1"
   local ruleset_json="$2"
+  local classic_json
 
   if [[ -z "$ruleset_json" ]]; then
+    classic_json="$(rp_fetch_classic_main_protection_json "$slug" 2>/dev/null || true)"
+    if [[ -n "$classic_json" ]] && rp_classic_protection_has_graphite_bypass "$classic_json"; then
+      return 0
+    fi
+    if rp_repo_uses_tier2_protection "$slug"; then
+      rp_log_fail "${slug}: tier-2 repo requires protect-main ruleset with Graphite App bypass"
+      return 1
+    fi
     if rp_is_strict_repo "$slug"; then
-      rp_log_warn "${slug}: no protect-main ruleset (Graphite MQ needs bypass for graphite-app)"
-      if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_suggest "${slug}: add protect-main with Graphite App (actor_id ${rp_GRAPHITE_APP_ACTOR_ID}) on bypass list"
-      fi
+      rp_log_fail "${slug}: tier-1 repo needs classic main protection bypass for graphite-app"
+      return 1
     fi
     return 0
   fi
