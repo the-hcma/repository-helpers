@@ -239,7 +239,7 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 
 1. Resolve `repo_dir` from `BASH_SOURCE[0]`; never assume `$PWD`.
 2. Load the library via `on-deploy-deps-bootstrap` (see `docs/on-deploy-deps-load.snippet` — path-resolve and `source` the bootstrap file, then `on_deploy_deps_load_library "$repo_dir"`).
-3. **Skip decision:** if caching “already deployed at commit X”, also call `on_deploy_deps_python_env_stale "$repo_dir"` and, when applicable, `on_deploy_deps_pnpm_modules_stale "$repo_dir" [subdir]`. Do not skip when either returns stale (exit status `0`).
+3. **Skip decision:** if caching “already deployed at commit X”, call **both** `on_deploy_deps_python_env_stale "$repo_dir"` and, when the repo has a `package.json` (or nested `web/package.json`), `on_deploy_deps_pnpm_modules_stale "$repo_dir" [subdir]`. Do not skip when **either** returns stale (exit status `0`) — dual-ecosystem repos must rebuild/restart if Python or Node is out of sync.
 4. **Bootstrap:** `on_deploy_deps_bootstrap_python_venv "$repo_dir"` before `uv run` when the service uses uv.
 5. **Full deploy path:** `on_deploy_deps_sync_python_frozen "$repo_dir"`; `on_deploy_deps_install_pnpm_frozen "$repo_dir" [subdir]` before `pnpm run build`; then repo-specific migrations, bundles, and smoke imports.
 6. Do not invoke bare `python3` for utility work before the venv exists (consuming services may document an exception after `uv sync` in their own AGENTS.md).
