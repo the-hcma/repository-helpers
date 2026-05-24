@@ -31,13 +31,13 @@ active login session.
 - Target repositories are git clones under the scan root (default:
   `$(dirname "$(git rev-parse --show-toplevel)")`)
 - **`curl`** for SMTP email reports
-- **`~/.config/repository-helpers/dep-updater.env`** (required; see below)
+- **`~/.config/dep-updater.env`** (required; see below)
 
 ## Email reports (SMTP)
 
 Each run executes `scripts/dep-updater-batch-run`, which:
 
-1. Loads **`~/.config/repository-helpers/dep-updater.env`** (hard failure if missing)
+1. Loads **`~/.config/dep-updater.env`** (hard failure if missing)
 2. Runs `git fetch --prune origin` on this checkout and each repository under the scan root
 3. Runs `dep-updater --batch --all` under a **deadline** (`DEP_UPDATER_BATCH_TIMEOUT`,
    default **4h**). When the limit is exceeded, `timeout(1)` stops the batch (and child
@@ -57,22 +57,20 @@ incomplete.
 Configure reporting:
 
 ```bash
-mkdir -p ~/.config/repository-helpers
-cp etc/dep-updater.env.example ~/.config/repository-helpers/dep-updater.env
-chmod 600 ~/.config/repository-helpers/dep-updater.env
-# Edit: DEP_UPDATER_SMTP_HOST, DEP_UPDATER_SMTP_USER, DEP_UPDATER_SMTP_PASSWORD,
-#       DEP_UPDATER_REPORT_TO, DEP_UPDATER_REPORT_FROM
+cp etc/dep-updater.env.example ~/.config/dep-updater.env
+chmod 600 ~/.config/dep-updater.env
+# For local sendmail, only DEP_UPDATER_SMTP_HOST=localhost is required.
 ./scripts/setup-service   # reload unit after env changes
 ```
 
 | Variable | Purpose |
 | --- | --- |
-| `DEP_UPDATER_SMTP_HOST` | SMTP server hostname |
-| `DEP_UPDATER_SMTP_PORT` | Port (default `587`) |
+| `DEP_UPDATER_SMTP_HOST` | Mail host (`localhost` uses local **sendmail**; only required setting) |
+| `DEP_UPDATER_REPORT_TO` | Report recipient (default `johndoe@example.com`) |
+| `DEP_UPDATER_REPORT_FROM` | Sender address (default `dep-updater-batch@example.com`) |
+| `DEP_UPDATER_SMTP_PORT` | Remote SMTP port (default `587`; `25` for localhost) |
 | `DEP_UPDATER_SMTP_TLS` | `starttls` (default), `ssl`, or `plain` |
-| `DEP_UPDATER_SMTP_USER` / `DEP_UPDATER_SMTP_PASSWORD` | AUTH (optional) |
-| `DEP_UPDATER_REPORT_TO` | Where to send the report |
-| `DEP_UPDATER_REPORT_FROM` | Envelope / From address |
+| `DEP_UPDATER_SMTP_USER` / `DEP_UPDATER_SMTP_PASSWORD` | Remote SMTP AUTH (optional) |
 | `DEP_UPDATER_BATCH_TIMEOUT` | Batch deadline (`4h`, `240m`, or seconds; default `4h`) |
 
 Preview a report email without running the batch (uses the same env file):
@@ -121,7 +119,7 @@ systemctl --user start dep-updater.service
 ## Change schedule or scan root
 
 Edit `etc/systemd/dep-updater.timer` (calendar) or set
-`DEP_UPDATER_BATCH_SCAN_ROOT` in `~/.config/repository-helpers/dep-updater.env` or a
+`DEP_UPDATER_BATCH_SCAN_ROOT` in `~/.config/dep-updater.env` or a
 unit override, then re-run `./scripts/setup-service`.
 
 ## Uninstall
