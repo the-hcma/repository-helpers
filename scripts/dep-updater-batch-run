@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# dep-updater-batch-run — git fetch, then dep-updater --batch --all.
+#
+# Entry point for the Dependency Updater systemd service. Fetches latest refs from
+# origin for this checkout and every git clone under the scan root before running
+# the batch updater.
+#
+# Usage:
+#   dep-updater-batch-run [--help]
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+repo_dir="$(cd "$script_dir/.." && pwd)"
+readonly repo_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/tooling-path"
+tooling_path_bootstrap_cron_minimal
+
+readonly dep_updater="${script_dir}/dep-updater"
+
+log_file="${DEP_UPDATER_BATCH_LOG:-${HOME}/scratch/repository-helpers/dep-updater-batch.log}"
+scan_root="${DEP_UPDATER_BATCH_SCAN_ROOT:-${repo_dir}/..}"
+
+usage() {
+  sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+done
+
+[[ -x "$dep_updater" ]] || die "dep-updater not found: ${dep_updater}"
+
+# batch_run_git_fetch <repo_path>
+# Fetches origin for one git checkout; warnings only on failure.
+batch_run_git_fetch() {
+  local -r git_dir="$1"
+  local name fetch_out fetch_exit
+
+  if ! git -C "$git_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 0
+  fi
+
+  name="$(basename "$git_dir")"
+  printf '[batch-run] git fetch origin (%s)…\n' "$name" >&2
+  fetch_out=""
+  fetch_exit=0
+  fetch_out="$(git -C "$git_dir" fetch --prune origin 2>&1)" || fetch_exit=$?
+  if [[ "$fetch_exit" -ne 0 ]]; then
+    printf 'WARNING: git fetch failed for %s (exit %d)\n' "$name" "$fetch_exit" >&2
+    if [[ -n "$fetch_out" ]]; then
+      printf '%s\n' "$fetch_out" >&2
+    fi
+    return 1
+  fi
+  if [[ -n "$fetch_out" ]]; then
+    printf '%s\n' "$fetch_out" >&2
+  fi
+  return 0
+}
+
+# batch_run_git_fetch_all
+# Fetches this repo and every immediate child of the scan root that is a git clone.
+batch_run_git_fetch_all() {
+  local child fetch_failures
+
+  fetch_failures=0
+  batch_run_git_fetch "$repo_dir" || fetch_failures=$(( fetch_failures + 1 ))
+
+  if [[ ! -d "$scan_root" ]]; then
+    printf 'WARNING: scan root not found: %s\n' "$scan_root" >&2
+    return "$fetch_failures"
+  fi
+
+  for child in "$scan_root"/*; do
+    [[ -d "$child" ]] || continue
+    [[ -e "$child/.git" ]] || continue
+    [[ "$child" -ef "$repo_dir" ]] && continue
+    batch_run_git_fetch "$child" || fetch_failures=$(( fetch_failures + 1 ))
+  done
+
+  return "$fetch_failures"
+}
+
+mkdir -p "$(dirname "$log_file")"
+
+batch_run_git_fetch_all || true
+
+run_exit=0
+set +e
+"$dep_updater" --batch --all --scan-root "$scan_root" 2>&1 | tee -a "$log_file"
+run_exit="${PIPESTATUS[0]}"
+set -e
+
+exit "$run_exit"

@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Tests for scripts/on-deploy (repository-helpers).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/on-deploy"
+readonly script
+
+pass=0
+fail=0
+
+printf '\n=== static: shebang and safety flags ===\n'
+if head -1 "$script" | grep -qF '#!/usr/bin/env bash'; then
+  printf '[PASS] shebang: uses #!/usr/bin/env bash\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] shebang: expected #!/usr/bin/env bash\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'set -euo pipefail' "$script"; then
+  printf '[PASS] safety-flags: set -euo pipefail present\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] safety-flags: set -euo pipefail missing\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: BASH_SOURCE repo_dir resolution ===\n'
+repo_dir_ok=0
+if grep -qF 'BASH_SOURCE[0]' "$script"; then
+  # shellcheck disable=SC2016
+  grep -qF 'repo_dir="$(cd "$script_dir/.." && pwd)"' "$script" && repo_dir_ok=1
+fi
+if [[ "$repo_dir_ok" == '1' ]]; then
+  printf '[PASS] repo-dir: resolves from BASH_SOURCE[0]\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] repo-dir: must resolve repo_dir from script location\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: exit code contract ===\n'
+if grep -qE 'exit 0$' "$script" && grep -qE 'exit 1$' "$script"; then
+  printf '[PASS] exit-codes: documents 0 changed / 1 unchanged\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] exit-codes: missing exit 0 or exit 1\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== first deploy records SHA and exits 0 ===\n'
+tmp_repo=""
+tmp_repo="$(mktemp -d)"
+git -C "$tmp_repo" init -q
+git -C "$tmp_repo" remote add origin "https://github.com/the-hcma/repository-helpers.git"
+git -C "$tmp_repo" config user.email "test@example.com"
+git -C "$tmp_repo" config user.name "Test"
+printf 'x\n' > "${tmp_repo}/README.md"
+git -C "$tmp_repo" add README.md
+git -C "$tmp_repo" commit -q -m "init"
+
+sha_scratch="${tmp_repo}/scratch"
+mkdir -p "${tmp_repo}/scripts"
+cp "$script" "${tmp_repo}/scripts/on-deploy"
+chmod +x "${tmp_repo}/scripts/on-deploy"
+
+first_out=""
+first_exit=0
+first_out="$(
+  HOME="${tmp_repo}" \
+  bash "${tmp_repo}/scripts/on-deploy" 2>&1
+)" || first_exit=$?
+
+# on-deploy uses HOME/scratch/<service>/on-deploy-sha
+sha_file="${sha_scratch}/repository-helpers/on-deploy-sha"
+if [[ "$first_exit" -eq 0 ]] \
+  && [[ -f "$sha_file" ]] \
+  && grep -qF 'Recorded deploy' <<<"$first_out"; then
+  printf '[PASS] first-run: exit 0 and wrote on-deploy-sha\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] first-run: expected exit 0 and sha file (exit=%s)\n' "$first_exit"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== second deploy with same SHA exits 1 ===\n'
+second_out=""
+second_exit=0
+second_out="$(
+  HOME="${tmp_repo}" \
+  bash "${tmp_repo}/scripts/on-deploy" 2>&1
+)" || second_exit=$?
+
+if [[ "$second_exit" -eq 1 ]] && grep -qF 'Already deployed' <<<"$second_out"; then
+  printf '[PASS] second-run: exit 1 when SHA unchanged\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] second-run: expected exit 1 (exit=%s)\n' "$second_exit"
+  fail=$(( fail + 1 ))
+fi
+
+rm -rf "$tmp_repo"
+
+printf '\n=== static: systemd unit templates ===\n'
+svc="${script_dir}/../etc/systemd/dep-updater.service"
+timer="${script_dir}/../etc/systemd/dep-updater.timer"
+if [[ -f "$svc" ]] \
+  && grep -qF 'Type=oneshot' "$svc" \
+  && grep -qF 'Description=Dependency Updater' "$svc" \
+  && grep -qF 'dep-updater-batch-run' "$svc"; then
+  printf '[PASS] service-unit: Dependency Updater oneshot via batch-run\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] service-unit: missing or incorrect dep-updater.service\n'
+  fail=$(( fail + 1 ))
+fi
+
+if [[ -f "$timer" ]] && grep -qF 'OnCalendar=' "$timer" \
+  && grep -qF 'Unit=dep-updater.service' "$timer"; then
+  printf '[PASS] timer-unit: daily calendar triggers dep-updater.service\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] timer-unit: missing or incorrect dep-updater.timer\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== results ===\n'
+printf 'Passed: %d  Failed: %d\n' "$pass" "$fail"
+test_summary

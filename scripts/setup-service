@@ -22,11 +22,20 @@ readonly repo_dir
 gh_remote="$(git -C "$repo_dir" remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||')"
 service_name="${gh_remote##*/}"
 readonly service_name
-service_filename="${service_name}.service"
+unit_basename="$service_name"
+if [[ -f "${repo_dir}/etc/systemd/dep-updater.service" ]]; then
+    unit_basename="dep-updater"
+fi
+readonly unit_basename
+service_filename="${unit_basename}.service"
 readonly service_filename
 readonly source_service="${repo_dir}/etc/systemd/${service_filename}"
+timer_filename="${unit_basename}.timer"
+readonly timer_filename
+source_timer="${repo_dir}/etc/systemd/${timer_filename}"
 readonly target_dir="${HOME}/.config/systemd/user"
 readonly target_service="${target_dir}/${service_filename}"
+target_timer="${target_dir}/${timer_filename}"
 log_dir="${HOME}/scratch/${service_name}"
 readonly log_dir
 kernel_name="$(uname -s)"
@@ -67,6 +76,48 @@ generate_service_unit() {
         )"
     fi
     printf '%s' "$generated"
+}
+
+# generate_timer_unit
+# Substitute @@REPO_DIR@@ in the timer template (no DEPLOYED_COMMIT injection).
+generate_timer_unit() {
+    sed "s|@@REPO_DIR@@|${repo_dir}|g" "$source_timer"
+}
+
+# service_unit_is_oneshot [unit_file]
+# True when Type=oneshot (timer-driven jobs stay idle between runs).
+service_unit_is_oneshot() {
+    local unit_path="${1:-$target_service}"
+    [[ -f "$unit_path" ]] && grep -qE '^Type=oneshot([[:space:]]|$)' "$unit_path"
+}
+
+# service_display_label
+# Human-readable name from the unit Description= line, else service_name.
+service_display_label() {
+    local label
+    label=""
+    if [[ -f "$source_service" ]]; then
+        label="$(grep -m1 '^Description=' "$source_service" 2>/dev/null | sed 's/^Description=//' || true)"
+    fi
+    if [[ -z "$label" ]]; then
+        label="$service_name"
+    fi
+    printf '%s\n' "$label"
+}
+
+# remove_stale_timer_unit
+# Disables and removes an installed timer when the repo no longer ships a .timer template.
+remove_stale_timer_unit() {
+    if [[ -f "$source_timer" ]]; then
+        return 1
+    fi
+    if [[ ! -f "$target_timer" ]]; then
+        return 1
+    fi
+    echo "🗑️  Removing timer (no template at ${source_timer})..."
+    systemctl --user disable --now "$timer_filename" 2>/dev/null || true
+    rm -f "$target_timer"
+    return 0
 }
 
 # read_deployed_commit_from_pid <main_pid>
@@ -255,8 +306,22 @@ check_status() {
     fi
 
     local all_good=true
-    echo "🔍 Verifying ${service_name} service configuration..."
+    local is_oneshot=false
+    local has_timer=false
+    local display_name
+    display_name="$(service_display_label)"
+    echo "🔍 Verifying ${display_name} service configuration..."
     echo "----------------------------------------"
+
+    if [[ -f "$source_timer" ]]; then
+        has_timer=true
+    fi
+    if [[ -f "$target_service" ]] && service_unit_is_oneshot "$target_service"; then
+        is_oneshot=true
+    elif [[ -f "$source_service" ]] \
+        && grep -qE '^Type=oneshot([[:space:]]|$)' <(sed "s|@@REPO_DIR@@|${repo_dir}|g" "$source_service"); then
+        is_oneshot=true
+    fi
 
     # 1. Check service file is installed and up to date
     if [[ ! -f "$target_service" ]]; then
@@ -282,7 +347,13 @@ check_status() {
     fi
 
     # 3. Check Systemd Service Status
-    if systemctl --user is-active "${service_filename}" > /dev/null 2>&1; then
+    if [[ "$is_oneshot" == "true" ]]; then
+        if [[ "$has_timer" == "true" ]]; then
+            echo "✅ Active:   Oneshot (idle until timer runs)"
+        else
+            echo "✅ Active:   Oneshot (start manually when needed)"
+        fi
+    elif systemctl --user is-active "${service_filename}" > /dev/null 2>&1; then
         echo "✅ Active:   Running"
     else
         echo "❌ Active:   Inactive (Stopped)"
@@ -290,13 +361,42 @@ check_status() {
     fi
 
     if systemctl --user is-enabled "${service_filename}" > /dev/null 2>&1; then
-        echo "✅ Enabled:  Auto-start is active"
+        echo "✅ Enabled:  Service unit enabled"
     else
-        echo "❌ Enabled:  Auto-start is disabled"
+        echo "❌ Enabled:  Service unit disabled"
         all_good=false
     fi
 
-    print_running_commit
+    if [[ "$has_timer" == "true" ]]; then
+        if [[ ! -f "$target_timer" ]]; then
+            echo "❌ Timer:    Not installed (Run setup to install it)"
+            all_good=false
+        elif diff --brief <(generate_timer_unit) "$target_timer" > /dev/null 2>&1; then
+            echo "✅ Timer:    Up to date ($target_timer)"
+        else
+            echo "❌ Timer:    Outdated (Run setup to update it)"
+            all_good=false
+        fi
+        if systemctl --user is-enabled "${timer_filename}" > /dev/null 2>&1; then
+            echo "✅ Timer:    Enabled (daily schedule)"
+        else
+            echo "❌ Timer:    Disabled"
+            all_good=false
+        fi
+        local timer_line
+        timer_line="$(
+            systemctl --user list-timers "${timer_filename}" --no-pager 2>/dev/null \
+                | awk 'NR==2 { print $1, $2, $3, $4, $5 }' \
+                || true
+        )"
+        if [[ -n "$timer_line" ]]; then
+            echo "   Next run:  ${timer_line}"
+        fi
+    fi
+
+    if [[ "$is_oneshot" != "true" ]]; then
+        print_running_commit
+    fi
 
     # 4. Show how the service is invoked
     local unit_text exec_start exec_post args port log_file
@@ -319,7 +419,7 @@ check_status() {
 
     echo "----------------------------------------"
     if $all_good; then
-        echo "✨ Everything looks good! ${service_name} is correctly configured."
+        echo "✨ Everything looks good! ${display_name} is correctly configured."
         return 0
     else
         echo "⚠️  Some issues were found. Run ./scripts/setup-service to fix them."
@@ -375,7 +475,8 @@ run_on_deploy_hook() {
 }
 
 # Main installation flow
-echo "Setting up ${service_name} systemd service..."
+display_name="$(service_display_label)"
+echo "Setting up ${display_name} systemd service..."
 
 # 1. Verify source service file exists
 if [[ ! -f "$source_service" ]]; then
@@ -479,15 +580,54 @@ if [[ "$deploy_refresh_needed" == "1" ]]; then
     code_changed=true
 fi
 
-# 7. Reload daemon only if service file changed
-if [[ "$service_changed" == "true" ]]; then
+timer_changed=false
+if remove_stale_timer_unit; then
+    timer_changed=true
+fi
+if [[ -f "$source_timer" ]]; then
+    generated_timer="$(generate_timer_unit)"
+    if [[ ! -f "$target_timer" ]]; then
+        printf '%s' "$generated_timer" > "$target_timer"
+        timer_changed=true
+        echo "✅ Timer file generated: $target_timer"
+    elif ! diff --brief <(printf '%s' "$generated_timer") "$target_timer" > /dev/null 2>&1; then
+        printf '%s' "$generated_timer" > "$target_timer"
+        timer_changed=true
+        echo "🔄 Timer file changed. Updating..."
+    else
+        echo "✅ Timer file unchanged: $target_timer"
+    fi
+fi
+
+# 7. Reload daemon when unit files changed
+if [[ "$service_changed" == "true" || "$timer_changed" == "true" ]]; then
     echo "🔄 Reloading systemd user daemon..."
     systemctl --user daemon-reload
 fi
 
-# 8. Always ensure the service is enabled and running
+is_oneshot=false
+if [[ -f "$target_service" ]] && service_unit_is_oneshot "$target_service"; then
+    is_oneshot=true
+fi
+
+# 8. Enable service (and timer when present); start/restart long-running units only
 systemctl --user enable "$service_filename"
-if [[ "$service_changed" == "true" ]]; then
+if [[ -f "$source_timer" ]]; then
+    echo "⏰ Enabling daily timer: ${timer_filename}"
+    systemctl --user enable --now "$timer_filename"
+fi
+
+if [[ "$is_oneshot" == "true" && -f "$source_timer" ]]; then
+    if [[ "$service_changed" == "true" || "$timer_changed" == "true" ]]; then
+        echo "⏭️  Oneshot service — runs on timer schedule (not started now)."
+    elif [[ "$code_changed" == "true" ]]; then
+        echo "⏭️  Scripts updated; next batch run uses new code on timer schedule."
+    else
+        echo "⏭️  Oneshot service — idle until next timer run."
+    fi
+elif [[ "$is_oneshot" == "true" ]]; then
+    echo "⏭️  Oneshot service — no timer unit; start manually with systemctl --user start ${service_filename}"
+elif [[ "$service_changed" == "true" ]]; then
     echo "🔄 Restarting ${service_filename} (config changed)..."
     systemctl_user_or_fail restart "$service_filename" || exit 1
 elif [[ "$code_changed" == "true" ]]; then
@@ -505,5 +645,5 @@ else
 fi
 
 echo ""
-echo "✨ ${service_name} service successfully configured!"
+echo "✨ ${display_name} service successfully configured!"
 check_status
