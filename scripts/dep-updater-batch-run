@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# dep-updater-batch-run — git fetch, then dep-updater --batch --all.
+# dep-updater-batch-run — git fetch, dep-updater --batch --all, SMTP report.
 #
-# Entry point for the Dependency Updater systemd service. Fetches latest refs from
-# origin for this checkout and every git clone under the scan root before running
-# the batch updater.
+# Entry point for the Dependency Updater systemd service. Requires
+# ~/.config/repository-helpers/dep-updater.env (see etc/dep-updater.env.example).
 #
 # Usage:
-#   dep-updater-batch-run [--help]
+#   dep-updater-batch-run [--print]
+#   dep-updater-batch-run --help
+#
+# Options:
+#   --print   Build the report and write the email to stdout (no SMTP, no batch).
+#   --help    Show usage.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,13 +22,30 @@ readonly repo_dir
 source "${script_dir}/lib/tooling-path"
 tooling_path_bootstrap_cron_minimal
 
+# shellcheck disable=SC1091
+source "${script_dir}/lib/smtp-mail"
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/email-multipart"
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/time-log"
+
 readonly dep_updater="${script_dir}/dep-updater"
+readonly subject_prefix="${DEP_UPDATER_REPORT_SUBJECT_PREFIX:-[dep-updater-batch]}"
+readonly report_separator='────────────────────────────────────────────────────────────────'
+readonly batch_timeout_default='4h'
+readonly batch_timeout_kill_after_sec=30
+
+env_file="${DEP_UPDATER_ENV_FILE:-${HOME}/.config/repository-helpers/dep-updater.env}"
+
+print_only=0
 
 log_file="${DEP_UPDATER_BATCH_LOG:-${HOME}/scratch/repository-helpers/dep-updater-batch.log}"
 scan_root="${DEP_UPDATER_BATCH_SCAN_ROOT:-${repo_dir}/..}"
 
 usage() {
-  sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -32,8 +53,151 @@ die() {
   exit 2
 }
 
+# batch_load_required_env_file
+# Sources the mandatory dep-updater.env file (systemd EnvironmentFile uses the same path).
+batch_load_required_env_file() {
+  if [[ "${REPO_HELPERS_TEST_MODE:-0}" == '1' && "${DEP_UPDATER_BATCH_SKIP_ENV_FILE:-0}" == '1' ]]; then
+    return 0
+  fi
+  if [[ ! -f "$env_file" ]]; then
+    die "Missing required env file: ${env_file} (copy etc/dep-updater.env.example and configure SMTP)."
+  fi
+  if [[ ! -r "$env_file" ]]; then
+    die "Env file is not readable: ${env_file}"
+  fi
+  set -a
+  # shellcheck source=/dev/null
+  source "$env_file"
+  set +a
+}
+
+# batch_timeout_to_sec <spec>
+# Plain seconds or a suffix: 90s, 30m, 4h (case-insensitive).
+batch_timeout_to_sec() {
+  local -r raw="$1"
+  local value unit
+
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$raw"
+    return 0
+  fi
+
+  if [[ "$raw" =~ ^([0-9]+)([smh])$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      s) printf '%s\n' "$value"; return 0 ;;
+      m) printf '%s\n' $(( value * 60 )); return 0 ;;
+      h) printf '%s\n' $(( value * 3600 )); return 0 ;;
+    esac
+  fi
+
+  die "Invalid DEP_UPDATER_BATCH_TIMEOUT: ${raw} (use seconds or Ns/Nm/Nh)"
+}
+
+# batch_format_duration <seconds>
+# Formats elapsed seconds for WAIT_TIMEOUT lines (e.g. 20m 0s, 4h 5m 3s).
+batch_format_duration() {
+  local -r sec="$1"
+  local hours mins
+
+  if (( sec < 60 )); then
+    printf '%ss' "$sec"
+    return 0
+  fi
+  if (( sec < 3600 )); then
+    printf '%dm %ss' $(( sec / 60 )) $(( sec % 60 ))
+    return 0
+  fi
+  hours=$(( sec / 3600 ))
+  mins=$(( (sec % 3600) / 60 ))
+  printf '%dh %dm %ss' "$hours" "$mins" $(( sec % 60 ))
+}
+
+# batch_format_timeout_label <seconds>
+# Compact timeout label for WAIT_TIMEOUT (e.g. 4h, 90m).
+batch_format_timeout_label() {
+  local -r sec="$1"
+
+  if (( sec >= 3600 && sec % 3600 == 0 )); then
+    printf '%dh' $(( sec / 3600 ))
+    return 0
+  fi
+  if (( sec >= 60 && sec % 60 == 0 )); then
+    printf '%dm' $(( sec / 60 ))
+    return 0
+  fi
+  printf '%ss' "$sec"
+}
+
+# batch_emit_wait_timeout <elapsed_sec> <limit_sec> [run_log]
+# Logs a machine-parseable WAIT_TIMEOUT line to stderr, the batch log, and run_log.
+batch_emit_wait_timeout() {
+  local -r elapsed_sec="$1"
+  local -r limit_sec="$2"
+  local -r run_log="${3:-}"
+  local elapsed_fmt limit_fmt line
+
+  elapsed_fmt="$(batch_format_duration "$elapsed_sec")"
+  limit_fmt="$(batch_format_timeout_label "$limit_sec")"
+  line="ERROR: WAIT_TIMEOUT batch-run waited=${elapsed_fmt} timeout=${limit_fmt}"
+  printf '%s\n' "$line" >&2
+  printf '%s\n' "$line" >>"$log_file"
+  if [[ -n "$run_log" ]]; then
+    printf '%s\n' "$line" >>"$run_log"
+  fi
+}
+
+# batch_run_dep_updater_with_deadline <run_log>
+# Runs dep-updater under timeout(1); returns exit code (124 = deadline exceeded).
+batch_run_dep_updater_with_deadline() {
+  local -r run_log="$1"
+  local timeout_sec timeout_spec batch_start batch_end elapsed_sec dep_exit
+
+  if ! command -v timeout >/dev/null 2>&1; then
+    die "timeout(1) is required for batch deadline enforcement but was not found in PATH."
+  fi
+
+  timeout_spec="${DEP_UPDATER_BATCH_TIMEOUT:-$batch_timeout_default}"
+  timeout_sec="$(batch_timeout_to_sec "$timeout_spec")"
+  if (( timeout_sec < 1 )); then
+    die "DEP_UPDATER_BATCH_TIMEOUT must be at least 1 second (got: ${timeout_spec})"
+  fi
+
+  batch_start="$(time_log_now_utc_epoch)"
+  set +e
+  # Do not pipe timeout(1): tee keeps the pipeline open and delays SIGTERM until the child exits.
+  timeout --foreground --kill-after="${batch_timeout_kill_after_sec}" "${timeout_sec}s" \
+    "$dep_updater" --batch --all --scan-root "$scan_root" \
+    >"$run_log" 2>&1
+  dep_exit=$?
+  set -e
+  cat "$run_log" >>"$log_file"
+
+  if [[ "$dep_exit" -eq 124 ]]; then
+    batch_end="$(time_log_now_utc_epoch)"
+    elapsed_sec=$(( batch_end - batch_start ))
+    batch_emit_wait_timeout "$elapsed_sec" "$timeout_sec" "$run_log"
+    return 124
+  fi
+
+  return "$dep_exit"
+}
+
+# batch_require_smtp_config
+# Verifies SMTP and report addresses after the env file is loaded.
+batch_require_smtp_config() {
+  if ! repo_helpers_smtp_configured; then
+    die "Incomplete SMTP config in ${env_file} — set DEP_UPDATER_SMTP_HOST, DEP_UPDATER_REPORT_TO, and DEP_UPDATER_REPORT_FROM."
+  fi
+  if [[ "${REPO_HELPERS_TEST_MODE:-0}" != '1' ]] && ! command -v curl >/dev/null 2>&1; then
+    die "curl is required for SMTP reporting but was not found in PATH."
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --print) print_only=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1" ;;
   esac
@@ -41,8 +205,10 @@ done
 
 [[ -x "$dep_updater" ]] || die "dep-updater not found: ${dep_updater}"
 
+batch_load_required_env_file
+batch_require_smtp_config
+
 # batch_run_git_fetch <repo_path>
-# Fetches origin for one git checkout; warnings only on failure.
 batch_run_git_fetch() {
   local -r git_dir="$1"
   local name fetch_out fetch_exit
@@ -70,7 +236,6 @@ batch_run_git_fetch() {
 }
 
 # batch_run_git_fetch_all
-# Fetches this repo and every immediate child of the scan root that is a git clone.
 batch_run_git_fetch_all() {
   local child fetch_failures
 
@@ -92,14 +257,191 @@ batch_run_git_fetch_all() {
   return "$fetch_failures"
 }
 
+# batch_report_strip_ansi <file>
+batch_report_strip_ansi() {
+  local -r in_file="$1"
+  sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' "$in_file" 2>/dev/null || cat "$in_file"
+}
+
+# batch_report_repo_name_from_parens <parens_content>
+# Extracts a display name from "(path)" or "(name (12s))" log fragments.
+batch_report_repo_name_from_parens() {
+  local -r raw="$1"
+  local inner
+  inner="${raw#(}"
+  inner="${inner%%)*}"
+  basename "$inner"
+}
+
+# batch_report_build <clean_log> <exit_code> <started_at> <finished_at>
+# Builds a notifier-style plain-text report body.
+batch_report_build() {
+  local -r clean_log="$1"
+  local -r run_exit="$2"
+  local -r started_at="$3"
+  local -r finished_at="$4"
+  local host repo_line ok_lines fail_lines summary_lines body_lines
+  local ok_count fail_count entry sline repo_name
+
+  host="$(hostname -s 2>/dev/null || echo unknown)"
+  ok_lines=()
+  fail_lines=()
+  while IFS= read -r repo_line; do
+    [[ -n "$repo_line" ]] || continue
+    ok_lines+=("$repo_line")
+  done < <(rg -o '\[batch-all\] OK \([^)]+\)' "$clean_log" 2>/dev/null \
+    | sed 's/^\[batch-all\] OK //' || true)
+  while IFS= read -r repo_line; do
+    [[ -n "$repo_line" ]] || continue
+    fail_lines+=("$repo_line")
+  done < <(rg -o '\[batch-all\] FAILED \([^)]+\) exit [0-9]+' "$clean_log" 2>/dev/null \
+    | sed 's/^\[batch-all\] FAILED //' || true)
+
+  ok_count=${#ok_lines[@]}
+  fail_count=${#fail_lines[@]}
+
+  body_lines=()
+  if rg -qF 'ERROR: WAIT_TIMEOUT batch-run' "$clean_log" 2>/dev/null; then
+    body_lines+=("The Dependency Updater batch run exceeded its deadline and was stopped.")
+    body_lines+=("Child processes were terminated; no batch job should remain running.")
+  elif (( run_exit == 0 && fail_count == 0 )); then
+    body_lines+=("The Dependency Updater batch run completed successfully (${ok_count} repositories).")
+  elif (( fail_count > 0 )); then
+    body_lines+=("The Dependency Updater batch run finished with failures.")
+    body_lines+=("See each repository section below for details.")
+  else
+    body_lines+=("The Dependency Updater batch run exited with an error.")
+    body_lines+=("See the log excerpt below.")
+  fi
+  body_lines+=("")
+  body_lines+=("Finished:  ${finished_at}")
+  body_lines+=("Started:   ${started_at}")
+  body_lines+=("Host:      ${host}  (user: $(id -un 2>/dev/null || echo '?'))")
+  body_lines+=("Script:    ${BASH_SOURCE[0]}")
+  body_lines+=("dep-updater: ${dep_updater}")
+  body_lines+=("Scan root: ${scan_root}")
+  body_lines+=("Log file:  ${log_file}")
+  body_lines+=("")
+  body_lines+=("$report_separator")
+  body_lines+=("")
+
+  for entry in "${ok_lines[@]}"; do
+    repo_name="$(batch_report_repo_name_from_parens "$entry")"
+    body_lines+=("=== ${repo_name} ===")
+    body_lines+=("")
+    body_lines+=("  Status: OK ${entry}")
+    body_lines+=("")
+  done
+
+  for entry in "${fail_lines[@]}"; do
+    repo_name="$(batch_report_repo_name_from_parens "$entry")"
+    body_lines+=("=== ${repo_name} ===")
+    body_lines+=("")
+    body_lines+=("  Status: FAILED ${entry}")
+    body_lines+=("")
+  done
+
+  summary_lines=()
+  while IFS= read -r repo_line; do
+    [[ -n "$repo_line" ]] || continue
+    summary_lines+=("$repo_line")
+  done < <(rg '\[batch-all\] (Failure summary|Failure details|   |Root cause|Finished with|All repos completed)' \
+    "$clean_log" 2>/dev/null | sed -E 's/^[0-9]+://' | tail -n 40 || true)
+
+  if [[ ${#summary_lines[@]} -gt 0 ]]; then
+    body_lines+=("Run summary:")
+    body_lines+=("")
+    for sline in "${summary_lines[@]}"; do
+      body_lines+=("  ${sline}")
+    done
+    body_lines+=("")
+  fi
+
+  if (( run_exit != 0 )); then
+    body_lines+=("--- last 80 lines of log ---")
+    body_lines+=("")
+    while IFS= read -r sline || [[ -n "$sline" ]]; do
+      body_lines+=("  ${sline}")
+    done < <(tail -n 80 "$clean_log" 2>/dev/null || true)
+    body_lines+=("")
+  fi
+
+  body_lines+=("$report_separator")
+  body_lines+=("")
+  body_lines+=("Full log:  ${log_file}")
+
+  printf '%s\n' "${body_lines[@]}"
+}
+
+# batch_report_send_email <subject> <body>
+batch_report_send_email() {
+  local -r subject="$1"
+  local -r body="$2"
+  local from_addr to_addr reply_to
+
+  from_addr="${DEP_UPDATER_REPORT_FROM}"
+  to_addr="${DEP_UPDATER_REPORT_TO}"
+  reply_to="${DEP_UPDATER_REPORT_REPLY_TO:-$from_addr}"
+
+  repo_helpers_email_write_multipart "$to_addr" "$from_addr" "$reply_to" "$subject" "$body" \
+    'dep-updater-batch' \
+    | repo_helpers_smtp_send "$from_addr" "$to_addr"
+}
+
+run_exit=0
+started_at=""
+finished_at=""
+body=""
+subject=""
+clean_log=""
+
+started_at="$(date '+%Y-%m-%d %H:%M %z %Z')"
+
+if (( print_only == 1 )); then
+  clean_log="$(mktemp)"
+  # shellcheck disable=SC2016
+  printf '[batch-all] OK (demo-repo) (12s)\n[batch-all] All repos completed successfully.\n' >"$clean_log"
+  run_exit=0
+  finished_at="$(date '+%Y-%m-%d %H:%M %z %Z')"
+  body="$(batch_report_build "$clean_log" "$run_exit" "$started_at" "$finished_at")"
+  subject="${subject_prefix} success (demo)"
+  rm -f "$clean_log"
+  repo_helpers_email_write_multipart "${DEP_UPDATER_REPORT_TO}" "${DEP_UPDATER_REPORT_FROM}" \
+    "${DEP_UPDATER_REPORT_REPLY_TO:-${DEP_UPDATER_REPORT_FROM}}" "$subject" "$body" \
+    'dep-updater-batch'
+  exit 0
+fi
+
 mkdir -p "$(dirname "$log_file")"
 
 batch_run_git_fetch_all || true
 
+run_log="$(mktemp)"
+clean_log="$(mktemp)"
+
 run_exit=0
-set +e
-"$dep_updater" --batch --all --scan-root "$scan_root" 2>&1 | tee -a "$log_file"
-run_exit="${PIPESTATUS[0]}"
-set -e
+batch_run_dep_updater_with_deadline "$run_log" || run_exit=$?
+
+batch_report_strip_ansi "$run_log" >"$clean_log"
+rm -f "$run_log"
+
+finished_at="$(date '+%Y-%m-%d %H:%M %z %Z')"
+body="$(batch_report_build "$clean_log" "$run_exit" "$started_at" "$finished_at")"
+rm -f "$clean_log"
+
+if (( run_exit == 0 )); then
+  subject="${subject_prefix} batch completed successfully"
+elif (( run_exit == 124 )); then
+  subject="${subject_prefix} batch TIMEOUT (deadline exceeded)"
+else
+  subject="${subject_prefix} batch FAILED (exit ${run_exit})"
+fi
+
+if batch_report_send_email "$subject" "$body"; then
+  printf 'Sent batch report to %s via %s\n' \
+    "${DEP_UPDATER_REPORT_TO}" "${DEP_UPDATER_SMTP_HOST}" >&2
+else
+  die "SMTP send failed (host=${DEP_UPDATER_SMTP_HOST})"
+fi
 
 exit "$run_exit"

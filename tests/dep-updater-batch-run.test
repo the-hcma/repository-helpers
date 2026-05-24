@@ -11,23 +11,71 @@ test_init
 
 script="${script_dir}/../scripts/dep-updater-batch-run"
 readonly script
+unit="${script_dir}/../etc/systemd/dep-updater.service"
+readonly unit
 
 pass=0
 fail=0
 
+write_test_env_file() {
+  local -r dir="$1"
+  mkdir -p "${dir}/.config/repository-helpers"
+  cat >"${dir}/.config/repository-helpers/dep-updater.env" <<'EOF'
+DEP_UPDATER_SMTP_HOST=smtp.test
+DEP_UPDATER_REPORT_TO=hcma@example.com
+DEP_UPDATER_REPORT_FROM=batch@example.com
+EOF
+}
+
+printf '\n=== static: mandatory env file ===\n'
+if grep -qF 'batch_load_required_env_file' "$script" \
+  && grep -qF 'Missing required env file' "$script" \
+  && grep -qF 'EnvironmentFile=%h/.config/repository-helpers/dep-updater.env' "$unit" \
+  && ! grep -qF 'EnvironmentFile=-%h' "$unit"; then
+  printf '[PASS] env-file: script and unit require dep-updater.env\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] env-file: expected mandatory EnvironmentFile and batch_load_required_env_file\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: notifier-style email ===\n'
+if grep -qF 'lib/email-multipart' "$script" \
+  && grep -qF 'repo_helpers_email_write_multipart' "$script" \
+  && grep -qF 'Finished:' "$script" \
+  && grep -qF 'report_separator' "$script"; then
+  printf '[PASS] email: uses shared multipart layout like notifier\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] email: missing notifier-style multipart email wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== static: git fetch before batch ===\n'
 if grep -qF 'batch_run_git_fetch' "$script" \
   && grep -qF 'fetch --prune origin' "$script" \
-  && grep -qF 'dep-updater --batch --all' "$script"; then
-  printf '[PASS] batch-run: fetches origin then runs batch-all\n'
+  && grep -qF 'batch_run_dep_updater_with_deadline' "$script"; then
+  printf '[PASS] batch-run: fetches origin then runs batch-all under deadline\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] batch-run: missing git fetch or batch-all invocation\n'
+  printf '[FAIL] batch-run: missing git fetch or deadline-wrapped batch-all\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: batch deadline and WAIT_TIMEOUT ===\n'
+if grep -qF 'batch_timeout_to_sec' "$script" \
+  && grep -qF 'ERROR: WAIT_TIMEOUT batch-run' "$script" \
+  && grep -qF 'timeout --foreground' "$script" \
+  && grep -qF 'TimeoutStartSec=' "$unit" \
+  && grep -qF 'KillMode=control-group' "$unit"; then
+  printf '[PASS] deadline: script timeout + systemd cgroup kill safety net\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] deadline: expected batch timeout, WAIT_TIMEOUT, and unit limits\n'
   fail=$(( fail + 1 ))
 fi
 
 printf '\n=== static: Dependency Updater unit ===\n'
-unit="${script_dir}/../etc/systemd/dep-updater.service"
 if [[ -f "$unit" ]] \
   && grep -qF 'Description=Dependency Updater' "$unit" \
   && grep -qF 'dep-updater-batch-run' "$unit"; then
@@ -38,16 +86,138 @@ else
   fail=$(( fail + 1 ))
 fi
 
-printf '\n=== static: fetches git clones under scan root ===\n'
-if grep -qF 'batch_run_git_fetch_all' "$script" \
-  && grep -qF '.git' "$script" \
-  && grep -qF 'scan_root' "$script"; then
-  printf '[PASS] batch-run: batch_run_git_fetch_all walks scan_root children\n'
+printf '\n=== missing env file exits non-zero ===\n'
+missing_home=""
+missing_home="$(mktemp -d)"
+missing_out=""
+missing_exit=0
+missing_out="$(
+  HOME="$missing_home" bash "$script" 2>&1
+)" || missing_exit=$?
+rm -rf "$missing_home"
+if [[ "$missing_exit" -ne 0 ]] && grep -qF 'Missing required env file' <<<"$missing_out"; then
+  printf '[PASS] missing-env: hard failure when env file absent\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] batch-run: missing scan_root fetch loop\n'
+  printf '[FAIL] missing-env: expected die on missing env (exit=%s)\n' "$missing_exit"
   fail=$(( fail + 1 ))
 fi
+
+printf '\n=== --print builds notifier-style report ===\n'
+print_tmp=""
+print_tmp="$(mktemp -d)"
+write_test_env_file "$print_tmp"
+print_out=""
+print_exit=0
+print_out="$(
+  HOME="$print_tmp" bash "$script" --print 2>/dev/null
+)" || print_exit=$?
+rm -rf "$print_tmp"
+if [[ "$print_exit" -eq 0 ]] \
+  && grep -qF 'Finished:' <<<"$print_out" \
+  && grep -qF '=== demo-repo ===' <<<"$print_out" \
+  && grep -qF 'multipart/alternative' <<<"$print_out"; then
+  printf '[PASS] print: notifier-style multipart email on stdout\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] print: expected Finished/===/multipart output (exit=%s)\n' "$print_exit"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== mock batch sends SMTP report on failure ===\n'
+tmp=""
+tmp="$(mktemp -d)"
+write_test_env_file "$tmp"
+mkdir -p "$tmp/scripts/lib" "$tmp/scan" "$tmp/scratch/repository-helpers"
+git -C "$tmp" init -q
+cp "$script" "$tmp/scripts/dep-updater-batch-run"
+cp "${script_dir}/../scripts/lib/smtp-mail" "$tmp/scripts/lib/smtp-mail"
+cp "${script_dir}/../scripts/lib/email-multipart" "$tmp/scripts/lib/email-multipart"
+cp "${script_dir}/../scripts/lib/tooling-path" "$tmp/scripts/lib/tooling-path"
+cp "${script_dir}/../scripts/lib/time-log" "$tmp/scripts/lib/time-log"
+
+cat >"$tmp/scripts/dep-updater" <<'EOF'
+#!/usr/bin/env bash
+printf '[batch-all] --- demo (/) ---\n'
+printf '[batch-all] FAILED (demo) exit 1\n'
+printf '[batch-all] Finished with failures (exit 1).\n'
+exit 1
+EOF
+chmod +x "$tmp/scripts/dep-updater" "$tmp/scripts/dep-updater-batch-run"
+
+breadcrumb="${tmp}/smtp.out"
+batch_exit=0
+batch_stderr="${tmp}/batch.stderr"
+(
+  cd "$tmp"
+  HOME="$tmp" \
+  REPO_HELPERS_TEST_MODE=1 \
+  REPO_HELPERS_SMTP_BREADCRUMB="$breadcrumb" \
+  DEP_UPDATER_BATCH_SCAN_ROOT="${tmp}/scan" \
+  DEP_UPDATER_BATCH_LOG="${tmp}/scratch/repository-helpers/dep-updater-batch.log" \
+  bash "${tmp}/scripts/dep-updater-batch-run"
+) 2>"$batch_stderr" || batch_exit=$?
+
+if [[ "$batch_exit" -eq 1 ]] \
+  && [[ -f "$breadcrumb" ]] \
+  && grep -qF 'batch FAILED (exit 1)' "$breadcrumb" \
+  && grep -qF '=== demo ===' "$breadcrumb" \
+  && grep -qF 'multipart/alternative' "$breadcrumb" \
+  && grep -qF 'hcma@example.com' "$breadcrumb"; then
+  printf '[PASS] mock-batch: exit 1 and notifier-style failure email\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] mock-batch: expected failure email (exit=%s stderr=%s)\n' \
+    "$batch_exit" "$(tr '\n' ' ' <"$batch_stderr" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+
+rm -rf "$tmp"
+
+printf '\n=== mock batch timeout sends WAIT_TIMEOUT email ===\n'
+timeout_tmp=""
+timeout_tmp="$(mktemp -d)"
+write_test_env_file "$timeout_tmp"
+mkdir -p "$timeout_tmp/scripts/lib" "$timeout_tmp/scan" "$timeout_tmp/scratch/repository-helpers"
+git -C "$timeout_tmp" init -q
+cp "$script" "$timeout_tmp/scripts/dep-updater-batch-run"
+cp "${script_dir}/../scripts/lib/smtp-mail" "$timeout_tmp/scripts/lib/smtp-mail"
+cp "${script_dir}/../scripts/lib/email-multipart" "$timeout_tmp/scripts/lib/email-multipart"
+cp "${script_dir}/../scripts/lib/tooling-path" "$timeout_tmp/scripts/lib/tooling-path"
+cp "${script_dir}/../scripts/lib/time-log" "$timeout_tmp/scripts/lib/time-log"
+
+cat >"$timeout_tmp/scripts/dep-updater" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+EOF
+chmod +x "$timeout_tmp/scripts/dep-updater" "$timeout_tmp/scripts/dep-updater-batch-run"
+
+timeout_breadcrumb="${timeout_tmp}/smtp-timeout.out"
+timeout_exit=0
+(
+  cd "$timeout_tmp"
+  HOME="$timeout_tmp" \
+  REPO_HELPERS_TEST_MODE=1 \
+  REPO_HELPERS_SMTP_BREADCRUMB="$timeout_breadcrumb" \
+  DEP_UPDATER_BATCH_TIMEOUT=1s \
+  DEP_UPDATER_BATCH_SCAN_ROOT="${timeout_tmp}/scan" \
+  DEP_UPDATER_BATCH_LOG="${timeout_tmp}/scratch/repository-helpers/dep-updater-batch.log" \
+  bash "${timeout_tmp}/scripts/dep-updater-batch-run"
+) || timeout_exit=$?
+
+if [[ "$timeout_exit" -eq 124 ]] \
+  && [[ -f "$timeout_breadcrumb" ]] \
+  && grep -qF 'batch TIMEOUT' "$timeout_breadcrumb" \
+  && grep -qF 'ERROR: WAIT_TIMEOUT batch-run' "$timeout_breadcrumb" \
+  && grep -qF 'exceeded its deadline' "$timeout_breadcrumb"; then
+  printf '[PASS] mock-timeout: exit 124 and timeout failure email\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] mock-timeout: expected TIMEOUT email (exit=%s)\n' "$timeout_exit"
+  fail=$(( fail + 1 ))
+fi
+
+rm -rf "$timeout_tmp"
 
 printf '\n=== results ===\n'
 printf 'Passed: %d  Failed: %d\n' "$pass" "$fail"
