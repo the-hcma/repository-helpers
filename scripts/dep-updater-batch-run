@@ -2,7 +2,7 @@
 # dep-updater-batch-run — git fetch, dep-updater --batch --all, SMTP report.
 #
 # Entry point for the Dependency Updater systemd service. Requires
-# ~/.config/repository-helpers/dep-updater.env (see etc/dep-updater.env.example).
+# ~/.config/dep-updater.env (see etc/dep-updater.env.example).
 #
 # Usage:
 #   dep-updater-batch-run [--print]
@@ -37,7 +37,7 @@ readonly report_separator='─────────────────�
 readonly batch_timeout_default='4h'
 readonly batch_timeout_kill_after_sec=30
 
-env_file="${DEP_UPDATER_ENV_FILE:-${HOME}/.config/repository-helpers/dep-updater.env}"
+env_file="${DEP_UPDATER_ENV_FILE:-${HOME}/.config/dep-updater.env}"
 
 print_only=0
 
@@ -184,14 +184,44 @@ batch_run_dep_updater_with_deadline() {
   return "$dep_exit"
 }
 
+# batch_apply_config_defaults
+# Fills report addresses and local-MTA settings after dep-updater.env is loaded.
+batch_apply_config_defaults() {
+  if [[ -z "${DEP_UPDATER_REPORT_TO:-}" ]]; then
+    DEP_UPDATER_REPORT_TO="hcma@hcma.info"
+  fi
+  if [[ -z "${DEP_UPDATER_REPORT_FROM:-}" ]]; then
+    DEP_UPDATER_REPORT_FROM="dep-updater-batch@hcma.info"
+  fi
+  if [[ -z "${DEP_UPDATER_REPORT_REPLY_TO:-}" ]]; then
+    DEP_UPDATER_REPORT_REPLY_TO="${DEP_UPDATER_REPORT_FROM}"
+  fi
+  if repo_helpers_smtp_use_sendmail; then
+    DEP_UPDATER_USE_SENDMAIL=1
+    DEP_UPDATER_SMTP_PORT="${DEP_UPDATER_SMTP_PORT:-25}"
+    DEP_UPDATER_SMTP_TLS="${DEP_UPDATER_SMTP_TLS:-plain}"
+  fi
+  export DEP_UPDATER_REPORT_TO DEP_UPDATER_REPORT_FROM DEP_UPDATER_REPORT_REPLY_TO
+  export DEP_UPDATER_USE_SENDMAIL DEP_UPDATER_SMTP_PORT DEP_UPDATER_SMTP_TLS
+}
+
 # batch_require_smtp_config
-# Verifies SMTP and report addresses after the env file is loaded.
+# Verifies mail config after the env file is loaded and defaults are applied.
 batch_require_smtp_config() {
   if ! repo_helpers_smtp_configured; then
-    die "Incomplete SMTP config in ${env_file} — set DEP_UPDATER_SMTP_HOST, DEP_UPDATER_REPORT_TO, and DEP_UPDATER_REPORT_FROM."
+    die "Incomplete mail config in ${env_file} — set DEP_UPDATER_SMTP_HOST (e.g. localhost)."
   fi
-  if [[ "${REPO_HELPERS_TEST_MODE:-0}" != '1' ]] && ! command -v curl >/dev/null 2>&1; then
-    die "curl is required for SMTP reporting but was not found in PATH."
+  if [[ "${REPO_HELPERS_TEST_MODE:-0}" == '1' ]]; then
+    return 0
+  fi
+  if repo_helpers_smtp_use_sendmail; then
+    if ! command -v sendmail >/dev/null 2>&1; then
+      die "sendmail is required for local delivery (DEP_UPDATER_SMTP_HOST=localhost) but was not found in PATH."
+    fi
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    die "curl is required for remote SMTP (DEP_UPDATER_SMTP_HOST) but was not found in PATH."
   fi
 }
 
@@ -206,7 +236,12 @@ done
 [[ -x "$dep_updater" ]] || die "dep-updater not found: ${dep_updater}"
 
 batch_load_required_env_file
+batch_apply_config_defaults
 batch_require_smtp_config
+
+readonly mail_smtp_host_var="DEP_UPDATER_SMTP_HOST"
+mail_smtp_host="${!mail_smtp_host_var}"
+readonly mail_smtp_host
 
 # batch_run_git_fetch <repo_path>
 batch_run_git_fetch() {
@@ -438,10 +473,19 @@ else
 fi
 
 if batch_report_send_email "$subject" "$body"; then
-  printf 'Sent batch report to %s via %s\n' \
-    "${DEP_UPDATER_REPORT_TO}" "${DEP_UPDATER_SMTP_HOST}" >&2
+  if repo_helpers_smtp_use_sendmail; then
+    printf 'Sent batch report to %s via sendmail (localhost)\n' \
+      "${DEP_UPDATER_REPORT_TO}" >&2
+  else
+    printf 'Sent batch report to %s via %s\n' \
+      "${DEP_UPDATER_REPORT_TO}" "$mail_smtp_host" >&2
+  fi
 else
-  die "SMTP send failed (host=${DEP_UPDATER_SMTP_HOST})"
+  if repo_helpers_smtp_use_sendmail; then
+    die "sendmail delivery failed (localhost)"
+  else
+    die "SMTP send failed (host=${mail_smtp_host})"
+  fi
 fi
 
 exit "$run_exit"
