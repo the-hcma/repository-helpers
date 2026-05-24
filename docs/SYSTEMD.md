@@ -66,8 +66,8 @@ chmod 600 ~/.config/dep-updater.env
 | Variable | Purpose |
 | --- | --- |
 | `DEP_UPDATER_SMTP_HOST` | Mail host (`localhost` uses local **sendmail**; only required setting) |
-| `DEP_UPDATER_REPORT_TO` | Report recipient (default `hcma@hcma.info`) |
-| `DEP_UPDATER_REPORT_FROM` | Sender address (default `dep-updater-batch@hcma.info`) |
+| `DEP_UPDATER_REPORT_TO` | Report recipient (default `johndoe@example.com`) |
+| `DEP_UPDATER_REPORT_FROM` | Sender address (default `dep-updater-batch@example.com`) |
 | `DEP_UPDATER_SMTP_PORT` | Remote SMTP port (default `587`; `25` for localhost) |
 | `DEP_UPDATER_SMTP_TLS` | `starttls` (default), `ssl`, or `plain` |
 | `DEP_UPDATER_SMTP_USER` / `DEP_UPDATER_SMTP_PASSWORD` | Remote SMTP AUTH (optional) |
