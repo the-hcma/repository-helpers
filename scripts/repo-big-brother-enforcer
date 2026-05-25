@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# repo-big-brother-enforcer - daily repository practices monitor with email report.
+#
+# Entry point for the repo-big-brother-enforcer systemd service. Reuses
+# ~/.config/dep-updater.env for SMTP by default; optionally overlay
+# ~/.config/repo-big-brother-enforcer.env (see etc/repo-big-brother-enforcer.env.example).
+#
+# Usage:
+#   repo-big-brother-enforcer [--print]
+#   repo-big-brother-enforcer --help
+#
+# Options:
+#   --print   Build a sample report and write the email to stdout (no SMTP, no checks).
+#   --help    Show usage.
+#
+# Remediation:
+#   For supported GitHub-side fixes, run:
+#     scripts/check-repo-practices --repo OWNER/NAME --apply
+#   Manual Graphite app steps remain manual and are reported as SUGGEST/manual output.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+repo_dir="$(cd "$script_dir/.." && pwd)"
+readonly repo_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/tooling-path"
+tooling_path_bootstrap_cron_minimal
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/smtp-mail"
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/email-multipart"
+
+readonly checker="${script_dir}/check-repo-practices"
+readonly default_subject_prefix='[repo-big-brother-enforcer]'
+readonly report_separator='----------------------------------------------------------------'
+
+env_file="${REPO_BIG_BROTHER_ENV_FILE:-${HOME}/.config/repo-big-brother-enforcer.env}"
+fallback_env_file="${REPO_BIG_BROTHER_FALLBACK_ENV_FILE:-${HOME}/.config/dep-updater.env}"
+log_file="${REPO_BIG_BROTHER_LOG:-${HOME}/scratch/repository-helpers/repo-big-brother-enforcer.log}"
+scan_root="${REPO_BIG_BROTHER_SCAN_ROOT:-${repo_dir}/..}"
+
+print_only=0
+run_log=""
+clean_log=""
+check_log=""
+repo_count=0
+failure_count=0
+
+# shellcheck disable=SC2317  # invoked by EXIT trap
+repo_big_brother_cleanup_temp_files() {
+  rm -f "${run_log:-}" "${clean_log:-}" "${check_log:-}" 2>/dev/null || true
+}
+trap repo_big_brother_cleanup_temp_files EXIT
+
+usage() {
+  sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+repo_big_brother_load_required_env_file() {
+  local loaded_env=0
+
+  if [[ "${REPO_HELPERS_TEST_MODE:-0}" == '1' \
+    && "${REPO_BIG_BROTHER_SKIP_ENV_FILE:-0}" == '1' ]]; then
+    return 0
+  fi
+  if [[ -f "$fallback_env_file" ]]; then
+    if [[ ! -r "$fallback_env_file" ]]; then
+      die "Env file is not readable: ${fallback_env_file}"
+    fi
+    set -a
+    # shellcheck source=/dev/null
+    source "$fallback_env_file"
+    set +a
+    loaded_env=1
+  fi
+  if [[ -f "$env_file" ]]; then
+    if [[ ! -r "$env_file" ]]; then
+      die "Env file is not readable: ${env_file}"
+    fi
+    set -a
+    # shellcheck source=/dev/null
+    source "$env_file"
+    set +a
+    loaded_env=1
+  fi
+  if [[ "$loaded_env" -eq 0 ]]; then
+    die "Missing required env file: ${env_file} or ${fallback_env_file}"
+  fi
+}
+
+repo_big_brother_apply_config_defaults() {
+  if [[ -n "${REPO_BIG_BROTHER_SMTP_HOST:-}" ]]; then
+    DEP_UPDATER_SMTP_HOST="$REPO_BIG_BROTHER_SMTP_HOST"
+  fi
+  if [[ -n "${REPO_BIG_BROTHER_SMTP_PORT:-}" ]]; then
+    DEP_UPDATER_SMTP_PORT="$REPO_BIG_BROTHER_SMTP_PORT"
+  fi
+  if [[ -n "${REPO_BIG_BROTHER_SMTP_USER:-}" ]]; then
+    DEP_UPDATER_SMTP_USER="$REPO_BIG_BROTHER_SMTP_USER"
+  fi
+  if [[ -n "${REPO_BIG_BROTHER_SMTP_PASSWORD:-}" ]]; then
+    DEP_UPDATER_SMTP_PASSWORD="$REPO_BIG_BROTHER_SMTP_PASSWORD"
+  fi
+  if [[ -n "${REPO_BIG_BROTHER_SMTP_TLS:-}" ]]; then
+    DEP_UPDATER_SMTP_TLS="$REPO_BIG_BROTHER_SMTP_TLS"
+  fi
+  if [[ -n "${REPO_BIG_BROTHER_USE_SENDMAIL:-}" ]]; then
+    DEP_UPDATER_USE_SENDMAIL="$REPO_BIG_BROTHER_USE_SENDMAIL"
+  fi
+  if [[ -z "${DEP_UPDATER_SMTP_HOST:-}" ]]; then
+    die "Missing REPO_BIG_BROTHER_SMTP_HOST (or DEP_UPDATER_SMTP_HOST) in ${env_file}"
+  fi
+
+  if [[ -z "${DEP_UPDATER_REPORT_TO:-}" ]]; then
+    DEP_UPDATER_REPORT_TO="${REPO_BIG_BROTHER_REPORT_TO:-johndoe@example.com}"
+  fi
+  if [[ -z "${DEP_UPDATER_REPORT_FROM:-}" ]]; then
+    DEP_UPDATER_REPORT_FROM="${REPO_BIG_BROTHER_REPORT_FROM:-repo-big-brother-enforcer@example.com}"
+  fi
+  export DEP_UPDATER_SMTP_HOST DEP_UPDATER_REPORT_TO DEP_UPDATER_REPORT_FROM
+  export DEP_UPDATER_SMTP_PORT DEP_UPDATER_SMTP_USER DEP_UPDATER_SMTP_PASSWORD
+  export DEP_UPDATER_SMTP_TLS DEP_UPDATER_USE_SENDMAIL
+}
+
+repo_big_brother_resolve_scan_root() {
+  local resolved
+
+  if [[ ! -d "$scan_root" ]]; then
+    die "REPO_BIG_BROTHER_SCAN_ROOT is not a directory: ${scan_root}"
+  fi
+  resolved="$(realpath "$scan_root")"
+  printf '%s\n' "$resolved"
+}
+
+repo_big_brother_slug_from_origin() {
+  local -r repo_path="$1"
+  local remote_url slug
+
+  remote_url="$(git -C "$repo_path" remote get-url origin 2>/dev/null || true)"
+  if [[ -z "$remote_url" ]]; then
+    return 1
+  fi
+  slug="$(printf '%s' "$remote_url" \
+    | sed -E 's#^git@github.com:##; s#^ssh://git@github.com/##; s#^https://github.com/##; s#\.git$##')"
+  if [[ "$slug" != */* ]]; then
+    return 1
+  fi
+  printf '%s\n' "$slug"
+}
+
+repo_big_brother_discover_repo_slugs() {
+  local -r root="$1"
+  local entry entry_name entry_real top slug
+  local -a slugs=()
+
+  for entry in "$root"/*; do
+    [[ -e "$entry" ]] || continue
+    [[ -d "$entry" ]] || continue
+    entry_name="${entry##*/}"
+    [[ "$entry_name" == .* ]] && continue
+
+    top="$(git -C "$entry" rev-parse --show-toplevel 2>/dev/null || true)"
+    [[ -n "$top" ]] || continue
+    top="$(realpath "$top")"
+    entry_real="$(realpath "$entry")"
+    [[ "$top" == "$entry_real" ]] || continue
+
+    slug="$(repo_big_brother_slug_from_origin "$top" || true)"
+    [[ -n "$slug" ]] || continue
+    slugs+=("$slug")
+  done
+
+  if [[ "${#slugs[@]}" -gt 0 ]]; then
+    printf '%s\n' "${slugs[@]}" | sort -u
+  fi
+}
+
+repo_big_brother_log() {
+  printf '%s\n' "$*" | tee -a "$run_log"
+}
+
+repo_big_brother_run_checks() {
+  local -r root="$1"
+  local slug check_exit
+  local -a slugs=()
+
+  mapfile -t slugs < <(repo_big_brother_discover_repo_slugs "$root")
+  repo_count="${#slugs[@]}"
+  failure_count=0
+
+  repo_big_brother_log "Started:  $(date -Is)"
+  repo_big_brother_log "Root:     ${root}"
+  repo_big_brother_log "Checks:   check-repo-practices --strict-onboarding --suggest"
+  repo_big_brother_log ""
+
+  if [[ "$repo_count" -eq 0 ]]; then
+    repo_big_brother_log "ERROR: no GitHub repositories discovered under ${root}"
+    return 1
+  fi
+
+  for slug in "${slugs[@]}"; do
+    repo_big_brother_log "=== ${slug} ==="
+    check_exit=0
+    check_log="$(mktemp)"
+    NO_COLOR=1 "$checker" --repo "$slug" --suggest --strict-onboarding >"$check_log" 2>&1 \
+      || check_exit=$?
+    tee -a "$run_log" <"$check_log"
+    rm -f "$check_log"
+    check_log=""
+    if [[ "$check_exit" -eq 0 ]]; then
+      repo_big_brother_log "OK: ${slug} passed"
+    else
+      failure_count=$(( failure_count + 1 ))
+      repo_big_brother_log "FAIL: ${slug} failed practices check (exit ${check_exit})"
+    fi
+    repo_big_brother_log ""
+  done
+
+  if [[ "$failure_count" -gt 0 ]]; then
+    repo_big_brother_log "${failure_count} of ${repo_count} repositories failed practices check"
+    return 1
+  fi
+
+  repo_big_brother_log "all ${repo_count} repositories passed"
+}
+
+repo_big_brother_clean_report_log() {
+  sed -E 's/\x1B\[[0-9;]*[mK]//g' "$run_log" >"$clean_log"
+}
+
+repo_big_brother_report_body() {
+  local -r run_exit="$1"
+  local -r started_at="$2"
+  local -r finished_at="$3"
+  local status_text
+
+  if [[ "$run_exit" -eq 0 ]]; then
+    status_text='PASSED'
+  else
+    status_text='FAILED'
+  fi
+
+  {
+    printf 'Repo Big Brother Enforcer %s\n' "$status_text"
+    printf '%s\n' "$report_separator"
+    printf 'Started:  %s\n' "$started_at"
+    printf 'Finished: %s\n' "$finished_at"
+    printf 'Scan root: %s\n' "$(repo_big_brother_resolve_scan_root)"
+    printf 'Repos:    %s checked, %s failed\n' "$repo_count" "$failure_count"
+    printf 'Exit:     %s\n' "$run_exit"
+    printf 'Apply:    scripts/check-repo-practices --repo OWNER/NAME --apply\n'
+    printf '\n'
+    printf 'Practices output:\n'
+    printf '%s\n' "$report_separator"
+    if [[ -s "$clean_log" ]]; then
+      sed -n '1,240p' "$clean_log"
+    else
+      printf '(no output)\n'
+    fi
+  }
+}
+
+repo_big_brother_write_sample_log() {
+  repo_count=1
+  failure_count=0
+  {
+    printf 'Started:  %s\n' "$(date -Is)"
+    printf 'Root:     %s\n' "$(repo_big_brother_resolve_scan_root)"
+    printf 'Checks:   check-repo-practices --strict-onboarding --suggest\n'
+    printf '\n'
+    printf '=== the-hcma/demo-repo ===\n'
+    printf 'OK: branch cleanup workflows\n'
+    printf 'OK: the-hcma/demo-repo passed\n'
+    printf '\n'
+    printf 'all 1 repositories passed\n'
+  } >"$run_log"
+}
+
+repo_big_brother_send_report() {
+  local -r run_exit="$1"
+  local -r body="$2"
+  local status_text subject subject_prefix
+
+  if [[ "$run_exit" -eq 0 ]]; then
+    status_text='PASSED'
+  else
+    status_text='FAILED'
+  fi
+  subject_prefix="${REPO_BIG_BROTHER_REPORT_SUBJECT_PREFIX:-$default_subject_prefix}"
+  subject="${subject_prefix} practices ${status_text}: ${failure_count}/${repo_count} failing"
+
+  repo_helpers_email_write_multipart \
+    "$DEP_UPDATER_REPORT_TO" \
+    "$DEP_UPDATER_REPORT_FROM" \
+    "$DEP_UPDATER_REPORT_FROM" \
+    "$subject" \
+    "$body" \
+    'repo-big-brother' \
+    | repo_helpers_smtp_send "$DEP_UPDATER_REPORT_FROM" "$DEP_UPDATER_REPORT_TO"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --print)
+      print_only=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      die "Unknown argument: $1 (see --help)"
+      ;;
+  esac
+done
+
+repo_big_brother_load_required_env_file
+repo_big_brother_apply_config_defaults
+mkdir -p "$(dirname "$log_file")"
+
+run_log="$(mktemp)"
+clean_log="$(mktemp)"
+started_at="$(date -Is)"
+
+if [[ "$print_only" -eq 1 ]]; then
+  repo_big_brother_write_sample_log
+  finished_at="$(date -Is)"
+  repo_big_brother_clean_report_log
+  body="$(repo_big_brother_report_body 0 "$started_at" "$finished_at")"
+  repo_helpers_email_write_multipart \
+    "$DEP_UPDATER_REPORT_TO" \
+    "$DEP_UPDATER_REPORT_FROM" \
+    "$DEP_UPDATER_REPORT_FROM" \
+    "${REPO_BIG_BROTHER_REPORT_SUBJECT_PREFIX:-$default_subject_prefix} practices PASSED: 0/1 failing" \
+    "$body" \
+    'repo-big-brother'
+  exit 0
+fi
+
+resolved_scan_root="$(repo_big_brother_resolve_scan_root)"
+run_exit=0
+repo_big_brother_run_checks "$resolved_scan_root" || run_exit=$?
+finished_at="$(date -Is)"
+repo_big_brother_log "Finished: ${finished_at}"
+repo_big_brother_clean_report_log
+body="$(repo_big_brother_report_body "$run_exit" "$started_at" "$finished_at")"
+repo_big_brother_send_report "$run_exit" "$body"
+
+rm -f "$run_log" "$clean_log"
+run_log=""
+clean_log=""
+
+exit "$run_exit"

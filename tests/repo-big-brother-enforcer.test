@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# Tests for scripts/repo-big-brother-enforcer.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/repo-big-brother-enforcer"
+setup_wrapper="${script_dir}/../scripts/setup-repo-big-brother-enforcer"
+unit="${script_dir}/../etc/systemd/repo-big-brother-enforcer.service"
+timer="${script_dir}/../etc/systemd/repo-big-brother-enforcer.timer"
+env_example="${script_dir}/../etc/repo-big-brother-enforcer.env.example"
+readonly script setup_wrapper unit timer env_example
+
+pass=0
+fail=0
+
+write_test_env_file() {
+  local -r dir="$1"
+  mkdir -p "${dir}/.config"
+  cat >"${dir}/.config/repo-big-brother-enforcer.env" <<'EOF'
+REPO_BIG_BROTHER_SMTP_HOST=smtp.test
+REPO_BIG_BROTHER_REPORT_TO=johndoe@example.com
+REPO_BIG_BROTHER_REPORT_FROM=repo-big-brother-enforcer@example.com
+EOF
+}
+
+printf '\n=== static: service assets ===\n'
+if [[ -x "$script" ]] \
+  && [[ -x "$setup_wrapper" ]] \
+  && [[ -f "$unit" ]] \
+  && [[ -f "$timer" ]] \
+  && [[ -f "$env_example" ]] \
+  && grep -qF -- '--apply' "$env_example"; then
+  printf '[PASS] assets: runner, setup wrapper, env example, service, and timer exist\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] assets: missing repo-big-brother-enforcer assets\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'EnvironmentFile=-%h/.config/dep-updater.env' "$unit" \
+  && grep -qF 'EnvironmentFile=-%h/.config/repo-big-brother-enforcer.env' "$unit" \
+  && grep -qF 'ExecStart=@@REPO_DIR@@/scripts/repo-big-brother-enforcer' "$unit" \
+  && grep -qF 'repo-big-brother-enforcer.log' "$unit" \
+  && grep -qF 'Unit=repo-big-brother-enforcer.service' "$timer" \
+  && grep -qF 'OnCalendar=*-*-* 04:00:00' "$timer"; then
+  printf '[PASS] unit: daily systemd service uses SMTP fallback, runner, and log\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] unit: expected repo-big-brother-enforcer service/timer wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: setup-service integration ===\n'
+if grep -qF 'REPO_BIG_BROTHER_ENFORCER_SERVICE_UNIT=repo-big-brother-enforcer' "$setup_wrapper" \
+  && grep -qF 'REPO_BIG_BROTHER_ENFORCER_SERVICE_UNIT' "${script_dir}/../scripts/setup-service"; then
+  printf '[PASS] setup: wrapper selects repo-big-brother-enforcer unit\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] setup: expected wrapper and setup-service unit override\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: strict onboarding monitor ===\n'
+if grep -qF 'repo_big_brother_discover_repo_slugs' "$script" \
+  && grep -qF 'remote get-url origin' "$script" \
+  && grep -qF -- '--strict-onboarding' "$script" \
+  && grep -qF -- '--suggest' "$script" \
+  && grep -qF "tee -a \"\$run_log\" <\"\$check_log\"" "$script" \
+  && grep -qF "\"\${check_log:-}\"" "$script"; then
+  printf '[PASS] monitor: discovers local GitHub repos and runs strict onboarding checks\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] monitor: missing repo discovery or strict check invocation\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== missing env file exits non-zero ===\n'
+missing_home=""
+missing_home="$(mktemp -d)"
+missing_out=""
+missing_exit=0
+missing_out="$(
+  HOME="$missing_home" bash "$script" 2>&1
+)" || missing_exit=$?
+rm -rf "$missing_home"
+if [[ "$missing_exit" -ne 0 ]] \
+  && grep -qF 'Missing required env file' <<<"$missing_out" \
+  && grep -qF 'dep-updater.env' <<<"$missing_out"; then
+  printf '[PASS] missing-env: hard failure when env file absent\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] missing-env: expected die on missing env (exit=%s)\n' "$missing_exit"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== --print builds multipart report ===\n'
+print_tmp=""
+print_tmp="$(mktemp -d)"
+write_test_env_file "$print_tmp"
+print_out=""
+print_exit=0
+print_out="$(
+  HOME="$print_tmp" bash "$script" --print 2>/dev/null
+)" || print_exit=$?
+rm -rf "$print_tmp"
+if [[ "$print_exit" -eq 0 ]] \
+  && grep -qF 'Repo Big Brother Enforcer PASSED' <<<"$print_out" \
+  && grep -qF 'scripts/check-repo-practices --repo OWNER/NAME --apply' <<<"$print_out" \
+  && grep -qF 'the-hcma/demo-repo' <<<"$print_out" \
+  && grep -qF 'multipart/alternative' <<<"$print_out"; then
+  printf '[PASS] print: sample multipart email on stdout\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] print: expected sample multipart report (exit=%s)\n' "$print_exit"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== mock monitor sends SMTP report on failure ===\n'
+tmp=""
+tmp="$(mktemp -d)"
+write_test_env_file "$tmp"
+mkdir -p "$tmp/scripts/lib" "$tmp/scan/ok-repo" "$tmp/scan/bad-repo" "$tmp/scratch"
+git -C "$tmp" init -q
+git -C "$tmp/scan/ok-repo" init -q
+git -C "$tmp/scan/ok-repo" remote add origin "https://github.com/the-hcma/ok-repo.git"
+git -C "$tmp/scan/bad-repo" init -q
+git -C "$tmp/scan/bad-repo" remote add origin "https://github.com/the-hcma/bad-repo.git"
+cp "$script" "$tmp/scripts/repo-big-brother-enforcer"
+cp "${script_dir}/../scripts/lib/smtp-mail" "$tmp/scripts/lib/smtp-mail"
+cp "${script_dir}/../scripts/lib/email-multipart" "$tmp/scripts/lib/email-multipart"
+cp "${script_dir}/../scripts/lib/tooling-path" "$tmp/scripts/lib/tooling-path"
+
+cat >"$tmp/scripts/check-repo-practices" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${REPO_BIG_BROTHER_ARGS_LOG:?}"
+if [[ "$*" == *'the-hcma/bad-repo'* ]]; then
+  printf 'FAIL: the-hcma/bad-repo: merge-it label is required\n'
+  exit 1
+fi
+printf 'OK: %s passed\n' "$*"
+EOF
+chmod +x "$tmp/scripts/check-repo-practices" "$tmp/scripts/repo-big-brother-enforcer"
+
+breadcrumb="${tmp}/smtp.out"
+args_log="${tmp}/args.out"
+monitor_exit=0
+(
+  cd "$tmp"
+  HOME="$tmp" \
+  REPO_HELPERS_TEST_MODE=1 \
+  REPO_HELPERS_SMTP_BREADCRUMB="$breadcrumb" \
+  REPO_BIG_BROTHER_ARGS_LOG="$args_log" \
+  REPO_BIG_BROTHER_SCAN_ROOT="${tmp}/scan" \
+  REPO_BIG_BROTHER_LOG="${tmp}/scratch/repo-big-brother-enforcer.log" \
+  bash "${tmp}/scripts/repo-big-brother-enforcer"
+) >/dev/null || monitor_exit=$?
+
+if [[ "$monitor_exit" -eq 1 ]] \
+  && [[ -f "$breadcrumb" ]] \
+  && grep -qF 'Repo Big Brother Enforcer FAILED' "$breadcrumb" \
+  && grep -qF 'Repos:    2 checked, 1 failed' "$breadcrumb" \
+  && grep -qF 'scripts/check-repo-practices --repo OWNER/NAME --apply' "$breadcrumb" \
+  && grep -qF 'the-hcma/bad-repo' "$breadcrumb" \
+  && grep -qF 'multipart/alternative' "$breadcrumb" \
+  && grep -qF -- '--strict-onboarding' "$args_log" \
+  && grep -qF -- '--suggest' "$args_log"; then
+  printf '[PASS] mock-monitor: exit 1 and sends failure email from strict checks\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] mock-monitor: expected failure email and strict args (exit=%s)\n' "$monitor_exit"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$tmp"
+
+printf '\n=== summary ===\n'
+printf '%s passed, %s failed\n' "$pass" "$fail"
+if [[ "$fail" -gt 0 ]]; then
+  exit 1
+fi
