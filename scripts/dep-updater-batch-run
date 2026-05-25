@@ -153,9 +153,14 @@ batch_emit_wait_timeout() {
 batch_run_dep_updater_with_deadline() {
   local -r run_log="$1"
   local timeout_sec timeout_spec batch_start batch_end elapsed_sec dep_exit
+  local stream_dir
+  local stream_fifo stream_tee_pid
 
   if ! command -v timeout >/dev/null 2>&1; then
     die "timeout(1) is required for batch deadline enforcement but was not found in PATH."
+  fi
+  if ! command -v mkfifo >/dev/null 2>&1; then
+    die "mkfifo(1) is required for streaming batch output but was not found in PATH."
   fi
 
   timeout_spec="${DEP_UPDATER_BATCH_TIMEOUT:-$batch_timeout_default}"
@@ -165,14 +170,22 @@ batch_run_dep_updater_with_deadline() {
   fi
 
   batch_start="$(time_log_now_utc_epoch)"
+  stream_dir="$(mktemp -d)"
+  stream_fifo="${stream_dir}/dep-updater-output"
+  mkfifo "$stream_fifo"
+  tee -a "$run_log" "$log_file" <"$stream_fifo" >/dev/null &
+  stream_tee_pid=$!
+
   set +e
-  # Do not pipe timeout(1): tee keeps the pipeline open and delays SIGTERM until the child exits.
+  # Do not put timeout(1) in a pipeline: that hides the timeout exit status and
+  # can delay SIGTERM. A FIFO lets tee stream output while timeout remains direct.
   timeout --foreground --kill-after="${batch_timeout_kill_after_sec}" "${timeout_sec}s" \
     "$dep_updater" --batch --all --scan-root "$scan_root" \
-    >"$run_log" 2>&1
+    >"$stream_fifo" 2>&1
   dep_exit=$?
+  wait "$stream_tee_pid"
   set -e
-  cat "$run_log" >>"$log_file"
+  rm -rf "$stream_dir"
 
   if [[ "$dep_exit" -eq 124 ]]; then
     batch_end="$(time_log_now_utc_epoch)"
@@ -308,6 +321,35 @@ batch_report_repo_name_from_parens() {
   basename "$inner"
 }
 
+# batch_report_update_lines <clean_log>
+# Extracts dep-updater child "Dependency update summary" tables as:
+# repo|ecosystem|package|from|to|cve_flag|cves|pr
+batch_report_update_lines() {
+  local -r clean_log="$1"
+
+  awk '
+    /^\[batch-all\] --- / {
+      current = $0
+      sub(/^\[batch-all\] --- /, "", current)
+      sub(/[[:space:]]+\(.*/, "", current)
+      next
+    }
+    /^Dependency update summary:/ {
+      in_summary = 1
+      next
+    }
+    in_summary && /^[[:space:]]*$/ {
+      in_summary = 0
+      next
+    }
+    in_summary && /No new dependency PRs were created/ { next }
+    in_summary && /^ECOSYSTEM[[:space:]]+PACKAGE[[:space:]]+FROM[[:space:]]+TO/ { next }
+    in_summary && current != "" && NF >= 7 {
+      print current "|" $1 "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7
+    }
+  ' "$clean_log" 2>/dev/null || true
+}
+
 # batch_report_build <clean_log> <exit_code> <started_at> <finished_at>
 # Builds a notifier-style plain-text report body.
 batch_report_build() {
@@ -315,12 +357,14 @@ batch_report_build() {
   local -r run_exit="$2"
   local -r started_at="$3"
   local -r finished_at="$4"
-  local host repo_line ok_lines fail_lines summary_lines body_lines
-  local ok_count fail_count entry sline repo_name
+  local host repo_line ok_lines fail_lines update_lines summary_lines body_lines
+  local ok_count fail_count update_count entry sline repo_name
+  local update_repo update_eco update_pkg update_from update_to update_cve update_cves update_pr
 
   host="$(hostname -s 2>/dev/null || echo unknown)"
   ok_lines=()
   fail_lines=()
+  update_lines=()
   while IFS= read -r repo_line; do
     [[ -n "$repo_line" ]] || continue
     ok_lines+=("$repo_line")
@@ -331,9 +375,14 @@ batch_report_build() {
     fail_lines+=("$repo_line")
   done < <(rg -o '\[batch-all\] FAILED \([^)]+\) exit [0-9]+' "$clean_log" 2>/dev/null \
     | sed 's/^\[batch-all\] FAILED //' || true)
+  while IFS= read -r repo_line; do
+    [[ -n "$repo_line" ]] || continue
+    update_lines+=("$repo_line")
+  done < <(batch_report_update_lines "$clean_log")
 
   ok_count=${#ok_lines[@]}
   fail_count=${#fail_lines[@]}
+  update_count=${#update_lines[@]}
 
   body_lines=()
   if rg -qF 'ERROR: WAIT_TIMEOUT batch-run' "$clean_log" 2>/dev/null; then
@@ -359,6 +408,24 @@ batch_report_build() {
   body_lines+=("")
   body_lines+=("$report_separator")
   body_lines+=("")
+
+  if (( update_count > 0 )); then
+    body_lines+=("Updates created (${update_count}):")
+    body_lines+=("")
+    for entry in "${update_lines[@]}"; do
+      IFS='|' read -r update_repo update_eco update_pkg update_from update_to \
+        update_cve update_cves update_pr <<<"$entry"
+      sline="  - ${update_repo}: ${update_eco} ${update_pkg} ${update_from} → ${update_to}"
+      if [[ "$update_cve" == "yes" ]]; then
+        sline="${sline} (CVE: ${update_cves})"
+      fi
+      if [[ -n "$update_pr" && "$update_pr" != "#-" ]]; then
+        sline="${sline} (${update_pr})"
+      fi
+      body_lines+=("$sline")
+    done
+    body_lines+=("")
+  fi
 
   for entry in "${ok_lines[@]}"; do
     repo_name="$(batch_report_repo_name_from_parens "$entry")"
