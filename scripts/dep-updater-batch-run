@@ -43,6 +43,19 @@ print_only=0
 
 log_file="${DEP_UPDATER_BATCH_LOG:-${HOME}/scratch/repository-helpers/dep-updater-batch.log}"
 scan_root="${DEP_UPDATER_BATCH_SCAN_ROOT:-${repo_dir}/..}"
+run_log=""
+clean_log=""
+updates_report=""
+_batch_run_stream_dir=""
+
+# shellcheck disable=SC2317  # invoked by EXIT trap
+batch_run_cleanup_temp_files() {
+  rm -f "${run_log:-}" "${clean_log:-}" "${updates_report:-}" 2>/dev/null || true
+  if [[ -n "${_batch_run_stream_dir:-}" ]]; then
+    rm -rf "$_batch_run_stream_dir" 2>/dev/null || true
+  fi
+}
+trap batch_run_cleanup_temp_files EXIT
 
 usage() {
   sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -148,14 +161,20 @@ batch_emit_wait_timeout() {
   fi
 }
 
-# batch_run_dep_updater_with_deadline <run_log>
+# batch_run_dep_updater_with_deadline <run_log> <updates_report>
 # Runs dep-updater under timeout(1); returns exit code (124 = deadline exceeded).
 batch_run_dep_updater_with_deadline() {
   local -r run_log="$1"
+  local -r updates_report="$2"
   local timeout_sec timeout_spec batch_start batch_end elapsed_sec dep_exit
+  local stream_dir
+  local stream_fifo stream_tee_pid
 
   if ! command -v timeout >/dev/null 2>&1; then
     die "timeout(1) is required for batch deadline enforcement but was not found in PATH."
+  fi
+  if ! command -v mkfifo >/dev/null 2>&1; then
+    die "mkfifo(1) is required for streaming batch output but was not found in PATH."
   fi
 
   timeout_spec="${DEP_UPDATER_BATCH_TIMEOUT:-$batch_timeout_default}"
@@ -165,14 +184,25 @@ batch_run_dep_updater_with_deadline() {
   fi
 
   batch_start="$(time_log_now_utc_epoch)"
+  stream_dir="$(mktemp -d)"
+  _batch_run_stream_dir="$stream_dir"
+  stream_fifo="${stream_dir}/dep-updater-output"
+  mkfifo "$stream_fifo"
+  tee -a "$run_log" "$log_file" <"$stream_fifo" >/dev/null &
+  stream_tee_pid=$!
+
   set +e
-  # Do not pipe timeout(1): tee keeps the pipeline open and delays SIGTERM until the child exits.
-  timeout --foreground --kill-after="${batch_timeout_kill_after_sec}" "${timeout_sec}s" \
+  # Do not put timeout(1) in a pipeline: that hides the timeout exit status and
+  # can delay SIGTERM. A FIFO lets tee stream output while timeout remains direct.
+  DEP_UPDATER_UPDATES_REPORT="$updates_report" \
+    timeout --foreground --kill-after="${batch_timeout_kill_after_sec}" "${timeout_sec}s" \
     "$dep_updater" --batch --all --scan-root "$scan_root" \
-    >"$run_log" 2>&1
+    >"$stream_fifo" 2>&1
   dep_exit=$?
+  wait "$stream_tee_pid"
   set -e
-  cat "$run_log" >>"$log_file"
+  rm -rf "$stream_dir"
+  _batch_run_stream_dir=""
 
   if [[ "$dep_exit" -eq 124 ]]; then
     batch_end="$(time_log_now_utc_epoch)"
@@ -308,19 +338,49 @@ batch_report_repo_name_from_parens() {
   basename "$inner"
 }
 
-# batch_report_build <clean_log> <exit_code> <started_at> <finished_at>
+# batch_report_update_lines <updates_report>
+# Reads dep-updater's structured update JSON as tab-separated rows:
+# repo_name ecosystem package from to cve_flag cves pr
+batch_report_update_lines() {
+  local -r updates_report="$1"
+  [[ -s "$updates_report" ]] || return 0
+
+  jq -r '
+    .[]?
+    | select(.package != null and .ecosystem != null)
+    | [
+        (.repo_name // (.repo | split("/") | last) // "-"),
+        (.ecosystem // "-"),
+        (.package // "-"),
+        (.from // "-"),
+        (.to // "-"),
+        (.cve // "no"),
+        (.cves // "-"),
+        (if (.pr // "" | tostring | length) == 0 then "-"
+         elif (.pr | tostring | startswith("#")) then (.pr | tostring)
+         else "#" + (.pr | tostring)
+         end)
+      ]
+    | @tsv
+  ' "$updates_report" 2>/dev/null || true
+}
+
+# batch_report_build <clean_log> <exit_code> <started_at> <finished_at> [updates_report]
 # Builds a notifier-style plain-text report body.
 batch_report_build() {
   local -r clean_log="$1"
   local -r run_exit="$2"
   local -r started_at="$3"
   local -r finished_at="$4"
-  local host repo_line ok_lines fail_lines summary_lines body_lines
-  local ok_count fail_count entry sline repo_name
+  local -r updates_report="${5:-}"
+  local host repo_line ok_lines fail_lines update_lines summary_lines body_lines
+  local ok_count fail_count update_count entry sline repo_name
+  local update_repo update_eco update_pkg update_from update_to update_cve update_cves update_pr
 
   host="$(hostname -s 2>/dev/null || echo unknown)"
   ok_lines=()
   fail_lines=()
+  update_lines=()
   while IFS= read -r repo_line; do
     [[ -n "$repo_line" ]] || continue
     ok_lines+=("$repo_line")
@@ -331,9 +391,16 @@ batch_report_build() {
     fail_lines+=("$repo_line")
   done < <(rg -o '\[batch-all\] FAILED \([^)]+\) exit [0-9]+' "$clean_log" 2>/dev/null \
     | sed 's/^\[batch-all\] FAILED //' || true)
+  if [[ -n "$updates_report" ]]; then
+    while IFS= read -r repo_line; do
+      [[ -n "$repo_line" ]] || continue
+      update_lines+=("$repo_line")
+    done < <(batch_report_update_lines "$updates_report")
+  fi
 
   ok_count=${#ok_lines[@]}
   fail_count=${#fail_lines[@]}
+  update_count=${#update_lines[@]}
 
   body_lines=()
   if rg -qF 'ERROR: WAIT_TIMEOUT batch-run' "$clean_log" 2>/dev/null; then
@@ -359,6 +426,24 @@ batch_report_build() {
   body_lines+=("")
   body_lines+=("$report_separator")
   body_lines+=("")
+
+  if (( update_count > 0 )); then
+    body_lines+=("Updates created (${update_count}):")
+    body_lines+=("")
+    for entry in "${update_lines[@]}"; do
+      IFS=$'\t' read -r update_repo update_eco update_pkg update_from update_to \
+        update_cve update_cves update_pr <<<"$entry"
+      sline="  - ${update_repo}: ${update_eco} ${update_pkg} ${update_from} → ${update_to}"
+      if [[ "$update_cve" == "yes" ]]; then
+        sline="${sline} (CVE: ${update_cves})"
+      fi
+      if [[ -n "$update_pr" && "$update_pr" != "#-" ]]; then
+        sline="${sline} (${update_pr})"
+      fi
+      body_lines+=("$sline")
+    done
+    body_lines+=("")
+  fi
 
   for entry in "${ok_lines[@]}"; do
     repo_name="$(batch_report_repo_name_from_parens "$entry")"
@@ -453,16 +538,20 @@ batch_run_git_fetch_all || true
 
 run_log="$(mktemp)"
 clean_log="$(mktemp)"
+updates_report="$(mktemp)"
 
 run_exit=0
-batch_run_dep_updater_with_deadline "$run_log" || run_exit=$?
+batch_run_dep_updater_with_deadline "$run_log" "$updates_report" || run_exit=$?
 
 batch_report_strip_ansi "$run_log" >"$clean_log"
 rm -f "$run_log"
+run_log=""
 
 finished_at="$(date '+%Y-%m-%d %H:%M %z %Z')"
-body="$(batch_report_build "$clean_log" "$run_exit" "$started_at" "$finished_at")"
-rm -f "$clean_log"
+body="$(batch_report_build "$clean_log" "$run_exit" "$started_at" "$finished_at" "$updates_report")"
+rm -f "$clean_log" "$updates_report"
+clean_log=""
+updates_report=""
 
 if (( run_exit == 0 )); then
   subject="${subject_prefix} batch completed successfully"

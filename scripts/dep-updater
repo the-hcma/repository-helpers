@@ -5142,6 +5142,73 @@ ${entry}"
   fi
 }
 
+dep_updater_write_updates_report_json() {
+  if [[ -z "${DEP_UPDATER_UPDATES_REPORT:-}" ]]; then
+    return 0
+  fi
+
+  local updates_json="[]"
+  local repo_name_for_report
+  repo_name_for_report="$(basename "$dir")"
+
+  while IFS='|' read -r eco pkg from to cve_flag cve_ids pr; do
+    [[ -z "$pkg" ]] && continue
+    updates_json="$(printf '%s' "$updates_json" \
+      | jq \
+          --arg repo "$dir" \
+          --arg repo_name "$repo_name_for_report" \
+          --arg ecosystem "$eco" \
+          --arg package "$pkg" \
+          --arg from "${from:--}" \
+          --arg to "${to:--}" \
+          --arg cve "${cve_flag:-no}" \
+          --arg cves "${cve_ids:--}" \
+          --arg pr "${pr:-}" \
+          '. + [{
+            repo: $repo,
+            repo_name: $repo_name,
+            ecosystem: $ecosystem,
+            package: $package,
+            from: $from,
+            to: $to,
+            cve: $cve,
+            cves: $cves,
+            pr: $pr
+          }]')"
+  done <<< "$summary_lines"
+
+  jq -n \
+    --arg repo "$dir" \
+    --arg repo_name "$repo_name_for_report" \
+    --argjson updates "$updates_json" \
+    '{repo: $repo, repo_name: $repo_name, updates: $updates}' \
+    >"${DEP_UPDATER_UPDATES_REPORT}" 2>/dev/null || true
+}
+
+dep_updater_batch_all_append_child_updates() {
+  local -r child_updates_file="$1"
+  local tmp_updates
+
+  if [[ -z "${DEP_UPDATER_UPDATES_REPORT:-}" || ! -s "$child_updates_file" ]]; then
+    return 0
+  fi
+  if ! jq -e '.updates | type == "array"' "$child_updates_file" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ ! -s "${DEP_UPDATER_UPDATES_REPORT}" ]]; then
+    printf '[]\n' >"${DEP_UPDATER_UPDATES_REPORT}"
+  fi
+
+  tmp_updates="$(mktemp)"
+  if jq -s '.[0] + (.[1].updates // [])' \
+      "${DEP_UPDATER_UPDATES_REPORT}" "$child_updates_file" >"$tmp_updates" 2>/dev/null; then
+    mv "$tmp_updates" "${DEP_UPDATER_UPDATES_REPORT}"
+  else
+    rm -f "$tmp_updates"
+  fi
+}
+
 print_stack_urls() {
   local -r prs_csv="$1"
   [[ -z "$prs_csv" ]] && return 0
@@ -5650,6 +5717,10 @@ batch_all_dispatch() {
     return 0
   fi
 
+  if [[ -n "${DEP_UPDATER_UPDATES_REPORT:-}" ]]; then
+    printf '[]\n' >"${DEP_UPDATER_UPDATES_REPORT}"
+  fi
+
   worst_exit=0
 
   for repo in "${repos_found[@]}"; do
@@ -5685,10 +5756,11 @@ batch_all_dispatch() {
     child_args+=(--dir "$repo")
 
     child_exit=0
-    local child_log child_fifo child_pid child_report
+    local child_log child_fifo child_pid child_report child_updates
     local root_cause child_clean report_line detail_count
     child_log="$(mktemp)"
     child_report="$(mktemp)"
+    child_updates="$(mktemp)"
     child_fifo="$(mktemp -u)"
     mkfifo "$child_fifo"
     _batch_all_active_child_log="$child_log"
@@ -5699,7 +5771,9 @@ batch_all_dispatch() {
     # DEP_UPDATER_RUN_REPORT: child writes structured JSON on non-zero exit for
     # batch-all to read (see dep_updater_write_batch_child_report_json).
     set +e
-    DEP_UPDATER_RUN_REPORT="$child_report" "$dep_self" "${child_args[@]}" >"$child_fifo" 2>&1 &
+    DEP_UPDATER_RUN_REPORT="$child_report" \
+      DEP_UPDATER_UPDATES_REPORT="$child_updates" \
+      "$dep_self" "${child_args[@]}" >"$child_fifo" 2>&1 &
     child_pid=$!
     _batch_all_active_child_pid="$child_pid"
 
@@ -5716,10 +5790,12 @@ batch_all_dispatch() {
     set -e
 
     if [[ "$_batch_all_interrupted" == '1' ]]; then
-      rm -f "$child_log" "$child_report"
+      rm -f "$child_log" "$child_report" "$child_updates"
       _batch_all_active_child_log=""
       break
     fi
+
+    dep_updater_batch_all_append_child_updates "$child_updates"
 
     if [[ "$child_exit" -ne 0 ]]; then
       TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
@@ -5788,7 +5864,7 @@ batch_all_dispatch() {
       TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
         log "[batch-all] OK ($(basename "$repo")) (${repo_elapsed_s}s)"
     fi
-    rm -f "$child_log" "$child_report"
+    rm -f "$child_log" "$child_report" "$child_updates"
     _batch_all_active_child_log=""
   done
 
@@ -6334,6 +6410,7 @@ else
 fi
 
 print_summary
+dep_updater_write_updates_report_json
 if [[ -n "$pnpm_ignored_build_pkgs" ]]; then
   log ""
   log "[pnpm] Skipped package(s) due to ERR_PNPM_IGNORED_BUILDS:"
