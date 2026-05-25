@@ -77,6 +77,7 @@ npm_tool=""
 # nested project, e.g. web/package.json with Python at repo root).
 npm_project_prefix=""
 py_tool=""
+has_rust=0
 has_gha=0
 
 # Set after create_worktree / init_state_file
@@ -492,7 +493,7 @@ Options:
                     combine with --no-wait-ci --no-wait-merge.
   --batch           Combine all updates into a single PR instead of one per package
   --dir <path>      Project root (default: current directory)
-  --ecosystem <e>   Force: npm | python | gha | auto  (default: auto)
+  --ecosystem <e>   Force: npm | python | rust | gha | auto  (default: auto)
   --merge-timeout <min>  Minutes to wait for all PRs to merge (default: 15)
   --no-wait-ci      Skip CI polling between PRs
   --no-wait-merge   Exit after stack is submitted; print cleanup command
@@ -515,6 +516,7 @@ Supported ecosystems:
   poetry        poetry.lock present   → poetry show --outdated + poetry add
   pipenv        Pipfile.lock present  → pipenv run pip list + pipenv install
   pip           requirements.txt or pyproject.toml → pip list + pip freeze
+  rust          Cargo.toml present  → cargo outdated + cargo add
   gha             .github/workflows/*.yml present  → gh api releases/latest + sed patch
 USAGE
 }
@@ -546,7 +548,7 @@ parse_args() {
         ;;
       --ecosystem)
         shift
-        [[ $# -eq 0 ]] && die "--ecosystem requires a value: npm | python | auto"
+        [[ $# -eq 0 ]] && die "--ecosystem requires a value: npm | python | rust | gha | auto"
         ecosystem="$1"
         ;;
       --merge-timeout)
@@ -608,8 +610,8 @@ parse_args() {
   done
 
   case "$ecosystem" in
-    npm|python|gha|auto) : ;;
-    *) die "Invalid --ecosystem: '$ecosystem'. Valid values: npm | python | gha | auto" ;;
+    npm|python|rust|gha|auto) : ;;
+    *) die "Invalid --ecosystem: '$ecosystem'. Valid values: npm | python | rust | gha | auto" ;;
   esac
 
   [[ "$batch_all" == '1' && "$batch" != '1' ]] \
@@ -1430,9 +1432,22 @@ check_auth_prereqs() {
 check_ecosystem_prereqs() {
   local -r chk_npm="$1"
   local -r chk_py="$2"
+  local -r chk_rust="${3:-0}"
   local missing=0
 
   tooling_prereq_check_ecosystem_tools "$chk_npm" "$npm_tool" "$chk_py" || missing=$?
+
+  if [[ "$chk_rust" == '1' ]]; then
+    if ! command -v cargo &>/dev/null; then
+      log "ERROR: 'cargo' is required for Rust projects."
+      log "       Install: https://www.rust-lang.org/tools/install"
+      missing=$(( missing + 1 ))
+    elif ! cargo outdated --version &>/dev/null 2>&1; then
+      log "ERROR: 'cargo outdated' is required for Rust projects."
+      log "       Install: cargo install cargo-outdated"
+      missing=$(( missing + 1 ))
+    fi
+  fi
 
   if [[ "$chk_py" == 'pip' ]] \
     && ! command -v pip &>/dev/null \
@@ -1484,6 +1499,7 @@ detect_ecosystem() {
   npm_tool=""
   npm_project_prefix=""
   py_tool=""
+  has_rust=0
   has_gha=0
 
   # Prefer origin/main manifests when available so detection matches what we scan
@@ -1588,6 +1604,12 @@ detect_ecosystem() {
     fi
   fi
 
+  if [[ "$ecosystem" == 'rust' || "$ecosystem" == 'auto' ]]; then
+    if _repo_file_exists "Cargo.toml"; then
+      has_rust=1
+    fi
+  fi
+
   if [[ "$ecosystem" == 'gha' || "$ecosystem" == 'auto' ]]; then
     if [[ "$detect_ref" == "origin/main" ]]; then
       if git -C "$dir" grep -q 'uses:' origin/main -- .github/workflows/ 2>/dev/null; then
@@ -1601,7 +1623,7 @@ detect_ecosystem() {
 
   unset -f _repo_file_exists _lockfile_present
 
-  if [[ "$has_npm" == '0' && -z "$py_tool" && "$has_gha" == '0' ]]; then
+  if [[ "$has_npm" == '0' && -z "$py_tool" && "$has_rust" == '0' && "$has_gha" == '0' ]]; then
     if [[ "$dry_run" == '1' ]]; then
       log "No supported ecosystem detected in: $dir"
     else
@@ -1609,7 +1631,7 @@ detect_ecosystem() {
     fi
   fi
 
-  readonly has_npm npm_tool py_tool has_gha npm_project_prefix
+  readonly has_npm npm_tool py_tool has_rust has_gha npm_project_prefix
 
   local eco_msg=""
   if [[ "$has_npm" == '1' ]]; then
@@ -1620,6 +1642,13 @@ detect_ecosystem() {
       eco_msg="${eco_msg}, python/${py_tool}"
     else
       eco_msg="python/${py_tool}"
+    fi
+  fi
+  if [[ "$has_rust" == '1' ]]; then
+    if [[ -n "$eco_msg" ]]; then
+      eco_msg="${eco_msg}, rust/cargo"
+    else
+      eco_msg="rust/cargo"
     fi
   fi
   if [[ "$has_gha" == '1' ]]; then
@@ -1641,6 +1670,12 @@ detect_ecosystem() {
     eco_tools+=("$py_tool")
     if tooling_prereq_pip_audit_usable "$py_tool"; then
       eco_tools+=("pip-audit")
+    fi
+  fi
+  if [[ "$has_rust" == '1' ]]; then
+    eco_tools+=("cargo")
+    if cargo outdated --version &>/dev/null 2>&1; then
+      eco_tools+=("cargo-outdated")
     fi
   fi
   local et et_line
@@ -2050,6 +2085,11 @@ create_worktree() {
         : # pip/pip3: no lockfile install needed; packages resolved per-update
         ;;
     esac
+  fi
+  if [[ "$has_rust" == '1' && -f "$worktree_path/Cargo.lock" ]]; then
+    log "[worktree] Fetching Rust dependencies (cargo fetch)…"
+    install_with_net_retry cargo "$worktree_path" \
+      cargo fetch --locked
   fi
   log "[worktree] Ready: $worktree_path"
 }
@@ -3586,6 +3626,184 @@ py_update_one() {
 }
 
 # ---------------------------------------------------------------------------
+# Rust / Cargo ecosystem
+# ---------------------------------------------------------------------------
+
+# True when Cargo.toml declares a [workspace] table (scan root only).
+rust_workspace_enabled() {
+  local -r scan_root="${1:-$dir}"
+  [[ -f "${scan_root}/Cargo.toml" ]] \
+    && grep -qE '^\[workspace\]' "${scan_root}/Cargo.toml"
+}
+
+# True when the crate has an intentional exact (=) version pin in Cargo.toml.
+rust_is_pinned() {
+  local -r pkg="$1"
+  local -r scan_root="${2:-$dir}"
+  local manifest
+  for manifest in "${scan_root}/Cargo.toml" "${scan_root}"/*/Cargo.toml; do
+    [[ -f "$manifest" ]] || continue
+    if awk -v pkg="$pkg" '
+      BEGIN {
+        dep_table = "^[[:space:]]*\\[(dependencies|dev-dependencies|build-dependencies)\\." pkg "\\][[:space:]]*$"
+      }
+      /^[[:space:]]*\[/ {
+        in_dep_table = ($0 ~ dep_table)
+      }
+      {
+        line = $0
+        sub(/[[:space:]]*#.*/, "", line)
+        if (line ~ "^[[:space:]]*" pkg "[[:space:]]*=[[:space:]]*\"=") pinned = 1
+        if (line ~ "^[[:space:]]*" pkg "[[:space:]]*=[[:space:]]*\\{[^}]*version[[:space:]]*=[[:space:]]*\"=") pinned = 1
+        if (in_dep_table && line ~ "^[[:space:]]*version[[:space:]]*=[[:space:]]*\"=") pinned = 1
+      }
+      END { exit pinned ? 0 : 1 }
+    ' "$manifest" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# List direct outdated crates as: name current target kind package
+# Uses cargo-outdated JSON (--root-deps-only; --workspace when applicable).
+# Optional $1: directory to scan (defaults to $dir).
+rust_outdated() {
+  local -r target_dir="${1:-$dir}"
+  local -a outdated_args=(--root-deps-only --format json)
+  local json_out dep_name cur target dep_kind dep_package
+
+  if rust_workspace_enabled "$target_dir"; then
+    outdated_args+=(--workspace)
+  fi
+
+  if ! json_out="$(cd "$target_dir" && cargo outdated "${outdated_args[@]}" 2>/dev/null)"; then
+    json_out=""
+  fi
+  [[ -z "$json_out" ]] && return 0
+
+  printf '%s' "$json_out" \
+    | jq -r '
+        .[]?
+        | .crate_name as $crate
+        | .dependencies[]?
+        | select(.name != null and .project != null)
+        | select(.latest != null and .latest != "---")
+        | . as $d
+        | ($d.compat // $d.latest) as $target
+        | select($target != "---" and $d.project != $target)
+        | "\($d.name | split(" -> ") | last) \($d.project) \($target) \($d.kind // "Normal") \($crate // "-")"
+      ' 2>/dev/null \
+    | while IFS=' ' read -r dep_name cur target dep_kind dep_package; do
+        [[ -z "$dep_name" ]] && continue
+        [[ "$dep_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
+        if rust_is_pinned "$dep_name" "$target_dir"; then
+          log "[rust] Skipping exactly-pinned crate: ${dep_name} (${cur})"
+          continue
+        fi
+        [[ -z "$dep_kind" ]] && dep_kind="Normal"
+        [[ -z "$dep_package" ]] && dep_package="-"
+        printf '%s %s %s %s %s\n' "$dep_name" "$cur" "$target" "$dep_kind" "$dep_package"
+      done
+}
+
+# Bump one direct dependency and open a stacked PR.
+# Args: $1=crate, $2=current version, $3=target version, $4=dependency kind, $5=workspace package
+rust_update_one() {
+  local -r pkg="$1"
+  local -r old_ver="$2"
+  local -r new_ver="$3"
+  local -r dep_kind="${4:-Normal}"
+  local -r dep_package="${5:--}"
+  local safe_name
+  safe_name="$(sanitize_branch_name "$pkg")"
+  local -r branch="dep-updates/rust-${safe_name}"
+  local -r commit_msg="chore(deps): bump ${pkg} from ${old_ver} to ${new_ver}"
+  local -r files_changed="Cargo.toml + Cargo.lock"
+  local cargo_out cargo_exit
+  local -a cargo_add_args=("${pkg}@${new_ver}")
+
+  if branch_exists_in_worktree "$branch"; then
+    log "Skipping existing branch: ${branch}"
+    register_existing_branch_state "$branch"
+    local existing_pr
+    existing_pr="$(gh_pr_number_for_branch "$branch")"
+    if [[ -z "$existing_pr" ]]; then
+      log "Branch ${branch} has no PR — submitting now."
+      git -C "$worktree_path" checkout "$branch"
+      run_in_worktree gt track -p main 2>/dev/null || true
+      run_in_worktree gt submit --no-interactive --publish --no-stack
+      existing_pr="$(gh_pr_number_for_branch "$branch")"
+      if [[ -n "$existing_pr" ]]; then
+        state_append_pr "$existing_pr"
+      fi
+    fi
+    git -C "$worktree_path" checkout "$branch"
+    return 0
+  fi
+
+  log "[rust] ${pkg}: ${old_ver} → ${new_ver}"
+
+  case "$dep_kind" in
+    Development) cargo_add_args=(--dev "${cargo_add_args[@]}") ;;
+    Build)       cargo_add_args=(--build "${cargo_add_args[@]}") ;;
+    *)           : ;;
+  esac
+  if rust_workspace_enabled "$worktree_path" && [[ "$dep_package" != "-" ]]; then
+    cargo_add_args=(--package "$dep_package" "${cargo_add_args[@]}")
+  fi
+
+  cargo_out="$(cd "$worktree_path" && cargo add "${cargo_add_args[@]}" 2>&1)" && cargo_exit=0 || cargo_exit=$?
+  if (( cargo_exit != 0 )); then
+    log "[rust] Skipping ${pkg} ${new_ver}: cargo add failed."
+    log "$cargo_out"
+    dep_updater_append_ecosystem_failure "rust|cargo add failed for ${pkg} (exit ${cargo_exit})"
+    return 0
+  fi
+
+  git -C "$worktree_path" add -u
+
+  if git -C "$worktree_path" diff --cached --quiet; then
+    log "[rust] ${pkg}: no file changes after update — already at latest. Skipping PR."
+    return 0
+  fi
+
+  local parent_branch
+  parent_branch="$(git -C "$worktree_path" branch --show-current)"
+
+  git -C "$worktree_path" checkout -b "$branch"
+  _worktree_commit "$commit_msg"
+  if [[ "$parent_branch" == "$wt_base_branch" ]]; then
+    run_in_worktree gt track -p main
+  else
+    run_in_worktree gt track -p "$parent_branch"
+  fi
+  log "[gate] Submitting PR for '${branch}'…"
+  run_in_worktree gt submit --no-interactive --publish --no-stack
+
+  local pr_num
+  pr_num="$(wait_for_pr_number_for_new_branch "$branch" || true)"
+  [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
+
+  local rust_body_file
+  rust_body_file="$(mktemp)"
+  write_pr_body "$pkg" "$old_ver" "$new_ver" "rust/cargo" "$files_changed" "" "$rust_body_file"
+  gh pr edit "$pr_num" \
+    --repo "${repo_owner}/${repo_name}" \
+    --title "$commit_msg" \
+    --body-file "$rust_body_file" \
+    --add-label "dep-updater" || true
+  rm -f "$rust_body_file"
+  if [[ "$repo_name" == 'my-tracks' ]]; then
+    gh pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
+  fi
+
+  state_append "branches" "$branch"
+  state_append_pr "$pr_num"
+  add_summary_line "rust/cargo" "$pkg" "$old_ver" "$new_ver" "$branch" "$pr_num" "no" "-"
+}
+
+# ---------------------------------------------------------------------------
 # GitHub Actions ecosystem
 # ---------------------------------------------------------------------------
 
@@ -3828,12 +4046,14 @@ gha_update_one() {
 #   $3  npm_lines        (may be empty; ignored when security_only=1)
 #   $4  py_lines         (may be empty; ignored when security_only=1)
 #   $5  gha_lines        (may be empty; ignored when security_only=1)
+#   $6  rust_lines       (may be empty; ignored when security_only=1)
 batch_update_all() {
   local -r npm_audit_lines_arg="$1"
   local -r py_audit_lines_arg="$2"
   local -r npm_lines_arg="$3"
   local -r py_lines_arg="$4"
   local -r gha_lines_arg="${5:-}"
+  local -r rust_lines_arg="${6:-}"
 
   # Use a timestamped branch name so each run gets a fresh Graphite identity.
   # A fixed name like 'dep-updates/batch' caused repeated submit failures: Graphite
@@ -3844,7 +4064,8 @@ batch_update_all() {
   batch_ts="$(time_log_date_utc '%Y%m%dT%H%M%S')"
   local -r branch="dep-updates/batch-${batch_ts}"
   local any_npm=0 any_py=0
-  local py_out py_exit b_constraint_op b_spec actual_py_lines
+  local py_out py_exit b_constraint_op b_spec actual_py_lines dep_kind dep_package
+  local -a cargo_add_args=()
 
   dep_updater_ensure_eco_fail_file
 
@@ -4146,6 +4367,31 @@ batch_update_all() {
     fi
   fi
 
+  # ── Rust / Cargo ─────────────────────────────────────────────────────────
+  local any_rust=0
+  if [[ "$has_rust" == '1' && -n "$rust_lines_arg" && "$security_only" == '0' ]]; then
+    while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+      [[ -z "$pkg" ]] && continue
+      log "[rust] Batch update: ${pkg} ${old_ver} → ${new_ver}"
+      cargo_add_args=("${pkg}@${new_ver}")
+      case "${dep_kind:-Normal}" in
+        Development) cargo_add_args=(--dev "${cargo_add_args[@]}") ;;
+        Build)       cargo_add_args=(--build "${cargo_add_args[@]}") ;;
+        *)           : ;;
+      esac
+      if rust_workspace_enabled "$worktree_path" && [[ "${dep_package:-"-"}" != "-" ]]; then
+        cargo_add_args=(--package "$dep_package" "${cargo_add_args[@]}")
+      fi
+      if ! (cd "$worktree_path" && cargo add "${cargo_add_args[@]}" 2>&1); then
+        dep_updater_append_ecosystem_failure "rust|batch cargo add failed for ${pkg}"
+      fi
+    done <<< "$rust_lines_arg"
+    git -C "$worktree_path" add -u
+    if ! git -C "$worktree_path" diff --cached --quiet; then
+      any_rust=1
+    fi
+  fi
+
   # ── GitHub Actions ───────────────────────────────────────────────────────
   local any_gha=0
   if [[ "$has_gha" == '1' && -n "$gha_lines_arg" && "$security_only" == '0' ]]; then
@@ -4257,6 +4503,12 @@ batch_update_all() {
           printf "| python/%s | \`%s\` | \`%s\` | \`%s\` | no | - |\n" "$py_tool" "$pkg" "$old_ver" "$new_ver"
         done <<< "${actual_py_lines:-${py_lines_arg}}"
       fi
+      if [[ "$any_rust" == '1' && -n "$rust_lines_arg" ]]; then
+        while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+          [[ -z "$pkg" ]] && continue
+          printf "| rust/cargo | \`%s\` | \`%s\` | \`%s\` | no | - |\n" "$pkg" "$old_ver" "$new_ver"
+        done <<< "$rust_lines_arg"
+      fi
       if [[ "$any_gha" == '1' && -n "$gha_lines_arg" ]]; then
         while IFS=' ' read -r action cur_ref new_ref; do
           [[ -z "$action" ]] && continue
@@ -4308,6 +4560,16 @@ batch_update_all() {
           printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$pkg" "$old_ver" "$new_ver"
         done <<< "${actual_py_lines:-${py_lines_arg}}"
       fi
+      if [[ "$any_rust" == '1' && -n "$rust_lines_arg" ]]; then
+        printf '## Rust updates\n\n'
+        printf '| Crate | From | To |\n'
+        printf '|---|---|---|\n'
+        while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+          [[ -z "$pkg" ]] && continue
+          printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$pkg" "$old_ver" "$new_ver"
+        done <<< "$rust_lines_arg"
+        printf '\n'
+      fi
       if [[ "$any_gha" == '1' && -n "$gha_lines_arg" ]]; then
         printf '## GitHub Actions updates\n\n'
         printf '| Action | From | To |\n'
@@ -4358,6 +4620,12 @@ batch_update_all() {
     [[ -z "$pkg" ]] && continue
     add_summary_line "python/${py_tool}" "$pkg" "$_current" "$fix" "$branch" "$pr_num" "yes" "${_cves:--}"
   done <<< "${py_audit_lines_arg:-}"
+  if [[ "$any_rust" == '1' ]]; then
+    while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+      [[ -z "$pkg" ]] && continue
+      add_summary_line "rust/cargo" "$pkg" "$old_ver" "$new_ver" "$branch" "$pr_num" "no" "-"
+    done <<< "${rust_lines_arg:-}"
+  fi
   if [[ "$any_gha" == '1' ]]; then
     while IFS=' ' read -r action cur_ref new_ref; do
       [[ -z "$action" ]] && continue
@@ -4366,7 +4634,7 @@ batch_update_all() {
   fi
   if [[ -z "$actual_npm_lines" && -z "$npm_audit_lines_arg" && \
         -z "${actual_py_lines:-${py_lines_arg:-}}" && -z "$py_audit_lines_arg" && \
-        "$any_gha" == '0' ]]; then
+        "$any_rust" == '0' && "$any_gha" == '0' ]]; then
     add_summary_line "batch" "$branch" "-" "-" "$branch" "$pr_num" "no" "-"
   fi
 }
@@ -5091,7 +5359,7 @@ poll_until_merged() {
 # ---------------------------------------------------------------------------
 
 # Emit a JSON report to stdout for --report-json mode.
-# Args: npm_audit_lines  py_audit_lines  npm_lines  py_lines  gha_lines
+# Args: npm_audit_lines  py_audit_lines  npm_lines  py_lines  gha_lines  rust_lines
 # All args may be empty strings.
 _emit_report_json() {
   local npm_audit_lines="$1"
@@ -5099,6 +5367,7 @@ _emit_report_json() {
   local npm_lines="$3"
   local py_lines="$4"
   local gha_lines="${5:-}"
+  local rust_lines="${6:-}"
 
   local cves_json="[]"
   local updates_json="[]"
@@ -5145,6 +5414,14 @@ _emit_report_json() {
         | jq --arg p "$action" --arg o "$cur_ref" --arg n "$new_ref" \
             '. + [{"ecosystem":"github-actions","package":$p,"from":$o,"to":$n}]')"
     done <<< "$gha_lines"
+  fi
+  if [[ -n "$rust_lines" ]]; then
+    while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+      [[ -z "$pkg" ]] && continue
+      updates_json="$(printf '%s' "$updates_json" \
+        | jq --arg p "$pkg" --arg o "$old_ver" --arg n "$new_ver" \
+            '. + [{"ecosystem":"rust/cargo","package":$p,"from":$o,"to":$n}]')"
+    done <<< "$rust_lines"
   fi
 
   jq -n \
@@ -5567,7 +5844,7 @@ main() {
   if [[ "$report_json" == '1' ]]; then
     check_report_prereqs
     detect_ecosystem
-    check_ecosystem_prereqs "$has_npm" "$py_tool"
+    check_ecosystem_prereqs "$has_npm" "$py_tool" "$has_rust"
     # --report-json must be isolated from any local uncommitted state. Run the
     # scan via the dry-run worktree flow (clean tree based on origin/main / HEAD),
     # which already suppresses the human-readable plan output when report_json=1.
@@ -5581,7 +5858,7 @@ main() {
   fi
   if [[ "$report_json" == '0' ]]; then
     detect_ecosystem
-    check_ecosystem_prereqs "$has_npm" "$py_tool"
+    check_ecosystem_prereqs "$has_npm" "$py_tool" "$has_rust"
   fi
   if [[ "$dry_run" == '0' ]]; then
     check_auth_prereqs
@@ -5653,10 +5930,10 @@ if [[ "$dry_run" == '1' ]]; then
   cd "$audit_dir" || die "Failed to cd to dry-run worktree: $audit_dir"
 
   # ── No ecosystem detected ────────────────────────────────────────────
-  if [[ "$has_npm" == '0' && -z "$py_tool" ]]; then
+  if [[ "$has_npm" == '0' && -z "$py_tool" && "$has_rust" == '0' && "$has_gha" == '0' ]]; then
     log "No supported ecosystem detected — nothing to update."
     if [[ "$report_json" == '1' ]]; then
-      _emit_report_json "" "" "" ""
+      _emit_report_json "" "" "" "" "" ""
     fi
     _dry_run_teardown "$audit_dir"
     exit 0
@@ -5698,19 +5975,22 @@ if [[ "$dry_run" == '1' ]]; then
 
   if [[ "$security_only" == '1' ]]; then
     if [[ "$report_json" == '1' ]]; then
-      _emit_report_json "$npm_audit_lines" "$py_audit_lines" "" ""
+      _emit_report_json "$npm_audit_lines" "$py_audit_lines" "" "" "" ""
     fi
     _dry_run_teardown "$audit_dir"
     exit 0
   fi
 
   # ── Outdated packages ────────────────────────────────────────────────
-  local npm_lines="" py_lines="" gha_lines=""
+  local npm_lines="" py_lines="" rust_lines="" gha_lines=""
   if [[ "$has_npm" == '1' ]]; then
     npm_lines="$(npm_outdated "$(npm_project_root "$audit_dir")")"
   fi
   if [[ -n "$py_tool" ]]; then
     py_lines="$(py_outdated "$py_tool" "$audit_dir")"
+  fi
+  if [[ "$has_rust" == '1' ]]; then
+    rust_lines="$(rust_outdated "$audit_dir")"
   fi
   if [[ "$has_gha" == '1' ]]; then
     gha_lines="$(gha_outdated "$audit_dir")"
@@ -5720,10 +6000,10 @@ if [[ "$dry_run" == '1' ]]; then
   [[ "$npm_lines" == '{}' || "$npm_lines" == 'null' ]] && npm_lines=""
   [[ "$py_lines"  == '{}' || "$py_lines"  == 'null' ]] && py_lines=""
 
-  if [[ -z "$npm_lines" && -z "$py_lines" && -z "$gha_lines" ]]; then
+  if [[ -z "$npm_lines" && -z "$py_lines" && -z "$rust_lines" && -z "$gha_lines" ]]; then
     log "All dependencies are up to date."
     if [[ "$report_json" == '1' ]]; then
-      _emit_report_json "$npm_audit_lines" "$py_audit_lines" "" "" ""
+      _emit_report_json "$npm_audit_lines" "$py_audit_lines" "" "" "" ""
     fi
     _dry_run_teardown "$audit_dir"
     exit 0
@@ -5744,6 +6024,12 @@ if [[ "$dry_run" == '1' ]]; then
       [[ -z "$pkg" ]] && continue
       all_rows+=("python/${py_tool}|$pkg|$old_ver|$new_ver")
     done <<< "$py_lines"
+  fi
+  if [[ -n "$rust_lines" ]]; then
+    while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+      [[ -z "$pkg" ]] && continue
+      all_rows+=("rust/cargo|$pkg|$old_ver|$new_ver")
+    done <<< "$rust_lines"
   fi
   if [[ -n "$gha_lines" ]]; then
     while IFS=' ' read -r action cur_ref new_ref; do
@@ -5854,6 +6140,25 @@ if [[ "$dry_run" == '1' ]]; then
       done <<< "$py_lines"
     fi
 
+    if [[ -n "$rust_lines" ]]; then
+      while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+        [[ -z "$pkg" ]] && continue
+        local safe_rust rust_branch rust_commit
+        safe_rust="$(sanitize_branch_name "$pkg")"
+        rust_branch="dep-updates/rust-${safe_rust}"
+        rust_commit="chore(deps): bump ${pkg} from ${old_ver} to ${new_ver}"
+        pr_index=$(( pr_index + 1 ))
+        print_dry_run_pr_plan \
+          "$pr_index" \
+          "rust/cargo/${pkg}" \
+          "$rust_branch" \
+          "$rust_commit" \
+          "Cargo.toml + Cargo.lock" \
+          "${pkg} ${old_ver} ${new_ver}" \
+          "cargo add ${pkg}@${new_ver}"
+      done <<< "$rust_lines"
+    fi
+
     if [[ -n "$gha_lines" ]]; then
       while IFS=' ' read -r action cur_ref new_ref; do
         [[ -z "$action" ]] && continue
@@ -5876,7 +6181,7 @@ if [[ "$dry_run" == '1' ]]; then
   fi  # end: report_json == 0
 
   if [[ "$report_json" == '1' ]]; then
-    _emit_report_json "$npm_audit_lines" "$py_audit_lines" "$npm_lines" "$py_lines" "$gha_lines"
+    _emit_report_json "$npm_audit_lines" "$py_audit_lines" "$npm_lines" "$py_lines" "$gha_lines" "$rust_lines"
   fi
 
   _dry_run_teardown "$audit_dir"
@@ -5934,18 +6239,21 @@ if [[ -n "$py_tool" ]]; then
   fi
 fi
 
-local npm_lines="" py_lines="" gha_lines=""
+local npm_lines="" py_lines="" rust_lines="" gha_lines=""
 if [[ "$has_npm" == '1' ]]; then
   npm_lines="$(npm_outdated "$(npm_project_root "$worktree_path")")"
 fi
 if [[ -n "$py_tool" ]]; then
   py_lines="$(py_outdated "$py_tool" "$worktree_path")"
 fi
+if [[ "$has_rust" == '1' ]]; then
+  rust_lines="$(rust_outdated "$worktree_path")"
+fi
 if [[ "$has_gha" == '1' ]]; then
   gha_lines="$(gha_outdated "$worktree_path")"
 fi
 
-if [[ -z "$npm_lines" && -z "$py_lines" && -z "$gha_lines" ]]; then
+if [[ -z "$npm_lines" && -z "$py_lines" && -z "$rust_lines" && -z "$gha_lines" ]]; then
   log "All dependencies are up to date."
   require_resume_ci_gate "$existing_branches" "$existing_prs"
   gate_all_created_prs
@@ -5985,7 +6293,7 @@ fi
 # ── Regular updates follow (stacked on top of security PRs) ──────────────
 if [[ "$batch" == '1' ]]; then
   # Batch mode: one branch + one PR for everything.
-  batch_update_all "$npm_audit_lines" "$py_audit_lines" "$npm_lines" "$py_lines" "$gha_lines"
+  batch_update_all "$npm_audit_lines" "$py_audit_lines" "$npm_lines" "$py_lines" "$gha_lines" "$rust_lines"
 elif [[ "$security_only" == '1' ]]; then
   log "--security-only: skipping regular version bumps."
 else
@@ -6006,6 +6314,14 @@ else
     while IFS=' ' read -r pkg old_ver new_ver; do
       py_update_one "$pkg" "$old_ver" "$new_ver" "$py_tool" "$py_audit_lines"
     done <<< "$py_lines"
+  fi
+
+  # Process Rust / Cargo
+  if [[ -n "$rust_lines" ]]; then
+    while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+      [[ -z "$pkg" ]] && continue
+      rust_update_one "$pkg" "$old_ver" "$new_ver" "$dep_kind" "$dep_package"
+    done <<< "$rust_lines"
   fi
 
   # Process GitHub Actions
