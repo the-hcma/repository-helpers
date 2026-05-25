@@ -54,11 +54,17 @@ scripts/setup-service --status
 
 scripts/setup-repo-big-brother-enforcer
 scripts/setup-repo-big-brother-enforcer --status
+
+scripts/show-services
 ```
 
 `repo-big-brother-enforcer` reuses `~/.config/dep-updater.env` for SMTP by default.
 Use `~/.config/repo-big-brother-enforcer.env` when you need a different scan root or
 report settings.
+
+`scripts/show-services` prints a read-only summary of every systemd service template
+in this repo, including installed status, active/enabled state, timer next run,
+configuration files, log tail commands, and setup command.
 
 See [docs/SYSTEMD.md](docs/SYSTEMD.md) for service configuration, logs, timers, and
 manual trial runs.

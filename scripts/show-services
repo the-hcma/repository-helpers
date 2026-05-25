@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# show-services - summarize installed systemd user services.
+#
+# Usage:
+#   scripts/show-services
+#   scripts/show-services --help
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+repo_dir="$(cd "$script_dir/.." && pwd)"
+readonly repo_dir
+readonly systemd_dir="${repo_dir}/etc/systemd"
+readonly user_unit_dir="${HOME}/.config/systemd/user"
+
+usage() {
+  sed -n '2,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+systemctl_user() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 127
+  fi
+  systemctl --user "$@"
+}
+
+unit_template_text() {
+  local -r template="$1"
+  local -r template_repo_dir="${2:-$repo_dir}"
+  sed "s|@@REPO_DIR@@|${template_repo_dir}|g" "$template"
+}
+
+installed_unit_text() {
+  local -r unit="$1"
+  systemctl_user cat "$unit" 2>/dev/null || true
+}
+
+unit_field() {
+  local -r field="$1"
+  local text="$2"
+  printf '%s\n' "$text" | grep -m1 "^${field}=" | sed "s/^${field}=//" || true
+}
+
+unit_env_files() {
+  local text="$1"
+  printf '%s\n' "$text" \
+    | grep '^EnvironmentFile=' \
+    | sed 's/^EnvironmentFile=-\?//' \
+    | sed "s|%h|${HOME}|g" \
+    || true
+}
+
+unit_log_file() {
+  local text="$1"
+  local exec_start log_file
+
+  exec_start="$(unit_field ExecStart "$text")"
+  if [[ -n "$exec_start" ]]; then
+    log_file="$(printf '%s\n' "$exec_start" | grep -oP -- '--log-file \K\S+' || true)"
+    if [[ -n "$log_file" ]]; then
+      printf '%s\n' "$log_file" | sed "s|%h|${HOME}|g"
+      return 0
+    fi
+  fi
+
+  log_file="$(
+    printf '%s\n' "$text" \
+      | grep -E '^Standard(Output|Error)=' \
+      | head -n1 \
+      | grep -oP 'append:\K\S+' \
+      | sed "s|%h|${HOME}|g" \
+      || true
+  )"
+  printf '%s\n' "$log_file"
+}
+
+unit_compare_text() {
+  local text="$1"
+  printf '%s\n' "$text" | grep -v '^Environment=DEPLOYED_COMMIT=' || true
+}
+
+unit_enabled_state() {
+  local -r unit="$1"
+  local state
+
+  state="$(systemctl_user is-enabled "$unit" 2>/dev/null || true)"
+  if [[ -z "$state" ]]; then
+    state='disabled'
+  fi
+  printf '%s\n' "$state"
+}
+
+unit_active_state() {
+  local -r unit="$1"
+  local state substate
+
+  state="$(systemctl_user show "$unit" --property=ActiveState --value 2>/dev/null || true)"
+  substate="$(systemctl_user show "$unit" --property=SubState --value 2>/dev/null || true)"
+  if [[ -z "$state" ]]; then
+    state='not-installed'
+  fi
+  if [[ -n "$substate" && "$substate" != "$state" ]]; then
+    printf '%s (%s)\n' "$state" "$substate"
+  else
+    printf '%s\n' "$state"
+  fi
+}
+
+timer_next_run() {
+  local -r timer="$1"
+  systemctl_user list-timers "$timer" --no-pager --all 2>/dev/null \
+    | awk 'NR==2 { print $1, $2, $3, $4, $5 }' \
+    || true
+}
+
+service_setup_command() {
+  local -r unit_name="$1"
+  local -r service_path="${2:-}"
+  if [[ -z "$service_path" ]]; then
+    printf 'n/a (installed user unit)\n'
+    return 0
+  fi
+  case "$unit_name" in
+    repo-big-brother-enforcer.service)
+      printf 'scripts/setup-repo-big-brother-enforcer\n'
+      ;;
+    *)
+      printf 'scripts/setup-service\n'
+      ;;
+  esac
+}
+
+print_service_status() {
+  local -r unit_name="$1"
+  local service_path timer_name timer_path installed_service target_service
+  local source_text installed_text compare_status display_name exec_start log_file setup_cmd
+  local active_state enabled_state timer_enabled timer_next env_files env_file
+  local timer_installed timer_status installed_workdir compare_repo_dir target_text timer_text
+
+  service_path="${systemd_dir}/${unit_name}"
+  if [[ ! -f "$service_path" ]]; then
+    service_path=""
+  fi
+  timer_name="${unit_name%.service}.timer"
+  timer_path="${systemd_dir}/${timer_name}"
+  target_service="${user_unit_dir}/${unit_name}"
+  installed_text="$(installed_unit_text "$unit_name")"
+  installed_workdir="$(unit_field WorkingDirectory "$installed_text")"
+  compare_repo_dir="${installed_workdir:-$repo_dir}"
+  if [[ -n "$service_path" ]]; then
+    source_text="$(unit_template_text "$service_path" "$compare_repo_dir")"
+  else
+    source_text="$installed_text"
+  fi
+  display_name="$(unit_field Description "$source_text")"
+  if [[ -z "$display_name" ]]; then
+    display_name="$unit_name"
+  fi
+  exec_start="$(unit_field ExecStart "$installed_text")"
+  if [[ -z "$exec_start" ]]; then
+    exec_start="$(unit_field ExecStart "$source_text")"
+  fi
+  log_file="$(unit_log_file "$installed_text")"
+  if [[ -z "$log_file" ]]; then
+    log_file="$(unit_log_file "$source_text")"
+  fi
+  setup_cmd="$(service_setup_command "$unit_name" "$service_path")"
+
+  installed_service='no'
+  compare_status='not installed'
+  if [[ -f "$target_service" || -n "$installed_text" ]]; then
+    installed_service='yes'
+    target_text=""
+    if [[ -f "$target_service" ]]; then
+      target_text="$(<"$target_service")"
+    fi
+    if [[ -z "$service_path" ]]; then
+      compare_status='installed user unit'
+    elif [[ -n "$target_text" ]] \
+      && diff --brief <(unit_compare_text "$source_text") <(unit_compare_text "$target_text") \
+        >/dev/null 2>&1; then
+      compare_status='up to date'
+    else
+      compare_status='installed (not byte-for-byte template match)'
+    fi
+  fi
+
+  active_state="$(unit_active_state "$unit_name")"
+  enabled_state="$(unit_enabled_state "$unit_name")"
+
+  timer_installed='n/a'
+  timer_enabled='n/a'
+  timer_next=''
+  timer_status='no source timer'
+  timer_text="$(systemctl_user cat "$timer_name" 2>/dev/null || true)"
+  if [[ -f "$timer_path" || -n "$timer_text" ]]; then
+    timer_installed='no'
+    timer_enabled="$(unit_enabled_state "$timer_name")"
+    timer_next="$(timer_next_run "$timer_name")"
+    if [[ -f "$timer_path" ]]; then
+      timer_status='template present'
+    else
+      timer_status='installed timer'
+    fi
+    if [[ -f "${user_unit_dir}/${timer_name}" || -n "$timer_text" ]]; then
+      timer_installed='yes'
+    fi
+  fi
+
+  printf '%s\n' "$display_name"
+  printf '  Unit:      %s\n' "$unit_name"
+  printf '  Service:   %s, %s\n' "$installed_service" "$compare_status"
+  printf '  Active:    %s\n' "$active_state"
+  printf '  Enabled:   %s\n' "$enabled_state"
+  printf '  Timer:     %s' "$timer_status"
+  if [[ "$timer_installed" != 'n/a' ]]; then
+    printf ' (installed: %s, enabled: %s)' "$timer_installed" "$timer_enabled"
+  fi
+  printf '\n'
+  if [[ -n "$timer_next" ]]; then
+    printf '  Next run:  %s\n' "$timer_next"
+  fi
+  if [[ -n "$exec_start" ]]; then
+    printf '  Starts:    %s\n' "$exec_start"
+  fi
+  if [[ -n "$installed_workdir" ]]; then
+    printf '  Workdir:   %s\n' "$installed_workdir"
+  fi
+  printf '  Config:    %s\n' "${target_service}"
+  env_files="$(unit_env_files "$installed_text")"
+  if [[ -z "$env_files" ]]; then
+    env_files="$(unit_env_files "$source_text")"
+  fi
+  while IFS= read -r env_file; do
+    [[ -n "$env_file" ]] || continue
+    printf '  User cfg:  %s\n' "$env_file"
+  done <<<"$env_files"
+  if [[ -n "$log_file" ]]; then
+    printf '  Logs:      tail --follow=name --retry %s\n' "$log_file"
+  fi
+  printf '  Setup:     %s\n' "$setup_cmd"
+  printf '\n'
+}
+
+main() {
+  local arg service_path user_service_path unit_name
+  local -a service_units=()
+
+  while [[ $# -gt 0 ]]; do
+    arg="$1"
+    case "$arg" in
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown argument: ${arg} (see --help)"
+        ;;
+    esac
+  done
+
+  mapfile -t service_units < <(
+    {
+    for service_path in "$systemd_dir"/*.service; do
+      [[ -f "$service_path" ]] || continue
+      printf '%s\n' "${service_path##*/}"
+    done
+    for user_service_path in "$user_unit_dir"/*.service; do
+      [[ -f "$user_service_path" ]] || continue
+      unit_name="${user_service_path##*/}"
+      [[ "$unit_name" == *@* ]] && continue
+      printf '%s\n' "$unit_name"
+    done
+    } | sort -u
+  )
+
+  if [[ "${#service_units[@]}" -eq 0 ]]; then
+    die "No service templates or installed user units found"
+  fi
+
+  printf 'systemd user services\n'
+  printf 'Repo: %s\n\n' "$repo_dir"
+  for unit_name in "${service_units[@]}"; do
+    print_service_status "$unit_name"
+  done
+}
+
+main "$@"

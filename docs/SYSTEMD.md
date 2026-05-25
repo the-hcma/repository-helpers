@@ -10,6 +10,17 @@ This repository ships systemd user services for daily repository maintenance:
 Both are oneshot services installed under `~/.config/systemd/user/`, with logs
 under `~/scratch/repository-helpers/`.
 
+Use `scripts/show-services` for a read-only overview of every service template in
+this repo:
+
+```bash
+scripts/show-services
+```
+
+The summary includes installed/up-to-date state, active/enabled state, timer state
+and next run, `ExecStart`, working directory, user configuration files, log tail
+commands, and the setup command for each service.
+
 The services have different responsibilities:
 
 - **Dependency Updater** is allowed to create and update dependency PRs. Its email

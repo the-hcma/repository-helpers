@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Tests for scripts/show-services.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/show-services"
+readonly script
+
+printf '\n=== static: show-services script ===\n'
+script_text="$(<"$script")"
+assert_contains "script exists" "$script_text" "show-services"
+assert_contains "discovers service templates" "$script_text" "etc/systemd"
+assert_contains "discovers installed user units" "$script_text" ".config/systemd/user"
+assert_contains "reports environment files" "$script_text" "EnvironmentFile="
+assert_contains "reports log files" "$script_text" "Standard(Output|Error)="
+assert_contains "reports setup wrapper" "$script_text" "setup-repo-big-brother-enforcer"
+
+printf '\n=== --help ===\n'
+help_out=""
+help_exit=0
+help_out="$(bash "$script" --help 2>&1)" || help_exit=$?
+assert_exit_0 "--help" "$help_out" "$help_exit"
+assert_contains "--help includes usage" "$help_out" "Usage:"
+
+printf '\n=== mock systemd summary ===\n'
+tmp=""
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin" "${tmp}/.config/systemd/user" "${tmp}/scratch/repository-helpers"
+
+repo_root="${script_dir}/.."
+sed "s|@@REPO_DIR@@|${repo_root}|g" \
+  "${repo_root}/etc/systemd/dep-updater.service" \
+  >"${tmp}/.config/systemd/user/dep-updater.service"
+sed "s|@@REPO_DIR@@|${repo_root}|g" \
+  "${repo_root}/etc/systemd/dep-updater.timer" \
+  >"${tmp}/.config/systemd/user/dep-updater.timer"
+sed "s|@@REPO_DIR@@|${repo_root}|g" \
+  "${repo_root}/etc/systemd/repo-big-brother-enforcer.service" \
+  >"${tmp}/.config/systemd/user/repo-big-brother-enforcer.service"
+sed "s|@@REPO_DIR@@|${repo_root}|g" \
+  "${repo_root}/etc/systemd/repo-big-brother-enforcer.timer" \
+  >"${tmp}/.config/systemd/user/repo-big-brother-enforcer.timer"
+cat >"${tmp}/.config/systemd/user/user-cron.service" <<EOF
+[Unit]
+Description=User Cron Demo
+
+[Service]
+Type=oneshot
+WorkingDirectory=${tmp}
+EnvironmentFile=-%h/.config/user-cron.env
+ExecStart=${tmp}/bin/user-cron
+StandardOutput=append:%h/scratch/repository-helpers/user-cron.log
+EOF
+cat >"${tmp}/.config/systemd/user/user-cron.timer" <<'EOF'
+[Unit]
+Description=User Cron Demo timer
+
+[Timer]
+OnCalendar=hourly
+Unit=user-cron.service
+EOF
+
+cat >"${mock_bin}/systemctl" <<'MOCK_SYSTEMCTL'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "--user" ]]; then
+  shift
+fi
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  cat)
+    unit="${1:-}"
+    unit_file="${HOME}/.config/systemd/user/${unit}"
+    [[ -f "$unit_file" ]] || exit 1
+    printf '# %s\n' "$unit_file"
+    sed "s|%h|${HOME}|g" "$unit_file"
+    ;;
+  is-enabled)
+    case "${1:-}" in
+      dep-updater.service|dep-updater.timer|repo-big-brother-enforcer.service|repo-big-brother-enforcer.timer|user-cron.service|user-cron.timer)
+        printf 'enabled\n'
+        ;;
+      *)
+        printf 'disabled\n'
+        exit 1
+        ;;
+    esac
+    ;;
+  show)
+    unit="${1:-}"
+    property=""
+    for arg in "$@"; do
+      case "$arg" in
+        --property=*) property="${arg#--property=}" ;;
+      esac
+    done
+    case "$property" in
+      ActiveState)
+        printf 'inactive\n'
+        ;;
+      SubState)
+        printf 'dead\n'
+        ;;
+      *)
+        printf 'unexpected property for %s: %s\n' "$unit" "$property" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  list-timers)
+    printf 'NEXT LEFT LAST PASSED UNIT ACTIVATES\n'
+    printf 'Tue 2026-05-26 04:00:00 EDT 16h - - %s %s\n' "${1:-}" "${1:-.timer}.service"
+    ;;
+  *)
+    printf 'unexpected systemctl command: %s\n' "$cmd" >&2
+    exit 1
+    ;;
+esac
+MOCK_SYSTEMCTL
+chmod +x "${mock_bin}/systemctl"
+
+summary_out=""
+summary_exit=0
+summary_out="$(
+  HOME="$tmp" PATH="${mock_bin}:${PATH}" bash "$script" 2>&1
+)" || summary_exit=$?
+
+assert_exit_0 "mock summary" "$summary_out" "$summary_exit"
+assert_contains "summary includes header" "$summary_out" "systemd user services"
+assert_contains "summary includes dep-updater" "$summary_out" "Dependency Updater"
+assert_contains "summary includes enforcer" "$summary_out" "Repo Big Brother Enforcer"
+assert_count_equals "summary deduplicates dep-updater" "$summary_out" "Dependency Updater" "1"
+assert_count_equals "summary deduplicates enforcer" "$summary_out" "Repo Big Brother Enforcer" "1"
+assert_contains "summary includes other user service" "$summary_out" "User Cron Demo"
+assert_contains "summary labels other service" "$summary_out" "Service:   yes, installed user unit"
+assert_contains "summary includes service active state" "$summary_out" "Active:    inactive (dead)"
+assert_contains "summary includes dep-updater config" "$summary_out" "${tmp}/.config/dep-updater.env"
+assert_contains "summary includes enforcer config" "$summary_out" "${tmp}/.config/repo-big-brother-enforcer.env"
+assert_contains "summary includes other service config" "$summary_out" "${tmp}/.config/user-cron.env"
+assert_contains "summary includes dep-updater log" "$summary_out" "dep-updater-batch.log"
+assert_contains "summary includes enforcer log" "$summary_out" "repo-big-brother-enforcer.log"
+assert_contains "summary includes other service log" "$summary_out" "user-cron.log"
+assert_contains "summary includes enforcer setup" "$summary_out" "scripts/setup-repo-big-brother-enforcer"
+assert_contains "summary includes default setup" "$summary_out" "scripts/setup-service"
+assert_contains "summary includes n/a setup" "$summary_out" "n/a (installed user unit)"
+assert_contains "summary includes timer" "$summary_out" "Timer:     template present (installed: yes, enabled: enabled)"
+assert_contains "summary includes installed timer" "$summary_out" "Timer:     installed timer (installed: yes, enabled: enabled)"
+assert_contains "summary includes next run" "$summary_out" "Next run:"
+
+rm -rf "$tmp"
+
+test_summary
