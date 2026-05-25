@@ -1,92 +1,186 @@
 # repository-helpers
 
-General-purpose Bash scripts for managing repositories: service setup, development sessions, and dependency updates.
+[![CI](https://github.com/the-hcma/repository-helpers/actions/workflows/ci.yml/badge.svg)](https://github.com/the-hcma/repository-helpers/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Bash 5.x](https://img.shields.io/badge/bash-5.x-4EAA25?logo=gnu-bash&logoColor=white)
 
-## Scripts
+Pure Bash helpers for keeping repositories maintained: dependency update PRs, repository
+practice audits, systemd user services, and Graphite-based development workflow support.
 
-### `scripts/setup-service`
+## Highlights
 
-Installs a repository as a persistent **systemd user service**. Derives the service name from the repository directory — no hardcoding required.
+- `scripts/dep-updater` creates stacked dependency update PRs for npm/pnpm, Python
+  (`pip`, `uv`, `poetry`, `pipenv`), Rust/Cargo, and GitHub Actions.
+- `scripts/dep-updater-batch-run` runs dependency updates across every clone under a
+  scan root, streams a live log, and sends a daily email report.
+- `scripts/check-repo-practices` audits org repository settings such as Graphite merge
+  queue wiring, `protect-main`, classic branch protection, branch cleanup workflows,
+  and Dependabot auto-merge.
+- `scripts/repo-big-brother-enforcer` runs those practice checks daily across local
+  clones and emails a compliance report.
+- `scripts/setup-service` installs worktree-aware systemd user services from templates.
+- `scripts/dev/start-development` creates and resumes Graphite worktrees safely.
 
-```
-Usage: scripts/setup-service [OPTIONS]
+## Daily Services
 
-Options:
-  (no options)   Install or update the systemd service
-  --status       Check current service configuration and health
-  --help         Show usage information
-```
+This repo ships two optional systemd user services. They are separate on purpose:
+dependency updates can create PRs, while repository-practices monitoring only reports
+compliance drift and points to the explicit `--apply` remediation command.
 
-Reads a service unit template from `etc/systemd/<repo-name>.service` and expands `@@REPO_DIR@@` to the resolved repository path. The generated unit also sets `Environment=DEPLOYED_COMMIT=<git HEAD>` (injected automatically; templates may use `@@DEPLOYED_COMMIT@@` optionally).
+| Service | Script | Schedule | Purpose |
+| --- | --- | --- | --- |
+| `dep-updater.service` | `scripts/dep-updater-batch-run` | 03:00 daily | Create/update dependency PRs across a scan root and email the run report. |
+| `repo-big-brother-enforcer.service` | `scripts/repo-big-brother-enforcer` | 04:00 daily | Monitor local GitHub clones for repository-practices compliance and email the report. |
 
-**Running vs desired commit:** Before deploy, `setup-service` prints both. *Running* is read from `DEPLOYED_COMMIT` in the service process environment (set at last start), not from `git HEAD` in the repo directory (which changes on `git pull` before restart). If the running process lacks `DEPLOYED_COMMIT`, or it differs from the current checkout, `setup-service` conservatively runs `on-deploy` and restarts even when the hook would otherwise skip.
+`dep-updater.service` is the automation worker. It fetches every repository under
+the scan root, runs `dep-updater --batch --all`, streams the run to
+`~/scratch/repository-helpers/dep-updater-batch.log`, and sends a success, failure,
+or timeout report by email. When updates are created, the report lists them from
+structured JSON; when none are created, it says so explicitly.
 
-Runs `scripts/on-deploy` (exit 0 = rebuilt, exit 1 = unchanged) if present, and restarts the service when the unit changed, code changed, or a deploy refresh is required.
+`repo-big-brother-enforcer.service` is the compliance monitor. It discovers local
+GitHub clones under a scan root, runs strict repository-practices checks for each
+one, emails the daily report, and exits non-zero when any repository fails. It does
+not apply repairs automatically.
 
-#### `scripts/on-deploy` contract
-
-Repos with a systemd service should provide an executable `scripts/on-deploy` hook. `setup-service` calls it before (re)starting the unit:
-
-| Exit code | Meaning |
-|-----------|---------|
-| `0` | Build or sync steps ran; the service must be restarted |
-| `1` | Nothing changed; restart may be skipped |
-| `2+` | Failure; `setup-service` aborts |
-
-**Dependency expectations** (use `scripts/lib/on-deploy-deps` from this repo):
-
-1. **Load the library** via `scripts/lib/on-deploy-deps-bootstrap` (copy the block from `docs/on-deploy-deps-load.snippet` into `on-deploy`; do not call library functions before `source`).
-2. **Before skipping** on an unchanged commit, check staleness with `on_deploy_deps_python_env_stale` and, when the repo has a `package.json`, `on_deploy_deps_pnpm_modules_stale` (pass a subdir such as `web` for nested frontends).
-3. **Bootstrap** a missing or broken `.venv` with `on_deploy_deps_bootstrap_python_venv` when the service uses uv.
-4. **On a full deploy** (exit `0` path), run `on_deploy_deps_sync_python_frozen` and `on_deploy_deps_install_pnpm_frozen` before migrations, asset builds, or import smoke tests.
-
-Commit-only skip caches must not ignore lockfile changes at the same SHA. See [AGENTS.md](AGENTS.md#on-deploy-hooks) for worktree and `.env` patterns.
-
----
-
-### `scripts/dev/start-development`
-
-Initializes a **development session**: prunes stale git worktrees, syncs Graphite, and either creates a new worktree or resumes an existing one.
-
-```
-Usage: scripts/dev/start-development [OPTIONS]
-
-Options:
-  --refresh   Pull latest main and ensure the service is running, then exit
-  --resume    Prompt to resume an existing in-progress worktree
-  --help      Show usage information
-```
-
-Requires `git`, `gh`, and `gt` (Graphite CLI) on `PATH`.
-
----
-
-### `scripts/dep-updater`
-
-Automates dependency version bumps across npm, pip, uv, and poetry ecosystems. Creates stacked Graphite PRs for each updated dependency.
-
-See [dep-updater.plan.md](dep-updater.plan.md) for the full feature roadmap, and [dep-updater-hybrid-architecture.plan.md](dep-updater-hybrid-architecture.plan.md) for the Bash + Python extraction proposal.
-
----
-
-### `scripts/dep-updater-notifier`
-
-Companion to `dep-updater`. Posts a notification when dependency PRs are ready for review.
-
----
-
-## Testing
-
-Each script has a corresponding smoke test in `tests/`:
+Install or inspect them from this repository:
 
 ```bash
-bash tests/setup-service.test
-bash tests/start-development.test
-bash tests/on-deploy-deps.test
-bash tests/dep-updater.test
+cp etc/dep-updater.env.example ~/.config/dep-updater.env
+chmod 600 ~/.config/dep-updater.env
+
+scripts/setup-service
+scripts/setup-service --status
+
+scripts/setup-repo-big-brother-enforcer
+scripts/setup-repo-big-brother-enforcer --status
 ```
+
+`repo-big-brother-enforcer` reuses `~/.config/dep-updater.env` for SMTP by default.
+Use `~/.config/repo-big-brother-enforcer.env` when you need a different scan root or
+report settings.
+
+See [docs/SYSTEMD.md](docs/SYSTEMD.md) for service configuration, logs, timers, and
+manual trial runs.
+
+## Dependency Updates
+
+Run against one repository:
+
+```bash
+scripts/dep-updater --dry-run --dir /path/to/repo
+scripts/dep-updater --dir /path/to/repo
+```
+
+Run across all repositories under a scan root through the service wrapper:
+
+```bash
+DEP_UPDATER_BATCH_SCAN_ROOT=/path/to/repos scripts/dep-updater-batch-run --print
+systemctl --user start dep-updater.service
+tail --follow=name --retry ~/scratch/repository-helpers/dep-updater-batch.log
+```
+
+Supported ecosystems and policy defaults:
+
+- **npm / pnpm:** reads `package.json`, lockfiles, and workspace config. Exact pins
+  are updated in place; workspace, local, file, link, and git refs are skipped.
+- **Python / pip:** supports `requirements.txt` and `pyproject.toml`, writes `>=`
+  floor constraints, and respects intentional `==` pins.
+- **Python / uv:** supports `uv.lock`; `==` pins are updated and promoted to `>=`,
+  with dry-run install checks guarding transitive constraints.
+- **Python / Poetry:** supports `poetry.lock`, respecting intentional `==` pins.
+- **Python / Pipenv:** supports `Pipfile.lock`, respecting intentional `==` pins.
+- **Rust / Cargo:** supports `Cargo.toml` / `Cargo.lock` using `cargo outdated`
+  JSON and `cargo add`, preserving dev/build kind and workspace package targeting.
+- **GitHub Actions:** supports `.github/workflows/*.yml`, preserving existing `v`
+  prefix style, updating major-only pins only on newer majors, and skipping SHA or
+  local action pins.
+
+For npm packages, registry releases newer than 10 days are skipped unless the bump
+fixes a CVE.
+
+See [dep-updater.plan.md](dep-updater.plan.md) for implementation details and
+[dep-updater-hybrid-architecture.plan.md](dep-updater-hybrid-architecture.plan.md)
+for the Bash + Python extraction proposal.
+
+## Repository Practices
+
+Audit one repository:
+
+```bash
+scripts/check-repo-practices --repo OWNER/NAME --suggest
+```
+
+Audit a new repository with strict onboarding expectations:
+
+```bash
+scripts/check-repo-practices --new-repo --repo OWNER/NAME
+```
+
+Apply supported GitHub-side fixes:
+
+```bash
+scripts/check-repo-practices --repo OWNER/NAME --apply
+```
+
+`--apply` can repair supported GitHub settings such as Release Please squash settings,
+the `protect-main` ruleset, and classic `main` branch protection. Graphite app merge
+queue configuration remains a manual step and is reported as such.
+
+## Systemd Service Setup
+
+`scripts/setup-service` installs a user service from `etc/systemd/<unit>.service`,
+substitutes `@@REPO_DIR@@`, injects `DEPLOYED_COMMIT`, and enables the companion
+timer when `etc/systemd/<unit>.timer` exists.
+
+For service repositories, provide an executable `scripts/on-deploy` hook:
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Build or sync steps ran; the service must restart. |
+| `1` | Nothing changed; restart may be skipped. |
+| `2+` | Failure; setup aborts. |
+
+Use `scripts/lib/on-deploy-deps` from this repo for Python and pnpm dependency
+staleness checks. See [AGENTS.md](AGENTS.md#on-deploy-hooks) and
+[docs/on-deploy-deps-load.snippet](docs/on-deploy-deps-load.snippet).
 
 ## Development
 
-See [AGENTS.md](AGENTS.md) for coding conventions, linting rules, and CI requirements.  
-See [GRAPHITE.md](GRAPHITE.md) for the branch stacking and PR workflow.
+Start work in a Graphite worktree:
+
+```bash
+scripts/dev/start-development --worktree my-change --no-interactive
+```
+
+Before submitting a stack:
+
+```bash
+scripts/dev/pre-pr-checks
+scripts/dev/submit-stack
+```
+
+See [AGENTS.md](AGENTS.md) for coding conventions and [GRAPHITE.md](GRAPHITE.md) for
+the branch stacking and PR workflow.
+
+## Testing
+
+Run the full local CI mirror:
+
+```bash
+scripts/dev/pre-pr-checks
+```
+
+Focused tests live in `tests/` and can be run directly:
+
+```bash
+bash tests/dep-updater.test
+bash tests/dep-updater-batch-run.test
+bash tests/check-repo-practices.test
+bash tests/repo-big-brother-enforcer.test
+bash tests/setup-service.test
+```
+
+## License
+
+MIT. Copyright (c) 2026 Henrique Andrade / thehcma. See [LICENSE](LICENSE).

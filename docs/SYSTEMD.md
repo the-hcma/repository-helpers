@@ -1,4 +1,24 @@
-# Dependency Updater (systemd user service)
+# Systemd User Services
+
+This repository ships systemd user services for daily repository maintenance:
+
+| Service | Script | Timer | Report |
+| --- | --- | --- | --- |
+| `dep-updater.service` | `scripts/dep-updater-batch-run` | 03:00 daily | Dependency update run results |
+| `repo-big-brother-enforcer.service` | `scripts/repo-big-brother-enforcer` | 04:00 daily | Repository-practices compliance |
+
+Both are oneshot services installed under `~/.config/systemd/user/`, with logs
+under `~/scratch/repository-helpers/`.
+
+The services have different responsibilities:
+
+- **Dependency Updater** is allowed to create and update dependency PRs. Its email
+  reports summarize what changed, what failed, and whether the run timed out.
+- **Repo Big Brother Enforcer** is report-only. It monitors repository settings and
+  workflow compliance, then tells you when to run `check-repo-practices --apply` or
+  complete manual Graphite app steps.
+
+## Dependency Updater
 
 The **Dependency Updater** runs `dep-updater --batch --all` over git repositories
 discovered under a **scan root**. By default the scan root is the parent directory
@@ -9,7 +29,7 @@ Before each run, `scripts/dep-updater-batch-run` runs `git fetch --prune origin`
 this checkout and on each repository under the scan root so batch updates use the
 latest remote refs.
 
-## Timer (optional)
+### Timer (optional)
 
 A daily schedule is **optional**. It is enabled only when the repo ships
 `etc/systemd/dep-updater.timer` (same directory as the `.service` file).
@@ -22,7 +42,7 @@ when you want a batch run.
 User **lingering** is enabled so scheduled (or manual) runs can execute without an
 active login session.
 
-## Prerequisites
+### Prerequisites
 
 - Linux with a systemd user session (`systemctl --user status` works)
 - `gh`, `gt`, `jq`, `rg`, and ecosystem tools (`pnpm`, `uv`, …) on `PATH` or under
@@ -33,7 +53,7 @@ active login session.
 - **`curl`** for SMTP email reports
 - **`~/.config/dep-updater.env`** (required; see below)
 
-## Email reports (SMTP)
+### Email reports (SMTP)
 
 Each run executes `scripts/dep-updater-batch-run`, which:
 
@@ -83,7 +103,7 @@ Preview a report email without running the batch (uses the same env file):
 updates (dry-run). The timer batch job applies updates and emails *run results*
 (success/failure per repo).
 
-## Install
+### Install
 
 From this repository (any worktree):
 
@@ -100,7 +120,7 @@ This will:
 4. Run `scripts/on-deploy` to record the deployed commit
 5. Enable the **timer** when `dep-updater.timer` exists (not an immediate batch run)
 
-## Status and logs
+### Status and logs
 
 ```bash
 ./scripts/setup-service --status
@@ -110,23 +130,83 @@ journalctl --user -u dep-updater.service -n 100
 tail -f ~/scratch/repository-helpers/dep-updater-batch.log
 ```
 
-## Run batch manually
+### Run batch manually
 
 ```bash
 systemctl --user start dep-updater.service
 ```
 
-## Change schedule or scan root
+### Change schedule or scan root
 
 Edit `etc/systemd/dep-updater.timer` (calendar) or set
 `DEP_UPDATER_BATCH_SCAN_ROOT` in `~/.config/dep-updater.env` or a
 unit override, then re-run `./scripts/setup-service`.
 
-## Uninstall
+### Uninstall
 
 ```bash
 systemctl --user disable --now dep-updater.timer   # if installed
 systemctl --user disable dep-updater.service
 rm ~/.config/systemd/user/dep-updater.{service,timer}
+systemctl --user daemon-reload
+```
+
+## Repo Big Brother Enforcer
+
+The **Repo Big Brother Enforcer** scans GitHub clones under a root path and runs
+`scripts/check-repo-practices --strict-onboarding --suggest --repo OWNER/NAME`
+for each clone. It emails a daily report and exits non-zero when any repository
+fails the checks.
+
+It reuses `~/.config/dep-updater.env` for SMTP. Add
+`~/.config/repo-big-brother-enforcer.env` only for enforcer-specific overrides,
+such as the scan root:
+
+```bash
+cat >~/.config/repo-big-brother-enforcer.env <<'EOF'
+REPO_BIG_BROTHER_SCAN_ROOT=/path/to/repos
+EOF
+chmod 600 ~/.config/repo-big-brother-enforcer.env
+```
+
+### Install
+
+```bash
+./scripts/setup-repo-big-brother-enforcer
+./scripts/setup-repo-big-brother-enforcer --status
+```
+
+The wrapper uses `setup-service` with the `repo-big-brother-enforcer` unit
+template. It does not run from `scripts/dev/start-development`; installation is
+explicit.
+
+### Remediate findings
+
+The enforcer reports drift. To apply supported GitHub-side repairs, run:
+
+```bash
+scripts/check-repo-practices --repo OWNER/NAME --apply
+```
+
+`--apply` can repair supported Release Please squash settings, `protect-main`
+ruleset settings, and classic `main` branch protection. Graphite app merge queue
+configuration remains manual and is reported as a manual step in the output.
+
+### Status, logs, and trial runs
+
+```bash
+systemctl --user status repo-big-brother-enforcer.service
+systemctl --user list-timers repo-big-brother-enforcer.timer
+tail --follow=name --retry ~/scratch/repository-helpers/repo-big-brother-enforcer.log
+
+systemctl --user start repo-big-brother-enforcer.service
+```
+
+### Uninstall
+
+```bash
+systemctl --user disable --now repo-big-brother-enforcer.timer
+systemctl --user disable repo-big-brother-enforcer.service
+rm ~/.config/systemd/user/repo-big-brother-enforcer.{service,timer}
 systemctl --user daemon-reload
 ```
