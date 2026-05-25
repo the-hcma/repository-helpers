@@ -113,7 +113,8 @@ for the Bash + Python extraction proposal.
 
 `scripts/check-repo-practices` audits org conventions including Graphite merge
 queue wiring, branch protection, cleanup workflows, Dependabot auto-merge,
-Release Please settings, and top-level license/copyright metadata.
+Release Please settings, top-level license/copyright metadata, and CODEOWNERS
+coverage for all files.
 
 Audit one repository:
 

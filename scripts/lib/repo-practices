@@ -53,6 +53,7 @@ Audits GitHub conventions for org repositories:
   Repository metadata:
     - top-level license file
     - copyright notice
+    - CODEOWNERS with a repository-wide owner rule
 
   Release Please (when release-please.yml exists):
     - squash-only repo settings; squash_merge_commit_message=BLANK
@@ -310,6 +311,95 @@ rp_find_repo_copyright_notice_path() {
   return 1
 }
 
+rp_fetch_repo_codeowners_file() {
+  local slug="$1"
+  local codeowners_path text
+  local -a codeowners_paths=(
+    .github/CODEOWNERS
+    CODEOWNERS
+    docs/CODEOWNERS
+  )
+
+  for codeowners_path in "${codeowners_paths[@]}"; do
+    text="$(rp_fetch_github_text_file "$slug" "$codeowners_path" || true)"
+    [[ -n "$text" ]] || continue
+    printf '%s\n%s' "$codeowners_path" "$text"
+    return 0
+  done
+  return 1
+}
+
+rp_codeowners_has_global_owner_rule() {
+  local -r text="$1"
+  grep -Eq '^[[:space:]]*\*[[:space:]]+@[-A-Za-z0-9_]+' <<<"$text"
+}
+
+rp_authenticated_github_login() {
+  gh api user --jq '.login'
+}
+
+rp_apply_codeowners_pr() {
+  local slug="$1"
+  local login default_branch base_sha branch_name existing_sha content encoded_content pr_url
+  local -a put_args=()
+
+  login="$(rp_authenticated_github_login)"
+  default_branch="$(gh api "repos/${slug}" --jq '.default_branch // "main"')"
+  base_sha="$(gh api "repos/${slug}/git/ref/heads/${default_branch}" --jq '.object.sha')"
+  branch_name='repo-practices/add-codeowners'
+
+  pr_url="$(
+    gh pr list --repo "$slug" --head "$branch_name" --state open --json url \
+      --jq '.[0].url // empty' 2>/dev/null || true
+  )"
+  if [[ -n "$pr_url" ]]; then
+    rp_log_warn "${slug}: CODEOWNERS remediation PR already exists: ${pr_url}"
+    return 0
+  fi
+
+  if ! gh api "repos/${slug}/git/ref/heads/${branch_name}" >/dev/null 2>&1; then
+    gh api -X POST "repos/${slug}/git/refs" \
+      -f "ref=refs/heads/${branch_name}" \
+      -f "sha=${base_sha}" >/dev/null
+  fi
+
+  content="# Repository ownership"$'\n'"* @${login}"$'\n'
+  encoded_content="$(printf '%s' "$content" | base64 | tr -d '\n')"
+  existing_sha="$(
+    gh api "repos/${slug}/contents/.github/CODEOWNERS?ref=${branch_name}" \
+      --jq '.sha' 2>/dev/null || true
+  )"
+
+  put_args=(
+    -X PUT
+    "repos/${slug}/contents/.github/CODEOWNERS"
+    -f "message=chore: add CODEOWNERS"
+    -f "content=${encoded_content}"
+    -f "branch=${branch_name}"
+  )
+  if [[ -n "$existing_sha" ]]; then
+    put_args+=(-f "sha=${existing_sha}")
+  fi
+  gh api "${put_args[@]}" >/dev/null
+
+  pr_url="$(
+    gh pr create \
+      --repo "$slug" \
+      --head "$branch_name" \
+      --base "$default_branch" \
+      --title "chore: add CODEOWNERS" \
+      --body "$(cat <<EOF
+## Summary
+- Add CODEOWNERS with ${login} as the owner of all files.
+
+## Test plan
+- Repository-practices remediation only.
+EOF
+)" \
+  )"
+  rp_log_warn "${slug}: created CODEOWNERS remediation PR: ${pr_url}"
+}
+
 rp_repo_has_release_please() {
   local slug="$1"
   rp_gh_path_exists "$slug" '.github/workflows/release-please.yml'
@@ -395,6 +485,9 @@ rp_fetch_repo_labels_json() {
 
 rp_repo_requires_protect_main_ruleset() {
   local slug="$1"
+  if [[ "$rp_merge_only" -eq 0 ]] && rp_is_strict_repo "$slug"; then
+    return 0
+  fi
   if rp_repo_has_release_please "$slug"; then
     return 0
   fi
@@ -728,6 +821,7 @@ rp_print_new_repo_checklist() {
 
     Docs in the service repo:
       [ ] LICENSE with copyright notice
+      [ ] CODEOWNERS with * @OWNER so all code requires CODEOWNER review
       [ ] GRAPHITE.md (stacked PRs, merge-it flow)
       [ ] RELEASING.md when using Release Please
 
@@ -1222,7 +1316,8 @@ rp_check_graphite_merge_queue() {
   local labels_json
 
   if ! rp_repo_has_merge_it_label "$slug"; then
-    if [[ "$rp_strict_onboarding" -eq 1 ]] && rp_is_strict_repo "$slug"; then
+    if [[ "$rp_strict_onboarding" -eq 1 ]] \
+      || { [[ "$rp_merge_only" -eq 0 ]] && rp_is_strict_repo "$slug"; }; then
       rp_log_fail "${slug}: merge-it label is required for full org onboarding"
       rp_log_suggest "${slug}: create merge-it label and enable Graphite merge queue on main"
       return 1
@@ -1291,6 +1386,7 @@ rp_check_license_metadata() {
   local slug="$1"
   local repo_fail=0
   local license_blob license_path license_text copyright_path
+  local codeowners_blob codeowners_path codeowners_text
 
   license_blob="$(rp_fetch_repo_license_file "$slug" || true)"
   if [[ -n "$license_blob" ]]; then
@@ -1322,6 +1418,34 @@ rp_check_license_metadata() {
       "$(rp_github_url "$slug" '/tree/main')"
     if [[ "$rp_suggest" -eq 1 ]]; then
       rp_log_suggest "${slug}: add a copyright notice to LICENSE, NOTICE, COPYRIGHT, or README.md"
+    fi
+  fi
+
+  codeowners_blob="$(rp_fetch_repo_codeowners_file "$slug" || true)"
+  if [[ -n "$codeowners_blob" ]]; then
+    codeowners_path="${codeowners_blob%%$'\n'*}"
+    codeowners_text="${codeowners_blob#*$'\n'}"
+    if rp_codeowners_has_global_owner_rule "$codeowners_text"; then
+      rp_log_check_ok "$slug" "CODEOWNERS (${codeowners_path})" \
+        "$(rp_github_url "$slug" "/blob/main/${codeowners_path}")"
+    else
+      repo_fail=1
+      rp_log_check_fail "$slug" 'CODEOWNERS must include a repository-wide "* @owner" rule' \
+        "$(rp_github_url "$slug" "/blob/main/${codeowners_path}")"
+      if [[ "$rp_apply" -eq 1 ]]; then
+        rp_apply_codeowners_pr "$slug"
+      elif [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: add '* @OWNER' to CODEOWNERS so CODEOWNER review covers all files"
+      fi
+    fi
+  else
+    repo_fail=1
+    rp_log_check_fail "$slug" 'CODEOWNERS (add .github/CODEOWNERS)' \
+      "$(rp_github_url "$slug" '/new/main?filename=.github/CODEOWNERS')"
+    if [[ "$rp_apply" -eq 1 ]]; then
+      rp_apply_codeowners_pr "$slug"
+    elif [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: run scripts/check-repo-practices --repo ${slug} --apply to open a CODEOWNERS PR"
     fi
   fi
 
