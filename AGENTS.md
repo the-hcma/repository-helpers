@@ -9,7 +9,9 @@ This file defines the non-negotiable standards for all contributors (human or AI
 - Scripts live in `scripts/` (e.g. `scripts/dep-updater`, `scripts/setup-service`). Sub-directories are allowed (e.g. `scripts/dev/start-development`).
 - Tests live in `tests/` and mirror the script name (e.g. `tests/dep-updater.test`).
 - Target **bash ≥ 5.x** (every script declares `#!/usr/bin/env bash` and uses `set -euo pipefail`).
-- External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`, `rg` (ripgrep), plus the ecosystem tools being managed (`pnpm`, `pip`, `uv`, `poetry`) as optional callees.
+- External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`,
+  `rg` (ripgrep), `actionlint`, plus the ecosystem tools being managed (`pnpm`,
+  `pip`, `uv`, `poetry`) as optional callees.
 - No Node.js helpers, no Python scripting. Keep the implementation pure Bash.
 - Test harnesses are plain Bash — no test framework installs required.
 
@@ -82,7 +84,7 @@ Run **`scripts/check-repo-practices`** to audit or onboard a GitHub repository a
 scripts/check-repo-practices --new-repo --repo OWNER/NAME   # checklist + SUGGEST hints
 scripts/check-repo-practices --repo OWNER/NAME --suggest    # audit one repo with remediation lines
 scripts/check-repo-practices --all --org the-hcma             # every repo in the org
-scripts/check-repo-practices --apply-fix --repo OWNER/NAME  # patch Release Please squash settings
+scripts/check-repo-practices --apply-fix --repo OWNER/NAME  # patch settings + candidate workflow PRs
 ```
 
 **`scripts/check-merge-settings`** is a thin wrapper (merge + Graphite only). Prefer **`check-repo-practices`** for full coverage including branch cleanup workflows.
@@ -112,7 +114,10 @@ Classic branch protection on **`main`** is also required (org standard). It comp
 | Force-push / delete | disabled |
 | `enforce_admins` | `false` (warn if enabled) |
 
-Create or repair ruleset + classic settings with `scripts/check-repo-practices --repo OWNER/NAME --apply-fix`.
+Create or repair ruleset + classic settings with
+`scripts/check-repo-practices --repo OWNER/NAME --apply-fix`. Run it from the target
+repository clone when you want candidate workflow fixes emitted as a Graphite stack
+under `.worktrees/repo-practices-candidate-fixes-wt`.
 
 **`merge-mq`** is not the default enqueue label. Use it only when Graphite MQ for that repo is wired to **`merge-mq`**; otherwise use **`merge-it`** only.
 
@@ -322,6 +327,7 @@ scripts/dev/pre-pr-checks            # preferred: all checks + main worktree gua
 # or manually:
 bash -n scripts/* scripts/dev/* scripts/lib/* tests/* tests/lib/*
 shellcheck -S info scripts/* scripts/dev/* scripts/lib/* tests/* tests/lib/*
+actionlint .github/workflows/*.yml scripts/lib/repo-practices-workflows/*.yaml
 bash tests/*.test                    # every test harness
 ```
 
