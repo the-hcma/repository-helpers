@@ -9,7 +9,9 @@ This file defines the non-negotiable standards for all contributors (human or AI
 - Scripts live in `scripts/` (e.g. `scripts/dep-updater`, `scripts/setup-service`). Sub-directories are allowed (e.g. `scripts/dev/start-development`).
 - Tests live in `tests/` and mirror the script name (e.g. `tests/dep-updater.test`).
 - Target **bash ≥ 5.x** (every script declares `#!/usr/bin/env bash` and uses `set -euo pipefail`).
-- External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`, `rg` (ripgrep), plus the ecosystem tools being managed (`pnpm`, `pip`, `uv`, `poetry`) as optional callees.
+- External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`,
+  `rg` (ripgrep), `actionlint`, plus the ecosystem tools being managed (`pnpm`,
+  `pip`, `uv`, `poetry`) as optional callees.
 - No Node.js helpers, no Python scripting. Keep the implementation pure Bash.
 - Test harnesses are plain Bash — no test framework installs required.
 
@@ -325,6 +327,7 @@ scripts/dev/pre-pr-checks            # preferred: all checks + main worktree gua
 # or manually:
 bash -n scripts/* scripts/dev/* scripts/lib/* tests/* tests/lib/*
 shellcheck -S info scripts/* scripts/dev/* scripts/lib/* tests/* tests/lib/*
+actionlint .github/workflows/*.yml scripts/lib/repo-practices-workflows/*.yaml
 bash tests/*.test                    # every test harness
 ```
 
