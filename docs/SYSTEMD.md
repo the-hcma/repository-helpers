@@ -203,8 +203,9 @@ scripts/check-repo-practices --repo OWNER/NAME --apply-fix
 ruleset settings, and classic `main` branch protection. When run from the target
 repository clone, it also prepares candidate workflow fixes in
 `.worktrees/repo-practices-candidate-fixes-wt` and submits a Graphite stack for
-review. Graphite app merge queue configuration remains manual and is reported as a
-manual step in the output.
+review. Candidate workflow templates live under `scripts/lib/repo-practices-workflows/`
+so they can be reviewed and linted directly. Graphite app merge queue configuration
+remains manual and is reported as a manual step in the output.
 
 ### Status, logs, and trial runs
 
