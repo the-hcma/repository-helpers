@@ -82,7 +82,7 @@ Run **`scripts/check-repo-practices`** to audit or onboard a GitHub repository a
 scripts/check-repo-practices --new-repo --repo OWNER/NAME   # checklist + SUGGEST hints
 scripts/check-repo-practices --repo OWNER/NAME --suggest    # audit one repo with remediation lines
 scripts/check-repo-practices --all --org the-hcma             # every repo in the org
-scripts/check-repo-practices --apply --repo OWNER/NAME      # patch Release Please squash settings
+scripts/check-repo-practices --apply-fix --repo OWNER/NAME  # patch Release Please squash settings
 ```
 
 **`scripts/check-merge-settings`** is a thin wrapper (merge + Graphite only). Prefer **`check-repo-practices`** for full coverage including branch cleanup workflows.
@@ -112,7 +112,7 @@ Classic branch protection on **`main`** is also required (org standard). It comp
 | Force-push / delete | disabled |
 | `enforce_admins` | `false` (warn if enabled) |
 
-Create or repair ruleset + classic settings with `scripts/check-repo-practices --repo OWNER/NAME --apply`.
+Create or repair ruleset + classic settings with `scripts/check-repo-practices --repo OWNER/NAME --apply-fix`.
 
 **`merge-mq`** is not the default enqueue label. Use it only when Graphite MQ for that repo is wired to **`merge-mq`**; otherwise use **`merge-it`** only.
 
@@ -130,7 +130,7 @@ With no `--repo`, the script audits the **current git repository** when run insi
 ```bash
 scripts/check-merge-settings                      # current repo in a clone; else discover
 scripts/check-merge-settings --repo OWNER/NAME
-scripts/check-merge-settings --apply              # patch Release Please squash settings only
+scripts/check-merge-settings --apply-fix          # patch Release Please squash settings only
 ```
 
 ### Release Please
