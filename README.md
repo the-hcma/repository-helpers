@@ -25,7 +25,7 @@ practice audits, systemd user services, and Graphite-based development workflow 
 
 This repo ships two optional systemd user services. They are separate on purpose:
 dependency updates can create PRs, while repository-practices monitoring only reports
-compliance drift and points to the explicit `--apply` remediation command.
+compliance drift and points to the explicit `--apply-fix` remediation command.
 
 | Service | Script | Schedule | Purpose |
 | --- | --- | --- | --- |
@@ -131,10 +131,10 @@ scripts/check-repo-practices --new-repo --repo OWNER/NAME
 Apply supported GitHub-side fixes:
 
 ```bash
-scripts/check-repo-practices --repo OWNER/NAME --apply
+scripts/check-repo-practices --repo OWNER/NAME --apply-fix
 ```
 
-`--apply` can repair supported GitHub settings such as Release Please squash settings,
+`--apply-fix` can repair supported GitHub settings such as Release Please squash settings,
 the `protect-main` ruleset, and classic `main` branch protection. Graphite app merge
 queue configuration remains a manual step and is reported as such.
 

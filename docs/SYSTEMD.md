@@ -26,7 +26,7 @@ The services have different responsibilities:
 - **Dependency Updater** is allowed to create and update dependency PRs. Its email
   reports summarize what changed, what failed, and whether the run timed out.
 - **Repo Big Brother Enforcer** is report-only. It monitors repository settings and
-  workflow compliance, then tells you when to run `check-repo-practices --apply` or
+  workflow compliance, then tells you when to run `check-repo-practices --apply-fix` or
   complete manual Graphite app steps.
 
 ## Dependency Updater
@@ -165,9 +165,9 @@ systemctl --user daemon-reload
 ## Repo Big Brother Enforcer
 
 The **Repo Big Brother Enforcer** scans GitHub clones under a root path and runs
-`scripts/check-repo-practices --strict-onboarding --suggest --repo OWNER/NAME`
-for each clone. It emails a daily report and exits non-zero when any repository
-fails the checks.
+`scripts/check-repo-practices --strict-onboarding --compact` across the discovered
+repositories. It emails a daily report and exits non-zero when any repository fails
+the checks.
 
 It reuses `~/.config/dep-updater.env` for SMTP. Add
 `~/.config/repo-big-brother-enforcer.env` only for enforcer-specific overrides,
@@ -196,10 +196,10 @@ explicit.
 The enforcer reports drift. To apply supported GitHub-side repairs, run:
 
 ```bash
-scripts/check-repo-practices --repo OWNER/NAME --apply
+scripts/check-repo-practices --repo OWNER/NAME --apply-fix
 ```
 
-`--apply` can repair supported Release Please squash settings, `protect-main`
+`--apply-fix` can repair supported Release Please squash settings, `protect-main`
 ruleset settings, and classic `main` branch protection. Graphite app merge queue
 configuration remains manual and is reported as a manual step in the output.
 

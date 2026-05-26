@@ -12,15 +12,20 @@ rp_ORG_OWNER_BYPASS_USER='thehcma'
 rp_THIS_REPO_NAME='repository-helpers'
 
 rp_org="$rp_DEFAULT_ORG"
-rp_apply=0
+rp_apply_fix=0
 rp_suggest=0
 rp_new_repo=0
 rp_audit_all=0
 rp_merge_only=0
 rp_strict_onboarding=0
+rp_compact=0
 rp_single_repo=0
 rp_warn_count=0
+rp_current_slug=""
 declare -a rp_repo_slugs=()
+declare -a rp_compact_passed_repos=()
+declare -a rp_compact_failed_repos=()
+declare -A rp_compact_entries=()
 
 rp_usage() {
   local -r prog="${1:-check-repo-practices}"
@@ -31,7 +36,7 @@ Usage:
   scripts/${prog} --strict-onboarding --repo OWNER/NAME ...
   scripts/${prog} --all [--org ORG]
   scripts/${prog} --suggest [--repo OWNER/NAME ...]
-  scripts/${prog} --apply [--repo ...]          # squash settings, protect-main, classic main BP
+  scripts/${prog} --apply-fix [--repo ...]      # squash settings, protect-main, classic main BP
 
 Audits GitHub conventions for org repositories:
 
@@ -64,6 +69,7 @@ Audits GitHub conventions for org repositories:
 With no --repo: audit the current git repository when run inside a clone (origin on GitHub);
 otherwise discover org repos with release-please.yml or merge-it.
 --suggest: print SUGGEST lines with remediation hints (non-zero exit still on FAIL).
+--compact: print one passed-repos line plus grouped failures and fixes (implies --suggest).
 
 Requires: gh (authenticated), jq.
 USAGE
@@ -88,7 +94,106 @@ rp_color() {
   fi
 }
 
+rp_compact_append_entry() {
+  local slug="$1"
+  local line="$2"
+  local existing
+
+  [[ -n "$slug" && -n "$line" ]] || return 0
+  existing="${rp_compact_entries[$slug]:-}"
+  if [[ -n "$existing" ]] && grep -qxF -- "$line" <<<"$existing"; then
+    return 0
+  fi
+  if [[ -n "$existing" ]]; then
+    rp_compact_entries[$slug]+=$'\n'"$line"
+  else
+    rp_compact_entries[$slug]="$line"
+  fi
+}
+
+rp_compact_strip_slug() {
+  local slug="$1"
+  local message="$2"
+  local prefix
+
+  prefix="${slug}: "
+  if [[ "$message" == "${prefix}"* ]]; then
+    printf '%s' "${message:${#prefix}}"
+  else
+    printf '%s' "$message"
+  fi
+}
+
+rp_compact_record_failure() {
+  local slug="$1"
+  local message="$2"
+  local stripped
+
+  stripped="$(rp_compact_strip_slug "$slug" "$message")"
+  rp_compact_append_entry "$slug" "- ${stripped}"
+}
+
+rp_compact_record_fix() {
+  local slug="$1"
+  local message="$2"
+  local stripped
+
+  stripped="$(rp_compact_strip_slug "$slug" "$message")"
+  rp_compact_append_entry "$slug" "  Fix: ${stripped}"
+}
+
+rp_compact_print_joined_repos() {
+  local label="$1"
+  shift
+  local first=1
+  local slug
+
+  printf '%s' "$label" >&2
+  if [[ "$#" -eq 0 ]]; then
+    printf ' none\n' >&2
+    return 0
+  fi
+  for slug in "$@"; do
+    if [[ "$first" -eq 1 ]]; then
+      printf ' ' >&2
+      first=0
+    else
+      printf ', ' >&2
+    fi
+    printf '%s' "$slug" >&2
+  done
+  printf '\n' >&2
+}
+
+rp_compact_print_report() {
+  local slug
+  local block
+  local line
+
+  rp_compact_print_joined_repos 'Passed:' "${rp_compact_passed_repos[@]}"
+  if [[ "${#rp_compact_failed_repos[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  printf 'Failed:\n' >&2
+  for slug in "${rp_compact_failed_repos[@]}"; do
+    printf '%s:\n' "$slug" >&2
+    block="${rp_compact_entries[$slug]:-}"
+    if [[ -z "$block" ]]; then
+      printf '  - failed practices check\n' >&2
+      continue
+    fi
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      printf '  %s\n' "$line" >&2
+    done <<<"$block"
+  done
+}
+
 rp_log_ok() {
+  if [[ "$rp_compact" -eq 1 ]]; then
+    return 0
+  fi
   printf 'OK: %s\n' "$*" >&2
 }
 
@@ -98,6 +203,10 @@ rp_log_warn() {
 }
 
 rp_log_fail() {
+  if [[ "$rp_compact" -eq 1 && -n "$rp_current_slug" ]]; then
+    rp_compact_record_failure "$rp_current_slug" "$*"
+    return 0
+  fi
   printf 'FAIL: %s\n' "$*" >&2
 }
 
@@ -119,6 +228,9 @@ rp_log_check_ok() {
   local slug="$1"
   local message="$2"
   local url="${3:-}"
+  if [[ "$rp_compact" -eq 1 ]]; then
+    return 0
+  fi
   printf 'OK: ' >&2
   rp_check_line_prefix "$slug" >&2
   printf '%s\n' "$message" >&2
@@ -131,6 +243,9 @@ rp_log_check_fail() {
   local slug="$1"
   local message="$2"
   local url="${3:-}"
+  if [[ "$rp_compact" -eq 1 ]]; then
+    return 0
+  fi
   printf 'FAIL: ' >&2
   rp_check_line_prefix "$slug" >&2
   printf '%s\n' "$message" >&2
@@ -143,6 +258,10 @@ rp_log_check_fail() {
 rp_log_manual_step() {
   local message="$1"
   local url="${2:-}"
+  if [[ "$rp_compact" -eq 1 && -n "$rp_current_slug" ]]; then
+    rp_compact_record_fix "$rp_current_slug" "$message"
+    return 0
+  fi
   printf '     ' >&2
   if rp_color_enabled; then
     rp_color 33 "👉 ${message}" >&2
@@ -194,6 +313,10 @@ rp_print_final_status() {
 }
 
 rp_log_suggest() {
+  if [[ "$rp_compact" -eq 1 && -n "$rp_current_slug" ]]; then
+    rp_compact_record_fix "$rp_current_slug" "$*"
+    return 0
+  fi
   printf 'SUGGEST: %s\n' "$*" >&2
 }
 
@@ -814,7 +937,7 @@ rp_print_new_repo_checklist() {
       [ ] classic main protection (CODEOWNERS, CI contexts, push via Graphite only)
 
     Release Please (optional):
-      [ ] release-please.yml + squash-only repo settings (scripts/check-repo-practices --apply)
+      [ ] release-please.yml + squash-only repo settings (scripts/check-repo-practices --apply-fix)
 
     Graphite (manual in app.graphite.com):
       [ ] Enable merge queue on main, strategy squash, enqueue label merge-it
@@ -847,8 +970,8 @@ rp_parse_args() {
         rp_repo_slugs+=("$2")
         shift 2
         ;;
-      --apply)
-        rp_apply=1
+      --apply-fix|--apply)
+        rp_apply_fix=1
         shift
         ;;
       --suggest)
@@ -863,6 +986,11 @@ rp_parse_args() {
         ;;
       --strict-onboarding)
         rp_strict_onboarding=1
+        rp_suggest=1
+        shift
+        ;;
+      --compact)
+        rp_compact=1
         rp_suggest=1
         shift
         ;;
@@ -916,7 +1044,7 @@ rp_validate_repo_settings_json() {
   if [[ "$v" != 'false' ]]; then
     rp_log_fail "${slug}: allow_merge_commit must be false (got ${v})"
     if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest "${slug}: run scripts/check-repo-practices --repo ${slug} --apply (Release Please repos)"
+      rp_log_suggest "${slug}: run scripts/check-repo-practices --repo ${slug} --apply-fix (Release Please repos)"
     fi
     fail=1
   fi
@@ -958,7 +1086,7 @@ rp_validate_ruleset_methods_json() {
     if rp_repo_requires_protect_main_ruleset "$slug"; then
       rp_log_fail "${slug}: missing protect-main ruleset (squash-only merges on main)"
       if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_suggest "${slug}: add protect-main ruleset (see AGENTS.md) or run --apply"
+        rp_log_suggest "${slug}: add protect-main ruleset (see AGENTS.md) or run --apply-fix"
       fi
       return 1
     fi
@@ -1189,7 +1317,7 @@ rp_check_release_please() {
 
   settings_json="$(rp_fetch_repo_settings "$slug")"
 
-  if [[ "$rp_apply" -eq 1 ]]; then
+  if [[ "$rp_apply_fix" -eq 1 ]]; then
     if ! rp_validate_repo_settings_json "$slug" "$settings_json"; then
       rp_apply_repo_settings "$slug"
       settings_json="$(rp_fetch_repo_settings "$slug")"
@@ -1204,7 +1332,7 @@ rp_check_release_please() {
     rp_log_check_ok "$slug" 'release-please merge settings' \
       "$(rp_github_url "$slug" '/settings')"
   else
-    rp_log_check_fail "$slug" 'release-please settings (fix with --apply; see AGENTS.md)' \
+    rp_log_check_fail "$slug" 'release-please settings (fix with --apply-fix; see AGENTS.md)' \
       "$(rp_github_url "$slug" '/settings')"
   fi
 
@@ -1227,7 +1355,7 @@ rp_check_protect_main_ruleset() {
     methods_json='[]'
   fi
 
-  if [[ "$rp_apply" -eq 1 ]]; then
+  if [[ "$rp_apply_fix" -eq 1 ]]; then
     if [[ -z "$ruleset_json" ]]; then
       rp_apply_protect_main_create "$slug"
       ruleset_json="$(rp_fetch_protect_main_ruleset "$slug" 2>/dev/null || true)"
@@ -1254,7 +1382,7 @@ rp_check_protect_main_ruleset() {
     rp_log_check_ok "$slug" 'protect-main ruleset (squash-only + Graphite bypass)' \
       "$(rp_github_url "$slug" '/settings/rules')"
   else
-    rp_log_check_fail "$slug" 'protect-main ruleset (see AGENTS.md; fix with --apply)' \
+    rp_log_check_fail "$slug" 'protect-main ruleset (see AGENTS.md; fix with --apply-fix)' \
       "$(rp_github_url "$slug" '/settings/rules')"
   fi
 
@@ -1274,15 +1402,15 @@ rp_check_classic_main_protection() {
   if [[ -z "$protection_json" ]]; then
     rp_log_fail "${slug}: classic main branch protection is required (see AGENTS.md)"
     if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest "${slug}: enable classic protection on main or run --apply"
+      rp_log_suggest "${slug}: enable classic protection on main or run --apply-fix"
     fi
-    if [[ "$rp_apply" -eq 1 ]]; then
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
       rp_apply_classic_main_protection "$slug"
       protection_json="$(rp_fetch_classic_main_protection_json "$slug" 2>/dev/null || true)"
     else
       return 1
     fi
-  elif [[ "$rp_apply" -eq 1 ]]; then
+  elif [[ "$rp_apply_fix" -eq 1 ]]; then
     if ! rp_validate_classic_main_protection_json "$slug" "$protection_json"; then
       rp_apply_classic_main_protection "$slug"
       protection_json="$(rp_fetch_classic_main_protection_json "$slug" 2>/dev/null || true)"
@@ -1290,7 +1418,7 @@ rp_check_classic_main_protection() {
   fi
 
   if [[ -z "$protection_json" ]]; then
-    rp_log_fail "${slug}: classic main branch protection missing after --apply"
+    rp_log_fail "${slug}: classic main branch protection missing after --apply-fix"
     return 1
   fi
 
@@ -1302,7 +1430,7 @@ rp_check_classic_main_protection() {
     rp_log_check_ok "$slug" 'classic main branch protection' \
       "$(rp_github_url "$slug" '/settings/branches')"
   else
-    rp_log_check_fail "$slug" 'classic main branch protection (fix with --apply; see AGENTS.md)' \
+    rp_log_check_fail "$slug" 'classic main branch protection (fix with --apply-fix; see AGENTS.md)' \
       "$(rp_github_url "$slug" '/settings/branches')"
   fi
 
@@ -1432,7 +1560,7 @@ rp_check_license_metadata() {
       repo_fail=1
       rp_log_check_fail "$slug" 'CODEOWNERS must include a repository-wide "* @owner" rule' \
         "$(rp_github_url "$slug" "/blob/main/${codeowners_path}")"
-      if [[ "$rp_apply" -eq 1 ]]; then
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
         rp_apply_codeowners_pr "$slug"
       elif [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest "${slug}: add '* @OWNER' to CODEOWNERS so CODEOWNER review covers all files"
@@ -1442,10 +1570,10 @@ rp_check_license_metadata() {
     repo_fail=1
     rp_log_check_fail "$slug" 'CODEOWNERS (add .github/CODEOWNERS)' \
       "$(rp_github_url "$slug" '/new/main?filename=.github/CODEOWNERS')"
-    if [[ "$rp_apply" -eq 1 ]]; then
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
       rp_apply_codeowners_pr "$slug"
     elif [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest "${slug}: run scripts/check-repo-practices --repo ${slug} --apply to open a CODEOWNERS PR"
+      rp_log_suggest "${slug}: run scripts/check-repo-practices --repo ${slug} --apply-fix to open a CODEOWNERS PR"
     fi
   fi
 
@@ -1505,13 +1633,24 @@ rp_main() {
     if [[ "$slug" != */* ]]; then
       rp_die "Invalid --repo (expected OWNER/NAME): ${slug}"
     fi
-    if [[ "$repo_count" -gt 1 ]]; then
+    if [[ "$repo_count" -gt 1 && "$rp_compact" -eq 0 ]]; then
       printf '\n%s\n' "$slug" >&2
     fi
+    rp_current_slug="$slug"
     if ! rp_check_one_repo "$slug"; then
       total_fail=$(( total_fail + 1 ))
+      if [[ "$rp_compact" -eq 1 ]]; then
+        rp_compact_failed_repos+=("$slug")
+      fi
+    elif [[ "$rp_compact" -eq 1 ]]; then
+      rp_compact_passed_repos+=("$slug")
     fi
+    rp_current_slug=""
   done
+
+  if [[ "$rp_compact" -eq 1 ]]; then
+    rp_compact_print_report
+  fi
 
   if [[ "$total_fail" -gt 0 ]]; then
     if [[ "$rp_single_repo" -eq 1 ]]; then
