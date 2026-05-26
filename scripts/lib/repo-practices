@@ -18,9 +18,14 @@ rp_new_repo=0
 rp_audit_all=0
 rp_merge_only=0
 rp_strict_onboarding=0
+rp_compact=0
 rp_single_repo=0
 rp_warn_count=0
+rp_current_slug=""
 declare -a rp_repo_slugs=()
+declare -a rp_compact_passed_repos=()
+declare -a rp_compact_failed_repos=()
+declare -A rp_compact_entries=()
 
 rp_usage() {
   local -r prog="${1:-check-repo-practices}"
@@ -64,6 +69,7 @@ Audits GitHub conventions for org repositories:
 With no --repo: audit the current git repository when run inside a clone (origin on GitHub);
 otherwise discover org repos with release-please.yml or merge-it.
 --suggest: print SUGGEST lines with remediation hints (non-zero exit still on FAIL).
+--compact: print one passed-repos line plus grouped failures and fixes (implies --suggest).
 
 Requires: gh (authenticated), jq.
 USAGE
@@ -88,7 +94,106 @@ rp_color() {
   fi
 }
 
+rp_compact_append_entry() {
+  local slug="$1"
+  local line="$2"
+  local existing
+
+  [[ -n "$slug" && -n "$line" ]] || return 0
+  existing="${rp_compact_entries[$slug]:-}"
+  if [[ -n "$existing" ]] && grep -qxF -- "$line" <<<"$existing"; then
+    return 0
+  fi
+  if [[ -n "$existing" ]]; then
+    rp_compact_entries[$slug]+=$'\n'"$line"
+  else
+    rp_compact_entries[$slug]="$line"
+  fi
+}
+
+rp_compact_strip_slug() {
+  local slug="$1"
+  local message="$2"
+  local prefix
+
+  prefix="${slug}: "
+  if [[ "$message" == "${prefix}"* ]]; then
+    printf '%s' "${message:${#prefix}}"
+  else
+    printf '%s' "$message"
+  fi
+}
+
+rp_compact_record_failure() {
+  local slug="$1"
+  local message="$2"
+  local stripped
+
+  stripped="$(rp_compact_strip_slug "$slug" "$message")"
+  rp_compact_append_entry "$slug" "- ${stripped}"
+}
+
+rp_compact_record_fix() {
+  local slug="$1"
+  local message="$2"
+  local stripped
+
+  stripped="$(rp_compact_strip_slug "$slug" "$message")"
+  rp_compact_append_entry "$slug" "  Fix: ${stripped}"
+}
+
+rp_compact_print_joined_repos() {
+  local label="$1"
+  shift
+  local first=1
+  local slug
+
+  printf '%s' "$label" >&2
+  if [[ "$#" -eq 0 ]]; then
+    printf ' none\n' >&2
+    return 0
+  fi
+  for slug in "$@"; do
+    if [[ "$first" -eq 1 ]]; then
+      printf ' ' >&2
+      first=0
+    else
+      printf ', ' >&2
+    fi
+    printf '%s' "$slug" >&2
+  done
+  printf '\n' >&2
+}
+
+rp_compact_print_report() {
+  local slug
+  local block
+  local line
+
+  rp_compact_print_joined_repos 'Passed:' "${rp_compact_passed_repos[@]}"
+  if [[ "${#rp_compact_failed_repos[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  printf 'Failed:\n' >&2
+  for slug in "${rp_compact_failed_repos[@]}"; do
+    printf '%s:\n' "$slug" >&2
+    block="${rp_compact_entries[$slug]:-}"
+    if [[ -z "$block" ]]; then
+      printf '  - failed practices check\n' >&2
+      continue
+    fi
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      printf '  %s\n' "$line" >&2
+    done <<<"$block"
+  done
+}
+
 rp_log_ok() {
+  if [[ "$rp_compact" -eq 1 ]]; then
+    return 0
+  fi
   printf 'OK: %s\n' "$*" >&2
 }
 
@@ -98,6 +203,10 @@ rp_log_warn() {
 }
 
 rp_log_fail() {
+  if [[ "$rp_compact" -eq 1 && -n "$rp_current_slug" ]]; then
+    rp_compact_record_failure "$rp_current_slug" "$*"
+    return 0
+  fi
   printf 'FAIL: %s\n' "$*" >&2
 }
 
@@ -119,6 +228,9 @@ rp_log_check_ok() {
   local slug="$1"
   local message="$2"
   local url="${3:-}"
+  if [[ "$rp_compact" -eq 1 ]]; then
+    return 0
+  fi
   printf 'OK: ' >&2
   rp_check_line_prefix "$slug" >&2
   printf '%s\n' "$message" >&2
@@ -131,6 +243,9 @@ rp_log_check_fail() {
   local slug="$1"
   local message="$2"
   local url="${3:-}"
+  if [[ "$rp_compact" -eq 1 ]]; then
+    return 0
+  fi
   printf 'FAIL: ' >&2
   rp_check_line_prefix "$slug" >&2
   printf '%s\n' "$message" >&2
@@ -143,6 +258,10 @@ rp_log_check_fail() {
 rp_log_manual_step() {
   local message="$1"
   local url="${2:-}"
+  if [[ "$rp_compact" -eq 1 && -n "$rp_current_slug" ]]; then
+    rp_compact_record_fix "$rp_current_slug" "$message"
+    return 0
+  fi
   printf '     ' >&2
   if rp_color_enabled; then
     rp_color 33 "👉 ${message}" >&2
@@ -194,6 +313,10 @@ rp_print_final_status() {
 }
 
 rp_log_suggest() {
+  if [[ "$rp_compact" -eq 1 && -n "$rp_current_slug" ]]; then
+    rp_compact_record_fix "$rp_current_slug" "$*"
+    return 0
+  fi
   printf 'SUGGEST: %s\n' "$*" >&2
 }
 
@@ -866,6 +989,11 @@ rp_parse_args() {
         rp_suggest=1
         shift
         ;;
+      --compact)
+        rp_compact=1
+        rp_suggest=1
+        shift
+        ;;
       --all)
         rp_audit_all=1
         shift
@@ -1505,13 +1633,24 @@ rp_main() {
     if [[ "$slug" != */* ]]; then
       rp_die "Invalid --repo (expected OWNER/NAME): ${slug}"
     fi
-    if [[ "$repo_count" -gt 1 ]]; then
+    if [[ "$repo_count" -gt 1 && "$rp_compact" -eq 0 ]]; then
       printf '\n%s\n' "$slug" >&2
     fi
+    rp_current_slug="$slug"
     if ! rp_check_one_repo "$slug"; then
       total_fail=$(( total_fail + 1 ))
+      if [[ "$rp_compact" -eq 1 ]]; then
+        rp_compact_failed_repos+=("$slug")
+      fi
+    elif [[ "$rp_compact" -eq 1 ]]; then
+      rp_compact_passed_repos+=("$slug")
     fi
+    rp_current_slug=""
   done
+
+  if [[ "$rp_compact" -eq 1 ]]; then
+    rp_compact_print_report
+  fi
 
   if [[ "$total_fail" -gt 0 ]]; then
     if [[ "$rp_single_repo" -eq 1 ]]; then
