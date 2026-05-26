@@ -327,7 +327,7 @@ scripts/dev/pre-pr-checks            # preferred: all checks + main worktree gua
 # or manually:
 bash -n scripts/* scripts/dev/* scripts/lib/* tests/* tests/lib/*
 shellcheck -S info scripts/* scripts/dev/* scripts/lib/* tests/* tests/lib/*
-actionlint .github/workflows/*.yml scripts/lib/repo-practices-workflows/*.yaml
+actionlint .github/workflows/*.yml scripts/lib/repo-practices-workflows/*.yml
 bash tests/*.test                    # every test harness
 ```
 
