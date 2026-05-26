@@ -200,8 +200,11 @@ scripts/check-repo-practices --repo OWNER/NAME --apply-fix
 ```
 
 `--apply-fix` can repair supported Release Please squash settings, `protect-main`
-ruleset settings, and classic `main` branch protection. Graphite app merge queue
-configuration remains manual and is reported as a manual step in the output.
+ruleset settings, and classic `main` branch protection. When run from the target
+repository clone, it also prepares candidate workflow fixes in
+`.worktrees/repo-practices-candidate-fixes-wt` and submits a Graphite stack for
+review. Graphite app merge queue configuration remains manual and is reported as a
+manual step in the output.
 
 ### Status, logs, and trial runs
 

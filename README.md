@@ -135,8 +135,11 @@ scripts/check-repo-practices --repo OWNER/NAME --apply-fix
 ```
 
 `--apply-fix` can repair supported GitHub settings such as Release Please squash settings,
-the `protect-main` ruleset, and classic `main` branch protection. Graphite app merge
-queue configuration remains a manual step and is reported as such.
+the `protect-main` ruleset, and classic `main` branch protection. When run from the
+target repository clone, it also prepares candidate workflow fixes in a dedicated
+`.worktrees/repo-practices-candidate-fixes-wt` worktree and submits them as a
+Graphite stack for review. Graphite app merge queue configuration remains a manual
+step and is reported as such.
 
 ## Systemd Service Setup
 

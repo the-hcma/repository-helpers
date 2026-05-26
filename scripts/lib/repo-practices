@@ -26,6 +26,12 @@ declare -a rp_repo_slugs=()
 declare -a rp_compact_passed_repos=()
 declare -a rp_compact_failed_repos=()
 declare -A rp_compact_entries=()
+declare -a rp_candidate_fix_keys=()
+declare -A rp_candidate_fix_seen=()
+declare -A rp_candidate_fix_paths=()
+declare -A rp_candidate_fix_contents=()
+declare -A rp_candidate_fix_branch_suffixes=()
+declare -A rp_candidate_fix_messages=()
 
 rp_usage() {
   local -r prog="${1:-check-repo-practices}"
@@ -36,7 +42,7 @@ Usage:
   scripts/${prog} --strict-onboarding --repo OWNER/NAME ...
   scripts/${prog} --all [--org ORG]
   scripts/${prog} --suggest [--repo OWNER/NAME ...]
-  scripts/${prog} --apply-fix [--repo ...]      # squash settings, protect-main, classic main BP
+  scripts/${prog} --apply-fix [--repo ...]      # settings fixes + candidate workflow PRs
 
 Audits GitHub conventions for org repositories:
 
@@ -459,6 +465,336 @@ rp_codeowners_has_global_owner_rule() {
 
 rp_authenticated_github_login() {
   gh api user --jq '.login'
+}
+
+rp_candidate_merged_pr_closer_workflow() {
+  cat <<'WORKFLOW'
+name: Close Graphite-Merged PRs
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  close-merged-pr:
+    if: >-
+      github.event.issue.pull_request &&
+      github.event.comment.user.login == 'graphite-app' &&
+      contains(github.event.comment.body, 'Graphite merge queue')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Close PR already landed by Graphite merge queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          state="$(gh pr view "${PR_NUMBER}" --repo "${REPOSITORY}" --json state --jq .state)"
+          if [[ "${state}" == "OPEN" ]]; then
+            gh pr close "${PR_NUMBER}" --repo "${REPOSITORY}" \
+              --comment "Closing because Graphite merge queue already landed this change on main."
+          fi
+WORKFLOW
+}
+
+rp_candidate_cleanup_branch_on_merge_workflow() {
+  cat <<'WORKFLOW'
+name: Cleanup Branch On Merge
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup-branch:
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref != github.event.repository.default_branch
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Delete merged PR branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh api --method DELETE "repos/${REPOSITORY}/git/refs/heads/${BRANCH}" || true
+WORKFLOW
+}
+
+rp_candidate_cleanup_merged_branches_workflow() {
+  cat <<'WORKFLOW'
+name: Cleanup Merged Branches
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup-merged-branches:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Delete merged and stale closed PR branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          branches="$(gh api "repos/${REPOSITORY}/branches" --paginate --jq '.[].name' | grep -v '^main$' || true)"
+          if [[ -z "${branches}" ]]; then
+            echo "No branches found besides main."
+            exit 0
+          fi
+
+          cutoff="$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+          deleted=0
+          kept=0
+
+          for branch in ${branches}; do
+            pr_number="$(
+              gh api "repos/${REPOSITORY}/pulls?state=closed&head=${REPOSITORY_OWNER}:${branch}" \
+                --jq '.[0].number // empty' 2>/dev/null || true
+            )"
+            if [[ -z "${pr_number}" ]]; then
+              kept=$(( kept + 1 ))
+              continue
+            fi
+
+            pr_data="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}" --jq '{merged, closed_at}')"
+            pr_merged="$(jq -r '.merged' <<<"${pr_data}")"
+            pr_closed_at="$(jq -r '.closed_at' <<<"${pr_data}")"
+
+            if [[ "${pr_merged}" == "true" || "${pr_closed_at}" < "${cutoff}" ]]; then
+              if gh api --method DELETE "repos/${REPOSITORY}/git/refs/heads/${branch}" >/dev/null 2>&1; then
+                deleted=$(( deleted + 1 ))
+              else
+                kept=$(( kept + 1 ))
+              fi
+            else
+              kept=$(( kept + 1 ))
+            fi
+          done
+
+          echo "Deleted ${deleted} branches; kept ${kept} branches."
+WORKFLOW
+}
+
+rp_candidate_dependabot_auto_merge_workflow() {
+  cat <<'WORKFLOW'
+name: Dependabot Auto Merge
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  label-dependabot-pr:
+    if: github.actor == 'dependabot[bot]' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Add Graphite merge queue labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          labels_to_add=(merge-it)
+          repo_labels="$(gh api "repos/${REPOSITORY}/labels" --paginate --jq '.[].name')"
+          if grep -qx 'merge-mq' <<<"${repo_labels}"; then
+            labels_to_add+=(merge-mq)
+          fi
+          labels="$(IFS=,; printf '%s' "${labels_to_add[*]}")"
+          gh pr edit "${PR_NUMBER}" --repo "${REPOSITORY}" --add-label "${labels}"
+WORKFLOW
+}
+
+rp_queue_candidate_file_fix() {
+  local slug="$1"
+  local path="$2"
+  local content="$3"
+  local branch_suffix="$4"
+  local message="$5"
+  local key
+
+  if [[ "$path" == /* || "$path" == *'..'* ]]; then
+    rp_die "internal error: unsafe candidate fix path: ${path}"
+  fi
+
+  key="${slug}|${path}"
+  if [[ -n "${rp_candidate_fix_seen[$key]:-}" ]]; then
+    return 0
+  fi
+  rp_candidate_fix_seen[$key]=1
+  rp_candidate_fix_keys+=("$key")
+  rp_candidate_fix_paths[$key]="$path"
+  rp_candidate_fix_contents[$key]="$content"
+  rp_candidate_fix_branch_suffixes[$key]="$branch_suffix"
+  rp_candidate_fix_messages[$key]="$message"
+}
+
+rp_git_remote_slug_for_dir() {
+  local repo_dir="$1"
+  local remote_url slug
+
+  remote_url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)"
+  if [[ -z "$remote_url" ]]; then
+    return 1
+  fi
+  slug="$(printf '%s' "$remote_url" \
+    | sed -E 's#^git@github.com:##; s#^ssh://git@github.com/##; s#^https://github.com/##; s#\.git$##')"
+  if [[ "$slug" == */* ]]; then
+    printf '%s\n' "$slug"
+    return 0
+  fi
+  return 1
+}
+
+rp_resolve_local_repo_dir() {
+  local slug="$1"
+  local repo_root repo_slug
+
+  repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -z "$repo_root" ]]; then
+    return 1
+  fi
+  repo_slug="$(rp_git_remote_slug_for_dir "$repo_root" || true)"
+  if [[ "$repo_slug" == "$slug" ]]; then
+    printf '%s\n' "$repo_root"
+    return 0
+  fi
+  return 1
+}
+
+rp_candidate_worktree_path() {
+  local repo_dir="$1"
+  local primary_dir
+
+  primary_dir="$(git -C "$repo_dir" worktree list --porcelain | awk 'NR == 1 { print $2; exit }')"
+  if [[ -z "$primary_dir" ]]; then
+    return 1
+  fi
+  printf '%s\n' "${primary_dir}/.worktrees/repo-practices-candidate-fixes-wt"
+}
+
+rp_prepare_candidate_worktree() {
+  local repo_dir="$1"
+  local default_branch="$2"
+  local worktree_path worktrees_dir status
+
+  worktree_path="$(rp_candidate_worktree_path "$repo_dir")"
+  worktrees_dir="$(dirname "$worktree_path")"
+  mkdir -p "$worktrees_dir"
+
+  if [[ -d "$worktree_path" ]]; then
+    status="$(git -C "$worktree_path" status --porcelain)"
+    if [[ -n "$status" ]]; then
+      rp_die "candidate fix worktree has local changes: ${worktree_path}"
+    fi
+    printf '%s\n' "$worktree_path"
+    return 0
+  fi
+
+  git -C "$repo_dir" fetch --prune origin
+  git -C "$repo_dir" worktree add "$worktree_path" "origin/${default_branch}"
+  printf '%s\n' "$worktree_path"
+}
+
+rp_apply_candidate_fix_stack() {
+  local slug="$1"
+  local repo_dir default_branch worktree_path key key_slug path content branch_suffix message
+  local branch parent_branch parent_ref created_any has_candidate path_dir status
+
+  if [[ "$rp_apply_fix" -ne 1 ]]; then
+    return 0
+  fi
+
+  has_candidate=0
+  for key in "${rp_candidate_fix_keys[@]}"; do
+    key_slug="${key%%|*}"
+    if [[ "$key_slug" == "$slug" ]]; then
+      has_candidate=1
+      break
+    fi
+  done
+  if [[ "$has_candidate" -eq 0 ]]; then
+    return 0
+  fi
+
+  created_any=0
+  if ! repo_dir="$(rp_resolve_local_repo_dir "$slug")"; then
+    rp_log_warn "${slug}: candidate workflow PRs require running --apply-fix from the local clone"
+    return 0
+  fi
+
+  default_branch="$(gh api "repos/${slug}" --jq '.default_branch // "main"')"
+  worktree_path="$(rp_prepare_candidate_worktree "$repo_dir" "$default_branch")"
+  parent_branch="$default_branch"
+  parent_ref="origin/${default_branch}"
+
+  for key in "${rp_candidate_fix_keys[@]}"; do
+    key_slug="${key%%|*}"
+    [[ "$key_slug" == "$slug" ]] || continue
+    path="${rp_candidate_fix_paths[$key]}"
+    content="${rp_candidate_fix_contents[$key]}"
+    branch_suffix="${rp_candidate_fix_branch_suffixes[$key]}"
+    message="${rp_candidate_fix_messages[$key]}"
+    branch="repo-practices/${branch_suffix}"
+
+    if git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${branch}"; then
+      rp_log_warn "${slug}: candidate branch already exists, skipping ${branch}"
+      parent_branch="$branch"
+      parent_ref="$branch"
+      continue
+    fi
+
+    git -C "$worktree_path" checkout -B "$branch" "$parent_ref"
+    path_dir="$(dirname "${worktree_path}/${path}")"
+    mkdir -p "$path_dir"
+    printf '%s\n' "$content" >"${worktree_path}/${path}"
+    git -C "$worktree_path" add "$path"
+    if git -C "$worktree_path" diff --cached --quiet; then
+      rp_log_warn "${slug}: candidate fix has no file changes for ${path}"
+      continue
+    fi
+    git -C "$worktree_path" commit -m "$message"
+    (cd "$worktree_path" && gt track --parent "$parent_branch")
+    rp_log_warn "${slug}: created candidate branch ${branch} for ${path}"
+    parent_branch="$branch"
+    parent_ref="$branch"
+    created_any=1
+  done
+
+  if [[ "$created_any" -eq 0 ]]; then
+    return 0
+  fi
+
+  (cd "$worktree_path" && gt submit --publish --no-interactive)
+  status="$(git -C "$worktree_path" status --porcelain)"
+  if [[ -n "$status" ]]; then
+    rp_die "candidate fix worktree is dirty after submit: ${worktree_path}"
+  fi
+  rp_log_warn "${slug}: submitted candidate workflow fix stack from ${worktree_path}"
 }
 
 rp_apply_codeowners_pr() {
@@ -1159,6 +1495,12 @@ rp_validate_graphite_workflows() {
   if ! rp_gh_path_exists "$slug" '.github/workflows/merged-pr-closer.yml'; then
     if [[ "$strict" == '1' ]]; then
       rp_log_fail "${slug}: missing .github/workflows/merged-pr-closer.yml"
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
+        rp_queue_candidate_file_fix "$slug" '.github/workflows/merged-pr-closer.yml' \
+          "$(rp_candidate_merged_pr_closer_workflow)" \
+          'add-merged-pr-closer' \
+          'chore: add merged-pr-closer workflow'
+      fi
       if [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest "${slug}: add merged-pr-closer.yml (closes open PRs already on main via Graphite MQ)"
       fi
@@ -1172,6 +1514,12 @@ rp_validate_graphite_workflows() {
       || ! grep -qF 'graphite-app' <<<"$closer_text" \
       || ! grep -qF 'Graphite merge queue' <<<"$closer_text"; then
       rp_log_fail "${slug}: merged-pr-closer.yml must detect graphite-app Graphite merge queue comments"
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
+        rp_queue_candidate_file_fix "$slug" '.github/workflows/merged-pr-closer.yml' \
+          "$(rp_candidate_merged_pr_closer_workflow)" \
+          'add-merged-pr-closer' \
+          'chore: update merged-pr-closer workflow'
+      fi
       fail=1
     fi
   fi
@@ -1199,6 +1547,12 @@ rp_validate_graphite_workflows() {
     if [[ -z "$dependabot_workflow" ]]; then
       if [[ "$strict" == '1' ]]; then
         rp_log_fail "${slug}: dependabot.yml present but no dependabot auto-merge workflow"
+        if [[ "$rp_apply_fix" -eq 1 ]]; then
+          rp_queue_candidate_file_fix "$slug" '.github/workflows/dependabot-auto-merge.yml' \
+            "$(rp_candidate_dependabot_auto_merge_workflow)" \
+            'add-dependabot-auto-merge' \
+            'chore: add dependabot auto-merge workflow'
+        fi
         if [[ "$rp_suggest" -eq 1 ]]; then
           rp_log_suggest "${slug}: add dependabot-auto-merge.yml (labels merge-it for Graphite MQ)"
         fi
@@ -1208,11 +1562,23 @@ rp_validate_graphite_workflows() {
       dependabot_auto_text="$(rp_fetch_github_text_file "$slug" "$dependabot_workflow" || true)"
       if [[ -z "$dependabot_auto_text" ]] || ! grep -qF 'merge-it' <<<"$dependabot_auto_text"; then
         rp_log_fail "${slug}: ${dependabot_workflow} must add merge-it label"
+        if [[ "$rp_apply_fix" -eq 1 ]]; then
+          rp_queue_candidate_file_fix "$slug" "$dependabot_workflow" \
+            "$(rp_candidate_dependabot_auto_merge_workflow)" \
+            'add-dependabot-auto-merge' \
+            'chore: update dependabot auto-merge workflow'
+        fi
         fail=1
       fi
       if jq -e 'index("merge-mq") != null' >/dev/null <<<"$labels_json" \
         && ! grep -qF 'merge-mq' <<<"$dependabot_auto_text"; then
         rp_log_fail "${slug}: ${dependabot_workflow} must add merge-mq when merge-mq label exists"
+        if [[ "$rp_apply_fix" -eq 1 ]]; then
+          rp_queue_candidate_file_fix "$slug" "$dependabot_workflow" \
+            "$(rp_candidate_dependabot_auto_merge_workflow)" \
+            'add-dependabot-auto-merge' \
+            'chore: update dependabot auto-merge workflow'
+        fi
         fail=1
       fi
     fi
@@ -1232,6 +1598,12 @@ rp_validate_branch_cleanup_workflows() {
   if ! rp_gh_path_exists "$slug" '.github/workflows/cleanup-branch-on-merge.yml'; then
     if [[ "$strict" == '1' ]]; then
       rp_log_fail "${slug}: missing .github/workflows/cleanup-branch-on-merge.yml"
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
+        rp_queue_candidate_file_fix "$slug" '.github/workflows/cleanup-branch-on-merge.yml' \
+          "$(rp_candidate_cleanup_branch_on_merge_workflow)" \
+          'add-cleanup-branch-on-merge' \
+          'chore: add branch cleanup workflow'
+      fi
       if [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest "${slug}: add cleanup-branch-on-merge.yml (delete head branch when PR merges)"
       fi
@@ -1242,6 +1614,12 @@ rp_validate_branch_cleanup_workflows() {
   if ! rp_gh_path_exists "$slug" '.github/workflows/cleanup-merged-branches.yml'; then
     if [[ "$strict" == '1' ]]; then
       rp_log_fail "${slug}: missing .github/workflows/cleanup-merged-branches.yml"
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
+        rp_queue_candidate_file_fix "$slug" '.github/workflows/cleanup-merged-branches.yml' \
+          "$(rp_candidate_cleanup_merged_branches_workflow)" \
+          'add-cleanup-merged-branches' \
+          'chore: add merged branch cleanup workflow'
+      fi
       if [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest "${slug}: add cleanup-merged-branches.yml (daily sweep of merged/stale branches)"
       fi
@@ -1251,6 +1629,12 @@ rp_validate_branch_cleanup_workflows() {
     sweep_text="$(rp_fetch_github_text_file "$slug" '.github/workflows/cleanup-merged-branches.yml' || true)"
     if [[ -z "$sweep_text" ]] || ! grep -qF 'schedule:' <<<"$sweep_text"; then
       rp_log_fail "${slug}: cleanup-merged-branches.yml should include a schedule trigger"
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
+        rp_queue_candidate_file_fix "$slug" '.github/workflows/cleanup-merged-branches.yml' \
+          "$(rp_candidate_cleanup_merged_branches_workflow)" \
+          'add-cleanup-merged-branches' \
+          'chore: update merged branch cleanup workflow'
+      fi
       fail=1
     fi
   fi
@@ -1606,6 +1990,7 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
   fi
+  rp_apply_candidate_fix_stack "$slug"
 
   return "$total_fail"
 }

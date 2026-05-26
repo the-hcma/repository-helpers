@@ -82,7 +82,7 @@ Run **`scripts/check-repo-practices`** to audit or onboard a GitHub repository a
 scripts/check-repo-practices --new-repo --repo OWNER/NAME   # checklist + SUGGEST hints
 scripts/check-repo-practices --repo OWNER/NAME --suggest    # audit one repo with remediation lines
 scripts/check-repo-practices --all --org the-hcma             # every repo in the org
-scripts/check-repo-practices --apply-fix --repo OWNER/NAME  # patch Release Please squash settings
+scripts/check-repo-practices --apply-fix --repo OWNER/NAME  # patch settings + candidate workflow PRs
 ```
 
 **`scripts/check-merge-settings`** is a thin wrapper (merge + Graphite only). Prefer **`check-repo-practices`** for full coverage including branch cleanup workflows.
@@ -112,7 +112,10 @@ Classic branch protection on **`main`** is also required (org standard). It comp
 | Force-push / delete | disabled |
 | `enforce_admins` | `false` (warn if enabled) |
 
-Create or repair ruleset + classic settings with `scripts/check-repo-practices --repo OWNER/NAME --apply-fix`.
+Create or repair ruleset + classic settings with
+`scripts/check-repo-practices --repo OWNER/NAME --apply-fix`. Run it from the target
+repository clone when you want candidate workflow fixes emitted as a Graphite stack
+under `.worktrees/repo-practices-candidate-fixes-wt`.
 
 **`merge-mq`** is not the default enqueue label. Use it only when Graphite MQ for that repo is wired to **`merge-mq`**; otherwise use **`merge-it`** only.
 
