@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+set -euo pipefail
+
+lockfile_drift_die() {
+  echo "ERROR: $*" >&2
+  exit 2
+}
+
+_lockfile_drift_has_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+_lockfile_drift_note() {
+  printf 'ℹ️  lockfile-drift: %s\n' "$1"
+}
+
+_lockfile_drift_warn() {
+  printf '⚠️  lockfile-drift: %s\n' "$1"
+}
+
+_lockfile_drift_error() {
+  printf '❌ lockfile-drift: %s\n' "$1" >&2
+}
+
+_lockfile_drift_check_uv() {
+  local repo="$1"
+  local strict_mode="$2"
+  local rc out
+
+  if [[ ! -f "${repo}/uv.lock" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${repo}/pyproject.toml" ]]; then
+    _lockfile_drift_note "uv.lock present but no pyproject.toml; skipping uv drift check"
+    return 0
+  fi
+  if ! _lockfile_drift_has_cmd uv; then
+    _lockfile_drift_note "uv.lock present but 'uv' not on PATH; skipping (add to CI/release workflow)"
+    return 0
+  fi
+
+  out=""
+  rc=0
+  out="$(cd "$repo" && uv lock --check 2>&1)" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    return 0
+  fi
+
+  _lockfile_drift_warn "uv.lock appears out of date vs pyproject.toml"
+  _lockfile_drift_note "Workflow fix: ensure your release/deploy workflow runs 'uv lock' (or 'uv sync') and commits uv.lock"
+  if [[ "$strict_mode" == "1" ]]; then
+    _lockfile_drift_error "uv lock --check failed (strict mode). Output:"
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  _lockfile_drift_note "uv lock --check output (warning mode):"
+  printf '%s\n' "$out"
+  return 0
+}
+
+_lockfile_drift_check_pnpm() {
+  local repo="$1"
+  local strict_mode="$2"
+  local rc out
+
+  if [[ ! -f "${repo}/pnpm-lock.yaml" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${repo}/package.json" ]]; then
+    _lockfile_drift_note "pnpm-lock.yaml present but no package.json; skipping pnpm drift check"
+    return 0
+  fi
+  if ! _lockfile_drift_has_cmd pnpm; then
+    _lockfile_drift_note "pnpm-lock.yaml present but 'pnpm' not on PATH; skipping (add to CI/release workflow)"
+    return 0
+  fi
+
+  out=""
+  rc=0
+  out="$(cd "$repo" && pnpm install --frozen-lockfile --ignore-scripts 2>&1)" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    return 0
+  fi
+
+  _lockfile_drift_warn "pnpm frozen install failed (lockfile drift or missing store/network)"
+  _lockfile_drift_note "Workflow fix: ensure your release/deploy workflow runs 'pnpm install' and fails on drift via '--frozen-lockfile'"
+  if [[ "$strict_mode" == "1" ]]; then
+    _lockfile_drift_error "pnpm install --frozen-lockfile failed (strict mode). Output:"
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  _lockfile_drift_note "pnpm output (warning mode):"
+  printf '%s\n' "$out"
+  return 0
+}
+
+lockfile_drift_check_repo() {
+  local scan_repo_dir=""
+  local strict_mode=0
+  local drift=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo-dir)
+        [[ $# -ge 2 ]] || lockfile_drift_die "Missing value for --repo-dir"
+        scan_repo_dir="$2"
+        shift 2
+        ;;
+      --strict)
+        [[ $# -ge 2 ]] || lockfile_drift_die "Missing value for --strict (0/1)"
+        strict_mode="$2"
+        shift 2
+        ;;
+      *)
+        lockfile_drift_die "Unknown argument: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$scan_repo_dir" ]] || lockfile_drift_die "Missing --repo-dir"
+
+  if ! _lockfile_drift_check_uv "$scan_repo_dir" "$strict_mode"; then
+    drift=1
+  fi
+  if ! _lockfile_drift_check_pnpm "$scan_repo_dir" "$strict_mode"; then
+    drift=1
+  fi
+
+  if [[ "$strict_mode" == "1" && "$drift" == "1" ]]; then
+    return 1
+  fi
+  return 0
+}
+

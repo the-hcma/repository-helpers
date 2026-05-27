@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+show_help() {
+  cat <<'EOF'
+check-lockfile-drift — detect lockfile drift in a safe throwaway worktree
+
+USAGE:
+  scripts/check-lockfile-drift [--repo <path>] [--strict] [--no-worktree]
+
+OPTIONS:
+  --repo <path>   Path to a git repo (default: current repo root).
+  --strict        Exit non-zero when drift is detected (default: warn-only).
+  --no-worktree   Run checks in-place (best-effort, may leave state behind).
+
+NOTES:
+  - By default this runs all tool-invoking checks inside a temporary detached
+    worktree and removes it on exit, so the caller's worktree stays clean.
+  - This script is designed to be called from release/deploy workflows.
+EOF
+  exit 0
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 2
+}
+
+strict=0
+no_worktree=0
+repo_dir=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)
+      show_help
+      ;;
+    --strict)
+      strict=1
+      shift
+      ;;
+    --no-worktree)
+      no_worktree=1
+      shift
+      ;;
+    --repo)
+      [[ $# -ge 2 ]] || die "Missing value for --repo"
+      repo_dir="$2"
+      shift 2
+      ;;
+    --repo=*)
+      repo_dir="${1#*=}"
+      shift
+      ;;
+    *)
+      die "Unknown argument: $1"
+      ;;
+  esac
+done
+
+if [[ -z "$repo_dir" ]]; then
+  repo_dir="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" \
+    || die "Not a git repository (use --repo <path>)"
+fi
+repo_dir="$(cd "$repo_dir" && pwd)"
+readonly repo_dir
+readonly strict
+readonly no_worktree
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck source=/dev/null
+source "${script_dir}/lib/lockfile-drift"
+
+if [[ "$no_worktree" == "1" ]]; then
+  lockfile_drift_check_repo --repo-dir "$repo_dir" --strict "$strict"
+  exit $?
+fi
+
+tmp_root=""
+tmp_wt=""
+cleanup_ran=0
+
+cleanup() {
+  local rc=$?
+  if [[ "$cleanup_ran" == "1" ]]; then
+    exit "$rc"
+  fi
+  cleanup_ran=1
+
+  if [[ -n "${tmp_wt:-}" ]]; then
+    git -C "$repo_dir" worktree remove --force "$tmp_wt" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${tmp_root:-}" ]]; then
+    rm -rf "$tmp_root" >/dev/null 2>&1 || true
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT INT TERM
+
+tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/lockfile-drift.XXXXXX")"
+readonly tmp_root
+tmp_wt="${tmp_root}/wt"
+readonly tmp_wt
+
+git -C "$repo_dir" worktree add --detach "$tmp_wt" HEAD >/dev/null
+
+lockfile_drift_check_repo --repo-dir "$tmp_wt" --strict "$strict"
