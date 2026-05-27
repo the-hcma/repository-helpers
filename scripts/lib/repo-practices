@@ -14,6 +14,9 @@ rp_THIS_REPO_NAME='repository-helpers'
 rp_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly rp_lib_dir
 
+# shellcheck source=scripts/lib/release-age-defaults
+source "${rp_lib_dir}/release-age-defaults"
+
 rp_org="$rp_DEFAULT_ORG"
 rp_apply_fix=0
 rp_suggest=0
@@ -1187,59 +1190,85 @@ rp_fetch_workflow_file_names() {
   jq -r '.[]? | select(.type == "file") | .name // empty' <<<"$response"
 }
 
-rp_dependabot_has_npm_cooldown_10_days() {
+# Every updates entry with package-ecosystem must include cooldown.default-days
+# matching release_age_default_days (all ecosystems, not npm-only).
+rp_dependabot_has_release_age_cooldown() {
   local text="$1"
-  # Best-effort YAML parsing:
-  # - Look for an npm update entry.
-  # - Require a cooldown block within that entry with default-days: 10.
-  # This is intentionally strict and mirrors the org's 10-day cooldown standard.
-  awk '
-    BEGIN { in_updates=0; in_item=0; item_indent=-1; is_npm=0; in_cooldown=0; cd_indent=-1; ok=0 }
-    /^updates:[[:space:]]*$/ { in_updates=1; next }
+  local required_days="$release_age_default_days"
+  awk -v required_days="$required_days" '
+    function finish_item() {
+      if (has_ecosystem) {
+        saw_entry = 1
+        if (!item_cooldown_ok) {
+          all_ok = 0
+        }
+      }
+      has_ecosystem = 0
+      item_cooldown_ok = 0
+      in_cooldown = 0
+      cd_indent = -1
+    }
+    BEGIN {
+      in_updates = 0
+      in_item = 0
+      item_indent = -1
+      has_ecosystem = 0
+      in_cooldown = 0
+      cd_indent = -1
+      item_cooldown_ok = 0
+      saw_entry = 0
+      all_ok = 1
+    }
+    /^updates:[[:space:]]*$/ { in_updates = 1; next }
     !in_updates { next }
-    # start of an item: "  - ..."
     /^[[:space:]]*-[[:space:]]/ {
-      in_item=1
+      if (in_item) {
+        finish_item()
+      }
+      in_item = 1
       item_indent = match($0, /[^ ]/) - 1
-      is_npm=0
-      in_cooldown=0
-      cd_indent=-1
-      # Some dependabot.yml files put package-ecosystem on the same "-" line.
-      if ($0 ~ /package-ecosystem:[[:space:]]*"?npm"?([[:space:]]|$)/) {
-        is_npm=1
+      if ($0 ~ /package-ecosystem:[[:space:]]*/) {
+        has_ecosystem = 1
       }
       next
     }
     in_item {
       cur = match($0, /[^ ]/) - 1
       if (cur <= item_indent) {
-        # item ended
-        in_item=0
-        is_npm=0
-        in_cooldown=0
-        cd_indent=-1
+        finish_item()
+        in_item = 0
         next
       }
-      if ($0 ~ /^[[:space:]]*package-ecosystem:[[:space:]]*"?npm"?[[:space:]]*$/) {
-        is_npm=1
+      if ($0 ~ /^[[:space:]]*package-ecosystem:[[:space:]]*/) {
+        has_ecosystem = 1
       }
-      if (is_npm && $0 ~ /^[[:space:]]*cooldown:[[:space:]]*$/) {
-        in_cooldown=1
+      if ($0 ~ /^[[:space:]]*cooldown:[[:space:]]*$/) {
+        in_cooldown = 1
         cd_indent = match($0, /[^ ]/) - 1
         next
       }
       if (in_cooldown) {
         cur2 = match($0, /[^ ]/) - 1
         if (cur2 <= cd_indent) {
-          in_cooldown=0
+          in_cooldown = 0
           next
         }
-        if ($0 ~ /^[[:space:]]*default-days:[[:space:]]*10[[:space:]]*$/) {
-          ok=1
+        if ($0 ~ /^[[:space:]]*default-days:[[:space:]]*[0-9]+[[:space:]]*$/) {
+          line = $0
+          sub(/^[[:space:]]*default-days:[[:space:]]*/, "", line)
+          sub(/[[:space:]]*$/, "", line)
+          if ((line + 0) == required_days) {
+            item_cooldown_ok = 1
+          }
         }
       }
     }
-    END { exit(ok ? 0 : 1) }
+    END {
+      if (in_item) {
+        finish_item()
+      }
+      exit((saw_entry && all_ok) ? 0 : 1)
+    }
   ' <<<"$text"
 }
 
@@ -1558,10 +1587,10 @@ rp_validate_graphite_workflows() {
     if [[ -z "$dependabot_text" ]]; then
       rp_log_fail "${slug}: dependabot.yml exists but could not be read"
       fail=1
-    elif ! rp_dependabot_has_npm_cooldown_10_days "$dependabot_text"; then
-      rp_log_fail "${slug}: dependabot.yml must set npm cooldown default-days: 10 (see fpdf)"
+    elif ! rp_dependabot_has_release_age_cooldown "$dependabot_text"; then
+      rp_log_fail "${slug}: dependabot.yml must set cooldown default-days: ${release_age_default_days} on every update entry (see fpdf)"
       if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_suggest "${slug}: add 'cooldown: { default-days: 10 }' to npm updates in .github/dependabot.yml"
+        rp_log_suggest "${slug}: add 'cooldown: { default-days: ${release_age_default_days} }' to each updates entry in .github/dependabot.yml"
       fi
       fail=1
     fi

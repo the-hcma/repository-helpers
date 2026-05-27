@@ -4,7 +4,7 @@ New dependency versions must be at least **10 days** old before this repo adopts
 
 | Layer | Mechanism |
 |-------|-----------|
-| **pnpm** | `minimumReleaseAge: 14400` in `pnpm-workspace.yaml`. `minimumReleaseAgeExclude: ["*"]` grandfathers the **existing lockfile at cutover** so CI keeps working. |
+| **pnpm** | `minimumReleaseAge: 14400` (10 days) in `pnpm-workspace.yaml`. `minimumReleaseAgeExclude: ["*"]` grandfathers the **existing lockfile at cutover** so CI keeps working. |
 | **Dependabot** | `cooldown: default-days: 10` on **version-update** PRs in `.github/dependabot.yml`. |
 | **dep-updater** | Same 10-day npm gate when proposing bumps from repository-helpers. |
 
