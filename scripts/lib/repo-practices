@@ -891,6 +891,65 @@ rp_fetch_ci_workflow_text() {
   gh api "repos/${slug}/contents/.github/workflows/ci.yml" --jq '.content' | base64 -d
 }
 
+rp_ci_workflow_restricts_pr_branches() {
+  local text="$1"
+  # Graphite stacks open upstack PRs against a non-main base branch, so
+  # restricting pull_request.branches to main prevents CI from running.
+  awk '
+    BEGIN { in_on = 0; in_pr = 0; pr_indent = -1; found = 0 }
+    /^on:[[:space:]]*$/ { in_on = 1; next }
+    in_on && /^[^[:space:]]/ { in_on = 0; in_pr = 0; pr_indent = -1 }
+    in_on && /^[[:space:]]*pull_request:[[:space:]]*$/ {
+      in_pr = 1
+      pr_indent = match($0, /[^ ]/) - 1
+      next
+    }
+    in_pr {
+      # If indentation backs out to pull_request: level or less, the block ended.
+      cur = match($0, /[^ ]/) - 1
+      if (cur <= pr_indent) { in_pr = 0; next }
+      if ($0 ~ /^[[:space:]]*branches:[[:space:]]*/) { found = 1 }
+    }
+    END { exit(found ? 0 : 1) }
+  ' <<<"$text"
+}
+
+rp_fix_ci_workflow_for_stacked_prs() {
+  local text="$1"
+  # - Keep push triggers on main only.
+  # - Remove any pull_request.branches restriction so stacked PRs run CI.
+  # - Preserve the rest of the workflow verbatim.
+  awk '
+    BEGIN { in_on = 0; in_pr = 0; pr_indent = -1 }
+    /^on:[[:space:]]*$/ { in_on = 1; print; next }
+    in_on && /^[^[:space:]]/ { in_on = 0; in_pr = 0; pr_indent = -1; print; next }
+
+    # Normalize push branches to main-only when on a single-line list.
+    in_on && /^[[:space:]]*push:[[:space:]]*$/ { print; next }
+    in_on && /^[[:space:]]*branches:[[:space:]]*\\[main, master\\][[:space:]]*$/ { sub(/\\[main, master\\]/, "[main]"); print; next }
+
+    # Enter pull_request block; we keep the key but drop branches restriction.
+    in_on && /^[[:space:]]*pull_request:[[:space:]]*$/ {
+      in_pr = 1
+      pr_indent = match($0, /[^ ]/) - 1
+      print
+      next
+    }
+
+    in_pr {
+      cur = match($0, /[^ ]/) - 1
+      if (cur <= pr_indent) { in_pr = 0; pr_indent = -1; print; next }
+      # Drop pull_request.branches lines (both single-line list and multi-line style)
+      if ($0 ~ /^[[:space:]]*branches:[[:space:]]*/) { next }
+      if ($0 ~ /^[[:space:]]*-[[:space:]]*(main|master)[[:space:]]*$/) { next }
+      print
+      next
+    }
+
+    { print }
+  ' <<<"$text"
+}
+
 # Emit CI check context names for branch protection (job display name, else job id).
 # Skips guard/changed-files/secret-scan/workflow-lint (optional CI gates, not merge blockers).
 rp_discover_ci_status_contexts() {
@@ -1368,7 +1427,7 @@ rp_validate_graphite_workflows() {
   local strict="$2"
   local labels_json="$3"
   local fail=0
-  local ci_text closer_text dependabot_workflow dependabot_auto_text
+  local ci_text ci_fixed closer_text dependabot_workflow dependabot_auto_text
 
   if ! rp_gh_path_exists "$slug" '.github/workflows/merged-pr-closer.yml'; then
     if [[ "$strict" == '1' ]]; then
@@ -1414,6 +1473,23 @@ rp_validate_graphite_workflows() {
       else
         rp_log_warn "${slug}: ci.yml does not skip gtmq_merge_* (recommended when using Graphite MQ)"
       fi
+    fi
+
+    # Stacked PRs: CI must run even when the PR base is not main.
+    if rp_ci_workflow_restricts_pr_branches "$ci_text"; then
+      rp_log_fail "${slug}: ci.yml restricts pull_request branches; stacked PRs will not run CI"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: remove pull_request.branches filters so CI runs for stacked PR base branches"
+      fi
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
+        ci_fixed="$(rp_fix_ci_workflow_for_stacked_prs "$ci_text")"
+        rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
+          "$ci_fixed" \
+          'fix-ci-stacked-prs' \
+          'fix(ci): run CI for stacked PR base branches'
+        rp_compact_record_fix "$slug" "${slug}: candidate PR: fix ci.yml pull_request trigger for stacked PRs"
+      fi
+      fail=1
     fi
   elif [[ "$strict" == '1' ]]; then
     rp_log_fail "${slug}: missing .github/workflows/ci.yml"
