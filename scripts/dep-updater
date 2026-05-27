@@ -510,6 +510,11 @@ Options:
   --tz <tz>         Timezone for logs (sets $TZ). Examples: America/New_York, EST5EDT
   -h, --help        Print this help and exit
 
+Primary clone (--dir):
+  Keep the project checkout on main. Stack work (gt sync, gt checkout, gt submit)
+  runs only in the dep-updater worktree under --tmpdir — not from the primary clone.
+  When a run finishes, a clean primary clone is switched back to main automatically.
+
 Supported ecosystems:
   npm           package.json present  → pnpm outdated + pnpm update
   uv            uv.lock present       → uv pip list --outdated + uv add
@@ -1738,6 +1743,52 @@ warn_if_dirty_workdir() {
   fi
 }
 
+primary_repo_current_branch() {
+  git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || true
+}
+
+primary_repo_worktree_is_clean() {
+  git -C "$dir" diff --quiet 2>/dev/null \
+    && git -C "$dir" diff --cached --quiet 2>/dev/null
+}
+
+primary_repo_warn_if_not_main() {
+  local branch
+  branch="$(primary_repo_current_branch)"
+  if [[ -z "$branch" || "$branch" == 'main' ]]; then
+    return 0
+  fi
+
+  log "[worktree] Warning: primary clone is checked out on '${branch}', not main."
+  log "[worktree] dep-updater runs stacks in a separate worktree under --tmpdir."
+  log "[worktree] Do not run 'gt sync', 'gt checkout', or 'gt submit' from the primary clone."
+  if primary_repo_worktree_is_clean; then
+    log "[worktree] Primary checkout will be restored to main when this run finishes."
+  else
+    log "[worktree] Primary clone has local changes; checkout will not be changed automatically."
+  fi
+}
+
+primary_repo_ensure_on_main() {
+  local branch
+  branch="$(primary_repo_current_branch)"
+  if [[ "$branch" == 'main' ]]; then
+    return 0
+  fi
+
+  if ! primary_repo_worktree_is_clean; then
+    log "[worktree] Warning: primary clone is on '${branch:-detached}' with local changes; leaving checkout unchanged."
+    log "[worktree] Switch back manually: (cd ${dir} && git checkout main)"
+    return 0
+  fi
+
+  log "[worktree] Restoring primary clone checkout to main (was: ${branch:-detached})."
+  if git -C "$dir" checkout main >/dev/null 2>&1; then
+    return 0
+  fi
+  log "[worktree] Note: could not checkout main on primary clone."
+}
+
 # ---------------------------------------------------------------------------
 # Branch name sanitization
 # ---------------------------------------------------------------------------
@@ -1766,6 +1817,27 @@ init_state_file() {
   repo_hash="$(printf '%s' "$dir" | md5sum | cut -c1-8)"
   state_file="${wt_tmpdir:-${TMPDIR:-/tmp}}/.dep-updater-state-${repo_hash}"
   readonly state_file
+  state_prune_if_worktree_missing
+}
+
+state_prune_if_worktree_missing() {
+  local existing_wt
+  [[ -f "$state_file" ]] || return 0
+  existing_wt="$(state_get "worktree")"
+  if [[ -z "$existing_wt" ]]; then
+    log "[state] Removing stale state (no worktree path recorded)."
+    rm -f "$state_file"
+    return 0
+  fi
+  if [[ ! -d "$existing_wt" ]]; then
+    log "[state] Removing stale state (worktree directory missing: ${existing_wt})."
+    rm -f "$state_file"
+    return 0
+  fi
+  if ! git -C "$existing_wt" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    log "[state] Removing stale state (not a git worktree: ${existing_wt})."
+    rm -f "$state_file"
+  fi
 }
 
 state_get() {
@@ -1924,9 +1996,11 @@ primary_repo_snapshot() {
 }
 
 primary_repo_restore() {
+  local snapshot_was_taken=0
   if [[ "$_primary_snapshot_taken" != '1' ]]; then
     return 0
   fi
+  snapshot_was_taken=1
   _primary_snapshot_taken=0
   if [[ -n "$_pri_main_sha" ]]; then
     git -C "$dir" update-ref refs/heads/main "$_pri_main_sha" >/dev/null 2>&1 \
@@ -1939,6 +2013,9 @@ primary_repo_restore() {
     fi
     git -C "$dir" reset --hard "$_pri_head_sha" >/dev/null 2>&1 \
       || log "[worktree] Note: could not reset primary clone working tree after restore."
+  fi
+  if [[ "$snapshot_was_taken" == '1' && "$report_json" != '1' ]]; then
+    primary_repo_ensure_on_main
   fi
 }
 
@@ -5980,6 +6057,9 @@ main() {
   fi
 
   warn_if_dirty_workdir
+  if [[ "$report_json" != '1' ]]; then
+    primary_repo_warn_if_not_main
+  fi
 
 # ---------------------------------------------------------------------------
 # Dry-run mode: temporary worktree → scan → plan → destroy
@@ -6269,6 +6349,9 @@ fi
 # ---------------------------------------------------------------------------
 init_state_file
 sanitize_state_prs
+if [[ "$report_json" != '1' ]]; then
+  primary_repo_snapshot
+fi
 # Read any open-PR state from a prior interrupted run BEFORE prepare_worktree
 # can overwrite the state file.  cleanup_on_error intentionally preserves the
 # state file so these values survive a SIGINT.
