@@ -1187,6 +1187,62 @@ rp_fetch_workflow_file_names() {
   jq -r '.[]? | select(.type == "file") | .name // empty' <<<"$response"
 }
 
+rp_dependabot_has_npm_cooldown_10_days() {
+  local text="$1"
+  # Best-effort YAML parsing:
+  # - Look for an npm update entry.
+  # - Require a cooldown block within that entry with default-days: 10.
+  # This is intentionally strict and mirrors the org's 10-day cooldown standard.
+  awk '
+    BEGIN { in_updates=0; in_item=0; item_indent=-1; is_npm=0; in_cooldown=0; cd_indent=-1; ok=0 }
+    /^updates:[[:space:]]*$/ { in_updates=1; next }
+    !in_updates { next }
+    # start of an item: "  - ..."
+    /^[[:space:]]*-[[:space:]]/ {
+      in_item=1
+      item_indent = match($0, /[^ ]/) - 1
+      is_npm=0
+      in_cooldown=0
+      cd_indent=-1
+      # Some dependabot.yml files put package-ecosystem on the same "-" line.
+      if ($0 ~ /package-ecosystem:[[:space:]]*"?npm"?([[:space:]]|$)/) {
+        is_npm=1
+      }
+      next
+    }
+    in_item {
+      cur = match($0, /[^ ]/) - 1
+      if (cur <= item_indent) {
+        # item ended
+        in_item=0
+        is_npm=0
+        in_cooldown=0
+        cd_indent=-1
+        next
+      }
+      if ($0 ~ /^[[:space:]]*package-ecosystem:[[:space:]]*"?npm"?[[:space:]]*$/) {
+        is_npm=1
+      }
+      if (is_npm && $0 ~ /^[[:space:]]*cooldown:[[:space:]]*$/) {
+        in_cooldown=1
+        cd_indent = match($0, /[^ ]/) - 1
+        next
+      }
+      if (in_cooldown) {
+        cur2 = match($0, /[^ ]/) - 1
+        if (cur2 <= cd_indent) {
+          in_cooldown=0
+          next
+        }
+        if ($0 ~ /^[[:space:]]*default-days:[[:space:]]*10[[:space:]]*$/) {
+          ok=1
+        }
+      }
+    }
+    END { exit(ok ? 0 : 1) }
+  ' <<<"$text"
+}
+
 rp_print_new_repo_checklist() {
   local slug="$1"
   cat >&2 <<CHECKLIST
@@ -1497,6 +1553,19 @@ rp_validate_graphite_workflows() {
   fi
 
   if rp_gh_path_exists "$slug" '.github/dependabot.yml'; then
+    local dependabot_text
+    dependabot_text="$(rp_fetch_github_text_file "$slug" '.github/dependabot.yml' || true)"
+    if [[ -z "$dependabot_text" ]]; then
+      rp_log_fail "${slug}: dependabot.yml exists but could not be read"
+      fail=1
+    elif ! rp_dependabot_has_npm_cooldown_10_days "$dependabot_text"; then
+      rp_log_fail "${slug}: dependabot.yml must set npm cooldown default-days: 10 (see fpdf)"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: add 'cooldown: { default-days: 10 }' to npm updates in .github/dependabot.yml"
+      fi
+      fail=1
+    fi
+
     dependabot_workflow="$(rp_dependabot_auto_merge_workflow_path "$slug" || true)"
     if [[ -z "$dependabot_workflow" ]]; then
       if [[ "$strict" == '1' ]]; then
