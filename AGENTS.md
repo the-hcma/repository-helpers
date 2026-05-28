@@ -78,16 +78,16 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ## Repository practices (new and existing repos)
 
-Run **`scripts/check-repo-practices`** to audit or onboard a GitHub repository against org conventions (merge settings, Graphite merge queue, branch cleanup, Dependabot auto-merge).
+Run **`scripts/github-repo-lint`** to audit or onboard a GitHub repository against org conventions (merge settings, Graphite merge queue, branch cleanup, Dependabot auto-merge).
 
 ```bash
-scripts/check-repo-practices --new-repo --repo OWNER/NAME   # checklist + SUGGEST hints
-scripts/check-repo-practices --repo OWNER/NAME --suggest    # audit one repo with remediation lines
-scripts/check-repo-practices --all --org the-hcma             # every repo in the org
-scripts/check-repo-practices --apply-fix --repo OWNER/NAME  # patch settings + candidate workflow PRs
+scripts/github-repo-lint --new-repo --repo OWNER/NAME       # checklist + SUGGEST hints
+scripts/github-repo-lint --repo OWNER/NAME --suggest        # audit one repo with remediation lines
+scripts/github-repo-lint --all --org the-hcma               # every repo in the org
+scripts/github-repo-lint --apply-fix --repo OWNER/NAME      # patch settings + candidate workflow PRs
 ```
 
-**`scripts/check-merge-settings`** is a thin wrapper (merge + Graphite only). Prefer **`check-repo-practices`** for full coverage including branch cleanup workflows.
+**`scripts/check-merge-settings`** is a thin wrapper (merge + Graphite only). Prefer **`github-repo-lint`** for full coverage including branch cleanup workflows.
 
 See [GRAPHITE.md](./GRAPHITE.md) for stacked PRs, the merge queue, and the **`merge-it`** label.
 
@@ -115,7 +115,7 @@ Classic branch protection on **`main`** is also required (org standard). It comp
 | `enforce_admins` | `false` (warn if enabled) |
 
 Create or repair ruleset + classic settings with
-`scripts/check-repo-practices --repo OWNER/NAME --apply-fix`. Run it from the target
+`scripts/github-repo-lint --repo OWNER/NAME --apply-fix`. Run it from the target
 repository clone when you want candidate workflow fixes emitted as a Graphite stack
 under `.worktrees/repo-practices-candidate-fixes-wt`.
 

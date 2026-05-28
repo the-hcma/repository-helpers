@@ -13,11 +13,11 @@ practice audits, systemd user services, and Graphite-based development workflow 
   (`pip`, `uv`, `poetry`, `pipenv`), Rust/Cargo, and GitHub Actions.
 - `scripts/dep-updater-batch-run` runs dependency updates across every clone under a
   scan root, streams a live log, and sends a daily email report.
-- `scripts/check-repo-practices` audits org repository settings such as Graphite merge
+- `scripts/github-repo-lint` audits org repository settings such as Graphite merge
   queue wiring, `protect-main`, classic branch protection, branch cleanup workflows,
   and Dependabot auto-merge.
-- `scripts/repo-big-brother-enforcer` runs those practice checks daily across local
-  clones and emails a compliance report.
+- `scripts/github-repo-lint --enforcer` runs those practice checks daily across local
+  clones and emails a compliance report (legacy wrapper: `scripts/repo-big-brother-enforcer`).
 - `scripts/setup-service` installs worktree-aware systemd user services from templates.
 - `scripts/dev/start-development` creates and resumes Graphite worktrees safely.
 
@@ -30,7 +30,7 @@ compliance drift and points to the explicit `--apply-fix` remediation command.
 | Service | Script | Schedule | Purpose |
 | --- | --- | --- | --- |
 | `dep-updater.service` | `scripts/dep-updater-batch-run` | 03:00 daily | Create/update dependency PRs across a scan root and email the run report. |
-| `repo-big-brother-enforcer.service` | `scripts/repo-big-brother-enforcer` | 04:00 daily | Monitor local GitHub clones for repository-practices compliance and email the report. |
+| `github-repo-lint.service` | `scripts/github-repo-lint` | 04:00 daily | Monitor local GitHub clones for repository-practices compliance and email the report. |
 
 `dep-updater.service` is the automation worker. It fetches every repository under
 the scan root, runs `dep-updater --batch --all`, streams the run to
@@ -38,7 +38,7 @@ the scan root, runs `dep-updater --batch --all`, streams the run to
 or timeout report by email. When updates are created, the report lists them from
 structured JSON; when none are created, it says so explicitly.
 
-`repo-big-brother-enforcer.service` is the compliance monitor. It discovers local
+`github-repo-lint.service` is the compliance monitor. It discovers local
 GitHub clones under a scan root, runs strict repository-practices checks for each
 one, emails the daily report, and exits non-zero when any repository fails. It does
 not apply repairs automatically.
@@ -52,14 +52,14 @@ chmod 600 ~/.config/dep-updater.env
 scripts/setup-service
 scripts/setup-service --status
 
-scripts/setup-repo-big-brother-enforcer
-scripts/setup-repo-big-brother-enforcer --status
+scripts/setup-github-repo-lint
+scripts/setup-github-repo-lint --status
 
 scripts/show-services
 ```
 
-`repo-big-brother-enforcer` reuses `~/.config/dep-updater.env` for SMTP by default.
-Use `~/.config/repo-big-brother-enforcer.env` when you need a different scan root or
+`github-repo-lint` (no args) reuses `~/.config/dep-updater.env` for SMTP by default.
+Use `~/.config/github-repo-lint.env` when you need a different scan root or
 report settings.
 
 `scripts/show-services` prints a read-only summary of every systemd service template
@@ -111,7 +111,7 @@ for the Bash + Python extraction proposal.
 
 ## Repository Practices
 
-`scripts/check-repo-practices` audits org conventions including Graphite merge
+`scripts/github-repo-lint` audits org conventions including Graphite merge
 queue wiring, branch protection, cleanup workflows, Dependabot auto-merge,
 Release Please settings, top-level license/copyright metadata, and CODEOWNERS
 coverage for all files.
@@ -119,19 +119,19 @@ coverage for all files.
 Audit one repository:
 
 ```bash
-scripts/check-repo-practices --repo OWNER/NAME --suggest
+scripts/github-repo-lint --repo OWNER/NAME --suggest
 ```
 
 Audit a new repository with strict onboarding expectations:
 
 ```bash
-scripts/check-repo-practices --new-repo --repo OWNER/NAME
+scripts/github-repo-lint --new-repo --repo OWNER/NAME
 ```
 
 Apply supported GitHub-side fixes:
 
 ```bash
-scripts/check-repo-practices --repo OWNER/NAME --apply-fix
+scripts/github-repo-lint --repo OWNER/NAME --apply-fix
 ```
 
 `--apply-fix` can repair supported GitHub settings such as Release Please squash settings,
@@ -191,8 +191,8 @@ Focused tests live in `tests/` and can be run directly:
 ```bash
 bash tests/dep-updater.test
 bash tests/dep-updater-batch-run.test
-bash tests/check-repo-practices.test
-bash tests/repo-big-brother-enforcer.test
+bash tests/aa-github-repo-lint.test
+bash tests/a-github-repo-lint-enforcer.test
 bash tests/setup-service.test
 ```
 

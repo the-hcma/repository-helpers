@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+# github-repo-lint — Audit org GitHub conventions for repositories.
+#
+# Default mode (checker):
+#   scripts/github-repo-lint [--org ORG] [--repo OWNER/NAME ...]
+#   scripts/github-repo-lint --new-repo --repo OWNER/NAME
+#   scripts/github-repo-lint --strict-onboarding --repo OWNER/NAME ...
+#   scripts/github-repo-lint --all [--org ORG]
+#   scripts/github-repo-lint --suggest [--repo OWNER/NAME ...]
+#   scripts/github-repo-lint --apply-fix [--repo ...]
+#
+# Enforcer mode (daily email report over local clones):
+#   scripts/github-repo-lint --enforcer [--print]
+#   scripts/github-repo-lint --enforcer --help
+#
+# Enforcer config:
+# - Reuses ~/.config/dep-updater.env for SMTP by default.
+# - Optionally overlays ~/.config/repo-big-brother-enforcer.env (legacy) and
+#   ~/.config/github-repo-lint.env (preferred).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+lint_repo_dir="$(cd "$script_dir/.." && pwd)"
+readonly lint_repo_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/repo-practices"
+
+enforcer_require_libs() {
+  # Enforcer mode runs under cron/systemd, so it must seed PATH and load mail helpers.
+  # shellcheck disable=SC1091
+  source "${script_dir}/lib/tooling-path"
+  tooling_path_bootstrap_cron_minimal
+
+  # shellcheck disable=SC1091
+  source "${script_dir}/lib/smtp-mail"
+
+  # shellcheck disable=SC1091
+  source "${script_dir}/lib/email-multipart"
+}
+
+readonly enforcer_default_subject_prefix='[github-repo-lint]'
+readonly enforcer_report_separator='----------------------------------------------------------------'
+readonly enforcer_checker="${GITHUB_REPO_LINT_CHECKER:-${lint_repo_dir}/scripts/github-repo-lint}"
+
+enforcer_env_file="${GITHUB_REPO_LINT_ENV_FILE:-${HOME}/.config/github-repo-lint.env}"
+enforcer_legacy_env_file="${REPO_BIG_BROTHER_ENV_FILE:-${HOME}/.config/repo-big-brother-enforcer.env}"
+enforcer_fallback_env_file="${GITHUB_REPO_LINT_FALLBACK_ENV_FILE:-${REPO_BIG_BROTHER_FALLBACK_ENV_FILE:-${HOME}/.config/dep-updater.env}}"
+enforcer_log_file="${GITHUB_REPO_LINT_LOG:-${REPO_BIG_BROTHER_LOG:-${HOME}/scratch/repository-helpers/github-repo-lint.log}}"
+enforcer_scan_root="${GITHUB_REPO_LINT_SCAN_ROOT:-${REPO_BIG_BROTHER_SCAN_ROOT:-${lint_repo_dir}/..}}"
+
+enforcer_print_only=0
+enforcer_run_log=""
+enforcer_clean_log=""
+enforcer_check_log=""
+enforcer_repo_count=0
+enforcer_failure_count=0
+
+# shellcheck disable=SC2317  # invoked by EXIT trap
+enforcer_cleanup_temp_files() {
+  rm -f "${enforcer_run_log:-}" "${enforcer_clean_log:-}" "${enforcer_check_log:-}" 2>/dev/null || true
+}
+trap enforcer_cleanup_temp_files EXIT
+
+enforcer_usage() {
+  sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+enforcer_die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+enforcer_load_required_env_file() {
+  local loaded_env=0
+
+  if [[ "${REPO_HELPERS_TEST_MODE:-0}" == '1' \
+    && "${GITHUB_REPO_LINT_SKIP_ENV_FILE:-${REPO_BIG_BROTHER_SKIP_ENV_FILE:-0}}" == '1' ]]; then
+    return 0
+  fi
+
+  if [[ -f "$enforcer_fallback_env_file" ]]; then
+    if [[ ! -r "$enforcer_fallback_env_file" ]]; then
+      enforcer_die "Env file is not readable: ${enforcer_fallback_env_file}"
+    fi
+    set -a
+    # shellcheck source=/dev/null
+    source "$enforcer_fallback_env_file"
+    set +a
+    loaded_env=1
+  fi
+
+  if [[ -f "$enforcer_legacy_env_file" ]]; then
+    if [[ ! -r "$enforcer_legacy_env_file" ]]; then
+      enforcer_die "Env file is not readable: ${enforcer_legacy_env_file}"
+    fi
+    set -a
+    # shellcheck source=/dev/null
+    source "$enforcer_legacy_env_file"
+    set +a
+    loaded_env=1
+  fi
+
+  if [[ -f "$enforcer_env_file" ]]; then
+    if [[ ! -r "$enforcer_env_file" ]]; then
+      enforcer_die "Env file is not readable: ${enforcer_env_file}"
+    fi
+    set -a
+    # shellcheck source=/dev/null
+    source "$enforcer_env_file"
+    set +a
+    loaded_env=1
+  fi
+
+  if [[ "$loaded_env" -eq 0 ]]; then
+    enforcer_die "Missing required env file: ${enforcer_env_file} or ${enforcer_fallback_env_file}"
+  fi
+}
+
+enforcer_apply_config_defaults() {
+  if [[ -n "${GITHUB_REPO_LINT_SMTP_HOST:-${REPO_BIG_BROTHER_SMTP_HOST:-}}" ]]; then
+    DEP_UPDATER_SMTP_HOST="${GITHUB_REPO_LINT_SMTP_HOST:-$REPO_BIG_BROTHER_SMTP_HOST}"
+  fi
+  if [[ -n "${GITHUB_REPO_LINT_SMTP_PORT:-${REPO_BIG_BROTHER_SMTP_PORT:-}}" ]]; then
+    DEP_UPDATER_SMTP_PORT="${GITHUB_REPO_LINT_SMTP_PORT:-$REPO_BIG_BROTHER_SMTP_PORT}"
+  fi
+  if [[ -n "${GITHUB_REPO_LINT_SMTP_USER:-${REPO_BIG_BROTHER_SMTP_USER:-}}" ]]; then
+    DEP_UPDATER_SMTP_USER="${GITHUB_REPO_LINT_SMTP_USER:-$REPO_BIG_BROTHER_SMTP_USER}"
+  fi
+  if [[ -n "${GITHUB_REPO_LINT_SMTP_PASSWORD:-${REPO_BIG_BROTHER_SMTP_PASSWORD:-}}" ]]; then
+    DEP_UPDATER_SMTP_PASSWORD="${GITHUB_REPO_LINT_SMTP_PASSWORD:-$REPO_BIG_BROTHER_SMTP_PASSWORD}"
+  fi
+  if [[ -n "${GITHUB_REPO_LINT_SMTP_TLS:-${REPO_BIG_BROTHER_SMTP_TLS:-}}" ]]; then
+    DEP_UPDATER_SMTP_TLS="${GITHUB_REPO_LINT_SMTP_TLS:-$REPO_BIG_BROTHER_SMTP_TLS}"
+  fi
+  if [[ -n "${GITHUB_REPO_LINT_USE_SENDMAIL:-${REPO_BIG_BROTHER_USE_SENDMAIL:-}}" ]]; then
+    DEP_UPDATER_USE_SENDMAIL="${GITHUB_REPO_LINT_USE_SENDMAIL:-$REPO_BIG_BROTHER_USE_SENDMAIL}"
+  fi
+
+  if [[ -z "${DEP_UPDATER_SMTP_HOST:-}" ]]; then
+    enforcer_die "Missing GITHUB_REPO_LINT_SMTP_HOST (or DEP_UPDATER_SMTP_HOST) in ${enforcer_env_file}"
+  fi
+
+  if [[ -z "${DEP_UPDATER_REPORT_TO:-}" ]]; then
+    DEP_UPDATER_REPORT_TO="${GITHUB_REPO_LINT_REPORT_TO:-${REPO_BIG_BROTHER_REPORT_TO:-johndoe@example.com}}"
+  fi
+  if [[ -z "${DEP_UPDATER_REPORT_FROM:-}" ]]; then
+    DEP_UPDATER_REPORT_FROM="${GITHUB_REPO_LINT_REPORT_FROM:-${REPO_BIG_BROTHER_REPORT_FROM:-github-repo-lint@example.com}}"
+  fi
+
+  export DEP_UPDATER_SMTP_HOST DEP_UPDATER_REPORT_TO DEP_UPDATER_REPORT_FROM
+  export DEP_UPDATER_SMTP_PORT DEP_UPDATER_SMTP_USER DEP_UPDATER_SMTP_PASSWORD
+  export DEP_UPDATER_SMTP_TLS DEP_UPDATER_USE_SENDMAIL
+}
+
+enforcer_resolve_scan_root() {
+  local resolved
+
+  if [[ ! -d "$enforcer_scan_root" ]]; then
+    enforcer_die "GITHUB_REPO_LINT_SCAN_ROOT is not a directory: ${enforcer_scan_root}"
+  fi
+  resolved="$(realpath "$enforcer_scan_root")"
+  printf '%s\n' "$resolved"
+}
+
+enforcer_slug_from_origin() {
+  local -r repo_path="$1"
+  local remote_url slug
+
+  remote_url="$(git -C "$repo_path" remote get-url origin 2>/dev/null || true)"
+  if [[ -z "$remote_url" ]]; then
+    return 1
+  fi
+  slug="$(printf '%s' "$remote_url" \
+    | sed -E 's#^git@github.com:##; s#^ssh://git@github.com/##; s#^https://github.com/##; s#\\.git$##')"
+  if [[ "$slug" != */* ]]; then
+    return 1
+  fi
+  printf '%s\n' "$slug"
+}
+
+enforcer_discover_repo_slugs() {
+  local -r root="$1"
+  local entry entry_name entry_real top slug
+  local -a slugs=()
+
+  for entry in "$root"/*; do
+    [[ -e "$entry" ]] || continue
+    [[ -d "$entry" ]] || continue
+    entry_name="${entry##*/}"
+    [[ "$entry_name" == .* ]] && continue
+
+    top="$(git -C "$entry" rev-parse --show-toplevel 2>/dev/null || true)"
+    [[ -n "$top" ]] || continue
+    top="$(realpath "$top")"
+    entry_real="$(realpath "$entry")"
+    [[ "$top" == "$entry_real" ]] || continue
+
+    slug="$(enforcer_slug_from_origin "$top" || true)"
+    [[ -n "$slug" ]] || continue
+    slugs+=("$slug")
+  done
+
+  if [[ "${#slugs[@]}" -gt 0 ]]; then
+    printf '%s\n' "${slugs[@]}" | sort -u
+  fi
+}
+
+enforcer_log() {
+  printf '%s\n' "$*" | tee -a "$enforcer_run_log"
+}
+
+enforcer_run_checks() {
+  local -r root="$1"
+  local slug check_exit parsed_failure_count
+  local -a check_args=()
+  local -a slugs=()
+
+  mapfile -t slugs < <(enforcer_discover_repo_slugs "$root")
+  enforcer_repo_count="${#slugs[@]}"
+  enforcer_failure_count=0
+
+  enforcer_log "Started:  $(date -Is)"
+  enforcer_log "Root:     ${root}"
+  enforcer_log "Checks:   github-repo-lint --strict-onboarding --compact"
+  enforcer_log ""
+
+  if [[ "$enforcer_repo_count" -eq 0 ]]; then
+    enforcer_log "ERROR: no GitHub repositories discovered under ${root}"
+    return 1
+  fi
+
+  for slug in "${slugs[@]}"; do
+    check_args+=(--repo "$slug")
+  done
+  check_args+=(--strict-onboarding --compact)
+
+  check_exit=0
+  enforcer_check_log="$(mktemp)"
+  NO_COLOR=1 "$enforcer_checker" "${check_args[@]}" >"$enforcer_check_log" 2>&1 || check_exit=$?
+  tee -a "$enforcer_run_log" <"$enforcer_check_log"
+  parsed_failure_count="$(
+    awk '/^[0-9]+ of [0-9]+ repositories failed practices check$/ { count = $1 }
+      END { print count + 0 }' "$enforcer_check_log"
+  )"
+  rm -f "$enforcer_check_log"
+  enforcer_check_log=""
+
+  if [[ "$check_exit" -ne 0 ]]; then
+    if [[ "$parsed_failure_count" -gt 0 ]]; then
+      enforcer_failure_count="$parsed_failure_count"
+    else
+      enforcer_failure_count="$enforcer_repo_count"
+      enforcer_log ""
+      enforcer_log "github-repo-lint failed before reporting a repository count"
+    fi
+    return 1
+  fi
+}
+
+enforcer_clean_report_log() {
+  sed -E 's/\\x1B\\[[0-9;]*[mK]//g' "$enforcer_run_log" >"$enforcer_clean_log"
+}
+
+enforcer_report_body() {
+  local -r run_exit="$1"
+  local -r started_at="$2"
+  local -r finished_at="$3"
+  local status_text
+
+  if [[ "$run_exit" -eq 0 ]]; then
+    status_text='PASSED'
+  else
+    status_text='FAILED'
+  fi
+
+  {
+    printf 'GitHub Repo Lint %s\n' "$status_text"
+    printf '%s\n' "$enforcer_report_separator"
+    printf 'Started:  %s\n' "$started_at"
+    printf 'Finished: %s\n' "$finished_at"
+    printf 'Scan root: %s\n' "$(enforcer_resolve_scan_root)"
+    printf 'Repos:    %s checked, %s failed\n' "$enforcer_repo_count" "$enforcer_failure_count"
+    printf 'Exit:     %s\n' "$run_exit"
+    printf 'Apply:    scripts/github-repo-lint --repo OWNER/NAME --apply-fix\n'
+    printf '\n'
+    printf 'Practices output:\n'
+    printf '%s\n' "$enforcer_report_separator"
+    if [[ -s "$enforcer_clean_log" ]]; then
+      sed -n '1,240p' "$enforcer_clean_log"
+    else
+      printf '(no output)\n'
+    fi
+  }
+}
+
+enforcer_write_sample_log() {
+  enforcer_repo_count=1
+  enforcer_failure_count=0
+  {
+    printf 'Started:  %s\n' "$(date -Is)"
+    printf 'Root:     %s\n' "$(enforcer_resolve_scan_root)"
+    printf 'Checks:   github-repo-lint --strict-onboarding --compact\n'
+    printf '\n'
+    printf 'Passed: the-hcma/demo-repo\n'
+    printf 'all 1 repositories passed\n'
+  } >"$enforcer_run_log"
+}
+
+enforcer_send_report() {
+  local -r run_exit="$1"
+  local -r body="$2"
+  local status_text subject subject_prefix
+
+  if [[ "$run_exit" -eq 0 ]]; then
+    status_text='PASSED'
+  else
+    status_text='FAILED'
+  fi
+
+  subject_prefix="${GITHUB_REPO_LINT_REPORT_SUBJECT_PREFIX:-${REPO_BIG_BROTHER_REPORT_SUBJECT_PREFIX:-$enforcer_default_subject_prefix}}"
+  subject="${subject_prefix} practices ${status_text}: ${enforcer_failure_count}/${enforcer_repo_count} failing"
+
+  repo_helpers_email_write_multipart \
+    "$DEP_UPDATER_REPORT_TO" \
+    "$DEP_UPDATER_REPORT_FROM" \
+    "$DEP_UPDATER_REPORT_FROM" \
+    "$subject" \
+    "$body" \
+    'github-repo-lint' \
+    | repo_helpers_smtp_send "$DEP_UPDATER_REPORT_FROM" "$DEP_UPDATER_REPORT_TO"
+}
+
+enforcer_main() {
+  enforcer_require_libs
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --print)
+        enforcer_print_only=1
+        shift
+        ;;
+      --help|-h)
+        enforcer_usage
+        exit 0
+        ;;
+      *)
+        enforcer_die "Unknown argument: $1 (see --enforcer --help)"
+        ;;
+    esac
+  done
+
+  enforcer_load_required_env_file
+  enforcer_apply_config_defaults
+  mkdir -p "$(dirname "$enforcer_log_file")"
+
+  enforcer_run_log="$(mktemp)"
+  enforcer_clean_log="$(mktemp)"
+  started_at="$(date -Is)"
+
+  if [[ "$enforcer_print_only" -eq 1 ]]; then
+    enforcer_write_sample_log
+    finished_at="$(date -Is)"
+    enforcer_clean_report_log
+    body="$(enforcer_report_body 0 "$started_at" "$finished_at")"
+    repo_helpers_email_write_multipart \
+      "$DEP_UPDATER_REPORT_TO" \
+      "$DEP_UPDATER_REPORT_FROM" \
+      "$DEP_UPDATER_REPORT_FROM" \
+      "${GITHUB_REPO_LINT_REPORT_SUBJECT_PREFIX:-$enforcer_default_subject_prefix} practices PASSED: 0/1 failing" \
+      "$body" \
+      'github-repo-lint'
+    exit 0
+  fi
+
+  resolved_scan_root="$(enforcer_resolve_scan_root)"
+  run_exit=0
+  enforcer_run_checks "$resolved_scan_root" || run_exit=$?
+  finished_at="$(date -Is)"
+  enforcer_log "Finished: ${finished_at}"
+  enforcer_clean_report_log
+  body="$(enforcer_report_body "$run_exit" "$started_at" "$finished_at")"
+  enforcer_send_report "$run_exit" "$body"
+
+  rm -f "$enforcer_run_log" "$enforcer_clean_log"
+  enforcer_run_log=""
+  enforcer_clean_log=""
+
+  exit "$run_exit"
+}
+
+main() {
+  if [[ "$#" -eq 0 ]]; then
+    enforcer_main
+  fi
+
+  if [[ "${1:-}" == '--enforcer' ]]; then
+    shift
+    enforcer_main "$@"
+  fi
+
+  if [[ "${1:-}" == '--print' ]]; then
+    enforcer_main "$@"
+  fi
+
+  rp_main 'github-repo-lint' "$@"
+}
+
+main "$@"
