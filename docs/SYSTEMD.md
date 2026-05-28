@@ -5,7 +5,7 @@ This repository ships systemd user services for daily repository maintenance:
 | Service | Script | Timer | Report |
 | --- | --- | --- | --- |
 | `dep-updater.service` | `scripts/dep-updater-batch-run` | 03:00 daily | Dependency update run results |
-| `repo-big-brother-enforcer.service` | `scripts/repo-big-brother-enforcer` | 04:00 daily | Repository-practices compliance |
+| `github-repo-lint.service` | `scripts/github-repo-lint` | 04:00 daily | Repository-practices compliance |
 
 Both are oneshot services installed under `~/.config/systemd/user/`, with logs
 under `~/scratch/repository-helpers/`.
@@ -25,8 +25,8 @@ The services have different responsibilities:
 
 - **Dependency Updater** is allowed to create and update dependency PRs. Its email
   reports summarize what changed, what failed, and whether the run timed out.
-- **Repo Big Brother Enforcer** is report-only. It monitors repository settings and
-  workflow compliance, then tells you when to run `check-repo-practices --apply-fix` or
+- **GitHub Repo Lint** is report-only. It monitors repository settings and
+  workflow compliance, then tells you when to run `github-repo-lint --apply-fix` or
   complete manual Graphite app steps.
 
 ## Dependency Updater
@@ -162,32 +162,32 @@ rm ~/.config/systemd/user/dep-updater.{service,timer}
 systemctl --user daemon-reload
 ```
 
-## Repo Big Brother Enforcer
+## GitHub Repo Lint (enforcer)
 
-The **Repo Big Brother Enforcer** scans GitHub clones under a root path and runs
-`scripts/check-repo-practices --strict-onboarding --compact` across the discovered
+The **GitHub Repo Lint enforcer** scans GitHub clones under a root path and runs
+`scripts/github-repo-lint --strict-onboarding --compact` across the discovered
 repositories. It emails a daily report and exits non-zero when any repository fails
 the checks.
 
 It reuses `~/.config/dep-updater.env` for SMTP. Add
-`~/.config/repo-big-brother-enforcer.env` only for enforcer-specific overrides,
+`~/.config/github-repo-lint.env` only for enforcer-specific overrides,
 such as the scan root:
 
 ```bash
-cat >~/.config/repo-big-brother-enforcer.env <<'EOF'
-REPO_BIG_BROTHER_SCAN_ROOT=/path/to/repos
+cat >~/.config/github-repo-lint.env <<'EOF'
+GITHUB_REPO_LINT_SCAN_ROOT=/path/to/repos
 EOF
-chmod 600 ~/.config/repo-big-brother-enforcer.env
+chmod 600 ~/.config/github-repo-lint.env
 ```
 
 ### Install
 
 ```bash
-./scripts/setup-repo-big-brother-enforcer
-./scripts/setup-repo-big-brother-enforcer --status
+./scripts/setup-github-repo-lint
+./scripts/setup-github-repo-lint --status
 ```
 
-The wrapper uses `setup-service` with the `repo-big-brother-enforcer` unit
+The wrapper uses `setup-service` with the `github-repo-lint` unit
 template. It does not run from `scripts/dev/start-development`; installation is
 explicit.
 
@@ -196,7 +196,7 @@ explicit.
 The enforcer reports drift. To apply supported GitHub-side repairs, run:
 
 ```bash
-scripts/check-repo-practices --repo OWNER/NAME --apply-fix
+scripts/github-repo-lint --repo OWNER/NAME --apply-fix
 ```
 
 `--apply-fix` can repair supported Release Please squash settings, `protect-main`
@@ -210,18 +210,18 @@ remains manual and is reported as a manual step in the output.
 ### Status, logs, and trial runs
 
 ```bash
-systemctl --user status repo-big-brother-enforcer.service
-systemctl --user list-timers repo-big-brother-enforcer.timer
-tail --follow=name --retry ~/scratch/repository-helpers/repo-big-brother-enforcer.log
+systemctl --user status github-repo-lint.service
+systemctl --user list-timers github-repo-lint.timer
+tail --follow=name --retry ~/scratch/repository-helpers/github-repo-lint.log
 
-systemctl --user start repo-big-brother-enforcer.service
+systemctl --user start github-repo-lint.service
 ```
 
 ### Uninstall
 
 ```bash
-systemctl --user disable --now repo-big-brother-enforcer.timer
-systemctl --user disable repo-big-brother-enforcer.service
-rm ~/.config/systemd/user/repo-big-brother-enforcer.{service,timer}
+systemctl --user disable --now github-repo-lint.timer
+systemctl --user disable github-repo-lint.service
+rm ~/.config/systemd/user/github-repo-lint.{service,timer}
 systemctl --user daemon-reload
 ```
