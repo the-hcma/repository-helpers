@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Smoke and static tests for scripts/dev/post-pr-submission-checks.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/dev/post-pr-submission-checks"
+readonly script
+
+printf '\n=== --help ===\n'
+help_out=""
+help_exit=0
+help_out="$(bash "$script" --help 2>&1)" || help_exit=$?
+assert_exit_0 "--help" "$help_out" "$help_exit"
+assert_contains "--help usage" "$help_out" "post-pr-submission-checks"
+
+printf '\n=== unknown argument ===\n'
+unknown_out=""
+unknown_exit=0
+unknown_out="$(bash "$script" --nope 2>&1)" || unknown_exit=$?
+assert_exit_nonzero "unknown arg" "$unknown_out" "$unknown_exit"
+assert_contains "unknown arg" "$unknown_out" "Unknown argument"
+
+printf '\n=== functional: waits for CI success ===\n'
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin"
+
+cat >"${mock_bin}/git" <<'MOCK_GIT'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *'branch --show-current'* ]]; then
+  printf '%s\n' 'my-branch'
+  exit 0
+fi
+if [[ "$*" == *'rev-parse --abbrev-ref @{u}'* ]]; then
+  printf '%s\n' 'origin/my-branch'
+  exit 0
+fi
+printf 'unexpected git call: %s\n' "$*" >&2
+exit 1
+MOCK_GIT
+chmod +x "${mock_bin}/git"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'pr list'* ]]; then
+  printf '42\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json state'* ]]; then
+  printf 'OPEN\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json isDraft'* ]]; then
+  printf 'false\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json body'* ]]; then
+  printf '%s\n' $'## Summary\n- ok\n\n## Test plan\n- ok\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json statusCheckRollup'* ]]; then
+  # No failures, no pending.
+  printf '%s\n' '[]'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(PATH="${mock_bin}:${PATH}" POST_PR_CHECKS_TIMEOUT=1s POST_PR_CHECKS_POLL_SECS=1 bash "$script" 2>&1)"
+exit_code=$?
+set -e
+
+assert_exit_0 "ci success" "$out" "$exit_code"
+assert_contains "ci success logs" "$out" "CI passed"
+rm -rf "$tmp"
+
+printf '\n=== functional: timeout emits WAIT_TIMEOUT line ===\n'
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin"
+
+cp "${script_dir}/lib/test-assert" "${tmp}/test-assert" >/dev/null 2>&1 || true
+
+cat >"${mock_bin}/git" <<'MOCK_GIT'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *'branch --show-current'* ]]; then
+  printf '%s\n' 'my-branch'
+  exit 0
+fi
+if [[ "$*" == *'rev-parse --abbrev-ref @{u}'* ]]; then
+  printf '%s\n' 'origin/my-branch'
+  exit 0
+fi
+printf 'unexpected git call: %s\n' "$*" >&2
+exit 1
+MOCK_GIT
+chmod +x "${mock_bin}/git"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'pr list'* ]]; then
+  printf '42\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json state'* ]]; then
+  printf 'OPEN\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json isDraft'* ]]; then
+  printf 'false\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json body'* ]]; then
+  printf '%s\n' $'## Summary\n- ok\n\n## Test plan\n- ok\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json statusCheckRollup'* ]]; then
+  # Pending check (empty conclusion).
+  printf '%s\n' '[{"name":"CI","conclusion":null,"detailsUrl":"x"}]'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(PATH="${mock_bin}:${PATH}" POST_PR_CHECKS_TIMEOUT=1s POST_PR_CHECKS_POLL_SECS=1 bash "$script" 2>&1)"
+exit_code=$?
+set -e
+
+assert_exit_nonzero "timeout" "$out" "$exit_code"
+assert_contains "timeout line" "$out" "ERROR: WAIT_TIMEOUT post-pr-submission-checks"
+rm -rf "$tmp"
+
+test_summary
+
