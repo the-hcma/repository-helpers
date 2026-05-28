@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# scripts/dev/post-pr-submission-checks — Verify PR exists and CI is green.
+#
+# Intended to run immediately after scripts/dev/submit-stack (or any PR creation).
+# By default it discovers the PR for the current branch and waits for required
+# checks to complete. Exits non-zero if CI is not green.
+#
+# Usage:
+#   scripts/dev/post-pr-submission-checks
+#   scripts/dev/post-pr-submission-checks --pr <number>
+#   scripts/dev/post-pr-submission-checks --no-wait
+#   scripts/dev/post-pr-submission-checks --help
+#
+# Environment:
+#   POST_PR_CHECKS_TIMEOUT     Timeout for waiting on CI (default: 20m)
+#   POST_PR_CHECKS_POLL_SECS   Poll interval in seconds (default: 10)
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+repo_dir="$(cd "$script_dir/../.." && pwd)"
+readonly repo_dir
+
+pr_number=""
+no_wait=0
+
+usage() {
+  sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+log_step() {
+  printf '==> %s\n' "$*" >&2
+}
+
+require_tools() {
+  command -v gh >/dev/null 2>&1 || die "gh not found on PATH"
+  command -v jq >/dev/null 2>&1 || die "jq not found on PATH"
+  command -v git >/dev/null 2>&1 || die "git not found on PATH"
+}
+
+parse_duration_seconds() {
+  local -r raw="$1"
+  local n
+
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$raw"
+    return 0
+  fi
+  if [[ "$raw" =~ ^([0-9]+)s$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$raw" =~ ^([0-9]+)m$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    printf '%s\n' "$(( n * 60 ))"
+    return 0
+  fi
+  if [[ "$raw" =~ ^([0-9]+)h$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    printf '%s\n' "$(( n * 3600 ))"
+    return 0
+  fi
+  return 1
+}
+
+git_current_branch() {
+  git -C "$repo_dir" branch --show-current
+}
+
+ensure_branch_is_pushed() {
+  local upstream
+  upstream="$(git -C "$repo_dir" rev-parse --abbrev-ref '@{u}' 2>/dev/null || true)"
+  if [[ -z "$upstream" ]]; then
+    die "Branch has no upstream configured (push it or run scripts/dev/submit-stack)"
+  fi
+}
+
+discover_pr_number_for_branch() {
+  local -r branch="$1"
+  local out
+
+  out="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+  if [[ -z "$out" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
+
+require_pr_open_and_ready() {
+  local -r pr="$1"
+  local state is_draft
+
+  state="$(gh pr view "$pr" --json state --jq '.state')"
+  is_draft="$(gh pr view "$pr" --json isDraft --jq '.isDraft')"
+  if [[ "$state" != 'OPEN' ]]; then
+    die "PR is not open (state: ${state})"
+  fi
+  if [[ "$is_draft" == 'true' ]]; then
+    die "PR is draft (publish it before merge queue)"
+  fi
+}
+
+require_pr_has_summary_and_test_plan() {
+  local -r pr="$1"
+  local body
+
+  body="$(gh pr view "$pr" --json body --jq '.body // ""')"
+  if ! grep -qF '## Summary' <<<"$body"; then
+    die "PR body is missing \"## Summary\""
+  fi
+  if ! grep -qF '## Test plan' <<<"$body"; then
+    die "PR body is missing \"## Test plan\""
+  fi
+}
+
+ci_rollup_json() {
+  local -r pr="$1"
+  gh pr view "$pr" --json statusCheckRollup --jq '.statusCheckRollup'
+}
+
+rollup_has_pending_or_in_progress() {
+  local -r json="$1"
+  jq -e '
+    [ .[]?
+      | (.conclusion // "")
+    ]
+    | any(. == "" or . == "IN_PROGRESS" or . == "QUEUED" or . == "PENDING")
+  ' >/dev/null <<<"$json"
+}
+
+rollup_failed_contexts() {
+  local -r json="$1"
+  jq -r '
+    [ .[]?
+      | {
+          name: (.name // .context // "unknown"),
+          conclusion: (.conclusion // ""),
+          detailsUrl: (.detailsUrl // "")
+        }
+      | select(.conclusion != "SUCCESS")
+      | select(.conclusion != "SKIPPED")
+      | select(.conclusion != "NEUTRAL")
+      | select(.conclusion != "")
+    ]
+    | .[]
+    | "\(.name)\t\(.conclusion)\t\(.detailsUrl)"
+  ' <<<"$json"
+}
+
+require_ci_success() {
+  local -r pr="$1"
+  local rollup failures
+
+  rollup="$(ci_rollup_json "$pr")"
+  if rollup_has_pending_or_in_progress "$rollup"; then
+    return 2
+  fi
+
+  failures="$(rollup_failed_contexts "$rollup" | head -n 20 || true)"
+  if [[ -n "$failures" ]]; then
+    printf '%s\n' "ERROR: CI failures for PR #${pr}:" >&2
+    printf '%s\n' "$failures" >&2
+    return 1
+  fi
+
+  return 0
+}
+
+wait_for_ci_success() {
+  local -r pr="$1"
+  local -r timeout_raw="${POST_PR_CHECKS_TIMEOUT:-20m}"
+  local -r poll_raw="${POST_PR_CHECKS_POLL_SECS:-10}"
+  local timeout_secs poll_secs start now elapsed rc
+
+  timeout_secs=""
+  if ! timeout_secs="$(parse_duration_seconds "$timeout_raw")"; then
+    die "Invalid POST_PR_CHECKS_TIMEOUT (expected Ns/Nm/Nh): ${timeout_raw}"
+  fi
+  if ! poll_secs="$(parse_duration_seconds "${poll_raw}s")"; then
+    die "Invalid POST_PR_CHECKS_POLL_SECS: ${poll_raw}"
+  fi
+
+  start="$(date +%s)"
+  while true; do
+    rc=0
+    require_ci_success "$pr" || rc=$?
+    case "$rc" in
+      0) return 0 ;;
+      1) return 1 ;;
+      2) ;;
+      *) die "Internal error: unexpected CI status rc=${rc}" ;;
+    esac
+
+    now="$(date +%s)"
+    elapsed="$(( now - start ))"
+    if (( elapsed >= timeout_secs )); then
+      printf 'ERROR: WAIT_TIMEOUT post-pr-submission-checks pr=%s waited=%ss timeout=%ss\n' \
+        "$pr" "$elapsed" "$timeout_secs" >&2
+      return 1
+    fi
+    sleep "$poll_secs"
+  done
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --pr)
+        [[ $# -ge 2 ]] || die "--pr requires a number"
+        pr_number="$2"
+        shift 2
+        ;;
+      --no-wait)
+        no_wait=1
+        shift
+        ;;
+      *)
+        die "Unknown argument: $1 (see --help)"
+        ;;
+    esac
+  done
+}
+
+main() {
+  parse_args "$@"
+  require_tools
+
+  branch="$(git_current_branch)"
+  [[ -n "$branch" ]] || die "Not on a branch (detached HEAD)"
+  ensure_branch_is_pushed
+
+  if [[ -z "$pr_number" ]]; then
+    pr_number="$(discover_pr_number_for_branch "$branch" || true)"
+    [[ -n "$pr_number" ]] || die "No open PR found for branch: ${branch}"
+  fi
+
+  log_step "PR: #${pr_number}"
+  require_pr_open_and_ready "$pr_number"
+  require_pr_has_summary_and_test_plan "$pr_number"
+
+  if [[ "$no_wait" -eq 1 ]]; then
+    log_step "Skipping CI wait (--no-wait)"
+    return 0
+  fi
+
+  log_step "Waiting for CI to pass…"
+  wait_for_ci_success "$pr_number"
+  log_step "CI passed"
+}
+
+main "$@"
+
