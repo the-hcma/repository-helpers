@@ -17,7 +17,7 @@ practice audits, systemd user services, and Graphite-based development workflow 
   queue wiring, `protect-main`, classic branch protection, branch cleanup workflows,
   and Dependabot auto-merge.
 - `scripts/github-repo-lint --enforcer` runs those practice checks daily across local
-  clones and emails a compliance report (legacy wrapper: `scripts/repo-big-brother-enforcer`).
+  clones and emails a compliance report.
 - `scripts/setup-service` installs worktree-aware systemd user services from templates.
 - `scripts/dev/start-development` creates and resumes Graphite worktrees safely.
 
