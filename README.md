@@ -192,7 +192,7 @@ Focused tests live in `tests/` and can be run directly:
 bash tests/dep-updater.test
 bash tests/dep-updater-batch-run.test
 bash tests/github-repo-lint.test
-bash tests/github-repo-lint-enforcer.test
+bash tests/a-github-repo-lint-enforcer.test
 bash tests/setup-service.test
 ```
 
