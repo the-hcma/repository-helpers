@@ -20,6 +20,16 @@ assert_contains "discovers installed user units" "$script_text" ".config/systemd
 assert_contains "reports environment files" "$script_text" "EnvironmentFile="
 assert_contains "reports log files" "$script_text" "Standard(Output|Error)="
 assert_contains "reports setup wrapper" "$script_text" "setup-github-repo-lint"
+assert_contains "reports installed commit" "$script_text" "format_commit_status"
+assert_contains "reads running commit from environ" "$script_text" "read_deployed_commit_from_pid"
+assert_contains "compares against main" "$script_text" "repo_main_full_sha"
+assert_contains "colors deploy status" "$script_text" "deploy_status_color_code"
+assert_contains "colors running status" "$script_text" "running_status_color_code"
+assert_contains "documents NO_COLOR IDE behavior" "$script_text" "NO_COLOR does not disable"
+assert_contains "detects interactive session" "$script_text" "interactive_session"
+assert_contains "reports oneshot timer idle state" "$script_text" "idle until timer runs"
+assert_contains "supports --color flag" "$script_text" '--color'
+assert_contains "supports --no-color flag" "$script_text" '--no-color'
 
 printf '\n=== --help ===\n'
 help_out=""
@@ -27,6 +37,7 @@ help_exit=0
 help_out="$(bash "$script" --help 2>&1)" || help_exit=$?
 assert_exit_0 "--help" "$help_out" "$help_exit"
 assert_contains "--help includes usage" "$help_out" "Usage:"
+assert_contains "--help documents --color" "$help_out" "--color"
 
 printf '\n=== mock systemd summary ===\n'
 tmp=""
@@ -35,15 +46,34 @@ mock_bin="${tmp}/bin"
 mkdir -p "$mock_bin" "${tmp}/.config/systemd/user" "${tmp}/scratch/repository-helpers"
 
 repo_root="${script_dir}/.."
+main_sha=""
+main_sha="$(git -C "$repo_root" rev-parse origin/main 2>/dev/null || git -C "$repo_root" rev-parse main)"
+main_short="${main_sha:0:7}"
 sed "s|@@REPO_DIR@@|${repo_root}|g" \
   "${repo_root}/etc/systemd/dep-updater.service" \
-  >"${tmp}/.config/systemd/user/dep-updater.service"
+  | awk -v sha="$main_sha" '
+    /^\[Service\]/ && !inserted {
+      print
+      print "Environment=DEPLOYED_COMMIT=" sha
+      inserted = 1
+      next
+    }
+    { print }
+  ' >"${tmp}/.config/systemd/user/dep-updater.service"
 sed "s|@@REPO_DIR@@|${repo_root}|g" \
   "${repo_root}/etc/systemd/dep-updater.timer" \
   >"${tmp}/.config/systemd/user/dep-updater.timer"
 sed "s|@@REPO_DIR@@|${repo_root}|g" \
   "${repo_root}/etc/systemd/github-repo-lint.service" \
-  >"${tmp}/.config/systemd/user/github-repo-lint.service"
+  | awk -v sha="$main_sha" '
+    /^\[Service\]/ && !inserted {
+      print
+      print "Environment=DEPLOYED_COMMIT=" sha
+      inserted = 1
+      next
+    }
+    { print }
+  ' >"${tmp}/.config/systemd/user/github-repo-lint.service"
 sed "s|@@REPO_DIR@@|${repo_root}|g" \
   "${repo_root}/etc/systemd/github-repo-lint.timer" \
   >"${tmp}/.config/systemd/user/github-repo-lint.timer"
@@ -130,7 +160,7 @@ chmod +x "${mock_bin}/systemctl"
 summary_out=""
 summary_exit=0
 summary_out="$(
-  HOME="$tmp" PATH="${mock_bin}:${PATH}" bash "$script" 2>&1
+  HOME="$tmp" PATH="${mock_bin}:${PATH}" bash "$script" --no-color 2>&1
 )" || summary_exit=$?
 
 assert_exit_0 "mock summary" "$summary_out" "$summary_exit"
@@ -141,7 +171,18 @@ assert_count_equals "summary deduplicates dep-updater" "$summary_out" "Dependenc
 assert_count_equals "summary deduplicates enforcer" "$summary_out" "GitHub Repo Lint" "1"
 assert_contains "summary includes other user service" "$summary_out" "User Cron Demo"
 assert_contains "summary labels other service" "$summary_out" "Service:   yes, installed user unit"
-assert_contains "summary includes service active state" "$summary_out" "Active:    inactive (dead)"
+assert_contains "summary includes dep-updater active state" \
+  "$summary_out" "Active:    oneshot (idle until timer runs)"
+assert_contains "summary includes enforcer active state" \
+  "$summary_out" "Active:    oneshot (idle until timer runs)"
+assert_contains "summary includes other service active state" \
+  "$summary_out" "Active:    oneshot (idle until timer runs)"
+assert_contains "summary includes dep-updater commit status" \
+  "$summary_out" "Commit:    installed ${main_short}, main ${main_short} (up to date)"
+assert_contains "summary includes enforcer commit status" \
+  "$summary_out" "Commit:    installed ${main_short}, main ${main_short} (up to date)"
+assert_contains "summary includes other service commit status" \
+  "$summary_out" "Commit:    installed (not recorded), main n/a (main unknown)"
 assert_contains "summary includes dep-updater config" "$summary_out" "${tmp}/.config/dep-updater.env"
 assert_contains "summary includes enforcer config" "$summary_out" "${tmp}/.config/github-repo-lint.env"
 assert_contains "summary includes other service config" "$summary_out" "${tmp}/.config/user-cron.env"
@@ -154,6 +195,41 @@ assert_contains "summary includes n/a setup" "$summary_out" "n/a (installed user
 assert_contains "summary includes timer" "$summary_out" "Timer:     template present (installed: yes, enabled: enabled)"
 assert_contains "summary includes installed timer" "$summary_out" "Timer:     installed timer (installed: yes, enabled: enabled)"
 assert_contains "summary includes next run" "$summary_out" "Next run:"
+
+forced_color_out=""
+forced_color_exit=0
+forced_color_out="$(
+  HOME="$tmp" NO_COLOR=1 TERM=xterm-256color PATH="${mock_bin}:${PATH}" \
+    bash "$script" --color 2>&1
+)" || forced_color_exit=$?
+assert_exit_0 "forced color summary" "$forced_color_out" "$forced_color_exit"
+if printf '%s' "$forced_color_out" | grep -q $'\033'; then
+  printf '[PASS] --color emits ANSI escapes when NO_COLOR is set\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] --color must emit ANSI escapes when NO_COLOR is set\n'
+  fail=$(( fail + 1 ))
+fi
+
+auto_tty_out=""
+auto_tty_exit=0
+if command -v script >/dev/null 2>&1; then
+  auto_tty_out="$(
+    HOME="$tmp" NO_COLOR=1 TERM=xterm-256color PATH="${mock_bin}:${PATH}" \
+      script -qfc "bash \"$script\"" /dev/null 2>&1
+  )" || auto_tty_exit=$?
+  assert_exit_0 "auto color on interactive session" "$auto_tty_out" "$auto_tty_exit"
+  if [[ "$auto_tty_out" == *$'\033[0;32m'* ]]; then
+    printf '[PASS] auto mode colors on interactive session without --color\n'
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] auto mode must color on interactive session without --color\n'
+    fail=$(( fail + 1 ))
+  fi
+else
+  printf '[PASS] auto mode tty test skipped (script(1) unavailable)\n'
+  pass=$(( pass + 1 ))
+fi
 
 rm -rf "$tmp"
 

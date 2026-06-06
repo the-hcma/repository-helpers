@@ -2,7 +2,7 @@
 # show-services - summarize installed systemd user services.
 #
 # Usage:
-#   scripts/show-services
+#   scripts/show-services [--color|--no-color]
 #   scripts/show-services --help
 set -euo pipefail
 
@@ -12,9 +12,124 @@ repo_dir="$(cd "$script_dir/.." && pwd)"
 readonly repo_dir
 readonly systemd_dir="${repo_dir}/etc/systemd"
 readonly user_unit_dir="${HOME}/.config/systemd/user"
+readonly deployed_commit_env_name="DEPLOYED_COMMIT"
+color_mode="auto"
 
 usage() {
-  sed -n '2,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  cat <<'EOF'
+show-services - summarize installed systemd user services.
+
+Usage:
+  scripts/show-services [--color|--no-color]
+  scripts/show-services --help
+
+Options:
+  --color      Force ANSI colors even when stdout is not a terminal
+  --no-color   Disable ANSI colors
+EOF
+}
+
+term_supports_color() {
+  [[ "${TERM:-}" != "dumb" ]] && [[ -n "${TERM:-}" ]]
+}
+
+interactive_session() {
+  [[ -t 0 || -t 1 || -t 2 ]]
+}
+
+color_enabled() {
+  # IDE terminals often attach a TTY to stdin/stderr but not stdout; treat any
+  # attached stdio fd as interactive. Piped/captured output stays plain unless
+  # --color or FORCE_COLOR is used. NO_COLOR does not disable terminal output.
+  case "$color_mode" in
+    never)
+      return 1
+      ;;
+    always)
+      term_supports_color
+      ;;
+    auto)
+      if interactive_session; then
+        term_supports_color
+        return $?
+      fi
+      if [[ -n "${FORCE_COLOR:-}" || -n "${CLICOLOR_FORCE:-}" ]]; then
+        term_supports_color
+        return $?
+      fi
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+color_text() {
+  local -r code="$1"
+  shift
+
+  if color_enabled; then
+    printf '\033[%sm%s\033[0m' "$code" "$*"
+  else
+    printf '%s' "$*"
+  fi
+}
+
+deploy_status_color_code() {
+  local -r deploy_note="$1"
+
+  case "$deploy_note" in
+    "up to date") printf '%s\n' "0;32" ;;
+    *) printf '%s\n' "0;33" ;;
+  esac
+}
+
+running_status_color_code() {
+  local -r deploy_note="$1"
+  local -r oneshot="$2"
+  local -r running="$3"
+  local -r running_note="$4"
+
+  if [[ "$oneshot" == "true" ]]; then
+    case "$running_note" in
+      "idle until timer runs"|"idle (start manually)")
+        if [[ "$deploy_note" == "up to date" ]]; then
+          printf '%s\n' "0;32"
+        else
+          printf '%s\n' "0;33"
+        fi
+        ;;
+      running\ batch*)
+        if [[ "$deploy_note" == "up to date" ]]; then
+          printf '%s\n' "0;32"
+        else
+          printf '%s\n' "0;33"
+        fi
+        ;;
+      *failed*)
+        printf '%s\n' "0;31"
+        ;;
+      *)
+        if [[ "$deploy_note" == "up to date" ]]; then
+          printf '%s\n' "0;32"
+        else
+          printf '%s\n' "0;33"
+        fi
+        ;;
+    esac
+    return 0
+  fi
+
+  if [[ "$running" == "true" ]]; then
+    if [[ "$deploy_note" == "up to date" ]]; then
+      printf '%s\n' "0;32"
+    else
+      printf '%s\n' "0;33"
+    fi
+    return 0
+  fi
+  printf '%s\n' "0;31"
 }
 
 die() {
@@ -81,7 +196,182 @@ unit_log_file() {
 
 unit_compare_text() {
   local text="$1"
-  printf '%s\n' "$text" | grep -v '^Environment=DEPLOYED_COMMIT=' || true
+  printf '%s\n' "$text" | grep -v "^Environment=${deployed_commit_env_name}=" || true
+}
+
+short_sha() {
+  local -r sha="$1"
+  printf '%s\n' "${sha:0:7}"
+}
+
+unit_deployed_commit() {
+  local text="$1"
+  local line sha
+
+  line="$(
+    printf '%s\n' "$text" \
+      | grep -m1 "^Environment=${deployed_commit_env_name}=" \
+      || true
+  )"
+  if [[ -z "$line" ]]; then
+    return 1
+  fi
+  sha="${line#Environment="${deployed_commit_env_name}"=}"
+  if [[ -z "$sha" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$sha"
+}
+
+repo_main_full_sha() {
+  local -r git_dir="$1"
+  local sha
+
+  if sha="$(git -C "$git_dir" rev-parse origin/main 2>/dev/null)"; then
+    printf '%s\n' "$sha"
+    return 0
+  fi
+  if sha="$(git -C "$git_dir" rev-parse main 2>/dev/null)"; then
+    printf '%s\n' "$sha"
+    return 0
+  fi
+  return 1
+}
+
+read_deployed_commit_from_pid() {
+  local -r main_pid="$1"
+  local env_line sha
+
+  env_line="$(
+    tr '\0' '\n' <"/proc/${main_pid}/environ" 2>/dev/null \
+      | grep "^${deployed_commit_env_name}=" \
+      | head -n1 \
+      || true
+  )"
+  if [[ -z "$env_line" ]]; then
+    return 1
+  fi
+  sha="${env_line#"${deployed_commit_env_name}"=}"
+  if [[ -z "$sha" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$sha"
+}
+
+service_main_pid() {
+  local -r unit_name="$1"
+  local main_pid
+
+  main_pid="$(systemctl_user show "$unit_name" --property=MainPID --value 2>/dev/null || true)"
+  if [[ -z "$main_pid" || "$main_pid" == "0" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$main_pid"
+}
+
+service_is_running() {
+  local state="$1"
+  case "$state" in
+    active|activating) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+unit_is_oneshot() {
+  local text="$1"
+  printf '%s\n' "$text" | grep -qE '^Type=oneshot([[:space:]]|$)'
+}
+
+format_commit_status() {
+  local -r unit_name="$1"
+  local unit_text="$2"
+  local -r git_dir="$3"
+  local active_state="$4"
+  local -r timer_scheduled="$5"
+  local installed_full="" installed_short="" main_full="" main_short=""
+  local deploy_note="" running_note="" main_pid="" running_full="" running_short=""
+  local active_base="${active_state%% *}"
+  local deploy_color="" running_color="" running="false" oneshot="false"
+  local colored_deploy_note="" colored_active_line=""
+
+  if installed_full="$(unit_deployed_commit "$unit_text")"; then
+    installed_short="$(short_sha "$installed_full")"
+  else
+    installed_short="(not recorded)"
+  fi
+
+  if [[ -n "$git_dir" ]] && main_full="$(repo_main_full_sha "$git_dir")"; then
+    main_short="$(short_sha "$main_full")"
+  else
+    main_short="n/a"
+  fi
+
+  if [[ "$main_short" == "n/a" ]]; then
+    deploy_note="main unknown"
+  elif [[ "$installed_short" == "(not recorded)" ]]; then
+    deploy_note="stale (re-run setup-service)"
+  elif [[ "$installed_full" == "$main_full" ]]; then
+    deploy_note="up to date"
+  else
+    deploy_note="stale (re-run setup-service)"
+  fi
+
+  if unit_is_oneshot "$unit_text"; then
+    oneshot="true"
+  fi
+
+  if [[ "$oneshot" == "true" ]]; then
+    if service_is_running "$active_base"; then
+      running="true"
+      if main_pid="$(service_main_pid "$unit_name")" \
+        && running_full="$(read_deployed_commit_from_pid "$main_pid")"; then
+        running_short="$(short_sha "$running_full")"
+        running_note="running batch ${running_short}"
+      else
+        running_note="running batch"
+      fi
+    elif [[ "$active_base" == "failed" ]]; then
+      if [[ "$timer_scheduled" == "true" ]]; then
+        running_note="idle until timer (last run failed)"
+      else
+        running_note="last run failed"
+      fi
+    elif [[ "$timer_scheduled" == "true" ]]; then
+      running_note="idle until timer runs"
+    else
+      running_note="idle (start manually)"
+    fi
+    deploy_color="$(deploy_status_color_code "$deploy_note")"
+    running_color="$(running_status_color_code "$deploy_note" "$oneshot" "$running" "$running_note")"
+    colored_deploy_note="$(color_text "$deploy_color" "(${deploy_note})")"
+    colored_active_line="$(color_text "$running_color" "oneshot (${running_note})")"
+    printf '  Commit:    installed %s, main %s %s\n' \
+      "$installed_short" "$main_short" "$colored_deploy_note"
+    printf '  Active:    %s\n' "$colored_active_line"
+    return 0
+  fi
+
+  if service_is_running "$active_base"; then
+    running="true"
+    if main_pid="$(service_main_pid "$unit_name")" \
+      && running_full="$(read_deployed_commit_from_pid "$main_pid")"; then
+      running_short="$(short_sha "$running_full")"
+      running_note="running ${running_short}"
+    else
+      running_note="running (commit unknown)"
+    fi
+  else
+    running_note="not running"
+  fi
+
+  deploy_color="$(deploy_status_color_code "$deploy_note")"
+  running_color="$(running_status_color_code "$deploy_note" "$oneshot" "$running" "$running_note")"
+  colored_deploy_note="$(color_text "$deploy_color" "(${deploy_note})")"
+  colored_active_line="$(color_text "$running_color" "$running_note")"
+
+  printf '  Commit:    installed %s, main %s %s\n' \
+    "$installed_short" "$main_short" "$colored_deploy_note"
+  printf '  Active:    %s, %s\n' "$active_state" "$colored_active_line"
 }
 
 unit_enabled_state() {
@@ -141,6 +431,7 @@ print_service_status() {
   local source_text installed_text compare_status display_name exec_start log_file setup_cmd
   local active_state enabled_state timer_enabled timer_next env_files env_file
   local timer_installed timer_status installed_workdir compare_repo_dir target_text timer_text
+  local commit_unit_text timer_scheduled="false"
 
   service_path="${systemd_dir}/${unit_name}"
   if [[ ! -f "$service_path" ]]; then
@@ -192,6 +483,11 @@ print_service_status() {
 
   active_state="$(unit_active_state "$unit_name")"
   enabled_state="$(unit_enabled_state "$unit_name")"
+  commit_unit_text="$installed_text"
+  if ! unit_deployed_commit "$commit_unit_text" >/dev/null 2>&1 \
+    && [[ -n "${target_text:-}" ]]; then
+    commit_unit_text="$target_text"
+  fi
 
   timer_installed='n/a'
   timer_enabled='n/a'
@@ -211,11 +507,15 @@ print_service_status() {
       timer_installed='yes'
     fi
   fi
+  if [[ "$timer_installed" == "yes" && "$timer_enabled" == "enabled" ]]; then
+    timer_scheduled="true"
+  fi
 
   printf '%s\n' "$display_name"
   printf '  Unit:      %s\n' "$unit_name"
   printf '  Service:   %s, %s\n' "$installed_service" "$compare_status"
-  printf '  Active:    %s\n' "$active_state"
+  format_commit_status "$unit_name" "$commit_unit_text" "$installed_workdir" "$active_state" \
+    "$timer_scheduled"
   printf '  Enabled:   %s\n' "$enabled_state"
   printf '  Timer:     %s' "$timer_status"
   if [[ "$timer_installed" != 'n/a' ]]; then
@@ -258,11 +558,20 @@ main() {
         usage
         exit 0
         ;;
+      --color)
+        color_mode="always"
+        shift
+        ;;
+      --no-color)
+        color_mode="never"
+        shift
+        ;;
       *)
         die "Unknown argument: ${arg} (see --help)"
         ;;
     esac
   done
+  readonly color_mode
 
   mapfile -t service_units < <(
     {
