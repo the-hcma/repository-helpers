@@ -157,11 +157,79 @@ service_display_label() {
     printf '%s\n' "$label"
 }
 
+# unit_is_repo_managed <unit_path>
+# True when the installed unit file references this repo worktree path.
+unit_is_repo_managed() {
+    local -r unit_path="$1"
+
+    [[ -f "$unit_path" ]] && grep -qF "$repo_dir" "$unit_path"
+}
+
+# unit_timer_activation_service_basename <timer_path>
+# Prints the service basename (no .service) from Unit=, or empty.
+unit_timer_activation_service_basename() {
+    local -r timer_path="$1"
+    local unit_line
+
+    unit_line="$(grep -m1 '^Unit=' "$timer_path" 2>/dev/null || true)"
+    unit_line="${unit_line#Unit=}"
+    unit_line="${unit_line%.service}"
+    printf '%s\n' "$unit_line"
+}
+
+# remove_stale_unit_file <unit_filename>
+remove_stale_unit_file() {
+    local -r unit="$1"
+
+    echo "🗑️  Removing stale unit: ${unit}"
+    systemctl --user disable --now "$unit" 2>/dev/null || true
+    rm -f "${target_dir}/${unit}"
+}
+
+# unit_should_remove_stale_timer <timer_path> <timer_base> <desired_csv> <removed_stale_bases...>
+# Timer templates often omit repo_dir; match paired services or repo-managed companions.
+unit_should_remove_stale_timer() {
+    local -r timer_path="$1"
+    local -r timer_base="$2"
+    local -r desired_csv="$3"
+    shift 3
+    local removed_csv service_base companion_path
+
+    if unit_is_repo_managed "$timer_path"; then
+        return 0
+    fi
+
+    removed_csv=",$(printf '%s,' "$@"),"
+    service_base="$(unit_timer_activation_service_basename "$timer_path")"
+    if [[ -z "$service_base" ]]; then
+        return 1
+    fi
+    if [[ "$desired_csv" == *",${service_base},"* ]]; then
+        return 1
+    fi
+    if [[ "$removed_csv" == *",${service_base},"* ]]; then
+        return 0
+    fi
+    if [[ "$timer_base" != "$service_base" ]]; then
+        return 1
+    fi
+
+    companion_path="${target_dir}/${service_base}.service"
+    if [[ ! -f "$companion_path" ]]; then
+        return 0
+    fi
+    if unit_is_repo_managed "$companion_path"; then
+        return 0
+    fi
+    return 1
+}
+
 # remove_stale_managed_units <desired_unit_basenames...>
 # Stops/disables/removes installed user units that reference repo_dir but are no longer shipped.
 remove_stale_managed_units() {
     local desired_csv unit_path unit base
     local stale_count
+    local removed_stale_bases=()
 
     desired_csv=",$(printf '%s,' "$@")"
     stale_count=0
@@ -170,11 +238,11 @@ remove_stale_managed_units() {
         return 1
     fi
 
-    for unit_path in "${target_dir}/"*.service "${target_dir}/"*.timer; do
+    for unit_path in "${target_dir}/"*.service; do
         if [[ ! -f "$unit_path" ]]; then
             continue
         fi
-        if ! grep -qF "$repo_dir" "$unit_path"; then
+        if ! unit_is_repo_managed "$unit_path"; then
             continue
         fi
         unit="$(basename "$unit_path")"
@@ -184,13 +252,25 @@ remove_stale_managed_units() {
         fi
 
         stale_count=$(( stale_count + 1 ))
-        echo "🗑️  Removing stale unit: ${unit}"
-        if [[ "$unit" == *.timer ]]; then
-            systemctl --user disable --now "$unit" 2>/dev/null || true
-        elif [[ "$unit" == *.service ]]; then
-            systemctl --user disable --now "$unit" 2>/dev/null || true
+        removed_stale_bases+=("$base")
+        remove_stale_unit_file "$unit"
+    done
+
+    for unit_path in "${target_dir}/"*.timer; do
+        if [[ ! -f "$unit_path" ]]; then
+            continue
         fi
-        rm -f "$unit_path"
+        unit="$(basename "$unit_path")"
+        base="${unit%.*}"
+        if [[ "$desired_csv" == *",${base},"* ]]; then
+            continue
+        fi
+        if ! unit_should_remove_stale_timer "$unit_path" "$base" "$desired_csv" "${removed_stale_bases[@]}"; then
+            continue
+        fi
+
+        stale_count=$(( stale_count + 1 ))
+        remove_stale_unit_file "$unit"
     done
 
     if [[ "$stale_count" -gt 0 ]]; then
