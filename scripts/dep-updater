@@ -25,13 +25,13 @@ trap '_on_signal TERM'   TERM
 dep_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly dep_script_dir
 
-# Minimum age (minutes) before proposing an npm registry version bump. Aligns with
-# scripts/lib/release-age-defaults (Dependabot cooldown / pnpm minimumReleaseAge).
+# Minimum age (minutes) before proposing a version bump. One day shorter than
+# Dependabot cooldown so dep-updater lands updates first (see release-age-defaults).
 #
 # shellcheck source=scripts/lib/release-age-defaults
 source "${dep_script_dir}/lib/release-age-defaults"
 
-dep_updater_minimum_release_age_minutes="$release_age_default_minutes"
+dep_updater_minimum_release_age_minutes="$release_age_dep_updater_minutes"
 readonly dep_updater_minimum_release_age_minutes
 
 # shellcheck disable=SC1091  # shared helper sourced at runtime; CI shellcheck doesn't use -x
@@ -119,6 +119,8 @@ _merge_it_poll_had_label=""
 
 # Populated before npm_outdated (format: pkg current fix cve1,cve2,...).
 npm_cve_fix_audit_lines=""
+# Populated before py_outdated (format: pkg current fix cve1,cve2,...).
+py_cve_fix_audit_lines=""
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -916,6 +918,141 @@ npm_version_meets_minimum_release_age() {
   age_minutes=$(( (now_epoch - published_epoch) / 60 ))
   if (( age_minutes < min_minutes )); then
     log "[pnpm] Skipping ${pkg}@${version}: published ${age_minutes}m ago; minimumReleaseAge is ${min_minutes}m."
+    return 1
+  fi
+  return 0
+}
+
+# pypi_version_published_epoch <pkg> <version>
+# Prints publish-time epoch from PyPI, or empty when unknown.
+pypi_version_published_epoch() {
+  local -r pkg="$1"
+  local -r version="$2"
+  local encoded_pkg body published_iso published_epoch
+
+  if [[ "${DEP_UPDATER_SKIP_PYPI_REGISTRY:-0}" == '1' ]]; then
+    return 1
+  fi
+
+  encoded_pkg="${pkg//+/%2B}"
+  body="$(curl --silent --max-time 15 "https://pypi.org/pypi/${encoded_pkg}/${version}/json" 2>/dev/null || true)"
+  published_iso="$(printf '%s' "$body" | jq -r '.urls[0].upload_time // empty' 2>/dev/null || true)"
+  if [[ -z "$published_iso" || "$published_iso" == 'null' ]]; then
+    return 1
+  fi
+  published_epoch="$(npm_parse_iso8601_to_epoch "$published_iso" 2>/dev/null || true)"
+  if [[ -z "$published_epoch" ]]; then
+    return 1
+  fi
+  printf '%s' "$published_epoch"
+  return 0
+}
+
+# py_pkg_has_cve_fix_in_audit <pkg>
+# True when pip-audit reported CVEs with an available fix for this package.
+py_pkg_has_cve_fix_in_audit() {
+  local -r pkg="$1"
+  local ap _ac _af cves
+
+  [[ -z "$py_cve_fix_audit_lines" ]] && return 1
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    read -r ap _ac _af cves <<< "$line"
+    [[ -z "$ap" ]] && continue
+    if [[ "${ap,,}" == "${pkg,,}" && -n "$cves" ]]; then
+      return 0
+    fi
+  done <<< "$py_cve_fix_audit_lines"
+  return 1
+}
+
+# py_version_meets_minimum_release_age <pkg> <version>
+# Returns 0 when the version is old enough under dep-updater release-age policy.
+# When publish time is unknown, allow. CVE-marked packages bypass the age gate.
+py_version_meets_minimum_release_age() {
+  local -r pkg="$1"
+  local -r version="$2"
+  local published_epoch now_epoch age_minutes
+
+  if [[ "${DEP_UPDATER_SKIP_PYPI_REGISTRY:-0}" == '1' ]]; then
+    return 0
+  fi
+
+  if py_pkg_has_cve_fix_in_audit "$pkg"; then
+    return 0
+  fi
+
+  published_epoch="$(pypi_version_published_epoch "$pkg" "$version" 2>/dev/null || true)"
+  if [[ -z "$published_epoch" ]]; then
+    return 0
+  fi
+  now_epoch="$(time_log_now_utc_epoch)"
+  age_minutes=$(( (now_epoch - published_epoch) / 60 ))
+  if (( age_minutes < dep_updater_minimum_release_age_minutes )); then
+    log "[python] Skipping ${pkg}==${version}: published ${age_minutes}m ago; minimum release age is ${dep_updater_minimum_release_age_minutes}m."
+    return 1
+  fi
+  return 0
+}
+
+# gha_release_published_epoch <action> <ref>
+# Prints publish-time epoch for a GitHub Actions release tag, or empty when unknown.
+gha_release_published_epoch() {
+  local -r action="$1"
+  local -r ref="$2"
+  local published_iso published_epoch commit_sha
+
+  if [[ "${DEP_UPDATER_SKIP_GHA_REGISTRY:-0}" == '1' ]]; then
+    return 1
+  fi
+
+  published_iso="$(gh api "repos/${action}/releases/tags/${ref}" \
+    --jq '.published_at // empty' 2>/dev/null || true)"
+  if [[ -n "$published_iso" && "$published_iso" != 'null' ]]; then
+    published_epoch="$(npm_parse_iso8601_to_epoch "$published_iso" 2>/dev/null || true)"
+    if [[ -n "$published_epoch" ]]; then
+      printf '%s' "$published_epoch"
+      return 0
+    fi
+  fi
+
+  commit_sha="$(gh api "repos/${action}/git/ref/tags/${ref}" \
+    --jq '.object.sha // empty' 2>/dev/null || true)"
+  if [[ -z "$commit_sha" || "$commit_sha" == 'null' ]]; then
+    return 1
+  fi
+  published_iso="$(gh api "repos/${action}/git/commits/${commit_sha}" \
+    --jq '.committer.date // .author.date // empty' 2>/dev/null || true)"
+  if [[ -z "$published_iso" || "$published_iso" == 'null' ]]; then
+    return 1
+  fi
+  published_epoch="$(npm_parse_iso8601_to_epoch "$published_iso" 2>/dev/null || true)"
+  if [[ -z "$published_epoch" ]]; then
+    return 1
+  fi
+  printf '%s' "$published_epoch"
+  return 0
+}
+
+# gha_version_meets_minimum_release_age <action> <ref>
+# Returns 0 when the action release is old enough under dep-updater release-age policy.
+gha_version_meets_minimum_release_age() {
+  local -r action="$1"
+  local -r ref="$2"
+  local published_epoch now_epoch age_minutes
+
+  if [[ "${DEP_UPDATER_SKIP_GHA_REGISTRY:-0}" == '1' ]]; then
+    return 0
+  fi
+
+  published_epoch="$(gha_release_published_epoch "$action" "$ref" 2>/dev/null || true)"
+  if [[ -z "$published_epoch" ]]; then
+    return 0
+  fi
+  now_epoch="$(time_log_now_utc_epoch)"
+  age_minutes=$(( (now_epoch - published_epoch) / 60 ))
+  if (( age_minutes < dep_updater_minimum_release_age_minutes )); then
+    log "[github-actions] Skipping ${action}@${ref}: published ${age_minutes}m ago; minimum release age is ${dep_updater_minimum_release_age_minutes}m."
     return 1
   fi
   return 0
@@ -3533,6 +3670,9 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
         fi
       fi
     fi
+    if ! py_version_meets_minimum_release_age "$pkg" "$new"; then
+      continue
+    fi
     printf '%s %s %s\n' "$pkg" "$cur" "$new"
   done <<< "$raw_lines"
 }
@@ -3888,58 +4028,79 @@ rust_update_one() {
 # GitHub Actions ecosystem
 # ---------------------------------------------------------------------------
 
-# Query the GitHub API for the latest release of a GitHub Actions action and
-# compare to the currently pinned ref.  Returns newline-separated lines of:
+# _gha_ref_sortable_version <ref>
+# Normalizes @v6 to 6.0.0 and @v1.7.12 to 1.7.12 for sort -V comparisons.
+_gha_ref_sortable_version() {
+  local -r ref="$1"
+  local ver="${ref#v}"
+  if [[ "$ver" =~ ^[0-9]+$ ]]; then
+    printf '%s.0.0' "$ver"
+  else
+    printf '%s' "$ver"
+  fi
+}
+
+# _gha_semver_release_tags_desc <action>
+# Prints semver release/tag names newest-first (v-prefix preserved when present).
+_gha_semver_release_tags_desc() {
+  local -r action="$1"
+  local releases tags
+
+  releases="$(gh api "repos/${action}/releases?per_page=100" \
+    --jq '.[].tag_name' 2>/dev/null || true)"
+  tags="$(gh api "repos/${action}/tags?per_page=100" \
+    --jq '.[].name' 2>/dev/null || true)"
+  printf '%s\n%s\n' "$releases" "$tags" \
+    | awk '/^v?[0-9]+([.][0-9]+){0,3}([-.].*)?$/ {print}' \
+    | sed -E 's/^v//' \
+    | sort -Vu -r \
+    | sed -E 's/^/v/'
+}
+
+# _gha_pick_eligible_new_ref <action> <current_ref>
+# Picks the newest release ref newer than current_ref that passes release-age policy.
+_gha_pick_eligible_new_ref() {
+  local -r action="$1"
+  local -r ref="$2"
+  local current_cmp tag candidate_cmp new_ref
+
+  current_cmp="$(_gha_ref_sortable_version "$ref")"
+  while IFS= read -r tag; do
+    [[ -z "$tag" ]] && continue
+    candidate_cmp="$(_gha_ref_sortable_version "$tag")"
+    if [[ "$candidate_cmp" == "$current_cmp" ]]; then
+      continue
+    fi
+    if [[ "$(printf '%s\n%s\n' "$current_cmp" "$candidate_cmp" | sort -V | tail -1)" != "$candidate_cmp" ]]; then
+      continue
+    fi
+    if ! gha_version_meets_minimum_release_age "$action" "$tag"; then
+      continue
+    fi
+    if [[ "$ref" == v* ]]; then
+      new_ref="$tag"
+    else
+      new_ref="${tag#v}"
+    fi
+    printf '%s' "$new_ref"
+    return 0
+  done < <(_gha_semver_release_tags_desc "$action")
+  return 1
+}
+
+# Query GitHub Actions pins and compare to eligible releases. Returns lines of:
 #   owner/repo  current_ref  new_ref
-# Only emits a line when the latest release is newer than the pinned ref.
 #
 # Pin-style semantics:
-#   Major-only  (@v6)         — updated only when the latest major increments
-#   Full semver (@v1.7.12 or @0.36.0) — updated on any newer version
+#   Major-only  (@v6)         — bump to newest eligible release semver (v6.0.2, v8.1.0, …)
+#   Full semver (@v1.7.12)    — bump to newest eligible newer release
 #   Commit SHA  (@abc123...)  — skipped (not managed here)
 #
 # Optional $1: repository root containing .github/workflows (defaults to $dir).
 gha_outdated() {
   local -r scan_root="${1:-$dir}"
   local -a seen_actions=()
-  local line action ref
-
-    _gha_latest_semver_tag() {
-      local -r action="$1"
-      local tags_json
-      tags_json="$(gh api "repos/${action}/tags?per_page=100" 2>/dev/null || true)"
-      if [[ -z "$tags_json" ]]; then
-        return 0
-      fi
-      local best
-      best="$(printf '%s' "$tags_json" \
-        | jq -r '.[].name' 2>/dev/null \
-        | awk '/^v?[0-9]+([.][0-9]+){0,3}([-.].*)?$/ {print}' \
-        | sed -E 's/^v//' \
-        | sort -V | tail -1)"
-      [[ -z "$best" ]] && return 0
-      printf 'v%s' "$best"
-    }
-
-  _gha_latest_major_tag() {
-    local -r action="$1"
-    local tags_json
-    tags_json="$(gh api "repos/${action}/tags?per_page=100" 2>/dev/null || true)"
-    if [[ -z "$tags_json" ]]; then
-      return 0
-    fi
-    printf '%s' "$tags_json" \
-      | jq -r '.[].name' 2>/dev/null \
-      | awk '
-          /^v[0-9]+$/ {
-            sub(/^v/, "", $0)
-            if ($0 + 0 > max) max = $0 + 0
-          }
-          END {
-            if (max > 0) print "v" max
-          }
-        '
-  }
+  local line action ref new_ref
 
   while IFS= read -r line; do
     # Extract the value after `uses:`, strip surrounding quotes/whitespace.
@@ -3968,63 +4129,14 @@ gha_outdated() {
     [[ "$already_seen" == '1' ]] && continue
     seen_actions+=("$action")
 
-    # Query the latest published release tag.
-    local latest_tag
-    latest_tag="$(gh api "repos/${action}/releases/latest" \
-      --jq '.tag_name' 2>/dev/null || true)"
-    # Guard against 404 / API errors: the response may be a JSON error object
-    # rather than a bare tag string when the repo has no releases.
-    if [[ -z "$latest_tag" ]] || [[ ! "$latest_tag" =~ ^v?[0-9] ]]; then
-      # Many actions do not publish GitHub Releases; fall back to the latest semver-ish tag.
-      latest_tag="$(_gha_latest_semver_tag "$action")"
-      if [[ -z "$latest_tag" ]] || [[ ! "$latest_tag" =~ ^v?[0-9] ]]; then
+    new_ref="$(_gha_pick_eligible_new_ref "$action" "$ref" 2>/dev/null || true)"
+    if [[ -z "$new_ref" ]]; then
+      if [[ -z "$(_gha_semver_release_tags_desc "$action" | head -1 || true)" ]]; then
         log "[github-actions] No release or semver tag found for ${action} — skipping."
-        continue
       fi
+      continue
     fi
-
-    # Determine the new ref based on the current pin style.
-    local new_ref=""
-    if [[ "$ref" =~ ^v[0-9]+$ ]]; then
-      # Major-only pin: bump only when a newer major tag (e.g. v8) exists.
-      # Many actions publish semver tags (v8.1.0) without maintaining major tags (v8).
-      local current_major
-      current_major="${ref#v}"
-      local latest_major_tag
-      latest_major_tag="$(_gha_latest_major_tag "$action")"
-      if [[ -z "$latest_major_tag" ]]; then
-        log "[github-actions] No major tag refs found for ${action} — skipping major-only bump."
-        continue
-      fi
-      local latest_major
-      latest_major="${latest_major_tag#v}"
-      if (( latest_major > current_major )); then
-        new_ref="$latest_major_tag"
-      fi
-    else
-      # Full semver pin: bump when any newer version is available.
-      local current_ver latest_ver
-      current_ver="${ref#v}"
-      latest_ver="${latest_tag#v}"
-      if [[ "$current_ver" != "$latest_ver" ]]; then
-        # Only advance — never downgrade.
-        local sort_winner
-        sort_winner="$(printf '%s\n%s\n' "$current_ver" "$latest_ver" \
-          | sort -V | tail -1)"
-        if [[ "$sort_winner" == "$latest_ver" ]]; then
-          # Preserve leading 'v' from the current pin if present.
-          if [[ "$ref" == v* ]]; then
-            new_ref="v${latest_ver}"
-          else
-            new_ref="$latest_ver"
-          fi
-        fi
-      fi
-    fi
-
-    if [[ -n "$new_ref" ]]; then
-      printf '%s %s %s\n' "$action" "$ref" "$new_ref"
-    fi
+    printf '%s %s %s\n' "$action" "$ref" "$new_ref"
   done < <(grep -rh --include='*.yml' --include='*.yaml' \
     'uses:' "${scan_root}/.github/workflows/" 2>/dev/null)
 }
@@ -6106,6 +6218,7 @@ if [[ "$dry_run" == '1' ]]; then
   fi
   if [[ -n "$py_tool" ]]; then
     py_audit_lines="$(py_audit "$py_tool" "$audit_dir")"
+    py_cve_fix_audit_lines="$py_audit_lines"
   fi
   npm_cve_fix_audit_lines="$npm_audit_lines"
 
@@ -6393,6 +6506,7 @@ fi
 if [[ -n "$py_tool" ]]; then
   log "Running Python security audit…"
   py_audit_lines="$(py_audit "$py_tool" "$worktree_path")"
+  py_cve_fix_audit_lines="$py_audit_lines"
   if [[ -n "$py_audit_lines" ]]; then
     local py_vuln_count
     py_vuln_count="$(printf '%s\n' "$py_audit_lines" | grep -c .)"
