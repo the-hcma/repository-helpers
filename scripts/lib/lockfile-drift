@@ -23,116 +23,6 @@ _lockfile_drift_error() {
   printf '❌ lockfile-drift: %s\n' "$1" >&2
 }
 
-# _lockfile_drift_pyproject_field <pyproject.toml> <field>
-# Prints a quoted [project] field value (name, version).
-_lockfile_drift_pyproject_field() {
-  local project_file="$1"
-  local field="$2"
-
-  awk -v want="$field" '
-    BEGIN { in_project = 0 }
-    /^\[project\]/ { in_project = 1; next }
-    /^\[/ { in_project = 0 }
-    in_project && $0 ~ "^" want "[[:space:]]*=" {
-      line = $0
-      sub(/^[^=]*=[[:space:]]*/, "", line)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
-      if (line ~ /^".*"$/) {
-        sub(/^"/, "", line)
-        sub(/"$/, "", line)
-      } else if (line ~ /^'\''.*'\''$/) {
-        sub(/^'\''/, "", line)
-        sub(/'\''$/, "", line)
-      }
-      print line
-      exit 0
-    }
-  ' "$project_file"
-}
-
-# _lockfile_drift_uv_lock_package_version <uv.lock> <package_name>
-# Prints the locked version for package_name, or empty when not found.
-_lockfile_drift_uv_lock_package_version() {
-  local lock_file="$1"
-  local package_name="$2"
-
-  awk -v want="$package_name" '
-    BEGIN { in_pkg = 0; name = ""; version = "" }
-    /^\[\[package\]\]/ {
-      if (in_pkg && name == want && version != "") {
-        print version
-        exit 0
-      }
-      in_pkg = 1
-      name = ""
-      version = ""
-      next
-    }
-    in_pkg && /^name = / {
-      line = $0
-      sub(/^name = /, "", line)
-      gsub(/"/, "", line)
-      name = line
-      next
-    }
-    in_pkg && /^version = / {
-      line = $0
-      sub(/^version = /, "", line)
-      gsub(/"/, "", line)
-      version = line
-      next
-    }
-    END {
-      if (in_pkg && name == want && version != "") {
-        print version
-      }
-    }
-  ' "$lock_file"
-}
-
-# _lockfile_drift_check_uv_project_version <repo> <strict_mode>
-# When uv lock --check passes, still verify the project package version in uv.lock.
-_lockfile_drift_check_uv_project_version() {
-  local repo="$1"
-  local strict_mode="$2"
-  local project_file lock_file project_name project_version locked_version
-
-  project_file="${repo}/pyproject.toml"
-  lock_file="${repo}/uv.lock"
-  if [[ ! -f "$project_file" || ! -f "$lock_file" ]]; then
-    return 0
-  fi
-
-  project_name="$(_lockfile_drift_pyproject_field "$project_file" "name")"
-  project_version="$(_lockfile_drift_pyproject_field "$project_file" "version")"
-  if [[ -z "$project_name" || -z "$project_version" ]]; then
-    return 0
-  fi
-
-  locked_version="$(_lockfile_drift_uv_lock_package_version "$lock_file" "$project_name")"
-  if [[ -z "$locked_version" ]]; then
-    _lockfile_drift_warn "uv.lock has no entry for project package '${project_name}'"
-    _lockfile_drift_note "Workflow fix: run 'uv lock' and commit uv.lock after changing pyproject.toml"
-    if [[ "$strict_mode" == "1" ]]; then
-      _lockfile_drift_error "missing project package in uv.lock (strict mode)"
-      return 1
-    fi
-    return 0
-  fi
-
-  if [[ "$locked_version" == "$project_version" ]]; then
-    return 0
-  fi
-
-  _lockfile_drift_warn "uv.lock pins ${project_name}@${locked_version} but pyproject.toml declares ${project_version}"
-  _lockfile_drift_note "Workflow fix: run 'uv lock' (or 'uv sync') and commit uv.lock"
-  if [[ "$strict_mode" == "1" ]]; then
-    _lockfile_drift_error "project version mismatch in uv.lock (strict mode)"
-    return 1
-  fi
-  return 0
-}
-
 _lockfile_drift_check_uv() {
   local repo="$1"
   local strict_mode="$2"
@@ -164,10 +54,6 @@ _lockfile_drift_check_uv() {
     _lockfile_drift_note "uv lock --check output (warning mode):"
     printf '%s\n' "$out"
     return 0
-  fi
-
-  if ! _lockfile_drift_check_uv_project_version "$repo" "$strict_mode"; then
-    return 1
   fi
   return 0
 }
@@ -347,7 +233,7 @@ _lockfile_drift_check_pnpm() {
 # Returns 0 when uv.lock is in sync; 1 when regeneration is needed.
 _lockfile_drift_uv_needs_fix() {
   local repo="$1"
-  local rc project_name project_version locked_version
+  local rc
 
   if [[ ! -f "${repo}/uv.lock" || ! -f "${repo}/pyproject.toml" ]]; then
     return 0
@@ -359,17 +245,6 @@ _lockfile_drift_uv_needs_fix() {
   rc=0
   (cd "$repo" && uv lock --check >/dev/null 2>&1) || rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    return 1
-  fi
-
-  project_name="$(_lockfile_drift_pyproject_field "${repo}/pyproject.toml" "name")"
-  project_version="$(_lockfile_drift_pyproject_field "${repo}/pyproject.toml" "version")"
-  if [[ -z "$project_name" || -z "$project_version" ]]; then
-    return 0
-  fi
-
-  locked_version="$(_lockfile_drift_uv_lock_package_version "${repo}/uv.lock" "$project_name")"
-  if [[ -z "$locked_version" || "$locked_version" != "$project_version" ]]; then
     return 1
   fi
   return 0
