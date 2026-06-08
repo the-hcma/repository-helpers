@@ -102,7 +102,7 @@ Supported ecosystems and policy defaults:
   prefix style, updating major-only pins only on newer majors, and skipping SHA or
   local action pins.
 
-For npm packages, registry releases newer than 10 days are skipped unless the bump
+For npm packages, registry releases newer than 9 days are skipped unless the bump
 fixes a CVE.
 
 See [dep-updater.plan.md](dep-updater.plan.md) for implementation details and
