@@ -1272,6 +1272,129 @@ rp_dependabot_has_release_age_cooldown() {
   ' <<<"$text"
 }
 
+# Candidate paths for pnpm minimumReleaseAge policy (root and common nested layouts).
+rp_pnpm_workspace_candidate_paths() {
+  printf '%s\n' 'pnpm-workspace.yaml' 'web/pnpm-workspace.yaml'
+}
+
+# minimumReleaseAge in pnpm-workspace.yaml must match release_age_dep_updater_minutes.
+rp_pnpm_workspace_has_minimum_release_age() {
+  local text="$1"
+  local required_minutes="$release_age_dep_updater_minutes"
+  awk -v required_minutes="$required_minutes" '
+    /^[[:space:]]*minimumReleaseAge:[[:space:]]*[0-9]+[[:space:]]*$/ {
+      line = $0
+      sub(/^[[:space:]]*minimumReleaseAge:[[:space:]]*/, "", line)
+      sub(/[[:space:]]*$/, "", line)
+      if ((line + 0) == required_minutes) {
+        found_ok = 1
+      }
+    }
+    END { exit(found_ok ? 0 : 1) }
+  ' <<<"$text"
+}
+
+rp_validate_dependabot_release_age_policy() {
+  local slug="$1"
+  local fail=0
+
+  if ! rp_repo_has_dependabot "$slug"; then
+    if [[ "$rp_suggest" -eq 1 ]] && rp_is_strict_repo "$slug"; then
+      rp_log_suggest "${slug}: consider .github/dependabot.yml for automated dependency PRs"
+    fi
+    return 0
+  fi
+
+  local dependabot_text
+  dependabot_text="$(rp_fetch_github_text_file "$slug" '.github/dependabot.yml' || true)"
+  if [[ -z "$dependabot_text" ]]; then
+    rp_log_fail "${slug}: dependabot.yml exists but could not be read"
+    return 1
+  fi
+  if ! rp_dependabot_has_release_age_cooldown "$dependabot_text"; then
+    rp_log_fail \
+      "${slug}: dependabot.yml must set cooldown default-days: ${release_age_dependabot_days} on every updates entry (one day after dep-updater ${release_age_dep_updater_days}-day gate)"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add 'cooldown: { default-days: ${release_age_dependabot_days} }' to each updates entry in .github/dependabot.yml (see fpdf and scripts/lib/release-age-defaults)"
+    fi
+    fail=1
+  fi
+
+  return "$fail"
+}
+
+rp_validate_pnpm_release_age_policy() {
+  local slug="$1"
+  local fail=0
+  local workspace_path workspace_text saw_workspace=0
+
+  while IFS= read -r workspace_path; do
+    [[ -n "$workspace_path" ]] || continue
+    if ! rp_gh_path_exists "$slug" "$workspace_path"; then
+      continue
+    fi
+    saw_workspace=1
+    workspace_text="$(rp_fetch_github_text_file "$slug" "$workspace_path" || true)"
+    if [[ -z "$workspace_text" ]]; then
+      rp_log_fail "${slug}: ${workspace_path} exists but could not be read"
+      fail=1
+      continue
+    fi
+    if ! rp_pnpm_workspace_has_minimum_release_age "$workspace_text"; then
+      rp_log_fail \
+        "${slug}: ${workspace_path} must set minimumReleaseAge: ${release_age_dep_updater_minutes} (${release_age_dep_updater_days_phrase}; dep-updater gate before Dependabot cooldown)"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: run scripts/grandfather-pnpm-release-age in the repo (or set minimumReleaseAge: ${release_age_dep_updater_minutes} with minimumReleaseAgeExclude: [\"*\"])"
+      fi
+      fail=1
+    fi
+  done < <(rp_pnpm_workspace_candidate_paths)
+
+  if [[ "$saw_workspace" -eq 0 ]]; then
+    return 0
+  fi
+
+  return "$fail"
+}
+
+rp_check_dependabot_release_age_policy() {
+  local slug="$1"
+  local repo_fail=0
+
+  if ! rp_validate_dependabot_release_age_policy "$slug"; then
+    repo_fail=1
+  elif rp_repo_has_dependabot "$slug"; then
+    rp_log_check_ok "$slug" \
+      "dependabot cooldown (${release_age_dependabot_days} days on every updates entry)" \
+      "$(rp_github_url "$slug" '/blob/main/.github/dependabot.yml')"
+  fi
+
+  return "$repo_fail"
+}
+
+rp_check_pnpm_release_age_policy() {
+  local slug="$1"
+  local repo_fail=0
+  local workspace_path
+
+  if ! rp_validate_pnpm_release_age_policy "$slug"; then
+    repo_fail=1
+  else
+    while IFS= read -r workspace_path; do
+      [[ -n "$workspace_path" ]] || continue
+      if rp_gh_path_exists "$slug" "$workspace_path"; then
+        rp_log_check_ok "$slug" \
+          "pnpm minimumReleaseAge (${release_age_dep_updater_days_phrase})" \
+          "$(rp_github_url "$slug" "/blob/main/${workspace_path}")"
+      fi
+    done < <(rp_pnpm_workspace_candidate_paths)
+  fi
+
+  return "$repo_fail"
+}
+
 rp_print_new_repo_checklist() {
   local slug="$1"
   cat >&2 <<CHECKLIST
@@ -1289,6 +1412,10 @@ rp_print_new_repo_checklist() {
       [ ] cleanup-branch-on-merge.yml (delete branch on PR merge)
       [ ] cleanup-merged-branches.yml (daily stale-branch sweep)
       [ ] dependabot-auto-merge.yml OR auto-merge-dependabot.yml (when dependabot.yml exists)
+
+    Dependency release age (scripts/lib/release-age-defaults):
+      [ ] dependabot.yml: cooldown default-days: ${release_age_dependabot_days} on every updates entry
+      [ ] pnpm-workspace.yaml: minimumReleaseAge: ${release_age_dep_updater_minutes} when using pnpm
 
     Branch protection (required when using merge-it or Release Please):
       [ ] protect-main ruleset on refs/heads/main (squash-only + Graphite App bypass)
@@ -1582,19 +1709,6 @@ rp_validate_graphite_workflows() {
   fi
 
   if rp_gh_path_exists "$slug" '.github/dependabot.yml'; then
-    local dependabot_text
-    dependabot_text="$(rp_fetch_github_text_file "$slug" '.github/dependabot.yml' || true)"
-    if [[ -z "$dependabot_text" ]]; then
-      rp_log_fail "${slug}: dependabot.yml exists but could not be read"
-      fail=1
-    elif ! rp_dependabot_has_release_age_cooldown "$dependabot_text"; then
-      rp_log_fail "${slug}: dependabot.yml must set cooldown default-days: ${release_age_dependabot_days} on every update entry (see fpdf)"
-      if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_suggest "${slug}: add 'cooldown: { default-days: ${release_age_dependabot_days} }' to each updates entry in .github/dependabot.yml"
-      fi
-      fail=1
-    fi
-
     dependabot_workflow="$(rp_dependabot_auto_merge_workflow_path "$slug" || true)"
     if [[ -z "$dependabot_workflow" ]]; then
       if [[ "$strict" == '1' ]]; then
@@ -1634,8 +1748,6 @@ rp_validate_graphite_workflows() {
         fail=1
       fi
     fi
-  elif [[ "$rp_suggest" -eq 1 ]] && [[ "$strict" == '1' ]]; then
-    rp_log_suggest "${slug}: consider .github/dependabot.yml for automated dependency PRs"
   fi
 
   return "$fail"
@@ -2083,6 +2195,12 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_license_metadata "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_dependabot_release_age_policy "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_pnpm_release_age_policy "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
   fi

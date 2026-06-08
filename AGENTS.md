@@ -78,7 +78,7 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ## Repository practices (new and existing repos)
 
-Run **`scripts/github-repo-lint`** to audit or onboard a GitHub repository against org conventions (merge settings, Graphite merge queue, branch cleanup, Dependabot auto-merge).
+Run **`scripts/github-repo-lint`** to audit or onboard a GitHub repository against org conventions (merge settings, Graphite merge queue, branch cleanup, Dependabot auto-merge, and dependency release-age policy: Dependabot `cooldown` and pnpm `minimumReleaseAge` per `scripts/lib/release-age-defaults`).
 
 ```bash
 scripts/github-repo-lint --new-repo --repo OWNER/NAME       # checklist + SUGGEST hints

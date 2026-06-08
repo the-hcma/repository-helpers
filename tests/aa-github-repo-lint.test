@@ -251,18 +251,22 @@ else
 fi
 rm -rf "$mock_dir"
 
-printf '\n=== static: dependabot cooldown uses release-age-defaults for all ecosystems ===\n'
+printf '\n=== static: release-age policy lint uses release-age-defaults ===\n'
 defaults="${rh_root}/scripts/lib/release-age-defaults"
 # shellcheck disable=SC1090,SC1091
 source "$defaults"
 # shellcheck disable=SC2016  # grep for literal strings in the library under test
 if grep -qF 'source "${rp_lib_dir}/release-age-defaults"' "$lib" \
   && grep -q '^rp_dependabot_has_release_age_cooldown()' "$lib" \
+  && grep -q '^rp_check_dependabot_release_age_policy()' "$lib" \
+  && grep -q '^rp_check_pnpm_release_age_policy()' "$lib" \
+  && grep -qF 'required_days="$release_age_dependabot_days"' "$lib" \
+  && grep -qF 'required_minutes="$release_age_dep_updater_minutes"' "$lib" \
   && ! grep -q 'rp_dependabot_has_npm_cooldown_10_days' "$lib"; then
-  printf '[PASS] repo-practices: dependabot cooldown check sources release-age-defaults for every ecosystem\n'
+  printf '[PASS] repo-practices: dependabot and pnpm release-age checks source release-age-defaults\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] repo-practices: expected all-ecosystem dependabot cooldown wired to release-age-defaults\n'
+  printf '[FAIL] repo-practices: expected dependabot/pnpm release-age lint wired to release-age-defaults\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -328,7 +332,8 @@ set -e
 
 # shellcheck disable=SC2154  # set by scripts/lib/release-age-defaults (sourced above)
 if [[ "$exit_code" -ne 0 ]] \
-  && grep -qF "dependabot.yml must set cooldown default-days: ${release_age_dependabot_days} on every update entry" <<<"$output" \
+  && grep -qF "dependabot.yml must set cooldown default-days: ${release_age_dependabot_days} on every updates entry" <<<"$output" \
+  && grep -qF "one day after dep-updater ${release_age_dep_updater_days}-day gate" <<<"$output" \
   && grep -qF 'SUGGEST:' <<<"$output"; then
   printf '[PASS] dependabot-cooldown: missing cooldown fails with suggestion\n'
   pass=$(( pass + 1 ))
@@ -400,11 +405,156 @@ set -e
 
 # shellcheck disable=SC2154  # set by scripts/lib/release-age-defaults (sourced above)
 if [[ "$exit_code" -ne 0 ]] \
-  && grep -qF "dependabot.yml must set cooldown default-days: ${release_age_dependabot_days} on every update entry" <<<"$output"; then
+  && grep -qF "dependabot.yml must set cooldown default-days: ${release_age_dependabot_days} on every updates entry" <<<"$output"; then
   printf '[PASS] dependabot-cooldown: cargo entry without cooldown fails when npm has cooldown\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] dependabot-cooldown: expected failure when any ecosystem entry lacks cooldown (exit=%s)\n%s\n' \
+    "$exit_code" "$output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
+printf '\n=== functional: dependabot cooldown rejects wrong default-days ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+mkdir -p "$mock_bin"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'auth status'* ]]; then
+  exit 0
+fi
+if [[ "$args" == *'/labels'* ]]; then
+  printf '%s\n' '["merge-it"]'
+  exit 0
+fi
+if [[ "$args" == *'repos/the-hcma/mq-repo/rulesets'* ]]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+if [[ "$args" == *'merged-pr-closer.yml'* ]]; then
+  printf '%s\n' '{"content":"Z3JhcGhpdGUtYXBwCkdyYXBoaXRlIG1lcmdlIHF1ZXVlCg=="}'
+  exit 0
+fi
+if [[ "$args" == *'ci.yml'* && "$args" == *contents* ]]; then
+  printf '%s\n' '{"content":"Z3RtcV9tZXJnZV8q"}'
+  exit 0
+fi
+if [[ "$args" == *'contents/LICENSE'* ]]; then
+  printf '%s\n' '{"content":"TUlUIExpY2Vuc2UKCkNvcHlyaWdodCAoYykgMjAyNiBIZW5yaXF1ZSBBbmRyYWRlIC8gdGhlaGNtYQo="}'
+  exit 0
+fi
+if [[ "$args" == *'contents/.github/CODEOWNERS'* ]]; then
+  printf '%s\n' '{"content":"KiBAdGhlaGNtYQo="}'
+  exit 0
+fi
+if [[ "$args" == *'contents/.github/dependabot.yml'* ]]; then
+  # npm cooldown is 9 days (policy requires release_age_dependabot_days)
+  printf '%s\n' '{"content":"dmVyc2lvbjogMgp1cGRhdGVzOgogIC0gcGFja2FnZS1lY29zeXN0ZW06ICJucG0iCiAgICBkaXJlY3Rvcnk6ICIvIgogICAgc2NoZWR1bGU6CiAgICAgIGludGVydmFsOiB3ZWVrbHkKICAgIGNvb2xkb3duOgogICAgICBkZWZhdWx0LWRheXM6IDkK"}'
+  exit 0
+fi
+if [[ "$args" == *'/contents/'* ]]; then
+  exit 1
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+set +e
+output="$(PATH="${mock_bin}:${PATH}" bash "$checker" --repo the-hcma/mq-repo --suggest 2>&1)"
+exit_code=$?
+set -e
+
+# shellcheck disable=SC2154
+if [[ "$exit_code" -ne 0 ]] \
+  && grep -qF "dependabot.yml must set cooldown default-days: ${release_age_dependabot_days} on every updates entry" <<<"$output"; then
+  printf '[PASS] dependabot-cooldown: wrong default-days value fails\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] dependabot-cooldown: expected failure for wrong default-days (exit=%s)\n%s\n' \
+    "$exit_code" "$output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
+printf '\n=== functional: pnpm minimumReleaseAge enforced ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+mkdir -p "$mock_bin"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'auth status'* ]]; then
+  exit 0
+fi
+if [[ "$args" == *'/labels'* ]]; then
+  printf '%s\n' '["merge-it"]'
+  exit 0
+fi
+if [[ "$args" == *'repos/the-hcma/mq-repo/rulesets'* ]]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+if [[ "$args" == *'merged-pr-closer.yml'* ]]; then
+  printf '%s\n' '{"content":"Z3JhcGhpdGUtYXBwCkdyYXBoaXRlIG1lcmdlIHF1ZXVlCg=="}'
+  exit 0
+fi
+if [[ "$args" == *'ci.yml'* && "$args" == *contents* ]]; then
+  printf '%s\n' '{"content":"Z3RtcV9tZXJnZV8q"}'
+  exit 0
+fi
+if [[ "$args" == *'contents/LICENSE'* ]]; then
+  printf '%s\n' '{"content":"TUlUIExpY2Vuc2UKCkNvcHlyaWdodCAoYykgMjAyNiBIZW5yaXF1ZSBBbmRyYWRlIC8gdGhlaGNtYQo="}'
+  exit 0
+fi
+if [[ "$args" == *'contents/.github/CODEOWNERS'* ]]; then
+  printf '%s\n' '{"content":"KiBAdGhlaGNtYQo="}'
+  exit 0
+fi
+if [[ "$args" == *'contents/pnpm-workspace.yaml'* ]]; then
+  # stale 10-day (14400 minute) policy
+  printf '%s\n' '{"content":"cGFja2FnZXM6CiAgLSAnLicKCm1pbmltdW1SZWxlYXNlQWdlOiAxNDQwMAo="}'
+  exit 0
+fi
+if [[ "$args" == *'/contents/'* ]]; then
+  exit 1
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+set +e
+output="$(PATH="${mock_bin}:${PATH}" bash "$checker" --repo the-hcma/mq-repo --suggest 2>&1)"
+exit_code=$?
+set -e
+
+# shellcheck disable=SC2154
+if [[ "$exit_code" -ne 0 ]] \
+  && grep -qF "pnpm-workspace.yaml must set minimumReleaseAge: ${release_age_dep_updater_minutes}" <<<"$output" \
+  && grep -qF 'SUGGEST:' <<<"$output"; then
+  printf '[PASS] pnpm-release-age: wrong minimumReleaseAge fails with suggestion\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] pnpm-release-age: expected failure for stale minimumReleaseAge (exit=%s)\n%s\n' \
     "$exit_code" "$output"
   fail=$(( fail + 1 ))
 fi
