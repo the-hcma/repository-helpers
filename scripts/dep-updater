@@ -39,6 +39,8 @@ source "${dep_script_dir}/lib/time-log"
 # shellcheck disable=SC1091
 source "${dep_script_dir}/lib/runner"
 # shellcheck disable=SC1091
+source "${dep_script_dir}/lib/ci-check-rollup"
+# shellcheck disable=SC1091
 source "${dep_script_dir}/lib/tooling-path"
 tooling_path_bootstrap_node_ecosystem
 
@@ -117,6 +119,9 @@ pnpm_ignored_build_pkgs=""
 # Last merge-it observation from poll_until_merged (used to explain re-applies).
 _merge_it_poll_pr=""
 _merge_it_poll_had_label=""
+
+# Set when CI fails and the PR is closed (batch child report enrichment).
+_last_ci_failure_summary=""
 
 # Populated before npm_outdated (format: pkg current fix cve1,cve2,...).
 npm_cve_fix_audit_lines=""
@@ -1355,14 +1360,34 @@ dep_updater_ensure_eco_fail_file() {
 # invocations only), write one JSON object the parent reads with jq — no log
 # scraping. Keys: exit_code, dir, primary, details (array of strings).
 # shellcheck disable=SC2317  # invoked indirectly from _on_exit
+dep_updater_handle_ci_failure() {
+  local -r pr_num="$1"
+  local -r branch="${2:-}"
+  local summary comment
+
+  summary="$(ci_failure_summary_for_pr "$pr_num" "${repo_owner}/${repo_name}" "$branch")"
+  _last_ci_failure_summary="$summary"
+
+  log "PR #${pr_num} failed CI: ${summary}"
+  comment="Closed by dep-updater: CI failed (${summary}). Re-run to create a fresh update."
+  gh pr close "$pr_num" \
+    --repo "${repo_owner}/${repo_name}" \
+    --comment "$comment" \
+    2>/dev/null || true
+
+  record_first_failure "CI failed: pr=#${pr_num} ${summary}"
+  die "CI failed: pr=#${pr_num} ${summary}. PR closed; re-run to create a fresh update."
+}
+
 dep_updater_write_batch_child_report_json() {
   local -r exit_code="${1:?}"
   local -r first_failure="${2:-}"
-  local out_file primary details_json
+  local out_file primary details_json ci_failure_json
 
   out_file="${DEP_UPDATER_RUN_REPORT:?}"
   primary="$first_failure"
   details_json='[]'
+  ci_failure_json='null'
 
   if [[ -n "${DEP_UPDATER_ECO_FAIL_FILE:-}" && -s "${DEP_UPDATER_ECO_FAIL_FILE}" ]]; then
     details_json="$(jq -Rs 'split("\n") | map(select(length > 0))' \
@@ -1381,15 +1406,21 @@ dep_updater_write_batch_child_report_json() {
     [[ -z "$primary" ]] && primary="dep-updater exited with code ${exit_code}"
   fi
 
+  if [[ -n "${_last_ci_failure_summary:-}" ]]; then
+    ci_failure_json="$(jq -n --arg s "$_last_ci_failure_summary" '$s')"
+  fi
+
   jq -n \
     --argjson exit_code "$exit_code" \
     --arg dir "$dir" \
     --arg primary "$primary" \
     --argjson details "${details_json}" \
-    '{exit_code: $exit_code, dir: $dir, primary: $primary, details: $details}' \
+    --argjson ci_failure "${ci_failure_json}" \
+    '{exit_code: $exit_code, dir: $dir, primary: $primary, details: $details, ci_failure: $ci_failure}' \
     >"$out_file" 2>/dev/null \
     || jq -n --argjson exit_code "$exit_code" --arg primary "$primary" \
-         '{exit_code: $exit_code, dir: "", primary: $primary, details: []}' \
+         --argjson ci_failure "${ci_failure_json}" \
+         '{exit_code: $exit_code, dir: "", primary: $primary, details: [], ci_failure: $ci_failure}' \
          >"$out_file" 2>/dev/null || true
 }
 
@@ -4911,7 +4942,7 @@ wait_for_ci() {
         return 0
         ;;
       failure)
-        die "CI failed: pr=#${pr_num} branch='${branch}'. Fix the failure and re-run."
+        dep_updater_handle_ci_failure "$pr_num" "$branch"
         ;;
       missing)
         # GitHub hasn't scheduled CI yet — this is normal right after a push.
@@ -5147,14 +5178,9 @@ require_resume_ci_gate() {
     failure)
       # CI has already failed on the interrupted PR — close it automatically
       # and clean up so the next run starts fresh.
-      log "PR #${last_pr} (${last_branch}) failed CI. Closing it automatically."
-      gh pr close "$last_pr" \
-        --repo "${repo_owner}/${repo_name}" \
-        --comment "Closed by dep-updater: CI failed on branch '${last_branch}'. Re-run to create a fresh update." \
-        2>/dev/null || true
       cleanup
       _cleanup_trap_active=0
-      die "PR #${last_pr} was closed. Re-run dep-updater to create a fresh update."
+      dep_updater_handle_ci_failure "$last_pr" "$last_branch"
       ;;
     success|skipped|neutral)
       # CI already passed — nothing to wait for.
@@ -5650,7 +5676,7 @@ poll_until_merged() {
   _merge_it_poll_pr=""
   _merge_it_poll_had_label=""
 
-  local all_merged p merged pending_list check_rollup failed_check
+  local all_merged p merged pending_list check_rollup failed_check failed_branch
   local branches_csv top_branch top_pr top_has_label top_ci_status top_head wait_context
   while true; do
     # If we're waiting for merges, CI may finish after initial submission; ensure
@@ -5684,8 +5710,11 @@ poll_until_merged() {
               )) | if length > 0 then .[0].name else "" end
             ' 2>/dev/null || true)"
         if [[ -n "$failed_check" ]]; then
+          failed_branch="$(gh pr view "$p" \
+            --repo "${repo_owner}/${repo_name}" \
+            --json headRefName --jq '.headRefName // ""' 2>/dev/null || true)"
           cleanup_on_error "PR #${p}: CI check '${failed_check}' failed in the merge queue"
-          die "PR #${p}: CI check '${failed_check}' failed in the merge queue. Fix the failure and re-run."
+          dep_updater_handle_ci_failure "$p" "$failed_branch"
         fi
       fi
     done
