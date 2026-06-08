@@ -23,6 +23,116 @@ _lockfile_drift_error() {
   printf '❌ lockfile-drift: %s\n' "$1" >&2
 }
 
+# _lockfile_drift_pyproject_field <pyproject.toml> <field>
+# Prints a quoted [project] field value (name, version).
+_lockfile_drift_pyproject_field() {
+  local project_file="$1"
+  local field="$2"
+
+  awk -v want="$field" '
+    BEGIN { in_project = 0 }
+    /^\[project\]/ { in_project = 1; next }
+    /^\[/ { in_project = 0 }
+    in_project && $0 ~ "^" want "[[:space:]]*=" {
+      line = $0
+      sub(/^[^=]*=[[:space:]]*/, "", line)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+      if (line ~ /^".*"$/) {
+        sub(/^"/, "", line)
+        sub(/"$/, "", line)
+      } else if (line ~ /^'\''.*'\''$/) {
+        sub(/^'\''/, "", line)
+        sub(/'\''$/, "", line)
+      }
+      print line
+      exit 0
+    }
+  ' "$project_file"
+}
+
+# _lockfile_drift_uv_lock_package_version <uv.lock> <package_name>
+# Prints the locked version for package_name, or empty when not found.
+_lockfile_drift_uv_lock_package_version() {
+  local lock_file="$1"
+  local package_name="$2"
+
+  awk -v want="$package_name" '
+    BEGIN { in_pkg = 0; name = ""; version = "" }
+    /^\[\[package\]\]/ {
+      if (in_pkg && name == want && version != "") {
+        print version
+        exit 0
+      }
+      in_pkg = 1
+      name = ""
+      version = ""
+      next
+    }
+    in_pkg && /^name = / {
+      line = $0
+      sub(/^name = /, "", line)
+      gsub(/"/, "", line)
+      name = line
+      next
+    }
+    in_pkg && /^version = / {
+      line = $0
+      sub(/^version = /, "", line)
+      gsub(/"/, "", line)
+      version = line
+      next
+    }
+    END {
+      if (in_pkg && name == want && version != "") {
+        print version
+      }
+    }
+  ' "$lock_file"
+}
+
+# _lockfile_drift_check_uv_project_version <repo> <strict_mode>
+# When uv lock --check passes, still verify the project package version in uv.lock.
+_lockfile_drift_check_uv_project_version() {
+  local repo="$1"
+  local strict_mode="$2"
+  local project_file lock_file project_name project_version locked_version
+
+  project_file="${repo}/pyproject.toml"
+  lock_file="${repo}/uv.lock"
+  if [[ ! -f "$project_file" || ! -f "$lock_file" ]]; then
+    return 0
+  fi
+
+  project_name="$(_lockfile_drift_pyproject_field "$project_file" "name")"
+  project_version="$(_lockfile_drift_pyproject_field "$project_file" "version")"
+  if [[ -z "$project_name" || -z "$project_version" ]]; then
+    return 0
+  fi
+
+  locked_version="$(_lockfile_drift_uv_lock_package_version "$lock_file" "$project_name")"
+  if [[ -z "$locked_version" ]]; then
+    _lockfile_drift_warn "uv.lock has no entry for project package '${project_name}'"
+    _lockfile_drift_note "Workflow fix: run 'uv lock' and commit uv.lock after changing pyproject.toml"
+    if [[ "$strict_mode" == "1" ]]; then
+      _lockfile_drift_error "missing project package in uv.lock (strict mode)"
+      return 1
+    fi
+    return 0
+  fi
+
+  if [[ "$locked_version" == "$project_version" ]]; then
+    return 0
+  fi
+
+  _lockfile_drift_warn "uv.lock pins ${project_name}@${locked_version} but pyproject.toml declares ${project_version}"
+  _lockfile_drift_note "Workflow fix: run 'uv lock' (or 'uv sync') and commit uv.lock"
+  if [[ "$strict_mode" == "1" ]]; then
+    _lockfile_drift_error "project version mismatch in uv.lock (strict mode)"
+    return 1
+  fi
+  return 0
+}
+
 _lockfile_drift_check_uv() {
   local repo="$1"
   local strict_mode="$2"
@@ -43,19 +153,22 @@ _lockfile_drift_check_uv() {
   out=""
   rc=0
   out="$(cd "$repo" && uv lock --check 2>&1)" || rc=$?
-  if [[ "$rc" -eq 0 ]]; then
+  if [[ "$rc" -ne 0 ]]; then
+    _lockfile_drift_warn "uv.lock appears out of date vs pyproject.toml"
+    _lockfile_drift_note "Workflow fix: run 'uv lock' (or 'uv sync') and commit uv.lock before deploy"
+    if [[ "$strict_mode" == "1" ]]; then
+      _lockfile_drift_error "uv lock --check failed (strict mode). Output:"
+      printf '%s\n' "$out" >&2
+      return 1
+    fi
+    _lockfile_drift_note "uv lock --check output (warning mode):"
+    printf '%s\n' "$out"
     return 0
   fi
 
-  _lockfile_drift_warn "uv.lock appears out of date vs pyproject.toml"
-  _lockfile_drift_note "Workflow fix: ensure your release/deploy workflow runs 'uv lock' (or 'uv sync') and commits uv.lock"
-  if [[ "$strict_mode" == "1" ]]; then
-    _lockfile_drift_error "uv lock --check failed (strict mode). Output:"
-    printf '%s\n' "$out" >&2
+  if ! _lockfile_drift_check_uv_project_version "$repo" "$strict_mode"; then
     return 1
   fi
-  _lockfile_drift_note "uv lock --check output (warning mode):"
-  printf '%s\n' "$out"
   return 0
 }
 
@@ -95,32 +208,108 @@ _lockfile_drift_check_cargo() {
   return 0
 }
 
-_lockfile_drift_check_pnpm() {
+# _lockfile_drift_pnpm_install_root <repo>
+# Prints the directory to run pnpm install from (repo root or nested lock root).
+_lockfile_drift_pnpm_install_root() {
   local repo="$1"
+
+  if [[ -f "${repo}/pnpm-lock.yaml" ]]; then
+    if [[ -f "${repo}/package.json" || -f "${repo}/pnpm-workspace.yaml" ]]; then
+      printf '%s\n' "$repo"
+      return 0
+    fi
+    # Workspace lock at repo root with packages only in subdirs (e.g. web/package.json).
+    if find "$repo" -mindepth 2 -maxdepth 4 -name package.json \
+      -not -path '*/node_modules/*' -not -path '*/.worktrees/*' -print -quit 2>/dev/null \
+      | grep -q .; then
+      printf '%s\n' "$repo"
+      return 0
+    fi
+  fi
+
+  local lockfile install_root
+  while IFS= read -r lockfile; do
+    install_root="$(dirname "$lockfile")"
+    if [[ -f "${install_root}/package.json" ]]; then
+      printf '%s\n' "$install_root"
+    fi
+  done < <(
+    find "$repo" -maxdepth 4 -name pnpm-lock.yaml \
+      -not -path '*/node_modules/*' -not -path '*/.worktrees/*' 2>/dev/null | sort -u
+  )
+}
+
+# _lockfile_drift_pnpm_manifests <install_root>
+# Prints package.json paths that should stay in sync with the workspace lockfile.
+_lockfile_drift_pnpm_manifests() {
+  local install_root="$1"
+
+  find "$install_root" -name package.json \
+    -not -path '*/node_modules/*' \
+    -not -path '*/.worktrees/*' \
+    -maxdepth 6 2>/dev/null | sort -u
+}
+
+# _lockfile_drift_check_pnpm_manifest_mtime <install_root> <strict_mode>
+# Fast check: any workspace package.json newer than pnpm-lock.yaml.
+_lockfile_drift_check_pnpm_manifest_mtime() {
+  local install_root="$1"
+  local strict_mode="$2"
+  local lock_file lock_mtime manifest manifest_mtime rel_manifest
+  local stale=0
+
+  lock_file="${install_root}/pnpm-lock.yaml"
+  if [[ ! -f "$lock_file" ]]; then
+    return 0
+  fi
+
+  lock_mtime="$(stat -c '%Y' "$lock_file")"
+  while IFS= read -r manifest; do
+    [[ -n "$manifest" ]] || continue
+    manifest_mtime="$(stat -c '%Y' "$manifest")"
+    if (( manifest_mtime > lock_mtime )); then
+      rel_manifest="${manifest#"${install_root}/"}"
+      _lockfile_drift_warn "package.json newer than pnpm-lock.yaml: ${rel_manifest}"
+      stale=1
+    fi
+  done < <(_lockfile_drift_pnpm_manifests "$install_root")
+
+  if [[ "$stale" == "0" ]]; then
+    return 0
+  fi
+
+  _lockfile_drift_note "Workflow fix: run 'pnpm install' and commit pnpm-lock.yaml before deploy"
+  if [[ "$strict_mode" == "1" ]]; then
+    _lockfile_drift_error "pnpm manifest/lock mtime drift (strict mode)"
+    return 1
+  fi
+  return 0
+}
+
+# _lockfile_drift_check_pnpm_root <install_root> <strict_mode>
+_lockfile_drift_check_pnpm_root() {
+  local install_root="$1"
   local strict_mode="$2"
   local rc out
 
-  if [[ ! -f "${repo}/pnpm-lock.yaml" ]]; then
-    return 0
+  if ! _lockfile_drift_check_pnpm_manifest_mtime "$install_root" "$strict_mode"; then
+    return 1
   fi
-  if [[ ! -f "${repo}/package.json" ]]; then
-    _lockfile_drift_note "pnpm-lock.yaml present but no package.json; skipping pnpm drift check"
-    return 0
-  fi
+
   if ! _lockfile_drift_has_cmd pnpm; then
-    _lockfile_drift_note "pnpm-lock.yaml present but 'pnpm' not on PATH; skipping (add to CI/release workflow)"
+    _lockfile_drift_note "pnpm-lock.yaml present but 'pnpm' not on PATH; skipping frozen install (add to CI/release workflow)"
     return 0
   fi
 
   out=""
   rc=0
-  out="$(cd "$repo" && pnpm install --frozen-lockfile --ignore-scripts 2>&1)" || rc=$?
+  out="$(cd "$install_root" && pnpm install --frozen-lockfile --ignore-scripts 2>&1)" || rc=$?
   if [[ "$rc" -eq 0 ]]; then
     return 0
   fi
 
-  _lockfile_drift_warn "pnpm frozen install failed (lockfile drift or missing store/network)"
-  _lockfile_drift_note "Workflow fix: ensure your release/deploy workflow runs 'pnpm install' and fails on drift via '--frozen-lockfile'"
+  _lockfile_drift_warn "pnpm frozen install failed under ${install_root} (lockfile drift or missing store/network)"
+  _lockfile_drift_note "Workflow fix: run 'pnpm install' and commit pnpm-lock.yaml; deploy uses --frozen-lockfile"
   if [[ "$strict_mode" == "1" ]]; then
     _lockfile_drift_error "pnpm install --frozen-lockfile failed (strict mode). Output:"
     printf '%s\n' "$out" >&2
@@ -129,6 +318,250 @@ _lockfile_drift_check_pnpm() {
   _lockfile_drift_note "pnpm output (warning mode):"
   printf '%s\n' "$out"
   return 0
+}
+
+_lockfile_drift_check_pnpm() {
+  local repo="$1"
+  local strict_mode="$2"
+  local install_root roots_found
+
+  roots_found=0
+  while IFS= read -r install_root; do
+    [[ -n "$install_root" ]] || continue
+    roots_found=1
+    if ! _lockfile_drift_check_pnpm_root "$install_root" "$strict_mode"; then
+      return 1
+    fi
+  done < <(_lockfile_drift_pnpm_install_root "$repo")
+
+  if [[ "$roots_found" == "0" ]]; then
+    if [[ -f "${repo}/pnpm-lock.yaml" ]]; then
+      _lockfile_drift_note "pnpm-lock.yaml present but no workspace package.json found; skipping pnpm drift check"
+    fi
+    return 0
+  fi
+  return 0
+}
+
+# _lockfile_drift_uv_needs_fix <repo>
+# Returns 0 when uv.lock is in sync; 1 when regeneration is needed.
+_lockfile_drift_uv_needs_fix() {
+  local repo="$1"
+  local rc project_name project_version locked_version
+
+  if [[ ! -f "${repo}/uv.lock" || ! -f "${repo}/pyproject.toml" ]]; then
+    return 0
+  fi
+  if ! _lockfile_drift_has_cmd uv; then
+    return 0
+  fi
+
+  rc=0
+  (cd "$repo" && uv lock --check >/dev/null 2>&1) || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    return 1
+  fi
+
+  project_name="$(_lockfile_drift_pyproject_field "${repo}/pyproject.toml" "name")"
+  project_version="$(_lockfile_drift_pyproject_field "${repo}/pyproject.toml" "version")"
+  if [[ -z "$project_name" || -z "$project_version" ]]; then
+    return 0
+  fi
+
+  locked_version="$(_lockfile_drift_uv_lock_package_version "${repo}/uv.lock" "$project_name")"
+  if [[ -z "$locked_version" || "$locked_version" != "$project_version" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# _lockfile_drift_pnpm_root_needs_fix <install_root>
+# Returns 0 when pnpm-lock.yaml is in sync; 1 when regeneration is needed.
+_lockfile_drift_pnpm_root_needs_fix() {
+  local install_root="$1"
+  local lock_file lock_mtime manifest manifest_mtime
+  local rc
+
+  lock_file="${install_root}/pnpm-lock.yaml"
+  if [[ ! -f "$lock_file" ]]; then
+    return 0
+  fi
+
+  lock_mtime="$(stat -c '%Y' "$lock_file")"
+  while IFS= read -r manifest; do
+    [[ -n "$manifest" ]] || continue
+    manifest_mtime="$(stat -c '%Y' "$manifest")"
+    if (( manifest_mtime > lock_mtime )); then
+      return 1
+    fi
+  done < <(_lockfile_drift_pnpm_manifests "$install_root")
+
+  if ! _lockfile_drift_has_cmd pnpm; then
+    return 0
+  fi
+
+  rc=0
+  (cd "$install_root" && pnpm install --frozen-lockfile --ignore-scripts >/dev/null 2>&1) || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# _lockfile_drift_cargo_needs_fix <repo>
+# Returns 0 when Cargo.lock is in sync; 1 when regeneration is needed.
+_lockfile_drift_cargo_needs_fix() {
+  local repo="$1"
+  local rc
+
+  if [[ ! -f "${repo}/Cargo.lock" || ! -f "${repo}/Cargo.toml" ]]; then
+    return 0
+  fi
+  if ! _lockfile_drift_has_cmd cargo; then
+    return 0
+  fi
+
+  rc=0
+  (cd "$repo" && cargo metadata --locked --format-version 1 --no-deps >/dev/null 2>&1) || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# _lockfile_drift_fix_uv <repo>
+_lockfile_drift_fix_uv() {
+  local repo="$1"
+  local rc out
+
+  if ! _lockfile_drift_has_cmd uv; then
+    _lockfile_drift_warn "cannot regenerate uv.lock — 'uv' not on PATH"
+    return 1
+  fi
+
+  _lockfile_drift_note "Regenerating uv.lock to match pyproject.toml..."
+  rc=0
+  out="$(cd "$repo" && uv lock 2>&1)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    _lockfile_drift_error "uv lock failed. Output:"
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  return 0
+}
+
+# _lockfile_drift_fix_pnpm <install_root>
+_lockfile_drift_fix_pnpm() {
+  local install_root="$1"
+  local rc out
+
+  if ! _lockfile_drift_has_cmd pnpm; then
+    _lockfile_drift_warn "cannot regenerate pnpm-lock.yaml — 'pnpm' not on PATH"
+    return 1
+  fi
+
+  _lockfile_drift_note "Regenerating pnpm-lock.yaml under ${install_root}..."
+  rc=0
+  out="$(cd "$install_root" && pnpm install --ignore-scripts 2>&1)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    _lockfile_drift_error "pnpm install failed. Output:"
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  return 0
+}
+
+# _lockfile_drift_fix_cargo <repo>
+_lockfile_drift_fix_cargo() {
+  local repo="$1"
+  local rc out
+
+  if ! _lockfile_drift_has_cmd cargo; then
+    _lockfile_drift_warn "cannot regenerate Cargo.lock — 'cargo' not on PATH"
+    return 1
+  fi
+
+  _lockfile_drift_note "Regenerating Cargo.lock to match Cargo.toml..."
+  if cargo generate-lockfile --help >/dev/null 2>&1; then
+    rc=0
+    out="$(cd "$repo" && cargo generate-lockfile 2>&1)" || rc=$?
+  else
+    rc=0
+    out="$(cd "$repo" && cargo check 2>&1)" || rc=$?
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    _lockfile_drift_error "cargo lockfile regeneration failed. Output:"
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  return 0
+}
+
+# lockfile_drift_remediate_repo
+# Detects drift, regenerates lockfiles when possible, then re-checks.
+lockfile_drift_remediate_repo() {
+  local scan_repo_dir=""
+  local strict_mode=0
+  local install_root
+  local fixed_any=0
+  local fix_failed=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo-dir)
+        [[ $# -ge 2 ]] || lockfile_drift_die "Missing value for --repo-dir"
+        scan_repo_dir="$2"
+        shift 2
+        ;;
+      --strict)
+        [[ $# -ge 2 ]] || lockfile_drift_die "Missing value for --strict (0/1)"
+        strict_mode="$2"
+        shift 2
+        ;;
+      *)
+        lockfile_drift_die "Unknown argument: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$scan_repo_dir" ]] || lockfile_drift_die "Missing --repo-dir"
+
+  if ! _lockfile_drift_uv_needs_fix "$scan_repo_dir"; then
+    if _lockfile_drift_fix_uv "$scan_repo_dir"; then
+      fixed_any=1
+    else
+      fix_failed=1
+    fi
+  fi
+
+  while IFS= read -r install_root; do
+    [[ -n "$install_root" ]] || continue
+    if ! _lockfile_drift_pnpm_root_needs_fix "$install_root"; then
+      if _lockfile_drift_fix_pnpm "$install_root"; then
+        fixed_any=1
+      else
+        fix_failed=1
+      fi
+    fi
+  done < <(_lockfile_drift_pnpm_install_root "$scan_repo_dir")
+
+  if ! _lockfile_drift_cargo_needs_fix "$scan_repo_dir"; then
+    if _lockfile_drift_fix_cargo "$scan_repo_dir"; then
+      fixed_any=1
+    else
+      fix_failed=1
+    fi
+  fi
+
+  if [[ "$fixed_any" == "1" ]]; then
+    _lockfile_drift_note "Lockfiles updated locally — commit before pushing if you intend to land the change"
+  fi
+
+  if [[ "$fix_failed" == "1" && "$strict_mode" == "1" ]]; then
+    return 1
+  fi
+
+  lockfile_drift_check_repo --repo-dir "$scan_repo_dir" --strict "$strict_mode"
 }
 
 lockfile_drift_check_repo() {
@@ -171,4 +604,3 @@ lockfile_drift_check_repo() {
   fi
   return 0
 }
-
