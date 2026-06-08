@@ -11,6 +11,8 @@ test_init
 
 script="${script_dir}/../scripts/check-lockfile-drift"
 readonly script
+lib="${script_dir}/../scripts/lib/lockfile-drift"
+readonly lib
 
 pass=0
 fail=0
@@ -153,6 +155,109 @@ if [[ "$pre_wt_count" == "$post_wt_count" ]]; then
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] cleanup: expected worktree count unchanged (%s -> %s)\n' "$pre_wt_count" "$post_wt_count"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== strict: uv project version mismatch fails ===\n'
+tmp_repo="$(mktemp -d)"
+git -C "$tmp_repo" init -q
+git -C "$tmp_repo" remote add origin "https://github.com/example/example.git"
+printf '[project]\nname = "demo"\nversion = "0.2.0"\n' >"${tmp_repo}/pyproject.toml"
+cat >"${tmp_repo}/uv.lock" <<'EOF'
+[[package]]
+name = "demo"
+version = "0.1.0"
+source = { editable = "." }
+EOF
+git -C "$tmp_repo" add pyproject.toml uv.lock
+git -C "$tmp_repo" -c user.name="CI" -c user.email="ci@example.invalid" commit -m "init" -q
+
+stub_bin="${tmp_repo}/stub-bin"
+make_stub_bin "$stub_bin" uv 'exit 0'
+
+strict_out=""
+strict_rc=0
+strict_out="$(PATH="${stub_bin}:${PATH}" bash "$script" --repo "$tmp_repo" --strict --no-worktree 2>&1)" || strict_rc=$?
+rm -rf "$tmp_repo"
+
+if [[ "$strict_rc" -ne 0 ]] && [[ "$strict_out" == *"pyproject.toml declares 0.2.0"* ]]; then
+  printf '[PASS] strict-uv-version: exits non-zero on project version mismatch\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] strict-uv-version: expected version mismatch failure, got rc=%s\n%s\n' "$strict_rc" "$strict_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== warn: pnpm workspace manifest newer than lock ===\n'
+tmp_repo="$(mktemp -d)"
+git -C "$tmp_repo" init -q
+git -C "$tmp_repo" remote add origin "https://github.com/example/example.git"
+mkdir -p "${tmp_repo}/web"
+printf 'packages:\n  - web\n' >"${tmp_repo}/pnpm-workspace.yaml"
+printf 'lockfileVersion: 9.0\n' >"${tmp_repo}/pnpm-lock.yaml"
+printf '{"name":"web","version":"1.0.1"}\n' >"${tmp_repo}/web/package.json"
+touch -d '2000-01-01' "${tmp_repo}/pnpm-lock.yaml"
+touch -d '2000-01-02' "${tmp_repo}/web/package.json"
+git -C "$tmp_repo" add pnpm-workspace.yaml pnpm-lock.yaml web/package.json
+git -C "$tmp_repo" -c user.name="CI" -c user.email="ci@example.invalid" commit -m "init" -q
+
+warn_out=""
+warn_rc=0
+warn_out="$(bash "$script" --repo "$tmp_repo" --no-worktree 2>&1)" || warn_rc=$?
+rm -rf "$tmp_repo"
+
+if [[ "$warn_rc" -eq 0 ]] && [[ "$warn_out" == *"package.json newer than pnpm-lock.yaml: web/package.json"* ]]; then
+  printf '[PASS] warn-pnpm-workspace: detects web/package.json drift without root package.json\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] warn-pnpm-workspace: expected web/package.json drift warning, got rc=%s\n%s\n' "$warn_rc" "$warn_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== remediate: uv drift auto-fixed ===\n'
+tmp_repo="$(mktemp -d)"
+git -C "$tmp_repo" init -q
+git -C "$tmp_repo" remote add origin "https://github.com/example/example.git"
+printf '[project]\nname = "demo"\nversion = "0.2.0"\n' >"${tmp_repo}/pyproject.toml"
+cat >"${tmp_repo}/uv.lock" <<'EOF'
+[[package]]
+name = "demo"
+version = "0.1.0"
+source = { editable = "." }
+EOF
+git -C "$tmp_repo" add pyproject.toml uv.lock
+git -C "$tmp_repo" -c user.name="CI" -c user.email="ci@example.invalid" commit -m "init" -q
+
+stub_bin="${tmp_repo}/stub-bin"
+make_stub_bin "$stub_bin" uv "if [[ \"\${1:-}\" == \"lock\" && \"\${2:-}\" == \"--check\" ]]; then exit 0; fi
+if [[ \"\${1:-}\" == \"lock\" ]]; then
+  cat >\"${tmp_repo}/uv.lock\" <<'LOCK'
+[[package]]
+name = \"demo\"
+version = \"0.2.0\"
+source = { editable = \".\" }
+LOCK
+  exit 0
+fi
+exit 0"
+
+remediate_out=""
+remediate_rc=0
+remediate_out="$(
+  PATH="${stub_bin}:${PATH}" bash -c '
+    # shellcheck source=/dev/null
+    source "'"$lib"'"
+    lockfile_drift_remediate_repo --repo-dir "'"$tmp_repo"'" --strict 0
+  ' 2>&1
+)" || remediate_rc=$?
+rm -rf "$tmp_repo"
+
+if [[ "$remediate_rc" -eq 0 ]] && [[ "$remediate_out" == *"Regenerating uv.lock"* ]] \
+  && [[ "$remediate_out" == *"Lockfiles updated locally"* ]]; then
+  printf '[PASS] remediate-uv: regenerates uv.lock and passes re-check\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] remediate-uv: expected auto-fix, got rc=%s\n%s\n' "$remediate_rc" "$remediate_out"
   fail=$(( fail + 1 ))
 fi
 

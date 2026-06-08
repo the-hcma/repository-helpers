@@ -352,6 +352,80 @@ die() {
     exit 1
 }
 
+# resolve_lockfile_drift_lib
+# Prints the path to scripts/lib/lockfile-drift (repository-helpers checkout).
+resolve_lockfile_drift_lib() {
+    local candidate rh_root setup_script_dir
+
+    setup_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    candidate="${setup_script_dir}/lib/lockfile-drift"
+    if [[ -f "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    if [[ -n "${REPOSITORY_HELPERS_DIR:-}" ]]; then
+        candidate="${REPOSITORY_HELPERS_DIR}/scripts/lib/lockfile-drift"
+        if [[ -f "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+
+    rh_root=""
+    if cd "${repo_dir}/../repository-helpers" 2>/dev/null; then
+        rh_root="$(pwd)"
+    fi
+    if [[ -n "$rh_root" ]]; then
+        candidate="${rh_root}/scripts/lib/lockfile-drift"
+        if [[ -f "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+
+    if [[ -n "${HOME:-}" ]]; then
+        candidate="${HOME}/work/ai/repository-helpers/scripts/lib/lockfile-drift"
+        if [[ -f "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# run_lockfile_drift_preflight
+# Checks manifest/lock drift before on-deploy. With --fix-lockfiles, regenerates
+# stale lockfiles locally; on-deploy then installs from those locks (--frozen).
+run_lockfile_drift_preflight() {
+    local lib_path drift_rc
+
+    if ! lib_path="$(resolve_lockfile_drift_lib)"; then
+        echo "ℹ️  lockfile-drift: library not found; skipping preflight"
+        return 0
+    fi
+
+    # shellcheck source=/dev/null
+    source "$lib_path"
+
+    drift_rc=0
+    if [[ "$fix_lockfiles" == "1" ]]; then
+        echo "Checking lockfile drift (auto-fix enabled)..."
+        if ! lockfile_drift_remediate_repo --repo-dir "$repo_dir" --strict "$strict_lockfiles"; then
+            drift_rc=1
+        fi
+    else
+        echo "Checking lockfile drift (warn-only unless --strict-lockfiles)..."
+        if ! lockfile_drift_check_repo --repo-dir "$repo_dir" --strict "$strict_lockfiles"; then
+            drift_rc=1
+        fi
+    fi
+    if [[ "$drift_rc" -ne 0 ]]; then
+        die "Lockfile drift remains after preflight. Regenerate and commit lockfiles before deploy (uv lock / pnpm install)."
+    fi
+}
+
 # resolve_service_log_file
 # resolve_service_log_file <service_filename> <target_service> <source_service>
 # Prints the service log path from the installed unit, source template, or scratch default.
@@ -474,6 +548,14 @@ OPTIONS:
     -r, --force-restart
         Force a service restart even when setup detects no unit/code changes.
         Useful after changing user config files referenced by the unit.
+
+    --fix-lockfiles
+        Regenerate stale uv.lock, pnpm-lock.yaml, or Cargo.lock before on-deploy.
+        start-development --refresh passes this automatically.
+
+    --strict-lockfiles
+        Fail when lockfiles still drift after checks (or after --fix-lockfiles).
+        Default is warn-only.
 
     -h, --help
         Display this help message and exit.
@@ -670,6 +752,8 @@ check_status() {
 # Handle arguments
 force_restart=0
 status_only=0
+strict_lockfiles=0
+fix_lockfiles=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
@@ -683,6 +767,14 @@ while [[ $# -gt 0 ]]; do
             force_restart=1
             shift
             ;;
+        --strict-lockfiles)
+            strict_lockfiles=1
+            shift
+            ;;
+        --fix-lockfiles)
+            fix_lockfiles=1
+            shift
+            ;;
         *)
             echo "❌ Error: Unknown option: $1"
             echo "Run './scripts/setup-service --help' for usage information"
@@ -692,6 +784,8 @@ while [[ $# -gt 0 ]]; do
 done
 readonly force_restart
 readonly status_only
+readonly strict_lockfiles
+readonly fix_lockfiles
 
 if [[ "$status_only" == "1" ]]; then
     check_status
@@ -746,6 +840,7 @@ if [[ "$kernel_name" == "Darwin" ]]; then
     if [[ -n "$desired_sha" ]]; then
         echo "   Desired commit: ${desired_sha}  (${repo_dir})"
     fi
+    run_lockfile_drift_preflight
     if run_on_deploy_hook; then
         echo "✅ on-deploy: completed (code may have changed)."
     else
@@ -880,7 +975,8 @@ else
     loginctl enable-linger "$current_user"
 fi
 
-# 6. Run repo-specific deploy hook if present (see run_on_deploy_hook).
+# 6. Lockfile drift preflight, then repo-specific deploy hook (see run_on_deploy_hook).
+run_lockfile_drift_preflight
 code_changed=false
 if run_on_deploy_hook; then
     code_changed=true
