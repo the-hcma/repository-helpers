@@ -36,6 +36,11 @@ discovered under a **scan root**. By default the scan root is the parent directo
 of this checkout: `dep-updater` processes each immediate child directory that
 contains a `.git` folder.
 
+Batch runs default to **`--merge-via gh`**: after CI passes, each batch PR is
+squash-merged with `gh pr merge` (not the Graphite merge queue). Set
+`DEP_UPDATER_MERGE_VIA=merge-queue` in `~/.config/dep-updater.env` to roll back to
+the merge-queue path.
+
 Before each run, `scripts/dep-updater-batch-run` runs `git fetch --prune origin` on
 this checkout and on each repository under the scan root so batch updates use the
 latest remote refs.

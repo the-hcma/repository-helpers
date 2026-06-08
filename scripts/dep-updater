@@ -65,6 +65,7 @@ batch_all=0
 scan_roots_csv=""
 dir_explicit=0
 merge_timeout_min=15
+merge_via=""
 wt_tmpdir=""
 quiet=0
 report_json=0
@@ -501,6 +502,9 @@ Options:
   --dir <path>      Project root (default: current directory)
   --ecosystem <e>   Force: npm | python | rust | gha | auto  (default: auto)
   --merge-timeout <min>  Minutes to wait for all PRs to merge (default: 15)
+  --merge-via <mode>  How to land PRs after CI passes: gh | merge-queue
+                    (default: gh for --batch, merge-queue otherwise; override via
+                    DEP_UPDATER_MERGE_VIA)
   --no-wait-ci      Skip CI polling between PRs
   --no-wait-merge   Exit after stack is submitted; print cleanup command
   --quiet           Suppress non-error log lines
@@ -566,6 +570,11 @@ parse_args() {
         shift
         [[ $# -eq 0 ]] && die "--merge-timeout requires a number of minutes."
         merge_timeout_min="$1"
+        ;;
+      --merge-via)
+        shift
+        [[ $# -eq 0 ]] && die "--merge-via requires a value: gh | merge-queue"
+        merge_via="$1"
         ;;
       --no-wait-ci)
         no_wait_ci=1
@@ -685,8 +694,23 @@ parse_args() {
   export TIME_LOG_COLOR_START="$log_color"
   export TIME_LOG_COLOR_RESET="$log_reset"
 
+  if [[ -z "$merge_via" && -n "${DEP_UPDATER_MERGE_VIA:-}" ]]; then
+    merge_via="${DEP_UPDATER_MERGE_VIA}"
+  fi
+  if [[ -z "$merge_via" ]]; then
+    if [[ "$batch" == '1' ]]; then
+      merge_via='gh'
+    else
+      merge_via='merge-queue'
+    fi
+  fi
+  case "$merge_via" in
+    gh|merge-queue) ;;
+    *) die "Invalid --merge-via: '${merge_via}'. Valid values: gh | merge-queue" ;;
+  esac
+
   # shellcheck disable=SC2034  # cleanup_mode, rebase_mode, merge_timeout_min used in main() dispatch
-  readonly dry_run cleanup_mode rebase_mode dir ecosystem semver_only no_wait_ci no_wait_merge security_only batch batch_all merge_timeout_min wt_tmpdir quiet report_json scan_roots_csv log_tz
+  readonly dry_run cleanup_mode rebase_mode dir ecosystem semver_only no_wait_ci no_wait_merge security_only batch batch_all merge_timeout_min merge_via wt_tmpdir quiet report_json scan_roots_csv log_tz
 }
 
 # ---------------------------------------------------------------------------
@@ -2155,7 +2179,10 @@ primary_repo_restore() {
     git -C "$dir" reset --hard "$_pri_head_sha" >/dev/null 2>&1 \
       || log "[worktree] Note: could not reset primary clone working tree after restore."
   fi
-  if [[ "$snapshot_was_taken" == '1' && "$report_json" != '1' ]]; then
+  # Dry-run exercises the worktree lifecycle only; do not move the primary clone
+  # checkout to main (that would reset tracked files — e.g. scripts/dep-updater on
+  # this repo — to origin/main while tests still grep the PR branch version).
+  if [[ "$snapshot_was_taken" == '1' && "$report_json" != '1' && "$dry_run" != '1' ]]; then
     primary_repo_ensure_on_main
   fi
 }
@@ -5511,6 +5538,105 @@ cleanup() {
   log "Cleanup complete."
 }
 
+merge_pr_via_gh_single() {
+  local -r pr_num="$1"
+  local -r timeout_min="${merge_timeout_min}"
+  local -r poll_sec=10
+  local merged ci_status merge_out merge_exit elapsed elapsed_fmt
+
+  merged="$(gh_pr_merged_for_number "$pr_num")"
+  if [[ "$merged" == 'true' ]]; then
+    log "PR #${pr_num} already merged."
+    return 0
+  fi
+
+  ci_status="$(ci_conclusion_for_pr "$pr_num")"
+  if [[ "$ci_status" != 'success' ]]; then
+    die "PR #${pr_num} is not CI-green (status: ${ci_status}); refusing gh merge."
+  fi
+
+  log "Merging PR #${pr_num} via gh (squash)…"
+  merge_out=""
+  merge_exit=0
+  merge_out="$(gh pr merge "$pr_num" \
+    --repo "${repo_owner}/${repo_name}" \
+    --squash --delete-branch 2>&1)" || merge_exit=$?
+  if (( merge_exit != 0 )); then
+    record_first_failure "gh merge failed: pr=#${pr_num}: ${merge_out}"
+    die "gh merge failed: pr=#${pr_num}: ${merge_out}"
+  fi
+  if [[ -n "$merge_out" ]]; then
+    log "$merge_out"
+  fi
+
+  elapsed=0
+  while (( elapsed < timeout_min * 60 )); do
+    merged="$(gh_pr_merged_for_number "$pr_num")"
+    if [[ "$merged" == 'true' ]]; then
+      log "PR #${pr_num} merged."
+      return 0
+    fi
+    sleep "$poll_sec"
+    elapsed=$(( elapsed + poll_sec ))
+  done
+
+  if (( elapsed < 60 )); then
+    elapsed_fmt="${elapsed}s"
+  else
+    elapsed_fmt="$(( elapsed / 60 ))m $(( elapsed % 60 ))s"
+  fi
+  wait_timeout_error "merge pr=#${pr_num} via=gh waited=${elapsed_fmt} timeout=${timeout_min}m"
+  return 1
+}
+
+merge_prs_via_gh() {
+  local -r prs_csv="$1"
+  local p worst_rc rc
+
+  log "Merging PRs via gh (squash): $(csv_pretty "$prs_csv")"
+  worst_rc=0
+  IFS=',' read -ra pr_list <<< "$prs_csv"
+  for p in "${pr_list[@]}"; do
+    [[ -z "$p" ]] && continue
+    set +e
+    merge_pr_via_gh_single "$p"
+    rc=$?
+    set -e
+    if (( rc != 0 )) && (( worst_rc == 0 || rc > worst_rc )); then
+      worst_rc=$rc
+    fi
+  done
+  return "$worst_rc"
+}
+
+finalize_prs() {
+  local -r prs_csv="$1"
+  local poll_rc=0
+
+  [[ -z "$prs_csv" ]] && return 0
+
+  case "$merge_via" in
+    gh)
+      set +e
+      merge_prs_via_gh "$prs_csv"
+      poll_rc=$?
+      set -e
+      return "$poll_rc"
+      ;;
+    merge-queue)
+      maybe_label_top_pr_for_merge
+      set +e
+      poll_until_merged "$prs_csv"
+      poll_rc=$?
+      set -e
+      return "$poll_rc"
+      ;;
+    *)
+      die "Invalid --merge-via: '${merge_via}' (expected gh or merge-queue)"
+      ;;
+  esac
+}
+
 poll_until_merged() {
   local -r prs_csv="$1"
   local -r timeout_min="${merge_timeout_min}"
@@ -5945,6 +6071,7 @@ batch_all_dispatch() {
     [[ "$security_only" == '1' ]] && child_args+=(--security-only)
     [[ -n "$wt_tmpdir" ]] && child_args+=(--tmpdir "$wt_tmpdir")
     child_args+=(--merge-timeout "$merge_timeout_min")
+    child_args+=(--merge-via "$merge_via")
     [[ "$ecosystem" != 'auto' ]] && child_args+=(--ecosystem "$ecosystem")
     child_args+=(--dir "$repo")
 
@@ -6534,7 +6661,6 @@ if [[ -z "$npm_lines" && -z "$py_lines" && -z "$rust_lines" && -z "$gha_lines" ]
   log "All dependencies are up to date."
   require_resume_ci_gate "$existing_branches" "$existing_prs"
   gate_all_created_prs
-  maybe_label_top_pr_for_merge
 
   if [[ "$no_wait_merge" == '1' ]]; then
     log ""
@@ -6547,7 +6673,7 @@ if [[ -z "$npm_lines" && -z "$py_lines" && -z "$rust_lines" && -z "$gha_lines" ]
   local final_prs_wt
   final_prs_wt="$(collect_tracked_prs_csv)"
   if [[ -n "$final_prs_wt" ]]; then
-    poll_until_merged "$final_prs_wt"
+    finalize_prs "$final_prs_wt"
   else
     log "No tracked PRs found; nothing to monitor."
   fi
@@ -6631,7 +6757,6 @@ local all_prs_csv
 all_prs_csv="$(collect_tracked_prs_csv)"
 print_stack_urls "$all_prs_csv"
 gate_all_created_prs
-maybe_label_top_pr_for_merge
 
 local run_exit_rc="$dep_updater_final_rc"
 
@@ -6655,7 +6780,7 @@ fi
 
 # Wait for merge and clean up automatically
 set +e
-poll_until_merged "$all_prs_csv"
+finalize_prs "$all_prs_csv"
 poll_rc=$?
 set -e
 if (( poll_rc != 0 )); then
