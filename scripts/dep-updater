@@ -853,8 +853,86 @@ npm_parse_iso8601_to_epoch() {
   time_log_iso8601_utc_to_epoch "$1"
 }
 
+# _npm_version_is_stable_release <version>
+# Returns 0 for release versions without a prerelease suffix (no '-' in the version).
+_npm_version_is_stable_release() {
+  local -r version="$1"
+  [[ "$version" != *-* ]]
+}
+
+# _npm_registry_stable_versions_desc <pkg>
+# Prints stable published versions newest-first from the npm packument.
+_npm_registry_stable_versions_desc() {
+  local -r pkg="$1"
+  local registry encoded_pkg body
+
+  if [[ "${DEP_UPDATER_SKIP_NPM_REGISTRY:-0}" == '1' ]]; then
+    return 0
+  fi
+
+  registry="$(pnpm config get registry 2>/dev/null | tr -d '[:space:]' || echo 'https://registry.npmjs.org/')"
+  [[ "$registry" != */ ]] && registry="${registry}/"
+  encoded_pkg="${pkg//@/%40}"
+  encoded_pkg="${encoded_pkg//\//%2F}"
+  body="$(curl --silent --max-time 15 "${registry}${encoded_pkg}" 2>/dev/null || true)"
+  if [[ -z "$body" ]]; then
+    return 1
+  fi
+  printf '%s' "$body" | jq -r '.versions | keys[]' 2>/dev/null \
+    | while IFS= read -r ver; do
+        [[ -z "$ver" ]] && continue
+        if _npm_version_is_stable_release "$ver"; then
+          printf '%s\n' "$ver"
+        fi
+      done \
+    | sort -V -r
+}
+
+# npm_pick_eligible_new_version <pkg> <current> [scan_root]
+# Prints the newest registry version newer than current that passes release-age and
+# closure checks. When dist-tags.latest is too new, walks back to the newest
+# eligible stable version (same behaviour as Dependabot cooldown + _gha_pick_eligible_new_ref).
+npm_pick_eligible_new_version() {
+  local -r pkg="$1"
+  local -r current="$2"
+  local -r scan_root="${3:-$dir}"
+  local ver latest_tag picked
+
+  latest_tag="$(npm_registry_dist_tag_latest "$pkg" 2>/dev/null || true)"
+  picked=""
+  while IFS= read -r ver; do
+    [[ -z "$ver" ]] && continue
+    if [[ "$ver" == "$current" ]]; then
+      continue
+    fi
+    if [[ "$(printf '%s\n%s\n' "$current" "$ver" | sort -V | tail -1)" != "$ver" ]]; then
+      continue
+    fi
+    # Age-gate the candidate and confirm the top-level tarball exists. Exact-semver
+    # sibling closure is deferred to npm_pnpm_filter_outdated_lines (lockfile dry-run),
+    # which matches Dependabot and avoids false negatives on monorepo publishes.
+    if npm_version_meets_minimum_release_age "$pkg" "$ver" "$scan_root" \
+      && npm_version_prefetch "$pkg" "$ver"; then
+      picked="$ver"
+      break
+    fi
+    if [[ "$(printf '%s\n%s\n' "$ver" "$current" | sort -V | tail -1)" == "$current" && "$ver" != "$current" ]]; then
+      break
+    fi
+  done < <(_npm_registry_stable_versions_desc "$pkg")
+
+  if [[ -z "$picked" ]]; then
+    return 1
+  fi
+  if [[ -n "$latest_tag" && "$picked" != "$latest_tag" ]]; then
+    log "[pnpm] ${pkg}: proposing ${picked} (newest eligible; dist-tags.latest ${latest_tag} is too new)."
+  fi
+  printf '%s' "$picked"
+  return 0
+}
+
 # npm_minimum_release_age_minutes [scan_root]
-# Effective minimumReleaseAge for bump proposals: max(project pnpm config, release-age floor).
+# Effective minimumReleaseAge for bump proposals: max(project pnpm config, dep-updater floor).
 npm_minimum_release_age_minutes() {
   local -r scan_root="${1:-$dir}"
   local cfg project_minutes
@@ -2591,7 +2669,7 @@ npm_outdated() {
     pkgs_json="$(printf '%s' "$pkg_json_specs" | jq -c 'keys' 2>/dev/null || echo '[]')"
 
     local -a candidate_lines=()
-    local pkg spec current latest sort_winner pv reg higher
+    local pkg spec current eligible pv reg higher latest
     while IFS= read -r pkg; do
       [[ -z "$pkg" ]] && continue
       if pnpm_pkg_is_ignored_build "$pkg"; then
@@ -2631,14 +2709,9 @@ npm_outdated() {
       [[ -z "$latest" ]] && continue
       [[ "$current" == "$latest" ]] && continue
 
-      # Only advance — never downgrade.
-      sort_winner="$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -1)"
-      if [[ "$sort_winner" == "$latest" ]]; then
-        # Verify release age, registry availability, and exact-semver closure.
-        if npm_version_meets_minimum_release_age "$pkg" "$latest" "$scan_root" \
-          && npm_version_prefetch_closure "$pkg" "$latest" "$scan_root"; then
-          candidate_lines+=("$pkg $current $latest")
-        fi
+      eligible="$(npm_pick_eligible_new_version "$pkg" "$current" "$scan_root" 2>/dev/null || true)"
+      if [[ -n "$eligible" && "$eligible" != "$current" ]]; then
+        candidate_lines+=("$pkg $current $eligible")
       fi
     done < <(printf '%s' "$pkgs_json" | jq -r '.[]' 2>/dev/null || true)
 
@@ -2696,23 +2769,32 @@ npm_outdated() {
       | "\(.[0]) \(.[1]) \(.[3])"' "$tmp_json" 2>/dev/null \
       | awk '{if(NF==3 && $1!="" && $2!="" && $3!="") print $0}' \
       | while IFS=' ' read -r _ypkg _ycur _ynew; do
-          if npm_version_meets_minimum_release_age "$_ypkg" "$_ynew" "$scan_root" \
-            && npm_version_prefetch "$_ypkg" "$_ynew"; then
-            printf '%s %s %s\n' "$_ypkg" "$_ycur" "$_ynew"
+          local _yeligible
+          _yeligible="$(npm_pick_eligible_new_version "$_ypkg" "$_ycur" "$scan_root" 2>/dev/null || true)"
+          if [[ -n "$_yeligible" ]]; then
+            printf '%s %s %s\n' "$_ypkg" "$_ycur" "$_yeligible"
           fi
         done
   else
     local -a candidate_lines=()
     while IFS= read -r _npkg _ncur _nnew; do
       [[ -z "$_npkg" ]] && continue
-      if [[ "$tool" == 'pnpm' ]]; then
-        if npm_version_meets_minimum_release_age "$_npkg" "$_nnew" "$scan_root" \
-          && npm_version_prefetch_closure "$_npkg" "$_nnew" "$scan_root"; then
+      if [[ "$semver_only" == '1' ]]; then
+        if [[ "$tool" == 'pnpm' ]]; then
+          if npm_version_meets_minimum_release_age "$_npkg" "$_nnew" "$scan_root" \
+            && npm_version_prefetch_closure "$_npkg" "$_nnew" "$scan_root"; then
+            candidate_lines+=("$_npkg $_ncur $_nnew")
+          fi
+        elif npm_version_meets_minimum_release_age "$_npkg" "$_nnew" "$scan_root" \
+          && npm_version_prefetch "$_npkg" "$_nnew"; then
           candidate_lines+=("$_npkg $_ncur $_nnew")
         fi
-      elif npm_version_meets_minimum_release_age "$_npkg" "$_nnew" "$scan_root" \
-        && npm_version_prefetch "$_npkg" "$_nnew"; then
-        candidate_lines+=("$_npkg $_ncur $_nnew")
+      else
+        local _neligible
+        _neligible="$(npm_pick_eligible_new_version "$_npkg" "$_ncur" "$scan_root" 2>/dev/null || true)"
+        if [[ -n "$_neligible" ]]; then
+          candidate_lines+=("$_npkg $_ncur $_neligible")
+        fi
       fi
     done < <(jq -r --argjson specs "$pkg_json_specs" --arg semver_only "$semver_only" '
       to_entries[]
