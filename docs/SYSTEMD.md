@@ -37,7 +37,7 @@ of this checkout: `dep-updater` processes each immediate child directory that
 contains a `.git` folder.
 
 Batch runs default to **`--merge-via gh`**: after CI passes, each batch PR is
-squash-merged with `gh pr merge` (not the Graphite merge queue). Set
+squash-merged with `gh pr merge --auto` (not the Graphite merge queue). Set
 `DEP_UPDATER_MERGE_VIA=merge-queue` in `~/.config/dep-updater.env` to roll back to
 the merge-queue path.
 

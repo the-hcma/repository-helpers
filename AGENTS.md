@@ -290,7 +290,7 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 - `pre-pr-checks` mirrors CI: `bash -n`, `shellcheck -S info` (all `scripts/*`, `scripts/dev/*`, `scripts/lib/*`, `tests/*`, `tests/lib/*`), and **every** `tests/*.test` must pass. It also verifies the **primary worktree** is unchanged when checks finish (auto-stash/restore any pre-existing local changes on main).
 - Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).
 - PRs must be **published (not draft)** so reviewers see them normally. Prefer `scripts/dev/submit-stack` for non-interactive submit (implies `--publish`).
-- To merge a PR, add the `merge-it` label: `gh pr edit <number> --add-label merge-it`. Do not use `gh pr merge` manually. **Exception:** `dep-updater` batch runs (`--batch`, including daily `--batch --all`) may use `gh pr merge --squash` after CI passes (`--merge-via gh`, the batch default).
+- To merge a PR, add the `merge-it` label: `gh pr edit <number> --add-label merge-it`. Do not use `gh pr merge` manually. **Exception:** `dep-updater` batch runs (`--batch`, including daily `--batch --all`) may use `gh pr merge --auto --squash` after CI passes (`--merge-via gh`, the batch default); `--auto` lets GitHub wait for required branch checks instead of merging immediately.
 - Follow **Conventional Commits**: `feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`.
 - Each commit must pass all CI checks (see below) before being pushed.
 - Never merge a PR until **all checks have run and are green** (no skipped required checks).
