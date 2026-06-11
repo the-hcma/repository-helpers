@@ -49,6 +49,7 @@ This file defines the non-negotiable standards for all contributors (human or AI
 - **Every new behaviour or bug fix must be accompanied by a test**, even if that test is a dry-run smoke test or a static-analysis assertion (`awk`/`grep` over the source).
 - Tests must be **deterministic**: no `sleep` for timing, no real network calls, no real git operations on remote state.
 - Static analysis tests (e.g. "no `local -r` inside loops") live in a dedicated `=== static: ... ===` section.
+- Shared libs must not hardcode sibling org repo names; discover via `rp_DEFAULT_ORG` (`the-hcma`) helpers (`rp_discover_org_repos`, etc.). Enforce with `rp_assert_no_hardcoded_consumer_repo_names` in `tests/lib/test-assert` (see `.cursor/rules/no-hardcoded-org-repos.mdc`).
 - Test names must read as sentences: `output contains "[worktree] Creating worktree at:"`.
 - Do not write tests that only assert a function was reached — assert the observable output or exit code.
 
