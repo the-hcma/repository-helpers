@@ -17,6 +17,9 @@ readonly rp_lib_dir
 # shellcheck source=scripts/lib/release-age-defaults
 source "${rp_lib_dir}/release-age-defaults"
 
+# shellcheck source=scripts/lib/ci-secret-scan-policy
+source "${rp_lib_dir}/ci-secret-scan-policy"
+
 rp_org="$rp_DEFAULT_ORG"
 rp_apply_fix=0
 rp_suggest=0
@@ -497,6 +500,93 @@ rp_candidate_cleanup_merged_branches_workflow() {
 
 rp_candidate_dependabot_auto_merge_workflow() {
   rp_candidate_workflow_template 'dependabot-auto-merge.yml'
+}
+
+rp_candidate_secret_scan_script() {
+  local -r path="${rp_lib_dir}/ci-secret-scan"
+
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing ci-secret-scan script: ${path}"
+  fi
+  cat "$path"
+}
+
+rp_candidate_ci_secret_scan_job_yaml() {
+  cat <<'YAML'
+  secret-scan:
+    name: Secret Scan
+    needs: guard
+    if: needs.guard.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Secret Scan
+        env:
+          GITLEAKS_BASE: ${{ github.event.pull_request.base.sha || '' }}
+          GITLEAKS_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash .github/ci/secret-scan
+YAML
+}
+
+rp_ci_workflow_has_secret_scan_job() {
+  local text="$1"
+  grep -qE '^  secret-scan:' <<<"$text"
+}
+
+rp_ci_workflow_uses_canonical_secret_scan_invocation() {
+  local text="$1"
+  grep -qF 'bash .github/ci/secret-scan' <<<"$text" \
+    && grep -qF 'GITLEAKS_BASE:' <<<"$text" \
+    && grep -qF 'GITLEAKS_HEAD:' <<<"$text"
+}
+
+rp_ci_workflow_has_brittle_gitleaks_install() {
+  local text="$1"
+  if grep -qF 'bash .github/ci/secret-scan' <<<"$text"; then
+    return 1
+  fi
+  grep -qE 'gitleaks_[0-9.]+_linux_' <<<"$text" \
+    || grep -qF 'FALLBACK_VERSION=' <<<"$text" \
+    || grep -qF 'releases/latest' <<<"$text"
+}
+
+rp_ci_secret_scan_script_is_canonical() {
+  local text="$1"
+  local canonical
+  canonical="$(rp_candidate_secret_scan_script)"
+  [[ "$text" == "$canonical" ]]
+}
+
+rp_fix_ci_workflow_secret_scan_job() {
+  local text="$1"
+  local block_path
+  block_path="$(mktemp)"
+  rp_candidate_ci_secret_scan_job_yaml >"$block_path"
+  awk -v block_path="$block_path" '
+    BEGIN {
+      replacing = 0
+      while ((getline block_line < block_path) > 0) {
+        block = block block_line "\n"
+      }
+      close(block_path)
+    }
+    /^  [a-zA-Z0-9_.-]+:/ {
+      if (replacing) {
+        replacing = 0
+      }
+      if ($0 ~ /^  secret-scan:/) {
+        printf "%s", block
+        replacing = 1
+        next
+      }
+    }
+    replacing { next }
+    { print }
+  ' <<<"$text"
+  rm -f "$block_path"
 }
 
 rp_queue_candidate_file_fix() {
@@ -1408,6 +1498,7 @@ rp_print_new_repo_checklist() {
 
     Workflows under .github/workflows/:
       [ ] ci.yml with gtmq_merge_* skip in a guard job
+      [ ] ci.yml secret-scan job invoking .github/ci/secret-scan (canonical scripts/lib/ci-secret-scan)
       [ ] merged-pr-closer.yml (graphite-app merge-queue comment detection)
       [ ] cleanup-branch-on-merge.yml (delete branch on PR merge)
       [ ] cleanup-merged-branches.yml (daily stale-branch sweep)
@@ -1702,6 +1793,42 @@ rp_validate_graphite_workflows() {
         rp_compact_record_fix "$slug" "${slug}: candidate PR: fix ci.yml pull_request trigger for stacked PRs"
       fi
       fail=1
+    fi
+
+    if rp_ci_workflow_has_secret_scan_job "$ci_text" \
+      || grep -qF 'gitleaks' <<<"$ci_text"; then
+      secret_scan_script=""
+      secret_scan_script="$(rp_fetch_github_text_file "$slug" '.github/ci/secret-scan' || true)"
+      if [[ -z "$secret_scan_script" ]] \
+        || ! rp_ci_secret_scan_script_is_canonical "$secret_scan_script" \
+        || ! rp_ci_workflow_uses_canonical_secret_scan_invocation "$ci_text" \
+        || rp_ci_workflow_has_brittle_gitleaks_install "$ci_text"; then
+        rp_log_fail "${slug}: secret-scan must use the canonical scripts/lib/ci-secret-scan install"
+        if [[ "$rp_suggest" -eq 1 ]]; then
+          rp_log_suggest "${slug}: add .github/ci/secret-scan from repository-helpers and invoke it from ci.yml"
+        fi
+        if [[ "$rp_apply_fix" -eq 1 ]]; then
+          rp_queue_candidate_file_fix "$slug" '.github/ci/secret-scan' \
+            "$(rp_candidate_secret_scan_script)" \
+            'sync-secret-scan-script' \
+            'fix(ci): sync canonical secret-scan script'
+          if rp_ci_workflow_has_secret_scan_job "$ci_text"; then
+            ci_fixed="$(rp_fix_ci_workflow_secret_scan_job "$ci_text")"
+            rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
+              "$ci_fixed" \
+              'sync-secret-scan-job' \
+              'fix(ci): use canonical secret-scan job'
+            rp_compact_record_fix "$slug" \
+              "${slug}: candidate PR: sync secret-scan script and ci.yml job"
+          else
+            rp_compact_record_fix "$slug" \
+              "${slug}: candidate PR: sync secret-scan script"
+          fi
+        fi
+        fail=1
+      fi
+    elif [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_warn "${slug}: ci.yml has no secret-scan job (recommended)"
     fi
   elif [[ "$strict" == '1' ]]; then
     rp_log_fail "${slug}: missing .github/workflows/ci.yml"
@@ -2169,6 +2296,47 @@ rp_check_license_metadata() {
   return "$repo_fail"
 }
 
+# Warn when scripts/lib/ci-secret-scan pins a gitleaks release behind the newest
+# eligible version (same ${release_age_dep_updater_days}-day gate as dep-updater).
+rp_check_ci_secret_scan_gitleaks_pin() {
+  local script_path pinned eligible
+
+  script_path="${rp_lib_dir}/ci-secret-scan"
+  if [[ ! -f "$script_path" ]]; then
+    return 0
+  fi
+
+  pinned="$(ci_secret_scan_policy_read_pinned_version "$script_path" || true)"
+  if [[ -z "$pinned" ]]; then
+    rp_log_warn 'ci-secret-scan: could not read ci_secret_scan_version pin'
+    return 0
+  fi
+
+  eligible="$(ci_secret_scan_policy_pick_eligible_gitleaks_version 2>/dev/null || true)"
+  if [[ -z "$eligible" ]]; then
+    return 0
+  fi
+
+  if ! ci_secret_scan_policy_version_is_older_than "$pinned" "$eligible"; then
+    rp_log_check_ok 'the-hcma/repository-helpers' \
+      "ci-secret-scan gitleaks pin (${pinned})" \
+      'https://github.com/gitleaks/gitleaks/releases'
+    return 0
+  fi
+
+  rp_log_warn \
+    "ci-secret-scan: gitleaks pin ${pinned} is behind eligible ${eligible} (${release_age_dep_updater_days_phrase} release-age gate)"
+  rp_log_suggest \
+    "bump ci_secret_scan_version to ${eligible} in scripts/lib/ci-secret-scan, merge repository-helpers, then sync consumer repos with scripts/github-repo-lint --repo OWNER/NAME --apply-fix"
+  rp_log_manual_step \
+    "edit scripts/lib/ci-secret-scan: ci_secret_scan_version='${eligible}'"
+  rp_log_manual_step \
+    'run scripts/dev/pre-pr-checks and merge the repository-helpers PR'
+  rp_log_manual_step \
+    'sync each consumer repo: scripts/github-repo-lint --repo OWNER/NAME --apply-fix (every repo with secret-scan)'
+  return 0
+}
+
 rp_check_one_repo() {
   local slug="$1"
   local total_fail=0
@@ -2226,6 +2394,10 @@ rp_main() {
 
   if [[ "$rp_new_repo" -eq 1 ]]; then
     rp_print_new_repo_checklist "${rp_repo_slugs[0]}"
+  fi
+
+  if [[ "$rp_merge_only" -eq 0 ]]; then
+    rp_check_ci_secret_scan_gitleaks_pin
   fi
 
   for slug in "${rp_repo_slugs[@]}"; do
