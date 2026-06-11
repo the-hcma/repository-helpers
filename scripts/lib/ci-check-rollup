@@ -4,6 +4,94 @@
 # Sourced by dep-updater and post-pr-submission-checks. Functions expect gh and jq
 # on PATH.
 
+# Job display names (or job ids) from ci.yml that must be green before merge.
+# Skips guard/changed-files/secret-scan/workflow-lint (optional gates, not merge blockers).
+ci_discover_required_contexts_from_ci_yml_text() {
+  local text="$1"
+
+  awk '
+    function emit() {
+      if (job == "" || job == "guard" || job == "changed-files" || job == "secret-scan" \
+          || job == "workflow-lint") {
+        return
+      }
+      if (disp != "") {
+        print disp
+      } else {
+        print job
+      }
+    }
+    BEGIN { in_jobs = 0; job = ""; disp = "" }
+    /^jobs:/ { in_jobs = 1; next }
+    !in_jobs { next }
+    /^  [a-zA-Z0-9_-]+:/ {
+      emit()
+      job = $1
+      sub(/^  /, "", job)
+      sub(/:$/, "", job)
+      disp = ""
+      next
+    }
+    job != "" && /^    name:/ {
+      sub(/^    name: /, "")
+      disp = $0
+      next
+    }
+    END { emit() }
+  ' <<<"$text"
+}
+
+ci_rollup_conclusion_for_gating() {
+  local rollup_json="$1"
+  local required_contexts="${2:-}"
+  local required_json
+
+  if [[ -z "$rollup_json" ]]; then
+    rollup_json='[]'
+  fi
+
+  required_json="$(printf '%s\n' "$required_contexts" | jq -R -s 'split("\n") | map(select(length > 0))')"
+
+  jq -r --argjson required "$required_json" '
+    def fail_conclusions:
+      ["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"];
+    def ok_conclusions:
+      ["SUCCESS", "SKIPPED", "NEUTRAL"];
+    def is_failure($c):
+      ($c // "") as $v | fail_conclusions | index($v) != null;
+    def is_ok($c):
+      ($c // "") as $v | ok_conclusions | index($v) != null;
+    def is_external($n):
+      ($n // "") as $v
+      | ($v | startswith("Graphite /"))
+        or $v == "label"
+        or ($v | startswith("label-"))
+        or $v == "cleanup-merged-branch"
+        or $v == "close-merged-prs"
+        or ($v | test("(?i)dependabot"));
+    def is_incomplete($e):
+      ((.conclusion // "") == "")
+        or ((.status // "") != "" and (.status // "") != "COMPLETED");
+    def rollup_entry($r; $ctx):
+      ($r | map(select((.name // .context // "") == $ctx)) | .[0] // null);
+
+    (. // []) as $r
+    | if ($r | length) == 0 then "missing"
+      elif any($r[]; is_failure(.conclusion)) then "failure"
+      elif ($required | length) > 0 then
+        if any($required[]; rollup_entry($r; .) == null) then "pending"
+        elif any($required[]; rollup_entry($r; .) as $e | is_ok($e.conclusion) | not) then "pending"
+        elif any($r[]; (is_external(.name // .context // "") | not) and is_incomplete(.)) then "pending"
+        else "success"
+        end
+      elif any($r[]; (is_external(.name // .context // "") | not) and is_incomplete(.)) then "pending"
+      elif ([$r[] | select(is_external(.name // .context // "") | not)] | length) == 0 then "pending"
+      elif all($r[] | select(is_external(.name // .context // "") | not); is_ok(.conclusion)) then "success"
+      else "pending"
+      end
+  ' <<<"$rollup_json"
+}
+
 ci_rollup_json_for_pr() {
   local -r pr="$1"
   local -r repo="${2:-}"
