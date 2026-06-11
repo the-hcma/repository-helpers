@@ -565,24 +565,113 @@ rp_candidate_secret_scan_script() {
   cat "$path"
 }
 
+rp_candidate_ci_concurrency_yaml() {
+  rp_candidate_workflow_template 'ci-concurrency.snippet'
+}
+
 rp_candidate_ci_secret_scan_job_yaml() {
-  cat <<'YAML'
-  secret-scan:
-    name: Secret Scan
-    needs: guard
-    if: needs.guard.outputs.skip != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6.0.2
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Secret Scan
-        env:
-          GITLEAKS_BASE: ${{ github.event.pull_request.base.sha || '' }}
-          GITLEAKS_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: bash .github/ci/secret-scan
-YAML
+  local -r path="${rp_lib_dir}/repo-practices-workflows/ci-secret-scan-job.snippet"
+
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing ci secret-scan job snippet: ${path}"
+  fi
+  cat "$path"
+}
+
+rp_ci_workflow_extract_secret_scan_job() {
+  local text="$1"
+  awk '
+    /^  secret-scan:/ { found = 1 }
+    found {
+      if ($0 ~ /^  [a-zA-Z0-9_.-]+:/ && $0 !~ /^  secret-scan:/) {
+        exit
+      }
+      print
+    }
+  ' <<<"$text"
+}
+
+rp_ci_workflow_secret_scan_job_is_canonical() {
+  local text="$1"
+  local canonical job
+  canonical="$(rp_candidate_ci_secret_scan_job_yaml)"
+  job="$(rp_ci_workflow_extract_secret_scan_job "$text")"
+  [[ "$job" == "$canonical" ]]
+}
+
+rp_ci_workflow_has_hardened_concurrency() {
+  local text="$1"
+  local group_line
+  if ! grep -qE '^concurrency:' <<<"$text"; then
+    return 1
+  fi
+  group_line="$(
+    awk '
+      /^concurrency:/ { in_block = 1; next }
+      in_block && /^  group:/ { print; exit }
+      in_block && /^[a-zA-Z#]/ { exit }
+    ' <<<"$text"
+  )"
+  [[ -n "$group_line" ]] || return 1
+  grep -qF 'github.event.pull_request.head.sha' <<<"$group_line"
+}
+
+rp_fix_ci_workflow_concurrency() {
+  local text="$1"
+  local block_path
+  block_path="$(mktemp)"
+  rp_candidate_ci_concurrency_yaml >"$block_path"
+  if grep -qE '^concurrency:' <<<"$text"; then
+    awk -v block_path="$block_path" '
+      BEGIN {
+        while ((getline block_line < block_path) > 0) {
+          block = block block_line "\n"
+        }
+        close(block_path)
+      }
+      /^concurrency:/ {
+        replacing = 1
+        printf "%s", block
+        next
+      }
+      replacing && /^[a-zA-Z#]/ {
+        replacing = 0
+        print
+        next
+      }
+      replacing { next }
+      { print }
+    ' <<<"$text"
+  else
+    awk -v block_path="$block_path" '
+      BEGIN {
+        while ((getline block_line < block_path) > 0) {
+          block = block block_line "\n"
+        }
+        close(block_path)
+        inserted = 0
+      }
+      /^jobs:/ {
+        if (!inserted) {
+          printf "\n%s", block
+          inserted = 1
+        }
+        print
+        next
+      }
+      { print }
+    ' <<<"$text"
+  fi
+  rm -f "$block_path"
+}
+
+rp_fix_ci_workflow_hardening() {
+  local text="$1"
+  text="$(rp_fix_ci_workflow_concurrency "$text")"
+  if rp_ci_workflow_has_secret_scan_job "$text"; then
+    text="$(rp_fix_ci_workflow_secret_scan_job "$text")"
+  fi
+  printf '%s' "$text"
 }
 
 rp_ci_workflow_has_secret_scan_job() {
@@ -673,7 +762,7 @@ rp_queue_ci_secret_scan_candidate_fixes() {
 
   if [[ "$mode" == 'add' ]]; then
     rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
-      "$(rp_add_ci_secret_scan_job_to_workflow "$ci_text")" \
+      "$(rp_fix_ci_workflow_hardening "$(rp_add_ci_secret_scan_job_to_workflow "$ci_text")")" \
       'add-secret-scan-job' \
       'feat(ci): add secret-scan job'
     rp_compact_record_fix "$slug" \
@@ -683,9 +772,9 @@ rp_queue_ci_secret_scan_candidate_fixes() {
 
   if rp_ci_workflow_has_secret_scan_job "$ci_text"; then
     rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
-      "$(rp_fix_ci_workflow_secret_scan_job "$ci_text")" \
+      "$(rp_fix_ci_workflow_hardening "$ci_text")" \
       'sync-secret-scan-job' \
-      'fix(ci): use canonical secret-scan job'
+      'fix(ci): harden secret-scan job and CI concurrency'
     rp_compact_record_fix "$slug" \
       "${slug}: candidate PR: sync secret-scan script and ci.yml job"
   else
@@ -1609,7 +1698,7 @@ rp_print_new_repo_checklist() {
 
     Workflows under .github/workflows/:
       [ ] ci.yml with gtmq_merge_* skip in a guard job
-      [ ] ci.yml secret-scan job invoking .github/ci/secret-scan (required; canonical scripts/lib/ci-secret-scan)
+      [ ] ci.yml secret-scan job invoking .github/ci/secret-scan (canonical; timeout-minutes + per-SHA concurrency)
       [ ] merged-pr-closer.yml (graphite-app merge-queue comment detection)
       [ ] cleanup-branch-on-merge.yml (delete branch on PR merge)
       [ ] cleanup-merged-branches.yml (daily stale-branch sweep)
@@ -1906,12 +1995,28 @@ rp_validate_graphite_workflows() {
       fail=1
     fi
 
+    if ! rp_ci_workflow_has_hardened_concurrency "$ci_text"; then
+      rp_log_fail \
+        "${slug}: ci.yml concurrency must key on head SHA (avoids zombie secret-scan checks)"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: sync ci.yml concurrency (scripts/github-repo-lint --apply-fix)"
+      fi
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
+        rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
+          "$(rp_fix_ci_workflow_hardening "$ci_text")" \
+          'sync-ci-concurrency' \
+          'fix(ci): key CI concurrency on head SHA'
+        rp_compact_record_fix "$slug" "${slug}: candidate PR: harden ci.yml concurrency and secret-scan"
+      fi
+      fail=1
+    fi
+
     if rp_ci_workflow_has_secret_scan_coverage "$ci_text"; then
       secret_scan_script=""
       secret_scan_script="$(rp_fetch_github_text_file "$slug" '.github/ci/secret-scan' || true)"
       if [[ -z "$secret_scan_script" ]] \
         || ! rp_ci_secret_scan_script_is_canonical "$secret_scan_script" \
-        || ! rp_ci_workflow_uses_canonical_secret_scan_invocation "$ci_text" \
+        || ! rp_ci_workflow_secret_scan_job_is_canonical "$ci_text" \
         || rp_ci_workflow_has_brittle_gitleaks_install "$ci_text"; then
         rp_log_fail "${slug}: secret-scan must use the canonical scripts/lib/ci-secret-scan install"
         if [[ "$rp_suggest" -eq 1 ]]; then
