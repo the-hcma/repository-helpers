@@ -753,7 +753,8 @@ rp_ci_workflow_needs_graphite_restack_trigger_fix() {
   local text="$1"
   if rp_ci_workflow_has_pull_request_edited_type "$text" \
     && rp_ci_workflow_has_feature_branch_push_trigger "$text" \
-    && rp_ci_workflow_guard_has_push_dedup "$text"; then
+    && rp_ci_workflow_guard_has_push_dedup "$text" \
+    && ! rp_ci_workflow_guard_skip_run_is_broken "$text"; then
     return 1
   fi
   return 0
@@ -883,94 +884,103 @@ rp_fix_ci_workflow_feature_branch_push_trigger() {
   rm -f "$block_path"
 }
 
+rp_ci_guard_skip_run_template_name() {
+  local text="$1"
+  # shellcheck disable=SC2016  # markers match literal GitHub Actions ${{ }} in ci.yml
+  local -r pr_state_marker='PR_STATE: ${{ steps.pr-state.outputs.state }}'
+  # shellcheck disable=SC2016  # markers match literal GitHub Actions ${{ }} in ci.yml
+  local -r pr_number_marker='pr_number="${{ github.event.pull_request.number }}"'
+  # shellcheck disable=SC2016  # markers match literal GitHub Actions ${{ }} in ci.yml
+  local -r head_ref_pr_number_marker='PR_NUMBER: ${{ github.event.pull_request.number }}'
+  if grep -qF "$pr_state_marker" <<<"$text"; then
+    printf '%s' 'ci-guard-skip-run-pr-state.snippet'
+  elif grep -qF "$pr_number_marker" <<<"$text"; then
+    printf '%s' 'ci-guard-skip-run-inline-merged.snippet'
+  elif grep -qF "$head_ref_pr_number_marker" <<<"$text" \
+    && grep -qF 'HEAD_REF:' <<<"$text"; then
+    printf '%s' 'ci-guard-skip-run-head-ref-pr-number.snippet'
+  else
+    printf '%s' 'ci-guard-skip-run-gtmq-only.snippet'
+  fi
+}
+
+rp_candidate_ci_guard_skip_run_yaml() {
+  local text="$1"
+  local template_name
+  # shellcheck disable=SC2016  # YAML run line embeds $GITHUB_OUTPUT literally
+  local -r skip_false_line='          echo "skip=false" >> "$GITHUB_OUTPUT"'
+  template_name="$(rp_ci_guard_skip_run_template_name "$text")"
+  rp_candidate_workflow_template "$template_name"
+  rp_candidate_ci_guard_push_dedup_yaml
+  printf '%s\n' "$skip_false_line"
+}
+
+rp_ci_workflow_guard_skip_run_is_broken() {
+  local text="$1"
+  local guard_text
+  guard_text="$(
+    awk '
+      /^  guard:/ { in_guard = 1 }
+      in_guard && /^  [a-zA-Z0-9_.-]+:/ && $0 !~ /^  guard:/ { exit }
+      in_guard { print }
+    ' <<<"$text"
+  )"
+  if awk '
+    BEGIN { prev_exit = 0; gh_token = 0 }
+    /GH_TOKEN:/ {
+      gh_token++
+      if (gh_token > 1) { broken = 1 }
+    }
+    /exit 0/ {
+      if (prev_exit) { broken = 1 }
+      prev_exit = 1
+      next
+    }
+    { prev_exit = 0 }
+    END { exit(broken ? 0 : 1) }
+  ' <<<"$guard_text"; then
+    return 0
+  fi
+  if grep -qF 'pull_request workflow covers' <<<"$guard_text" \
+    && grep -qE '^[[:space:]]*else[[:space:]]*$' <<<"$guard_text"; then
+    return 0
+  fi
+  return 1
+}
+
 rp_fix_ci_workflow_guard_push_dedup() {
   local text="$1"
-  local dedup_path
-  dedup_path="$(mktemp)"
-  rp_candidate_ci_guard_push_dedup_yaml >"$dedup_path"
-  if rp_ci_workflow_guard_has_push_dedup "$text"; then
-    rm -f "$dedup_path"
+  local run_path
+  if rp_ci_workflow_guard_has_push_dedup "$text" \
+    && ! rp_ci_workflow_guard_skip_run_is_broken "$text"; then
     printf '%s' "$text"
     return 0
   fi
-  awk -v dedup_path="$dedup_path" '
+  run_path="$(mktemp)"
+  rp_candidate_ci_guard_skip_run_yaml "$text" >"$run_path"
+  awk -v run_path="$run_path" '
     BEGIN {
       in_guard = 0
       in_skip_step = 0
       in_env = 0
       env_indent = -1
       env_has_token = 0
-      in_run = 0
       run_indent = -1
-      inserted = 0
-      drop_else = 0
-      after_skip_true = 0
-      while ((getline dedup_line < dedup_path) > 0) {
-        dedup = dedup dedup_line "\n"
-      }
-      close(dedup_path)
-    }
-    function flush_run_tail() {
-      if (in_run && !inserted) {
-        printf "%s", dedup
-        print "          echo \"skip=false\" >> \"$GITHUB_OUTPUT\""
-        inserted = 1
-      }
-      in_run = 0
-      in_skip_step = 0
-      drop_else = 0
-      after_skip_true = 0
+      replacing_run = 0
     }
     /^  guard:/ { in_guard = 1; print; next }
-    in_run {
-      cur = match($0, /[^ ]/) - 1
-      if ((cur <= run_indent && $0 ~ /^        [a-zA-Z]/) \
-          || (cur <= run_indent && $0 ~ /^  [a-zA-Z]/)) {
-        flush_run_tail()
-        print
-        next
-      }
-      if ($0 ~ /echo "skip=true" >> "\$GITHUB_OUTPUT"/) {
-        print
-        match($0, /^[[:space:]]*/)
-        print substr($0, 1, RLENGTH) "exit 0"
-        after_skip_true = 1
-        next
-      }
-      if (after_skip_true && $0 ~ /^[[:space:]]*else[[:space:]]*$/) {
-        drop_else = 1
-        next
-      }
-      if (drop_else && $0 ~ /echo "skip=false" >> "\$GITHUB_OUTPUT"/) {
-        next
-      }
-      if (drop_else && $0 ~ /^[[:space:]]*fi[[:space:]]*$/) {
-        drop_else = 0
-        after_skip_true = 0
-        match($0, /^[[:space:]]*/)
-        print substr($0, 1, RLENGTH) "fi"
-        printf "%s", dedup
-        print "          echo \"skip=false\" >> \"$GITHUB_OUTPUT\""
-        inserted = 1
-        next
-      }
-      if (!inserted && $0 ~ /echo "skip=false" >> "\$GITHUB_OUTPUT"/) {
-        printf "%s", dedup
-        inserted = 1
-      }
-      print
-      next
-    }
     in_guard && /^  [a-zA-Z0-9_.-]+:/ && $0 !~ /^  guard:/ {
-      flush_run_tail()
       in_guard = 0
+      in_skip_step = 0
       in_env = 0
+      replacing_run = 0
       print
       next
     }
     in_guard && /^      - id: (check|set-skip)$/ {
       in_skip_step = 1
       in_env = 0
+      replacing_run = 0
       env_has_token = 0
       print
       next
@@ -979,18 +989,23 @@ rp_fix_ci_workflow_guard_push_dedup() {
       in_env = 1
       env_indent = match($0, /[^ ]/) - 1
       print
-      if (!env_has_token) {
-        print "          GH_TOKEN: ${{ github.token }}"
-        env_has_token = 1
-      }
       next
     }
     in_env {
       cur = match($0, /[^ ]/) - 1
       if (cur <= env_indent) {
         in_env = 0
+        if (!env_has_token) {
+          print "          GH_TOKEN: ${{ github.token }}"
+          env_has_token = 1
+        }
       } else {
-        if ($0 ~ /GH_TOKEN:/) { env_has_token = 1 }
+        if ($0 ~ /GH_TOKEN:/) {
+          if (env_has_token) {
+            next
+          }
+          env_has_token = 1
+        }
         if ($0 ~ /HEAD_REF: \$\{\{ github\.head_ref \}\}/) {
           sub(/github\.head_ref \}\}/, "github.head_ref || github.ref_name }}")
         }
@@ -999,15 +1014,34 @@ rp_fix_ci_workflow_guard_push_dedup() {
       }
     }
     in_skip_step && /^        run: \|/ {
-      in_run = 1
-      run_indent = match($0, /[^ ]/) - 1
       print
+      run_indent = match($0, /[^ ]/) - 1
+      while ((getline run_line < run_path) > 0) {
+        print run_line
+      }
+      close(run_path)
+      replacing_run = 1
+      next
+    }
+    replacing_run {
+      cur = match($0, /[^ ]/) - 1
+      if (cur <= run_indent && $0 ~ /^        [a-zA-Z]/) {
+        replacing_run = 0
+        in_skip_step = 0
+        print
+        next
+      }
+      if (cur <= run_indent && $0 ~ /^  [a-zA-Z]/) {
+        replacing_run = 0
+        in_skip_step = 0
+        print
+        next
+      }
       next
     }
     { print }
-    END { flush_run_tail() }
   ' <<<"$text"
-  rm -f "$dedup_path"
+  rm -f "$run_path"
 }
 
 rp_fix_ci_workflow_graphite_restack_triggers() {
