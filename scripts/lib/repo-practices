@@ -690,6 +690,10 @@ rp_candidate_ci_guard_push_dedup_yaml() {
   rp_candidate_workflow_template 'ci-guard-push-dedup.snippet'
 }
 
+rp_candidate_ci_guard_permissions_yaml() {
+  rp_candidate_workflow_template 'ci-guard-permissions.snippet'
+}
+
 rp_ci_workflow_has_pull_request_edited_type() {
   local text="$1"
   awk '
@@ -762,8 +766,30 @@ rp_ci_workflow_has_feature_branch_push_trigger() {
 rp_ci_workflow_guard_has_push_dedup() {
   local text="$1"
   grep -qF 'github.event_name }}" == "push"' <<<"$text" \
-    && grep -qF 'pull_request workflow covers' <<<"$text" \
+    && grep -qF -- "--head \"\$BRANCH\"" <<<"$text" \
+    && grep -qF 'open PR exists; pull_request handles this push' <<<"$text" \
     && grep -qF "GH_TOKEN: \${{ github.token }}" <<<"$text"
+}
+
+rp_ci_workflow_guard_has_dedup_permissions() {
+  local text="$1"
+  local guard_block
+  guard_block="$(
+    awk '
+      /^  guard:/ { in_guard = 1; block = $0 "\n"; next }
+      in_guard {
+        if (/^  [a-zA-Z0-9_.-]+:/ && $0 !~ /^  guard:/) {
+          print block
+          exit
+        }
+        block = block $0 "\n"
+      }
+      END { if (in_guard) { print block } }
+    ' <<<"$text"
+  )"
+  [[ -n "$guard_block" ]] || return 1
+  grep -qE '^[[:space:]]*permissions:' <<<"$guard_block" \
+    && grep -qF 'pull-requests: read' <<<"$guard_block"
 }
 
 rp_ci_workflow_needs_graphite_restack_trigger_fix() {
@@ -771,6 +797,7 @@ rp_ci_workflow_needs_graphite_restack_trigger_fix() {
   if rp_ci_workflow_has_pull_request_edited_type "$text" \
     && rp_ci_workflow_has_feature_branch_push_trigger "$text" \
     && rp_ci_workflow_guard_has_push_dedup "$text" \
+    && rp_ci_workflow_guard_has_dedup_permissions "$text" \
     && ! rp_ci_workflow_guard_skip_run_is_broken "$text"; then
     return 1
   fi
@@ -970,11 +997,74 @@ rp_ci_workflow_guard_skip_run_is_broken() {
   ' <<<"$skip_step_text"; then
     return 0
   fi
+  if grep -qF "GITHUB_REPOSITORY_OWNER}:\${BRANCH}" <<<"$skip_step_text"; then
+    return 0
+  fi
+  if grep -qF 'pull_request workflow covers' <<<"$skip_step_text"; then
+    return 0
+  fi
   if grep -qF 'pull_request workflow covers' <<<"$skip_step_text" \
     && grep -qE '^[[:space:]]*else[[:space:]]*$' <<<"$skip_step_text"; then
     return 0
   fi
   return 1
+}
+
+rp_fix_ci_workflow_guard_permissions() {
+  local text="$1"
+  local block_path
+  if rp_ci_workflow_guard_has_dedup_permissions "$text"; then
+    printf '%s' "$text"
+    return 0
+  fi
+  block_path="$(mktemp)"
+  rp_candidate_ci_guard_permissions_yaml >"$block_path"
+  awk -v block_path="$block_path" '
+    BEGIN {
+      while ((getline block_line < block_path) > 0) {
+        block = block block_line "\n"
+      }
+      close(block_path)
+    }
+    /^  guard:/ {
+      in_guard = 1
+      guard_indent = match($0, /[^ ]/) - 1
+      print
+      next
+    }
+    in_guard && /^    permissions:/ {
+      skipping_permissions = 1
+      perm_indent = match($0, /[^ ]/) - 1
+      next
+    }
+    skipping_permissions {
+      cur = match($0, /[^ ]/) - 1
+      if (cur <= perm_indent) {
+        skipping_permissions = 0
+      } else {
+        next
+      }
+    }
+    in_guard && /^  [a-zA-Z0-9_.-]+:/ {
+      in_guard = 0
+      print block
+      print
+      next
+    }
+    in_guard && /^    (runs-on:|name:)/ && !inserted_permissions {
+      printf "%s", block
+      inserted_permissions = 1
+      print
+      next
+    }
+    { print }
+    END {
+      if (in_guard && !inserted_permissions) {
+        printf "%s", block
+      }
+    }
+  ' <<<"$text"
+  rm -f "$block_path"
 }
 
 rp_fix_ci_workflow_guard_push_dedup() {
@@ -1077,6 +1167,7 @@ rp_fix_ci_workflow_graphite_restack_triggers() {
   local text="$1"
   text="$(rp_fix_ci_workflow_pull_request_edited_type "$text")"
   text="$(rp_fix_ci_workflow_feature_branch_push_trigger "$text")"
+  text="$(rp_fix_ci_workflow_guard_permissions "$text")"
   text="$(rp_fix_ci_workflow_guard_push_dedup "$text")"
   printf '%s' "$text"
 }
@@ -2429,7 +2520,7 @@ rp_validate_graphite_workflows() {
 
     if rp_ci_workflow_needs_graphite_restack_trigger_fix "$ci_text"; then
       rp_log_fail \
-        "${slug}: ci.yml lacks full Graphite restack CI coverage (feature-branch push, guard push dedup, pull_request edited type)"
+        "${slug}: ci.yml lacks full Graphite restack CI coverage (feature-branch push, guard push dedup with pull-requests read, pull_request edited type)"
       if [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest \
           "${slug}: sync ci.yml Graphite restack triggers (scripts/github-repo-lint --apply-fix)"
@@ -2438,7 +2529,7 @@ rp_validate_graphite_workflows() {
         rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
           "$(rp_fix_ci_workflow_hardening "$ci_text")" \
           'sync-graphite-restack-ci-v2' \
-          'fix(ci): run CI on Graphite restack (push fallback + guard dedup)'
+          'fix(ci): skip duplicate push CI when an open PR exists'
         rp_compact_record_fix "$slug" \
           "${slug}: candidate PR: full Graphite restack ci.yml triggers"
       fi
