@@ -665,20 +665,20 @@ rp_fix_ci_workflow_concurrency() {
   rm -f "$block_path"
 }
 
-rp_ci_workflow_needs_graphite_restack_trigger_fix() {
+rp_candidate_ci_push_trigger_yaml() {
+  rp_candidate_workflow_template 'ci-push-trigger.snippet'
+}
+
+rp_candidate_ci_guard_push_dedup_yaml() {
+  rp_candidate_workflow_template 'ci-guard-push-dedup.snippet'
+}
+
+rp_ci_workflow_has_pull_request_edited_type() {
   local text="$1"
   awk '
-    BEGIN {
-      in_on = 0
-      in_pr = 0
-      pr_indent = -1
-      in_branches_ignore = 0
-      branches_ignore_indent = -1
-      has_graphite_ignore = 0
-      has_edited = 0
-    }
+    BEGIN { in_on = 0; in_pr = 0; pr_indent = -1; has_edited = 0 }
     /^on:[[:space:]]*$/ { in_on = 1; next }
-    in_on && /^[^[:space:]]/ { in_on = 0; in_pr = 0; pr_indent = -1; in_branches_ignore = 0 }
+    in_on && /^[^[:space:]]/ { in_on = 0; in_pr = 0; pr_indent = -1 }
     in_on && /^[[:space:]]*pull_request:[[:space:]]*$/ {
       in_pr = 1
       pr_indent = match($0, /[^ ]/) - 1
@@ -686,13 +686,43 @@ rp_ci_workflow_needs_graphite_restack_trigger_fix() {
     }
     in_pr {
       cur = match($0, /[^ ]/) - 1
-      if (cur <= pr_indent) {
-        in_pr = 0
+      if (cur <= pr_indent) { in_pr = 0; next }
+      if ($0 ~ /^[[:space:]]*types:[[:space:]]*/ && $0 ~ /edited/) {
+        has_edited = 1
+      }
+    }
+    END { exit(has_edited ? 0 : 1) }
+  ' <<<"$text"
+}
+
+rp_ci_workflow_has_feature_branch_push_trigger() {
+  local text="$1"
+  awk '
+    BEGIN {
+      in_on = 0
+      in_push = 0
+      push_indent = -1
+      in_branches_ignore = 0
+      branches_ignore_indent = -1
+      has_main_ignore = 0
+      has_graphite_ignore = 0
+    }
+    /^on:[[:space:]]*$/ { in_on = 1; next }
+    in_on && /^[^[:space:]]/ { in_on = 0; in_push = 0; in_branches_ignore = 0 }
+    in_on && /^[[:space:]]*push:[[:space:]]*$/ {
+      in_push = 1
+      push_indent = match($0, /[^ ]/) - 1
+      next
+    }
+    in_push {
+      cur = match($0, /[^ ]/) - 1
+      if (cur <= push_indent) {
+        in_push = 0
         in_branches_ignore = 0
         next
       }
-      if ($0 ~ /^[[:space:]]*types:[[:space:]]*/ && $0 ~ /edited/) {
-        has_edited = 1
+      if ($0 ~ /^[[:space:]]*branches:[[:space:]]*\[[[:space:]]*main/) {
+        exit 1
       }
       if ($0 ~ /^[[:space:]]*branches-ignore:[[:space:]]*$/) {
         in_branches_ignore = 1
@@ -702,26 +732,42 @@ rp_ci_workflow_needs_graphite_restack_trigger_fix() {
       if (in_branches_ignore) {
         if (cur <= branches_ignore_indent) {
           in_branches_ignore = 0
-        } else if ($0 ~ /graphite-base/) {
-          has_graphite_ignore = 1
+          next
         }
-        next
+        if ($0 ~ /main/) { has_main_ignore = 1 }
+        if ($0 ~ /graphite-base/) { has_graphite_ignore = 1 }
       }
     }
-    END { exit((has_graphite_ignore || !has_edited) ? 0 : 1) }
+    END { exit((has_main_ignore && has_graphite_ignore) ? 0 : 1) }
   ' <<<"$text"
 }
 
-rp_fix_ci_workflow_graphite_restack_triggers() {
+rp_ci_workflow_guard_has_push_dedup() {
+  local text="$1"
+  grep -qF 'github.event_name }}" == "push"' <<<"$text" \
+    && grep -qF 'pull_request workflow covers' <<<"$text" \
+    && grep -qF "GH_TOKEN: \${{ github.token }}" <<<"$text"
+}
+
+rp_ci_workflow_needs_graphite_restack_trigger_fix() {
+  local text="$1"
+  if rp_ci_workflow_has_pull_request_edited_type "$text" \
+    && rp_ci_workflow_has_feature_branch_push_trigger "$text" \
+    && rp_ci_workflow_guard_has_push_dedup "$text"; then
+    return 1
+  fi
+  return 0
+}
+
+rp_fix_ci_workflow_pull_request_edited_type() {
   local text="$1"
   awk '
-    BEGIN { in_on = 0; in_pr = 0; pr_indent = -1; in_branches_ignore = 0; branches_ignore_indent = -1 }
+    BEGIN { in_on = 0; in_pr = 0; pr_indent = -1; added_types = 0 }
     /^on:[[:space:]]*$/ { in_on = 1; print; next }
     in_on && /^[^[:space:]]/ {
       in_on = 0
       in_pr = 0
       pr_indent = -1
-      in_branches_ignore = 0
       print
       next
     }
@@ -729,33 +775,25 @@ rp_fix_ci_workflow_graphite_restack_triggers() {
       in_pr = 1
       pr_indent = match($0, /[^ ]/) - 1
       print
+      if (!added_types) {
+        printf "%*s  types: [opened, reopened, synchronize, ready_for_review, edited]\n", pr_indent + 2, ""
+        added_types = 1
+      }
       next
     }
     in_pr {
       cur = match($0, /[^ ]/) - 1
       if (cur <= pr_indent) {
         in_pr = 0
-        in_branches_ignore = 0
         print
         next
       }
       if ($0 ~ /^[[:space:]]*types:[[:space:]]*\[/) {
+        added_types = 1
         if ($0 !~ /edited/) {
           sub(/\][[:space:]]*$/, ", edited]")
         }
         print
-        next
-      }
-      if ($0 ~ /^[[:space:]]*branches-ignore:[[:space:]]*$/) {
-        in_branches_ignore = 1
-        branches_ignore_indent = cur
-        next
-      }
-      if (in_branches_ignore) {
-        if (cur <= branches_ignore_indent) {
-          in_branches_ignore = 0
-          print
-        }
         next
       }
       print
@@ -763,6 +801,187 @@ rp_fix_ci_workflow_graphite_restack_triggers() {
     }
     { print }
   ' <<<"$text"
+}
+
+rp_fix_ci_workflow_feature_branch_push_trigger() {
+  local text="$1"
+  local block_path
+  block_path="$(mktemp)"
+  rp_candidate_ci_push_trigger_yaml >"$block_path"
+  if rp_ci_workflow_has_feature_branch_push_trigger "$text"; then
+    rm -f "$block_path"
+    printf '%s' "$text"
+    return 0
+  fi
+  awk -v block_path="$block_path" '
+    BEGIN {
+      in_on = 0
+      in_push = 0
+      push_indent = -1
+      skipping_push = 0
+      inserted = 0
+      while ((getline block_line < block_path) > 0) {
+        block = block block_line "\n"
+      }
+      close(block_path)
+    }
+    /^on:[[:space:]]*$/ { in_on = 1; print; next }
+    in_on && /^[^[:space:]]/ {
+      if (!inserted) {
+        printf "\n%s", block
+        inserted = 1
+      }
+      in_on = 0
+      in_push = 0
+      skipping_push = 0
+      print
+      next
+    }
+    in_on && /^[[:space:]]*push:[[:space:]]*$/ {
+      in_push = 1
+      push_indent = match($0, /[^ ]/) - 1
+      skipping_push = 1
+      next
+    }
+    in_push {
+      cur = match($0, /[^ ]/) - 1
+      if (cur <= push_indent) {
+        in_push = 0
+        if (skipping_push) {
+          skipping_push = 0
+          if (!inserted) {
+            printf "%s", block
+            inserted = 1
+          }
+        }
+        print
+        next
+      }
+      next
+    }
+    in_on && /^[[:space:]]*schedule:[[:space:]]*$/ {
+      if (!inserted) {
+        printf "\n%s", block
+        inserted = 1
+      }
+      print
+      next
+    }
+    { print }
+    END {
+      if (in_on && !inserted) {
+        printf "\n%s", block
+      }
+    }
+  ' <<<"$text"
+  rm -f "$block_path"
+}
+
+rp_fix_ci_workflow_guard_push_dedup() {
+  local text="$1"
+  local dedup_path
+  dedup_path="$(mktemp)"
+  rp_candidate_ci_guard_push_dedup_yaml >"$dedup_path"
+  if rp_ci_workflow_guard_has_push_dedup "$text"; then
+    rm -f "$dedup_path"
+    printf '%s' "$text"
+    return 0
+  fi
+  awk -v dedup_path="$dedup_path" '
+    BEGIN {
+      in_guard = 0
+      in_skip_step = 0
+      in_env = 0
+      env_indent = -1
+      env_has_token = 0
+      in_run = 0
+      run_indent = -1
+      inserted = 0
+      while ((getline dedup_line < dedup_path) > 0) {
+        dedup = dedup dedup_line "\n"
+      }
+      close(dedup_path)
+    }
+    function flush_run_tail() {
+      if (in_run && !inserted) {
+        printf "%s", dedup
+        print "          echo \"skip=false\" >> \"$GITHUB_OUTPUT\""
+        inserted = 1
+      }
+      in_run = 0
+      in_skip_step = 0
+    }
+    /^  guard:/ { in_guard = 1; print; next }
+    in_run {
+      cur = match($0, /[^ ]/) - 1
+      if ((cur <= run_indent && $0 ~ /^        [a-zA-Z]/) \
+          || (cur <= run_indent && $0 ~ /^  [a-zA-Z]/)) {
+        flush_run_tail()
+        print
+        next
+      }
+      if (!inserted && $0 ~ /echo "skip=false" >> "\$GITHUB_OUTPUT"/) {
+        printf "%s", dedup
+        inserted = 1
+      }
+      print
+      next
+    }
+    in_guard && /^  [a-zA-Z0-9_.-]+:/ && $0 !~ /^  guard:/ {
+      flush_run_tail()
+      in_guard = 0
+      in_env = 0
+      print
+      next
+    }
+    in_guard && /^      - id: (check|set-skip)$/ {
+      in_skip_step = 1
+      in_env = 0
+      env_has_token = 0
+      print
+      next
+    }
+    in_skip_step && /^        env:/ {
+      in_env = 1
+      env_indent = match($0, /[^ ]/) - 1
+      print
+      if (!env_has_token) {
+        print "          GH_TOKEN: ${{ github.token }}"
+        env_has_token = 1
+      }
+      next
+    }
+    in_env {
+      cur = match($0, /[^ ]/) - 1
+      if (cur <= env_indent) {
+        in_env = 0
+      } else {
+        if ($0 ~ /GH_TOKEN:/) { env_has_token = 1 }
+        if ($0 ~ /HEAD_REF: \$\{\{ github\.head_ref \}\}/) {
+          sub(/github\.head_ref \}\}/, "github.head_ref || github.ref_name }}")
+        }
+        print
+        next
+      }
+    }
+    in_skip_step && /^        run: \|/ {
+      in_run = 1
+      run_indent = match($0, /[^ ]/) - 1
+      print
+      next
+    }
+    { print }
+    END { flush_run_tail() }
+  ' <<<"$text"
+  rm -f "$dedup_path"
+}
+
+rp_fix_ci_workflow_graphite_restack_triggers() {
+  local text="$1"
+  text="$(rp_fix_ci_workflow_pull_request_edited_type "$text")"
+  text="$(rp_fix_ci_workflow_feature_branch_push_trigger "$text")"
+  text="$(rp_fix_ci_workflow_guard_push_dedup "$text")"
+  printf '%s' "$text"
 }
 
 rp_fix_ci_workflow_hardening() {
@@ -2098,18 +2317,18 @@ rp_validate_graphite_workflows() {
 
     if rp_ci_workflow_needs_graphite_restack_trigger_fix "$ci_text"; then
       rp_log_fail \
-        "${slug}: ci.yml pull_request triggers miss Graphite restack coverage (edited type and/or graphite-base branches-ignore)"
+        "${slug}: ci.yml lacks full Graphite restack CI coverage (feature-branch push, guard push dedup, pull_request edited type)"
       if [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest \
-          "${slug}: add pull_request edited type and drop graphite-base branches-ignore (scripts/github-repo-lint --apply-fix)"
+          "${slug}: sync ci.yml Graphite restack triggers (scripts/github-repo-lint --apply-fix)"
       fi
       if [[ "$rp_apply_fix" -eq 1 ]]; then
         rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
           "$(rp_fix_ci_workflow_hardening "$ci_text")" \
           'fix-graphite-restack-ci-triggers' \
-          'fix(ci): run CI after Graphite restack without push fallback'
+          'fix(ci): run CI on Graphite restack (push fallback + guard dedup)'
         rp_compact_record_fix "$slug" \
-          "${slug}: candidate PR: fix ci.yml Graphite restack pull_request triggers"
+          "${slug}: candidate PR: full Graphite restack ci.yml triggers"
       fi
       fail=1
     fi
