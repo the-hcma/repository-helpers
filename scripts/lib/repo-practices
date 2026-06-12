@@ -665,8 +665,109 @@ rp_fix_ci_workflow_concurrency() {
   rm -f "$block_path"
 }
 
+rp_ci_workflow_needs_graphite_restack_trigger_fix() {
+  local text="$1"
+  awk '
+    BEGIN {
+      in_on = 0
+      in_pr = 0
+      pr_indent = -1
+      in_branches_ignore = 0
+      branches_ignore_indent = -1
+      has_graphite_ignore = 0
+      has_edited = 0
+    }
+    /^on:[[:space:]]*$/ { in_on = 1; next }
+    in_on && /^[^[:space:]]/ { in_on = 0; in_pr = 0; pr_indent = -1; in_branches_ignore = 0 }
+    in_on && /^[[:space:]]*pull_request:[[:space:]]*$/ {
+      in_pr = 1
+      pr_indent = match($0, /[^ ]/) - 1
+      next
+    }
+    in_pr {
+      cur = match($0, /[^ ]/) - 1
+      if (cur <= pr_indent) {
+        in_pr = 0
+        in_branches_ignore = 0
+        next
+      }
+      if ($0 ~ /^[[:space:]]*types:[[:space:]]*/ && $0 ~ /edited/) {
+        has_edited = 1
+      }
+      if ($0 ~ /^[[:space:]]*branches-ignore:[[:space:]]*$/) {
+        in_branches_ignore = 1
+        branches_ignore_indent = cur
+        next
+      }
+      if (in_branches_ignore) {
+        if (cur <= branches_ignore_indent) {
+          in_branches_ignore = 0
+        } else if ($0 ~ /graphite-base/) {
+          has_graphite_ignore = 1
+        }
+        next
+      }
+    }
+    END { exit((has_graphite_ignore || !has_edited) ? 0 : 1) }
+  ' <<<"$text"
+}
+
+rp_fix_ci_workflow_graphite_restack_triggers() {
+  local text="$1"
+  awk '
+    BEGIN { in_on = 0; in_pr = 0; pr_indent = -1; in_branches_ignore = 0; branches_ignore_indent = -1 }
+    /^on:[[:space:]]*$/ { in_on = 1; print; next }
+    in_on && /^[^[:space:]]/ {
+      in_on = 0
+      in_pr = 0
+      pr_indent = -1
+      in_branches_ignore = 0
+      print
+      next
+    }
+    in_on && /^[[:space:]]*pull_request:[[:space:]]*$/ {
+      in_pr = 1
+      pr_indent = match($0, /[^ ]/) - 1
+      print
+      next
+    }
+    in_pr {
+      cur = match($0, /[^ ]/) - 1
+      if (cur <= pr_indent) {
+        in_pr = 0
+        in_branches_ignore = 0
+        print
+        next
+      }
+      if ($0 ~ /^[[:space:]]*types:[[:space:]]*\[/) {
+        if ($0 !~ /edited/) {
+          sub(/\][[:space:]]*$/, ", edited]")
+        }
+        print
+        next
+      }
+      if ($0 ~ /^[[:space:]]*branches-ignore:[[:space:]]*$/) {
+        in_branches_ignore = 1
+        branches_ignore_indent = cur
+        next
+      }
+      if (in_branches_ignore) {
+        if (cur <= branches_ignore_indent) {
+          in_branches_ignore = 0
+          print
+        }
+        next
+      }
+      print
+      next
+    }
+    { print }
+  ' <<<"$text"
+}
+
 rp_fix_ci_workflow_hardening() {
   local text="$1"
+  text="$(rp_fix_ci_workflow_graphite_restack_triggers "$text")"
   text="$(rp_fix_ci_workflow_concurrency "$text")"
   if rp_ci_workflow_has_secret_scan_job "$text"; then
     text="$(rp_fix_ci_workflow_secret_scan_job "$text")"
@@ -1991,6 +2092,24 @@ rp_validate_graphite_workflows() {
           'fix-ci-stacked-prs' \
           'fix(ci): run CI for stacked PR base branches'
         rp_compact_record_fix "$slug" "${slug}: candidate PR: fix ci.yml pull_request trigger for stacked PRs"
+      fi
+      fail=1
+    fi
+
+    if rp_ci_workflow_needs_graphite_restack_trigger_fix "$ci_text"; then
+      rp_log_fail \
+        "${slug}: ci.yml pull_request triggers miss Graphite restack coverage (edited type and/or graphite-base branches-ignore)"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: add pull_request edited type and drop graphite-base branches-ignore (scripts/github-repo-lint --apply-fix)"
+      fi
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
+        rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
+          "$(rp_fix_ci_workflow_hardening "$ci_text")" \
+          'fix-graphite-restack-ci-triggers' \
+          'fix(ci): run CI after Graphite restack without push fallback'
+        rp_compact_record_fix "$slug" \
+          "${slug}: candidate PR: fix ci.yml Graphite restack pull_request triggers"
       fi
       fail=1
     fi
