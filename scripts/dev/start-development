@@ -151,6 +151,28 @@ worktree_has_dirty_tree() {
   [[ -n "$st" ]]
 }
 
+# branch_patch_already_on_main <repo> <branch>
+# Exit 0 when every commit on branch is already on main (fast-forward merge or squash).
+branch_patch_already_on_main() {
+  local -r repo="$1"
+  local -r branch="$2"
+  local branch_sha cherry_out
+
+  branch_sha="$(git -C "$repo" rev-parse --verify "${branch}^{commit}" 2>/dev/null || true)"
+  [[ -n "$branch_sha" ]] || return 1
+
+  if git -C "$repo" merge-base --is-ancestor "$branch_sha" main 2>/dev/null; then
+    return 0
+  fi
+
+  cherry_out="$(git -C "$repo" cherry -v main "$branch" 2>/dev/null || true)"
+  [[ -n "$cherry_out" ]] || return 1
+  if printf '%s\n' "$cherry_out" | grep -q '^+'; then
+    return 1
+  fi
+  return 0
+}
+
 # remove_secondary_worktree <main_repo> <path> <branch> <human_reason_one_line>
 remove_secondary_worktree() {
   local -r repo="$1"
@@ -235,6 +257,16 @@ handle_secondary_worktree() {
   # NOT_FOUND (or unexpected empty): optional stale cleanup, else keep.
   if [[ "$pr_state" == "NOT_FOUND" ]]; then
     if ! worktree_has_dirty_tree "$current_path"; then
+      if branch_patch_already_on_main "$main_repo" "$current_branch"; then
+        if [[ "$current_path" == "$this_worktree" ]]; then
+          printf '   [~] Patch content already on main, but this is the running worktree; skipping removal.\n'
+          pending_worktrees+=("$current_path|$current_branch")
+          return 0
+        fi
+        remove_secondary_worktree "$main_repo" "$current_path" "$current_branch" \
+          "Patch content already on main (git cherry / ancestor). Removing worktree…"
+        return 0
+      fi
       head_epoch="$(secondary_worktree_head_epoch "$current_path")"
       now="$(date +%s)"
       stale_threshold=$(( 12 * 60 * 60 ))
@@ -494,6 +526,12 @@ while IFS= read -r branch; do
         # Remote branch gone; check if it's fully merged into main locally
         elif git -C "$main_repo" branch --merged main | grep -qxF "  $branch"; then
             echo "   [!] Deleting $branch (merged into main, no remote PR)..."
+            git -C "$main_repo" branch -D "$branch" 2>/dev/null || true
+        elif branch_patch_already_on_main "$main_repo" "$branch"; then
+            echo "   [!] Deleting $branch (patch content already on main, no PR)..."
+            git -C "$main_repo" branch -D "$branch" 2>/dev/null || true
+        elif [[ "$branch" =~ ^pr-[0-9]+-merge$ ]]; then
+            echo "   [!] Deleting $branch (Graphite merge-queue staging branch, no PR)..."
             git -C "$main_repo" branch -D "$branch" 2>/dev/null || true
         else
             echo "   [+] Keeping $branch (unmerged, no remote PR)."
