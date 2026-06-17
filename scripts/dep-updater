@@ -31,6 +31,9 @@ readonly dep_script_dir
 # shellcheck source=scripts/lib/release-age-defaults
 source "${dep_script_dir}/lib/release-age-defaults"
 
+# shellcheck source=scripts/lib/github-repo-slug
+source "${dep_script_dir}/lib/github-repo-slug"
+
 dep_updater_minimum_release_age_minutes="$release_age_dep_updater_minutes"
 readonly dep_updater_minimum_release_age_minutes
 
@@ -64,6 +67,7 @@ no_wait_merge=0
 security_only=0
 batch=0
 batch_all=0
+include_private=0
 scan_roots_csv=""
 dir_explicit=0
 merge_timeout_min=15
@@ -503,11 +507,15 @@ Modes:
 Options:
   --all             With --batch: run batch updates for every git repo discovered
                     under the top-level scan directories (see --scan-root). Prints
-                    each resolved top-level directory before running. For quick runs,
+                    each resolved top-level directory before running. Skips private
+                    GitHub repositories unless --include-private is set. For quick runs,
                     combine with --no-wait-ci --no-wait-merge.
   --batch           Combine all updates into a single PR instead of one per package
   --dir <path>      Project root (default: current directory)
   --ecosystem <e>   Force: npm | python | rust | gha | auto  (default: auto)
+  --include-private Include private GitHub repositories in --batch --all discovery
+                    (default: skip private repos; explicit --dir is always processed).
+                    Override via DEP_UPDATER_INCLUDE_PRIVATE=1.
   --merge-timeout <min>  Minutes to wait for all PRs to merge (default: 15)
   --merge-via <mode>  How to land PRs after CI passes: gh | merge-queue
                     (default: gh for --batch, merge-queue otherwise; override via
@@ -572,6 +580,9 @@ parse_args() {
         shift
         [[ $# -eq 0 ]] && die "--ecosystem requires a value: npm | python | rust | gha | auto"
         ecosystem="$1"
+        ;;
+      --include-private)
+        include_private=1
         ;;
       --merge-timeout)
         shift
@@ -716,8 +727,12 @@ parse_args() {
     *) die "Invalid --merge-via: '${merge_via}'. Valid values: gh | merge-queue" ;;
   esac
 
+  if [[ "${DEP_UPDATER_INCLUDE_PRIVATE:-0}" == '1' ]]; then
+    include_private=1
+  fi
+
   # shellcheck disable=SC2034  # cleanup_mode, rebase_mode, merge_timeout_min used in main() dispatch
-  readonly dry_run cleanup_mode rebase_mode dir ecosystem semver_only no_wait_ci no_wait_merge security_only batch batch_all merge_timeout_min merge_via wt_tmpdir quiet report_json scan_roots_csv log_tz
+  readonly dry_run cleanup_mode rebase_mode dir ecosystem semver_only no_wait_ci no_wait_merge security_only batch batch_all include_private merge_timeout_min merge_via wt_tmpdir quiet report_json scan_roots_csv log_tz
 }
 
 # ---------------------------------------------------------------------------
@@ -6047,7 +6062,7 @@ log_batch_all_top_level_dirs() {
 }
 
 discover_batch_all_repos() {
-  local root resolved_root child resolved_child
+  local root resolved_root child resolved_child slug priv_status
 
   while IFS= read -r root; do
     [[ -n "$root" ]] || continue
@@ -6062,6 +6077,24 @@ discover_batch_all_repos() {
       [[ -e "$child/.git" ]] || continue
       resolved_child=""
       resolved_child="$(realpath "$child" 2>/dev/null)" || continue
+
+      slug=""
+      slug="$(gh_slug_from_repo_dir "$resolved_child" 2>/dev/null)" || slug=""
+      if [[ -n "$slug" ]] && [[ "$include_private" -eq 0 ]]; then
+        priv_status=0
+        gh_repo_is_private "$slug" || priv_status=$?
+        case "$priv_status" in
+          0)
+            log "[batch-all] Skipping private repository: $(basename "$resolved_child") (${slug})"
+            continue
+            ;;
+          2)
+            log "[batch-all] WARNING: could not determine visibility for ${slug}; skipping"
+            continue
+            ;;
+        esac
+      fi
+
       printf '%s\n' "$resolved_child"
     done < <(find "$resolved_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
   done < <(tr ':' '\n' <<<"$scan_roots_csv" | sed '/^$/d')

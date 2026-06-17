@@ -20,11 +20,15 @@ source "${rp_lib_dir}/release-age-defaults"
 # shellcheck source=scripts/lib/ci-secret-scan-policy
 source "${rp_lib_dir}/ci-secret-scan-policy"
 
+# shellcheck source=scripts/lib/github-repo-slug
+source "${rp_lib_dir}/github-repo-slug"
+
 rp_org="$rp_DEFAULT_ORG"
 rp_apply_fix=0
 rp_suggest=0
 rp_new_repo=0
 rp_audit_all=0
+rp_include_private=0
 rp_merge_only=0
 rp_strict_onboarding=0
 rp_compact=0
@@ -50,8 +54,8 @@ Usage:
   scripts/${prog} [--org ORG] [--repo OWNER/NAME ...]
   scripts/${prog} --new-repo --repo OWNER/NAME
   scripts/${prog} --strict-onboarding --repo OWNER/NAME ...
-  scripts/${prog} --all [--org ORG]
-  scripts/${prog} --suggest [--repo OWNER/NAME ...]
+  scripts/${prog} --all [--org ORG] [--include-private]
+  scripts/${prog} --suggest [--repo OWNER/NAME ...] [--include-private]
   scripts/${prog} --apply-fix [--repo ...]      # settings fixes + candidate workflow PRs
 
 Audits GitHub conventions for org repositories:
@@ -82,6 +86,9 @@ Audits GitHub conventions for org repositories:
 --new-repo: audit a single repo with SUGGEST hints and a setup checklist (requires --repo).
 --strict-onboarding: require full org onboarding, including merge-it, for audited repos.
 --all: audit every repository in the org (not only merge-it / release-please).
+--include-private: include private GitHub repositories in org discovery and enforcer scans
+(default: skip private repos in bulk discovery; explicit --repo and current-clone audits are
+always included). Override via GITHUB_REPO_LINT_INCLUDE_PRIVATE=1.
 With no --repo: audit the current git repository when run inside a clone (origin on GitHub);
 otherwise discover org repos with release-please.yml or merge-it.
 --suggest: print SUGGEST lines with remediation hints (non-zero exit still on FAIL).
@@ -394,22 +401,12 @@ rp_repo_short_name() {
 
 # When run inside a git clone, resolve OWNER/NAME from origin (GitHub only).
 rp_resolve_git_context_slug() {
-  local repo_root remote_url slug
+  local repo_root
   repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   if [[ -z "$repo_root" ]]; then
     return 1
   fi
-  remote_url="$(git -C "$repo_root" remote get-url origin 2>/dev/null || true)"
-  if [[ -z "$remote_url" ]]; then
-    return 1
-  fi
-  slug="$(printf '%s' "$remote_url" \
-    | sed -E 's#^git@github.com:##; s#^ssh://git@github.com/##; s#^https://github.com/##; s#\.git$##')"
-  if [[ "$slug" == */* ]]; then
-    printf '%s\n' "$slug"
-    return 0
-  fi
-  return 1
+  gh_slug_from_repo_dir "$repo_root"
 }
 
 rp_is_strict_repo() {
@@ -1549,7 +1546,11 @@ rp_repo_should_audit_default() {
 
 rp_discover_org_repos() {
   local owner="$1"
-  gh api "orgs/${owner}/repos" --paginate --jq '.[].name'
+  local jq_expr='.[].name'
+  if [[ "$rp_include_private" -eq 0 ]]; then
+    jq_expr='.[] | select(.private == false) | .name'
+  fi
+  gh api "orgs/${owner}/repos" --paginate --jq "$jq_expr"
 }
 
 rp_discover_audit_repos() {
@@ -2283,6 +2284,10 @@ rp_parse_args() {
         rp_audit_all=1
         shift
         ;;
+      --include-private)
+        rp_include_private=1
+        shift
+        ;;
       --merge-only)
         rp_merge_only=1
         shift
@@ -2292,6 +2297,10 @@ rp_parse_args() {
         ;;
     esac
   done
+
+  if [[ "${GITHUB_REPO_LINT_INCLUDE_PRIVATE:-0}" == '1' ]]; then
+    rp_include_private=1
+  fi
 
   if [[ "$rp_new_repo" -eq 1 ]]; then
     if [[ "${#rp_repo_slugs[@]}" -ne 1 ]]; then
