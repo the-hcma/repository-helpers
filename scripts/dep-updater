@@ -447,6 +447,35 @@ wait_for_pr_number_for_new_branch() {
   return 1
 }
 
+gh_pr_head_ref_for_number() {
+  local -r pr_number="$1"
+  gh pr view "$pr_number" --repo "${repo_owner}/${repo_name}" \
+    --json headRefName --jq '.headRefName // empty' 2>/dev/null || true
+}
+
+gh_pr_head_sha_for_number() {
+  local -r pr_number="$1"
+  gh pr view "$pr_number" --repo "${repo_owner}/${repo_name}" \
+    --json headRefOid --jq '.headRefOid // empty' 2>/dev/null || true
+}
+
+gh_pr_number_resolve_for_gate() {
+  local -r branch="$1"
+  local pr
+
+  pr="$(gh_pr_number_for_branch "$branch")"
+  if [[ -n "$pr" ]]; then
+    printf '%s' "$pr"
+    return 0
+  fi
+  pr="$(gh_pr_number_for_new_branch "$branch")"
+  if [[ -n "$pr" ]]; then
+    printf '%s' "$pr"
+    return 0
+  fi
+  return 1
+}
+
 gh_pr_state_for_number() {
   local -r pr_number="$1"
   gh api "repos/${repo_owner}/${repo_name}/pulls/${pr_number}" \
@@ -5344,6 +5373,83 @@ require_resume_ci_gate() {
   esac
 }
 
+gate_branch_head_sha() {
+  local -r branch="$1"
+  local -r pr_num="$2"
+  local sha
+
+  sha="$(git -C "$worktree_path" rev-parse "$branch" 2>/dev/null || true)"
+  if [[ -n "$sha" ]]; then
+    printf '%s' "$sha"
+    return 0
+  fi
+  if git -C "$worktree_path" show-ref --verify --quiet "refs/remotes/origin/${branch}" 2>/dev/null; then
+    sha="$(git -C "$worktree_path" rev-parse "origin/${branch}" 2>/dev/null || true)"
+    if [[ -n "$sha" ]]; then
+      printf '%s' "$sha"
+      return 0
+    fi
+  fi
+  if [[ -n "$pr_num" ]]; then
+    sha="$(gh_pr_head_sha_for_number "$pr_num")"
+    if [[ -n "$sha" ]]; then
+      printf '%s' "$sha"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+gate_open_pr_for_ci() {
+  local branch="$1"
+  local -r pr_num="$2"
+  local head_sha already_merged pr_state
+
+  if ! is_valid_pr_number "$pr_num"; then
+    die "Expected a valid PR number for CI gate, got '${pr_num}'"
+  fi
+
+  already_merged="$(gh_pr_merged_for_number "$pr_num" 2>/dev/null || true)"
+  if [[ "$already_merged" == 'true' ]]; then
+    return 0
+  fi
+
+  pr_state="$(gh_pr_state_for_number "$pr_num")"
+  if [[ "$pr_state" == 'closed' ]]; then
+    return 0
+  fi
+
+  if [[ -z "$branch" ]]; then
+    branch="$(gh_pr_head_ref_for_number "$pr_num")"
+  fi
+  [[ -n "$branch" ]] || die "Could not resolve branch for PR #${pr_num} before CI wait."
+
+  head_sha="$(gate_branch_head_sha "$branch" "$pr_num")"
+  [[ -n "$head_sha" ]] \
+    || die "Could not resolve head SHA for PR #${pr_num} (branch='${branch}') before CI wait."
+
+  log "[gate] Checking merge conflict status for PR #${pr_num} before waiting for CI…"
+  wait_for_mergeable_quick "$pr_num"
+  log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
+  wait_for_ci "$branch" "$head_sha" "$pr_num"
+  if [[ "$(gh_pr_merged_for_number "$pr_num")" != 'true' ]]; then
+    log "[gate] CI passed. Final merge conflict check…"
+    wait_for_mergeable "$pr_num"
+    log "[gate] PR #${pr_num} is mergeable."
+  fi
+}
+
+gate_pr_was_gated() {
+  local -r pr_number="$1"
+  local -a gated_pr_nums=("${@:2}")
+  local g
+
+  for g in "${gated_pr_nums[@]}"; do
+    [[ "$g" == "$pr_number" ]] && return 0
+  done
+  return 1
+}
+
 # Gates on CI and mergeability for every branch that has been created so far
 # in this run.  Called once after all PRs are created so that no individual
 # PR is visible as "CI-passed + labelled" before the full stack is assembled.
@@ -5351,33 +5457,71 @@ require_resume_ci_gate() {
 # handles the regular (and batch) PRs, and is a fast no-op for branches whose
 # CI already passed (wait_for_ci returns success on the first poll).
 gate_all_created_prs() {
-  local branches_csv branch pr_num head_sha already_merged
-  local -a gate_list
+  local branches_csv prs_csv branch pr_num
+  local -a gate_list gated_pr_nums=()
+  local tracked_csv tracked_p ungated_csv="" p
 
   [[ "$no_wait_ci" == '0' ]] || return 0
 
   branches_csv="$(state_get "branches")"
-  [[ -z "$branches_csv" ]] && return 0
+  prs_csv="$(state_get "prs")"
+  if [[ -z "$branches_csv" && -z "$prs_csv" ]]; then
+    return 0
+  fi
 
-  IFS=',' read -ra gate_list <<< "$branches_csv"
-  for branch in "${gate_list[@]}"; do
-    [[ -z "$branch" ]] && continue
-    pr_num="$(gh_pr_number_for_branch "$branch")"
-    [[ -z "$pr_num" ]] && continue
-    already_merged="$(gh_pr_merged_for_number "$pr_num" 2>/dev/null || true)"
-    [[ "$already_merged" == 'true' ]] && continue
-    head_sha="$(git -C "$worktree_path" rev-parse "$branch" 2>/dev/null || true)"
-    [[ -z "$head_sha" ]] && continue
-    log "[gate] Checking merge conflict status for PR #${pr_num} before waiting for CI…"
-    wait_for_mergeable_quick "$pr_num"
-    log "[gate] Waiting for CI on PR #${pr_num} (${branch})…"
-    wait_for_ci "$branch" "$head_sha" "$pr_num"
-    if [[ "$(gh_pr_merged_for_number "$pr_num")" != 'true' ]]; then
-      log "[gate] CI passed. Final merge conflict check…"
-      wait_for_mergeable "$pr_num"
-      log "[gate] PR #${pr_num} is mergeable."
+  if [[ -n "$branches_csv" ]]; then
+    IFS=',' read -ra gate_list <<< "$branches_csv"
+    for branch in "${gate_list[@]}"; do
+      [[ -z "$branch" ]] && continue
+      pr_num="$(gh_pr_number_resolve_for_gate "$branch" 2>/dev/null || true)"
+      if [[ -z "$pr_num" ]]; then
+        die "Could not resolve open PR for branch '${branch}' before CI wait (dep-updater label may be missing)."
+      fi
+      if gate_pr_was_gated "$pr_num" "${gated_pr_nums[@]}"; then
+        continue
+      fi
+      gate_open_pr_for_ci "$branch" "$pr_num"
+      gated_pr_nums+=("$pr_num")
+    done
+  fi
+
+  if [[ -n "$prs_csv" ]]; then
+    IFS=',' read -ra gate_list <<< "$prs_csv"
+    for p in "${gate_list[@]}"; do
+      [[ -z "$p" ]] && continue
+      if ! is_valid_pr_number "$p"; then
+        continue
+      fi
+      if gate_pr_was_gated "$p" "${gated_pr_nums[@]}"; then
+        continue
+      fi
+      branch="$(gh_pr_head_ref_for_number "$p")"
+      gate_open_pr_for_ci "$branch" "$p"
+      gated_pr_nums+=("$p")
+    done
+  fi
+
+  tracked_csv="$(collect_tracked_prs_csv)"
+  if [[ -z "$tracked_csv" ]]; then
+    return 0
+  fi
+
+  IFS=',' read -ra gate_list <<< "$tracked_csv"
+  for tracked_p in "${gate_list[@]}"; do
+    [[ -z "$tracked_p" ]] && continue
+    if gate_pr_was_gated "$tracked_p" "${gated_pr_nums[@]}"; then
+      continue
+    fi
+    if [[ -z "$ungated_csv" ]]; then
+      ungated_csv="#${tracked_p}"
+    else
+      ungated_csv="${ungated_csv}, #${tracked_p}"
     fi
   done
+
+  if [[ -n "$ungated_csv" ]]; then
+    die "CI wait was skipped for tracked PR(s): ${ungated_csv}; refusing to merge without wait_for_ci."
+  fi
 }
 
 maybe_label_top_pr_for_merge() {
@@ -5697,6 +5841,7 @@ merge_pr_via_gh_single() {
   local -r timeout_min="${merge_timeout_min}"
   local -r poll_sec=10
   local merged ci_status merge_out merge_exit elapsed elapsed_fmt
+  local merge_branch merge_head
 
   merged="$(gh_pr_merged_for_number "$pr_num")"
   if [[ "$merged" == 'true' ]]; then
@@ -5705,7 +5850,19 @@ merge_pr_via_gh_single() {
   fi
 
   ci_status="$(ci_conclusion_for_pr "$pr_num")"
+  if [[ "$ci_status" != 'success' && "$no_wait_ci" == '0' ]]; then
+    merge_branch="$(gh_pr_head_ref_for_number "$pr_num")"
+    merge_head="$(gh_pr_head_sha_for_number "$pr_num")"
+    if [[ -n "$merge_branch" && -n "$merge_head" ]]; then
+      log "[merge] CI status ${ci_status} on PR #${pr_num}; waiting for CI before gh merge…"
+      wait_for_ci "$merge_branch" "$merge_head" "$pr_num"
+      ci_status="$(ci_conclusion_for_pr "$pr_num")"
+    fi
+  fi
   if [[ "$ci_status" != 'success' ]]; then
+    if [[ "$ci_status" == 'pending' || "$ci_status" == 'missing' ]]; then
+      die "PR #${pr_num} CI not ready (status: ${ci_status}); refusing gh merge without a successful CI wait."
+    fi
     die "PR #${pr_num} is not CI-green (status: ${ci_status}); refusing gh merge."
   fi
 
@@ -6156,6 +6313,23 @@ batch_all_scrape_actionable_from_log() {
     return 0
   fi
 
+  line="$(grep -E 'not CI-green|CI not ready|CI wait was skipped|refusing gh merge without' \
+    "$log_file" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$line" ]]; then
+    stripped="${line#*ERROR: }"
+    stripped="${stripped#*  }"
+    printf '%s' "$stripped"
+    return 0
+  fi
+
+  line="$(grep -E 'Could not resolve open PR for branch ' \
+    "$log_file" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$line" ]]; then
+    stripped="${line#*ERROR: }"
+    printf '%s' "$stripped"
+    return 0
+  fi
+
   line="$(grep -E 'ERR_PNPM_NO_MATCHING_VERSION|No matching version found for ' \
     "$log_file" 2>/dev/null | tail -n 1 || true)"
   if [[ -n "$line" ]]; then
@@ -6344,7 +6518,11 @@ batch_all_dispatch() {
       fi
 
       rm -f "$child_clean" "$child_report"
-      failure_summaries+=("$(basename "$repo"): exit ${child_exit}")
+      if [[ -n "$root_cause" ]]; then
+        failure_summaries+=("$(basename "$repo"): exit ${child_exit} — ${root_cause}")
+      else
+        failure_summaries+=("$(basename "$repo"): exit ${child_exit}")
+      fi
       if [[ "$worst_exit" -eq 0 ]] || [[ "$child_exit" -gt "$worst_exit" ]]; then
         worst_exit="$child_exit"
       fi
