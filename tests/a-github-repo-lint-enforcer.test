@@ -70,6 +70,8 @@ printf '\n=== static: strict onboarding monitor ===\n'
 if grep -qF 'enforcer_discover_repo_slugs' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF 'gh_slug_from_repo_dir' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF 'gh_repo_is_private' "${script_dir}/../scripts/github-repo-lint" \
+  && grep -qF 'enforcer_discover_note' "${script_dir}/../scripts/github-repo-lint" \
+  && grep -qF 'repo_helpers_run_context_footer' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF -- '--strict-onboarding' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF -- '--compact' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF $'tee -a "$enforcer_run_log" <"$enforcer_check_log"' "${script_dir}/../scripts/github-repo-lint" \
@@ -126,11 +128,21 @@ printf '\n=== mock monitor sends SMTP report on failure ===\n'
 tmp=""
 tmp="$(mktemp -d)"
 write_test_env_file "$tmp"
-mkdir -p "$tmp/scan/ok-repo" "$tmp/scan/bad-repo" "$tmp/scratch"
+mkdir -p "$tmp/scan/ok-repo" "$tmp/scan/bad-repo" "$tmp/scratch" "$tmp/bin"
 git -C "$tmp/scan/ok-repo" init -q
 git -C "$tmp/scan/ok-repo" remote add origin "https://github.com/the-hcma/ok-repo.git"
 git -C "$tmp/scan/bad-repo" init -q
 git -C "$tmp/scan/bad-repo" remote add origin "https://github.com/the-hcma/bad-repo.git"
+
+cat >"$tmp/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == api && "${2:-}" == repos/* ]]; then
+  printf 'false\n'
+  exit 0
+fi
+printf 'false\n'
+EOF
+chmod +x "$tmp/bin/gh"
 
 cat >"$tmp/github-repo-lint-checker" <<'EOF'
 #!/usr/bin/env bash
@@ -154,6 +166,7 @@ args_log="${tmp}/args.out"
 monitor_exit=0
 (
   HOME="$tmp" \
+  PATH="${tmp}/bin:${PATH}" \
   REPO_HELPERS_TEST_MODE=1 \
   REPO_HELPERS_SMTP_BREADCRUMB="$breadcrumb" \
   GITHUB_REPO_LINT_ARGS_LOG="$args_log" \
@@ -181,6 +194,87 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$tmp"
+
+printf '\n=== discovery skip lines do not become repo slugs ===\n'
+disc_tmp=""
+disc_tmp="$(mktemp -d)"
+write_test_env_file "$disc_tmp"
+mkdir -p "$disc_tmp/scan/public-repo" "$disc_tmp/scan/private-repo" "$disc_tmp/bin"
+git -C "$disc_tmp/scan/public-repo" init -q
+git -C "$disc_tmp/scan/public-repo" remote add origin "https://github.com/the-hcma/public-repo.git"
+git -C "$disc_tmp/scan/private-repo" init -q
+git -C "$disc_tmp/scan/private-repo" remote add origin "https://github.com/the-hcma/private-repo.git"
+
+cat >"$disc_tmp/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == api && "${2:-}" == repos/the-hcma/private-repo ]]; then
+  printf 'true\n'
+  exit 0
+fi
+if [[ "${1:-}" == api && "${2:-}" == repos/the-hcma/public-repo ]]; then
+  printf 'false\n'
+  exit 0
+fi
+printf 'false\n'
+EOF
+chmod +x "$disc_tmp/bin/gh"
+
+disc_args_log="${disc_tmp}/args.out"
+cat >"$disc_tmp/github-repo-lint-checker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${GITHUB_REPO_LINT_ARGS_LOG:?}"
+printf 'Passed: the-hcma/public-repo\n'
+printf 'all 1 repositories passed\n'
+EOF
+chmod +x "$disc_tmp/github-repo-lint-checker"
+
+disc_monitor_exit=0
+(
+  HOME="$disc_tmp" \
+  PATH="${disc_tmp}/bin:${PATH}" \
+  REPO_HELPERS_TEST_MODE=1 \
+  GITHUB_REPO_LINT_ARGS_LOG="$disc_args_log" \
+  GITHUB_REPO_LINT_SCAN_ROOT="${disc_tmp}/scan" \
+  GITHUB_REPO_LINT_LOG="${disc_tmp}/scratch/github-repo-lint.log" \
+  GITHUB_REPO_LINT_CHECKER="${disc_tmp}/github-repo-lint-checker" \
+  bash "${script}"
+) >/dev/null || disc_monitor_exit=$?
+
+if [[ "$disc_monitor_exit" -eq 0 ]] \
+  && grep -qF -- '--repo the-hcma/public-repo' "$disc_args_log" \
+  && ! grep -qF 'Skipping private repository' "$disc_args_log"; then
+  printf '[PASS] discovery: private skip log lines are not passed as --repo slugs\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] discovery: expected only public repo in checker args (exit=%s)\n%s\n' \
+    "$disc_monitor_exit" "$(cat "$disc_args_log" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$disc_tmp"
+
+printf '\n=== print report includes run context footer ===\n'
+ctx_tmp=""
+ctx_tmp="$(mktemp -d)"
+write_test_env_file "$ctx_tmp"
+ctx_out=""
+ctx_exit=0
+ctx_out="$(
+  HOME="$ctx_tmp" REPO_HELPERS_TEST_MODE=1 \
+    bash "$script" --print 2>/dev/null
+)" || ctx_exit=$?
+if [[ "$ctx_exit" -eq 0 ]] \
+  && grep -qF 'Run context:' <<<"$ctx_out" \
+  && grep -qF 'Host:' <<<"$ctx_out" \
+  && grep -qF 'User:' <<<"$ctx_out" \
+  && grep -qF 'Command:' <<<"$ctx_out"; then
+  printf '[PASS] print: multipart report ends with host/user/command run context\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] print: expected run context footer (exit=%s)\n' "$ctx_exit"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$ctx_tmp"
 
 printf '\n=== slug discovery strips .git suffix ===\n'
 slug_lib="${script_dir}/../scripts/lib/github-repo-slug"
