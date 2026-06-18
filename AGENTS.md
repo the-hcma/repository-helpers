@@ -218,12 +218,11 @@ scripts/dev/start-development --refresh
 
 ## Worktree-aware Scripts
 
-`setup-service` and `scripts/on-deploy` are **worktree-aware**: service templates
-in `share/systemd-unit-templates/` (or optional gitignored `etc/systemd/` overrides),
-`@@REPO_DIR@@` substitution in the generated unit file, and the `on-deploy` hook
-itself are resolved from whichever worktree the script is invoked from. Calling
-`setup-service` from a feature worktree therefore deploys that worktree's code —
-this is intentional and is the primary mechanism for testing feature branches locally.
+`setup-service` and `scripts/on-deploy` are **worktree-aware**: unit templates in
+`etc/systemd/`, `@@REPO_DIR@@` substitution in the generated unit file, and the
+`on-deploy` hook itself are resolved from whichever worktree the script is invoked
+from. Calling `setup-service` from a feature worktree therefore deploys that
+worktree's code — this is the primary mechanism for testing feature branches locally.
 
 - **`DEPLOYED_COMMIT`:** `setup-service` injects `Environment=DEPLOYED_COMMIT=<HEAD>` into the generated systemd unit (no template change required). The running commit is read from the service process environment, not `git HEAD` at the process cwd. If `DEPLOYED_COMMIT` is missing on the running process, missing from the installed unit, or differs from the current checkout, treat the deploy as stale: run `on-deploy` and restart conservatively.
 - **Service name** is derived from the git remote URL (not the directory name), so it is stable across all worktrees.
