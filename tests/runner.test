@@ -25,19 +25,18 @@ lib_text="$(cat "$lib")"
 assert_contains "declares run_command"           "$lib_text" "run_command()"
 assert_contains "declares run_command_or_die"    "$lib_text" "run_command_or_die()"
 assert_contains "declares record_first_failure"  "$lib_text" "record_first_failure()"
-assert_contains "delegates to run_command"       "$lib_text" 'run_command "$@"'
+assert_contains "declares runner_exec"           "$lib_text" "runner_exec()"
+assert_contains "declares runner_session_begin"  "$lib_text" "runner_session_begin()"
+assert_contains "artifact stdout file"           "$lib_text" "_runner_artifact_stdout"
+assert_contains "artifact stderr file"           "$lib_text" "_runner_artifact_stderr"
+assert_contains "artifact exit_status file"      "$lib_text" "_runner_artifact_exit_status"
+assert_contains "artifact cmdline file"        "$lib_text" "_runner_artifact_cmdline"
+# shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars
+assert_contains "delegates to runner_exec"     "$lib_text" 'runner_exec "$label" --stream-stdout'
 assert_not_contains "run_command does not call exit" \
   "$(awk '/^run_command\(\) \{/{found=1; next} found && /^\}$/{exit} found' "$lib" \
       | grep -E '^\s+exit\b' || true)" \
   "exit"
-
-# Temp file must be cleaned up via RETURN trap, not inline rm
-assert_contains "uses RETURN trap for cleanup" "$lib_text" 'trap "rm -f '
-assert_contains "RETURN trap fires on return"  "$lib_text" 'RETURN'
-assert_not_contains "no inline rm after command" \
-  "$(awk '/^run_command\(\) \{/{found=1; next} found && /^\}$/{exit} found' "$lib" \
-      | grep -E '^\s+rm -f' || true)" \
-  "rm -f"
 
 # run_command must call record_first_failure on failure
 assert_contains "run_command calls record_first_failure on failure" \
@@ -187,6 +186,9 @@ printf '\n=== run_command: writes first failure to RUNNER_FIRST_FAILURE_FILE ===
 ff_file2="$(mktemp)"
 RUNNER_FIRST_FAILURE_FILE="$ff_file2"
 export RUNNER_FIRST_FAILURE_FILE
+runner_session_end 2>/dev/null || true
+unset RUNNER_SESSION_DIR
+runner_session_begin
 
 run_command "my-label" bash -c 'echo "the error" >&2; exit 1' 2>/dev/null || true
 ff_content3="$(cat "$ff_file2")"
@@ -194,6 +196,66 @@ assert_contains "run_command records label in failure file" "$ff_content3" "my-l
 assert_contains "run_command records stderr in failure file" "$ff_content3" "the error"
 rm -f "$ff_file2"
 unset RUNNER_FIRST_FAILURE_FILE
+
+# ---------------------------------------------------------------------------
+# Session: UUID artifacts
+# ---------------------------------------------------------------------------
+
+printf '\n=== runner session: UUID artifacts ===\n'
+
+runner_session_end 2>/dev/null || true
+unset RUNNER_SESSION_DIR
+RUNNER_SESSION_KEEP=1
+export RUNNER_SESSION_KEEP
+runner_session_begin
+
+rc=0
+runner_exec "artifact ok" -- echo "out-data" >/dev/null || rc=$?
+assert_exit_0 "runner_exec success" "" "$rc"
+
+ok_id="$(runner_last_id)"
+if [[ -n "$ok_id" ]]; then
+  pass_case "runner_last_id returns id"
+else
+  printf '[FAIL] runner_last_id returned empty\n'
+  fail=$(( fail + 1 ))
+fi
+
+assert_contains "cmdline artifact exists" "$(runner_read "$ok_id" cmdline)" "echo"
+assert_contains "stdout artifact" "$(runner_read "$ok_id" stdout)" "out-data"
+assert_contains "exit_status zero" "$(runner_read_exit "$ok_id")" "0"
+
+rc=0
+runner_exec "artifact fail" -- bash -c 'echo err >&2; echo out; exit 9' >/dev/null 2>/dev/null || rc=$?
+fail_id="$(runner_last_id)"
+assert_exit_nonzero "runner_exec failure rc" "" "$rc"
+if [[ "$rc" -eq 9 ]]; then
+  pass_case "runner_exec preserves exit code 9"
+else
+  printf '[FAIL] runner_exec: expected exit 9, got %d\n' "$rc"
+  fail=$(( fail + 1 ))
+fi
+
+failed_ids="$(runner_session_failed_ids)"
+assert_contains "failed_ids lists failure" "$failed_ids" "$fail_id"
+assert_contains "stderr artifact" "$(runner_read "$fail_id" stderr)" "err"
+assert_contains "stdout artifact on failure" "$(runner_read "$fail_id" stdout)" "out"
+
+diag="$(runner_format_failure "$fail_id")"
+assert_contains "format_failure label" "$diag" "[FAIL] artifact fail"
+assert_contains "format_failure stderr block" "$diag" "err"
+assert_contains "format_failure stdout block" "$diag" "out"
+
+printf '\n=== runner_sh: pipeline capture ===\n'
+
+rc=0
+runner_sh "pipe test" 'printf one; printf two' >/dev/null || rc=$?
+assert_exit_0 "runner_sh success" "" "$rc"
+pipe_id="$(runner_last_id)"
+assert_contains "runner_sh stdout" "$(runner_read "$pipe_id" stdout)" "onetwo"
+
+runner_session_end
+unset RUNNER_SESSION_KEEP RUNNER_SESSION_DIR
 
 # ---------------------------------------------------------------------------
 # Summary
