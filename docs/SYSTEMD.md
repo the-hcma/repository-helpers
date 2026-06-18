@@ -13,7 +13,9 @@ under `~/scratch/repository-helpers/`.
 Unit **templates** (with `@@REPO_DIR@@`) live in each repository's `etc/systemd/`.
 `setup-service` expands them into `~/.config/systemd/user/` and mirrors the
 expanded units under `~/.config/share/systemd-units/`.
-`setup-service` injects `ConditionHost=` from `~/.config/user-services-host` (or
+`setup-service` injects `ConditionMachineId=` (from `/etc/machine-id` on the
+service host, saved in `~/.config/user-services-machine-id`) using the hostname
+label in `~/.config/user-services-host` (or
 `--condition-host` / an interactive prompt on first install) so units run on one
 designated machine even when `~/.config/systemd/user/` is on NFS.
 

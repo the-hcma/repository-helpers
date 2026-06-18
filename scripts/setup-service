@@ -30,20 +30,64 @@ readonly kernel_name
 readonly deployed_commit_env_name="DEPLOYED_COMMIT"
 readonly expanded_units_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/share/systemd-units"
 readonly condition_host_config_path="${HOME}/.config/user-services-host"
+readonly condition_machine_id_config_path="${HOME}/.config/user-services-machine-id"
 condition_host_value=""
+condition_host_machine_id=""
 condition_host_cli=""
 
 # current_hostname_short
-# Short hostname for ConditionHost comparisons (matches systemd ConditionHost).
+# Short hostname for status messages and setup-service host checks.
 current_hostname_short() {
     hostname -s 2>/dev/null || hostname
 }
 
+# machine_id_is_valid <id>
+# True when id looks like a systemd /etc/machine-id value (32 hex chars).
+machine_id_is_valid() {
+    local -r id="$1"
+
+    [[ "$id" =~ ^[0-9a-fA-F]{32}$ ]]
+}
+
+# read_local_machine_id
+# Prints this machine's ID from /etc/machine-id (systemd ConditionMachineId source).
+read_local_machine_id() {
+    local id
+
+    if [[ ! -r /etc/machine-id ]]; then
+        return 1
+    fi
+    id="$(tr -d '[:space:]' </etc/machine-id)"
+    if ! machine_id_is_valid "$id"; then
+        return 1
+    fi
+    printf '%s\n' "$id"
+}
+
+# host_name_matches_service_host
+# True when this machine's hostname matches the configured service-host label.
+host_name_matches_service_host() {
+    local short fqdn
+
+    short="$(current_hostname_short)"
+    fqdn="$(hostname 2>/dev/null || printf '%s' "$short")"
+    [[ "$short" == "$condition_host_value" ]] \
+        || [[ "$fqdn" == "$condition_host_value" ]] \
+        || [[ "$fqdn" == "${condition_host_value}."* ]]
+}
+
 # save_condition_host_config
-# Persists the chosen ConditionHost for future setup-service runs.
+# Persists the chosen service host for future setup-service runs.
 save_condition_host_config() {
     mkdir -p "$(dirname "$condition_host_config_path")"
     printf '%s\n' "$condition_host_value" >"$condition_host_config_path"
+}
+
+# save_condition_machine_id_config
+# Persists the service-host machine-id (from /etc/machine-id on that host).
+save_condition_machine_id_config() {
+    mkdir -p "$(dirname "$condition_machine_id_config_path")"
+    printf '%s\n' "$condition_host_machine_id" >"$condition_machine_id_config_path"
 }
 
 # prompt_for_condition_host
@@ -54,10 +98,10 @@ prompt_for_condition_host() {
 
     default_host="$(current_hostname_short)"
     if [[ ! -t 0 ]]; then
-        die "ConditionHost required: create ${condition_host_config_path} or pass --condition-host NAME"
+        die "Service host required: create ${condition_host_config_path} or pass --condition-host NAME"
     fi
 
-    echo "Systemd user units run on a single host (ConditionHost)."
+    echo "Systemd user units run on a single host (ConditionMachineId from /etc/machine-id)."
     read -r -p "Hostname where services should run [${default_host}]: " input
     input="${input#"${input%%[![:space:]]*}"}"
     input="${input%"${input##*[![:space:]]}"}"
@@ -66,7 +110,7 @@ prompt_for_condition_host() {
     fi
     condition_host_value="$input"
     save_condition_host_config
-    echo "✅ ConditionHost saved to ${condition_host_config_path}"
+    echo "✅ Service host saved to ${condition_host_config_path}"
 }
 
 # resolve_condition_host
@@ -90,10 +134,44 @@ resolve_condition_host() {
     prompt_for_condition_host
 }
 
+# resolve_service_host_machine_id
+# Sets condition_host_machine_id from ~/.config/user-services-machine-id or captures
+# /etc/machine-id when setup-service runs on the configured service host.
+resolve_service_host_machine_id() {
+    local local_id
+
+    if [[ -f "$condition_machine_id_config_path" ]]; then
+        condition_host_machine_id="$(
+            sed -e 's/[[:space:]]//g' "$condition_machine_id_config_path" | head -n1
+        )"
+        if [[ -n "$condition_host_machine_id" ]]; then
+            if machine_id_is_valid "$condition_host_machine_id"; then
+                return 0
+            fi
+            die "Invalid machine-id in ${condition_machine_id_config_path} (expected 32 hex chars from /etc/machine-id)"
+        fi
+    fi
+
+    if host_name_matches_service_host; then
+        local_id="$(read_local_machine_id)" \
+            || die "Cannot read /etc/machine-id on service host ${condition_host_value}"
+        condition_host_machine_id="$local_id"
+        save_condition_machine_id_config
+        echo "✅ Service host machine-id captured from /etc/machine-id into ${condition_machine_id_config_path}"
+        return 0
+    fi
+
+    die "Service host machine-id not configured (${condition_machine_id_config_path}). Run setup-service on ${condition_host_value} once to capture /etc/machine-id, or create that file manually."
+}
+
 # host_runs_units
-# True when this machine matches the configured ConditionHost.
+# True when this machine's /etc/machine-id matches the configured service host.
 host_runs_units() {
-    [[ "$(current_hostname_short)" == "$condition_host_value" ]]
+    local local_id
+
+    [[ -n "$condition_host_machine_id" ]] || return 1
+    local_id="$(read_local_machine_id)" || return 1
+    [[ "$local_id" == "$condition_host_machine_id" ]]
 }
 
 # warn_host_skips_service
@@ -102,27 +180,33 @@ warn_host_skips_service() {
     local current_host
 
     current_host="$(current_hostname_short)"
-    if [[ "$current_host" != "$condition_host_value" ]]; then
-        echo "⚠️  WARNING: ConditionHost=${condition_host_value} but this machine is ${current_host}; systemd will not run these units here."
+    if ! host_runs_units; then
+        echo "⚠️  WARNING: Service host ${condition_host_value} (machine-id ${condition_host_machine_id}) but this machine is ${current_host}; systemd will not run these units here."
     fi
 }
 
-# inject_condition_host_into_unit <unit_text> <hostname>
-# Inserts or replaces ConditionHost= in the [Unit] section.
-inject_condition_host_into_unit() {
+# inject_service_host_machine_id_into_unit <unit_text> <host_label> <machine_id>
+# Inserts ConditionMachineId (and readable hostname comment) in [Unit].
+inject_service_host_machine_id_into_unit() {
     local generated="$1"
-    local host="$2"
+    local host_label="$2"
+    local machine_id="$3"
+    local guard_comment guard_line
 
-    if grep -qE '^ConditionHost=' <<<"$generated"; then
-        sed "s/^ConditionHost=.*/ConditionHost=${host}/" <<<"$generated"
-        return 0
-    fi
+    guard_comment="# Service host: ${host_label} (machine-id from /etc/machine-id on that host)"
+    guard_line="ConditionMachineId=${machine_id}"
 
-    awk -v host="$host" '
+    generated="$(
+        printf '%s\n' "$generated" \
+            | grep -vE '^ConditionHost=|^ConditionMachineId=|^ExecCondition=.*/service-host-exec-condition |^# Service host:'
+    )"
+
+    awk -v comment="$guard_comment" -v cond="$guard_line" '
         BEGIN { inserted = 0 }
         /^\[Unit\]/ && !inserted {
             print
-            print "ConditionHost=" host
+            print comment
+            print cond
             inserted = 1
             next
         }
@@ -183,7 +267,7 @@ unit_source_timer_path() {
         printf '%s\n' "$template_path"
         return 0
     fi
-    die "No timer template for ${unit_basename} (expected ${template_path})"
+    return 1
 }
 
 # expanded_unit_service_path <unit_basename>
@@ -272,9 +356,12 @@ generate_service_unit() {
         )"
     fi
     if [[ -z "$condition_host_value" ]]; then
-        die "ConditionHost is not set (internal error)"
+        die "Service host is not set (internal error)"
     fi
-    generated="$(inject_condition_host_into_unit "$generated" "$condition_host_value")"
+    if [[ -z "$condition_host_machine_id" ]]; then
+        die "Service host machine-id is not set (internal error)"
+    fi
+    generated="$(inject_service_host_machine_id_into_unit "$generated" "$condition_host_value" "$condition_host_machine_id")"
     printf '%s' "$generated"
 }
 
@@ -287,9 +374,12 @@ generate_timer_unit() {
 
     generated="$(sed "s|@@REPO_DIR@@|${repo_dir}|g" "$source_timer")"
     if [[ -z "$condition_host_value" ]]; then
-        die "ConditionHost is not set (internal error)"
+        die "Service host is not set (internal error)"
     fi
-    inject_condition_host_into_unit "$generated" "$condition_host_value"
+    if [[ -z "$condition_host_machine_id" ]]; then
+        die "Service host machine-id is not set (internal error)"
+    fi
+    inject_service_host_machine_id_into_unit "$generated" "$condition_host_value" "$condition_host_machine_id"
 }
 
 # service_unit_is_oneshot [unit_file]
@@ -715,9 +805,12 @@ OPTIONS:
         Default is warn-only.
 
     --condition-host NAME
-        Hostname where systemd should run these units (ConditionHost=NAME).
-        Saved to ~/.config/user-services-host for future runs. When the config
-        file is missing, setup-service prompts interactively (or requires this flag).
+        Hostname label for the single machine where systemd should run these units.
+        Saved to ~/.config/user-services-host. setup-service captures that host's
+        /etc/machine-id into ~/.config/user-services-machine-id (on first run on
+        the service host) and injects ConditionMachineId= into each unit. When the
+        config file is missing, setup-service prompts interactively (or requires
+        this flag).
 
     -h, --help
         Display this help message and exit.
@@ -786,14 +879,15 @@ check_status() {
         condition_host_value=""
     fi
     if [[ -n "$condition_host_value" ]]; then
+        resolve_service_host_machine_id
         if host_runs_units; then
-            echo "✅ Host:     ConditionHost=${condition_host_value} (this machine)"
+            echo "✅ Host:     ${condition_host_value} (machine-id ${condition_host_machine_id}) — this machine"
         else
-            echo "⚠️  Host:     ConditionHost=${condition_host_value} (this machine is $(current_hostname_short); units skip here)"
+            echo "⚠️  Host:     ${condition_host_value} (machine-id ${condition_host_machine_id}) — this machine is $(current_hostname_short); units skip here"
             overall_good=false
         fi
     else
-        echo "❌ Host:     ConditionHost not configured (${condition_host_config_path})"
+        echo "❌ Host:     Service host not configured (${condition_host_config_path})"
         overall_good=false
     fi
 
@@ -807,7 +901,8 @@ check_status() {
         source_service="$(unit_source_service_path "$unit_basename")"
         service_filename="$(unit_service_filename "$unit_basename")"
         target_service="$(unit_target_service_path "$unit_basename")"
-        source_timer="$(unit_source_timer_path "$unit_basename")"
+        source_timer=""
+        source_timer="$(unit_source_timer_path "$unit_basename" || true)"
         timer_filename="$(unit_timer_filename "$unit_basename")"
         target_timer="$(unit_target_timer_path "$unit_basename")"
 
@@ -1042,6 +1137,7 @@ fi
 mkdir -p "$target_dir"
 
 resolve_condition_host
+resolve_service_host_machine_id
 warn_host_skips_service
 
 desired_sha="$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || true)"
@@ -1082,7 +1178,8 @@ while IFS= read -r unit_basename; do
     local_source_service="$(unit_source_service_path "$unit_basename")"
     local_target_service="$(unit_target_service_path "$unit_basename")"
     service_filename="$(unit_service_filename "$unit_basename")"
-    local_source_timer="$(unit_source_timer_path "$unit_basename")"
+    local_source_timer=""
+    local_source_timer="$(unit_source_timer_path "$unit_basename" || true)"
     local_target_timer="$(unit_target_timer_path "$unit_basename")"
     timer_filename="$(unit_timer_filename "$unit_basename")"
 
@@ -1171,7 +1268,7 @@ if host_runs_units; then
         loginctl enable-linger "$current_user"
     fi
 else
-    echo "ℹ️  Skipping loginctl enable-linger (ConditionHost=${condition_host_value}; this host is $(current_hostname_short))"
+    echo "ℹ️  Skipping loginctl enable-linger (service host ${condition_host_value} / ${condition_host_machine_id}; this host is $(current_hostname_short))"
 fi
 
 # 6. Lockfile drift preflight, then repo-specific deploy hook (see run_on_deploy_hook).
@@ -1203,7 +1300,8 @@ while IFS= read -r unit_basename; do
     local_source_service="$(unit_source_service_path "$unit_basename")"
     local_target_service="$(unit_target_service_path "$unit_basename")"
     service_filename="$(unit_service_filename "$unit_basename")"
-    local_source_timer="$(unit_source_timer_path "$unit_basename")"
+    local_source_timer=""
+    local_source_timer="$(unit_source_timer_path "$unit_basename" || true)"
     local_target_timer="$(unit_target_timer_path "$unit_basename")"
     timer_filename="$(unit_timer_filename "$unit_basename")"
 
@@ -1218,7 +1316,7 @@ while IFS= read -r unit_basename; do
             systemctl --user enable --now "$timer_filename"
         else
             systemctl --user enable "$timer_filename"
-            echo "⏭️  ${timer_filename}: enabled but not started on $(current_hostname_short) (ConditionHost=${condition_host_value})."
+            echo "⏭️  ${timer_filename}: enabled but not started on $(current_hostname_short) (service host ${condition_host_value} / ${condition_host_machine_id})."
         fi
     fi
 
@@ -1226,7 +1324,7 @@ while IFS= read -r unit_basename; do
         if host_runs_units; then
             echo "⏭️  ${service_filename}: oneshot — runs on timer schedule (not started now)."
         else
-            echo "⏭️  ${service_filename}: oneshot — skipped on $(current_hostname_short) (ConditionHost=${condition_host_value})."
+            echo "⏭️  ${service_filename}: oneshot — skipped on $(current_hostname_short) (service host ${condition_host_value} / ${condition_host_machine_id})."
         fi
         continue
     fi
@@ -1234,13 +1332,13 @@ while IFS= read -r unit_basename; do
         if host_runs_units; then
             echo "⏭️  ${service_filename}: oneshot — no timer; start manually with systemctl --user start ${service_filename}"
         else
-            echo "⏭️  ${service_filename}: oneshot — skipped on $(current_hostname_short) (ConditionHost=${condition_host_value})."
+            echo "⏭️  ${service_filename}: oneshot — skipped on $(current_hostname_short) (service host ${condition_host_value} / ${condition_host_machine_id})."
         fi
         continue
     fi
 
     if ! host_runs_units; then
-        echo "⏭️  ${service_filename}: skipped start/restart on $(current_hostname_short) (ConditionHost=${condition_host_value})."
+        echo "⏭️  ${service_filename}: skipped start/restart on $(current_hostname_short) (service host ${condition_host_value} / ${condition_host_machine_id})."
         continue
     fi
 
