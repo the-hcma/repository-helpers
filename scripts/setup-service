@@ -34,6 +34,7 @@ readonly condition_machine_id_config_path="${HOME}/.config/user-services-machine
 condition_host_value=""
 condition_host_machine_id=""
 condition_host_cli=""
+service_host_machine_id_failure=""
 
 # current_hostname_short
 # Short hostname for status messages and setup-service host checks.
@@ -42,11 +43,29 @@ current_hostname_short() {
 }
 
 # machine_id_is_valid <id>
-# True when id looks like a systemd /etc/machine-id value (32 hex chars).
+# True when id looks like a systemd /etc/machine-id value (32 lowercase hex chars).
 machine_id_is_valid() {
     local -r id="$1"
 
-    [[ "$id" =~ ^[0-9a-fA-F]{32}$ ]]
+    [[ "$id" =~ ^[0-9a-f]{32}$ ]]
+}
+
+# normalize_machine_id <id>
+# Strips whitespace and lowercases hex (systemd /etc/machine-id is lowercase).
+normalize_machine_id() {
+    local id="$1"
+
+    id="$(tr -d '[:space:]' <<<"$id")"
+    id="${id,,}"
+    printf '%s\n' "$id"
+}
+
+# config_file_first_line <path>
+# Reads the first line without sed|head pipes (avoids SIGPIPE under set -euo pipefail).
+config_file_first_line() {
+    local -r path="$1"
+
+    head -n1 "$path"
 }
 
 # read_local_machine_id
@@ -57,7 +76,7 @@ read_local_machine_id() {
     if [[ ! -r /etc/machine-id ]]; then
         return 1
     fi
-    id="$(tr -d '[:space:]' </etc/machine-id)"
+    id="$(normalize_machine_id "$(< /etc/machine-id)")"
     if ! machine_id_is_valid "$id"; then
         return 1
     fi
@@ -124,7 +143,7 @@ resolve_condition_host() {
 
     if [[ -f "$condition_host_config_path" ]]; then
         condition_host_value="$(
-            sed -e 's/[[:space:]]//g' "$condition_host_config_path" | head -n1
+            tr -d '[:space:]' <<<"$(config_file_first_line "$condition_host_config_path")"
         )"
         if [[ -n "$condition_host_value" ]]; then
             return 0
@@ -140,15 +159,21 @@ resolve_condition_host() {
 resolve_service_host_machine_id() {
     local local_id
 
+    service_host_machine_id_failure=""
+
     if [[ -f "$condition_machine_id_config_path" ]]; then
         condition_host_machine_id="$(
-            sed -e 's/[[:space:]]//g' "$condition_machine_id_config_path" | head -n1
+            normalize_machine_id "$(config_file_first_line "$condition_machine_id_config_path")"
         )"
         if [[ -n "$condition_host_machine_id" ]]; then
             if machine_id_is_valid "$condition_host_machine_id"; then
                 return 0
             fi
-            die "Invalid machine-id in ${condition_machine_id_config_path} (expected 32 hex chars from /etc/machine-id)"
+            service_host_machine_id_failure="invalid"
+            if [[ "$status_only" == "1" ]]; then
+                return 1
+            fi
+            die "Invalid machine-id in ${condition_machine_id_config_path} (expected 32 lowercase hex chars from /etc/machine-id)"
         fi
     fi
 
@@ -161,7 +186,41 @@ resolve_service_host_machine_id() {
         return 0
     fi
 
+    service_host_machine_id_failure="missing"
+    if [[ "$status_only" == "1" ]]; then
+        return 1
+    fi
+
     die "Service host machine-id not configured (${condition_machine_id_config_path}). Run setup-service on ${condition_host_value} once to capture /etc/machine-id, or create that file manually."
+}
+
+# load_machine_id_from_installed_units_for_status
+# Sets condition_host_machine_id from ConditionMachineId= in a repo-managed installed unit.
+load_machine_id_from_installed_units_for_status() {
+    local unit_path machine_id_line candidate
+
+    if [[ ! -d "$target_dir" ]]; then
+        return 1
+    fi
+
+    for unit_path in "${target_dir}/"*.service; do
+        if [[ ! -f "$unit_path" ]]; then
+            continue
+        fi
+        if ! unit_is_repo_managed "$unit_path"; then
+            continue
+        fi
+        machine_id_line="$(grep -m1 '^ConditionMachineId=' "$unit_path" 2>/dev/null || true)"
+        if [[ -z "$machine_id_line" ]]; then
+            continue
+        fi
+        candidate="$(normalize_machine_id "${machine_id_line#ConditionMachineId=}")"
+        if machine_id_is_valid "$candidate"; then
+            condition_host_machine_id="$candidate"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # host_runs_units
@@ -198,7 +257,8 @@ inject_service_host_machine_id_into_unit() {
 
     generated="$(
         printf '%s\n' "$generated" \
-            | grep -vE '^ConditionHost=|^ConditionMachineId=|^ExecCondition=.*/service-host-exec-condition |^# Service host:'
+            | grep -vE '^ConditionHost=|^ConditionMachineId=|^ExecCondition=.*/service-host-exec-condition|^# Service host:' \
+            || true
     )"
 
     awk -v comment="$guard_comment" -v cond="$guard_line" '
@@ -837,7 +897,7 @@ check_status() {
     local any_running_pid=""
     local all_good is_oneshot has_timer running_pid display_name
     local unit_text exec_start exec_post args port user_config_file log_file
-    local current_user timer_line
+    local current_user timer_line status_can_diff_units
 
     desired_units="$(discover_unit_basenames)"
     if [[ -z "$desired_units" ]]; then
@@ -871,24 +931,46 @@ check_status() {
         overall_good=false
     fi
 
+    status_can_diff_units=true
+
     if [[ -f "$condition_host_config_path" ]]; then
         condition_host_value="$(
-            sed -e 's/[[:space:]]//g' "$condition_host_config_path" | head -n1
+            tr -d '[:space:]' <<<"$(config_file_first_line "$condition_host_config_path")"
         )"
     else
         condition_host_value=""
     fi
     if [[ -n "$condition_host_value" ]]; then
-        resolve_service_host_machine_id
-        if host_runs_units; then
-            echo "✅ Host:     ${condition_host_value} (machine-id ${condition_host_machine_id}) — this machine"
+        if resolve_service_host_machine_id; then
+            if host_runs_units; then
+                echo "✅ Host:     ${condition_host_value} (machine-id ${condition_host_machine_id}) — this machine"
+            else
+                echo "⚠️  Host:     ${condition_host_value} (machine-id ${condition_host_machine_id}) — this machine is $(current_hostname_short); units skip here"
+                overall_good=false
+            fi
         else
-            echo "⚠️  Host:     ${condition_host_value} (machine-id ${condition_host_machine_id}) — this machine is $(current_hostname_short); units skip here"
+            if [[ "$service_host_machine_id_failure" == "invalid" ]]; then
+                echo "❌ Host:     ${condition_host_value} — invalid machine-id in ${condition_machine_id_config_path} (expected 32 lowercase hex chars from /etc/machine-id)"
+            else
+                echo "⚠️  Host:     ${condition_host_value} — machine-id not configured (${condition_machine_id_config_path}); run setup-service on ${condition_host_value} once"
+            fi
             overall_good=false
+            condition_host_machine_id=""
+            if load_machine_id_from_installed_units_for_status; then
+                echo "ℹ️  Host:     using machine-id from installed unit(s) for template comparison"
+            else
+                status_can_diff_units=false
+            fi
         fi
     else
         echo "❌ Host:     Service host not configured (${condition_host_config_path})"
         overall_good=false
+        condition_host_machine_id=""
+        if load_machine_id_from_installed_units_for_status; then
+            echo "ℹ️  Host:     using machine-id from installed unit(s) for template comparison"
+        else
+            status_can_diff_units=false
+        fi
     fi
 
     while IFS= read -r unit_basename; do
@@ -922,6 +1004,9 @@ check_status() {
 
         if [[ ! -f "$target_service" ]]; then
             echo "❌ Service:  Not installed (Run setup to install it)"
+            all_good=false
+        elif [[ "$status_can_diff_units" == "false" ]]; then
+            echo "⚠️  Service:  Installed ($target_service); cannot verify template match (machine-id unresolved)"
             all_good=false
         elif diff --brief <(generate_service_unit "$source_service") "$target_service" > /dev/null 2>&1; then
             echo "✅ Service:  Up to date ($target_service)"
@@ -957,6 +1042,9 @@ check_status() {
         if [[ "$has_timer" == "true" ]]; then
             if [[ ! -f "$target_timer" ]]; then
                 echo "❌ Timer:    Not installed (Run setup to install it)"
+                all_good=false
+            elif [[ "$status_can_diff_units" == "false" ]]; then
+                echo "⚠️  Timer:    Installed ($target_timer); cannot verify template match (machine-id unresolved)"
                 all_good=false
             elif diff --brief <(generate_timer_unit "$source_timer") "$target_timer" > /dev/null 2>&1; then
                 echo "✅ Timer:    Up to date ($target_timer)"
@@ -1242,6 +1330,11 @@ while IFS= read -r unit_basename; do
         else
             echo "✅ Timer file unchanged: $local_target_timer"
         fi
+    elif [[ -f "$local_target_timer" ]]; then
+        remove_stale_unit_file "$timer_filename"
+        rm -f "$(expanded_unit_timer_path "$unit_basename")"
+        any_stale_removed=true
+        timer_changed=true
     fi
 
     if [[ "$timer_changed" == "true" ]]; then
