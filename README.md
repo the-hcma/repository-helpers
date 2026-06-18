@@ -144,9 +144,11 @@ Graphite app merge queue configuration remains a manual step and is reported as 
 
 ## Systemd Service Setup
 
-`scripts/setup-service` installs a user service from `etc/systemd/<unit>.service`,
-substitutes `@@REPO_DIR@@`, injects `DEPLOYED_COMMIT`, and enables the companion
-timer when `etc/systemd/<unit>.timer` exists.
+`scripts/setup-service` installs user units from
+`share/systemd-unit-templates/<unit>.service` (or a gitignored per-repo
+`etc/systemd/` override), substitutes `@@REPO_DIR@@`, injects `DEPLOYED_COMMIT`
+and `ConditionHost=`, and enables the companion timer when
+`share/systemd-unit-templates/<unit>.timer` exists.
 
 For service repositories, provide an executable `scripts/on-deploy` hook:
 

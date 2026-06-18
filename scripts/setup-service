@@ -28,41 +28,191 @@ readonly log_dir
 kernel_name="$(uname -s)"
 readonly kernel_name
 readonly deployed_commit_env_name="DEPLOYED_COMMIT"
+helpers_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+helpers_repo_root="$(cd "${helpers_script_dir}/.." && pwd)"
+readonly helpers_repo_root
+readonly shared_templates_dir="${helpers_repo_root}/share/systemd-unit-templates"
+readonly condition_host_config_path="${HOME}/.config/user-services-host"
+condition_host_value=""
+condition_host_cli=""
+
+# current_hostname_short
+# Short hostname for ConditionHost comparisons (matches systemd ConditionHost).
+current_hostname_short() {
+    hostname -s 2>/dev/null || hostname
+}
+
+# save_condition_host_config
+# Persists the chosen ConditionHost for future setup-service runs.
+save_condition_host_config() {
+    mkdir -p "$(dirname "$condition_host_config_path")"
+    printf '%s\n' "$condition_host_value" >"$condition_host_config_path"
+}
+
+# prompt_for_condition_host
+# Interactive first-time setup when ~/.config/user-services-host is missing.
+prompt_for_condition_host() {
+    local input=""
+    local default_host
+
+    default_host="$(current_hostname_short)"
+    if [[ ! -t 0 ]]; then
+        die "ConditionHost required: create ${condition_host_config_path} or pass --condition-host NAME"
+    fi
+
+    echo "Systemd user units run on a single host (ConditionHost)."
+    read -r -p "Hostname where services should run [${default_host}]: " input
+    input="${input#"${input%%[![:space:]]*}"}"
+    input="${input%"${input##*[![:space:]]}"}"
+    if [[ -z "$input" ]]; then
+        input="$default_host"
+    fi
+    condition_host_value="$input"
+    save_condition_host_config
+    echo "✅ ConditionHost saved to ${condition_host_config_path}"
+}
+
+# resolve_condition_host
+# Uses --condition-host, then ~/.config/user-services-host, then prompts on first setup.
+resolve_condition_host() {
+    if [[ -n "$condition_host_cli" ]]; then
+        condition_host_value="$condition_host_cli"
+        save_condition_host_config
+        return 0
+    fi
+
+    if [[ -f "$condition_host_config_path" ]]; then
+        condition_host_value="$(
+            sed -e 's/[[:space:]]//g' "$condition_host_config_path" | head -n1
+        )"
+        if [[ -n "$condition_host_value" ]]; then
+            return 0
+        fi
+    fi
+
+    prompt_for_condition_host
+}
+
+# host_runs_units
+# True when this machine matches the configured ConditionHost.
+host_runs_units() {
+    [[ "$(current_hostname_short)" == "$condition_host_value" ]]
+}
+
+# warn_host_skips_service
+# Emits a warning when setup-service runs on a host that will not execute units.
+warn_host_skips_service() {
+    local current_host
+
+    current_host="$(current_hostname_short)"
+    if [[ "$current_host" != "$condition_host_value" ]]; then
+        echo "⚠️  WARNING: ConditionHost=${condition_host_value} but this machine is ${current_host}; systemd will not run these units here."
+    fi
+}
+
+# inject_condition_host_into_unit <unit_text> <hostname>
+# Inserts or replaces ConditionHost= in the [Unit] section.
+inject_condition_host_into_unit() {
+    local generated="$1"
+    local host="$2"
+
+    if grep -qE '^ConditionHost=' <<<"$generated"; then
+        sed "s/^ConditionHost=.*/ConditionHost=${host}/" <<<"$generated"
+        return 0
+    fi
+
+    awk -v host="$host" '
+        BEGIN { inserted = 0 }
+        /^\[Unit\]/ && !inserted {
+            print
+            print "ConditionHost=" host
+            inserted = 1
+            next
+        }
+        { print }
+    ' <<<"$generated"
+}
 
 # discover_unit_basenames
 # Prints unit basenames (no extension), one per line.
 # When GITHUB_REPO_LINT_SERVICE_UNIT is set, only that unit is managed (wrapper support).
 discover_unit_basenames() {
     local unit
+    local -a discovered=()
 
     if [[ -n "${GITHUB_REPO_LINT_SERVICE_UNIT:-}" ]]; then
         printf '%s\n' "$GITHUB_REPO_LINT_SERVICE_UNIT"
         return 0
     fi
 
-    if [[ ! -d "${repo_dir}/etc/systemd" ]]; then
-        return 0
+    if [[ -d "${repo_dir}/etc/systemd" ]]; then
+        for unit in "${repo_dir}/etc/systemd/"*.service; do
+            if [[ ! -f "$unit" ]]; then
+                continue
+            fi
+            unit="$(basename "$unit")"
+            discovered+=("${unit%.service}")
+        done
+        if [[ "${#discovered[@]}" -gt 0 ]]; then
+            printf '%s\n' "${discovered[@]}"
+            return 0
+        fi
     fi
 
-    for unit in "${repo_dir}/etc/systemd/"*.service; do
-        if [[ ! -f "$unit" ]]; then
-            continue
-        fi
-        unit="$(basename "$unit")"
-        printf '%s\n' "${unit%.service}"
-    done
+    if [[ "$service_name" == "repository-helpers" ]]; then
+        for unit in dep-updater github-repo-lint; do
+            if [[ -f "${shared_templates_dir}/${unit}.service" ]]; then
+                discovered+=("$unit")
+            fi
+        done
+    elif [[ -f "${shared_templates_dir}/${service_name}.service" ]]; then
+        discovered+=("$service_name")
+    fi
+
+    if [[ "${#discovered[@]}" -eq 0 ]]; then
+        return 0
+    fi
+    printf '%s\n' "${discovered[@]}"
 }
 
 # unit_source_service_path <unit_basename>
 unit_source_service_path() {
     local -r unit_basename="$1"
-    printf '%s\n' "${repo_dir}/etc/systemd/${unit_basename}.service"
+    local local_path
+    local shared_path
+
+    local_path="${repo_dir}/etc/systemd/${unit_basename}.service"
+    shared_path="${shared_templates_dir}/${unit_basename}.service"
+
+    if [[ -f "$local_path" ]]; then
+        printf '%s\n' "$local_path"
+        return 0
+    fi
+    if [[ -f "$shared_path" ]]; then
+        printf '%s\n' "$shared_path"
+        return 0
+    fi
+    die "No service template for ${unit_basename} (checked ${local_path} and ${shared_path})"
 }
 
 # unit_source_timer_path <unit_basename>
 unit_source_timer_path() {
     local -r unit_basename="$1"
-    printf '%s\n' "${repo_dir}/etc/systemd/${unit_basename}.timer"
+    local local_path
+    local shared_path
+
+    local_path="${repo_dir}/etc/systemd/${unit_basename}.timer"
+    shared_path="${shared_templates_dir}/${unit_basename}.timer"
+
+    if [[ -f "$local_path" ]]; then
+        printf '%s\n' "$local_path"
+        return 0
+    fi
+    if [[ -f "$shared_path" ]]; then
+        printf '%s\n' "$shared_path"
+        return 0
+    fi
+    die "No timer template for ${unit_basename} (checked ${local_path} and ${shared_path})"
 }
 
 # unit_target_service_path <unit_basename>
@@ -124,6 +274,10 @@ generate_service_unit() {
             ' <<<"$generated"
         )"
     fi
+    if [[ -z "$condition_host_value" ]]; then
+        die "ConditionHost is not set (internal error)"
+    fi
+    generated="$(inject_condition_host_into_unit "$generated" "$condition_host_value")"
     printf '%s' "$generated"
 }
 
@@ -132,7 +286,13 @@ generate_service_unit() {
 # Substitute @@REPO_DIR@@ in the timer template (no DEPLOYED_COMMIT injection).
 generate_timer_unit() {
     local -r source_timer="$1"
-    sed "s|@@REPO_DIR@@|${repo_dir}|g" "$source_timer"
+    local generated
+
+    generated="$(sed "s|@@REPO_DIR@@|${repo_dir}|g" "$source_timer")"
+    if [[ -z "$condition_host_value" ]]; then
+        die "ConditionHost is not set (internal error)"
+    fi
+    inject_condition_host_into_unit "$generated" "$condition_host_value"
 }
 
 # service_unit_is_oneshot [unit_file]
@@ -557,6 +717,11 @@ OPTIONS:
         Fail when lockfiles still drift after checks (or after --fix-lockfiles).
         Default is warn-only.
 
+    --condition-host NAME
+        Hostname where systemd should run these units (ConditionHost=NAME).
+        Saved to ~/.config/user-services-host for future runs. When the config
+        file is missing, setup-service prompts interactively (or requires this flag).
+
     -h, --help
         Display this help message and exit.
 
@@ -613,6 +778,25 @@ check_status() {
         echo "✅ Linger:   Enabled for $current_user"
     else
         echo "❌ Linger:   Disabled (Service won't survive reboots!)"
+        overall_good=false
+    fi
+
+    if [[ -f "$condition_host_config_path" ]]; then
+        condition_host_value="$(
+            sed -e 's/[[:space:]]//g' "$condition_host_config_path" | head -n1
+        )"
+    else
+        condition_host_value=""
+    fi
+    if [[ -n "$condition_host_value" ]]; then
+        if host_runs_units; then
+            echo "✅ Host:     ConditionHost=${condition_host_value} (this machine)"
+        else
+            echo "⚠️  Host:     ConditionHost=${condition_host_value} (this machine is $(current_hostname_short); units skip here)"
+            overall_good=false
+        fi
+    else
+        echo "❌ Host:     ConditionHost not configured (${condition_host_config_path})"
         overall_good=false
     fi
 
@@ -775,6 +959,20 @@ while [[ $# -gt 0 ]]; do
             fix_lockfiles=1
             shift
             ;;
+        --condition-host)
+            if [[ $# -lt 2 ]]; then
+                die "--condition-host requires a hostname argument"
+            fi
+            condition_host_cli="$2"
+            shift 2
+            ;;
+        --condition-host=*)
+            condition_host_cli="${1#--condition-host=}"
+            if [[ -z "$condition_host_cli" ]]; then
+                die "--condition-host requires a hostname argument"
+            fi
+            shift
+            ;;
         *)
             echo "❌ Error: Unknown option: $1"
             echo "Run './scripts/setup-service --help' for usage information"
@@ -845,6 +1043,9 @@ fi
 
 # 2. Ensure target directory exists
 mkdir -p "$target_dir"
+
+resolve_condition_host
+warn_host_skips_service
 
 desired_sha="$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || true)"
 desired_full="$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || true)"
@@ -958,13 +1159,17 @@ done <<<"$unit_basenames"
 mkdir -p "$log_dir"
 echo "✅ Log directory: $log_dir"
 
-# 5. Enable lingering for the current user
+# 5. Enable lingering for the current user (designated host only)
 current_user="$(whoami)"
-echo "👤 Enabling lingering for user: $current_user"
-if [[ "$kernel_name" == "Darwin" ]]; then
-    echo "ℹ️  Skipping loginctl enable-linger (Linux hosts only; not available on macOS)."
+if host_runs_units; then
+    echo "👤 Enabling lingering for user: $current_user"
+    if [[ "$kernel_name" == "Darwin" ]]; then
+        echo "ℹ️  Skipping loginctl enable-linger (Linux hosts only; not available on macOS)."
+    else
+        loginctl enable-linger "$current_user"
+    fi
 else
-    loginctl enable-linger "$current_user"
+    echo "ℹ️  Skipping loginctl enable-linger (ConditionHost=${condition_host_value}; this host is $(current_hostname_short))"
 fi
 
 # 6. Lockfile drift preflight, then repo-specific deploy hook (see run_on_deploy_hook).
@@ -1007,15 +1212,33 @@ while IFS= read -r unit_basename; do
     systemctl --user enable "$service_filename"
     if [[ -f "$local_source_timer" ]]; then
         echo "⏰ Enabling timer: ${timer_filename}"
-        systemctl --user enable --now "$timer_filename"
+        if host_runs_units; then
+            systemctl --user enable --now "$timer_filename"
+        else
+            systemctl --user enable "$timer_filename"
+            echo "⏭️  ${timer_filename}: enabled but not started on $(current_hostname_short) (ConditionHost=${condition_host_value})."
+        fi
     fi
 
     if [[ "$is_oneshot" == "true" && -f "$local_source_timer" ]]; then
-        echo "⏭️  ${service_filename}: oneshot — runs on timer schedule (not started now)."
+        if host_runs_units; then
+            echo "⏭️  ${service_filename}: oneshot — runs on timer schedule (not started now)."
+        else
+            echo "⏭️  ${service_filename}: oneshot — skipped on $(current_hostname_short) (ConditionHost=${condition_host_value})."
+        fi
         continue
     fi
     if [[ "$is_oneshot" == "true" ]]; then
-        echo "⏭️  ${service_filename}: oneshot — no timer; start manually with systemctl --user start ${service_filename}"
+        if host_runs_units; then
+            echo "⏭️  ${service_filename}: oneshot — no timer; start manually with systemctl --user start ${service_filename}"
+        else
+            echo "⏭️  ${service_filename}: oneshot — skipped on $(current_hostname_short) (ConditionHost=${condition_host_value})."
+        fi
+        continue
+    fi
+
+    if ! host_runs_units; then
+        echo "⏭️  ${service_filename}: skipped start/restart on $(current_hostname_short) (ConditionHost=${condition_host_value})."
         continue
     fi
 

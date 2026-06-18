@@ -10,6 +10,11 @@ This repository ships systemd user services for daily repository maintenance:
 Both are oneshot services installed under `~/.config/systemd/user/`, with logs
 under `~/scratch/repository-helpers/`.
 
+Unit templates live in `share/systemd-unit-templates/` (not per-repo `etc/systemd/`).
+`setup-service` injects `ConditionHost=` from `~/.config/user-services-host` (or
+`--condition-host` / an interactive prompt on first install) so units run on one
+designated machine even when `~/.config/systemd/user/` is on NFS.
+
 Use `scripts/show-services` for a read-only overview of every service template in
 this repo:
 
@@ -47,8 +52,8 @@ latest remote refs.
 
 ### Timer (optional)
 
-A daily schedule is **optional**. It is enabled only when the repo ships
-`etc/systemd/dep-updater.timer` (same directory as the `.service` file).
+A daily schedule is **optional**. It is enabled when
+`share/systemd-unit-templates/dep-updater.timer` is present.
 `setup-service` installs and enables the timer when that file exists; if you remove
 the timer template and re-run setup, the installed timer is disabled and removed.
 
@@ -129,12 +134,12 @@ From this repository (any worktree):
 
 This will:
 
-1. Install `etc/systemd/dep-updater.service` (and `.timer` when present)
-   under `~/.config/systemd/user/`
+1. Install units from `share/systemd-unit-templates/` under `~/.config/systemd/user/`
 2. Substitute `@@REPO_DIR@@` with the checkout you invoked setup from
-3. Enable lingering for your user
-4. Run `scripts/on-deploy` to record the deployed commit
-5. Enable the **timer** when `dep-updater.timer` exists (not an immediate batch run)
+3. Set `ConditionHost=` from `~/.config/user-services-host` (or `--condition-host`)
+4. Enable lingering on the ConditionHost machine
+5. Run `scripts/on-deploy` to record the deployed commit
+6. Enable the **timer** when `dep-updater.timer` exists (not an immediate batch run)
 
 ### Status and logs
 
@@ -154,7 +159,7 @@ systemctl --user start dep-updater.service
 
 ### Change schedule or scan root
 
-Edit `etc/systemd/dep-updater.timer` (calendar) or set
+Edit `share/systemd-unit-templates/dep-updater.timer` (calendar) or set
 `DEP_UPDATER_BATCH_SCAN_ROOT` in `~/.config/dep-updater.env` or a
 unit override, then re-run `./scripts/setup-service`.
 
