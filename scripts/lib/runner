@@ -1,43 +1,271 @@
 #!/usr/bin/env bash
 # Shared command-execution helpers for scripts/*.
 #
-# Provides two functions:
+# Session model: call runner_session_begin once per script invocation (or let
+# runner_exec auto-begin). Every external command runs via runner_exec /
+# run_command / run_command_or_die and is recorded under:
+#
+#   ${RUNNER_SESSION_DIR}/<uuid>/
+#     cmdline    — quoted command line
+#     stdout     — captured standard output
+#     stderr     — captured standard error
+#     exit_status — numeric exit code
+#     label      — human-readable label (optional)
+#
+# Inspect failures with runner_session_failed_ids, runner_read, and
+# runner_format_failure.
 #
 #   run_command <label> <cmd> [args…]
-#     Runs <cmd> [args…], capturing its stderr internally.
-#     Stdout is passed through so callers can redirect it freely (e.g. > file).
-#     On success: returns 0.
-#     On failure: prints a structured diagnostic block to stderr (which cron
-#       captures) and returns the original exit code.  Never calls exit.
+#     Runs <cmd> [args…]. Stdout is passed through (tee) so callers can redirect.
+#     On failure: prints a structured diagnostic to stderr and returns the exit code.
 #
 #   run_command_or_die <label> <cmd> [args…]
-#     Delegates to run_command.  On failure, exits with the same exit code.
-#     The structured diagnostic is already printed by run_command — no duplication.
+#     Delegates to run_command; exits with the same code on failure.
 #
 #   record_first_failure <message>
 #     Saves the first failure reason to $RUNNER_FIRST_FAILURE_FILE (if set).
-#     Only the first call takes effect — subsequent calls are no-ops.
-#     Callers that don't go through run_command (e.g. custom install functions)
-#     should call this explicitly when they detect a non-retriable failure so the
-#     EXIT trap can emit a meaningful reason instead of "script exited unexpectedly".
-#
-# Usage example:
-#   source "${script_dir}/lib/runner"
-#
-#   # Capture stdout to file; get actionable stderr on failure:
-#   run_command "dep-updater: my-repo" \
-#     dep-updater --report-json --dir /path/to/repo >"$out_file" || rc=$?
-#
-#   # Fatal variant — abort immediately on failure:
-#   run_command_or_die "pnpm install" pnpm install --frozen-lockfile
 set -euo pipefail
 
+readonly _runner_artifact_stdout='stdout'
+readonly _runner_artifact_stderr='stderr'
+readonly _runner_artifact_exit_status='exit_status'
+readonly _runner_artifact_cmdline='cmdline'
+readonly _runner_artifact_label='label'
+
+# runner_session_begin
+# Creates RUNNER_SESSION_DIR and exports it. Idempotent when already set.
+runner_session_begin() {
+  if [[ -n "${RUNNER_SESSION_DIR:-}" && -d "${RUNNER_SESSION_DIR}" ]]; then
+    return 0
+  fi
+  RUNNER_SESSION_DIR="$(mktemp -d "${TMPDIR:-/tmp}/runner-session.XXXXXX")"
+  export RUNNER_SESSION_DIR
+}
+
+# runner_session_ensure — begin if needed.
+runner_session_ensure() {
+  runner_session_begin
+}
+
+# runner_session_end
+# Removes RUNNER_SESSION_DIR unless RUNNER_SESSION_KEEP=1.
+runner_session_end() {
+  if [[ -z "${RUNNER_SESSION_DIR:-}" ]]; then
+    return 0
+  fi
+  if [[ "${RUNNER_SESSION_KEEP:-0}" == '1' ]]; then
+    return 0
+  fi
+  rm -rf "${RUNNER_SESSION_DIR}"
+  unset RUNNER_SESSION_DIR
+}
+
+# runner_quote_cmdline <argv…>
+# Prints a single line safe for logging (bash printf %q).
+runner_quote_cmdline() {
+  local arg
+  local first=1
+  for arg in "$@"; do
+    if (( first )); then
+      printf '%q' "$arg"
+      first=0
+    else
+      printf ' %q' "$arg"
+    fi
+  done
+  printf '\n'
+}
+
+# runner_new_uuid
+runner_new_uuid() {
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+    return 0
+  fi
+  printf '%s-%s-%s\n' "$(date +%s%N)" "$$" "$RANDOM"
+}
+
+# runner_exec <label> [--stream-stdout] -- <cmd> [args…]
+# Captures stdout/stderr/exit in a UUID directory. Returns the command exit code.
+# With --stream-stdout, copies stdout to file descriptor 1 after completion.
+runner_exec() {
+  local label stream_stdout=0
+  label="${1:?}"
+  shift
+
+  if [[ "${1:-}" == '--stream-stdout' ]]; then
+    stream_stdout=1
+    shift
+  fi
+  [[ "${1:-}" == '--' ]] || {
+    printf 'runner_exec: expected -- before command (label=%s)\n' "$label" >&2
+    return 2
+  }
+  shift
+
+  runner_session_ensure
+
+  local uuid run_dir exit_code cmdline_quoted
+  uuid="$(runner_new_uuid)"
+  run_dir="${RUNNER_SESSION_DIR}/${uuid}"
+  mkdir -p "$run_dir"
+
+  printf '%s\n' "$label" >"${run_dir}/${_runner_artifact_label}"
+  cmdline_quoted="$(runner_quote_cmdline "$@")"
+  printf '%s' "$cmdline_quoted" >"${run_dir}/${_runner_artifact_cmdline}"
+
+  exit_code=0
+  "$@" >"${run_dir}/${_runner_artifact_stdout}" 2>"${run_dir}/${_runner_artifact_stderr}" || exit_code=$?
+  printf '%s\n' "$exit_code" >"${run_dir}/${_runner_artifact_exit_status}"
+  printf '%s\n' "$uuid" >>"${RUNNER_SESSION_DIR}/.order"
+
+  if (( stream_stdout )); then
+    cat "${run_dir}/${_runner_artifact_stdout}"
+  fi
+
+  return "$exit_code"
+}
+
+# runner_sh <label> [--stream-stdout] <script>
+# Runs bash -c with capture (pipelines and compound commands).
+runner_sh() {
+  local label stream_stdout=0 script
+  label="${1:?}"
+  shift
+  if [[ "${1:-}" == '--stream-stdout' ]]; then
+    stream_stdout=1
+    shift
+  fi
+  script="${1:?}"
+  if (( stream_stdout )); then
+    runner_exec "$label" --stream-stdout -- bash -c "$script"
+  else
+    runner_exec "$label" -- bash -c "$script"
+  fi
+}
+
+# runner_read <uuid> <artifact>
+# Prints artifact contents (exit_status has no trailing newline in file).
+runner_read() {
+  local -r uuid="$1"
+  local -r artifact="$2"
+  local path
+
+  [[ -n "${RUNNER_SESSION_DIR:-}" ]] || {
+    printf 'runner_read: no active session\n' >&2
+    return 2
+  }
+  path="${RUNNER_SESSION_DIR}/${uuid}/${artifact}"
+  [[ -f "$path" ]] || {
+    printf 'runner_read: missing %s\n' "$path" >&2
+    return 2
+  }
+  cat "$path"
+}
+
+# runner_last_id
+# Most recently created run id in this session.
+runner_last_id() {
+  [[ -n "${RUNNER_SESSION_DIR:-}" && -f "${RUNNER_SESSION_DIR}/.order" ]] || return 0
+  tail -n 1 "${RUNNER_SESSION_DIR}/.order"
+}
+
+# runner_exec_stdout <label> -- <cmd> [args…]
+# Runs command; prints captured stdout on success or failure. Returns exit code.
+runner_exec_stdout() {
+  local label="$1"
+  shift
+  [[ "${1:-}" == '--' ]] || {
+    printf 'runner_exec_stdout: expected -- before command (label=%s)\n' "$label" >&2
+    return 2
+  }
+  shift
+  local uuid exit_code
+  exit_code=0
+  runner_exec "$label" -- "$@" || exit_code=$?
+  uuid="$(runner_last_id)"
+  if [[ -n "$uuid" ]]; then
+    runner_read "$uuid" "$_runner_artifact_stdout" || true
+  fi
+  return "$exit_code"
+}
+
+# runner_sh_stdout <label> <script>
+runner_sh_stdout() {
+  local label script exit_code uuid
+  label="${1:?}"
+  script="${2:?}"
+  exit_code=0
+  runner_sh "$label" "$script" || exit_code=$?
+  uuid="$(runner_last_id)"
+  if [[ -n "$uuid" ]]; then
+    runner_read "$uuid" "$_runner_artifact_stdout" || true
+  fi
+  return "$exit_code"
+}
+
+# runner_read_exit <uuid>
+runner_read_exit() {
+  local raw
+  raw="$(runner_read "$1" "$_runner_artifact_exit_status")"
+  printf '%s' "$raw" | tr -d '[:space:]'
+}
+
+# runner_session_ids
+# Lists run ids in creation order.
+runner_session_ids() {
+  [[ -n "${RUNNER_SESSION_DIR:-}" && -f "${RUNNER_SESSION_DIR}/.order" ]] || return 0
+  cat "${RUNNER_SESSION_DIR}/.order"
+}
+
+# runner_session_failed_ids
+# Lists UUIDs whose exit_status is not 0.
+runner_session_failed_ids() {
+  local uuid exit_code
+  while IFS= read -r uuid; do
+    [[ -n "$uuid" ]] || continue
+    exit_code="$(runner_read_exit "$uuid" 2>/dev/null || printf '0')"
+    if [[ -n "$exit_code" && "$exit_code" -ne 0 ]]; then
+      printf '%s\n' "$uuid"
+    fi
+  done < <(runner_session_ids)
+}
+
+# runner_format_failure <uuid>
+# Prints a multi-line diagnostic block to stdout.
+runner_format_failure() {
+  local -r uuid="$1"
+  local label cmdline exit_code stdout stderr
+
+  label="$(runner_read "$uuid" "$_runner_artifact_label" 2>/dev/null || true)"
+  cmdline="$(runner_read "$uuid" "$_runner_artifact_cmdline" 2>/dev/null || true)"
+  exit_code="$(runner_read_exit "$uuid" 2>/dev/null || printf '?')"
+  stdout="$(runner_read "$uuid" "$_runner_artifact_stdout" 2>/dev/null || true)"
+  stderr="$(runner_read "$uuid" "$_runner_artifact_stderr" 2>/dev/null || true)"
+
+  if [[ -n "$label" ]]; then
+    printf '[FAIL] %s\n' "$label"
+  else
+    printf '[FAIL] command %s\n' "$uuid"
+  fi
+  printf '  command:   %s\n' "${cmdline:-?}"
+  printf '  exit code: %s\n' "$exit_code"
+  if [[ -n "$stderr" ]]; then
+    printf '  --- stderr ---\n'
+    printf '%s\n' "$stderr" | sed 's/^/  /'
+    printf '  --- end stderr ---\n'
+  fi
+  if [[ -n "$stdout" ]]; then
+    printf '  --- stdout ---\n'
+    printf '%s\n' "$stdout" | sed 's/^/  /'
+    printf '  --- end stdout ---\n'
+  fi
+}
+
 # record_first_failure <message>
-# Writes the first failure reason to $RUNNER_FIRST_FAILURE_FILE.
-# If the file already has content (a previous failure was recorded), this is a no-op.
 record_first_failure() {
   if [[ -n "${RUNNER_FIRST_FAILURE_FILE:-}" && ! -s "${RUNNER_FIRST_FAILURE_FILE}" ]]; then
-    printf '%s\n' "$*" > "${RUNNER_FIRST_FAILURE_FILE}"
+    printf '%s\n' "$*" >"${RUNNER_FIRST_FAILURE_FILE}"
   fi
 }
 
@@ -45,33 +273,26 @@ run_command() {
   local -r label="$1"
   shift
 
-  local stderr_file
   local exit_code
-  stderr_file="$(mktemp)"
-  # shellcheck disable=SC2064  # intentional: expand $stderr_file now to embed the path in the trap
-  trap "rm -f '${stderr_file}'" RETURN
   exit_code=0
-
-  "$@" 2>"$stderr_file" || exit_code=$?
+  runner_exec "$label" --stream-stdout -- "$@" || exit_code=$?
 
   if [[ "$exit_code" -ne 0 ]]; then
-    local stderr_content
-    stderr_content="$(cat "$stderr_file")"
-    # Record first failure so the EXIT trap can emit a real reason, not a generic wrapper.
-    local stderr_first_line=""
-    stderr_first_line="$(printf '%s' "$stderr_content" | grep -m1 '.' || true)"
-    if [[ -n "$stderr_first_line" ]]; then
-      record_first_failure "${label}: ${stderr_first_line}"
+    local failed_uuid stderr_first_line
+    failed_uuid="$(runner_last_id)"
+    if [[ -n "$failed_uuid" ]]; then
+      stderr_first_line="$(runner_read "$failed_uuid" "$_runner_artifact_stderr" 2>/dev/null \
+        | grep -m1 '.' || true)"
+      if [[ -n "$stderr_first_line" ]]; then
+        record_first_failure "${label}: ${stderr_first_line}"
+      else
+        record_first_failure "${label} (exit ${exit_code})"
+      fi
+      runner_format_failure "$failed_uuid" >&2
     else
       record_first_failure "${label} (exit ${exit_code})"
-    fi
-    printf '[FAIL] %s\n' "$label" >&2
-    printf '  command:   %s\n' "$*" >&2
-    printf '  exit code: %d\n' "$exit_code" >&2
-    if [[ -n "$stderr_content" ]]; then
-      printf '  --- stderr ---\n' >&2
-      printf '%s\n' "$stderr_content" | sed 's/^/  /' >&2
-      printf '  --- end stderr ---\n' >&2
+      printf '[FAIL] %s\n' "$label" >&2
+      printf '  exit code: %d\n' "$exit_code" >&2
     fi
   fi
 
