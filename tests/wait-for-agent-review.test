@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+# Smoke and static tests for scripts/wait-for-agent-review and trigger-agent-review.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+wait_script="${script_dir}/../scripts/wait-for-agent-review"
+trigger_script="${script_dir}/../scripts/trigger-agent-review"
+lib="${script_dir}/../scripts/lib/agent-review"
+profile="${script_dir}/../scripts/lib/agent-review-profiles/copilot"
+bugbot_profile="${script_dir}/../scripts/lib/agent-review-profiles/bugbot"
+quota_lib="${script_dir}/../scripts/lib/agent-review-quota"
+rule="${script_dir}/../.cursor/rules/pr-ship-and-review.mdc"
+agents_md="${script_dir}/../AGENTS.md"
+
+readonly wait_script trigger_script lib profile bugbot_profile quota_lib rule agents_md
+
+printf '\n=== --help ===\n'
+help_out=""
+help_exit=0
+help_out="$(bash "$wait_script" --help 2>&1)" || help_exit=$?
+assert_exit_0 "wait-for-agent-review --help" "$help_out" "$help_exit"
+assert_contains "wait help lists complete" "$help_out" "complete"
+
+trigger_out=""
+trigger_exit=0
+trigger_out="$(bash "$trigger_script" --help 2>&1)" || trigger_exit=$?
+assert_exit_0 "trigger-agent-review --help" "$trigger_out" "$trigger_exit"
+assert_contains "trigger help lists request" "$trigger_out" "request"
+
+printf '\n=== static: agent profile copilot ===\n'
+if grep -qF 'agent_review_profile_review_is_empty' "$profile" \
+  && grep -qF 'agent_review_profile_request' "$profile" \
+  && grep -qF 'copilot-pull-request-reviewer' "$profile"; then
+  printf '[PASS] copilot profile: empty review regex and reviewer slug\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot profile: missing empty review detection or reviewer slug\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: wait-for-agent-review commands ===\n'
+if grep -qF 'cmd_complete' "$wait_script" \
+  && grep -qF 'gh pr review' "$wait_script" \
+  && grep -qF 'agent_review_email_complete' "$wait_script" \
+  && grep -qF 'complete_ready' "$lib"; then
+  printf '[PASS] wait script: complete approves and emails on complete_ready\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] wait script: missing complete/approve/email wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'agent_review_empty' "$lib" \
+  && grep -qF 'agent_review_profile_review_is_empty' "$profile"; then
+  printf '[PASS] status: exposes agent_review_empty from profile\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] status: missing agent_review_empty wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'AGENT_REVIEW_REPORT_TO' "$wait_script" \
+  && grep -qF 'AGENT_REVIEW_REPORT_TO' "${script_dir}/../etc/agent-review.env.example"; then
+  printf '[PASS] config: uses AGENT_REVIEW_REPORT_TO\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] config: missing AGENT_REVIEW_REPORT_TO\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: docs and cursor rule ===\n'
+if [[ -f "$rule" ]] \
+  && grep -qF 'wait-for-agent-review complete' "$rule" \
+  && grep -qF 'generated no new comments' "$rule"; then
+  printf '[PASS] cursor rule: documents complete on empty agent review\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cursor rule: missing pr-ship-and-review complete guidance\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'pr-ship-and-review.mdc' "$agents_md" \
+  && grep -qF 'wait-for-agent-review complete' "$agents_md"; then
+  printf '[PASS] AGENTS.md: references agent review rule and complete\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] AGENTS.md: missing agent review section\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: wait timeouts ===\n'
+if grep -qF 'ERROR: WAIT_TIMEOUT wait-for-agent-review' "$wait_script" \
+  && grep -A1 'ERROR: WAIT_TIMEOUT restack' "$wait_script" | grep -qF 'return 4' \
+  && grep -qF 'select(.isResolved == false)' "$lib"; then
+  printf '[PASS] wait script: machine-parseable timeouts and unresolved thread filter\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] wait script: missing WAIT_TIMEOUT lines or unresolved thread filter\n'
+  fail=$(( fail + 1 ))
+fi
+
+if ! grep -qF 'set -euo pipefail' "$lib" \
+  && ! grep -qF 'set -euo pipefail' "${script_dir}/../scripts/lib/agent-review-email" \
+  && ! grep -qF 'set -euo pipefail' "$profile"; then
+  printf '[PASS] sourced libs: do not mutate caller shell options\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] sourced libs: still set -euo pipefail (mutates caller)\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: loop caps and give-up ===\n'
+if grep -qF 'cmd_loop' "$wait_script" \
+  && grep -qF 'cmd_give_up' "$wait_script" \
+  && grep -qF 'agent_review_post_give_up_comment' "${script_dir}/../scripts/lib/agent-review-email" \
+  && grep -qF 'WAIT_TIMEOUT agent-review-give-up' "$wait_script" \
+  && grep -qF 'AGENT_REVIEW_CYCLE_TIMEOUT' "$wait_script" \
+  && grep -qF 'AGENT_REVIEW_PR_TIMEOUT' "$wait_script" \
+  && grep -qF 'AGENT_REVIEW_QUOTA_EXHAUSTED' "$wait_script" \
+  && grep -qF 'agent_review_default_pr_timeout_s=43200' "$lib"; then
+  printf '[PASS] loop: cycle/PR caps, give-up email+comment\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] loop: missing cycle/PR caps or give-up wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+if awk '/^main\(\)/{m=NR} /agent_review_load_env/ && (!m || NR<=m){bad=1} END{exit bad}' "$wait_script"; then
+  printf '[PASS] wait script: loads env inside main after help handling\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] wait script: loads env at file scope before help\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: bugbot review fixes ===\n'
+# shellcheck disable=SC2016  # grep for literal ${head}/${pr} strings in wait script under test
+if grep -qF 'agent_review_head_check_state_json "${repo}" "${head}"' "$wait_script" \
+  && ! grep -qF 'agent_review_head_check_state_json "${repo}" "${pr}"' "$wait_script"; then
+  printf '[PASS] wait: head-check state uses head OID not PR number\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] wait: head-check state must pass headRefOid to agent_review_head_check_state_json\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'while re-requesting a review' "$wait_script" \
+  && grep -qF 'cmd_handle_quota_exhaustion' "$wait_script"; then
+  printf '[PASS] loop: check exit 5 re-request handles quota exhaustion\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] loop: check exit 5 must handle cmd_request quota exit 7\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: bugbot round-2 fixes ===\n'
+if grep -qF 'agent_review_quota_quote_env_value' "$quota_lib" \
+  && grep -qF 'reason_quoted=' "$quota_lib"; then
+  printf '[PASS] quota cache: reason values shell-quoted for source\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota cache: missing shell-quoted reason writes\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'agent_review_quota_timestamp_on_local_day' "$quota_lib" \
+  && ! grep -qF 'startswith' "$quota_lib"; then
+  printf '[PASS] quota probe: UTC timestamps filtered by local calendar day\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota probe: still uses UTC date prefix instead of local day\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'agent_review_head_check_complete_on_head' "$lib" \
+  && awk '/agent_review_fresh_agent_on_head\(\)/,/^}/ {
+       if ($0 ~ /agent_review_head_check_complete_on_head/) { found=1 }
+     } END { exit(found ? 0 : 1) }' "$lib"; then
+  printf '[PASS] head-check freshness uses commit head OID not PR rollup\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] head-check freshness must use headRefOid check-runs\n'
+  fail=$(( fail + 1 ))
+fi
+
+tmp_quota="$(mktemp)"
+# shellcheck disable=SC2016  # bash -c asserts literal ${reason} after sourcing quoted cache file
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_quota}'
+  agent_review_copilot_quota_write_cache 1 probe 'Copilot review quota exhausted on test.'
+  source '${tmp_quota}'
+  [[ \"\${reason}\" == 'Copilot review quota exhausted on test.' ]]
+"; then
+  printf '[PASS] quota cache: multi-word reason survives source\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota cache: multi-word reason breaks on source\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_quota}"
+
+printf '\n=== static: copilot quota detection ===\n'
+if grep -qF 'agent_review_profile_text_is_quota_exhausted' "$profile" \
+  && grep -qF 'agent_review_profile_review_is_quota_exhausted' "$profile" \
+  && grep -qF 'agent_quota_exhausted' "$lib"; then
+  printf '[PASS] copilot profile and status expose quota exhaustion\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot profile: missing quota exhaustion detection\n'
+  fail=$(( fail + 1 ))
+fi
+
+if bash -c "source '${profile}'; agent_review_profile_text_is_quota_exhausted 'You have no quota (quota_exceeded)'"; then
+  printf '[PASS] copilot profile: detects quota_exceeded text\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot profile: rejected quota_exceeded text\n'
+  fail=$(( fail + 1 ))
+fi
+
+if bash -c "source '${profile}'; agent_review_profile_text_is_quota_exhausted 'Copilot was unable to review this pull request because the user who requested the review has reached their quota limit.'"; then
+  printf '[PASS] copilot profile: detects reached quota limit review body\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot profile: rejected reached quota limit review body\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: copilot profile empty review function ===\n'
+if bash -c "source '${profile}'; agent_review_profile_review_is_empty 'Copilot reviewed 2 files and generated no new comments.'"; then
+  printf '[PASS] copilot profile: detects empty review body\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot profile: empty review regex rejected valid body\n'
+  fail=$(( fail + 1 ))
+fi
+
+if bash -c "source '${profile}'; agent_review_profile_review_is_empty 'generated 3 comments.'"; then
+  printf '[FAIL] copilot profile: accepted non-empty review body\n'
+  fail=$(( fail + 1 ))
+else
+  printf '[PASS] copilot profile: rejects non-empty review body\n'
+  pass=$(( pass + 1 ))
+fi
+
+printf '\n=== static: bugbot profile ===\n'
+if grep -qF 'agent_review_profile_review_is_empty' "$bugbot_profile" \
+  && grep -qF 'agent_review_profile_request' "$bugbot_profile" \
+  && grep -qF 'bugbot run' "$bugbot_profile" \
+  && grep -qF 'found[[:space:]]+no[[:space:]]+bugs' "$bugbot_profile"; then
+  printf '[PASS] bugbot profile: request comment and empty review detection\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot profile: missing request or empty review wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+if bash -c "source '${bugbot_profile}'; agent_review_profile_review_is_empty '### ✅ BugBot reviewed your changes and found no bugs!'"; then
+  printf '[PASS] bugbot profile: detects found no bugs review body\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot profile: rejected found no bugs review body\n'
+  fail=$(( fail + 1 ))
+fi
+
+if bash -c "source '${bugbot_profile}'; agent_review_profile_review_is_empty 'found 2 potential issues'"; then
+  printf '[FAIL] bugbot profile: accepted non-empty review body\n'
+  fail=$(( fail + 1 ))
+else
+  printf '[PASS] bugbot profile: rejects non-empty review body\n'
+  pass=$(( pass + 1 ))
+fi
+
+printf '\n=== static: copilot quota fallback ===\n'
+if grep -qF 'cmd_try_copilot_quota_fallback' "$wait_script" \
+  && grep -qF 'cmd_handle_quota_exhaustion' "$wait_script" \
+  && grep -qF 'AGENT_REVIEW_FALLBACK_AGENT' "$wait_script" \
+  && grep -qF 'agent_review_use_agent' "$lib" \
+  && grep -qF 'agent_review_post_fallback_comment' "${script_dir}/../scripts/lib/agent-review-email"; then
+  printf '[PASS] loop: copilot quota falls back to bugbot\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] loop: missing copilot quota fallback wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'cmd_handle_quota_exhaustion' "$wait_script" \
+  && grep -qF 'No further automated reviews are available' "$wait_script" \
+  && grep -qF 'Bugbot usage limit already reached (cached)' "$wait_script"; then
+  printf '[PASS] loop: bugbot usage limit gives up instead of fallback\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] loop: missing bugbot usage-limit give-up wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: copilot daily quota cache ===\n'
+if grep -qF 'scratch/repository-helpers/copilot-review-quota.env' "$quota_lib" \
+  && grep -qF 'agent_review_copilot_quota_probe_recent_reviews' "$quota_lib" \
+  && grep -qF 'agent_review_copilot_quota_skip_request' "$quota_lib" \
+  && grep -qF 'agent_review_agent_quota_mark_exhausted' "$wait_script"; then
+  printf '[PASS] copilot quota: daily scratch cache and programmatic probe\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot quota: missing daily cache or probe wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: bugbot daily quota cache ===\n'
+if grep -qF 'scratch/repository-helpers/bugbot-review-quota.env' "$quota_lib" \
+  && grep -qF 'agent_review_bugbot_quota_probe_recent_signals' "$quota_lib" \
+  && grep -qF 'probe_recent_comments' "$quota_lib" \
+  && grep -qF 'agent_review_bugbot_quota_skip_request' "$quota_lib" \
+  && grep -qF 'agent_review_agent_quota_skip_request' "$quota_lib"; then
+  printf '[PASS] bugbot quota: daily scratch cache and programmatic probe\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot quota: missing daily cache or probe wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+if bash -c "source '${lib}'; source '${quota_lib}'; agent_review_copilot_quota_text_is_exhausted 'reached their quota limit'"; then
+  printf '[PASS] copilot quota probe: detects quota text via copilot profile\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot quota probe: rejected quota text\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: bugbot GitHub check wait ===\n'
+if grep -qF 'agent_review_profile_uses_head_check=true' "$bugbot_profile" \
+  && grep -qF 'agent_review_profile_head_check_is_clean' "$bugbot_profile" \
+  && grep -qF 'agent_review_profile_head_check_has_findings' "$bugbot_profile" \
+  && grep -qF 'agent_review_profile_head_check_is_quota_exhausted' "$bugbot_profile" \
+  && grep -qF 'agent_review_head_check_state_json' "$lib" \
+  && grep -qF 'head_check_quota' "$lib"; then
+  printf '[PASS] bugbot profile: interprets Cursor Bugbot GitHub check output\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot profile: missing GitHub check interpretation wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+quota_json='{"status":"completed","conclusion":"neutral","output":{"summary":"Bugbot run failed","text":"Bugbot could not run - usage limit reached"}}'
+if TEST_JSON="${quota_json}" bash -c "source '${bugbot_profile}'; agent_review_profile_head_check_is_quota_exhausted \"\${TEST_JSON}\""; then
+  printf '[PASS] bugbot profile: detects usage limit as quota exhaustion\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot profile: rejected usage limit quota signal\n'
+  fail=$(( fail + 1 ))
+fi
+
+if TEST_JSON="${quota_json}" bash -c "source '${bugbot_profile}'; agent_review_profile_head_check_is_error \"\${TEST_JSON}\""; then
+  printf '[PASS] bugbot profile: usage limit still counts as check error for wait\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot profile: rejected usage limit as check error\n'
+  fail=$(( fail + 1 ))
+fi
+
+if TEST_JSON='{"status":"completed","conclusion":"neutral","output":{"summary":"Bugbot run failed","text":"Bugbot could not run - internal error"}}' \
+  bash -c "source '${bugbot_profile}'; agent_review_profile_head_check_is_quota_exhausted \"\${TEST_JSON}\""; then
+  printf '[FAIL] bugbot profile: accepted non-quota run failure as quota\n'
+  fail=$(( fail + 1 ))
+else
+  printf '[PASS] bugbot profile: rejects non-quota run failure\n'
+  pass=$(( pass + 1 ))
+fi
+
+if bash -c "source '${lib}'; source '${quota_lib}'; agent_review_bugbot_quota_text_is_exhausted 'Bugbot could not run - usage limit reached'"; then
+  printf '[PASS] bugbot quota probe: detects usage limit comment text\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot quota probe: rejected usage limit comment text\n'
+  fail=$(( fail + 1 ))
+fi
+
+if bash -c "source '${lib}'; source '${quota_lib}'; agent_review_bugbot_quota_check_run_is_exhausted '${quota_json}'"; then
+  printf '[PASS] bugbot quota probe: detects usage limit check JSON\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot quota probe: rejected usage limit check JSON\n'
+  fail=$(( fail + 1 ))
+fi
+
+if bash -c "source '${bugbot_profile}'; agent_review_profile_text_is_quota_exhausted \"Bugbot couldn't run - usage limit reached\""; then
+  printf '[PASS] bugbot profile: detects PR comment usage limit text\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot profile: rejected PR comment usage limit text\n'
+  fail=$(( fail + 1 ))
+fi
+
+clean_json='{"status":"completed","conclusion":"success","output":{"summary":"Final Result: no new issues found","text":""}}'
+readonly clean_json
+if bash -c "source '${bugbot_profile}'; agent_review_profile_head_check_is_clean '${clean_json}'"; then
+  printf '[PASS] bugbot profile: detects success check as clean\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot profile: rejected success check as clean\n'
+  fail=$(( fail + 1 ))
+fi
+
+findings_json='{"status":"completed","conclusion":"neutral","output":{"summary":"Posted analysis results — 2 bugs reported","text":""}}'
+readonly findings_json
+if bash -c "source '${bugbot_profile}'; agent_review_profile_head_check_has_findings '${findings_json}'"; then
+  printf '[PASS] bugbot profile: detects neutral check with bugs reported\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot profile: rejected neutral check with bugs reported\n'
+  fail=$(( fail + 1 ))
+fi
+
+neutral_cancel_json='{"status":"completed","conclusion":"neutral","output":{"summary":"Bugbot run cancelled","text":"Run was cancelled"}}'
+if bash -c "source '${bugbot_profile}'; agent_review_profile_head_check_has_findings '${neutral_cancel_json}'"; then
+  printf '[FAIL] bugbot profile: accepted cancelled neutral check as findings\n'
+  fail=$(( fail + 1 ))
+else
+  printf '[PASS] bugbot profile: rejects cancelled neutral check without findings text\n'
+  pass=$(( pass + 1 ))
+fi
+
+printf '\n=== static: coderabbit follow-up fixes ===\n'
+if grep -qF 'agent_review_profile_uses_head_check=false' "$lib" \
+  && grep -qF 'Reset optional hooks so profile switches cannot leak' "$lib"; then
+  printf '[PASS] agent-review: resets optional profile hooks before source\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] agent-review: missing profile hook reset before source\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'gh_slug_from_origin_url' "$lib" \
+  && grep -qF 'agent_review_assert_checkout_matches_repo' "$lib"; then
+  printf '[PASS] agent-review: exact origin slug match for checkout guard\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] agent-review: checkout guard still uses substring origin match\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'request_exit=$?' "$profile" \
+  && ! grep -qF 'if ! gh pr edit' "$profile"; then
+  printf '[PASS] copilot profile: captures gh exit code outside negated if\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot profile: still reads $? inside if ! gh block\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF '@tsv' "$quota_lib" \
+  && grep -qF 'agent_review_bugbot_quota_ensure_state_dir' "$quota_lib"; then
+  printf '[PASS] quota lib: TSV-safe probe output and Bugbot cache dir helper\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota lib: missing @tsv probe or Bugbot cache dir helper\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'give-up email failed (continuing with PR comment)' "$wait_script"; then
+  printf '[PASS] give-up: continues with PR comment when email fails\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] give-up: aborts before PR comment when email fails\n'
+  fail=$(( fail + 1 ))
+fi
+
+test_summary

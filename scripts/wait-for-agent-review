@@ -1,0 +1,768 @@
+#!/usr/bin/env bash
+# Poll GitHub for agent pull-request review state (default: Copilot).
+#
+# Subcommands:
+#   status              JSON status for the configured agent
+#   request             Ask the agent to review (idempotent)
+#   wait                Block until the agent posts a review for the current head
+#   list-threads        Print agent threads still needing a human reply (JSON)
+#   check               Exit 0 when complete_ready or PR merged
+#   complete            Approve PR + email operator (only when agent review is empty)
+#   restack             Sync and restack when mergeStateStatus is BEHIND
+#   resolve-thread      Resolve one thread by GraphQL node id
+#   resolve-addressed   Resolve agent threads that already have a human reply
+#   email-failure       Email operator that the agent loop timed out
+#   give-up             Email + PR comment that the agent loop is stopping
+#   loop                Run request/wait/check until complete, triage needed, or timeout
+#
+# See .cursor/rules/pr-ship-and-review.mdc for the full loop.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared libs sourced at runtime from scripts/lib
+source "${script_dir}/lib/agent-review"
+# shellcheck disable=SC1091  # shared libs sourced at runtime from scripts/lib
+source "${script_dir}/lib/agent-review-email"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/wait-for-agent-review <command> [options]
+
+Commands:
+  status [--pr N] [--repo OWNER/NAME]
+  request [--pr N] [--repo OWNER/NAME]
+  wait [--pr N] [--repo OWNER/NAME] [--timeout SECONDS] [--poll-interval SECONDS]
+  list-threads [--pr N] [--repo OWNER/NAME]
+  check [--pr N] [--repo OWNER/NAME]
+  complete [--pr N] [--repo OWNER/NAME]
+  restack [--pr N] [--repo OWNER/NAME]
+  resolve-thread --thread-id ID
+  resolve-addressed [--pr N] [--repo OWNER/NAME]
+  email-failure [--pr N] [--repo OWNER/NAME] [--reason TEXT]
+  give-up [--pr N] [--repo OWNER/NAME] [--reason TEXT]
+  loop [--pr N] [--repo OWNER/NAME]
+
+Environment:
+  AGENT_REVIEW_AGENT            Agent profile name (default: copilot)
+  AGENT_REVIEW_FALLBACK_AGENT   Fallback when Copilot quota exhausted (default: bugbot; empty disables)
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE  Daily Copilot quota cache (default: ~/scratch/repository-helpers/copilot-review-quota.env)
+  AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE   Daily Bugbot usage cache (default: ~/scratch/repository-helpers/bugbot-review-quota.env)
+  AGENT_REVIEW_GITHUB_REPO      Default repo (OWNER/NAME; else git remote origin)
+  AGENT_REVIEW_PR_NUMBER        Default PR number when --pr is omitted
+  AGENT_REVIEW_REPORT_TO        Operator email recipient (required for complete/email-failure)
+  AGENT_REVIEW_REPORT_FROM      Email sender (required for complete/email-failure)
+  AGENT_REVIEW_CYCLE_TIMEOUT    Per review-request cycle cap (default: 30m)
+  AGENT_REVIEW_PR_TIMEOUT       Overall PR agent review cap (default: 12h)
+  AGENT_REVIEW_LOOP_TIMEOUT     Deprecated alias for AGENT_REVIEW_CYCLE_TIMEOUT
+  AGENT_REVIEW_ENV_FILE         Config file (default: ~/.config/agent-review.env)
+  DEP_UPDATER_SMTP_HOST         SMTP host (from dep-updater.env or agent-review.env)
+
+Exit codes:
+  0  success / complete_ready / PR merged
+  1  usage / prerequisite error
+  2  timed out waiting for agent review (wait) or not fresh on head (check)
+  3  agent threads still lack a human reply (check; JSON on stdout)
+  4  mergeStateStatus is BEHIND/DIRTY/CONFLICTING (run restack)
+  5  fresh review but agent did not report "no new comments" yet (check/complete)
+  6  loop give-up (cycle or PR timeout; email + PR comment posted)
+  7  agent review quota exhausted with no fallback (give-up email + PR comment posted)
+  8  agent GitHub check failed to run (non-quota; see check output on PR)
+EOF
+}
+
+cmd_status() {
+  local repo pr owner name snapshot
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
+  agent_review_assert_snapshot_complete "${snapshot}"
+  agent_review_status_json_from_snapshot "${snapshot}" "${repo}" "${pr}"
+}
+
+cmd_request() {
+  local repo pr owner name snapshot request_exit
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  if agent_review_pr_is_merged "${repo}" "${pr}"; then
+    printf 'PR #%s is already merged — skipping agent request\n' "${pr}" >&2
+    return 0
+  fi
+  if agent_review_agent_quota_skip_request; then
+    return 7
+  fi
+  snapshot="$(agent_review_graphql_request_snapshot "${owner}" "${name}" "${pr}")"
+  agent_review_assert_review_requests_complete "${snapshot}"
+  if agent_review_agent_requested_from_snapshot "${snapshot}"; then
+    printf '%s review already requested on PR #%s\n' "${AGENT_REVIEW_AGENT:-copilot}" "${pr}" >&2
+    return 0
+  fi
+  request_exit=0
+  agent_review_profile_request "${repo}" "${pr}" || request_exit=$?
+  if (( request_exit == 7 )); then
+    agent_review_agent_quota_mark_exhausted \
+      "${AGENT_REVIEW_AGENT:-copilot} review request blocked by quota or usage limits (see gh stderr above)."
+    return 7
+  fi
+  if (( request_exit != 0 )); then
+    agent_review_die 'failed to request agent review'
+  fi
+  printf 'Requested %s review on PR #%s\n' "${AGENT_REVIEW_AGENT:-copilot}" "${pr}" >&2
+}
+
+cmd_wait() {
+  local repo pr timeout interval owner name head started snapshot review_body check_state_json check_state quota_hit
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  timeout="${3:-${agent_review_default_wait_timeout_s}}"
+  interval="${4:-${agent_review_default_poll_interval_s}}"
+  agent_review_validate_positive_int --timeout "${timeout}"
+  agent_review_validate_positive_int --poll-interval "${interval}"
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  started="$(date +%s)"
+  while true; do
+    if agent_review_pr_is_merged "${repo}" "${pr}"; then
+      printf 'PR #%s is already merged — stopping wait\n' "${pr}" >&2
+      return 0
+    fi
+    snapshot="$(agent_review_graphql_wait_snapshot "${owner}" "${name}" "${pr}")"
+    head="$(printf '%s' "${snapshot}" | jq -r '.data.repository.pullRequest.headRefOid')"
+    if agent_review_fresh_agent_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+      if agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
+        review_body="$(agent_review_latest_agent_review_body_on_head "${snapshot}" "${head}")"
+        if agent_review_profile_review_is_quota_exhausted "${review_body}"; then
+          if [[ "${AGENT_REVIEW_AGENT:-copilot}" == 'copilot' ]]; then
+            agent_review_copilot_quota_mark_exhausted \
+              "Copilot review on head ${head:0:7} reports quota exhaustion (PR #${pr})."
+          else
+            agent_review_bugbot_quota_mark_exhausted \
+              "Bugbot review on head ${head:0:7} reports usage limit reached (PR #${pr})."
+          fi
+          printf '%s review on head %s reports quota exhaustion (PR #%s)\n' \
+            "${AGENT_REVIEW_AGENT:-copilot}" "${head:0:7}" "${pr}" >&2
+          return 7
+        fi
+        printf '%s review posted for head %s (PR #%s)\n' \
+          "${AGENT_REVIEW_AGENT:-copilot}" "${head:0:7}" "${pr}" >&2
+        return 0
+      fi
+      if [[ "${agent_review_profile_uses_head_check:-false}" == 'true' ]]; then
+        check_state_json="$(agent_review_head_check_state_json "${repo}" "${head}")"
+        quota_hit="$(printf '%s' "${check_state_json}" | jq -r '.quota')"
+        if [[ "${quota_hit}" == 'true' ]]; then
+          agent_review_agent_quota_mark_exhausted \
+            "Bugbot check on head ${head:0:7} reports usage limit reached (PR #${pr})."
+          printf '%s GitHub check reports usage limit for head %s (PR #%s)\n' \
+            "${AGENT_REVIEW_AGENT:-copilot}" "${head:0:7}" "${pr}" >&2
+          return 7
+        fi
+        check_state="$(printf '%s' "${check_state_json}" | jq -r \
+          'if .error then "error" elif .clean then "clean" elif .findings then "findings" else .conclusion end')"
+        printf '%s GitHub check completed (%s) for head %s (PR #%s)\n' \
+          "${AGENT_REVIEW_AGENT:-copilot}" "${check_state}" "${head:0:7}" "${pr}" >&2
+        return 0
+      fi
+    fi
+    if (( $(date +%s) - started >= timeout )); then
+      printf 'ERROR: WAIT_TIMEOUT wait-for-agent-review pr=%s head=%s waited=%ss timeout=%ss agent=%s\n' \
+        "${pr}" "${head:0:7}" "$(( $(date +%s) - started ))" "${timeout}" "${AGENT_REVIEW_AGENT:-copilot}" >&2
+      return 2
+    fi
+    printf 'Waiting for %s review on PR #%s (head %s)…\n' "${AGENT_REVIEW_AGENT:-copilot}" "${pr}" "${head:0:7}" >&2
+    sleep "${interval}"
+  done
+}
+
+cmd_list_threads() {
+  local repo pr owner name snapshot
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
+  agent_review_assert_snapshot_complete "${snapshot}"
+  agent_review_threads_json_from_snapshot "${snapshot}"
+}
+
+cmd_check() {
+  local repo pr owner name snapshot status complete_ready unaddressed fresh merge_state pr_merged agent_empty agent_quota
+  local head_check_error head_check_findings
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
+  agent_review_assert_snapshot_complete "${snapshot}"
+  status="$(agent_review_status_json_from_snapshot "${snapshot}" "${repo}" "${pr}")"
+  pr_merged="$(printf '%s' "${status}" | jq -r '.pr_merged')"
+  if [[ "${pr_merged}" == 'true' ]]; then
+    printf '%s\n' "${status}"
+    printf 'wait-for-agent-review: PR #%s is merged — loop complete\n' "${pr}" >&2
+    return 0
+  fi
+  complete_ready="$(printf '%s' "${status}" | jq -r '.complete_ready')"
+  unaddressed="$(printf '%s' "${status}" | jq -r '.unaddressed_agent_threads')"
+  fresh="$(printf '%s' "${status}" | jq -r '.fresh_review_on_head')"
+  agent_empty="$(printf '%s' "${status}" | jq -r '.agent_review_empty')"
+  agent_quota="$(printf '%s' "${status}" | jq -r '.agent_quota_exhausted')"
+  head_check_error="$(printf '%s' "${status}" | jq -r '.head_check_error')"
+  head_check_findings="$(printf '%s' "${status}" | jq -r '.head_check_findings')"
+  merge_state="$(printf '%s' "${status}" | jq -r '.merge_state_status')"
+  if [[ "${agent_quota}" == 'true' ]]; then
+    agent_review_agent_quota_mark_exhausted \
+      "${AGENT_REVIEW_AGENT:-copilot} review on the current PR head reports quota or usage limit exhaustion."
+    printf '%s\n' "${status}"
+    printf 'wait-for-agent-review: %s review quota or usage limit exhausted on current head\n' \
+      "${AGENT_REVIEW_AGENT:-copilot}" >&2
+    return 7
+  fi
+  if [[ "${complete_ready}" == 'true' ]]; then
+    printf '%s\n' "${status}"
+    return 0
+  fi
+  if [[ "${head_check_error}" == 'true' ]]; then
+    printf '%s\n' "${status}"
+    printf 'wait-for-agent-review: %s GitHub check failed to run (see check output on PR)\n' \
+      "${AGENT_REVIEW_AGENT:-copilot}" >&2
+    return 8
+  fi
+  if [[ "${fresh}" != 'true' ]]; then
+    printf '%s\n' "${status}"
+    return 2
+  fi
+  if [[ "${unaddressed}" -gt 0 ]]; then
+    printf '%s\n' "${status}" >&2
+    agent_review_threads_json_from_snapshot "${snapshot}"
+    return 3
+  fi
+  if [[ "${head_check_findings}" == 'true' ]]; then
+    printf '%s\n' "${status}"
+    printf 'wait-for-agent-review: %s GitHub check reports findings — review comments expected on PR\n' \
+      "${AGENT_REVIEW_AGENT:-copilot}" >&2
+    return 5
+  fi
+  if ! agent_review_merge_state_ready "${merge_state}"; then
+    printf '%s\n' "${status}"
+    printf 'wait-for-agent-review: mergeStateStatus=%s — run restack (BEHIND) or fix conflicts\n' \
+      "${merge_state}" >&2
+    return 4
+  fi
+  if [[ "${agent_empty}" != 'true' ]]; then
+    printf '%s\n' "${status}"
+    printf 'wait-for-agent-review: %s reviewed head but did not report "no new comments" yet\n' \
+      "${AGENT_REVIEW_AGENT:-copilot}" >&2
+    return 5
+  fi
+  printf '%s\n' "${status}"
+  return 0
+}
+
+cmd_complete() {
+  local repo pr status complete_ready gh_user existing pr_merged
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  if agent_review_pr_is_merged "${repo}" "${pr}"; then
+    printf 'PR #%s is already merged — skipping approve/email\n' "${pr}" >&2
+    return 0
+  fi
+  status="$(cmd_status "${repo}" "${pr}")"
+  pr_merged="$(printf '%s' "${status}" | jq -r '.pr_merged')"
+  if [[ "${pr_merged}" == 'true' ]]; then
+    printf 'PR #%s is already merged — skipping approve/email\n' "${pr}" >&2
+    return 0
+  fi
+  complete_ready="$(printf '%s' "${status}" | jq -r '.complete_ready')"
+  if [[ "${complete_ready}" != 'true' ]]; then
+    agent_review_die 'complete requires agent review empty on current head with no unaddressed threads'
+  fi
+  gh_user="$(gh api user --jq '.login')"
+  existing="$(gh pr view "${pr}" --repo "${repo}" --json reviews \
+    | jq -r --arg user "${gh_user}" '
+      [.reviews[]
+        | select(.author.login == $user)
+        | select(.state != "PENDING")
+        | {state, submittedAt}]
+      | sort_by(.submittedAt)
+      | last
+      | .state // empty')"
+  if [[ "${existing}" != 'APPROVED' ]]; then
+    gh pr review "${pr}" --repo "${repo}" --approve \
+      --body "Agent review (${AGENT_REVIEW_AGENT:-copilot}): no new comments on current head."
+    printf 'Approved PR #%s as %s\n' "${pr}" "${gh_user}" >&2
+  else
+    printf 'PR #%s already approved by %s — skipping approve\n' "${pr}" "${gh_user}" >&2
+  fi
+  agent_review_email_complete "${repo}" "${pr}"
+}
+
+cmd_resolve_thread() {
+  local -r thread_id="${1:-}"
+
+  if [[ -z "${thread_id}" ]]; then
+    agent_review_die 'resolve-thread requires --thread-id'
+  fi
+  agent_review_require_cmd gh
+  agent_review_resolve_thread_id "${thread_id}"
+  printf 'Resolved thread %s\n' "${thread_id}" >&2
+}
+
+cmd_resolve_addressed() {
+  local repo pr owner name snapshot ids id
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
+  agent_review_assert_snapshot_complete "${snapshot}"
+  # shellcheck disable=SC2154  # agent_review_profile_thread_login_regex from sourced profile
+  mapfile -t ids < <(
+    printf '%s' "${snapshot}" \
+      | jq -r --arg re "${agent_review_profile_thread_login_regex}" '
+        .data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved == false)
+        | select((.comments.nodes[0].author.login // "") | test($re;"i"))
+        | select(any(.comments.nodes[1:][]; .author.__typename == "User"))
+        | .id'
+  )
+  if ((${#ids[@]} == 0)); then
+    printf 'No addressed agent threads to resolve on PR #%s\n' "${pr}" >&2
+    return 0
+  fi
+  for id in "${ids[@]}"; do
+    agent_review_resolve_thread_id "${id}"
+    printf 'Resolved thread %s\n' "${id}" >&2
+  done
+}
+
+cmd_restack() {
+  local repo pr merge_state head_branch pr_head_branch attempt base_branch
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  agent_review_require_cmd gh
+  agent_review_require_cmd gt
+  agent_review_require_cmd git
+  if agent_review_pr_is_merged "${repo}" "${pr}"; then
+    printf 'PR #%s is already merged — skipping restack\n' "${pr}" >&2
+    return 0
+  fi
+  agent_review_assert_checkout_matches_repo "${repo}"
+  agent_review_assert_not_primary_worktree
+  head_branch="$(gh pr view "${pr}" --repo "${repo}" --json headRefName --jq '.headRefName')"
+  pr_head_branch="$(git branch --show-current 2>/dev/null || true)"
+  if [[ -z "${pr_head_branch}" ]] || [[ "${pr_head_branch}" != "${head_branch}" ]]; then
+    agent_review_die "current branch ${pr_head_branch@Q} is not PR #${pr} head ${head_branch@Q}"
+  fi
+  merge_state="$(gh pr view "${pr}" --repo "${repo}" --json mergeStateStatus --jq '.mergeStateStatus')"
+  if [[ "${merge_state}" != 'BEHIND' ]]; then
+    if agent_review_merge_state_ready "${merge_state}"; then
+      printf 'PR #%s mergeStateStatus=%s (no restack needed)\n' "${pr}" "${merge_state}" >&2
+      return 0
+    fi
+    printf 'PR #%s mergeStateStatus=%s — cannot restack (resolve conflicts or fix merge state)\n' \
+      "${pr}" "${merge_state}" >&2
+    return 4
+  fi
+  base_branch="$(gh pr view "${pr}" --repo "${repo}" --json baseRefName --jq '.baseRefName')"
+  printf 'PR #%s is BEHIND %s — running gt sync and gt restack…\n' "${pr}" "${base_branch}" >&2
+  if ! gt sync; then
+    printf 'gt sync failed during restack for PR #%s\n' "${pr}" >&2
+    return 4
+  fi
+  if ! gt restack; then
+    printf 'gt restack failed for PR #%s\n' "${pr}" >&2
+    return 4
+  fi
+  if ! gt submit --no-interactive --publish; then
+    printf 'gt submit failed after restack for PR #%s\n' "${pr}" >&2
+    return 4
+  fi
+  attempt=0
+  while (( attempt < 12 )); do
+    merge_state="$(gh pr view "${pr}" --repo "${repo}" --json mergeStateStatus --jq '.mergeStateStatus')"
+    if [[ "${merge_state}" != 'BEHIND' ]]; then
+      if agent_review_merge_state_ready "${merge_state}"; then
+        printf 'After restack: mergeStateStatus=%s\n' "${merge_state}" >&2
+        return 0
+      fi
+      printf 'After restack: mergeStateStatus=%s — still not merge-ready\n' "${merge_state}" >&2
+      return 4
+    fi
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+  printf 'ERROR: WAIT_TIMEOUT restack pr=%s waited=60s\n' "${pr}" >&2
+  return 4
+}
+
+cmd_handle_quota_exhaustion() {
+  local repo pr reason fallback_exit
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  reason="${3:-Agent review quota exhausted.}"
+
+  if [[ "${AGENT_REVIEW_AGENT:-copilot}" == 'copilot' ]]; then
+    fallback_exit=0
+    cmd_try_copilot_quota_fallback "${repo}" "${pr}" "${reason}" || fallback_exit=$?
+    return "${fallback_exit}"
+  fi
+  cmd_give_up "${repo}" "${pr}" \
+    "${reason} No further automated reviews are available." quota
+  return 7
+}
+
+cmd_try_copilot_quota_fallback() {
+  local repo pr reason fallback_agent profile_path profiles_dir
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  reason="${3:-Copilot review quota exhausted.}"
+  fallback_agent="${AGENT_REVIEW_FALLBACK_AGENT:-bugbot}"
+  if [[ "${agent_review_loop_fallback_used:-0}" == '1' ]]; then
+    cmd_give_up "${repo}" "${pr}" \
+      "${reason} Fallback agent was already used." quota
+    return 7
+  fi
+  if [[ "${AGENT_REVIEW_AGENT:-copilot}" != 'copilot' ]]; then
+    cmd_give_up "${repo}" "${pr}" "${reason}" quota
+    return 7
+  fi
+  if [[ -z "${fallback_agent}" ]]; then
+    cmd_give_up "${repo}" "${pr}" "${reason}" quota
+    return 7
+  fi
+  profiles_dir="$(cd "${script_dir}/lib/agent-review-profiles" && pwd)"
+  profile_path="${profiles_dir}/${fallback_agent}"
+  if [[ ! -f "${profile_path}" ]]; then
+    cmd_give_up "${repo}" "${pr}" \
+      "${reason} Fallback profile ${fallback_agent@Q} is not installed." quota
+    return 7
+  fi
+  agent_review_loop_fallback_used=1
+  printf 'wait-for-agent-review: %s — falling back to %s\n' \
+    "${reason}" "${fallback_agent}" >&2
+  if ! agent_review_post_fallback_comment "${repo}" "${pr}" "${reason}" "${fallback_agent}"; then
+    printf 'wait-for-agent-review: fallback PR comment failed (continuing with %s)\n' \
+      "${fallback_agent}" >&2
+  fi
+  agent_review_use_agent "${fallback_agent}"
+  if [[ "${fallback_agent}" == 'bugbot' ]] && agent_review_bugbot_quota_skip_request; then
+    cmd_give_up "${repo}" "${pr}" \
+      "${reason} Bugbot usage limit already reached (cached)." quota
+    return 7
+  fi
+  return 0
+}
+
+cmd_give_up() {
+  local repo pr reason mode error_tag exit_code
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  reason="${3:-Agent review loop stopped without reaching complete_ready.}"
+  mode="${4:-}"
+  agent_review_require_cmd gh
+  if ! agent_review_email_failure "${repo}" "${pr}" "${reason}"; then
+    printf 'wait-for-agent-review: give-up email failed (continuing with PR comment)\n' >&2
+  fi
+  if ! agent_review_post_give_up_comment "${repo}" "${pr}" "${reason}"; then
+    printf 'wait-for-agent-review: give-up PR comment failed\n' >&2
+  fi
+  if [[ "${mode}" == 'quota' ]]; then
+    error_tag='AGENT_REVIEW_QUOTA_EXHAUSTED'
+    exit_code=7
+  else
+    error_tag='WAIT_TIMEOUT agent-review-give-up'
+    exit_code=6
+  fi
+  printf 'ERROR: %s pr=%s repo=%s reason=%s\n' \
+    "${error_tag}" "${pr}" "${repo}" "${reason}" >&2
+  return "${exit_code}"
+}
+
+cmd_loop() {
+  local repo pr pr_started cycle_started now pr_cap cycle_cap check_exit wait_exit request_exit
+  local remaining status unaddressed fallback_exit
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  agent_review_loop_fallback_used=0
+  # shellcheck disable=SC2154  # agent_review_default_* timeout constants from sourced lib
+  pr_cap="${agent_review_default_pr_timeout_s}"
+  # shellcheck disable=SC2154  # agent_review_default_cycle_timeout_s from sourced lib
+  cycle_cap="${agent_review_default_cycle_timeout_s}"
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  pr_started="$(date +%s)"
+  printf 'Agent review loop for PR #%s (cycle cap=%ss, PR cap=%ss)\n' \
+    "${pr}" "${cycle_cap}" "${pr_cap}" >&2
+
+  while true; do
+    now="$(date +%s)"
+    if (( now - pr_started >= pr_cap )); then
+      cmd_give_up "${repo}" "${pr}" \
+        "Overall PR agent review exceeded AGENT_REVIEW_PR_TIMEOUT (${pr_cap}s)."
+      return 6
+    fi
+    if agent_review_pr_is_merged "${repo}" "${pr}"; then
+      printf 'PR #%s is merged — loop complete\n' "${pr}" >&2
+      return 0
+    fi
+
+    cycle_started="$(date +%s)"
+    request_exit=0
+    cmd_request "${repo}" "${pr}" || request_exit=$?
+    if (( request_exit == 7 )); then
+      fallback_exit=0
+      cmd_handle_quota_exhaustion "${repo}" "${pr}" \
+        "${AGENT_REVIEW_AGENT:-copilot} review quota or usage limit exhausted while requesting a review." \
+        || fallback_exit=$?
+      if (( fallback_exit == 0 )); then
+        continue
+      fi
+      return 7
+    fi
+    if (( request_exit != 0 )); then
+      return "${request_exit}"
+    fi
+
+    while true; do
+      now="$(date +%s)"
+      if (( now - pr_started >= pr_cap )); then
+        cmd_give_up "${repo}" "${pr}" \
+          "Overall PR agent review exceeded AGENT_REVIEW_PR_TIMEOUT (${pr_cap}s)."
+        return 6
+      fi
+      if (( now - cycle_started >= cycle_cap )); then
+        cmd_give_up "${repo}" "${pr}" \
+          "Agent review request cycle exceeded AGENT_REVIEW_CYCLE_TIMEOUT (${cycle_cap}s) without completing."
+        return 6
+      fi
+
+      remaining="$(agent_review_remaining_s "${cycle_started}" "${cycle_cap}")"
+      if (( remaining < 1 )); then
+        remaining=1
+      fi
+
+      wait_exit=0
+      cmd_wait "${repo}" "${pr}" "${remaining}" "${agent_review_default_poll_interval_s}" || wait_exit=$?
+      if (( wait_exit == 7 )); then
+        fallback_exit=0
+        cmd_handle_quota_exhaustion "${repo}" "${pr}" \
+          "${AGENT_REVIEW_AGENT:-copilot} posted a review or check on the current head indicating quota or usage limit exhaustion." \
+          || fallback_exit=$?
+        if (( fallback_exit == 0 )); then
+          break
+        fi
+        return 7
+      fi
+      if (( wait_exit == 2 )); then
+        cmd_give_up "${repo}" "${pr}" \
+          "Timed out waiting for ${AGENT_REVIEW_AGENT:-copilot} review within AGENT_REVIEW_CYCLE_TIMEOUT (${cycle_cap}s)."
+        return 6
+      fi
+      if (( wait_exit != 0 )); then
+        return "${wait_exit}"
+      fi
+
+      check_exit=0
+      cmd_check "${repo}" "${pr}" || check_exit=$?
+      case "${check_exit}" in
+        0)
+          cmd_complete "${repo}" "${pr}"
+          return 0
+          ;;
+        7)
+          fallback_exit=0
+          cmd_handle_quota_exhaustion "${repo}" "${pr}" \
+            "${AGENT_REVIEW_AGENT:-copilot} review quota or usage limit exhausted on the current PR head." \
+            || fallback_exit=$?
+          if (( fallback_exit == 0 )); then
+            break
+          fi
+          return 7
+          ;;
+        3)
+          printf 'wait-for-agent-review loop: unaddressed agent threads — human triage required\n' >&2
+          return 3
+          ;;
+        4)
+          if ! cmd_restack "${repo}" "${pr}"; then
+            printf 'wait-for-agent-review loop: restack failed — human intervention required\n' >&2
+            return 4
+          fi
+          break
+          ;;
+        5)
+          status="$(cmd_status "${repo}" "${pr}")"
+          unaddressed="$(printf '%s' "${status}" | jq -r '.unaddressed_agent_threads')"
+          if (( unaddressed > 0 )); then
+            printf 'wait-for-agent-review loop: fresh review with unaddressed threads\n' >&2
+            return 3
+          fi
+          if [[ "$(printf '%s' "${status}" | jq -r '.head_check_findings')" == 'true' ]]; then
+            printf 'wait-for-agent-review loop: %s check reports findings — waiting for review comments\n' \
+              "${AGENT_REVIEW_AGENT:-copilot}" >&2
+            sleep "${agent_review_default_poll_interval_s}"
+            continue
+          fi
+          request_exit=0
+          cmd_request "${repo}" "${pr}" || request_exit=$?
+          if (( request_exit == 7 )); then
+            fallback_exit=0
+            cmd_handle_quota_exhaustion "${repo}" "${pr}" \
+              "${AGENT_REVIEW_AGENT:-copilot} review quota or usage limit exhausted while re-requesting a review." \
+              || fallback_exit=$?
+            if (( fallback_exit == 0 )); then
+              break
+            fi
+            return 7
+          fi
+          if (( request_exit != 0 )); then
+            return "${request_exit}"
+          fi
+          ;;
+        8)
+          printf 'wait-for-agent-review loop: %s GitHub check failed to run — human intervention required\n' \
+            "${AGENT_REVIEW_AGENT:-copilot}" >&2
+          return 8
+          ;;
+        2)
+          ;;
+        *)
+          return "${check_exit}"
+          ;;
+      esac
+    done
+  done
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  local repo_arg='' pr_arg='' timeout_arg='' interval_arg='' thread_id='' reason=''
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)
+        repo_arg="$(agent_review_require_option_value --repo "${2:-}")"
+        shift 2
+        ;;
+      --pr)
+        pr_arg="$(agent_review_require_option_value --pr "${2:-}")"
+        shift 2
+        ;;
+      --timeout)
+        timeout_arg="$(agent_review_require_option_value --timeout "${2:-}")"
+        shift 2
+        ;;
+      --poll-interval)
+        interval_arg="$(agent_review_require_option_value --poll-interval "${2:-}")"
+        shift 2
+        ;;
+      --thread-id)
+        thread_id="$(agent_review_require_option_value --thread-id "${2:-}")"
+        shift 2
+        ;;
+      --reason)
+        reason="$(agent_review_require_option_value --reason "${2:-}")"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        agent_review_die "unknown argument: $1"
+        ;;
+    esac
+  done
+
+  case "${cmd}" in
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    '')
+      usage >&2
+      exit 1
+      ;;
+  esac
+
+  agent_review_load_env
+  agent_review_load_agent_profile
+
+  case "${cmd}" in
+    status)
+      cmd_status "${repo_arg}" "${pr_arg}"
+      ;;
+    request)
+      cmd_request "${repo_arg}" "${pr_arg}"
+      ;;
+    wait)
+      cmd_wait "${repo_arg}" "${pr_arg}" \
+        "${timeout_arg:-${agent_review_default_wait_timeout_s}}" \
+        "${interval_arg:-${agent_review_default_poll_interval_s}}"
+      ;;
+    list-threads)
+      cmd_list_threads "${repo_arg}" "${pr_arg}"
+      ;;
+    check)
+      cmd_check "${repo_arg}" "${pr_arg}"
+      ;;
+    complete)
+      cmd_complete "${repo_arg}" "${pr_arg}"
+      ;;
+    restack)
+      cmd_restack "${repo_arg}" "${pr_arg}"
+      ;;
+    resolve-thread)
+      cmd_resolve_thread "${thread_id}"
+      ;;
+    resolve-addressed)
+      cmd_resolve_addressed "${repo_arg}" "${pr_arg}"
+      ;;
+    email-failure)
+      agent_review_email_failure \
+        "$(agent_review_resolve_repo "${repo_arg}")" \
+        "$(agent_review_resolve_pr "${pr_arg}" "$(agent_review_resolve_repo "${repo_arg}")")" \
+        "${reason:-Agent review loop stopped without reaching complete_ready.}"
+      ;;
+    give-up)
+      cmd_give_up \
+        "$(agent_review_resolve_repo "${repo_arg}")" \
+        "$(agent_review_resolve_pr "${pr_arg}" "$(agent_review_resolve_repo "${repo_arg}")")" \
+        "${reason:-Agent review loop stopped without reaching complete_ready.}"
+      ;;
+    loop)
+      cmd_loop "${repo_arg}" "${pr_arg}"
+      ;;
+    *)
+      agent_review_die "unknown command: ${cmd} (run with --help)"
+      ;;
+  esac
+}
+
+main "$@"

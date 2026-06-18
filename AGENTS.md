@@ -303,6 +303,16 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 - PR descriptions must reference the relevant milestone from [dep-updater.plan.md](./dep-updater.plan.md).
 - Before starting a new PR or branch, confirm the current PR is either merged or that all CI checks pass. Never start new work on a broken base.
 
+### Agent review after submit
+
+After `scripts/dev/submit-stack` and green `scripts/dev/post-pr-submission-checks`, run the **agent review loop** documented in **`.cursor/rules/pr-ship-and-review.mdc`**:
+
+1. `scripts/trigger-agent-review --pr <n>` — request review from the configured agent (default: Copilot)
+2. Iterate with `scripts/wait-for-agent-review` (`wait`, `check`, thread triage, `restack`) until `complete_ready`
+3. `scripts/wait-for-agent-review complete --pr <n>` — **approve PR** (authenticated `gh` user) and email `AGENT_REVIEW_REPORT_TO` when Copilot reports **“generated no new comments”**
+
+Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`. Set `AGENT_REVIEW_AGENT=copilot` or another supported profile under `scripts/lib/agent-review-profiles/`.
+
 ---
 
 ## Shell Script Conventions

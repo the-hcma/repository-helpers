@@ -1,0 +1,136 @@
+---
+description: Ship a PR end-to-end — local gates, submit, agent review loop, approve + operator email
+alwaysApply: true
+---
+
+# PR ship, agent review, and operator email
+
+When the user asks to **ship**, **submit**, **open a PR**, or **follow the flow**, run this sequence in a **stack worktree** (never the primary clone). See `pr-workflow.mdc` for worktree/Graphite basics.
+
+Helper scripts:
+
+- **`scripts/wait-for-agent-review`** — poll, triage, approve, email (default agent: Copilot)
+- **`scripts/trigger-agent-review`** — request a review from the configured agent
+
+Configure `~/.config/agent-review.env` from `etc/agent-review.env.example` (`AGENT_REVIEW_REPORT_TO`, SMTP).
+
+## 1. Local quality gates (all must pass before submit)
+
+From the stack worktree:
+
+```bash
+scripts/dev/pre-pr-checks
+```
+
+Fix failures before committing. Do not skip hooks or push with failing gates.
+
+## 2. Commit and submit
+
+```bash
+gt create <stack>/<topic> -m 'feat: …'   # or gt modify -m '…'
+scripts/dev/submit-stack
+```
+
+Patch title/body if stale: `gh pr edit <n> --title … --body …`
+
+Wait for CI:
+
+```bash
+scripts/dev/post-pr-submission-checks --pr <n>
+```
+
+## 3. Agent review loop (cycle + PR caps)
+
+Prefer the built-in loop (posts a PR comment + emails on timeout give-up):
+
+```bash
+./scripts/wait-for-agent-review loop --pr <n>
+```
+
+**Per-cycle deadline:** `AGENT_REVIEW_CYCLE_TIMEOUT` (default **30m**) — one request → wait → check iteration.
+
+**Overall PR deadline:** `AGENT_REVIEW_PR_TIMEOUT` (default **12h**) — total time across all cycles.
+
+Manual iteration (when `loop` exits **3** for triage):
+
+0. **Merged?** — if `status` reports `pr_merged: true`, stop (exit **0**).
+1. **Status** — `./scripts/wait-for-agent-review status --pr <n>`
+2. **Request** — `./scripts/trigger-agent-review --pr <n>` (or `wait-for-agent-review request`)
+3. **Wait** — `./scripts/wait-for-agent-review wait --pr <n> --timeout <remaining-or-300>`
+4. **Check** — `./scripts/wait-for-agent-review check --pr <n>`
+   - Exit **0** (`complete_ready: true`) → §4 **complete**
+   - Exit **3** → triage unaddressed threads (below)
+   - Exit **4** → `restack` (below)
+   - Exit **5** → fresh review but not empty yet; push fixes or wait for another review if threads are clear
+   - Exit **2** → no fresh review; retry wait if cycle time remains
+   - Exit **6** → cycle or PR timeout (`give-up` already emailed + commented)
+
+### Triage unaddressed threads (exit 3)
+
+For each valid agent comment:
+
+1. Fix in the worktree when actionable.
+2. Reply on-thread via `gh api …/comments/<id>/replies`.
+3. Resolve after replying: `./scripts/wait-for-agent-review resolve-thread --thread-id <PRRT_…>`
+   Or batch: `./scripts/wait-for-agent-review resolve-addressed --pr <n>`
+
+Then: `gt modify`, `scripts/dev/pre-pr-checks`, push, `post-pr-submission-checks --pr <n>`, and **start the next iteration**.
+
+### Restack when BEHIND (exit 4)
+
+```bash
+./scripts/wait-for-agent-review restack --pr <n>
+```
+
+## 4. Complete (approve + email)
+
+When `check` returns **0** and `status` shows `complete_ready: true` (Copilot review body contains **“generated no new comments”**):
+
+```bash
+./scripts/wait-for-agent-review complete --pr <n>
+```
+
+This **approves the PR as the authenticated gh user** and emails `AGENT_REVIEW_REPORT_TO`.
+
+Do **not** add `merge-it` unless the user explicitly confirms.
+
+### Failure (cycle or PR timeout)
+
+`loop` calls **give-up** automatically (email + PR comment). Manual:
+
+```bash
+./scripts/wait-for-agent-review give-up --pr <n> --reason "…"
+```
+
+### Quota exhausted (Copilot → Bugbot fallback; Bugbot → give-up)
+
+When Copilot review **quota or billing limits** block a request or appear in a review body, `loop` switches to **`AGENT_REVIEW_FALLBACK_AGENT`** (default **bugbot**): posts a PR comment, triggers Bugbot via `bugbot run`, and continues the loop. Set `AGENT_REVIEW_FALLBACK_AGENT=` (empty) to disable fallback; then `request` / `wait` / `check` / `loop` exit **7**, email `AGENT_REVIEW_REPORT_TO`, post a give-up PR comment, and emit `ERROR: AGENT_REVIEW_QUOTA_EXHAUSTED …`.
+
+Copilot quota is cached for the **local calendar day** in `~/scratch/repository-helpers/copilot-review-quota.env`. Once per day the cache refreshes by scanning today's Copilot reviews on your open PRs (no new review request). While cached as exhausted, Copilot requests are skipped and fallback runs immediately.
+
+When **Bugbot** hits a **usage or spend limit** (GitHub check output or PR comment from `cursor[bot]`), `loop` **gives up** (exit **7**) — no further automated reviews are available that day. Bugbot usage limits are cached in `~/scratch/repository-helpers/bugbot-review-quota.env` (refreshed once per day by scanning today's Bugbot PR comments, reviews, and head checks on open PRs — no new `bugbot run` request). While cached as exhausted, Bugbot requests are skipped and the loop gives up immediately (including when Copilot fallback would switch to Bugbot).
+
+**Bugbot** completion is detected via the **`Cursor Bugbot`** GitHub check on the PR head. The check **conclusion** and **output** (summary/text) drive status:
+
+| Check signal | Meaning |
+| --- | --- |
+| `success` or output “no new issues” / “0 bugs reported” | Clean — `complete_ready` when no unaddressed Bugbot threads |
+| `neutral` / `failure` with bugs reported | Findings — triage review comments (exit **3** or **5** while comments post) |
+| output “usage limit reached” / usage or spend limit | Quota exhausted — exit **7** (give-up when no fallback remains) |
+| other “couldn't run” / run failed | Check failed — exit **8** |
+
+Use `./scripts/wait-for-agent-review request --pr <n>` with `AGENT_REVIEW_AGENT=bugbot` to request Bugbot directly.
+
+## Quick reference — exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success / `complete_ready` / PR merged |
+| 1 | Usage or prerequisite error |
+| 2 | Timed out waiting for fresh review, or not fresh yet |
+| 3 | Agent threads still lack a human reply |
+| 4 | `mergeStateStatus` BEHIND/DIRTY/CONFLICTING — restack |
+| 5 | Fresh review but agent did not report “no new comments” yet |
+| 6 | Cycle or PR timeout — give-up emailed + PR comment posted |
+| 7 | Agent quota or usage limit exhausted and no fallback remains — give-up emailed + PR comment posted |
+| 8 | Agent GitHub check failed to run (non-quota; see check output on PR) |

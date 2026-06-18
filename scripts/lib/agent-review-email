@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# agent-review-email — operator notifications for wait-for-agent-review.
+
+agent_review_email_require_config() {
+  if [[ -z "${AGENT_REVIEW_REPORT_TO:-}" ]]; then
+    agent_review_die 'AGENT_REVIEW_REPORT_TO is required (set in ~/.config/agent-review.env)'
+  fi
+  if [[ -z "${AGENT_REVIEW_REPORT_FROM:-}" ]]; then
+    agent_review_die 'AGENT_REVIEW_REPORT_FROM is required (set in ~/.config/agent-review.env)'
+  fi
+  if [[ -z "${DEP_UPDATER_SMTP_HOST:-}" ]]; then
+    agent_review_die 'DEP_UPDATER_SMTP_HOST is required for email (set in ~/.config/agent-review.env or dep-updater.env)'
+  fi
+}
+
+agent_review_email_load_smtp() {
+  local dep_env="${HOME}/.config/dep-updater.env"
+  local allexport_was_on=0
+  if [[ -f "${dep_env}" ]]; then
+    if [[ $- == *a* ]]; then
+      allexport_was_on=1
+    fi
+    set -a
+    # shellcheck disable=SC1090  # dep-updater env path is runtime-only
+    source "${dep_env}"
+    if [[ $allexport_was_on -eq 0 ]]; then
+      set +a
+    fi
+  fi
+}
+
+agent_review_email_send_plain() {
+  local -r subject="$1"
+  local -r body="$2"
+  local from_addr to_addr
+
+  agent_review_email_load_smtp
+  agent_review_email_require_config
+  from_addr="${AGENT_REVIEW_REPORT_FROM}"
+  to_addr="${AGENT_REVIEW_REPORT_TO}"
+
+  # shellcheck disable=SC1091  # shared email helpers sourced at runtime from scripts/lib
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/email-multipart"
+  # shellcheck disable=SC1091  # shared email helpers sourced at runtime from scripts/lib
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/smtp-mail"
+
+  repo_helpers_email_write_multipart "${to_addr}" "${from_addr}" "${from_addr}" "${subject}" "${body}" "agent-review" \
+    | repo_helpers_smtp_send "${from_addr}" "${to_addr}"
+}
+
+agent_review_email_complete() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local title url body agent_id gh_user
+
+  agent_review_require_cmd gh
+  title="$(gh pr view "${pr}" --repo "${repo}" --json title --jq '.title')"
+  url="$(gh pr view "${pr}" --repo "${repo}" --json url --jq '.url')"
+  agent_id="${AGENT_REVIEW_AGENT:-copilot}"
+  gh_user="$(gh api user --jq '.login' 2>/dev/null || printf 'unknown')"
+  body="PR #${pr} passed the ${agent_id} agent review loop.
+
+URL: ${url}
+Title: ${title}
+
+Agent: ${agent_id} review on current head reports no new comments.
+Action: PR approved via gh as ${gh_user}.
+Merge: mergeStateStatus is CLEAN or BLOCKED (verify with gh pr checks ${pr} before merge-it).
+
+Do not add merge-it unless you intend to merge."
+
+  agent_review_email_send_plain "PR approved after ${agent_id} review: ${title} (#${pr})" "${body}"
+  printf 'Sent complete email for PR #%s to %s\n' "${pr}" "${AGENT_REVIEW_REPORT_TO}" >&2
+}
+
+agent_review_email_failure() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r reason="$3"
+  local title url body agent_id
+
+  agent_review_require_cmd gh
+  title="$(gh pr view "${pr}" --repo "${repo}" --json title --jq '.title')"
+  url="$(gh pr view "${pr}" --repo "${repo}" --json url --jq '.url')"
+  agent_id="${AGENT_REVIEW_AGENT:-copilot}"
+  body="The automated ${agent_id} agent review loop did not complete.
+
+PR #${pr}: ${url}
+Title: ${title}
+
+Reason: ${reason}
+
+Please review manually on GitHub."
+
+  agent_review_email_send_plain "PR agent review FAILED: ${title} (#${pr})" "${body}"
+  printf 'Sent failure email for PR #%s to %s\n' "${pr}" "${AGENT_REVIEW_REPORT_TO}" >&2
+}
+
+agent_review_post_fallback_comment() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r reason="$3"
+  local -r fallback_agent="$4"
+  local title url comment_body
+
+  agent_review_require_cmd gh
+  title="$(gh pr view "${pr}" --repo "${repo}" --json title --jq '.title')"
+  url="$(gh pr view "${pr}" --repo "${repo}" --json url --jq '.url')"
+  comment_body="## Agent review fallback
+
+Copilot review quota is exhausted; continuing with **${fallback_agent}** instead.
+
+${reason}
+
+- **PR:** ${url}
+- **Title:** ${title}
+- **Primary agent:** copilot
+- **Fallback agent:** ${fallback_agent}"
+
+  gh pr comment "${pr}" --repo "${repo}" --body "${comment_body}" >/dev/null \
+    || return 1
+  printf 'Posted fallback comment on PR #%s (%s)\n' "${pr}" "${fallback_agent}" >&2
+}
+
+agent_review_post_give_up_comment() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r reason="$3"
+  local title url comment_body agent_id
+
+  agent_review_require_cmd gh
+  title="$(gh pr view "${pr}" --repo "${repo}" --json title --jq '.title')"
+  url="$(gh pr view "${pr}" --repo "${repo}" --json url --jq '.url')"
+  agent_id="${AGENT_REVIEW_AGENT:-copilot}"
+  comment_body="## Agent review loop stopped
+
+${reason}
+
+- **PR:** ${url}
+- **Title:** ${title}
+- **Agent:** ${agent_id}
+
+Manual follow-up required: triage remaining agent threads, push fixes, and re-run \`scripts/wait-for-agent-review loop --pr ${pr}\` when ready."
+
+  gh pr comment "${pr}" --repo "${repo}" --body "${comment_body}" >/dev/null \
+    || return 1
+  printf 'Posted give-up comment on PR #%s\n' "${pr}" >&2
+}

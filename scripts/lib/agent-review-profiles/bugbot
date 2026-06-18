@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# Bugbot (Cursor) agent profile for wait-for-agent-review.
+# shellcheck disable=SC2034  # profile contract variables are read by scripts/lib/agent-review after source
+#
+# Bugbot publishes a GitHub check named "Cursor Bugbot". See:
+# https://cursor.com/docs/bugbot#ci-check-statuses
+#   success — no issues and no unresolved Bugbot comments
+#   neutral — findings, cancelled run, or internal/run error (default when findings posted)
+#   failure — findings when fail-on-unresolved is enabled
+
+agent_review_profile_id='bugbot'
+agent_review_profile_request_login_regex='cursor'
+agent_review_profile_thread_login_regex='cursor'
+agent_review_profile_trigger_comment='bugbot run'
+agent_review_profile_uses_head_check=true
+agent_review_profile_check_name_regex='Bugbot'
+
+# agent_review_profile_login_matches <github_login>
+agent_review_profile_login_matches() {
+  local -r login="${1:-}"
+
+  [[ "${login,,}" == *cursor* ]]
+}
+
+# agent_review_profile_head_check_lower_text <check_run_json>
+agent_review_profile_head_check_lower_text() {
+  local -r run_json="${1:-}"
+
+  printf '%s' "${run_json}" | jq -r '
+    [(.output.summary // ""), (.output.text // "")]
+    | join("\n")' | tr '[:upper:]' '[:lower:]'
+}
+
+# agent_review_profile_head_check_is_complete <check_run_json>
+agent_review_profile_head_check_is_complete() {
+  local -r run_json="${1:-}"
+  local status conclusion
+
+  status="$(printf '%s' "${run_json}" | jq -r '.status // ""')"
+  conclusion="$(printf '%s' "${run_json}" | jq -r '.conclusion // ""')"
+  status="${status,,}"
+  [[ "${status}" == 'completed' && -n "${conclusion}" ]]
+}
+
+# agent_review_profile_text_is_quota_exhausted <text>
+# True when a Bugbot PR comment/review or check output indicates usage/spend limits.
+agent_review_profile_text_is_quota_exhausted() {
+  local -r text="${1:-}"
+  local lower
+
+  if [[ -z "${text}" ]]; then
+    return 1
+  fi
+  lower="${text,,}"
+  if [[ "${lower}" == *"usage limit reached"* ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ usage[[:space:]]+(or[[:space:]]+spend[[:space:]]+)?limit ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ spend[[:space:]]+limit ]]; then
+    return 0
+  fi
+  if [[ "${lower}" == *"couldn't run"* ]] \
+    && [[ "${lower}" =~ usage[[:space:]]+or[[:space:]]+spend[[:space:]]+limit ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# agent_review_profile_review_is_quota_exhausted <review_body>
+agent_review_profile_review_is_quota_exhausted() {
+  local -r body="${1:-}"
+
+  agent_review_profile_text_is_quota_exhausted "${body}"
+}
+
+# agent_review_profile_head_check_is_quota_exhausted <check_run_json>
+# True when Bugbot hit Cursor usage/spend limits (no further automated reviews today).
+agent_review_profile_head_check_is_quota_exhausted() {
+  local -r run_json="${1:-}"
+
+  if ! agent_review_profile_head_check_is_complete "${run_json}"; then
+    return 1
+  fi
+  agent_review_profile_text_is_quota_exhausted "$(agent_review_profile_head_check_lower_text "${run_json}")"
+}
+
+# agent_review_profile_head_check_is_error <check_run_json>
+# True when Bugbot could not run for non-quota reasons.
+agent_review_profile_head_check_is_error() {
+  local -r run_json="${1:-}"
+  local lower
+
+  if ! agent_review_profile_head_check_is_complete "${run_json}"; then
+    return 1
+  fi
+  if agent_review_profile_head_check_is_quota_exhausted "${run_json}"; then
+    return 0
+  fi
+  lower="$(agent_review_profile_head_check_lower_text "${run_json}")"
+  if [[ "${lower}" =~ bugbot[[:space:]]+run[[:space:]]+failed ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ failed[[:space:]]+to[[:space:]]+run ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ cancell?ed ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ internal[[:space:]]+(run[[:space:]]+)?error ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# agent_review_profile_head_check_is_clean <check_run_json>
+# True when Bugbot reports no issues to review on this run.
+agent_review_profile_head_check_is_clean() {
+  local -r run_json="${1:-}"
+  local conclusion lower
+
+  if ! agent_review_profile_head_check_is_complete "${run_json}"; then
+    return 1
+  fi
+  if agent_review_profile_head_check_is_error "${run_json}"; then
+    return 1
+  fi
+  conclusion="$(printf '%s' "${run_json}" | jq -r '.conclusion // ""')"
+  if [[ "${conclusion,,}" == 'success' ]]; then
+    return 0
+  fi
+  lower="$(agent_review_profile_head_check_lower_text "${run_json}")"
+  if [[ "${lower}" =~ no[[:space:]]+new[[:space:]]+issues[[:space:]]+found ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ 0[[:space:]]+bugs[[:space:]]+reported ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ found[[:space:]]+no[[:space:]]+bugs ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ completed[[:space:]]+review[[:space:]]+-[[:space:]]+no[[:space:]]+new[[:space:]]+issues ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# agent_review_profile_head_check_has_findings <check_run_json>
+# True when Bugbot posted findings that should appear as review comments.
+agent_review_profile_head_check_has_findings() {
+  local -r run_json="${1:-}"
+  local conclusion lower
+
+  if ! agent_review_profile_head_check_is_complete "${run_json}"; then
+    return 1
+  fi
+  if agent_review_profile_head_check_is_error "${run_json}"; then
+    return 1
+  fi
+  if agent_review_profile_head_check_is_clean "${run_json}"; then
+    return 1
+  fi
+  conclusion="$(printf '%s' "${run_json}" | jq -r '.conclusion // ""')"
+  if [[ "${conclusion,,}" == 'failure' ]]; then
+    return 0
+  fi
+  lower="$(agent_review_profile_head_check_lower_text "${run_json}")"
+  if [[ "${lower}" =~ [1-9][0-9]*[[:space:]]+bugs[[:space:]]+reported ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ potential[[:space:]]+bug[s]?[[:space:]]+found ]]; then
+    return 0
+  fi
+  if [[ "${conclusion,,}" == 'neutral' ]] \
+    && [[ "${lower}" =~ (bug|bugs|issue|issues|finding|findings|potential) ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# agent_review_profile_review_is_empty <review_body>
+# Fallback when Bugbot also posts a formal PR review body.
+agent_review_profile_review_is_empty() {
+  local -r body="${1:-}"
+  local lower
+
+  if [[ -z "${body}" ]]; then
+    return 1
+  fi
+  lower="${body,,}"
+  if [[ "${lower}" =~ found[[:space:]]+no[[:space:]]+bugs ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ found[[:space:]]+0[[:space:]]+potential ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ already[[:space:]]+reviewed[[:space:]]+(that[[:space:]]+)?diff ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ no[[:space:]]+new[[:space:]]+issues[[:space:]]+found ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# agent_review_profile_request <repo> <pr>
+# Trigger Bugbot by posting a PR comment (not gh pr edit --add-reviewer).
+agent_review_profile_request() {
+  local -r repo="$1"
+  local -r pr="$2"
+
+  gh pr comment "${pr}" --repo "${repo}" --body "${agent_review_profile_trigger_comment}" >/dev/null
+}
