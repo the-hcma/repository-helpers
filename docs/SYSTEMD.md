@@ -10,7 +10,7 @@ This repository ships systemd user services for daily repository maintenance:
 Both are oneshot services installed under `~/.config/systemd/user/`, with logs
 under `~/scratch/repository-helpers/`.
 
-Unit templates live in `share/systemd-unit-templates/` (not per-repo `etc/systemd/`).
+Unit templates live in `share/systemd-unit-templates/`.
 `setup-service` injects `ConditionHost=` from `~/.config/user-services-host` (or
 `--condition-host` / an interactive prompt on first install) so units run on one
 designated machine even when `~/.config/systemd/user/` is on NFS.
