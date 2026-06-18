@@ -19,6 +19,22 @@ label in `~/.config/user-services-host` (or
 `--condition-host` / an interactive prompt on first install) so units run on one
 designated machine even when `~/.config/systemd/user/` is on NFS.
 
+### Service host (single-machine guard)
+
+Units are pinned to one physical host with native **`ConditionMachineId=`**
+(systemd matches `/etc/machine-id` on the running machine):
+
+| File | Purpose |
+| --- | --- |
+| `~/.config/user-services-host` | Readable hostname label (e.g. `meerkat`) — used in unit comments and prompts |
+| `~/.config/user-services-machine-id` | 32-char hex ID from `/etc/machine-id` on the service host |
+
+On the **first** `setup-service` run on the configured service host, the script
+captures `/etc/machine-id` into `user-services-machine-id`. Other machines can
+run `setup-service` to install or refresh units (e.g. over NFS), but systemd will
+not start them there. `setup-service --status` reports whether this machine
+matches the configured service host.
+
 Use `scripts/show-services` for a read-only overview of every service template in
 this repo:
 
@@ -140,10 +156,13 @@ This will:
 
 1. Read templates from `etc/systemd/`, expand into `~/.config/systemd/user/`
 2. Substitute `@@REPO_DIR@@` with the checkout you invoked setup from
-3. Set `ConditionHost=` from `~/.config/user-services-host` (or `--condition-host`)
-4. Enable lingering on the ConditionHost machine
-5. Run `scripts/on-deploy` to record the deployed commit
-6. Enable the **timer** when `dep-updater.timer` exists (not an immediate batch run)
+3. Resolve the service-host label from `~/.config/user-services-host` (or
+   `--condition-host` / an interactive prompt) and load or capture machine-id
+   into `~/.config/user-services-machine-id`
+4. Inject `ConditionMachineId=` into each unit (plus a readable hostname comment)
+5. Enable lingering on the service host (when this machine's machine-id matches)
+6. Run `scripts/on-deploy` to record the deployed commit
+7. Enable the **timer** when `dep-updater.timer` exists (not an immediate batch run)
 
 ### Status and logs
 
