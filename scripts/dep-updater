@@ -1524,12 +1524,20 @@ dep_updater_handle_ci_failure() {
 dep_updater_write_batch_child_report_json() {
   local -r exit_code="${1:?}"
   local -r first_failure="${2:-}"
-  local out_file primary details_json ci_failure_json
+  local out_file primary details_json ci_failure_json capture_stderr capture_stdout
 
   out_file="${DEP_UPDATER_RUN_REPORT:?}"
   primary="$first_failure"
   details_json='[]'
   ci_failure_json='null'
+  capture_stderr=""
+  capture_stdout=""
+
+  if [[ -n "${RUNNER_SESSION_DIR:-}" ]] \
+    && declare -F runner_last_failure_capture_stderr >/dev/null 2>&1; then
+    capture_stderr="$(runner_last_failure_capture_stderr 40)"
+    capture_stdout="$(runner_last_failure_capture_stdout 40)"
+  fi
 
   if [[ -n "${DEP_UPDATER_ECO_FAIL_FILE:-}" && -s "${DEP_UPDATER_ECO_FAIL_FILE}" ]]; then
     details_json="$(jq -Rs 'split("\n") | map(select(length > 0))' \
@@ -1558,11 +1566,15 @@ dep_updater_write_batch_child_report_json() {
     --arg primary "$primary" \
     --argjson details "${details_json}" \
     --argjson ci_failure "${ci_failure_json}" \
-    '{exit_code: $exit_code, dir: $dir, primary: $primary, details: $details, ci_failure: $ci_failure}' \
+    --arg capture_stderr "$capture_stderr" \
+    --arg capture_stdout "$capture_stdout" \
+    '{exit_code: $exit_code, dir: $dir, primary: $primary, details: $details, ci_failure: $ci_failure, capture_stderr: $capture_stderr, capture_stdout: $capture_stdout}' \
     >"$out_file" 2>/dev/null \
     || jq -n --argjson exit_code "$exit_code" --arg primary "$primary" \
          --argjson ci_failure "${ci_failure_json}" \
-         '{exit_code: $exit_code, dir: "", primary: $primary, details: [], ci_failure: $ci_failure}' \
+         --arg capture_stderr "$capture_stderr" \
+         --arg capture_stdout "$capture_stdout" \
+         '{exit_code: $exit_code, dir: "", primary: $primary, details: [], ci_failure: $ci_failure, capture_stderr: $capture_stderr, capture_stdout: $capture_stdout}' \
          >"$out_file" 2>/dev/null || true
 }
 
@@ -6344,6 +6356,7 @@ batch_all_scrape_actionable_from_log() {
 
 batch_all_dispatch() {
   local dep_self repo child_exit worst_exit
+  local capture_stderr capture_stdout cap_line
   local -a child_args repos_found
   local -a failure_summaries=()
   local -a failure_details=()
@@ -6509,6 +6522,26 @@ batch_all_dispatch() {
         log "[batch-all] Root cause: ${root_cause}"
       fi
 
+      if [[ -s "$child_report" ]] \
+        && jq -e 'has("capture_stderr") or has("capture_stdout")' "$child_report" >/dev/null 2>&1; then
+        capture_stderr="$(jq -r '.capture_stderr // empty' "$child_report" 2>/dev/null || true)"
+        capture_stdout="$(jq -r '.capture_stdout // empty' "$child_report" 2>/dev/null || true)"
+        if [[ -n "$capture_stderr" ]]; then
+          log "[batch-all] Captured stderr ($(basename "$repo")):"
+          while IFS= read -r cap_line || [[ -n "$cap_line" ]]; do
+            [[ -z "$cap_line" ]] && continue
+            log "[batch-all]   ${cap_line}"
+          done <<< "$capture_stderr"
+        fi
+        if [[ -n "$capture_stdout" ]]; then
+          log "[batch-all] Captured stdout ($(basename "$repo")):"
+          while IFS= read -r cap_line || [[ -n "$cap_line" ]]; do
+            [[ -z "$cap_line" ]] && continue
+            log "[batch-all]   ${cap_line}"
+          done <<< "$capture_stdout"
+        fi
+      fi
+
       # If pnpm ignored builds were encountered, surface the specific skipped packages.
       if pnpm_output_has_ignored_builds "$child_clean"; then
         log "[batch-all] pnpm blocked dependency build scripts (ERR_PNPM_IGNORED_BUILDS)."
@@ -6583,6 +6616,7 @@ main() {
   # the install functions.
   RUNNER_FIRST_FAILURE_FILE="$(mktemp)"
   export RUNNER_FIRST_FAILURE_FILE
+  runner_session_begin
 
   if [[ "$batch_all" == '1' ]]; then
     check_core_prereqs
