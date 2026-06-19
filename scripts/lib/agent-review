@@ -1,0 +1,779 @@
+#!/usr/bin/env bash
+# agent-review — shared helpers for wait-for-agent-review / trigger-agent-review.
+# shellcheck disable=SC2034  # default timeout constants are read by wait-for-agent-review
+
+agent_review_default_wait_timeout_s=300
+agent_review_default_poll_interval_s=15
+agent_review_default_cycle_timeout_s=1800
+agent_review_default_pr_timeout_s=43200
+
+agent_review_die() {
+  printf 'wait-for-agent-review: %s\n' "$*" >&2
+  exit 1
+}
+
+agent_review_require_cmd() {
+  local -r name="$1"
+  command -v "${name}" >/dev/null 2>&1 || agent_review_die "required command not found: ${name}"
+}
+
+agent_review_require_option_value() {
+  local -r flag="$1"
+  local -r value="${2:-}"
+  if [[ -z "${value}" || "${value}" == --* ]]; then
+    agent_review_die "option ${flag} requires a value"
+  fi
+  printf '%s\n' "${value}"
+}
+
+agent_review_parse_duration_seconds() {
+  local -r raw="$1"
+  local n
+
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$raw"
+    return 0
+  fi
+  if [[ "$raw" =~ ^([0-9]+)s$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$raw" =~ ^([0-9]+)m$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    printf '%s\n' "$(( n * 60 ))"
+    return 0
+  fi
+  if [[ "$raw" =~ ^([0-9]+)h$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    printf '%s\n' "$(( n * 3600 ))"
+    return 0
+  fi
+  return 1
+}
+
+agent_review_repo_parts() {
+  local -r repo="${1:-}"
+  local owner name
+
+  if [[ "${repo}" != */* ]] || [[ "${repo}" == */*/* ]]; then
+    agent_review_die "expected OWNER/NAME repo, got ${repo@Q}"
+  fi
+  owner="${repo%%/*}"
+  name="${repo#*/}"
+  if [[ -z "${owner}" || -z "${name}" ]]; then
+    agent_review_die "expected OWNER/NAME repo, got ${repo@Q}"
+  fi
+  printf '%s %s\n' "${owner}" "${name}"
+}
+
+agent_review_repo_from_git_origin() {
+  local url slug lib_dir
+
+  url="$(git remote get-url origin 2>/dev/null || true)"
+  if [[ -z "${url}" ]]; then
+    return 1
+  fi
+  lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck disable=SC1091  # shared slug helper sourced at runtime from scripts/lib
+  source "${lib_dir}/github-repo-slug"
+  slug="$(gh_slug_from_origin_url "${url}" || true)"
+  if [[ -z "${slug}" ]]; then
+    return 1
+  fi
+  printf '%s\n' "${slug}"
+}
+
+agent_review_resolve_repo() {
+  local repo="${AGENT_REVIEW_GITHUB_REPO:-}"
+
+  if [[ -n "${1:-}" ]]; then
+    repo="$1"
+  elif [[ -z "${repo}" ]]; then
+    repo="$(agent_review_repo_from_git_origin || true)"
+  fi
+  if [[ -z "${repo}" ]]; then
+    agent_review_die "repo required (pass --repo OWNER/NAME, set AGENT_REVIEW_GITHUB_REPO, or run inside a GitHub clone)"
+  fi
+  printf '%s' "${repo}"
+}
+
+agent_review_validate_positive_int() {
+  local -r flag="$1"
+  local -r value="$2"
+
+  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+    agent_review_die "option ${flag} requires a positive integer, got ${value@Q}"
+  fi
+  if (( 10#${value} < 1 )); then
+    agent_review_die "option ${flag} requires a positive integer, got ${value@Q}"
+  fi
+}
+
+agent_review_resolve_pr() {
+  local pr="${AGENT_REVIEW_PR_NUMBER:-}"
+  local repo
+
+  if [[ -n "${1:-}" ]]; then
+    pr="$1"
+  fi
+  repo="$(agent_review_resolve_repo "${2:-}")"
+  if [[ -z "${pr}" ]]; then
+    agent_review_require_cmd gh
+    pr="$(gh pr view --repo "${repo}" --json number --jq '.number' 2>/dev/null || true)"
+  fi
+  if [[ -z "${pr}" ]]; then
+    agent_review_die "PR number required (pass --pr N or set AGENT_REVIEW_PR_NUMBER)"
+  fi
+  agent_review_validate_positive_int --pr "${pr}"
+  printf '%s\n' "${pr}"
+}
+
+agent_review_load_env() {
+  local env_file="${AGENT_REVIEW_ENV_FILE:-${HOME}/.config/agent-review.env}"
+  local parsed_cycle parsed_pr allexport_was_on=0
+
+  if [[ -f "${env_file}" ]]; then
+    if [[ $- == *a* ]]; then
+      allexport_was_on=1
+    fi
+    set -a
+    # shellcheck disable=SC1090  # operator config path is runtime-only
+    source "${env_file}"
+    if [[ $allexport_was_on -eq 0 ]]; then
+      set +a
+    fi
+  fi
+  if [[ -n "${AGENT_REVIEW_CYCLE_TIMEOUT:-}" ]]; then
+    if ! parsed_cycle="$(agent_review_parse_duration_seconds "${AGENT_REVIEW_CYCLE_TIMEOUT}")"; then
+      agent_review_die "invalid AGENT_REVIEW_CYCLE_TIMEOUT: ${AGENT_REVIEW_CYCLE_TIMEOUT@Q}"
+    fi
+    agent_review_default_cycle_timeout_s="${parsed_cycle}"
+  elif [[ -n "${AGENT_REVIEW_LOOP_TIMEOUT:-}" ]]; then
+    if ! parsed_cycle="$(agent_review_parse_duration_seconds "${AGENT_REVIEW_LOOP_TIMEOUT}")"; then
+      agent_review_die "invalid AGENT_REVIEW_LOOP_TIMEOUT: ${AGENT_REVIEW_LOOP_TIMEOUT@Q}"
+    fi
+    agent_review_default_cycle_timeout_s="${parsed_cycle}"
+  fi
+  if [[ -n "${AGENT_REVIEW_PR_TIMEOUT:-}" ]]; then
+    if ! parsed_pr="$(agent_review_parse_duration_seconds "${AGENT_REVIEW_PR_TIMEOUT}")"; then
+      agent_review_die "invalid AGENT_REVIEW_PR_TIMEOUT: ${AGENT_REVIEW_PR_TIMEOUT@Q}"
+    fi
+    agent_review_default_pr_timeout_s="${parsed_pr}"
+  fi
+}
+
+agent_review_elapsed_s() {
+  local -r started="$1"
+
+  printf '%s\n' "$(( $(date +%s) - started ))"
+}
+
+agent_review_remaining_s() {
+  local -r started="$1"
+  local -r limit="$2"
+  local elapsed remaining
+
+  elapsed="$(agent_review_elapsed_s "${started}")"
+  if (( elapsed >= limit )); then
+    remaining=0
+  else
+    remaining=$(( limit - elapsed ))
+  fi
+  printf '%s\n' "${remaining}"
+}
+
+agent_review_use_agent() {
+  local agent_id="$1"
+
+  if [[ -z "${agent_id}" ]]; then
+    agent_review_die 'agent_review_use_agent requires an agent profile id'
+  fi
+  AGENT_REVIEW_AGENT="${agent_id}"
+  export AGENT_REVIEW_AGENT
+  agent_review_load_agent_profile
+}
+
+agent_review_load_agent_profile() {
+  local agent_id profile_path profiles_dir
+
+  # Reset optional hooks so profile switches cannot leak prior implementations.
+  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  agent_review_profile_review_is_quota_exhausted() { return 1; }
+  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  agent_review_profile_text_is_quota_exhausted() { return 1; }
+  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  agent_review_profile_head_check_has_findings() { return 1; }
+  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  agent_review_profile_head_check_is_clean() { return 1; }
+  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  agent_review_profile_head_check_is_complete() { return 1; }
+  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  agent_review_profile_head_check_is_quota_exhausted() { return 1; }
+  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  agent_review_profile_head_check_is_error() { return 1; }
+  agent_review_profile_uses_head_check=false
+  agent_review_profile_check_name_regex=''
+
+  agent_id="${AGENT_REVIEW_AGENT:-copilot}"
+  if [[ ! "${agent_id}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    agent_review_die "invalid agent profile ${agent_id@Q} (use lowercase letters, digits, hyphens)"
+  fi
+  profiles_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/agent-review-profiles" && pwd)"
+  profile_path="${profiles_dir}/${agent_id}"
+  if [[ "${profile_path}" != "${profiles_dir}/"* ]]; then
+    agent_review_die "invalid agent profile path for ${agent_id@Q}"
+  fi
+  if [[ ! -f "${profile_path}" ]]; then
+    agent_review_die "unknown agent profile ${agent_id@Q} (missing ${profile_path})"
+  fi
+  # shellcheck disable=SC1090  # agent profile path is selected at runtime
+  source "${profile_path}"
+  if [[ -z "${agent_review_profile_thread_login_regex:-}" ]] \
+    || [[ -z "${agent_review_profile_request_login_regex:-}" ]]; then
+    agent_review_die "agent profile ${agent_id@Q} must set login regex variables"
+  fi
+  if ! declare -F agent_review_profile_request >/dev/null 2>&1 \
+    || ! declare -F agent_review_profile_review_is_empty >/dev/null 2>&1; then
+    agent_review_die "agent profile ${agent_id@Q} is missing required functions"
+  fi
+}
+
+agent_review_assert_review_requests_complete() {
+  local -r snapshot="$1"
+  if printf '%s' "${snapshot}" | jq -e '.data.repository.pullRequest.reviewRequests.pageInfo.hasNextPage == true' >/dev/null; then
+    agent_review_die 'reviewRequests connection truncated (first:10); cannot trust request state'
+  fi
+}
+
+agent_review_assert_reviews_complete() {
+  local -r snapshot="$1"
+  if printf '%s' "${snapshot}" | jq -e '.data.repository.pullRequest.reviews.pageInfo.hasPreviousPage == true' >/dev/null; then
+    agent_review_die 'reviews connection truncated (last:100); cannot trust freshness'
+  fi
+}
+
+agent_review_assert_review_threads_complete() {
+  local -r snapshot="$1"
+  if printf '%s' "${snapshot}" | jq -e '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage == true' >/dev/null; then
+    agent_review_die 'reviewThreads connection truncated (first:100); cannot trust thread counts'
+  fi
+  if printf '%s' "${snapshot}" | jq -e '
+      [.data.repository.pullRequest.reviewThreads.nodes[]
+        | .comments.pageInfo.hasNextPage] | any' >/dev/null; then
+    agent_review_die 'reviewThread comments truncated (first:100); cannot trust reply detection'
+  fi
+}
+
+agent_review_assert_snapshot_complete() {
+  agent_review_assert_review_requests_complete "$1"
+  agent_review_assert_reviews_complete "$1"
+  agent_review_assert_review_threads_complete "$1"
+}
+
+agent_review_graphql_pr_snapshot() {
+  local -r owner="$1"
+  local -r name="$2"
+  local -r pr="$3"
+
+  # shellcheck disable=SC2016  # GraphQL query uses single-quoted $variables
+  gh api graphql -f query='
+query($owner:String!, $name:String!, $number:Int!) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      number
+      title
+      url
+      headRefOid
+      reviewRequests(first:10) {
+        pageInfo { hasNextPage }
+        nodes { requestedReviewer { ... on User { login } ... on Bot { login } ... on Team { slug } } }
+      }
+      reviews(last:100) {
+        pageInfo { hasPreviousPage }
+        nodes {
+          author { login }
+          state
+          submittedAt
+          body
+          commit { oid }
+        }
+      }
+      reviewThreads(first:100) {
+        pageInfo { hasNextPage }
+        nodes {
+          id
+          isResolved
+          comments(first:100) {
+            pageInfo { hasNextPage }
+            nodes { databaseId url author { __typename login } body path line createdAt }
+          }
+        }
+      }
+    }
+  }
+}' -f owner="${owner}" -f name="${name}" -F number="${pr}"
+}
+
+agent_review_graphql_request_snapshot() {
+  local -r owner="$1"
+  local -r name="$2"
+  local -r pr="$3"
+
+  # shellcheck disable=SC2016  # GraphQL query uses single-quoted $variables
+  gh api graphql -f query='
+query($owner:String!, $name:String!, $number:Int!) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      reviewRequests(first:10) {
+        pageInfo { hasNextPage }
+        nodes { requestedReviewer { ... on User { login } ... on Bot { login } ... on Team { slug } } }
+      }
+    }
+  }
+}' -f owner="${owner}" -f name="${name}" -F number="${pr}"
+}
+
+agent_review_graphql_wait_snapshot() {
+  local -r owner="$1"
+  local -r name="$2"
+  local -r pr="$3"
+
+  # shellcheck disable=SC2016  # GraphQL query uses single-quoted $variables
+  gh api graphql -f query='
+query($owner:String!, $name:String!, $number:Int!) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      headRefOid
+      reviews(last:100) {
+        pageInfo { hasPreviousPage }
+        nodes {
+          author { login }
+          state
+          body
+          commit { oid }
+        }
+      }
+    }
+  }
+}' -f owner="${owner}" -f name="${name}" -F number="${pr}"
+}
+
+agent_review_agent_reviews_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+
+  # shellcheck disable=SC2154  # agent_review_profile_request_login_regex from sourced profile
+  printf '%s' "${snapshot}" | jq -c --arg head "${head}" --arg re "${agent_review_profile_request_login_regex}" '
+    [.data.repository.pullRequest.reviews.nodes[]
+      | select((.author.login // "") | test($re;"i"))
+      | select(.state != "PENDING")
+      | select(.commit.oid == $head)]'
+}
+
+agent_review_fresh_agent_review_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+
+  agent_review_assert_reviews_complete "${snapshot}"
+  [[ "$(agent_review_agent_reviews_on_head "${snapshot}" "${head}" | jq 'length')" -gt 0 ]]
+}
+
+agent_review_head_check_json_for_pr() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local lib_dir
+
+  lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck disable=SC1091  # shared rollup helper sourced at runtime from scripts/lib
+  source "${lib_dir}/ci-check-rollup"
+  ci_rollup_json_for_pr "${pr}" "${repo}"
+}
+
+agent_review_head_check_run_json_for_head() {
+  local -r repo="$1"
+  local -r head="$2"
+  local owner name
+
+  if [[ "${agent_review_profile_uses_head_check}" != 'true' ]] \
+    || [[ -z "${agent_review_profile_check_name_regex}" ]]; then
+    printf 'null\n'
+    return 0
+  fi
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  gh api "repos/${owner}/${name}/commits/${head}/check-runs" --paginate \
+    | jq -s --arg re "${agent_review_profile_check_name_regex}" '
+      [.[] | .check_runs[]?]
+      | map(select((.name // "") | test($re;"i")))
+      | sort_by(.started_at // "")
+      | last // null'
+}
+
+agent_review_head_check_entry_for_profile() {
+  local -r json="$1"
+
+  # shellcheck disable=SC2154  # agent_review_profile_check_name_regex from sourced profile
+  printf '%s' "${json}" | jq -c --arg re "${agent_review_profile_check_name_regex}" '
+    [.[]?
+      | select((.name // .context // "") | test($re;"i"))] | first // null'
+}
+
+agent_review_head_check_complete_on_head() {
+  local -r repo="$1"
+  local -r head="$2"
+  local run_json
+
+  if [[ "${agent_review_profile_uses_head_check}" != 'true' ]] \
+    || [[ -z "${agent_review_profile_check_name_regex}" ]]; then
+    return 1
+  fi
+  run_json="$(agent_review_head_check_run_json_for_head "${repo}" "${head}")"
+  if [[ -z "${run_json}" || "${run_json}" == 'null' ]]; then
+    return 1
+  fi
+  agent_review_profile_head_check_is_complete "${run_json}"
+}
+
+agent_review_head_check_complete_on_pr() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local json entry status conclusion
+
+  if [[ "${agent_review_profile_uses_head_check}" != 'true' ]] \
+    || [[ -z "${agent_review_profile_check_name_regex}" ]]; then
+    return 1
+  fi
+  json="$(agent_review_head_check_json_for_pr "${repo}" "${pr}")"
+  entry="$(agent_review_head_check_entry_for_profile "${json}")"
+  if [[ -z "${entry}" || "${entry}" == 'null' ]]; then
+    return 1
+  fi
+  status="$(printf '%s' "${entry}" | jq -r '.status // ""')"
+  conclusion="$(printf '%s' "${entry}" | jq -r '.conclusion // ""')"
+  status="${status,,}"
+  [[ "${status}" == 'completed' && -n "${conclusion}" ]]
+}
+
+agent_review_head_check_conclusion_on_pr() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local json entry
+
+  json="$(agent_review_head_check_json_for_pr "${repo}" "${pr}")"
+  entry="$(agent_review_head_check_entry_for_profile "${json}")"
+  if [[ -z "${entry}" || "${entry}" == 'null' ]]; then
+    printf '\n'
+    return 0
+  fi
+  printf '%s' "${entry}" | jq -r '.conclusion // ""'
+}
+
+agent_review_head_check_state_json() {
+  local -r repo="$1"
+  local -r head="$2"
+  local run_json complete clean findings error quota conclusion status
+
+  if [[ "${agent_review_profile_uses_head_check}" != 'true' ]]; then
+    jq -n '{complete:false, clean:false, findings:false, error:false, quota:false, conclusion:"", status:""}'
+    return 0
+  fi
+  run_json="$(agent_review_head_check_run_json_for_head "${repo}" "${head}")"
+  if [[ -z "${run_json}" || "${run_json}" == 'null' ]]; then
+    jq -n '{complete:false, clean:false, findings:false, error:false, quota:false, conclusion:"", status:""}'
+    return 0
+  fi
+  complete=false
+  clean=false
+  findings=false
+  error=false
+  quota=false
+  if agent_review_profile_head_check_is_complete "${run_json}"; then
+    complete=true
+  fi
+  if agent_review_profile_head_check_is_quota_exhausted "${run_json}"; then
+    quota=true
+    error=true
+  elif agent_review_profile_head_check_is_error "${run_json}"; then
+    error=true
+  fi
+  if agent_review_profile_head_check_is_clean "${run_json}"; then
+    clean=true
+  fi
+  if agent_review_profile_head_check_has_findings "${run_json}"; then
+    findings=true
+  fi
+  conclusion="$(printf '%s' "${run_json}" | jq -r '.conclusion // ""')"
+  status="$(printf '%s' "${run_json}" | jq -r '.status // ""')"
+  jq -n \
+    --argjson complete "${complete}" \
+    --argjson clean "${clean}" \
+    --argjson findings "${findings}" \
+    --argjson error "${error}" \
+    --argjson quota "${quota}" \
+    --arg conclusion "${conclusion}" \
+    --arg status "${status}" \
+    '{
+      complete: $complete,
+      clean: $clean,
+      findings: $findings,
+      error: $error,
+      quota: $quota,
+      conclusion: $conclusion,
+      status: $status
+    }'
+}
+
+agent_review_fresh_agent_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local -r repo="$3"
+  local -r pr="$4"
+
+  if [[ "${agent_review_profile_uses_head_check}" == 'true' ]]; then
+    agent_review_head_check_complete_on_head "${repo}" "${head}"
+  else
+    agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"
+  fi
+}
+
+agent_review_latest_agent_review_body_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+
+  agent_review_agent_reviews_on_head "${snapshot}" "${head}" \
+    | jq -r 'sort_by(.submittedAt) | last | .body // ""'
+}
+
+agent_review_agent_requested_from_snapshot() {
+  local -r snapshot="$1"
+
+  # shellcheck disable=SC2154  # agent_review_profile_request_login_regex from sourced profile
+  printf '%s' "${snapshot}" | jq -e --arg re "${agent_review_profile_request_login_regex}" '
+    [.data.repository.pullRequest.reviewRequests.nodes[]
+      | .requestedReviewer | (.login // .slug // "")
+      | select(test($re;"i"))] | length > 0' >/dev/null
+}
+
+agent_review_pr_is_merged() {
+  local -r repo="$1"
+  local -r pr="$2"
+
+  [[ "$(gh pr view "${pr}" --repo "${repo}" --json state --jq '.state')" == 'MERGED' ]]
+}
+
+agent_review_pr_merge_json() {
+  local -r repo="$1"
+  local -r pr="$2"
+
+  gh pr view "${pr}" --repo "${repo}" --json state,mergedAt,mergeStateStatus,mergeable,baseRefName
+}
+
+agent_review_merge_state_ready() {
+  local -r state="$1"
+
+  case "${state}" in
+    CLEAN|BLOCKED) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+agent_review_assert_checkout_matches_repo() {
+  local -r repo="$1"
+  local owner name origin_url origin_slug lib_dir
+
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  origin_url="$(git remote get-url origin 2>/dev/null || true)"
+  if [[ -z "${origin_url}" ]]; then
+    agent_review_die 'current checkout has no origin remote'
+  fi
+  lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck disable=SC1091  # shared slug helper sourced at runtime from scripts/lib
+  source "${lib_dir}/github-repo-slug"
+  origin_slug="$(gh_slug_from_origin_url "${origin_url}" || true)"
+  if [[ "${origin_slug}" != "${owner}/${name}" ]]; then
+    agent_review_die "current checkout origin ${origin_url@Q} does not match repo ${repo@Q}"
+  fi
+}
+
+agent_review_assert_not_primary_worktree() {
+  local primary cwd
+
+  agent_review_require_cmd git
+  primary="$(git worktree list --porcelain | awk '/^worktree / { sub(/^worktree /, ""); print; exit }')"
+  cwd="$(git rev-parse --show-toplevel)"
+  if [[ -z "${primary}" || -z "${cwd}" ]]; then
+    agent_review_die 'could not determine git worktree paths'
+  fi
+  if [[ "${cwd}" == "${primary}" ]]; then
+    agent_review_die 'restack runs gt sync/restack/submit, which are forbidden in the primary (main) worktree — run from .worktrees/<stack>-wt'
+  fi
+}
+
+agent_review_threads_json_from_snapshot() {
+  local -r snapshot="$1"
+
+  # shellcheck disable=SC2154  # agent_review_profile_thread_login_regex from sourced profile
+  printf '%s' "${snapshot}" \
+    | jq --arg re "${agent_review_profile_thread_login_regex}" '
+      [.data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved == false)
+        | select((.comments.nodes[0].author.login // "") | test($re;"i"))
+        | select(any(.comments.nodes[1:][]; .author.__typename == "User") | not)
+        | {
+            thread_id: .id,
+            is_resolved: .isResolved,
+            comment_id: .comments.nodes[0].databaseId,
+            comment_url: .comments.nodes[0].url,
+            path: .comments.nodes[0].path,
+            line: .comments.nodes[0].line,
+            body: .comments.nodes[0].body,
+            reply_count: ([.comments.nodes[1:][]] | length)
+          }]'
+}
+
+agent_review_status_json_from_snapshot() {
+  local -r snapshot="$1"
+  local -r repo="$2"
+  local -r pr="$3"
+  local head requested fresh open unaddressed merge_json merge_state mergeable merge_ready
+  local pr_state pr_merged review_body agent_review_empty agent_quota_exhausted complete_ready agent_id
+  local head_check_state head_check_clean head_check_findings head_check_error head_check_quota head_check_conclusion
+
+  agent_review_assert_reviews_complete "${snapshot}"
+  head="$(printf '%s' "${snapshot}" | jq -r '.data.repository.pullRequest.headRefOid')"
+  head_check_state="$(agent_review_head_check_state_json "${repo}" "${head}")"
+  head_check_clean="$(printf '%s' "${head_check_state}" | jq -r '.clean')"
+  head_check_findings="$(printf '%s' "${head_check_state}" | jq -r '.findings')"
+  head_check_error="$(printf '%s' "${head_check_state}" | jq -r '.error')"
+  head_check_quota="$(printf '%s' "${head_check_state}" | jq -r '.quota')"
+  head_check_conclusion="$(printf '%s' "${head_check_state}" | jq -r '.conclusion')"
+  if agent_review_agent_requested_from_snapshot "${snapshot}"; then
+    requested=true
+  else
+    requested=false
+  fi
+  if agent_review_fresh_agent_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    fresh=true
+    if agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
+      review_body="$(agent_review_latest_agent_review_body_on_head "${snapshot}" "${head}")"
+    else
+      review_body=""
+    fi
+  else
+    fresh=false
+    review_body=""
+  fi
+  # shellcheck disable=SC2154  # agent_review_profile_thread_login_regex from sourced profile
+  open="$(printf '%s' "${snapshot}" | jq --arg re "${agent_review_profile_thread_login_regex}" '
+    [.data.repository.pullRequest.reviewThreads.nodes[]
+      | select(.isResolved == false)
+      | select((.comments.nodes[0].author.login // "") | test($re;"i"))] | length')"
+  unaddressed="$(printf '%s' "${snapshot}" | jq --arg re "${agent_review_profile_thread_login_regex}" '
+    [.data.repository.pullRequest.reviewThreads.nodes[]
+      | select(.isResolved == false)
+      | select((.comments.nodes[0].author.login // "") | test($re;"i"))
+      | select(any(.comments.nodes[1:][]; .author.__typename == "User") | not)] | length')"
+  if agent_review_profile_review_is_empty "${review_body}"; then
+    agent_review_empty=true
+  elif [[ "${head_check_clean}" == 'true' ]] && (( unaddressed == 0 )); then
+    agent_review_empty=true
+  else
+    agent_review_empty=false
+  fi
+  if [[ "${fresh}" == 'true' ]] \
+    && agent_review_profile_review_is_quota_exhausted "${review_body}"; then
+    agent_quota_exhausted=true
+  elif [[ "${head_check_quota}" == 'true' ]]; then
+    agent_quota_exhausted=true
+  else
+    agent_quota_exhausted=false
+  fi
+  merge_json="$(agent_review_pr_merge_json "${repo}" "${pr}")"
+  pr_state="$(printf '%s' "${merge_json}" | jq -r '.state')"
+  if [[ "${pr_state}" == 'MERGED' ]]; then
+    pr_merged=true
+  else
+    pr_merged=false
+  fi
+  merge_state="$(printf '%s' "${merge_json}" | jq -r '.mergeStateStatus')"
+  mergeable="$(printf '%s' "${merge_json}" | jq -r '.mergeable')"
+  if agent_review_merge_state_ready "${merge_state}"; then
+    merge_ready=true
+  else
+    merge_ready=false
+  fi
+  agent_id="${AGENT_REVIEW_AGENT:-copilot}"
+  if [[ "${pr_merged}" == 'true' ]] \
+    || { [[ "${fresh}" == 'true' ]] \
+      && [[ "${unaddressed}" -eq 0 ]] \
+      && [[ "${merge_ready}" == 'true' ]] \
+      && [[ "${agent_review_empty}" == 'true' ]]; }; then
+    complete_ready=true
+  else
+    complete_ready=false
+  fi
+  jq -n \
+    --arg pr "${pr}" \
+    --arg repo "${repo}" \
+    --arg head "${head}" \
+    --arg merge_state_status "${merge_state}" \
+    --arg pr_state "${pr_state}" \
+    --arg mergeable "${mergeable}" \
+    --arg agent_id "${agent_id}" \
+    --argjson merge_ready "${merge_ready}" \
+    --argjson pr_merged "${pr_merged}" \
+    --argjson requested "${requested}" \
+    --argjson fresh_review_on_head "${fresh}" \
+    --argjson agent_review_empty "${agent_review_empty}" \
+    --argjson agent_quota_exhausted "${agent_quota_exhausted}" \
+    --argjson open_agent_threads "${open}" \
+    --argjson unaddressed_agent_threads "${unaddressed}" \
+    --argjson complete_ready "${complete_ready}" \
+    --argjson head_check_clean "${head_check_clean}" \
+    --argjson head_check_findings "${head_check_findings}" \
+    --argjson head_check_error "${head_check_error}" \
+    --argjson head_check_quota "${head_check_quota}" \
+    --arg head_check_conclusion "${head_check_conclusion}" \
+    --argjson head_check "$(printf '%s' "${head_check_state}" | jq -c '.complete')" \
+    '{
+      pr: ($pr | tonumber),
+      repo: $repo,
+      agent: $agent_id,
+      head_sha: $head,
+      pr_state: $pr_state,
+      pr_merged: $pr_merged,
+      merge_state_status: $merge_state_status,
+      mergeable: $mergeable,
+      merge_ready: $merge_ready,
+      agent_requested: $requested,
+      fresh_review_on_head: $fresh_review_on_head,
+      agent_review_empty: $agent_review_empty,
+      agent_quota_exhausted: $agent_quota_exhausted,
+      open_agent_threads: $open_agent_threads,
+      unaddressed_agent_threads: $unaddressed_agent_threads,
+      complete_ready: $complete_ready,
+      head_check_complete: $head_check,
+      head_check_conclusion: $head_check_conclusion,
+      head_check_clean: $head_check_clean,
+      head_check_findings: $head_check_findings,
+      head_check_error: $head_check_error,
+      head_check_quota: $head_check_quota,
+      pending: (($pr_merged | not) and ($fresh_review_on_head | not))
+    }'
+}
+
+agent_review_resolve_thread_id() {
+  local -r thread_id="$1"
+
+  # shellcheck disable=SC2016  # GraphQL mutation uses single-quoted $variables
+  gh api graphql -f query='
+mutation($id:ID!) {
+  resolveReviewThread(input:{threadId:$id}) {
+    thread { isResolved }
+  }
+}' -f id="${thread_id}" >/dev/null
+}
+
+# shellcheck disable=SC1091  # quota helpers sourced at runtime from scripts/lib
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agent-review-quota"

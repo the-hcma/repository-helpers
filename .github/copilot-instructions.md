@@ -23,3 +23,4 @@ This is the single entry point for all new work. It prunes stale worktrees, sync
 - Every behaviour change or bug fix must have a test in `tests/`.
 - Never push directly to `main`. Use `gt create` → `gt submit --no-interactive`.
 - To merge a PR: `gh pr edit <number> --add-label merge-it`. Never `gh pr merge`.
+- After submit: agent review loop in `.cursor/rules/pr-ship-and-review.mdc` (`scripts/wait-for-agent-review complete` when Copilot reports no new comments).
