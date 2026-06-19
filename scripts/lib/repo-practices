@@ -79,6 +79,7 @@ Audits GitHub conventions for org repositories:
     - top-level license file
     - copyright notice
     - CODEOWNERS with a repository-wide owner rule
+    - .cursor/rules/pr-ship-and-review.mdc (canonical agent review loop)
 
   Release Please (when release-please.yml exists):
     - squash-only repo settings; squash_merge_commit_message=BLANK
@@ -514,6 +515,96 @@ rp_fetch_repo_codeowners_file() {
 rp_codeowners_has_global_owner_rule() {
   local -r text="$1"
   grep -Eq '^[[:space:]]*\*[[:space:]]+@[-A-Za-z0-9_]+' <<<"$text"
+}
+
+readonly rp_pr_ship_and_review_rule_path='.cursor/rules/pr-ship-and-review.mdc'
+
+rp_pr_ship_and_review_rule_template() {
+  local -r path="${rp_lib_dir}/repo-practices-cursor/pr-ship-and-review.mdc"
+
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing cursor rule template: ${path}"
+  fi
+  cat "$path"
+}
+
+rp_pr_ship_and_review_rule_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_pr_ship_and_review_rule_path}"
+      if [[ -f "$local_path" ]]; then
+        cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_pr_ship_and_review_rule_template
+}
+
+# True when the cursor rule references the canonical wait-for-agent-review flow.
+rp_pr_ship_and_review_rule_is_valid() {
+  local -r text="$1"
+  local -r slug="$2"
+
+  if ! grep -qF 'wait-for-agent-review' <<<"$text"; then
+    return 1
+  fi
+  if grep -qF 'wait-for-copilot-review' <<<"$text"; then
+    return 1
+  fi
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    grep -qF 'scripts/wait-for-agent-review' <<<"$text"
+    return $?
+  fi
+  grep -qE 'REPOSITORY_HELPERS_DIR|repository-helpers.*/scripts/wait-for-agent-review' <<<"$text"
+}
+
+rp_check_pr_ship_and_review_rule() {
+  local slug="$1"
+  local repo_fail=0
+  local rule_text
+
+  rule_text="$(rp_fetch_github_text_file "$slug" "$rp_pr_ship_and_review_rule_path" || true)"
+  if [[ -z "$rule_text" ]]; then
+    repo_fail=1
+    rp_log_check_fail "$slug" \
+      'pr-ship-and-review cursor rule (.cursor/rules/pr-ship-and-review.mdc)' \
+      "$(rp_github_url "$slug" '/new/main/.cursor/rules/pr-ship-and-review.mdc')"
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_pr_ship_and_review_rule_path" \
+        "$(rp_pr_ship_and_review_rule_content_for_apply_fix "$slug")" \
+        'add-pr-ship-and-review' \
+        'chore: add agent review cursor rule'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add .cursor/rules/pr-ship-and-review.mdc (template: scripts/lib/repo-practices-cursor/)"
+    fi
+  elif ! rp_pr_ship_and_review_rule_is_valid "$rule_text" "$slug"; then
+    repo_fail=1
+    rp_log_check_fail "$slug" \
+      'pr-ship-and-review rule must reference wait-for-agent-review (not legacy wait-for-copilot-review)' \
+      "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_rule_path}")"
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_pr_ship_and_review_rule_path" \
+        "$(rp_pr_ship_and_review_rule_content_for_apply_fix "$slug")" \
+        'sync-pr-ship-and-review' \
+        'chore: sync agent review cursor rule'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: sync .cursor/rules/pr-ship-and-review.mdc to the canonical agent review flow"
+    fi
+  else
+    rp_log_check_ok "$slug" 'pr-ship-and-review cursor rule' \
+      "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_rule_path}")"
+  fi
+
+  return "$repo_fail"
 }
 
 rp_authenticated_github_login() {
@@ -2234,6 +2325,7 @@ rp_print_new_repo_checklist() {
     Docs in the service repo:
       [ ] LICENSE with copyright notice
       [ ] CODEOWNERS with * @OWNER so all code requires CODEOWNER review
+      [ ] .cursor/rules/pr-ship-and-review.mdc (agent review loop; template in ${rp_THIS_REPO_NAME})
       [ ] GRAPHITE.md (stacked PRs, merge-it flow)
       [ ] RELEASING.md when using Release Please
 
@@ -3141,6 +3233,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_license_metadata "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_pr_ship_and_review_rule "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_dependabot_release_age_policy "$slug"; then

@@ -6,6 +6,7 @@ agent_review_default_wait_timeout_s=300
 agent_review_default_poll_interval_s=15
 agent_review_default_cycle_timeout_s=1800
 agent_review_default_pr_timeout_s=43200
+agent_review_default_idle_break_s=900
 
 agent_review_die() {
   printf 'wait-for-agent-review: %s\n' "$*" >&2
@@ -131,6 +132,21 @@ agent_review_resolve_pr() {
 agent_review_load_env() {
   local env_file="${AGENT_REVIEW_ENV_FILE:-${HOME}/.config/agent-review.env}"
   local parsed_cycle parsed_pr allexport_was_on=0
+  local cli_agent cli_fallback cli_agent_set=0 cli_fallback_set=0
+
+  if [[ -n "${AGENT_REVIEW_AGENT+x}" ]]; then
+    cli_agent_set=1
+    cli_agent="${AGENT_REVIEW_AGENT}"
+  fi
+  if [[ -n "${AGENT_REVIEW_FALLBACK_AGENT+x}" ]]; then
+    cli_fallback_set=1
+    cli_fallback="${AGENT_REVIEW_FALLBACK_AGENT}"
+  fi
+  local cli_chain cli_chain_set=0
+  if [[ -n "${AGENT_REVIEW_QUOTA_FALLBACK_CHAIN+x}" ]]; then
+    cli_chain_set=1
+    cli_chain="${AGENT_REVIEW_QUOTA_FALLBACK_CHAIN}"
+  fi
 
   if [[ -f "${env_file}" ]]; then
     if [[ $- == *a* ]]; then
@@ -142,6 +158,19 @@ agent_review_load_env() {
     if [[ $allexport_was_on -eq 0 ]]; then
       set +a
     fi
+  fi
+
+  if [[ "${cli_agent_set}" == '1' ]]; then
+    AGENT_REVIEW_AGENT="${cli_agent}"
+    export AGENT_REVIEW_AGENT
+  fi
+  if [[ "${cli_fallback_set}" == '1' ]]; then
+    AGENT_REVIEW_FALLBACK_AGENT="${cli_fallback}"
+    export AGENT_REVIEW_FALLBACK_AGENT
+  fi
+  if [[ "${cli_chain_set}" == '1' ]]; then
+    AGENT_REVIEW_QUOTA_FALLBACK_CHAIN="${cli_chain}"
+    export AGENT_REVIEW_QUOTA_FALLBACK_CHAIN
   fi
   if [[ -n "${AGENT_REVIEW_CYCLE_TIMEOUT:-}" ]]; then
     if ! parsed_cycle="$(agent_review_parse_duration_seconds "${AGENT_REVIEW_CYCLE_TIMEOUT}")"; then
@@ -159,6 +188,13 @@ agent_review_load_env() {
       agent_review_die "invalid AGENT_REVIEW_PR_TIMEOUT: ${AGENT_REVIEW_PR_TIMEOUT@Q}"
     fi
     agent_review_default_pr_timeout_s="${parsed_pr}"
+  fi
+  if [[ -n "${AGENT_REVIEW_IDLE_BREAK_TIMEOUT:-}" ]]; then
+    local parsed_idle
+    if ! parsed_idle="$(agent_review_parse_duration_seconds "${AGENT_REVIEW_IDLE_BREAK_TIMEOUT}")"; then
+      agent_review_die "invalid AGENT_REVIEW_IDLE_BREAK_TIMEOUT: ${AGENT_REVIEW_IDLE_BREAK_TIMEOUT@Q}"
+    fi
+    agent_review_default_idle_break_s="${parsed_idle}"
   fi
 }
 
@@ -193,6 +229,69 @@ agent_review_use_agent() {
   agent_review_load_agent_profile
 }
 
+# Epoch seconds of the last successful agent_review_profile_request in this process.
+agent_review_last_request_epoch=0
+
+agent_review_mark_profile_requested() {
+  agent_review_last_request_epoch="$(date +%s)"
+  if [[ "${AGENT_REVIEW_AGENT:-copilot}" == 'bugbot' ]]; then
+    agent_review_bugbot_quota_clear_observed_cache
+  fi
+}
+
+# Ordered fallback agents when the active profile hits quota (comma-separated).
+agent_review_quota_fallback_chain_raw() {
+  local chain="${AGENT_REVIEW_QUOTA_FALLBACK_CHAIN:-}"
+
+  if [[ -z "${chain}" ]]; then
+    chain="${AGENT_REVIEW_FALLBACK_AGENT:-bugbot},coderabbit"
+  fi
+  printf '%s' "${chain}"
+}
+
+# agent_review_quota_fallback_agent_at <index> — prints agent id or empty when exhausted.
+agent_review_quota_fallback_agent_at() {
+  local -r index="$1"
+  local chain part trimmed agents=()
+
+  chain="$(agent_review_quota_fallback_chain_raw)"
+  while IFS= read -r part || [[ -n "${part}" ]]; do
+    trimmed="${part#"${part%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ -n "${trimmed}" ]]; then
+      agents+=("${trimmed}")
+    fi
+  done < <(printf '%s' "${chain}" | tr ',' '\n')
+  if (( index < 0 || index >= ${#agents[@]} )); then
+    return 1
+  fi
+  printf '%s\n' "${agents[${index}]}"
+}
+
+agent_review_quota_fallback_chain_count() {
+  local chain part trimmed count=0
+
+  chain="$(agent_review_quota_fallback_chain_raw)"
+  while IFS= read -r part || [[ -n "${part}" ]]; do
+    trimmed="${part#"${part%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ -n "${trimmed}" ]]; then
+      count=$(( count + 1 ))
+    fi
+  done < <(printf '%s' "${chain}" | tr ',' '\n')
+  printf '%s\n' "${count}"
+}
+
+agent_review_profile_review_has_body_feedback() {
+  local -r body="${1:-}"
+
+  if declare -F agent_review_profile_review_has_actionable_feedback >/dev/null 2>&1 \
+    && agent_review_profile_review_has_actionable_feedback "${body}"; then
+    return 0
+  fi
+  return 1
+}
+
 agent_review_load_agent_profile() {
   local agent_id profile_path profiles_dir
 
@@ -213,6 +312,7 @@ agent_review_load_agent_profile() {
   agent_review_profile_head_check_is_error() { return 1; }
   agent_review_profile_uses_head_check=false
   agent_review_profile_check_name_regex=''
+  agent_review_profile_auto_review=false
 
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
   if [[ ! "${agent_id}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
@@ -309,6 +409,10 @@ query($owner:String!, $name:String!, $number:Int!) {
           }
         }
       }
+      comments(last:30) {
+        pageInfo { hasNextPage }
+        nodes { createdAt author { login __typename } }
+      }
     }
   }
 }' -f owner="${owner}" -f name="${name}" -F number="${pr}"
@@ -350,8 +454,22 @@ query($owner:String!, $name:String!, $number:Int!) {
           author { login }
           state
           body
+          submittedAt
           commit { oid }
         }
+      }
+      reviewThreads(first:100) {
+        pageInfo { hasNextPage }
+        nodes {
+          comments(first:100) {
+            pageInfo { hasNextPage }
+            nodes { createdAt }
+          }
+        }
+      }
+      comments(last:30) {
+        pageInfo { hasNextPage }
+        nodes { createdAt }
       }
     }
   }
@@ -403,9 +521,20 @@ agent_review_head_check_run_json_for_head() {
   agent_review_require_cmd gh
   agent_review_require_cmd jq
   gh api "repos/${owner}/${name}/commits/${head}/check-runs" --paginate \
-    | jq -s --arg re "${agent_review_profile_check_name_regex}" '
+    | jq -s --arg re "${agent_review_profile_check_name_regex}" \
+        --argjson min_epoch "${agent_review_last_request_epoch:-0}" '
+      def started_epoch:
+        if (.started_at // "") == "" then 0
+        else ((.started_at | fromdateiso8601?) // 0)
+        end;
       [.[] | .check_runs[]?]
       | map(select((.name // "") | test($re;"i")))
+      | map(select(
+          if $min_epoch == 0 then true
+          elif started_epoch == 0 then true
+          else started_epoch >= $min_epoch
+          end
+        ))
       | sort_by(.started_at // "")
       | last // null'
 }
@@ -612,31 +741,291 @@ agent_review_assert_not_primary_worktree() {
 
 agent_review_threads_json_from_snapshot() {
   local -r snapshot="$1"
+  local bots
 
-  # shellcheck disable=SC2154  # agent_review_profile_thread_login_regex from sourced profile
+  bots="$(agent_review_bot_login_regex)"
   printf '%s' "${snapshot}" \
-    | jq --arg re "${agent_review_profile_thread_login_regex}" '
+    | jq --arg bots "${bots}" '
+      def is_bot_login($login):
+        ($bots | split("|")) as $patterns
+        | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
       [.data.repository.pullRequest.reviewThreads.nodes[]
         | select(.isResolved == false)
-        | select((.comments.nodes[0].author.login // "") | test($re;"i"))
+        | .comments.nodes[0] as $first
+        | select(is_bot_login($first.author.login))
         | select(any(.comments.nodes[1:][]; .author.__typename == "User") | not)
         | {
             thread_id: .id,
             is_resolved: .isResolved,
-            comment_id: .comments.nodes[0].databaseId,
-            comment_url: .comments.nodes[0].url,
-            path: .comments.nodes[0].path,
-            line: .comments.nodes[0].line,
-            body: .comments.nodes[0].body,
+            comment_id: $first.databaseId,
+            comment_url: $first.url,
+            path: ($first.path // ""),
+            line: ($first.line // null),
+            body: $first.body,
             reply_count: ([.comments.nodes[1:][]] | length)
           }]'
+}
+
+# All unresolved review threads on the PR (any author).
+agent_review_open_thread_count_from_snapshot() {
+  local -r snapshot="$1"
+
+  printf '%s' "${snapshot}" \
+    | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved == false)] | length'
+}
+
+# Unresolved threads with no human (User) reply after the opening comment.
+agent_review_unaddressed_threads_json_from_snapshot() {
+  local -r snapshot="$1"
+
+  printf '%s' "${snapshot}" \
+    | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved == false)
+        | select(any(.comments.nodes[1:][]; .author.__typename == "User") | not)
+        | .comments.nodes[0] as $first
+        | {
+            thread_id: .id,
+            is_resolved: .isResolved,
+            author: ($first.author.login // ""),
+            comment_id: $first.databaseId,
+            comment_url: $first.url,
+            path: ($first.path // ""),
+            line: ($first.line // null),
+            body: $first.body,
+            reply_count: ([.comments.nodes[1:][]] | length)
+          }]'
+}
+
+# Unresolved threads that already have a human reply but are not resolved.
+agent_review_all_threads_needs_resolve_json_from_snapshot() {
+  local -r snapshot="$1"
+
+  printf '%s' "${snapshot}" \
+    | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved == false)
+        | select(any(.comments.nodes[1:][]; .author.__typename == "User"))
+        | .comments.nodes[0] as $first
+        | {
+            thread_id: .id,
+            is_resolved: .isResolved,
+            author: ($first.author.login // ""),
+            comment_id: $first.databaseId,
+            comment_url: $first.url,
+            path: ($first.path // ""),
+            line: ($first.line // null),
+            body: $first.body,
+            reply_count: ([.comments.nodes[1:][]] | length)
+          }]'
+}
+
+agent_review_bot_login_regex() {
+  printf '%s' "${AGENT_REVIEW_BOT_LOGIN_REGEX:-copilot|cursor|coderabbit|dependabot|github-actions|graphite|bugbot|chatgpt|sonarcloud|codecov|renovate}"
+}
+
+agent_review_open_bot_thread_count() {
+  local -r snapshot="$1"
+  local bots
+
+  bots="$(agent_review_bot_login_regex)"
+  printf '%s' "${snapshot}" \
+    | jq --arg bots "${bots}" '
+      def is_bot_login($login):
+        ($bots | split("|")) as $patterns
+        | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
+      [.data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved == false)
+        | .comments.nodes[0] as $first
+        | select(is_bot_login($first.author.login))] | length'
+}
+
+agent_review_human_threads_json_from_snapshot() {
+  local -r snapshot="$1"
+  local bots
+
+  bots="$(agent_review_bot_login_regex)"
+  printf '%s' "${snapshot}" \
+    | jq --arg bots "${bots}" '
+      def is_bot_login($login):
+        ($bots | split("|")) as $patterns
+        | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
+      [.data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved == false)
+        | .comments.nodes[0] as $first
+        | select($first.author.__typename == "User")
+        | select(is_bot_login($first.author.login) | not)
+        | select(any(.comments.nodes[1:][]; .author.__typename == "User") | not)
+        | {
+            thread_id: .id,
+            is_resolved: .isResolved,
+            author: ($first.author.login // ""),
+            comment_id: $first.databaseId,
+            comment_url: $first.url,
+            path: ($first.path // ""),
+            line: ($first.line // null),
+            body: $first.body,
+            reply_count: ([.comments.nodes[1:][]] | length)
+          }]'
+}
+
+agent_review_agent_threads_needs_resolve_json_from_snapshot() {
+  local -r snapshot="$1"
+  local bots
+
+  bots="$(agent_review_bot_login_regex)"
+  printf '%s' "${snapshot}" \
+    | jq --arg bots "${bots}" '
+      def is_bot_login($login):
+        ($bots | split("|")) as $patterns
+        | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
+      [.data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved == false)
+        | .comments.nodes[0] as $first
+        | select(is_bot_login($first.author.login))
+        | select(any(.comments.nodes[1:][]; .author.__typename == "User"))
+        | {
+            thread_id: .id,
+            is_resolved: .isResolved,
+            comment_id: $first.databaseId,
+            comment_url: $first.url,
+            path: ($first.path // ""),
+            line: ($first.line // null),
+            body: $first.body,
+            reply_count: ([.comments.nodes[1:][]] | length)
+          }]'
+}
+
+agent_review_human_threads_needs_resolve_json_from_snapshot() {
+  local -r snapshot="$1"
+  local bots
+
+  bots="$(agent_review_bot_login_regex)"
+  printf '%s' "${snapshot}" \
+    | jq --arg bots "${bots}" '
+      def is_bot_login($login):
+        ($bots | split("|")) as $patterns
+        | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
+      [.data.repository.pullRequest.reviewThreads.nodes[]
+        | select(.isResolved == false)
+        | .comments.nodes[0] as $first
+        | select($first.author.__typename == "User")
+        | select(is_bot_login($first.author.login) | not)
+        | select(any(.comments.nodes[1:][]; .author.__typename == "User"))
+        | {
+            thread_id: .id,
+            is_resolved: .isResolved,
+            author: ($first.author.login // ""),
+            comment_id: $first.databaseId,
+            comment_url: $first.url,
+            path: ($first.path // ""),
+            line: ($first.line // null),
+            body: $first.body,
+            reply_count: ([.comments.nodes[1:][]] | length)
+          }]'
+}
+
+agent_review_human_open_threads_json_from_snapshot() {
+  local -r snapshot="$1"
+  local unaddressed needs_resolve
+
+  unaddressed="$(agent_review_human_threads_json_from_snapshot "${snapshot}")"
+  needs_resolve="$(agent_review_human_threads_needs_resolve_json_from_snapshot "${snapshot}")"
+  jq -n --argjson unaddressed "${unaddressed}" --argjson needs_resolve "${needs_resolve}" \
+    '$unaddressed + $needs_resolve'
+}
+
+agent_review_triage_threads_json_from_snapshot() {
+  local -r snapshot="$1"
+  local bots unaddressed needs_resolve agent_json human_json agent_needs_resolve human_needs_resolve
+
+  bots="$(agent_review_bot_login_regex)"
+  unaddressed="$(agent_review_unaddressed_threads_json_from_snapshot "${snapshot}")"
+  needs_resolve="$(agent_review_all_threads_needs_resolve_json_from_snapshot "${snapshot}")"
+  agent_json="$(printf '%s' "${unaddressed}" | jq --arg bots "${bots}" '
+    def is_bot_login($login):
+      ($bots | split("|")) as $patterns
+      | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
+    [.[] | select(is_bot_login(.author // ""))]')"
+  human_json="$(printf '%s' "${unaddressed}" | jq --arg bots "${bots}" '
+    def is_bot_login($login):
+      ($bots | split("|")) as $patterns
+      | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
+    [.[] | select(is_bot_login(.author // "") | not)]')"
+  agent_needs_resolve="$(printf '%s' "${needs_resolve}" | jq --arg bots "${bots}" '
+    def is_bot_login($login):
+      ($bots | split("|")) as $patterns
+      | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
+    [.[] | select(is_bot_login(.author // ""))]')"
+  human_needs_resolve="$(printf '%s' "${needs_resolve}" | jq --arg bots "${bots}" '
+    def is_bot_login($login):
+      ($bots | split("|")) as $patterns
+      | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
+    [.[] | select(is_bot_login(.author // "") | not)]')"
+  jq -n \
+    --argjson agent "${agent_json}" \
+    --argjson human "${human_json}" \
+    --argjson agent_needs_resolve "${agent_needs_resolve}" \
+    --argjson human_needs_resolve "${human_needs_resolve}" \
+    '{
+      agent: $agent,
+      human: $human,
+      agent_needs_resolve: $agent_needs_resolve,
+      human_needs_resolve: $human_needs_resolve
+    }'
+}
+
+agent_review_pending_thread_count_from_snapshot() {
+  local -r snapshot="$1"
+  local unaddressed needs_resolve
+
+  unaddressed="$(agent_review_unaddressed_threads_json_from_snapshot "${snapshot}" | jq 'length')"
+  needs_resolve="$(agent_review_all_threads_needs_resolve_json_from_snapshot "${snapshot}" | jq 'length')"
+  printf '%s\n' "$(( unaddressed + needs_resolve ))"
+}
+
+# Exit 3 with triage JSON when review threads still need a reply or resolve; else 0.
+agent_review_abort_if_pending_threads() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local owner name snapshot pending_count triage_json
+
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
+  agent_review_assert_snapshot_complete "${snapshot}"
+  pending_count="$(agent_review_pending_thread_count_from_snapshot "${snapshot}")"
+  if (( pending_count == 0 )); then
+    return 0
+  fi
+  triage_json="$(agent_review_triage_threads_json_from_snapshot "${snapshot}")"
+  printf 'wait-for-agent-review: %s review thread(s) still need a reply or resolve before give-up\n' \
+    "${pending_count}" >&2
+  printf '%s\n' "${triage_json}"
+  return 3
+}
+
+agent_review_last_activity_epoch_from_snapshot() {
+  local -r snapshot="$1"
+
+  printf '%s' "${snapshot}" | jq -r '
+    [
+      (.data.repository.pullRequest.reviews.nodes[]?.submittedAt // empty),
+      (.data.repository.pullRequest.reviewThreads.nodes[]?.comments.nodes[]?.createdAt // empty),
+      (.data.repository.pullRequest.comments.nodes[]?.createdAt // empty)
+    ]
+    | map(select(. != ""))
+    | map(fromdateiso8601?)
+    | max // 0'
 }
 
 agent_review_status_json_from_snapshot() {
   local -r snapshot="$1"
   local -r repo="$2"
   local -r pr="$3"
-  local head requested fresh open unaddressed merge_json merge_state mergeable merge_ready
+  local head requested fresh open unaddressed open_human unaddressed_human needs_resolve_agent needs_resolve_human all_quotas_exhausted
+  local open_all pending_all ci_json ci_conclusion ci_ready ci_failures
+  local merge_json merge_state mergeable merge_ready
   local pr_state pr_merged review_body agent_review_empty agent_quota_exhausted complete_ready agent_id
   local head_check_state head_check_clean head_check_findings head_check_error head_check_quota head_check_conclusion
 
@@ -664,16 +1053,24 @@ agent_review_status_json_from_snapshot() {
     fresh=false
     review_body=""
   fi
-  # shellcheck disable=SC2154  # agent_review_profile_thread_login_regex from sourced profile
-  open="$(printf '%s' "${snapshot}" | jq --arg re "${agent_review_profile_thread_login_regex}" '
-    [.data.repository.pullRequest.reviewThreads.nodes[]
-      | select(.isResolved == false)
-      | select((.comments.nodes[0].author.login // "") | test($re;"i"))] | length')"
-  unaddressed="$(printf '%s' "${snapshot}" | jq --arg re "${agent_review_profile_thread_login_regex}" '
-    [.data.repository.pullRequest.reviewThreads.nodes[]
-      | select(.isResolved == false)
-      | select((.comments.nodes[0].author.login // "") | test($re;"i"))
-      | select(any(.comments.nodes[1:][]; .author.__typename == "User") | not)] | length')"
+  # shellcheck disable=SC2154  # agent_review_bot_login_regex is set by agent_review_open_bot_thread_count caller context
+  open="$(agent_review_open_bot_thread_count "${snapshot}")"
+  unaddressed="$(agent_review_threads_json_from_snapshot "${snapshot}" | jq 'length')"
+  open_human="$(agent_review_human_open_threads_json_from_snapshot "${snapshot}" | jq 'length')"
+  unaddressed_human="$(agent_review_human_threads_json_from_snapshot "${snapshot}" | jq 'length')"
+  needs_resolve_agent="$(agent_review_agent_threads_needs_resolve_json_from_snapshot "${snapshot}" | jq 'length')"
+  needs_resolve_human="$(agent_review_human_threads_needs_resolve_json_from_snapshot "${snapshot}" | jq 'length')"
+  open_all="$(agent_review_open_thread_count_from_snapshot "${snapshot}")"
+  pending_all="$(agent_review_pending_thread_count_from_snapshot "${snapshot}")"
+  ci_json="$(agent_review_ci_status_json_for_pr "${repo}" "${pr}")"
+  ci_conclusion="$(printf '%s' "${ci_json}" | jq -r '.ci_conclusion')"
+  ci_ready="$(printf '%s' "${ci_json}" | jq -r '.ci_ready')"
+  ci_failures="$(printf '%s' "${ci_json}" | jq -c '.ci_failures')"
+  if agent_review_all_quotas_exhausted; then
+    all_quotas_exhausted=true
+  else
+    all_quotas_exhausted=false
+  fi
   if agent_review_profile_review_is_empty "${review_body}"; then
     agent_review_empty=true
   elif [[ "${head_check_clean}" == 'true' ]] && (( unaddressed == 0 )); then
@@ -706,7 +1103,9 @@ agent_review_status_json_from_snapshot() {
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
   if [[ "${pr_merged}" == 'true' ]] \
     || { [[ "${fresh}" == 'true' ]] \
-      && [[ "${unaddressed}" -eq 0 ]] \
+      && [[ "${ci_ready}" == 'true' ]] \
+      && [[ "${pending_all}" -eq 0 ]] \
+      && [[ "${open_all}" -eq 0 ]] \
       && [[ "${merge_ready}" == 'true' ]] \
       && [[ "${agent_review_empty}" == 'true' ]]; }; then
     complete_ready=true
@@ -729,6 +1128,16 @@ agent_review_status_json_from_snapshot() {
     --argjson agent_quota_exhausted "${agent_quota_exhausted}" \
     --argjson open_agent_threads "${open}" \
     --argjson unaddressed_agent_threads "${unaddressed}" \
+    --argjson open_human_threads "${open_human}" \
+    --argjson unaddressed_human_threads "${unaddressed_human}" \
+    --argjson agent_threads_needs_resolve "${needs_resolve_agent}" \
+    --argjson human_threads_needs_resolve "${needs_resolve_human}" \
+    --argjson open_threads "${open_all}" \
+    --argjson pending_threads "${pending_all}" \
+    --arg ci_conclusion "${ci_conclusion}" \
+    --argjson ci_ready "${ci_ready}" \
+    --argjson ci_failures "${ci_failures}" \
+    --argjson all_quotas_exhausted "${all_quotas_exhausted}" \
     --argjson complete_ready "${complete_ready}" \
     --argjson head_check_clean "${head_check_clean}" \
     --argjson head_check_findings "${head_check_findings}" \
@@ -752,6 +1161,16 @@ agent_review_status_json_from_snapshot() {
       agent_quota_exhausted: $agent_quota_exhausted,
       open_agent_threads: $open_agent_threads,
       unaddressed_agent_threads: $unaddressed_agent_threads,
+      open_human_threads: $open_human_threads,
+      unaddressed_human_threads: $unaddressed_human_threads,
+      agent_threads_needs_resolve: $agent_threads_needs_resolve,
+      human_threads_needs_resolve: $human_threads_needs_resolve,
+      open_threads: $open_threads,
+      pending_threads: $pending_threads,
+      ci_conclusion: $ci_conclusion,
+      ci_ready: $ci_ready,
+      ci_failures: $ci_failures,
+      all_quotas_exhausted: $all_quotas_exhausted,
       complete_ready: $complete_ready,
       head_check_complete: $head_check,
       head_check_conclusion: $head_check_conclusion,
@@ -777,3 +1196,153 @@ mutation($id:ID!) {
 
 # shellcheck disable=SC1091  # quota helpers sourced at runtime from scripts/lib
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agent-review-quota"
+
+agent_review_ci_rollup_lib_loaded=false
+
+agent_review_load_ci_rollup_lib() {
+  if [[ "${agent_review_ci_rollup_lib_loaded}" == 'true' ]]; then
+    return 0
+  fi
+  local lib_dir
+  lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck disable=SC1091  # shared rollup helper sourced at runtime from scripts/lib
+  source "${lib_dir}/ci-check-rollup"
+  agent_review_ci_rollup_lib_loaded=true
+}
+
+# Exit 0 when required CI is green, 1 when failed, 2 when pending/in progress.
+agent_review_ci_check_for_pr() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local rollup latest conclusion
+
+  agent_review_load_ci_rollup_lib
+  rollup="$(ci_rollup_json_for_pr "${pr}" "${repo}")"
+  rollup="$(ci_rollup_normalize_json "${rollup}")"
+  if ci_rollup_has_pending_or_in_progress "$rollup"; then
+    return 2
+  fi
+  latest="$(ci_rollup_latest_by_name_json "${rollup}")"
+  conclusion="$(ci_rollup_conclusion_for_gating "${latest}" "")"
+  case "${conclusion}" in
+    success) return 0 ;;
+    failure) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+agent_review_ci_status_json_for_pr() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local rollup latest conclusion failures ready pending
+
+  agent_review_load_ci_rollup_lib
+  rollup="$(ci_rollup_json_for_pr "${pr}" "${repo}")"
+  rollup="$(ci_rollup_normalize_json "${rollup}")"
+  pending=false
+  if ci_rollup_has_pending_or_in_progress "$rollup"; then
+    pending=true
+  fi
+  latest="$(ci_rollup_latest_by_name_json "${rollup}")"
+  conclusion="$(ci_rollup_conclusion_for_gating "${latest}" "")"
+  if [[ "${pending}" == 'true' && "${conclusion}" != 'failure' ]]; then
+    conclusion='pending'
+  fi
+  failures="$(ci_rollup_failure_details_json "${latest}")"
+  ready=false
+  if [[ "${conclusion}" == 'success' ]]; then
+    ready=true
+  fi
+  jq -n \
+    --arg conclusion "${conclusion}" \
+    --argjson failures "${failures}" \
+    --argjson ci_ready "${ready}" \
+    '{ci_conclusion: $conclusion, ci_failures: $failures, ci_ready: $ci_ready}'
+}
+
+agent_review_print_ci_failures() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local rollup latest line
+
+  agent_review_load_ci_rollup_lib
+  rollup="$(ci_rollup_json_for_pr "${pr}" "${repo}")"
+  latest="$(ci_rollup_latest_by_name_json "${rollup}")"
+  printf 'wait-for-agent-review: CI failed on PR #%s — fix required checks before agent review\n' "${pr}" >&2
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    printf '  %s\n' "${line}" >&2
+  done < <(ci_rollup_failed_lines "${latest}" | head -n 20)
+}
+
+# True when the active agent's daily quota is exhausted and waiting would be futile.
+agent_review_skip_wait_for_quota_exhausted_agent() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local -r repo="$3"
+  local check_state_json complete agent_id
+
+  agent_id="${AGENT_REVIEW_AGENT:-copilot}"
+  if ! agent_review_agent_quota_exhausted_for_agent "${agent_id}"; then
+    return 1
+  fi
+  if [[ "${agent_review_profile_uses_head_check}" == 'true' ]]; then
+    check_state_json="$(agent_review_head_check_state_json "${repo}" "${head}")"
+    complete="$(printf '%s' "${check_state_json}" | jq -r '.complete')"
+    if [[ "${complete}" == 'true' ]]; then
+      return 1
+    fi
+    return 0
+  fi
+  if agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
+    return 1
+  fi
+  return 0
+}
+
+# Ordered unique agent ids: preferred profile, then AGENT_REVIEW_QUOTA_FALLBACK_CHAIN entries.
+agent_review_requestable_agent_candidates() {
+  local -r preferred="${1:-${AGENT_REVIEW_AGENT:-copilot}}"
+  local agents=() agent i
+
+  agents+=("${preferred}")
+  i=0
+  while agent="$(agent_review_quota_fallback_agent_at "${i}" 2>/dev/null)"; do
+    agents+=("${agent}")
+    i=$(( i + 1 ))
+  done
+
+  declare -A seen=()
+  for agent in "${agents[@]}"; do
+    if [[ -z "${seen[${agent}]:-}" ]]; then
+      seen["${agent}"]=1
+      printf '%s\n' "${agent}"
+    fi
+  done
+}
+
+# Activate the first profile whose daily quota is not cached exhausted. Returns 1 when none exist.
+agent_review_activate_first_requestable_agent() {
+  local profiles_dir profile_path agent current
+
+  profiles_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/agent-review-profiles" && pwd)"
+  current="${AGENT_REVIEW_AGENT:-copilot}"
+  while IFS= read -r agent || [[ -n "${agent}" ]]; do
+    [[ -z "${agent}" ]] && continue
+    profile_path="${profiles_dir}/${agent}"
+    if [[ ! -f "${profile_path}" ]]; then
+      continue
+    fi
+    if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
+      printf 'wait-for-agent-review: skipping %s — daily quota exhausted (will not request)\n' \
+        "${agent}" >&2
+      continue
+    fi
+    if [[ "${agent}" != "${current}" ]]; then
+      agent_review_use_agent "${agent}"
+      printf 'wait-for-agent-review: using %s (skipped quota-exhausted agents)\n' "${agent}" >&2
+    fi
+    printf '%s\n' "${agent}"
+    return 0
+  done < <(agent_review_requestable_agent_candidates "${current}")
+  return 1
+}
