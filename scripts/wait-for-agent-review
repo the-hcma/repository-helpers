@@ -21,6 +21,9 @@
 set -euo pipefail
 
 agent_review_loop_fallback_index=0
+agent_review_loop_notified=0
+agent_review_loop_stop_reason_code=''
+agent_review_loop_stop_reason_detail=''
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
@@ -80,6 +83,10 @@ Exit codes:
   8  agent GitHub check failed to run (non-quota; see check output on PR)
   9  wait idle break — no PR activity with all agent quotas exhausted (loop continues to check)
  10  required CI checks failed (fix CI before agent review or thread triage)
+
+Non-success loop exits (2–8, 10, and other failures) email AGENT_REVIEW_REPORT_TO and post a PR
+comment when the loop command exits. Success (0 after complete, or PR merged) sends no failure notify.
+Give-up paths (6/7) notify once inside give-up; the loop epilogue skips duplicate email.
 EOF
 }
 
@@ -111,6 +118,106 @@ cmd_loop_abort_if_ci_failed() {
     return 2
   fi
   return 0
+}
+
+agent_review_loop_set_stop() {
+  agent_review_loop_stop_reason_code="${1:-}"
+  agent_review_loop_stop_reason_detail="${2:-}"
+}
+
+agent_review_loop_default_stop_for_exit() {
+  local -r exit_code="$1"
+
+  case "${exit_code}" in
+    2)
+      agent_review_loop_set_stop 'NO_FRESH_REVIEW_AFTER_IDLE_BREAK' \
+        'No fresh agent review on the current PR head.'
+      ;;
+    3)
+      agent_review_loop_set_stop 'THREADS_PENDING' \
+        'Review threads still need a reply or resolve (bot and human).'
+      ;;
+    4)
+      agent_review_loop_set_stop 'RESTACK_FAILED' \
+        'Branch is BEHIND or restack failed — human intervention required.'
+      ;;
+    6)
+      agent_review_loop_set_stop 'TIMEOUT' \
+        'Agent review loop timed out.'
+      ;;
+    7)
+      agent_review_loop_set_stop 'QUOTA_EXHAUSTED' \
+        'Agent review quota or usage limit exhausted with no fallback.'
+      ;;
+    8)
+      agent_review_loop_set_stop 'AGENT_CHECK_ERROR' \
+        'Agent GitHub check failed to run (non-quota).'
+      ;;
+    10)
+      agent_review_loop_set_stop 'CI_FAILED' \
+        'Required CI checks failed.'
+      ;;
+    *)
+      agent_review_loop_set_stop 'LOOP_STOPPED' \
+        "Agent review loop stopped (exit ${exit_code})."
+      ;;
+  esac
+}
+
+agent_review_loop_status_context_json() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local status
+
+  status="$(cmd_status "${repo}" "${pr}" 2>/dev/null || true)"
+  if [[ -z "${status}" ]]; then
+    printf '{}'
+    return 0
+  fi
+  printf '%s' "${status}" | jq -c '{
+    pending_threads: (.pending_threads // 0),
+    head_sha: (.head_sha // ""),
+    ci_conclusion: (.ci_conclusion // "")
+  }' 2>/dev/null || printf '{}'
+}
+
+agent_review_loop_notify_stopped() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r exit_code="$3"
+  local reason_code reason_detail context_json
+
+  reason_code="${agent_review_loop_stop_reason_code}"
+  reason_detail="${agent_review_loop_stop_reason_detail}"
+  if [[ -z "${reason_code}" ]] || [[ -z "${reason_detail}" ]]; then
+    agent_review_loop_default_stop_for_exit "${exit_code}"
+    reason_code="${agent_review_loop_stop_reason_code}"
+    reason_detail="${agent_review_loop_stop_reason_detail}"
+  fi
+  context_json="$(agent_review_loop_status_context_json "${repo}" "${pr}")"
+  agent_review_require_cmd gh
+  if ! agent_review_email_loop_stopped \
+      "${repo}" "${pr}" "${exit_code}" "${reason_code}" "${reason_detail}" "${context_json}"; then
+    printf 'wait-for-agent-review: loop-stopped email failed (continuing with PR comment)\n' >&2
+  fi
+  if ! agent_review_post_loop_stopped_comment \
+      "${repo}" "${pr}" "${exit_code}" "${reason_code}" "${reason_detail}"; then
+    printf 'wait-for-agent-review: loop-stopped PR comment failed\n' >&2
+  fi
+}
+
+cmd_loop_exit_notify() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r exit_code="$3"
+
+  if (( exit_code == 0 )); then
+    return 0
+  fi
+  if (( agent_review_loop_notified == 1 )); then
+    return 0
+  fi
+  agent_review_loop_notify_stopped "${repo}" "${pr}" "${exit_code}"
 }
 
 cmd_request() {
@@ -620,15 +727,26 @@ cmd_give_up() {
   pending_exit=0
   agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
   if (( pending_exit == 3 )); then
+    agent_review_loop_set_stop 'THREADS_PENDING' \
+      'Review threads still need a reply or resolve (bot and human).'
     return 3
   fi
   agent_review_require_cmd gh
-  if ! agent_review_email_failure "${repo}" "${pr}" "${reason}"; then
-    printf 'wait-for-agent-review: give-up email failed (continuing with PR comment)\n' >&2
+  if [[ "${mode}" == 'quota' ]]; then
+    if ! agent_review_email_loop_stopped \
+        "${repo}" "${pr}" 7 QUOTA_EXHAUSTED "${reason}" '{}'; then
+      printf 'wait-for-agent-review: give-up email failed (continuing with PR comment)\n' >&2
+    fi
+  else
+    if ! agent_review_email_loop_stopped \
+        "${repo}" "${pr}" 6 TIMEOUT "${reason}" '{}'; then
+      printf 'wait-for-agent-review: give-up email failed (continuing with PR comment)\n' >&2
+    fi
   fi
-  if ! agent_review_post_give_up_comment "${repo}" "${pr}" "${reason}"; then
+  if ! agent_review_post_give_up_comment "${repo}" "${pr}" "${reason}" "${mode}"; then
     printf 'wait-for-agent-review: give-up PR comment failed\n' >&2
   fi
+  agent_review_loop_notified=1
   if [[ "${mode}" == 'quota' ]]; then
     error_tag='AGENT_REVIEW_QUOTA_EXHAUSTED'
     exit_code=7
@@ -683,6 +801,7 @@ cmd_loop() {
     ci_exit=0
     cmd_loop_abort_if_ci_failed "${repo}" "${pr}" || ci_exit=$?
     if (( ci_exit == 10 )); then
+      agent_review_loop_set_stop 'CI_FAILED' 'Required CI checks failed.'
       return 10
     fi
     if (( ci_exit == 2 )); then
@@ -712,6 +831,8 @@ cmd_loop() {
       return $?
     fi
     if (( request_exit != 0 )); then
+      agent_review_loop_set_stop 'REQUEST_FAILED' \
+        "Agent review request failed (exit ${request_exit})."
       return "${request_exit}"
     fi
 
@@ -740,6 +861,8 @@ cmd_loop() {
         pending_exit=0
         agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
         if (( pending_exit == 3 )); then
+          agent_review_loop_set_stop 'THREADS_PENDING' \
+            'Review threads still need a reply or resolve (bot and human).'
           return 3
         fi
       elif (( wait_exit == 7 )); then
@@ -759,12 +882,15 @@ cmd_loop() {
         return $?
       fi
       if (( wait_exit != 0 )) && (( wait_exit != 9 )); then
+        agent_review_loop_set_stop 'LOOP_STOPPED' \
+          "Agent review wait failed (exit ${wait_exit})."
         return "${wait_exit}"
       fi
 
       ci_exit=0
       cmd_loop_abort_if_ci_failed "${repo}" "${pr}" || ci_exit=$?
       if (( ci_exit == 10 )); then
+        agent_review_loop_set_stop 'CI_FAILED' 'Required CI checks failed.'
         return 10
       fi
       if (( ci_exit == 2 )); then
@@ -794,11 +920,15 @@ cmd_loop() {
           ;;
         3)
           printf 'wait-for-agent-review loop: review threads need a reply or resolve before continuing\n' >&2
+          agent_review_loop_set_stop 'THREADS_PENDING' \
+            'Review threads still need a reply or resolve (bot and human).'
           return 3
           ;;
         4)
           if ! cmd_restack "${repo}" "${pr}"; then
             printf 'wait-for-agent-review loop: restack failed — human intervention required\n' >&2
+            agent_review_loop_set_stop 'RESTACK_FAILED' \
+              'Branch is BEHIND or restack failed — human intervention required.'
             return 4
           fi
           break
@@ -808,11 +938,15 @@ cmd_loop() {
           pending_all="$(printf '%s' "${status}" | jq -r '.pending_threads // 0')"
           if (( pending_all > 0 )); then
             printf 'wait-for-agent-review loop: fresh review with unaddressed threads\n' >&2
+            agent_review_loop_set_stop 'THREADS_PENDING' \
+              'Fresh agent review has unaddressed threads.'
             return 3
           fi
           if [[ "${AGENT_REVIEW_AGENT:-copilot}" == 'coderabbit' ]] \
             && [[ "$(printf '%s' "${status}" | jq -r '.agent_review_empty')" != 'true' ]]; then
             printf 'wait-for-agent-review loop: CodeRabbit summary feedback needs triage\n' >&2
+            agent_review_loop_set_stop 'THREADS_PENDING' \
+              'CodeRabbit summary feedback needs triage.'
             return 3
           fi
           if [[ "$(printf '%s' "${status}" | jq -r '.head_check_findings')" == 'true' ]]; then
@@ -843,31 +977,42 @@ cmd_loop() {
             return $?
           fi
           if (( request_exit != 0 )); then
+            agent_review_loop_set_stop 'REQUEST_FAILED' \
+              "Agent review request failed (exit ${request_exit})."
             return "${request_exit}"
           fi
           ;;
         8)
           printf 'wait-for-agent-review loop: %s GitHub check failed to run — human intervention required\n' \
             "${AGENT_REVIEW_AGENT:-copilot}" >&2
+          agent_review_loop_set_stop 'AGENT_CHECK_ERROR' \
+            'Agent GitHub check failed to run (non-quota).'
           return 8
           ;;
         10)
           printf 'wait-for-agent-review loop: CI failed — fix required checks before continuing\n' >&2
+          agent_review_loop_set_stop 'CI_FAILED' 'Required CI checks failed.'
           return 10
           ;;
         2)
           pending_exit=0
           agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
           if (( pending_exit == 3 )); then
+            agent_review_loop_set_stop 'THREADS_PENDING' \
+              'Review threads still need a reply or resolve (bot and human).'
             return 3
           fi
           if (( wait_exit == 9 )); then
             printf 'wait-for-agent-review loop: no fresh agent review after idle break (quotas exhausted on PR #%s)\n' \
               "${pr}" >&2
+            agent_review_loop_set_stop 'NO_FRESH_REVIEW_AFTER_IDLE_BREAK' \
+              'All agent quotas exhausted; no fresh review on the current head after idle break.'
             return 2
           fi
           ;;
         *)
+          agent_review_loop_set_stop 'LOOP_STOPPED' \
+            "Agent review check failed (exit ${check_exit})."
           return "${check_exit}"
           ;;
       esac
@@ -979,7 +1124,15 @@ main() {
         "${reason:-Agent review loop stopped without reaching complete_ready.}"
       ;;
     loop)
-      cmd_loop "${repo_arg}" "${pr_arg}"
+      local loop_repo loop_pr loop_exit=0
+      loop_repo="$(agent_review_resolve_repo "${repo_arg}")"
+      loop_pr="$(agent_review_resolve_pr "${pr_arg}" "${loop_repo}")"
+      agent_review_loop_notified=0
+      agent_review_loop_stop_reason_code=''
+      agent_review_loop_stop_reason_detail=''
+      cmd_loop "${repo_arg}" "${pr_arg}" || loop_exit=$?
+      cmd_loop_exit_notify "${loop_repo}" "${loop_pr}" "${loop_exit}"
+      exit "${loop_exit}"
       ;;
     *)
       agent_review_die "unknown command: ${cmd} (run with --help)"
