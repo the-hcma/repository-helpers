@@ -14,7 +14,13 @@ Consumer repos use **`.cursor/rules/pr-ship-and-review.mdc`** pointing at `${REP
 | **M2** | Dev workflow glue — one command from submit through agent review loop | **In progress** (`scripts/dev/ship-and-review`) |
 | **M3** | Org lint **requires** valid `pr-ship-and-review.mdc` in every repo | **Done** (#260) |
 | **M4** | Org rollout — `github-repo-lint --apply-fix` across `the-hcma`; merge candidate PRs | **In progress** (`scripts/dev/rollout-agent-review`) |
-| **M5** | Remove domesti-bot local `wait-for-copilot-review`; point at canonical flow | **Pending** (after M4) |
+| **M5** | Remove domesti-bot local `wait-for-copilot-review`; point at canonical flow | **Done** (#326) |
+
+**M4/M5 rollout learnings (domesti-bot #326):**
+
+- Consumer template uses `gt submit` + `${rh}/scripts/dev/post-pr-submission-checks` — not `ship-and-review` / `submit-stack` (repository-helpers only).
+- Section 3 documents prerequisites (`gh auth`, `agent-review.env`, `complete_ready` source).
+- `--apply-fix` patches `.gitignore` when `.cursor/` is ignored and recreates stale candidate branches missing the rule file.
 
 ---
 
