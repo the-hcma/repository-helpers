@@ -73,27 +73,121 @@ Do not add merge-it unless you intend to merge."
   printf 'Sent complete email for PR #%s to %s\n' "${pr}" "${AGENT_REVIEW_REPORT_TO}" >&2
 }
 
-agent_review_email_failure() {
+agent_review_loop_stop_subject_short() {
+  local -r reason_code="${2:-}"
+  local -r pending_threads="${3:-}"
+
+  case "${reason_code}" in
+    CI_FAILED)
+      printf 'CI failed'
+      ;;
+    THREADS_PENDING)
+      if [[ -n "${pending_threads}" ]] && [[ "${pending_threads}" != '0' ]]; then
+        printf '%s review thread(s) need a reply or resolve' "${pending_threads}"
+      else
+        printf 'review threads need a reply or resolve'
+      fi
+      ;;
+    NO_FRESH_REVIEW_AFTER_IDLE_BREAK)
+      printf 'no fresh agent review after idle break'
+      ;;
+    RESTACK_FAILED)
+      printf 'restack failed'
+      ;;
+    MERGE_STATE_BLOCKED)
+      printf 'merge state blocked'
+      ;;
+    AGENT_CHECK_ERROR)
+      printf 'agent check failed to run'
+      ;;
+    QUOTA_EXHAUSTED)
+      printf 'agent review quota exhausted'
+      ;;
+    TIMEOUT)
+      printf 'agent review timed out'
+      ;;
+    REQUEST_FAILED)
+      printf 'agent review request failed'
+      ;;
+    LOOP_STOPPED)
+      printf 'agent review loop stopped'
+      ;;
+    *)
+      printf 'agent review loop stopped'
+      ;;
+  esac
+}
+
+agent_review_loop_stop_human_headline() {
+  local -r exit_code="$1"
+  local -r reason_code="$2"
+  local -r pending_threads="${3:-}"
+  local short_label
+
+  short_label="$(agent_review_loop_stop_subject_short \
+    "${exit_code}" "${reason_code}" "${pending_threads}")"
+  printf '%s (%s=%s)' "${short_label}" "${reason_code}" "${exit_code}"
+}
+
+agent_review_email_loop_stopped() {
   local -r repo="$1"
   local -r pr="$2"
-  local -r reason="$3"
-  local title url body agent_id
+  local -r exit_code="$3"
+  local -r reason_code="$4"
+  local -r reason_detail="$5"
+  local context_json="${6:-}"
+  local title url body agent_id headline subject pending_threads head_sha ci_conclusion
+
+  if [[ -z "${context_json}" ]]; then
+    context_json='{}'
+  fi
 
   agent_review_require_cmd gh
   title="$(gh pr view "${pr}" --repo "${repo}" --json title --jq '.title')"
   url="$(gh pr view "${pr}" --repo "${repo}" --json url --jq '.url')"
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
-  body="The automated ${agent_id} agent review loop did not complete.
+  pending_threads="$(printf '%s' "${context_json}" | jq -r '.pending_threads // empty')"
+  head_sha="$(printf '%s' "${context_json}" | jq -r '.head_sha // empty')"
+  ci_conclusion="$(printf '%s' "${context_json}" | jq -r '.ci_conclusion // empty')"
+  headline="$(agent_review_loop_stop_human_headline \
+    "${exit_code}" "${reason_code}" "${pending_threads}")"
+  subject="PR agent review stopped: ${headline} — ${title} (#${pr})"
+  body="The automated agent review loop stopped without reaching complete_ready.
 
 PR #${pr}: ${url}
 Title: ${title}
+Reason: ${headline}
+Agent: ${agent_id}"
 
-Reason: ${reason}
+  if [[ -n "${head_sha}" ]]; then
+    body="${body}
+Head: ${head_sha}"
+  fi
+  if [[ -n "${pending_threads}" ]]; then
+    body="${body}
+Pending threads: ${pending_threads}"
+  fi
+  if [[ -n "${ci_conclusion}" ]]; then
+    body="${body}
+CI conclusion: ${ci_conclusion}"
+  fi
 
-Please review manually on GitHub."
+  body="${body}
 
-  agent_review_email_send_plain "PR agent review FAILED: ${title} (#${pr})" "${body}"
-  printf 'Sent failure email for PR #%s to %s\n' "${pr}" "${AGENT_REVIEW_REPORT_TO}" >&2
+Details: ${reason_detail}
+
+Please review manually on GitHub and re-run scripts/wait-for-agent-review loop --pr ${pr} when ready."
+
+  agent_review_email_send_plain "${subject}" "${body}"
+  printf 'Sent loop-stopped email for PR #%s to %s\n' "${pr}" "${AGENT_REVIEW_REPORT_TO}" >&2
+}
+
+agent_review_email_failure() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r reason="$3"
+
+  agent_review_email_loop_stopped "${repo}" "${pr}" 6 TIMEOUT "${reason}" '{}'
 }
 
 agent_review_post_fallback_comment() {
@@ -124,19 +218,22 @@ ${reason}
     "${pr}" "${from_agent}" "${fallback_agent}" >&2
 }
 
-agent_review_post_give_up_comment() {
+agent_review_post_loop_stopped_comment() {
   local -r repo="$1"
   local -r pr="$2"
-  local -r reason="$3"
-  local title url comment_body agent_id
+  local -r exit_code="$3"
+  local -r reason_code="$4"
+  local -r reason_detail="$5"
+  local title url comment_body agent_id headline
 
   agent_review_require_cmd gh
   title="$(gh pr view "${pr}" --repo "${repo}" --json title --jq '.title')"
   url="$(gh pr view "${pr}" --repo "${repo}" --json url --jq '.url')"
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
-  comment_body="## Agent review loop stopped
+  headline="$(agent_review_loop_stop_human_headline "${exit_code}" "${reason_code}")"
+  comment_body="## Agent review loop stopped: ${headline}
 
-${reason}
+${reason_detail}
 
 - **PR:** ${url}
 - **Title:** ${title}
@@ -146,5 +243,18 @@ Manual follow-up required: triage remaining agent threads, push fixes, and re-ru
 
   gh pr comment "${pr}" --repo "${repo}" --body "${comment_body}" >/dev/null \
     || return 1
-  printf 'Posted give-up comment on PR #%s\n' "${pr}" >&2
+  printf 'Posted loop-stopped comment on PR #%s\n' "${pr}" >&2
+}
+
+agent_review_post_give_up_comment() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r reason="$3"
+  local mode="${4:-}"
+
+  if [[ "${mode}" == 'quota' ]]; then
+    agent_review_post_loop_stopped_comment "${repo}" "${pr}" 7 QUOTA_EXHAUSTED "${reason}"
+  else
+    agent_review_post_loop_stopped_comment "${repo}" "${pr}" 6 TIMEOUT "${reason}"
+  fi
 }
