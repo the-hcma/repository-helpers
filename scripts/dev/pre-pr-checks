@@ -2,18 +2,18 @@
 # scripts/dev/pre-pr-checks — Run local CI checks before opening/submitting a PR.
 #
 # Mirrors .github/workflows/ci.yml (bash -n, shellcheck, actionlint, tests/*.test).
-# Ensures the primary (main) worktree is unchanged when checks finish: stashes
-# pre-existing dirt on main for the run, then restores it.
+# Requires a stack worktree (not the primary clone) and a clean primary worktree.
 #
 # Independent checks run in parallel to minimize wall-clock time.
 set -euo pipefail
 
-readonly STASH_MSG='pre-pr-checks: temporary stash (auto-restore)'
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+# shellcheck disable=SC1091  # dev-worktree-guard is a sibling lib, not a package
+source "${script_dir}/../lib/dev-worktree-guard"
 
 main_repo=""
 check_root=""
-main_status_before=""
-did_stash=0
 restore_done=0
 prec_pr_jobs_dir=""
 prec_pr_job_count=0
@@ -23,11 +23,12 @@ usage() {
 Usage:
   scripts/dev/pre-pr-checks
 
-Run from any directory inside a git worktree of the repository you are about to
-submit. Exits non-zero if any check fails.
+Run from a stack worktree (.worktrees/<stack>-wt) of the repository you are about
+to submit. Exits non-zero if any check fails.
 
 Checks (same as CI, run in parallel where independent):
-  - Primary worktree cleanliness (stash/restore pre-existing local changes)
+  - Stack worktree (not the primary clone)
+  - Primary worktree clean (empty git status --porcelain)
   - bash -n on scripts/*, scripts/dev/*, scripts/lib/*, tests/*, tests/lib/*
   - shellcheck -S info on the same paths
   - actionlint on GitHub workflows and repository-practices workflow templates
@@ -50,7 +51,7 @@ resolve_repo_roots() {
   local start_dir="${1:-$PWD}"
   check_root="$(git -C "$start_dir" rev-parse --show-toplevel 2>/dev/null || true)"
   [[ -n "$check_root" ]] || die "Not inside a git repository (cwd: ${start_dir})"
-  main_repo="$(git -C "$check_root" worktree list --porcelain | awk 'NR==1{print $2}')"
+  main_repo="$(dev_worktree_primary_path "$check_root")"
   [[ -n "$main_repo" ]] || die "Could not resolve primary worktree path"
 }
 
@@ -89,13 +90,13 @@ collect_actionlint_files() {
 }
 
 on_exit() {
-  restore_main_worktree
+  verify_main_worktree_clean
   if [[ -n "$prec_pr_jobs_dir" && -d "$prec_pr_jobs_dir" ]]; then
     rm -rf "$prec_pr_jobs_dir"
   fi
 }
 
-restore_main_worktree() {
+verify_main_worktree_clean() {
   if [[ "$restore_done" == '1' ]]; then
     return 0
   fi
@@ -107,45 +108,18 @@ restore_main_worktree() {
 
   local after_checks
   after_checks="$(git -C "$main_repo" status --porcelain 2>/dev/null || true)"
-  if [[ "$did_stash" != '1' && -n "$after_checks" ]]; then
+  if [[ -n "$after_checks" ]]; then
     die "Primary worktree ${main_repo} has unexpected changes after checks (scripts must not modify main)"
-  fi
-  if [[ "$did_stash" == '1' && -n "$after_checks" ]]; then
-    die "Primary worktree ${main_repo} is dirty after checks (expected clean while stash is active)"
-  fi
-
-  if [[ "$did_stash" == '1' ]]; then
-    local top_msg
-    top_msg="$(git -C "$main_repo" stash list -1 --format='%s' 2>/dev/null || true)"
-    if [[ "$top_msg" != *"${STASH_MSG}"* ]]; then
-      die "Top stash on primary worktree is not from pre-pr-checks; restore manually: ${main_repo}"
-    fi
-    if ! git -C "$main_repo" stash pop 2>/dev/null; then
-      die "Failed to restore primary worktree stash in ${main_repo}"
-    fi
-  fi
-
-  local final_status
-  final_status="$(git -C "$main_repo" status --porcelain 2>/dev/null || true)"
-  if [[ "$final_status" != "$main_status_before" ]]; then
-    die "Primary worktree state changed during checks (before vs after mismatch)"
   fi
 }
 
-prepare_main_worktree() {
-  main_status_before="$(git -C "$main_repo" status --porcelain 2>/dev/null || true)"
-  if [[ -n "$main_status_before" ]]; then
-    log_step "Primary worktree has local changes; stashing before checks"
-    if ! git -C "$main_repo" stash push --include-untracked --message "$STASH_MSG" >/dev/null; then
-      die "Failed to stash primary worktree in ${main_repo}"
-    fi
-    did_stash=1
-    if [[ -n "$(git -C "$main_repo" status --porcelain 2>/dev/null || true)" ]]; then
-      die "Primary worktree ${main_repo} is still dirty after stash"
-    fi
-  else
-    log_step "Primary worktree is clean"
-  fi
+assert_worktree_guards() {
+  dev_assert_stack_worktree "$check_root" \
+    || die 'pre-pr-checks must run from a stack worktree (see --help)'
+  dev_assert_main_worktree_clean "$check_root" \
+    || die 'Primary worktree must be clean before pre-pr-checks'
+  log_step "Check root: ${check_root} (primary: ${main_repo})"
+  log_step 'Primary worktree is clean'
 }
 
 require_tools() {
@@ -269,14 +243,7 @@ main() {
 
   require_tools
   resolve_repo_roots "$PWD"
-
-  if [[ "$check_root" != "$main_repo" ]]; then
-    log_step "Check root: ${check_root} (primary: ${main_repo})"
-  else
-    log_step "Check root: ${check_root} (primary worktree)"
-  fi
-
-  prepare_main_worktree
+  assert_worktree_guards
   start_parallel_checks
   wait_parallel_checks
 

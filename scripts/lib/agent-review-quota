@@ -491,6 +491,7 @@ agent_review_agent_quota_mark_exhausted() {
   case "${AGENT_REVIEW_AGENT:-copilot}" in
     copilot) agent_review_copilot_quota_mark_exhausted "${reason}" ;;
     bugbot) agent_review_bugbot_quota_mark_exhausted "${reason}" ;;
+    coderabbit) agent_review_coderabbit_quota_mark_exhausted "${reason}" ;;
   esac
 }
 
@@ -500,6 +501,195 @@ agent_review_agent_quota_skip_request() {
     bugbot) agent_review_bugbot_quota_skip_request ;;
     *) return 1 ;;
   esac
+}
+
+agent_review_coderabbit_quota_state_file() {
+  printf '%s\n' \
+    "${AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE:-${HOME}/scratch/repository-helpers/coderabbit-review-quota.env}"
+}
+
+agent_review_coderabbit_quota_ensure_state_dir() {
+  local state_file state_dir
+
+  state_file="$(agent_review_coderabbit_quota_state_file)"
+  state_dir="$(dirname "${state_file}")"
+  if [[ ! -d "${state_dir}" ]]; then
+    mkdir -p "${state_dir}"
+  fi
+}
+
+agent_review_coderabbit_quota_text_is_exhausted() {
+  local -r text="${1:-}"
+  local profiles_dir coderabbit_profile
+
+  profiles_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/agent-review-profiles" && pwd)"
+  coderabbit_profile="${profiles_dir}/coderabbit"
+  if [[ ! -f "${coderabbit_profile}" ]]; then
+    agent_review_die 'coderabbit profile missing for quota detection'
+  fi
+  CODERABBIT_QUOTA_PROBE_TEXT="${text}" bash -c \
+    "source '${coderabbit_profile}'; agent_review_profile_text_is_quota_exhausted \"\${CODERABBIT_QUOTA_PROBE_TEXT}\""
+}
+
+agent_review_coderabbit_quota_read_cache() {
+  local state_file today valid_date exhausted source reason
+
+  agent_review_coderabbit_quota_exhausted_today=0
+  agent_review_coderabbit_quota_cache_source=''
+  agent_review_coderabbit_quota_cache_reason=''
+  today="$(agent_review_copilot_quota_local_day)"
+  state_file="$(agent_review_coderabbit_quota_state_file)"
+  if [[ ! -f "${state_file}" ]]; then
+    return 1
+  fi
+  # shellcheck disable=SC1090  # scratch cache path is operator-local runtime state
+  source "${state_file}"
+  valid_date="${valid_date:-}"
+  exhausted="${exhausted:-0}"
+  source="${source:-cache}"
+  reason="${reason:-}"
+  if [[ "${valid_date}" != "${today}" ]]; then
+    return 1
+  fi
+  agent_review_coderabbit_quota_cache_source="${source}"
+  agent_review_coderabbit_quota_cache_reason="${reason}"
+  if [[ "${exhausted}" == '1' ]]; then
+    agent_review_coderabbit_quota_exhausted_today=1
+  else
+    agent_review_coderabbit_quota_exhausted_today=0
+  fi
+  return 0
+}
+
+agent_review_coderabbit_quota_write_cache() {
+  local -r exhausted_flag="$1"
+  local -r source_tag="$2"
+  local -r reason_text="${3:-}"
+  local state_file today checked_at reason_quoted
+
+  agent_review_coderabbit_quota_ensure_state_dir
+  state_file="$(agent_review_coderabbit_quota_state_file)"
+  today="$(agent_review_copilot_quota_local_day)"
+  checked_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  reason_quoted="$(agent_review_quota_quote_env_value "${reason_text}")"
+  cat >"${state_file}" <<EOF
+valid_date=${today}
+exhausted=${exhausted_flag}
+source=${source_tag}
+checked_at=${checked_at}
+reason=${reason_quoted}
+EOF
+  agent_review_coderabbit_quota_exhausted_today="${exhausted_flag}"
+  # shellcheck disable=SC2034  # cache metadata read by wait-for-agent-review logging
+  agent_review_coderabbit_quota_cache_source="${source_tag}"
+  # shellcheck disable=SC2034  # cache metadata read by wait-for-agent-review logging
+  agent_review_coderabbit_quota_cache_reason="${reason_text}"
+}
+
+agent_review_coderabbit_quota_mark_exhausted() {
+  local -r reason="${1:-CodeRabbit usage limit reached.}"
+
+  agent_review_coderabbit_quota_write_cache 1 observed "${reason}"
+}
+
+agent_review_coderabbit_quota_mark_available() {
+  agent_review_coderabbit_quota_write_cache 0 probe 'Recent CodeRabbit comments show usage is available.'
+}
+
+# Probe open PR issue comments for CodeRabbit quota signals without requesting a review.
+# Exit 0 when usage limit exhausted today, 1 when available/unknown (not exhausted).
+agent_review_coderabbit_quota_probe_recent_comments() {
+  local probe_json today repo pr at body reason found_today
+
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  today="$(agent_review_copilot_quota_local_day)"
+  probe_json="$(gh api graphql -f query='
+query {
+  viewer {
+    pullRequests(first: 15, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        number
+        repository { nameWithOwner }
+        comments(last: 30) {
+          nodes { author { login } body createdAt }
+        }
+      }
+    }
+  }
+}')"
+  found_today=0
+  while IFS=$'\t' read -r repo pr at body; do
+    [[ -n "${at}" ]] || continue
+    if ! agent_review_quota_timestamp_on_local_day "${at}" "${today}"; then
+      continue
+    fi
+    found_today=1
+    if agent_review_coderabbit_quota_text_is_exhausted "${body}"; then
+      reason="CodeRabbit comment on ${repo}#${pr} at ${at} reports usage limit reached."
+      agent_review_coderabbit_quota_write_cache 1 probe_recent_comments "${reason}"
+      return 0
+    fi
+  done < <(
+    printf '%s' "${probe_json}" | jq -r '
+      [.data.viewer.pullRequests.nodes[]
+        | . as $pr
+        | .comments.nodes[]
+        | select((.author.login // "") | test("coderabbit|rabbit";"i"))
+        | select((.body // "") | length > 0)
+        | {repo: $pr.repository.nameWithOwner, pr: ($pr.number | tostring), body: .body, at: .createdAt}
+      ]
+      | sort_by(.at)
+      | .[]
+      | [.repo, .pr, .at, .body]
+      | @tsv'
+  )
+  if [[ "${found_today}" == '1' ]]; then
+    agent_review_coderabbit_quota_mark_available
+    return 1
+  fi
+  agent_review_coderabbit_quota_write_cache 0 probe 'No CodeRabbit comments found for today on open PRs.'
+  return 1
+}
+
+agent_review_coderabbit_quota_refresh_for_today() {
+  if agent_review_coderabbit_quota_read_cache; then
+    return 0
+  fi
+  agent_review_coderabbit_quota_probe_recent_comments || true
+}
+
+# Ordered agent ids reported at the start of each review cycle.
+agent_review_cycle_quota_agent_ids() {
+  printf '%s\n' copilot bugbot coderabbit
+}
+
+# Human-readable quota status for one agent (no side effects beyond cache refresh).
+agent_review_agent_quota_status_label() {
+  local -r agent_id="$1"
+
+  if agent_review_agent_quota_exhausted_for_agent "${agent_id}"; then
+    printf 'exhausted (will not request)\n'
+    return 0
+  fi
+  if [[ "${agent_id}" == 'coderabbit' ]]; then
+    printf 'available (auto-review; no manual request)\n'
+    return 0
+  fi
+  printf 'available\n'
+}
+
+# Log Copilot, Bugbot, and CodeRabbit quota status once at loop start / cycle preamble.
+agent_review_log_cycle_quota_preamble() {
+  local agent status
+
+  printf '==> Agent review quota (local day %s):\n' \
+    "$(agent_review_copilot_quota_local_day)" >&2
+  while IFS= read -r agent || [[ -n "${agent}" ]]; do
+    [[ -z "${agent}" ]] && continue
+    status="$(agent_review_agent_quota_status_label "${agent}")"
+    printf '    %s: %s' "${agent}" "${status}" >&2
+  done < <(agent_review_cycle_quota_agent_ids)
 }
 
 # True when <agent_id> daily quota cache reports exhaustion (no log output).
@@ -515,14 +705,20 @@ agent_review_agent_quota_exhausted_for_agent() {
       agent_review_bugbot_quota_refresh_for_today
       [[ "${agent_review_bugbot_quota_exhausted_today:-0}" == '1' ]]
       ;;
+    coderabbit)
+      agent_review_coderabbit_quota_refresh_for_today
+      [[ "${agent_review_coderabbit_quota_exhausted_today:-0}" == '1' ]]
+      ;;
     *) return 1 ;;
   esac
 }
 
-# True when Copilot and Bugbot daily quota caches both report exhaustion.
+# True when Copilot, Bugbot, and CodeRabbit daily quota caches all report exhaustion.
 agent_review_all_quotas_exhausted() {
   agent_review_copilot_quota_refresh_for_today
   agent_review_bugbot_quota_refresh_for_today
+  agent_review_coderabbit_quota_refresh_for_today
   [[ "${agent_review_copilot_quota_exhausted_today:-0}" == '1' \
-    && "${agent_review_bugbot_quota_exhausted_today:-0}" == '1' ]]
+    && "${agent_review_bugbot_quota_exhausted_today:-0}" == '1' \
+    && "${agent_review_coderabbit_quota_exhausted_today:-0}" == '1' ]]
 }
