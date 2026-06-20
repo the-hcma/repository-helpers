@@ -4,6 +4,8 @@ Canonical home: **repository-helpers** (`scripts/wait-for-agent-review`, `script
 
 Consumer repos use **`.cursor/rules/pr-ship-and-review.mdc`** pointing at `${REPOSITORY_HELPERS_DIR}` — they do not copy the scripts.
 
+**Status: workstream complete** (M1–M5 merged; closeout: worktree guard, quota preamble, operator handoff).
+
 ---
 
 ## Milestones
@@ -15,11 +17,30 @@ Consumer repos use **`.cursor/rules/pr-ship-and-review.mdc`** pointing at `${REP
 | **M3** | Org lint **requires** valid `pr-ship-and-review.mdc` in every repo | **Done** (#260) |
 | **M4** | Org rollout — cursor rule + repo-practices across `the-hcma` | **Done** (nine public repos merged; #264 calibration) |
 | **M5** | Remove domesti-bot local `wait-for-copilot-review`; point at canonical flow | **Done** (#326) |
+| **Closeout** | Stack worktree guard, main-worktree clean gate, cycle-start quota preamble (Copilot + Bugbot + CodeRabbit), quota-exhausted loop continues CI/thread monitoring | **Done** |
 
 **Follow-ups outside this plan:**
 
 - **`voxlane`** (private): run `scripts/github-repo-lint --repo the-hcma/voxlane --include-private --suggest` and merge any candidate PRs.
 - **Bulk org audits** on private repos: pass `--include-private` (or `GITHUB_REPO_LINT_INCLUDE_PRIVATE=1`).
+
+---
+
+## Worktree discipline
+
+All changeset work runs in a **stack worktree** (`.worktrees/<stack>-wt`), not the primary clone.
+
+| Guard | Where |
+| --- | --- |
+| `dev_assert_stack_worktree` | `pre-pr-checks`, `ship-and-review` (start) |
+| `dev_assert_main_worktree_clean` | `pre-pr-checks` (start + end), `ship-and-review` (start + EXIT trap) |
+
+The primary worktree must have **empty** `git status --porcelain` before and after submit/review cycles — no stash-and-restore of pre-existing dirt.
+
+```bash
+scripts/dev/start-development --worktree <stack> --no-interactive
+cd .worktrees/<stack>-wt
+```
 
 ---
 
@@ -46,6 +67,26 @@ scripts/dev/ensure-submit-clean-tree   # called by submit-stack and ship-and-rev
 ```
 
 Run `pre-pr-checks`, commit, then `scripts/dev/submit-stack` (or `ship-and-review`).
+
+---
+
+## Agent review loop — quota preamble and exhausted agents
+
+At **`wait-for-agent-review loop`** start, the script logs daily quota status for **Copilot**, **Bugbot**, and **CodeRabbit** (local scratch caches under `~/scratch/repository-helpers/`).
+
+When an agent's quota is exhausted, the loop **does not request** that agent. When **all** configured agents are exhausted, the loop **does not give up** — it continues CI gating, thread triage, and `check` / `complete` until merge-ready or a hard stop (threads pending, CI failure, timeout).
+
+---
+
+## Operator handoff (merge)
+
+Babysit until `wait-for-agent-review check` reports `complete_ready: true`, then:
+
+```bash
+scripts/wait-for-agent-review complete --pr <number>
+```
+
+`complete` approves via `gh` and emails `AGENT_REVIEW_REPORT_TO`. **Do not** add `merge-it` or squash-merge unless the operator explicitly requests merge.
 
 ---
 
