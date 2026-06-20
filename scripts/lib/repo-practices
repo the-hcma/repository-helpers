@@ -80,6 +80,7 @@ Audits GitHub conventions for org repositories:
     - copyright notice
     - CODEOWNERS with a repository-wide owner rule
     - .cursor/rules/pr-ship-and-review.mdc (canonical agent review loop)
+    - .gitignore must not ignore .cursor/rules/ (org cursor rules must be trackable)
 
   Release Please (when release-please.yml exists):
     - squash-only repo settings; squash_merge_commit_message=BLANK
@@ -1436,52 +1437,68 @@ rp_resolve_local_repo_dir() {
   return 1
 }
 
-# True when .gitignore ignores .cursor/ but does not un-ignore .cursor/rules/**.
-rp_gitignore_needs_cursor_rules_unignore() {
-  local -r gitignore="$1"
-  local text
+readonly rp_cursor_rules_gitignore_probe_path='.cursor/rules/pr-ship-and-review.mdc'
 
-  [[ -f "$gitignore" ]] || return 1
-  text="$(<"$gitignore")"
-  if grep -qF '!.cursor/rules/' <<<"$text"; then
+# True when gitignore text would ignore .cursor/rules/ without !.cursor/rules/ and !.cursor/rules/**.
+rp_gitignore_text_blocks_cursor_rules() {
+  local text="$1"
+
+  [[ -n "$text" ]] || return 1
+  if grep -qE '^/?\.cursor/rules(/|\*|$)|^/?\.cursor/rules/\*\*' <<<"$text"; then
+    return 0
+  fi
+  if ! grep -qE '^/?\.cursor(/$|/\*$|$)' <<<"$text"; then
     return 1
   fi
-  grep -qE '^\.cursor/$|^\.cursor/\*$' <<<"$text"
-}
-
-# Patch .gitignore so org cursor rules under .cursor/rules/ can be committed (my-tracks M5).
-rp_patch_gitignore_for_cursor_rules() {
-  local -r worktree_path="$1"
-  local -r gitignore="${worktree_path}/.gitignore"
-  local tmp added=0 line
-
-  if ! rp_gitignore_needs_cursor_rules_unignore "$gitignore"; then
+  if grep -qF '!.cursor/rules/' <<<"$text" && grep -qF '!.cursor/rules/**' <<<"$text"; then
     return 1
   fi
-
-  tmp="$(mktemp)"
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" == '.cursor/' || "$line" == '.cursor/*' ]]; then
-      if [[ "$added" -eq 0 ]]; then
-        printf '%s\n' '.cursor/*' '!.cursor/rules/' '!.cursor/rules/**'
-        added=1
-      fi
-    else
-      printf '%s\n' "$line"
-    fi
-  done <"$gitignore" >"$tmp"
-  mv "$tmp" "$gitignore"
   return 0
 }
 
-rp_candidate_git_add() {
-  local -r worktree_path="$1"
-  local -r path="$2"
+rp_check_cursor_rules_gitignore() {
+  local slug="$1"
+  local repo_fail=0
+  local repo_dir gitignore_text
 
-  if git -C "$worktree_path" add "$path" 2>/dev/null; then
+  if repo_dir="$(rp_resolve_local_repo_dir "$slug" 2>/dev/null)"; then
+    if git -C "$repo_dir" check-ignore --no-index -q "$rp_cursor_rules_gitignore_probe_path" 2>/dev/null; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        '.gitignore must not ignore .cursor/rules/ (org cursor rules must be trackable)' \
+        "$(rp_github_url "$slug" '/blob/main/.gitignore')"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: un-ignore .cursor/rules/ in .gitignore (e.g. .cursor/* with !.cursor/rules/ and !.cursor/rules/**)"
+      fi
+    else
+      rp_log_check_ok "$slug" '.cursor/rules/ is trackable in .gitignore' \
+        "$(rp_github_url "$slug" '/blob/main/.gitignore')"
+    fi
+    return "$repo_fail"
+  fi
+
+  gitignore_text="$(rp_fetch_github_text_file "$slug" ".gitignore" || true)"
+  if [[ -z "$gitignore_text" ]]; then
+    rp_log_check_ok "$slug" '.cursor/rules/ is trackable (.gitignore absent or no block)' \
+      "$(rp_github_url "$slug" '/blob/main/.gitignore')"
     return 0
   fi
-  git -C "$worktree_path" add -f "$path"
+  if rp_gitignore_text_blocks_cursor_rules "$gitignore_text"; then
+    repo_fail=1
+    rp_log_check_fail "$slug" \
+      '.gitignore must not ignore .cursor/rules/ (org cursor rules must be trackable)' \
+      "$(rp_github_url "$slug" '/blob/main/.gitignore')"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: un-ignore .cursor/rules/ in .gitignore (e.g. .cursor/* with !.cursor/rules/ and !.cursor/rules/**)"
+    fi
+  else
+    rp_log_check_ok "$slug" '.cursor/rules/ is trackable in .gitignore' \
+      "$(rp_github_url "$slug" '/blob/main/.gitignore')"
+  fi
+
+  return "$repo_fail"
 }
 
 rp_candidate_branch_has_path() {
@@ -1588,11 +1605,7 @@ rp_apply_candidate_fix_stack() {
     path_dir="$(dirname "${worktree_path}/${path}")"
     mkdir -p "$path_dir"
     printf '%s\n' "$content" >"${worktree_path}/${path}"
-    if rp_patch_gitignore_for_cursor_rules "$worktree_path"; then
-      git -C "$worktree_path" add .gitignore
-      rp_log_warn "${slug}: patched .gitignore so .cursor/rules/*.mdc is trackable"
-    fi
-    rp_candidate_git_add "$worktree_path" "$path"
+    git -C "$worktree_path" add "$path"
     if git -C "$worktree_path" diff --cached --quiet; then
       rp_log_warn "${slug}: candidate fix has no file changes for ${path}"
       continue
@@ -2390,6 +2403,7 @@ rp_print_new_repo_checklist() {
       [ ] LICENSE with copyright notice
       [ ] CODEOWNERS with * @OWNER so all code requires CODEOWNER review
       [ ] .cursor/rules/pr-ship-and-review.mdc (agent review loop; template in ${rp_THIS_REPO_NAME})
+      [ ] .gitignore must not ignore .cursor/rules/ (un-ignore if ignoring other .cursor content)
       [ ] GRAPHITE.md (stacked PRs, merge-it flow)
       [ ] RELEASING.md when using Release Please
 
@@ -3300,6 +3314,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_pr_ship_and_review_rule "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_cursor_rules_gitignore "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_dependabot_release_age_policy "$slug"; then
