@@ -1436,6 +1436,62 @@ rp_resolve_local_repo_dir() {
   return 1
 }
 
+# True when .gitignore ignores .cursor/ but does not un-ignore .cursor/rules/**.
+rp_gitignore_needs_cursor_rules_unignore() {
+  local -r gitignore="$1"
+  local text
+
+  [[ -f "$gitignore" ]] || return 1
+  text="$(<"$gitignore")"
+  if grep -qF '!.cursor/rules/' <<<"$text"; then
+    return 1
+  fi
+  grep -qE '^\.cursor/$|^\.cursor/\*$' <<<"$text"
+}
+
+# Patch .gitignore so org cursor rules under .cursor/rules/ can be committed (my-tracks M5).
+rp_patch_gitignore_for_cursor_rules() {
+  local -r worktree_path="$1"
+  local -r gitignore="${worktree_path}/.gitignore"
+  local tmp added=0 line
+
+  if ! rp_gitignore_needs_cursor_rules_unignore "$gitignore"; then
+    return 1
+  fi
+
+  tmp="$(mktemp)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == '.cursor/' || "$line" == '.cursor/*' ]]; then
+      if [[ "$added" -eq 0 ]]; then
+        printf '%s\n' '.cursor/*' '!.cursor/rules/' '!.cursor/rules/**'
+        added=1
+      fi
+    else
+      printf '%s\n' "$line"
+    fi
+  done <"$gitignore" >"$tmp"
+  mv "$tmp" "$gitignore"
+  return 0
+}
+
+rp_candidate_git_add() {
+  local -r worktree_path="$1"
+  local -r path="$2"
+
+  if git -C "$worktree_path" add "$path" 2>/dev/null; then
+    return 0
+  fi
+  git -C "$worktree_path" add -f "$path"
+}
+
+rp_candidate_branch_has_path() {
+  local -r worktree_path="$1"
+  local -r branch="$2"
+  local -r path="$3"
+
+  git -C "$worktree_path" show "${branch}:${path}" >/dev/null 2>&1
+}
+
 rp_candidate_worktree_path() {
   local repo_dir="$1"
   local primary_dir
@@ -1518,17 +1574,25 @@ rp_apply_candidate_fix_stack() {
     branch="repo-practices/${branch_suffix}"
 
     if git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${branch}"; then
-      rp_log_warn "${slug}: candidate branch already exists, skipping ${branch}"
-      parent_branch="$branch"
-      parent_ref="$branch"
-      continue
+      if rp_candidate_branch_has_path "$worktree_path" "$branch" "$path"; then
+        rp_log_warn "${slug}: candidate branch already exists, skipping ${branch}"
+        parent_branch="$branch"
+        parent_ref="$branch"
+        continue
+      fi
+      rp_log_warn "${slug}: stale candidate branch ${branch} missing ${path}; recreating"
+      git -C "$worktree_path" branch -D "$branch"
     fi
 
     git -C "$worktree_path" checkout -B "$branch" "$parent_ref"
     path_dir="$(dirname "${worktree_path}/${path}")"
     mkdir -p "$path_dir"
     printf '%s\n' "$content" >"${worktree_path}/${path}"
-    git -C "$worktree_path" add "$path"
+    if rp_patch_gitignore_for_cursor_rules "$worktree_path"; then
+      git -C "$worktree_path" add .gitignore
+      rp_log_warn "${slug}: patched .gitignore so .cursor/rules/*.mdc is trackable"
+    fi
+    rp_candidate_git_add "$worktree_path" "$path"
     if git -C "$worktree_path" diff --cached --quiet; then
       rp_log_warn "${slug}: candidate fix has no file changes for ${path}"
       continue
