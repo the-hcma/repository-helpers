@@ -18,6 +18,7 @@
 #   loop                Run request/wait/check until complete, triage needed, or timeout
 #
 # See .cursor/rules/pr-ship-and-review.mdc for the full loop.
+# shellcheck disable=SC2016  # jq filter strings passed to ar_runner_jq_file helpers
 set -euo pipefail
 
 agent_review_loop_fallback_index=0
@@ -28,10 +29,32 @@ agent_review_loop_stop_reason_detail=''
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
 
+# shellcheck disable=SC1091  # runner-bootstrap begins session for lib runner_exec calls
+source "${script_dir}/lib/runner-bootstrap"
+
 # shellcheck disable=SC1091  # shared libs sourced at runtime from scripts/lib
 source "${script_dir}/lib/agent-review"
 # shellcheck disable=SC1091  # shared libs sourced at runtime from scripts/lib
 source "${script_dir}/lib/agent-review-email"
+
+wait_ar_jq_status() {
+  local -r json="$1"
+  local -r filter="$2"
+  ar_runner_jq_file "wait-for-agent-review jq status" "$json" -r "$filter"
+}
+
+wait_ar_jq_snapshot() {
+  local -r json="$1"
+  local -r filter="$2"
+  ar_runner_jq_file "wait-for-agent-review jq snapshot" "$json" -r "$filter"
+}
+
+wait_ar_jq_check_state() {
+  local -r json="$1"
+  local -r filter="$2"
+  ar_runner_jq_file "wait-for-agent-review jq check state" "$json" -r "$filter"
+}
+
 
 usage() {
   cat <<'EOF'
@@ -174,7 +197,7 @@ agent_review_loop_status_context_json() {
     printf '{}'
     return 0
   fi
-  printf '%s' "${status}" | jq -c '{
+  ar_runner_jq_file "wait-for-agent-review status context" "$status" -c '{
     pending_threads: (.pending_threads // 0),
     head_sha: (.head_sha // ""),
     ci_conclusion: (.ci_conclusion // "")
@@ -289,7 +312,7 @@ cmd_wait() {
       return 10
     fi
     snapshot="$(agent_review_graphql_wait_snapshot "${owner}" "${name}" "${pr}")"
-    head="$(printf '%s' "${snapshot}" | jq -r '.data.repository.pullRequest.headRefOid')"
+    head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
     now_epoch="$(agent_review_last_activity_epoch_from_snapshot "${snapshot}")"
     if (( now_epoch > last_activity )); then
       last_activity="${now_epoch}"
@@ -339,7 +362,7 @@ cmd_wait() {
       fi
       if [[ "${agent_review_profile_uses_head_check:-false}" == 'true' ]]; then
         check_state_json="$(agent_review_head_check_state_json "${repo}" "${head}")"
-        quota_hit="$(printf '%s' "${check_state_json}" | jq -r '.quota')"
+        quota_hit="$(wait_ar_jq_check_state "$check_state_json" '.quota')"
         if [[ "${quota_hit}" == 'true' ]]; then
           agent_review_agent_quota_mark_exhausted \
             "Bugbot check on head ${head:0:7} reports usage limit reached (PR #${pr})."
@@ -347,8 +370,7 @@ cmd_wait() {
             "${AGENT_REVIEW_AGENT:-copilot}" "${head:0:7}" "${pr}" >&2
           return 7
         fi
-        check_state="$(printf '%s' "${check_state_json}" | jq -r \
-          'if .error then "error" elif .clean then "clean" elif .findings then "findings" else .conclusion end')"
+        check_state="$(wait_ar_jq_check_state "$check_state_json" 'if .error then "error" elif .clean then "clean" elif .findings then "findings" else .conclusion end')"
         printf '%s GitHub check completed (%s) for head %s (PR #%s)\n' \
           "${AGENT_REVIEW_AGENT:-copilot}" "${check_state}" "${head:0:7}" "${pr}" >&2
         return 0
@@ -402,26 +424,26 @@ cmd_check() {
   snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
   agent_review_assert_snapshot_complete "${snapshot}"
   status="$(agent_review_status_json_from_snapshot "${snapshot}" "${repo}" "${pr}")"
-  pr_merged="$(printf '%s' "${status}" | jq -r '.pr_merged')"
+  pr_merged="$(wait_ar_jq_status "$status" '.pr_merged')"
   if [[ "${pr_merged}" == 'true' ]]; then
     printf '%s\n' "${status}"
     printf 'wait-for-agent-review: PR #%s is merged — loop complete\n' "${pr}" >&2
     return 0
   fi
-  if [[ "$(printf '%s' "${status}" | jq -r '.ci_conclusion // ""')" == 'failure' ]]; then
+  if [[ "$(wait_ar_jq_status "$status" '.ci_conclusion // ""')" == 'failure' ]]; then
     agent_review_print_ci_failures "${repo}" "${pr}"
     printf '%s\n' "${status}" >&2
     return 10
   fi
-  complete_ready="$(printf '%s' "${status}" | jq -r '.complete_ready')"
-  all_quotas_exhausted="$(printf '%s' "${status}" | jq -r '.all_quotas_exhausted')"
+  complete_ready="$(wait_ar_jq_status "$status" '.complete_ready')"
+  all_quotas_exhausted="$(wait_ar_jq_status "$status" '.all_quotas_exhausted')"
   pending_count="$(agent_review_pending_thread_count_from_snapshot "${snapshot}")"
-  fresh="$(printf '%s' "${status}" | jq -r '.fresh_review_on_head')"
-  agent_empty="$(printf '%s' "${status}" | jq -r '.agent_review_empty')"
-  agent_quota="$(printf '%s' "${status}" | jq -r '.agent_quota_exhausted')"
-  head_check_error="$(printf '%s' "${status}" | jq -r '.head_check_error')"
-  head_check_findings="$(printf '%s' "${status}" | jq -r '.head_check_findings')"
-  merge_state="$(printf '%s' "${status}" | jq -r '.merge_state_status')"
+  fresh="$(wait_ar_jq_status "$status" '.fresh_review_on_head')"
+  agent_empty="$(wait_ar_jq_status "$status" '.agent_review_empty')"
+  agent_quota="$(wait_ar_jq_status "$status" '.agent_quota_exhausted')"
+  head_check_error="$(wait_ar_jq_status "$status" '.head_check_error')"
+  head_check_findings="$(wait_ar_jq_status "$status" '.head_check_findings')"
+  merge_state="$(wait_ar_jq_status "$status" '.merge_state_status')"
   if [[ "${complete_ready}" == 'true' ]]; then
     printf '%s\n' "${status}"
     return 0
@@ -465,8 +487,8 @@ cmd_check() {
   fi
   if [[ "${agent_empty}" != 'true' ]]; then
     if [[ "${AGENT_REVIEW_AGENT:-copilot}" == 'coderabbit' ]] \
-      && [[ "$(printf '%s' "${status}" | jq -r '.pending_threads // 0')" == '0' ]]; then
-      head="$(printf '%s' "${status}" | jq -r '.head_sha')"
+      && [[ "$(wait_ar_jq_status "$status" '.pending_threads // 0')" == '0' ]]; then
+      head="$(wait_ar_jq_status "$status" '.head_sha')"
       review_body="$(agent_review_latest_agent_review_body_on_head "${snapshot}" "${head}")"
       if agent_review_profile_review_has_body_feedback "${review_body}"; then
         printf '%s\n' "${status}" >&2
@@ -485,7 +507,7 @@ cmd_check() {
 }
 
 cmd_complete() {
-  local repo pr status complete_ready gh_user existing pr_merged
+  local repo pr status complete_ready gh_user existing pr_merged reviews_json
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
@@ -496,18 +518,19 @@ cmd_complete() {
     return 0
   fi
   status="$(cmd_status "${repo}" "${pr}")"
-  pr_merged="$(printf '%s' "${status}" | jq -r '.pr_merged')"
+  pr_merged="$(wait_ar_jq_status "$status" '.pr_merged')"
   if [[ "${pr_merged}" == 'true' ]]; then
     printf 'PR #%s is already merged — skipping approve/email\n' "${pr}" >&2
     return 0
   fi
-  complete_ready="$(printf '%s' "${status}" | jq -r '.complete_ready')"
+  complete_ready="$(wait_ar_jq_status "$status" '.complete_ready')"
   if [[ "${complete_ready}" != 'true' ]]; then
     agent_review_die 'complete requires agent and human review empty on current head with no unaddressed threads'
   fi
-  gh_user="$(gh api user --jq '.login')"
-  existing="$(gh pr view "${pr}" --repo "${repo}" --json reviews \
-    | jq -r --arg user "${gh_user}" '
+  gh_user="$(ar_runner_gh_api_stream "gh api user login" user --jq '.login')"
+  reviews_json="$(ar_runner_gh_pr_jq "wait-for-agent-review pr reviews" "${repo}" "${pr}" reviews)"
+  existing="$(ar_runner_jq_file "wait-for-agent-review last user review state" "${reviews_json}" \
+    -r --arg user "${gh_user}" '
       [.reviews[]
         | select(.author.login == $user)
         | select(.state != "PENDING")
@@ -516,7 +539,7 @@ cmd_complete() {
       | last
       | .state // empty')"
   if [[ "${existing}" != 'APPROVED' ]]; then
-    gh pr review "${pr}" --repo "${repo}" --approve \
+    runner_exec "wait-for-agent-review pr approve" -- gh pr review "${pr}" --repo "${repo}" --approve \
       --body "Agent review (${AGENT_REVIEW_AGENT:-copilot}): no new comments on current head."
     printf 'Approved PR #%s as %s\n' "${pr}" "${gh_user}" >&2
   else
@@ -537,7 +560,7 @@ cmd_resolve_thread() {
 }
 
 cmd_resolve_addressed() {
-  local repo pr owner name snapshot ids id bots
+  local repo pr owner name snapshot ids id needs_resolve_json
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   read -r owner name < <(agent_review_repo_parts "${repo}")
@@ -546,19 +569,10 @@ cmd_resolve_addressed() {
   agent_review_require_cmd jq
   snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
   agent_review_assert_snapshot_complete "${snapshot}"
-  bots="$(agent_review_bot_login_regex)"
+  needs_resolve_json="$(agent_review_agent_threads_needs_resolve_json_from_snapshot "${snapshot}")"
   mapfile -t ids < <(
-    printf '%s' "${snapshot}" \
-      | jq -r --arg bots "${bots}" '
-        def is_bot_login($login):
-          ($bots | split("|")) as $patterns
-          | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
-        .data.repository.pullRequest.reviewThreads.nodes[]
-        | select(.isResolved == false)
-        | .comments.nodes[0] as $first
-        | select(is_bot_login($first.author.login))
-        | select(any(.comments.nodes[1:][]; .author.__typename == "User"))
-        | .id'
+    ar_runner_jq_file "wait-for-agent-review agent addressed thread ids" "${needs_resolve_json}" \
+      -r '.[].thread_id'
   )
   if ((${#ids[@]} == 0)); then
     printf 'No addressed agent threads to resolve on PR #%s\n' "${pr}" >&2
@@ -571,7 +585,7 @@ cmd_resolve_addressed() {
 }
 
 cmd_resolve_human_addressed() {
-  local repo pr owner name snapshot ids id bots
+  local repo pr owner name snapshot ids id needs_resolve_json
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   read -r owner name < <(agent_review_repo_parts "${repo}")
@@ -580,20 +594,10 @@ cmd_resolve_human_addressed() {
   agent_review_require_cmd jq
   snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
   agent_review_assert_snapshot_complete "${snapshot}"
-  bots="$(agent_review_bot_login_regex)"
+  needs_resolve_json="$(agent_review_human_threads_needs_resolve_json_from_snapshot "${snapshot}")"
   mapfile -t ids < <(
-    printf '%s' "${snapshot}" \
-      | jq -r --arg bots "${bots}" '
-        def is_bot_login($login):
-          ($bots | split("|")) as $patterns
-          | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
-        .data.repository.pullRequest.reviewThreads.nodes[]
-        | select(.isResolved == false)
-        | .comments.nodes[0] as $first
-        | select($first.author.__typename == "User")
-        | select(is_bot_login($first.author.login) | not)
-        | select(any(.comments.nodes[1:][]; .author.__typename == "User"))
-        | .id'
+    ar_runner_jq_file "wait-for-agent-review human addressed thread ids" "${needs_resolve_json}" \
+      -r '.[].thread_id'
   )
   if ((${#ids[@]} == 0)); then
     printf 'No addressed human review threads to resolve on PR #%s\n' "${pr}" >&2
@@ -606,7 +610,7 @@ cmd_resolve_human_addressed() {
 }
 
 cmd_restack() {
-  local repo pr merge_state head_branch pr_head_branch attempt base_branch
+  local repo pr merge_state head_branch pr_head_branch attempt base_branch pr_fields_json
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
@@ -619,12 +623,17 @@ cmd_restack() {
   fi
   agent_review_assert_checkout_matches_repo "${repo}"
   agent_review_assert_not_primary_worktree
-  head_branch="$(gh pr view "${pr}" --repo "${repo}" --json headRefName --jq '.headRefName')"
-  pr_head_branch="$(git branch --show-current 2>/dev/null || true)"
+  pr_fields_json="$(ar_runner_gh_pr_jq "wait-for-agent-review pr restack fields" "${repo}" "${pr}" \
+    "headRefName,mergeStateStatus,baseRefName")"
+  head_branch="$(ar_runner_jq_file "wait-for-agent-review headRefName" "${pr_fields_json}" \
+    -r '.headRefName')"
+  pr_head_branch="$(runner_exec_stdout "wait-for-agent-review git current branch" \
+    -- git branch --show-current || true)"
   if [[ -z "${pr_head_branch}" ]] || [[ "${pr_head_branch}" != "${head_branch}" ]]; then
     agent_review_die "current branch ${pr_head_branch@Q} is not PR #${pr} head ${head_branch@Q}"
   fi
-  merge_state="$(gh pr view "${pr}" --repo "${repo}" --json mergeStateStatus --jq '.mergeStateStatus')"
+  merge_state="$(ar_runner_jq_file "wait-for-agent-review mergeStateStatus" "${pr_fields_json}" \
+    -r '.mergeStateStatus')"
   if [[ "${merge_state}" != 'BEHIND' ]]; then
     if agent_review_merge_state_ready "${merge_state}"; then
       printf 'PR #%s mergeStateStatus=%s (no restack needed)\n' "${pr}" "${merge_state}" >&2
@@ -634,23 +643,27 @@ cmd_restack() {
       "${pr}" "${merge_state}" >&2
     return 4
   fi
-  base_branch="$(gh pr view "${pr}" --repo "${repo}" --json baseRefName --jq '.baseRefName')"
+  base_branch="$(ar_runner_jq_file "wait-for-agent-review baseRefName" "${pr_fields_json}" \
+    -r '.baseRefName')"
   printf 'PR #%s is BEHIND %s — running gt sync and gt restack…\n' "${pr}" "${base_branch}" >&2
-  if ! gt sync; then
+  if ! runner_exec "wait-for-agent-review gt sync" -- gt sync; then
     printf 'gt sync failed during restack for PR #%s\n' "${pr}" >&2
     return 4
   fi
-  if ! gt restack; then
+  if ! runner_exec "wait-for-agent-review gt restack" -- gt restack; then
     printf 'gt restack failed for PR #%s\n' "${pr}" >&2
     return 4
   fi
-  if ! gt submit --no-interactive --publish; then
+  if ! runner_exec "wait-for-agent-review gt submit after restack" -- gt submit --no-interactive --publish; then
     printf 'gt submit failed after restack for PR #%s\n' "${pr}" >&2
     return 4
   fi
   attempt=0
   while (( attempt < 12 )); do
-    merge_state="$(gh pr view "${pr}" --repo "${repo}" --json mergeStateStatus --jq '.mergeStateStatus')"
+    pr_fields_json="$(ar_runner_gh_pr_jq "wait-for-agent-review pr merge state poll" "${repo}" "${pr}" \
+      mergeStateStatus)"
+    merge_state="$(ar_runner_jq_file "wait-for-agent-review mergeStateStatus poll" "${pr_fields_json}" \
+      -r '.mergeStateStatus')"
     if [[ "${merge_state}" != 'BEHIND' ]]; then
       if agent_review_merge_state_ready "${merge_state}"; then
         printf 'After restack: mergeStateStatus=%s\n' "${merge_state}" >&2
@@ -1007,7 +1020,7 @@ cmd_loop() {
           ;;
         5)
           status="$(cmd_status "${repo}" "${pr}")"
-          pending_all="$(printf '%s' "${status}" | jq -r '.pending_threads // 0')"
+          pending_all="$(wait_ar_jq_status "$status" '.pending_threads // 0')"
           if (( pending_all > 0 )); then
             printf 'wait-for-agent-review loop: fresh review with unaddressed threads\n' >&2
             agent_review_loop_set_stop 'THREADS_PENDING' \
@@ -1015,13 +1028,13 @@ cmd_loop() {
             return 3
           fi
           if [[ "${AGENT_REVIEW_AGENT:-copilot}" == 'coderabbit' ]] \
-            && [[ "$(printf '%s' "${status}" | jq -r '.agent_review_empty')" != 'true' ]]; then
+            && [[ "$(wait_ar_jq_status "$status" '.agent_review_empty')" != 'true' ]]; then
             printf 'wait-for-agent-review loop: CodeRabbit summary feedback needs triage\n' >&2
             agent_review_loop_set_stop 'THREADS_PENDING' \
               'CodeRabbit summary feedback needs triage.'
             return 3
           fi
-          if [[ "$(printf '%s' "${status}" | jq -r '.head_check_findings')" == 'true' ]]; then
+          if [[ "$(wait_ar_jq_status "$status" '.head_check_findings')" == 'true' ]]; then
             printf 'wait-for-agent-review loop: %s check reports findings — waiting for review comments\n' \
               "${AGENT_REVIEW_AGENT:-copilot}" >&2
             sleep "${agent_review_default_poll_interval_s}"

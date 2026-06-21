@@ -3,6 +3,50 @@
 #
 # Sourced by dep-updater and post-pr-submission-checks. Functions expect gh and jq
 # on PATH.
+# shellcheck disable=SC2016  # jq filter programs are single-quoted literals
+
+_ci_rollup_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _ci_rollup_lib_dir
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_ci_rollup_lib_dir}/runner-ensure"
+
+ci_rollup_runner_last_stdout() {
+  local uuid
+
+  uuid="$(runner_last_id)"
+  [[ -n "$uuid" ]] || return 0
+  runner_read "$uuid" stdout 2>/dev/null || true
+}
+
+# ci_rollup_jq_file <label> <input-json> [jq-args…]
+ci_rollup_jq_file() {
+  local -r label="$1"
+  local -r input="$2"
+  shift 2
+  local tmp exit_code
+
+  tmp="$(mktemp)"
+  printf '%s' "$input" >"$tmp"
+  exit_code=0
+  runner_exec "$label" --stream-stdout -- jq "$@" "$tmp" || exit_code=$?
+  rm -f "$tmp"
+  return "$exit_code"
+}
+
+# ci_rollup_jq_lines <label> [jq-args…]
+# Reads newline-separated stdin into a temp file for jq -R -s style filters.
+ci_rollup_jq_lines() {
+  local -r label="$1"
+  shift
+  local tmp exit_code
+
+  tmp="$(mktemp)"
+  cat >"$tmp"
+  exit_code=0
+  runner_exec "$label" --stream-stdout -- jq "$@" "$tmp" || exit_code=$?
+  rm -f "$tmp"
+  return "$exit_code"
+}
 
 # Job display names (or job ids) from ci.yml that must be green before merge.
 # Skips guard/changed-files/secret-scan/workflow-lint (optional gates, not merge blockers).
@@ -50,9 +94,10 @@ ci_rollup_conclusion_for_gating() {
     rollup_json='[]'
   fi
 
-  required_json="$(printf '%s\n' "$required_contexts" | jq -R -s 'split("\n") | map(select(length > 0))')"
+  required_json="$(printf '%s\n' "$required_contexts" \
+    | ci_rollup_jq_lines "ci-rollup required contexts" -R -s 'split("\n") | map(select(length > 0))')"
 
-  jq -r --argjson required "$required_json" '
+  ci_rollup_jq_file "ci-rollup gating conclusion" "$rollup_json" -r --argjson required "$required_json" '
     def fail_conclusions:
       ["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"];
     def ok_conclusions:
@@ -88,20 +133,31 @@ ci_rollup_conclusion_for_gating() {
       elif ([$r[] | select(is_external(.name // .context // "") | not)] | length) == 0 then "pending"
       elif all($r[] | select(is_external(.name // .context // "") | not); is_ok(.conclusion)) then "success"
       else "pending"
-      end
-  ' <<<"$rollup_json"
+      end'
 }
 
 ci_rollup_json_for_pr() {
   local -r pr="$1"
   local -r repo="${2:-}"
+  local exit_code out
 
+  exit_code=0
   if [[ -n "$repo" ]]; then
-    gh pr view "$pr" --repo "$repo" --json statusCheckRollup --jq '.statusCheckRollup // []' 2>/dev/null \
-      || printf '[]\n'
+    runner_exec "gh pr statusCheckRollup" -- gh pr view "$pr" --repo "$repo" \
+      --json statusCheckRollup --jq '.statusCheckRollup // []' || exit_code=$?
   else
-    gh pr view "$pr" --json statusCheckRollup --jq '.statusCheckRollup // []' 2>/dev/null \
-      || printf '[]\n'
+    runner_exec "gh pr statusCheckRollup" -- gh pr view "$pr" \
+      --json statusCheckRollup --jq '.statusCheckRollup // []' || exit_code=$?
+  fi
+  if (( exit_code != 0 )); then
+    printf '[]\n'
+    return 0
+  fi
+  out="$(ci_rollup_runner_last_stdout)"
+  if [[ -z "$out" ]]; then
+    printf '[]\n'
+  else
+    printf '%s\n' "$out"
   fi
 }
 
@@ -109,7 +165,7 @@ ci_rollup_json_for_pr() {
 ci_rollup_normalize_json() {
   local -r json="$1"
 
-  jq -c '
+  ci_rollup_jq_file "ci-rollup normalize" "$json" -c '
     [.[]?
       | if (.name // "") == "" and (.context // "") != "" then
           .name = .context
@@ -119,7 +175,7 @@ ci_rollup_normalize_json() {
           .conclusion = .state
         else .
         end
-    ]' <<<"${json}" 2>/dev/null || printf '[]\n'
+    ]' 2>/dev/null || printf '[]\n'
 }
 
 # Keep the newest rollup row per check name (supersedes stale CANCELLED/SKIPPED rows).
@@ -128,12 +184,12 @@ ci_rollup_latest_by_name_json() {
   local normalized
 
   normalized="$(ci_rollup_normalize_json "${json}")"
-  jq -c '
+  ci_rollup_jq_file "ci-rollup latest by name" "$normalized" -c '
     [.[]?
       | select((.name // .context // "") != "")]
     | group_by(.name // .context // "unknown")
     | map(sort_by(.startedAt // .completedAt // "") | .[-1])
-  ' <<<"${normalized}" 2>/dev/null || printf '[]\n'
+  ' 2>/dev/null || printf '[]\n'
 }
 
 ci_rollup_has_pending_or_in_progress() {
@@ -141,18 +197,18 @@ ci_rollup_has_pending_or_in_progress() {
   local normalized
 
   normalized="$(ci_rollup_normalize_json "${json}")"
-  jq -e '
+  ci_rollup_jq_file "ci-rollup pending check" "$normalized" -e '
     [ .[]?
       | (.conclusion // "")
     ]
     | any(. == "" or . == "IN_PROGRESS" or . == "QUEUED" or . == "PENDING")
-  ' >/dev/null <<<"${normalized}"
+  ' >/dev/null
 }
 
 ci_rollup_failed_lines() {
   local -r json="$1"
 
-  jq -r '
+  ci_rollup_jq_file "ci-rollup failed lines" "$json" -r '
     [ .[]?
       | {
           name: (.name // .context // "unknown"),
@@ -166,13 +222,13 @@ ci_rollup_failed_lines() {
     ]
     | .[]
     | "\(.name)\t\(.conclusion)\t\(.detailsUrl)"
-  ' <<<"$json"
+  '
 }
 
 ci_rollup_failure_details_json() {
   local -r json="$1"
 
-  jq -c '
+  ci_rollup_jq_file "ci-rollup failure details" "$json" -c '
     [ .[]?
       | {
           name: (.name // .context // "unknown"),
@@ -184,7 +240,7 @@ ci_rollup_failure_details_json() {
       | select(.conclusion != "NEUTRAL")
       | select(.conclusion != "")
     ]
-  ' <<<"$json" 2>/dev/null || printf '[]\n'
+  ' 2>/dev/null || printf '[]\n'
 }
 
 ci_failure_summary_for_pr() {

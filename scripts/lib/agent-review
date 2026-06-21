@@ -1,12 +1,77 @@
 #!/usr/bin/env bash
 # agent-review — shared helpers for wait-for-agent-review / trigger-agent-review.
 # shellcheck disable=SC2034  # default timeout constants are read by wait-for-agent-review
+# shellcheck disable=SC2016  # jq filter and GraphQL query strings use single quotes
 
 agent_review_default_wait_timeout_s=300
 agent_review_default_poll_interval_s=15
 agent_review_default_cycle_timeout_s=1800
 agent_review_default_pr_timeout_s=43200
 agent_review_default_idle_break_s=900
+
+_ar_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _ar_lib_dir
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_ar_lib_dir}/runner-ensure"
+
+ar_runner_last_stdout() {
+  local uuid
+
+  uuid="$(runner_last_id)"
+  [[ -n "$uuid" ]] || return 0
+  runner_read "$uuid" stdout 2>/dev/null || true
+}
+
+# ar_runner_gh_api_stream <label> [gh-api-args…]
+ar_runner_gh_api_stream() {
+  local -r label="$1"
+  shift
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" --stream-stdout -- gh api "$@" || exit_code=$?
+  return "$exit_code"
+}
+
+# ar_runner_gh_pr_jq <label> <repo> <pr> <json-fields>
+ar_runner_gh_pr_jq() {
+  local -r label="$1"
+  local -r repo="$2"
+  local -r pr="$3"
+  local -r json_fields="$4"
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" --stream-stdout -- gh pr view "$pr" --repo "$repo" --json "$json_fields" \
+    || exit_code=$?
+  return "$exit_code"
+}
+
+# ar_runner_jq_file <label> <input-json> [jq-args…]
+ar_runner_jq_file() {
+  local -r label="$1"
+  local -r input="$2"
+  shift 2
+  local tmp exit_code
+
+  tmp="$(mktemp)"
+  printf '%s' "$input" >"$tmp"
+  exit_code=0
+  runner_exec "$label" --stream-stdout -- jq "$@" "$tmp" || exit_code=$?
+  rm -f "$tmp"
+  return "$exit_code"
+}
+
+# ar_runner_jq_n <label> [jq -n args…]
+ar_runner_jq_n() {
+  local -r label="$1"
+  shift
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" --stream-stdout -- jq -n "$@" || exit_code=$?
+  return "$exit_code"
+}
 
 agent_review_die() {
   printf 'wait-for-agent-review: %s\n' "$*" >&2
@@ -68,9 +133,13 @@ agent_review_repo_parts() {
 }
 
 agent_review_repo_from_git_origin() {
-  local url slug lib_dir
+  local url slug lib_dir exit_code
 
-  url="$(git remote get-url origin 2>/dev/null || true)"
+  exit_code=0
+  url="$(runner_exec_stdout "git remote get-url origin" -- git remote get-url origin)" || exit_code=$?
+  if (( exit_code != 0 )); then
+    url=""
+  fi
   if [[ -z "${url}" ]]; then
     return 1
   fi
@@ -112,7 +181,7 @@ agent_review_validate_positive_int() {
 
 agent_review_resolve_pr() {
   local pr="${AGENT_REVIEW_PR_NUMBER:-}"
-  local repo
+  local repo exit_code
 
   if [[ -n "${1:-}" ]]; then
     pr="$1"
@@ -120,7 +189,12 @@ agent_review_resolve_pr() {
   repo="$(agent_review_resolve_repo "${2:-}")"
   if [[ -z "${pr}" ]]; then
     agent_review_require_cmd gh
-    pr="$(gh pr view --repo "${repo}" --json number --jq '.number' 2>/dev/null || true)"
+    exit_code=0
+    pr="$(runner_exec_stdout "gh pr view number" -- gh pr view --repo "${repo}" --json number \
+      --jq '.number // empty')" || exit_code=$?
+    if (( exit_code != 0 )); then
+      pr=""
+    fi
   fi
   if [[ -z "${pr}" ]]; then
     agent_review_die "PR number required (pass --pr N or set AGENT_REVIEW_PR_NUMBER)"
@@ -340,26 +414,47 @@ agent_review_load_agent_profile() {
 
 agent_review_assert_review_requests_complete() {
   local -r snapshot="$1"
-  if printf '%s' "${snapshot}" | jq -e '.data.repository.pullRequest.reviewRequests.pageInfo.hasNextPage == true' >/dev/null; then
+  local exit_code
+
+  exit_code=0
+  ar_runner_jq_file "agent-review reviewRequests complete" "${snapshot}" -e \
+    '.data.repository.pullRequest.reviewRequests.pageInfo.hasNextPage == true' \
+    >/dev/null || exit_code=$?
+  if (( exit_code == 0 )); then
     agent_review_die 'reviewRequests connection truncated (first:10); cannot trust request state'
   fi
 }
 
 agent_review_assert_reviews_complete() {
   local -r snapshot="$1"
-  if printf '%s' "${snapshot}" | jq -e '.data.repository.pullRequest.reviews.pageInfo.hasPreviousPage == true' >/dev/null; then
+  local exit_code
+
+  exit_code=0
+  ar_runner_jq_file "agent-review reviews complete" "${snapshot}" -e \
+    '.data.repository.pullRequest.reviews.pageInfo.hasPreviousPage == true' \
+    >/dev/null || exit_code=$?
+  if (( exit_code == 0 )); then
     agent_review_die 'reviews connection truncated (last:100); cannot trust freshness'
   fi
 }
 
 agent_review_assert_review_threads_complete() {
   local -r snapshot="$1"
-  if printf '%s' "${snapshot}" | jq -e '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage == true' >/dev/null; then
+  local exit_code
+
+  exit_code=0
+  ar_runner_jq_file "agent-review reviewThreads complete" "${snapshot}" -e \
+    '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage == true' \
+    >/dev/null || exit_code=$?
+  if (( exit_code == 0 )); then
     agent_review_die 'reviewThreads connection truncated (first:100); cannot trust thread counts'
   fi
-  if printf '%s' "${snapshot}" | jq -e '
+  exit_code=0
+  ar_runner_jq_file "agent-review reviewThread comments complete" "${snapshot}" -e '
       [.data.repository.pullRequest.reviewThreads.nodes[]
-        | .comments.pageInfo.hasNextPage] | any' >/dev/null; then
+        | .comments.pageInfo.hasNextPage] | any' \
+    >/dev/null || exit_code=$?
+  if (( exit_code == 0 )); then
     agent_review_die 'reviewThread comments truncated (first:100); cannot trust reply detection'
   fi
 }
@@ -376,7 +471,7 @@ agent_review_graphql_pr_snapshot() {
   local -r pr="$3"
 
   # shellcheck disable=SC2016  # GraphQL query uses single-quoted $variables
-  gh api graphql -f query='
+  ar_runner_gh_api_stream "agent-review graphql pr snapshot" graphql -f query='
 query($owner:String!, $name:String!, $number:Int!) {
   repository(owner:$owner, name:$name) {
     pullRequest(number:$number) {
@@ -424,7 +519,7 @@ agent_review_graphql_request_snapshot() {
   local -r pr="$3"
 
   # shellcheck disable=SC2016  # GraphQL query uses single-quoted $variables
-  gh api graphql -f query='
+  ar_runner_gh_api_stream "agent-review graphql request snapshot" graphql -f query='
 query($owner:String!, $name:String!, $number:Int!) {
   repository(owner:$owner, name:$name) {
     pullRequest(number:$number) {
@@ -443,7 +538,7 @@ agent_review_graphql_wait_snapshot() {
   local -r pr="$3"
 
   # shellcheck disable=SC2016  # GraphQL query uses single-quoted $variables
-  gh api graphql -f query='
+  ar_runner_gh_api_stream "agent-review graphql wait snapshot" graphql -f query='
 query($owner:String!, $name:String!, $number:Int!) {
   repository(owner:$owner, name:$name) {
     pullRequest(number:$number) {
@@ -481,7 +576,8 @@ agent_review_agent_reviews_on_head() {
   local -r head="$2"
 
   # shellcheck disable=SC2154  # agent_review_profile_request_login_regex from sourced profile
-  printf '%s' "${snapshot}" | jq -c --arg head "${head}" --arg re "${agent_review_profile_request_login_regex}" '
+  ar_runner_jq_file "agent-review agent reviews on head" "${snapshot}" -c \
+    --arg head "${head}" --arg re "${agent_review_profile_request_login_regex}" '
     [.data.repository.pullRequest.reviews.nodes[]
       | select((.author.login // "") | test($re;"i"))
       | select(.state != "PENDING")
@@ -491,9 +587,12 @@ agent_review_agent_reviews_on_head() {
 agent_review_fresh_agent_review_on_head() {
   local -r snapshot="$1"
   local -r head="$2"
+  local reviews_json count
 
   agent_review_assert_reviews_complete "${snapshot}"
-  [[ "$(agent_review_agent_reviews_on_head "${snapshot}" "${head}" | jq 'length')" -gt 0 ]]
+  reviews_json="$(agent_review_agent_reviews_on_head "${snapshot}" "${head}")"
+  count="$(ar_runner_jq_file "agent-review agent review count on head" "${reviews_json}" 'length')"
+  [[ "${count}" -gt 0 ]]
 }
 
 agent_review_head_check_json_for_pr() {
@@ -510,7 +609,7 @@ agent_review_head_check_json_for_pr() {
 agent_review_head_check_run_json_for_head() {
   local -r repo="$1"
   local -r head="$2"
-  local owner name
+  local owner name api_json exit_code
 
   if [[ "${agent_review_profile_uses_head_check}" != 'true' ]] \
     || [[ -z "${agent_review_profile_check_name_regex}" ]]; then
@@ -520,9 +619,16 @@ agent_review_head_check_run_json_for_head() {
   read -r owner name < <(agent_review_repo_parts "${repo}")
   agent_review_require_cmd gh
   agent_review_require_cmd jq
-  gh api "repos/${owner}/${name}/commits/${head}/check-runs" --paginate \
-    | jq -s --arg re "${agent_review_profile_check_name_regex}" \
-        --argjson min_epoch "${agent_review_last_request_epoch:-0}" '
+  exit_code=0
+  api_json="$(ar_runner_gh_api_stream "agent-review head check runs" \
+    "repos/${owner}/${name}/commits/${head}/check-runs" --paginate)" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "${api_json}" ]]; then
+    printf 'null\n'
+    return 0
+  fi
+  ar_runner_jq_file "agent-review head check run json" "${api_json}" -s \
+    --arg re "${agent_review_profile_check_name_regex}" \
+    --argjson min_epoch "${agent_review_last_request_epoch:-0}" '
       def started_epoch:
         if (.started_at // "") == "" then 0
         else ((.started_at | fromdateiso8601?) // 0)
@@ -543,7 +649,8 @@ agent_review_head_check_entry_for_profile() {
   local -r json="$1"
 
   # shellcheck disable=SC2154  # agent_review_profile_check_name_regex from sourced profile
-  printf '%s' "${json}" | jq -c --arg re "${agent_review_profile_check_name_regex}" '
+  ar_runner_jq_file "agent-review head check entry" "${json}" -c \
+    --arg re "${agent_review_profile_check_name_regex}" '
     [.[]?
       | select((.name // .context // "") | test($re;"i"))] | first // null'
 }
@@ -578,8 +685,8 @@ agent_review_head_check_complete_on_pr() {
   if [[ -z "${entry}" || "${entry}" == 'null' ]]; then
     return 1
   fi
-  status="$(printf '%s' "${entry}" | jq -r '.status // ""')"
-  conclusion="$(printf '%s' "${entry}" | jq -r '.conclusion // ""')"
+  status="$(ar_runner_jq_file "agent-review head check status" "${entry}" -r '.status // ""')"
+  conclusion="$(ar_runner_jq_file "agent-review head check conclusion" "${entry}" -r '.conclusion // ""')"
   status="${status,,}"
   [[ "${status}" == 'completed' && -n "${conclusion}" ]]
 }
@@ -595,7 +702,7 @@ agent_review_head_check_conclusion_on_pr() {
     printf '\n'
     return 0
   fi
-  printf '%s' "${entry}" | jq -r '.conclusion // ""'
+  ar_runner_jq_file "agent-review head check conclusion on pr" "${entry}" -r '.conclusion // ""'
 }
 
 agent_review_head_check_state_json() {
@@ -604,12 +711,14 @@ agent_review_head_check_state_json() {
   local run_json complete clean findings error quota conclusion status
 
   if [[ "${agent_review_profile_uses_head_check}" != 'true' ]]; then
-    jq -n '{complete:false, clean:false, findings:false, error:false, quota:false, conclusion:"", status:""}'
+    ar_runner_jq_n "agent-review head check state empty" \
+      '{complete:false, clean:false, findings:false, error:false, quota:false, conclusion:"", status:""}'
     return 0
   fi
   run_json="$(agent_review_head_check_run_json_for_head "${repo}" "${head}")"
   if [[ -z "${run_json}" || "${run_json}" == 'null' ]]; then
-    jq -n '{complete:false, clean:false, findings:false, error:false, quota:false, conclusion:"", status:""}'
+    ar_runner_jq_n "agent-review head check state missing" \
+      '{complete:false, clean:false, findings:false, error:false, quota:false, conclusion:"", status:""}'
     return 0
   fi
   complete=false
@@ -632,9 +741,9 @@ agent_review_head_check_state_json() {
   if agent_review_profile_head_check_has_findings "${run_json}"; then
     findings=true
   fi
-  conclusion="$(printf '%s' "${run_json}" | jq -r '.conclusion // ""')"
-  status="$(printf '%s' "${run_json}" | jq -r '.status // ""')"
-  jq -n \
+  conclusion="$(ar_runner_jq_file "agent-review head check run conclusion" "${run_json}" -r '.conclusion // ""')"
+  status="$(ar_runner_jq_file "agent-review head check run status" "${run_json}" -r '.status // ""')"
+  ar_runner_jq_n "agent-review head check state" \
     --argjson complete "${complete}" \
     --argjson clean "${clean}" \
     --argjson findings "${findings}" \
@@ -656,13 +765,20 @@ agent_review_head_check_state_json() {
 agent_review_latest_issue_comment_body_for_profile() {
   local -r repo="$1"
   local -r pr="$2"
-  local owner name
+  local owner name api_json exit_code
 
   read -r owner name < <(agent_review_repo_parts "${repo}")
   agent_review_require_cmd gh
   agent_review_require_cmd jq
-  gh api "repos/${owner}/${name}/issues/${pr}/comments" --paginate \
-    | jq -rs --arg re "${agent_review_profile_request_login_regex}" '
+  exit_code=0
+  api_json="$(ar_runner_gh_api_stream "agent-review issue comments" \
+    "repos/${owner}/${name}/issues/${pr}/comments" --paginate)" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "${api_json}" ]]; then
+    printf '\n'
+    return 0
+  fi
+  ar_runner_jq_file "agent-review latest issue comment body" "${api_json}" -rs \
+    --arg re "${agent_review_profile_request_login_regex}" '
       [ .[] | .[] | select((.user.login // "") | test($re;"i")) ]
       | sort_by(.created_at)
       | last
@@ -687,33 +803,43 @@ agent_review_fresh_agent_on_head() {
 agent_review_latest_agent_review_body_on_head() {
   local -r snapshot="$1"
   local -r head="$2"
+  local reviews_json
 
-  agent_review_agent_reviews_on_head "${snapshot}" "${head}" \
-    | jq -r 'sort_by(.submittedAt) | last | .body // ""'
+  reviews_json="$(agent_review_agent_reviews_on_head "${snapshot}" "${head}")"
+  ar_runner_jq_file "agent-review latest agent review body" "${reviews_json}" -r \
+    'sort_by(.submittedAt) | last | .body // ""'
 }
 
 agent_review_agent_requested_from_snapshot() {
   local -r snapshot="$1"
+  local exit_code
 
   # shellcheck disable=SC2154  # agent_review_profile_request_login_regex from sourced profile
-  printf '%s' "${snapshot}" | jq -e --arg re "${agent_review_profile_request_login_regex}" '
+  exit_code=0
+  ar_runner_jq_file "agent-review agent requested" "${snapshot}" -e \
+    --arg re "${agent_review_profile_request_login_regex}" '
     [.data.repository.pullRequest.reviewRequests.nodes[]
       | .requestedReviewer | (.login // .slug // "")
-      | select(test($re;"i"))] | length > 0' >/dev/null
+      | select(test($re;"i"))] | length > 0' >/dev/null || exit_code=$?
+  (( exit_code == 0 ))
 }
 
 agent_review_pr_is_merged() {
   local -r repo="$1"
   local -r pr="$2"
+  local merge_json state
 
-  [[ "$(gh pr view "${pr}" --repo "${repo}" --json state --jq '.state')" == 'MERGED' ]]
+  merge_json="$(agent_review_pr_merge_json "${repo}" "${pr}")"
+  state="$(ar_runner_jq_file "agent-review pr merged state" "${merge_json}" -r '.state')"
+  [[ "${state}" == 'MERGED' ]]
 }
 
 agent_review_pr_merge_json() {
   local -r repo="$1"
   local -r pr="$2"
 
-  gh pr view "${pr}" --repo "${repo}" --json state,mergedAt,mergeStateStatus,mergeable,baseRefName
+  ar_runner_gh_pr_jq "agent-review pr merge json" "${repo}" "${pr}" \
+    'state,mergedAt,mergeStateStatus,mergeable,baseRefName'
 }
 
 agent_review_merge_state_ready() {
@@ -727,10 +853,15 @@ agent_review_merge_state_ready() {
 
 agent_review_assert_checkout_matches_repo() {
   local -r repo="$1"
-  local owner name origin_url origin_slug lib_dir
+  local owner name origin_url origin_slug lib_dir exit_code
 
   read -r owner name < <(agent_review_repo_parts "${repo}")
-  origin_url="$(git remote get-url origin 2>/dev/null || true)"
+  exit_code=0
+  origin_url="$(runner_exec_stdout "git remote get-url origin" -- git remote get-url origin)" \
+    || exit_code=$?
+  if (( exit_code != 0 )); then
+    origin_url=""
+  fi
   if [[ -z "${origin_url}" ]]; then
     agent_review_die 'current checkout has no origin remote'
   fi
@@ -744,11 +875,22 @@ agent_review_assert_checkout_matches_repo() {
 }
 
 agent_review_assert_not_primary_worktree() {
-  local primary cwd
+  local primary cwd exit_code wt_list
 
   agent_review_require_cmd git
-  primary="$(git worktree list --porcelain | awk '/^worktree / { sub(/^worktree /, ""); print; exit }')"
-  cwd="$(git rev-parse --show-toplevel)"
+  exit_code=0
+  runner_exec "git worktree list primary" -- git worktree list --porcelain || exit_code=$?
+  if (( exit_code != 0 )); then
+    agent_review_die 'could not determine git worktree paths'
+  fi
+  wt_list="$(ar_runner_last_stdout)"
+  primary="$(printf '%s' "$wt_list" | awk '/^worktree / { sub(/^worktree /, ""); print; exit }')"
+  exit_code=0
+  cwd="$(runner_exec_stdout "git rev-parse show-toplevel" -- git rev-parse --show-toplevel)" \
+    || exit_code=$?
+  if (( exit_code != 0 )); then
+    cwd=""
+  fi
   if [[ -z "${primary}" || -z "${cwd}" ]]; then
     agent_review_die 'could not determine git worktree paths'
   fi
@@ -762,8 +904,7 @@ agent_review_threads_json_from_snapshot() {
   local bots
 
   bots="$(agent_review_bot_login_regex)"
-  printf '%s' "${snapshot}" \
-    | jq --arg bots "${bots}" '
+  ar_runner_jq_file "agent-review bot threads json" "${snapshot}" --arg bots "${bots}" '
       def is_bot_login($login):
         ($bots | split("|")) as $patterns
         | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
@@ -788,8 +929,8 @@ agent_review_threads_json_from_snapshot() {
 agent_review_open_thread_count_from_snapshot() {
   local -r snapshot="$1"
 
-  printf '%s' "${snapshot}" \
-    | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+  ar_runner_jq_file "agent-review open thread count" "${snapshot}" \
+    '[.data.repository.pullRequest.reviewThreads.nodes[]
         | select(.isResolved == false)] | length'
 }
 
@@ -797,8 +938,8 @@ agent_review_open_thread_count_from_snapshot() {
 agent_review_unaddressed_threads_json_from_snapshot() {
   local -r snapshot="$1"
 
-  printf '%s' "${snapshot}" \
-    | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+  ar_runner_jq_file "agent-review unaddressed threads json" "${snapshot}" \
+    '[.data.repository.pullRequest.reviewThreads.nodes[]
         | select(.isResolved == false)
         | select(any(.comments.nodes[1:][]; .author.__typename == "User") | not)
         | .comments.nodes[0] as $first
@@ -819,8 +960,8 @@ agent_review_unaddressed_threads_json_from_snapshot() {
 agent_review_all_threads_needs_resolve_json_from_snapshot() {
   local -r snapshot="$1"
 
-  printf '%s' "${snapshot}" \
-    | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+  ar_runner_jq_file "agent-review needs resolve threads json" "${snapshot}" \
+    '[.data.repository.pullRequest.reviewThreads.nodes[]
         | select(.isResolved == false)
         | select(any(.comments.nodes[1:][]; .author.__typename == "User"))
         | .comments.nodes[0] as $first
@@ -846,8 +987,7 @@ agent_review_open_bot_thread_count() {
   local bots
 
   bots="$(agent_review_bot_login_regex)"
-  printf '%s' "${snapshot}" \
-    | jq --arg bots "${bots}" '
+  ar_runner_jq_file "agent-review open bot thread count" "${snapshot}" --arg bots "${bots}" '
       def is_bot_login($login):
         ($bots | split("|")) as $patterns
         | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
@@ -862,8 +1002,7 @@ agent_review_human_threads_json_from_snapshot() {
   local bots
 
   bots="$(agent_review_bot_login_regex)"
-  printf '%s' "${snapshot}" \
-    | jq --arg bots "${bots}" '
+  ar_runner_jq_file "agent-review human threads json" "${snapshot}" --arg bots "${bots}" '
       def is_bot_login($login):
         ($bots | split("|")) as $patterns
         | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
@@ -891,8 +1030,7 @@ agent_review_agent_threads_needs_resolve_json_from_snapshot() {
   local bots
 
   bots="$(agent_review_bot_login_regex)"
-  printf '%s' "${snapshot}" \
-    | jq --arg bots "${bots}" '
+  ar_runner_jq_file "agent-review agent threads needs resolve json" "${snapshot}" --arg bots "${bots}" '
       def is_bot_login($login):
         ($bots | split("|")) as $patterns
         | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
@@ -918,8 +1056,7 @@ agent_review_human_threads_needs_resolve_json_from_snapshot() {
   local bots
 
   bots="$(agent_review_bot_login_regex)"
-  printf '%s' "${snapshot}" \
-    | jq --arg bots "${bots}" '
+  ar_runner_jq_file "agent-review human threads needs resolve json" "${snapshot}" --arg bots "${bots}" '
       def is_bot_login($login):
         ($bots | split("|")) as $patterns
         | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
@@ -948,7 +1085,8 @@ agent_review_human_open_threads_json_from_snapshot() {
 
   unaddressed="$(agent_review_human_threads_json_from_snapshot "${snapshot}")"
   needs_resolve="$(agent_review_human_threads_needs_resolve_json_from_snapshot "${snapshot}")"
-  jq -n --argjson unaddressed "${unaddressed}" --argjson needs_resolve "${needs_resolve}" \
+  ar_runner_jq_n "agent-review human open threads json" \
+    --argjson unaddressed "${unaddressed}" --argjson needs_resolve "${needs_resolve}" \
     '$unaddressed + $needs_resolve'
 }
 
@@ -959,27 +1097,27 @@ agent_review_triage_threads_json_from_snapshot() {
   bots="$(agent_review_bot_login_regex)"
   unaddressed="$(agent_review_unaddressed_threads_json_from_snapshot "${snapshot}")"
   needs_resolve="$(agent_review_all_threads_needs_resolve_json_from_snapshot "${snapshot}")"
-  agent_json="$(printf '%s' "${unaddressed}" | jq --arg bots "${bots}" '
+  agent_json="$(ar_runner_jq_file "agent-review triage agent unaddressed" "${unaddressed}" --arg bots "${bots}" '
     def is_bot_login($login):
       ($bots | split("|")) as $patterns
       | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
     [.[] | select(is_bot_login(.author // ""))]')"
-  human_json="$(printf '%s' "${unaddressed}" | jq --arg bots "${bots}" '
+  human_json="$(ar_runner_jq_file "agent-review triage human unaddressed" "${unaddressed}" --arg bots "${bots}" '
     def is_bot_login($login):
       ($bots | split("|")) as $patterns
       | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
     [.[] | select(is_bot_login(.author // "") | not)]')"
-  agent_needs_resolve="$(printf '%s' "${needs_resolve}" | jq --arg bots "${bots}" '
+  agent_needs_resolve="$(ar_runner_jq_file "agent-review triage agent needs resolve" "${needs_resolve}" --arg bots "${bots}" '
     def is_bot_login($login):
       ($bots | split("|")) as $patterns
       | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
     [.[] | select(is_bot_login(.author // ""))]')"
-  human_needs_resolve="$(printf '%s' "${needs_resolve}" | jq --arg bots "${bots}" '
+  human_needs_resolve="$(ar_runner_jq_file "agent-review triage human needs resolve" "${needs_resolve}" --arg bots "${bots}" '
     def is_bot_login($login):
       ($bots | split("|")) as $patterns
       | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
     [.[] | select(is_bot_login(.author // "") | not)]')"
-  jq -n \
+  ar_runner_jq_n "agent-review triage threads json" \
     --argjson agent "${agent_json}" \
     --argjson human "${human_json}" \
     --argjson agent_needs_resolve "${agent_needs_resolve}" \
@@ -994,10 +1132,12 @@ agent_review_triage_threads_json_from_snapshot() {
 
 agent_review_pending_thread_count_from_snapshot() {
   local -r snapshot="$1"
-  local unaddressed needs_resolve
+  local unaddressed_json needs_resolve_json unaddressed needs_resolve
 
-  unaddressed="$(agent_review_unaddressed_threads_json_from_snapshot "${snapshot}" | jq 'length')"
-  needs_resolve="$(agent_review_all_threads_needs_resolve_json_from_snapshot "${snapshot}" | jq 'length')"
+  unaddressed_json="$(agent_review_unaddressed_threads_json_from_snapshot "${snapshot}")"
+  needs_resolve_json="$(agent_review_all_threads_needs_resolve_json_from_snapshot "${snapshot}")"
+  unaddressed="$(ar_runner_jq_file "agent-review unaddressed thread count" "${unaddressed_json}" 'length')"
+  needs_resolve="$(ar_runner_jq_file "agent-review needs resolve thread count" "${needs_resolve_json}" 'length')"
   printf '%s\n' "$(( unaddressed + needs_resolve ))"
 }
 
@@ -1026,7 +1166,7 @@ agent_review_abort_if_pending_threads() {
 agent_review_last_activity_epoch_from_snapshot() {
   local -r snapshot="$1"
 
-  printf '%s' "${snapshot}" | jq -r '
+  ar_runner_jq_file "agent-review last activity epoch" "${snapshot}" -r '
     [
       (.data.repository.pullRequest.reviews.nodes[]?.submittedAt // empty),
       (.data.repository.pullRequest.reviewThreads.nodes[]?.comments.nodes[]?.createdAt // empty),
@@ -1046,15 +1186,16 @@ agent_review_status_json_from_snapshot() {
   local merge_json merge_state mergeable merge_ready
   local pr_state pr_merged review_body agent_review_empty agent_quota_exhausted complete_ready agent_id
   local head_check_state head_check_clean head_check_findings head_check_error head_check_quota head_check_conclusion
+  local threads_json human_open_json human_threads_json head_check_complete_json
 
   agent_review_assert_reviews_complete "${snapshot}"
-  head="$(printf '%s' "${snapshot}" | jq -r '.data.repository.pullRequest.headRefOid')"
+  head="$(ar_runner_jq_file "agent-review status head sha" "${snapshot}" -r '.data.repository.pullRequest.headRefOid')"
   head_check_state="$(agent_review_head_check_state_json "${repo}" "${head}")"
-  head_check_clean="$(printf '%s' "${head_check_state}" | jq -r '.clean')"
-  head_check_findings="$(printf '%s' "${head_check_state}" | jq -r '.findings')"
-  head_check_error="$(printf '%s' "${head_check_state}" | jq -r '.error')"
-  head_check_quota="$(printf '%s' "${head_check_state}" | jq -r '.quota')"
-  head_check_conclusion="$(printf '%s' "${head_check_state}" | jq -r '.conclusion')"
+  head_check_clean="$(ar_runner_jq_file "agent-review status head check clean" "${head_check_state}" -r '.clean')"
+  head_check_findings="$(ar_runner_jq_file "agent-review status head check findings" "${head_check_state}" -r '.findings')"
+  head_check_error="$(ar_runner_jq_file "agent-review status head check error" "${head_check_state}" -r '.error')"
+  head_check_quota="$(ar_runner_jq_file "agent-review status head check quota" "${head_check_state}" -r '.quota')"
+  head_check_conclusion="$(ar_runner_jq_file "agent-review status head check conclusion" "${head_check_state}" -r '.conclusion')"
   if agent_review_agent_requested_from_snapshot "${snapshot}"; then
     requested=true
   else
@@ -1076,17 +1217,22 @@ agent_review_status_json_from_snapshot() {
   fi
   # shellcheck disable=SC2154  # agent_review_bot_login_regex is set by agent_review_open_bot_thread_count caller context
   open="$(agent_review_open_bot_thread_count "${snapshot}")"
-  unaddressed="$(agent_review_threads_json_from_snapshot "${snapshot}" | jq 'length')"
-  open_human="$(agent_review_human_open_threads_json_from_snapshot "${snapshot}" | jq 'length')"
-  unaddressed_human="$(agent_review_human_threads_json_from_snapshot "${snapshot}" | jq 'length')"
-  needs_resolve_agent="$(agent_review_agent_threads_needs_resolve_json_from_snapshot "${snapshot}" | jq 'length')"
-  needs_resolve_human="$(agent_review_human_threads_needs_resolve_json_from_snapshot "${snapshot}" | jq 'length')"
+  threads_json="$(agent_review_threads_json_from_snapshot "${snapshot}")"
+  unaddressed="$(ar_runner_jq_file "agent-review status unaddressed count" "${threads_json}" 'length')"
+  human_open_json="$(agent_review_human_open_threads_json_from_snapshot "${snapshot}")"
+  open_human="$(ar_runner_jq_file "agent-review status open human count" "${human_open_json}" 'length')"
+  human_threads_json="$(agent_review_human_threads_json_from_snapshot "${snapshot}")"
+  unaddressed_human="$(ar_runner_jq_file "agent-review status unaddressed human count" "${human_threads_json}" 'length')"
+  needs_resolve_agent_json="$(agent_review_agent_threads_needs_resolve_json_from_snapshot "${snapshot}")"
+  needs_resolve_agent="$(ar_runner_jq_file "agent-review status agent needs resolve count" "${needs_resolve_agent_json}" 'length')"
+  needs_resolve_human_json="$(agent_review_human_threads_needs_resolve_json_from_snapshot "${snapshot}")"
+  needs_resolve_human="$(ar_runner_jq_file "agent-review status human needs resolve count" "${needs_resolve_human_json}" 'length')"
   open_all="$(agent_review_open_thread_count_from_snapshot "${snapshot}")"
   pending_all="$(agent_review_pending_thread_count_from_snapshot "${snapshot}")"
   ci_json="$(agent_review_ci_status_json_for_pr "${repo}" "${pr}")"
-  ci_conclusion="$(printf '%s' "${ci_json}" | jq -r '.ci_conclusion')"
-  ci_ready="$(printf '%s' "${ci_json}" | jq -r '.ci_ready')"
-  ci_failures="$(printf '%s' "${ci_json}" | jq -c '.ci_failures')"
+  ci_conclusion="$(ar_runner_jq_file "agent-review status ci conclusion" "${ci_json}" -r '.ci_conclusion')"
+  ci_ready="$(ar_runner_jq_file "agent-review status ci ready" "${ci_json}" -r '.ci_ready')"
+  ci_failures="$(ar_runner_jq_file "agent-review status ci failures" "${ci_json}" -c '.ci_failures')"
   if agent_review_all_quotas_exhausted; then
     all_quotas_exhausted=true
   else
@@ -1108,14 +1254,14 @@ agent_review_status_json_from_snapshot() {
     agent_quota_exhausted=false
   fi
   merge_json="$(agent_review_pr_merge_json "${repo}" "${pr}")"
-  pr_state="$(printf '%s' "${merge_json}" | jq -r '.state')"
+  pr_state="$(ar_runner_jq_file "agent-review status pr state" "${merge_json}" -r '.state')"
   if [[ "${pr_state}" == 'MERGED' ]]; then
     pr_merged=true
   else
     pr_merged=false
   fi
-  merge_state="$(printf '%s' "${merge_json}" | jq -r '.mergeStateStatus')"
-  mergeable="$(printf '%s' "${merge_json}" | jq -r '.mergeable')"
+  merge_state="$(ar_runner_jq_file "agent-review status merge state" "${merge_json}" -r '.mergeStateStatus')"
+  mergeable="$(ar_runner_jq_file "agent-review status mergeable" "${merge_json}" -r '.mergeable')"
   if agent_review_merge_state_ready "${merge_state}"; then
     merge_ready=true
   else
@@ -1133,7 +1279,8 @@ agent_review_status_json_from_snapshot() {
   else
     complete_ready=false
   fi
-  jq -n \
+  head_check_complete_json="$(ar_runner_jq_file "agent-review status head check complete" "${head_check_state}" -c '.complete')"
+  ar_runner_jq_n "agent-review status json" \
     --arg pr "${pr}" \
     --arg repo "${repo}" \
     --arg head "${head}" \
@@ -1165,7 +1312,7 @@ agent_review_status_json_from_snapshot() {
     --argjson head_check_error "${head_check_error}" \
     --argjson head_check_quota "${head_check_quota}" \
     --arg head_check_conclusion "${head_check_conclusion}" \
-    --argjson head_check "$(printf '%s' "${head_check_state}" | jq -c '.complete')" \
+    --argjson head_check "${head_check_complete_json}" \
     '{
       pr: ($pr | tonumber),
       repo: $repo,
@@ -1207,7 +1354,7 @@ agent_review_resolve_thread_id() {
   local -r thread_id="$1"
 
   # shellcheck disable=SC2016  # GraphQL mutation uses single-quoted $variables
-  gh api graphql -f query='
+  ar_runner_gh_api_stream "agent-review resolve thread" graphql -f query='
 mutation($id:ID!) {
   resolveReviewThread(input:{threadId:$id}) {
     thread { isResolved }
@@ -1274,7 +1421,7 @@ agent_review_ci_status_json_for_pr() {
   if [[ "${conclusion}" == 'success' ]]; then
     ready=true
   fi
-  jq -n \
+  ar_runner_jq_n "agent-review ci status json" \
     --arg conclusion "${conclusion}" \
     --argjson failures "${failures}" \
     --argjson ci_ready "${ready}" \
@@ -1308,7 +1455,7 @@ agent_review_skip_wait_for_quota_exhausted_agent() {
   fi
   if [[ "${agent_review_profile_uses_head_check}" == 'true' ]]; then
     check_state_json="$(agent_review_head_check_state_json "${repo}" "${head}")"
-    complete="$(printf '%s' "${check_state_json}" | jq -r '.complete')"
+    complete="$(ar_runner_jq_file "agent-review skip wait head check complete" "${check_state_json}" -r '.complete')"
     if [[ "${complete}" == 'true' ]]; then
       return 1
     fi
