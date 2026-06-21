@@ -31,16 +31,15 @@ readonly dep_script_dir
 # shellcheck source=scripts/lib/release-age-defaults
 source "${dep_script_dir}/lib/release-age-defaults"
 
+# shellcheck disable=SC1091  # shared helper sourced at runtime; CI shellcheck doesn't use -x
+source "${dep_script_dir}/lib/time-log"
+# shellcheck disable=SC1091
+source "${dep_script_dir}/lib/runner"
 # shellcheck source=scripts/lib/github-repo-slug
 source "${dep_script_dir}/lib/github-repo-slug"
 
 dep_updater_minimum_release_age_minutes="$release_age_dep_updater_minutes"
 readonly dep_updater_minimum_release_age_minutes
-
-# shellcheck disable=SC1091  # shared helper sourced at runtime; CI shellcheck doesn't use -x
-source "${dep_script_dir}/lib/time-log"
-# shellcheck disable=SC1091
-source "${dep_script_dir}/lib/runner"
 # shellcheck disable=SC1091
 source "${dep_script_dir}/lib/ci-check-rollup"
 # shellcheck disable=SC1091
@@ -1593,6 +1592,43 @@ dep_updater_emit_batch_child_report() {
   dep_updater_write_batch_child_report_json "$exit_code" "$first_fail"
 }
 
+# dep_updater_runner_realpath <path>
+# realpath via runner when available; falls back to bare realpath.
+dep_updater_runner_realpath() {
+  local -r path="$1"
+  local result exit_code
+
+  if declare -F runner_exec_stdout >/dev/null 2>&1; then
+    exit_code=0
+    result="$(runner_exec_stdout "realpath" -- realpath "$path")" || exit_code=$?
+    if [[ "$exit_code" -eq 0 && -n "$result" ]]; then
+      printf '%s\n' "$result"
+      return 0
+    fi
+    return 1
+  fi
+  realpath "$path" 2>/dev/null
+}
+
+# dep_runner_git_rev_parse <label> <git-dir> <ref>
+# Prints the resolved object name on success; returns non-zero when git fails.
+dep_runner_git_rev_parse() {
+  local -r label="$1"
+  local -r git_dir="$2"
+  local -r ref="$3"
+  local exit_code uuid out
+
+  exit_code=0
+  runner_exec "$label" -- git -C "$git_dir" rev-parse "$ref" 2>/dev/null || exit_code=$?
+  if (( exit_code != 0 )); then
+    return "$exit_code"
+  fi
+  uuid="$(runner_last_id)"
+  out="$(runner_read "$uuid" stdout 2>/dev/null || true)"
+  printf '%s' "$out"
+  return 0
+}
+
 # install_with_net_retry <label> <workdir> <cmd> [args…]
 # Runs <cmd> in <workdir> up to 4 times (30 / 60 / 90 s linear backoff) when
 # the output suggests a transient network error.  On success or a non-transient
@@ -1602,27 +1638,34 @@ install_with_net_retry() {
   local -r workdir="$2"
   shift 2
 
-  local install_log attempt delay exit_code
-  install_log="$(mktemp)"
-  exit_code=0
+  local attempt delay exit_code uuid cmd_quoted install_log
+
+  cmd_quoted="$(runner_quote_cmdline "$@")"
 
   for attempt in 1 2 3 4; do
-    set +e
-    (cd "$workdir" && "$@") >"$install_log" 2>&1
-    exit_code=$?
-    set -e
+    exit_code=0
+    runner_sh "${label} attempt ${attempt}" \
+      "cd $(printf '%q' "$workdir") && ${cmd_quoted}" || exit_code=$?
 
     if (( exit_code == 0 )); then
-      rm -f "$install_log"
       return 0
     fi
 
-    if grep -qiE \
+    uuid="$(runner_last_id)"
+    install_log=""
+    if [[ -n "$uuid" ]]; then
+      install_log="$(mktemp)"
+      runner_read "$uuid" stderr >"$install_log" 2>/dev/null || true
+    fi
+
+    if [[ -n "$install_log" && -s "$install_log" ]] \
+      && grep -qiE \
          'ECONNRESET|ETIMEDOUT|ENOTFOUND|network error|fetch failed|connection reset|connection refused|Read timed out|ConnectTimeout|connection error' \
          "$install_log" \
        && [[ "$attempt" -lt 4 ]]; then
       delay=$(( attempt * 30 ))
       log "[${label}] WARNING: transient network error; attempt ${attempt}/3, retrying in ${delay}s…"
+      rm -f "$install_log"
       sleep "$delay"
       continue
     fi
@@ -1631,9 +1674,13 @@ install_with_net_retry() {
   done
 
   printf '%s\n' "${label} install failed (exit ${exit_code}). Last output:" >&2
-  tail -n 80 "$install_log" | sed 's/^/  /' >&2
+  if [[ -n "$install_log" && -s "$install_log" ]]; then
+    tail -n 80 "$install_log" | sed 's/^/  /' >&2
+  elif [[ -n "$uuid" ]]; then
+    runner_format_failure "$uuid" >&2
+  fi
   record_first_failure "${label} install failed (exit ${exit_code})"
-  rm -f "$install_log"
+  rm -f "${install_log:-}"
   return "$exit_code"
 }
 
@@ -2398,20 +2445,22 @@ sync_worktree_to_origin_main_for_scan() {
     return 0
   fi
   local main_sha cur
-  git -C "$worktree_path" fetch origin main 2>/dev/null || true
-  if ! main_sha="$(git -C "$worktree_path" rev-parse origin/main 2>/dev/null)"; then
+  runner_exec "git fetch origin main (scan sync)" -- git -C "$worktree_path" fetch origin main 2>/dev/null || true
+  main_sha=""
+  main_sha="$(dep_runner_git_rev_parse "git rev-parse origin/main" "$worktree_path" "origin/main" || true)"
+  if [[ -z "$main_sha" ]]; then
     return 0
   fi
-  cur="$(git -C "$worktree_path" rev-parse HEAD)"
+  cur="$(dep_runner_git_rev_parse "git rev-parse HEAD" "$worktree_path" "HEAD" || true)"
   if [[ "$cur" == "$main_sha" ]]; then
     return 0
   fi
   log "[worktree] Syncing scan tree to origin/main (${main_sha:0:8})…"
   if [[ -n "$wt_base_branch" ]]; then
-    git -C "$worktree_path" checkout "$wt_base_branch" 2>/dev/null \
-      || git -C "$worktree_path" checkout -B "$wt_base_branch" "$main_sha"
+    run_command "git checkout base branch" git -C "$worktree_path" checkout "$wt_base_branch" 2>/dev/null \
+      || run_command "git checkout -B base branch" git -C "$worktree_path" checkout -B "$wt_base_branch" "$main_sha"
   fi
-  git -C "$worktree_path" reset --hard "$main_sha" >/dev/null 2>&1
+  runner_exec "git reset --hard origin/main" -- git -C "$worktree_path" reset --hard "$main_sha" >/dev/null 2>&1 || true
 }
 
 # ---------------------------------------------------------------------------
@@ -2435,17 +2484,19 @@ create_worktree() {
   # Using a stale local 'main' that diverges from origin/main causes the first
   # PR to show as conflicting immediately.
   log "Fetching origin/main…"
-  git -C "$dir" fetch origin main 2>/dev/null || true
+  runner_exec "git fetch origin main" -- git -C "$dir" fetch origin main 2>/dev/null || true
 
   # Create a uniquely-named local branch at origin/main's commit. Using 'main'
   # directly fails with "fatal: 'main' is already used by worktree at …" when
   # main is already checked out in the primary clone. A named branch is also
   # required by gt, which refuses to operate on a detached HEAD.
   local main_sha
-  if ! main_sha="$(git -C "$dir" rev-parse origin/main 2>/dev/null)"; then
+  main_sha=""
+  main_sha="$(dep_runner_git_rev_parse "git rev-parse origin/main" "$dir" "origin/main" || true)"
+  if [[ -z "$main_sha" ]]; then
     # No remote or fetch failed — fall back to local HEAD (e.g. during dry-run
     # against a repo that has no origin configured).
-    main_sha="$(git -C "$dir" rev-parse HEAD)" \
+    main_sha="$(dep_runner_git_rev_parse "git rev-parse HEAD" "$dir" "HEAD" || true)" \
       || die "Could not resolve origin/main or HEAD in: $dir"
     log "[worktree] origin/main not available; using local HEAD as base"
   else
@@ -2461,12 +2512,17 @@ create_worktree() {
       # Also update the working tree when main is checked out and clean.
       # Without this, update-ref fast-forwards the branch pointer but leaves the
       # working tree at the old commit, making it appear dirty relative to HEAD.
-      local checked_out_branch
-      checked_out_branch="$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || true)"
+      local checked_out_branch sym_exit
+      checked_out_branch=""
+      sym_exit=0
+      runner_exec "git symbolic-ref HEAD" -- git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || sym_exit=$?
+      if (( sym_exit == 0 )); then
+        checked_out_branch="$(runner_read "$(runner_last_id)" stdout 2>/dev/null || true)"
+      fi
       if [[ "$checked_out_branch" == 'main' ]] \
-          && git -C "$dir" diff --quiet 2>/dev/null \
-          && git -C "$dir" diff --cached --quiet 2>/dev/null; then
-        if git -C "$dir" reset --hard "$main_sha" >/dev/null 2>&1; then
+          && runner_exec "git diff clean check" -- git -C "$dir" diff --quiet 2>/dev/null \
+          && runner_exec "git diff --cached clean check" -- git -C "$dir" diff --cached --quiet 2>/dev/null; then
+        if runner_exec "git reset --hard origin/main" -- git -C "$dir" reset --hard "$main_sha" >/dev/null 2>&1; then
           _pri_reset_hard=1
           log "[worktree] Fast-forwarded working tree at ${dir} to origin/main"
         else
@@ -2476,7 +2532,7 @@ create_worktree() {
     fi
   fi
   wt_base_branch="dep-updater-wt-${timestamp}-$$"
-  git -C "$dir" worktree add -b "$wt_base_branch" "$worktree_path" "$main_sha" >&2
+  run_command "git worktree add" git -C "$dir" worktree add -b "$wt_base_branch" "$worktree_path" "$main_sha" >&2
   readonly worktree_path
   log "[worktree] Worktree created: $worktree_path"
 
@@ -6222,7 +6278,7 @@ log_batch_all_top_level_dirs() {
   while IFS= read -r root; do
     [[ -n "$root" ]] || continue
     resolved_root=""
-    resolved_root="$(realpath "$root" 2>/dev/null)" || {
+    resolved_root="$(dep_updater_runner_realpath "$root" 2>/dev/null)" || {
       log "[batch-all]   (skipped — unreadable path: ${root})"
       continue
     }
@@ -6236,7 +6292,7 @@ discover_batch_all_repos() {
   while IFS= read -r root; do
     [[ -n "$root" ]] || continue
     resolved_root=""
-    resolved_root="$(realpath "$root" 2>/dev/null)" || {
+    resolved_root="$(dep_updater_runner_realpath "$root" 2>/dev/null)" || {
       log "[batch-all] Skipping unreadable scan root: ${root}"
       continue
     }
@@ -6245,7 +6301,7 @@ discover_batch_all_repos() {
     while IFS= read -r child; do
       [[ -e "$child/.git" ]] || continue
       resolved_child=""
-      resolved_child="$(realpath "$child" 2>/dev/null)" || continue
+      resolved_child="$(dep_updater_runner_realpath "$child" 2>/dev/null)" || continue
 
       slug=""
       slug="$(gh_slug_from_repo_dir "$resolved_child" 2>/dev/null)" || slug=""
@@ -6386,7 +6442,7 @@ batch_all_dispatch() {
   trap batch_all_cleanup_on_interrupt INT TERM
 
   dep_self=""
-  dep_self="$(realpath "${BASH_SOURCE[0]}")" \
+  dep_self="$(dep_updater_runner_realpath "${BASH_SOURCE[0]}" 2>/dev/null)" \
     || die "Could not resolve dep-updater script path."
 
   log_batch_all_top_level_dirs
