@@ -1,20 +1,75 @@
 #!/usr/bin/env bash
 # scripts/dev/start-development - Session initialization and worktree management
+# shellcheck disable=SC2016  # gh --jq filter strings use single quotes
 set -euo pipefail
+
+_sd_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _sd_script_dir
+# shellcheck disable=SC1091  # runner-bootstrap begins session for runner_exec calls
+source "${_sd_script_dir}/../lib/runner-bootstrap"
+
+sd_runner_last_stdout() {
+  local uuid
+
+  uuid="$(runner_last_id)"
+  [[ -n "$uuid" ]] || return 0
+  runner_read "$uuid" stdout 2>/dev/null || true
+}
+
+# sd_runner_git_c_stdout <repo> <label> -- <git-args…>
+sd_runner_git_c_stdout() {
+  local -r repo="$1"
+  local -r label="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || {
+    printf 'sd_runner_git_c_stdout: expected -- before git args (label=%s)\n' "$label" >&2
+    return 2
+  }
+  shift
+  local exit_code out
+
+  exit_code=0
+  out="$(runner_exec_stdout "$label" -- git -C "$repo" "$@")" || exit_code=$?
+  if (( exit_code != 0 )); then
+    return "$exit_code"
+  fi
+  printf '%s' "$out"
+}
+
+# sd_runner_git_c <repo> <label> -- <git-args…>
+sd_runner_git_c() {
+  local -r repo="$1"
+  local -r label="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || {
+    printf 'sd_runner_git_c: expected -- before git args (label=%s)\n' "$label" >&2
+    return 2
+  }
+  shift
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" -- git -C "$repo" "$@" || exit_code=$?
+  return "$exit_code"
+}
 
 # Use the caller's git root to identify the repo, not the script's own location —
 # so the script works correctly when called from any repo or subdirectory.
-# Resolve the worktree root first (handles being inside a subdirectory), then find
-# the primary worktree from there.
-this_worktree="$(git -C "$PWD" rev-parse --show-toplevel)"
+this_worktree="$(sd_runner_git_c_stdout "$PWD" "start-development git toplevel" -- rev-parse --show-toplevel)"
 readonly this_worktree
 # Use the primary worktree path, not --show-toplevel which returns the *current*
 # worktree root when invoked from inside a linked worktree.
-main_repo="$(git -C "$this_worktree" worktree list --porcelain | awk 'NR==1{print $2}')"
+main_repo="$(
+  sd_runner_git_c_stdout "$this_worktree" "start-development primary worktree" -- worktree list --porcelain \
+    | awk '/^worktree / { sub(/^worktree /, ""); print; exit }'
+)"
 readonly main_repo
 readonly worktrees_dir="$main_repo/.worktrees"
 # Derive repo slug (owner/name) and service name from git remote — no hardcoding.
-gh_repo="$(git -C "$main_repo" remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||')"
+gh_repo="$(
+  sd_runner_git_c_stdout "$main_repo" "start-development remote url" -- remote get-url origin \
+    | sed 's|.*github.com[:/]||;s|\.git$||'
+)"
 readonly gh_repo
 service_name="${gh_repo##*/}"
 readonly service_name
@@ -39,10 +94,10 @@ gh_pr_info() {
   for attempt in 1 2 3; do
     # Include mergedAt: the state field can lag behind (GitHub API cache),
     # but mergedAt is set atomically and never reverts. Promote to MERGED if set.
-    if result=$("$timeout_cmd" 15 gh --repo "$gh_repo" pr list --head "$branch" --state all \
+    if result="$(runner_exec_stdout "start-development gh pr list" -- \
+        "$timeout_cmd" 15 gh --repo "$gh_repo" pr list --head "$branch" --state all \
         --json number,state,mergedAt \
-        --jq 'if length > 0 then (.[0] | if .mergedAt != "" and .mergedAt != null then "MERGED \(.number)" else "\(.state) \(.number)" end) else "NOT_FOUND" end' \
-        2>/dev/null); then
+        --jq 'if length > 0 then (.[0] | if .mergedAt != "" and .mergedAt != null then "MERGED \(.number)" else "\(.state) \(.number)" end) else "NOT_FOUND" end')"; then
       echo "$result"
       return 0
     fi
@@ -73,7 +128,8 @@ resolve_pr_state_for_branch() {
   fi
 
   gt_out=""
-  if gt_out="$(cd "$main_repo" && "$timeout_cmd" 25 gt info --branch "$branch" --no-interactive 2>/dev/null)"; then
+  if gt_out="$(runner_exec_stdout "start-development gt info" -- \
+      sh -c "cd \"${main_repo}\" && \"${timeout_cmd}\" 25 gt info --branch \"${branch}\" --no-interactive")"; then
     :
   else
     gt_out=""
@@ -133,9 +189,12 @@ print_pr_urls_github_graphite() {
 # Best-effort Unix time of HEAD in the worktree (fallback: directory mtime).
 secondary_worktree_head_epoch() {
   local -r path="$1"
-  local ts
-  ts="$(git -C "$path" log -1 --format=%ct HEAD 2>/dev/null || true)"
-  if [[ -n "$ts" ]]; then
+  local ts exit_code
+
+  exit_code=0
+  ts="$(sd_runner_git_c_stdout "$path" "start-development head epoch" -- log -1 --format=%ct HEAD)" \
+    || exit_code=$?
+  if (( exit_code == 0 )) && [[ -n "$ts" ]]; then
     printf '%s' "$ts"
     return 0
   fi
@@ -146,8 +205,14 @@ secondary_worktree_head_epoch() {
 # Exit 0 when there is any local change (tracked or untracked) — caller must not auto-delete.
 worktree_has_dirty_tree() {
   local -r path="$1"
-  local st
-  st="$(git -C "$path" status --porcelain 2>/dev/null || true)"
+  local st exit_code
+
+  exit_code=0
+  st="$(sd_runner_git_c_stdout "$path" "start-development worktree status" -- status --porcelain)" \
+    || exit_code=$?
+  if (( exit_code != 0 )); then
+    return 1
+  fi
   [[ -n "$st" ]]
 }
 
@@ -156,17 +221,24 @@ worktree_has_dirty_tree() {
 branch_patch_already_on_main() {
   local -r repo="$1"
   local -r branch="$2"
-  local branch_sha cherry_out
+  local branch_sha cherry_out exit_code
 
-  branch_sha="$(git -C "$repo" rev-parse --verify "${branch}^{commit}" 2>/dev/null || true)"
-  [[ -n "$branch_sha" ]] || return 1
+  exit_code=0
+  branch_sha="$(sd_runner_git_c_stdout "$repo" "start-development branch sha" -- rev-parse --verify "${branch}^{commit}")" \
+    || exit_code=$?
+  [[ "$exit_code" -eq 0 && -n "$branch_sha" ]] || return 1
 
-  if git -C "$repo" merge-base --is-ancestor "$branch_sha" main 2>/dev/null; then
+  exit_code=0
+  sd_runner_git_c "$repo" "start-development merge-base ancestor" -- merge-base --is-ancestor "$branch_sha" main \
+    || exit_code=$?
+  if (( exit_code == 0 )); then
     return 0
   fi
 
-  cherry_out="$(git -C "$repo" cherry -v main "$branch" 2>/dev/null || true)"
-  [[ -n "$cherry_out" ]] || return 1
+  exit_code=0
+  cherry_out="$(sd_runner_git_c_stdout "$repo" "start-development git cherry" -- cherry -v main "$branch")" \
+    || exit_code=$?
+  [[ "$exit_code" -eq 0 && -n "$cherry_out" ]] || return 1
   if printf '%s\n' "$cherry_out" | grep -q '^+'; then
     return 1
   fi
@@ -180,11 +252,11 @@ remove_secondary_worktree() {
   local -r branch="$3"
   local -r reason="$4"
   printf '   [!] %s\n' "$reason"
-  git -C "$repo" worktree remove --force "$path" 2>/dev/null || true
+  sd_runner_git_c "$repo" "start-development worktree remove" -- worktree remove --force "$path" || true
   rm -rf "$path" 2>/dev/null \
     || echo "   [~] Could not fully remove '$path' (files may be busy); continuing."
-  git -C "$repo" worktree prune
-  git -C "$repo" branch -D "$branch" 2>/dev/null || true
+  sd_runner_git_c "$repo" "start-development worktree prune" -- worktree prune
+  sd_runner_git_c "$repo" "start-development branch delete" -- branch -D "$branch" || true
 }
 
 # handle_secondary_worktree <mode> <current_path> <current_branch>
@@ -378,12 +450,12 @@ echo "=========================================="
 
 # 1. Clean up stale worktree metadata
 echo "Pruning stale worktree metadata..."
-git -C "$main_repo" worktree prune
+sd_runner_git_c "$main_repo" "start-development worktree prune initial" -- worktree prune
 
 # 2. Check each worktree: remove merged/closed, collect pending ones
 echo "Checking for Git worktrees..."
 
-wt_info=$(git -C "$main_repo" worktree list --porcelain)
+wt_info="$(sd_runner_git_c_stdout "$main_repo" "start-development worktree list" -- worktree list --porcelain)"
 current_path=""
 current_branch=""
 pending_worktrees=()
@@ -415,16 +487,17 @@ while IFS= read -r line; do
         uv.lock|*/uv.lock|pnpm-lock.yaml|*/pnpm-lock.yaml) continue ;;
         *) stash_paths+=("$path") ;;
     esac
-done < <(git -C "$main_repo" status --porcelain | grep -v '^??' || true)
+done < <(sd_runner_git_c_stdout "$main_repo" "start-development status porcelain stash" -- status --porcelain | grep -v '^??' || true)
 stashed=false
 if [[ ${#stash_paths[@]} -gt 0 ]]; then
     echo "Stashing local changes in main repo (excluding lockfiles)..."
-    git -C "$main_repo" stash push --message "start-development: automatic stash before sync" -- "${stash_paths[@]}"
+    sd_runner_git_c "$main_repo" "start-development stash push" -- stash push \
+      --message "start-development: automatic stash before sync" -- "${stash_paths[@]}"
     stashed=true
 fi
 
 set +e
-(cd "$main_repo" && gt sync --quiet --force)
+runner_sh "start-development gt sync" "cd \"${main_repo}\" && gt sync --quiet --force"
 gt_sync_exit=$?
 set -e
 if [[ "$gt_sync_exit" -ne 0 ]]; then
@@ -435,13 +508,13 @@ echo "Graphite sync complete."
 
 if [[ "$stashed" == "true" ]]; then
     echo "Restoring local changes in main repo..."
-    git -C "$main_repo" stash pop
+    sd_runner_git_c "$main_repo" "start-development stash pop" -- stash pop
 fi
 
 # 3a. Re-check worktrees after Graphite sync (Graphite-first merged/closed cleanup).
 echo "Re-checking worktrees after Graphite sync (merged or closed PRs)..."
 wt_info_post=""
-wt_info_post="$(git -C "$main_repo" worktree list --porcelain)"
+wt_info_post="$(sd_runner_git_c_stdout "$main_repo" "start-development worktree list post-sync" -- worktree list --porcelain)"
 current_path=""
 current_branch=""
 while IFS= read -r line; do
@@ -460,7 +533,7 @@ done <<< "$wt_info_post"
 # Rebuild pending worktrees from the live worktree list (removals above shrink the set).
 pending_worktrees=()
 wt_info_pending=""
-wt_info_pending="$(git -C "$main_repo" worktree list --porcelain)"
+wt_info_pending="$(sd_runner_git_c_stdout "$main_repo" "start-development worktree list pending" -- worktree list --porcelain)"
 current_path=""
 current_branch=""
 while IFS= read -r line; do
@@ -486,7 +559,7 @@ while IFS= read -r wt_line; do
     if [[ "$wt_line" =~ ^branch\ refs/heads/(.*) ]]; then
         active_branches+=("${BASH_REMATCH[1]}")
     fi
-done <<< "$(git -C "$main_repo" worktree list --porcelain)"
+done <<< "$(sd_runner_git_c_stdout "$main_repo" "start-development worktree list branches" -- worktree list --porcelain)"
 
 while IFS= read -r branch; do
     [[ "$branch" == "main" ]] && continue
@@ -514,7 +587,7 @@ while IFS= read -r branch; do
 
     if [[ "$orphan_state" == "MERGED" || "$orphan_state" == "CLOSED" ]]; then
         echo "   [!] Deleting $branch (PR: $orphan_label)..."
-        git -C "$main_repo" branch -D "$branch" 2>/dev/null || true
+        sd_runner_git_c "$main_repo" "start-development orphan branch delete" -- branch -D "$branch" || true
     elif [[ "$orphan_state" == "NOT_FOUND" ]]; then
         # dep-updates/* branches are always machine-generated and always paired with
         # a PR. If no PR exists, the branch is stale (e.g. an interrupted dep-updater
@@ -522,32 +595,33 @@ while IFS= read -r branch; do
         # there is nothing here to preserve.
         if [[ "$branch" == dep-updates/* ]]; then
             echo "   [!] Deleting $branch (machine-generated dep-updates branch, no PR)..."
-            git -C "$main_repo" branch -D "$branch" 2>/dev/null || true
+            sd_runner_git_c "$main_repo" "start-development dep-updates branch delete" -- branch -D "$branch" || true
         # Remote branch gone; check if it's fully merged into main locally
-        elif git -C "$main_repo" branch --merged main | grep -qxF "  $branch"; then
+        elif sd_runner_git_c_stdout "$main_repo" "start-development branch merged" -- branch --merged main \
+          | grep -qxF "  $branch"; then
             echo "   [!] Deleting $branch (merged into main, no remote PR)..."
-            git -C "$main_repo" branch -D "$branch" 2>/dev/null || true
+            sd_runner_git_c "$main_repo" "start-development merged branch delete" -- branch -D "$branch" || true
         elif branch_patch_already_on_main "$main_repo" "$branch"; then
             echo "   [!] Deleting $branch (patch content already on main, no PR)..."
-            git -C "$main_repo" branch -D "$branch" 2>/dev/null || true
+            sd_runner_git_c "$main_repo" "start-development patch branch delete" -- branch -D "$branch" || true
         elif [[ "$branch" =~ ^pr-[0-9]+-merge$ ]]; then
             echo "   [!] Deleting $branch (Graphite merge-queue staging branch, no PR)..."
-            git -C "$main_repo" branch -D "$branch" 2>/dev/null || true
+            sd_runner_git_c "$main_repo" "start-development mq branch delete" -- branch -D "$branch" || true
         else
             echo "   [+] Keeping $branch (unmerged, no remote PR)."
         fi
     else
         echo "   [+] Keeping $branch (PR: $orphan_state)."
     fi
-done <<< "$(git -C "$main_repo" branch --format='%(refname:short)')"
+done <<< "$(sd_runner_git_c_stdout "$main_repo" "start-development branch list" -- branch --format='%(refname:short)')"
 
 # Update main if behind origin and restart service if updated
-git -C "$main_repo" fetch origin main >/dev/null 2>&1 || true
-local_main=$(git -C "$main_repo" rev-parse main)
-remote_main=$(git -C "$main_repo" rev-parse origin/main)
+sd_runner_git_c "$main_repo" "start-development fetch origin main" -- fetch origin main || true
+local_main="$(sd_runner_git_c_stdout "$main_repo" "start-development rev-parse main" -- rev-parse main)"
+remote_main="$(sd_runner_git_c_stdout "$main_repo" "start-development rev-parse origin/main" -- rev-parse origin/main)"
 if [[ "$local_main" != "$remote_main" ]]; then
     echo "Main is outdated. Pulling latest..."
-    git -C "$main_repo" merge --ff-only origin/main
+    sd_runner_git_c "$main_repo" "start-development merge ff-only" -- merge --ff-only origin/main
 fi
 
 echo "=========================================="
@@ -650,7 +724,7 @@ if [[ -z "$selected_path" ]]; then
     # Validate against existing worktrees (even if the directory was deleted manually, Git may
     # still consider it registered until pruned/removed).
     existing_worktree_path="$(
-        git -C "$main_repo" worktree list --porcelain \
+        sd_runner_git_c_stdout "$main_repo" "start-development worktree list branch lookup" -- worktree list --porcelain \
             | awk -v b="refs/heads/$branch_name" '
                 $1 == "worktree" { wt=$2 }
                 $1 == "branch" && $2 == b { print wt; exit }
@@ -662,7 +736,8 @@ if [[ -z "$selected_path" ]]; then
         echo "Choose a different name, or remove the existing worktree first." >&2
         exit 2
     fi
-    if git -C "$main_repo" worktree list --porcelain | awk -v p="$selected_path" '$1=="worktree" && $2==p { found=1 } END { exit found?0:1 }'; then
+    if sd_runner_git_c_stdout "$main_repo" "start-development worktree path lookup" -- worktree list --porcelain \
+      | awk -v p="$selected_path" '$1=="worktree" && $2==p { found=1 } END { exit found?0:1 }'; then
         echo "Worktree path already registered with git: $selected_path" >&2
         echo "Choose a different name, or remove/prune the existing worktree first." >&2
         exit 2
@@ -672,13 +747,13 @@ if [[ -z "$selected_path" ]]; then
         echo "Choose a different name, or remove the directory/worktree first." >&2
         exit 2
     fi
-    if git -C "$main_repo" show-ref --verify --quiet "refs/heads/$branch_name"; then
+    if sd_runner_git_c "$main_repo" "start-development show-ref branch" -- show-ref --verify --quiet "refs/heads/$branch_name"; then
         echo "Branch already exists: $branch_name" >&2
         echo "Choose a different name, or delete the branch/worktree first." >&2
         exit 2
     fi
-    git -C "$main_repo" worktree add -b "$branch_name" "$selected_path" main
-    (cd "$selected_path" && gt track --parent main)
+    sd_runner_git_c "$main_repo" "start-development worktree add" -- worktree add -b "$branch_name" "$selected_path" main
+    runner_sh "start-development gt track" "cd \"${selected_path}\" && gt track --parent main"
 
     echo ""
     echo "Start your first branch with:"

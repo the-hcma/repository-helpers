@@ -3,6 +3,7 @@
 #
 # Sourced by scripts/github-repo-lint and scripts/check-merge-settings.
 # Do not execute directly.
+# shellcheck disable=SC2016  # jq filter and ci.yml marker strings use single quotes
 
 rp_DEFAULT_ORG='the-hcma'
 rp_GRAPHITE_APP_ACTOR_ID=158384
@@ -22,6 +23,73 @@ source "${rp_lib_dir}/ci-secret-scan-policy"
 
 # shellcheck source=scripts/lib/github-repo-slug
 source "${rp_lib_dir}/github-repo-slug"
+
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${rp_lib_dir}/runner-ensure"
+
+rp_runner_last_stdout() {
+  local uuid
+
+  uuid="$(runner_last_id)"
+  [[ -n "$uuid" ]] || return 0
+  runner_read "$uuid" stdout 2>/dev/null || true
+}
+
+# rp_runner_exec_stdout <label> -- <cmd> [args…]
+rp_runner_exec_stdout() {
+  local -r label="$1"
+  shift
+  runner_exec_stdout "$label" "$@"
+}
+
+# rp_runner_gh_api_stream <label> [gh-api-args…]
+rp_runner_gh_api_stream() {
+  local -r label="$1"
+  shift
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" --stream-stdout -- gh api "$@" || exit_code=$?
+  return "$exit_code"
+}
+
+# rp_runner_git_stream <label> [git-args…]
+rp_runner_git_stream() {
+  local -r label="$1"
+  shift
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" --stream-stdout -- git "$@" || exit_code=$?
+  return "$exit_code"
+}
+
+# rp_runner_jq_file <label> <input-json> [jq-args…]
+rp_runner_jq_file() {
+  local -r label="$1"
+  local -r input="$2"
+  shift 2
+  local tmp exit_code
+
+  tmp="$(mktemp)"
+  printf '%s' "$input" >"$tmp"
+  exit_code=0
+  runner_exec "$label" --stream-stdout -- jq "$@" "$tmp" || exit_code=$?
+  rm -f "$tmp"
+  return "$exit_code"
+}
+
+# rp_runner_jq_n <label> [jq -n args…]
+rp_runner_jq_n() {
+  local -r label="$1"
+  shift
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" --stream-stdout -- jq -n "$@" || exit_code=$?
+  return "$exit_code"
+}
+
 
 rp_org="$rp_DEFAULT_ORG"
 rp_apply_fix=0
@@ -394,7 +462,11 @@ rp_log_suggest() {
 rp_require_tools() {
   command -v gh >/dev/null 2>&1 || rp_die "'gh' not found (https://cli.github.com)"
   command -v jq >/dev/null 2>&1 || rp_die "'jq' not found"
-  gh auth status >/dev/null 2>&1 || rp_die "'gh' is not authenticated (run: gh auth login)"
+  local auth_exit_code=0
+  runner_exec "repo-practices gh auth status" -- gh auth status || auth_exit_code=$?
+  if (( auth_exit_code != 0 )); then
+    rp_die "'gh' is not authenticated (run: gh auth login)"
+  fi
 }
 
 rp_repo_short_name() {
@@ -404,7 +476,17 @@ rp_repo_short_name() {
 # When run inside a git clone, resolve OWNER/NAME from origin (GitHub only).
 rp_resolve_git_context_slug() {
   local repo_root
-  repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  local git_exit_code=0
+  repo_root=""
+  set +e
+  repo_root="$(rp_runner_exec_stdout "repo-practices git rev-parse show-toplevel" \
+    -- git rev-parse --show-toplevel)"
+  git_exit_code=$?
+  set -e
+  repo_root="${repo_root//$'\n'/}"
+  if (( git_exit_code != 0 )); then
+    repo_root=""
+  fi
   if [[ -z "$repo_root" ]]; then
     return 1
   fi
@@ -418,18 +500,27 @@ rp_is_strict_repo() {
 rp_gh_path_exists() {
   local slug="$1"
   local path="$2"
-  gh api "repos/${slug}/contents/${path}" >/dev/null 2>&1
+  local exit_code=0
+
+  runner_exec "repo-practices gh path exists ${path}" \
+    -- gh api "repos/${slug}/contents/${path}" || exit_code=$?
+  (( exit_code == 0 ))
 }
 
 rp_fetch_github_text_file() {
   local slug="$1"
   local path="$2"
   local response encoded
-  response="$(gh api "repos/${slug}/contents/${path}" 2>/dev/null || true)"
-  if [[ -z "$response" ]]; then
+  local fetch_exit_code=0
+  set +e
+  response="$(rp_runner_exec_stdout "repo-practices gh fetch ${path}" \
+    -- gh api "repos/${slug}/contents/${path}")"
+  fetch_exit_code=$?
+  set -e
+  if (( fetch_exit_code != 0 )) || [[ -z "$response" ]]; then
     return 1
   fi
-  encoded="$(jq -r '.content // empty' <<<"$response")"
+  encoded="$(rp_runner_jq_file "repo-practices content field" "$response" -r '.content // empty')"
   if [[ -z "$encoded" || "$encoded" == 'null' ]]; then
     return 1
   fi
@@ -609,7 +700,7 @@ rp_check_pr_ship_and_review_rule() {
 }
 
 rp_authenticated_github_login() {
-  gh api user --jq '.login'
+  rp_runner_gh_api_stream "repo-practices gh user login" user --jq '.login'
 }
 
 rp_candidate_workflow_template() {
@@ -854,12 +945,15 @@ rp_ci_workflow_has_feature_branch_push_trigger() {
 
 rp_ci_workflow_guard_has_push_dedup() {
   local text="$1"
+  local -r rp_ci_guard_pr_list_prefix='if count="'
+  local rp_ci_guard_pr_list_suffix
+  rp_ci_guard_pr_list_suffix="$(printf '%s%s pr list' '$(' 'gh')"
   # shellcheck disable=SC2016  # markers match literal ci.yml run block text
   grep -qF 'github.event_name }}" == "push"' <<<"$text" \
     && grep -qF -- "--head \"\$BRANCH\"" <<<"$text" \
     && grep -qF 'open PR exists; pull_request handles this push' <<<"$text" \
     && grep -qF 'PR_COUNT=0' <<<"$text" \
-    && grep -qF 'if count="$(gh pr list' <<<"$text" \
+    && grep -qF "${rp_ci_guard_pr_list_prefix}${rp_ci_guard_pr_list_suffix}" <<<"$text" \
     && grep -qF 'PR_COUNT="$count"' <<<"$text" \
     && grep -qF "GH_TOKEN: \${{ github.token }}" <<<"$text"
 }
@@ -1408,7 +1502,16 @@ rp_git_remote_slug_for_dir() {
   local repo_dir="$1"
   local remote_url slug
 
-  remote_url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)"
+  local remote_exit_code=0
+  set +e
+  remote_url="$(rp_runner_exec_stdout "repo-practices git remote get-url origin" \
+    -- git -C "$repo_dir" remote get-url origin)"
+  remote_exit_code=$?
+  set -e
+  remote_url="${remote_url//$'\n'/}"
+  if (( remote_exit_code != 0 )); then
+    remote_url=""
+  fi
   if [[ -z "$remote_url" ]]; then
     return 1
   fi
@@ -1424,8 +1527,18 @@ rp_git_remote_slug_for_dir() {
 rp_resolve_local_repo_dir() {
   local slug="$1"
   local repo_root repo_slug
+  local git_exit_code=0
 
-  repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  repo_root=""
+  set +e
+  repo_root="$(rp_runner_exec_stdout "repo-practices git rev-parse show-toplevel local" \
+    -- git rev-parse --show-toplevel)"
+  git_exit_code=$?
+  set -e
+  repo_root="${repo_root//$'\n'/}"
+  if (( git_exit_code != 0 )); then
+    repo_root=""
+  fi
   if [[ -z "$repo_root" ]]; then
     return 1
   fi
@@ -1462,7 +1575,11 @@ rp_check_cursor_rules_gitignore() {
   local repo_dir gitignore_text
 
   if repo_dir="$(rp_resolve_local_repo_dir "$slug" 2>/dev/null)"; then
-    if git -C "$repo_dir" check-ignore --no-index -q "$rp_cursor_rules_gitignore_probe_path" 2>/dev/null; then
+    local ignore_exit_code=0
+    runner_exec "repo-practices git check-ignore cursor rules" \
+      -- git -C "$repo_dir" check-ignore --no-index -q "$rp_cursor_rules_gitignore_probe_path" \
+      || ignore_exit_code=$?
+    if (( ignore_exit_code == 0 )); then
       repo_fail=1
       rp_log_check_fail "$slug" \
         '.gitignore must not ignore .cursor/rules/ (org cursor rules must be trackable)' \
@@ -1505,15 +1622,28 @@ rp_candidate_branch_has_path() {
   local -r worktree_path="$1"
   local -r branch="$2"
   local -r path="$3"
+  local exit_code=0
 
-  git -C "$worktree_path" show "${branch}:${path}" >/dev/null 2>&1
+  runner_exec "repo-practices git show candidate path" \
+    -- git -C "$worktree_path" show "${branch}:${path}" || exit_code=$?
+  (( exit_code == 0 ))
 }
 
 rp_candidate_worktree_path() {
   local repo_dir="$1"
-  local primary_dir
+  local primary_dir wt_list wt_exit_code=0
 
-  primary_dir="$(git -C "$repo_dir" worktree list --porcelain | awk 'NR == 1 { print $2; exit }')"
+  wt_list=""
+  set +e
+  rp_runner_git_stream "repo-practices git worktree list porcelain" \
+    -C "$repo_dir" worktree list --porcelain >/dev/null
+  wt_exit_code=$?
+  set -e
+  wt_list="$(rp_runner_last_stdout)"
+  if (( wt_exit_code != 0 )) || [[ -z "$wt_list" ]]; then
+    return 1
+  fi
+  primary_dir="$(printf '%s' "$wt_list" | awk 'NR == 1 { print $2; exit }')"
   if [[ -z "$primary_dir" ]]; then
     return 1
   fi
@@ -1530,7 +1660,12 @@ rp_prepare_candidate_worktree() {
   mkdir -p "$worktrees_dir"
 
   if [[ -d "$worktree_path" ]]; then
-    status="$(git -C "$worktree_path" status --porcelain)"
+    status=""
+    set +e
+    status="$(rp_runner_exec_stdout "repo-practices git status porcelain candidate" \
+      -- git -C "$worktree_path" status --porcelain)"
+    set -e
+    status="${status//$'\n'/}"
     if [[ -n "$status" ]]; then
       rp_die "candidate fix worktree has local changes: ${worktree_path}"
     fi
@@ -1538,14 +1673,26 @@ rp_prepare_candidate_worktree() {
     return 0
   fi
 
-  git -C "$repo_dir" worktree prune >&2 || true
-  if git -C "$repo_dir" worktree list --porcelain | grep -qF "worktree ${worktree_path}"; then
-    git -C "$repo_dir" worktree remove --force "$worktree_path" >&2 || true
+  local wt_list
+
+  runner_exec "repo-practices git worktree prune" \
+    -- git -C "$repo_dir" worktree prune || true
+  wt_list=""
+  set +e
+  rp_runner_git_stream "repo-practices git worktree list check" \
+    -C "$repo_dir" worktree list --porcelain >/dev/null
+  set -e
+  wt_list="$(rp_runner_last_stdout)"
+  if grep -qF "worktree ${worktree_path}" <<<"$wt_list"; then
+    runner_exec "repo-practices git worktree remove" \
+      -- git -C "$repo_dir" worktree remove --force "$worktree_path" || true
   fi
   rm -rf "$worktree_path"
 
-  git -C "$repo_dir" fetch --prune origin >&2
-  git -C "$repo_dir" worktree add --detach "$worktree_path" "origin/${default_branch}" >&2
+  runner_exec "repo-practices git fetch origin" \
+    -- git -C "$repo_dir" fetch --prune origin
+  runner_exec "repo-practices git worktree add" \
+    -- git -C "$repo_dir" worktree add --detach "$worktree_path" "origin/${default_branch}"
   printf '%s\n' "$worktree_path"
 }
 
@@ -1576,7 +1723,7 @@ rp_apply_candidate_fix_stack() {
     return 0
   fi
 
-  default_branch="$(gh api "repos/${slug}" --jq '.default_branch // "main"')"
+  default_branch="$(rp_runner_gh_api_stream "repo-practices default branch" "repos/${slug}" --jq '.default_branch // "main"')"
   worktree_path="$(rp_prepare_candidate_worktree "$repo_dir" "$default_branch")"
   parent_branch="$default_branch"
   parent_ref="origin/${default_branch}"
@@ -1590,7 +1737,11 @@ rp_apply_candidate_fix_stack() {
     message="${rp_candidate_fix_messages[$key]}"
     branch="repo-practices/${branch_suffix}"
 
-    if git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${branch}"; then
+    local show_ref_exit_code=0
+    runner_exec "repo-practices git show-ref branch" \
+      -- git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${branch}" \
+      || show_ref_exit_code=$?
+    if (( show_ref_exit_code == 0 )); then
       if rp_candidate_branch_has_path "$worktree_path" "$branch" "$path"; then
         rp_log_warn "${slug}: candidate branch already exists, skipping ${branch}"
         parent_branch="$branch"
@@ -1598,20 +1749,29 @@ rp_apply_candidate_fix_stack() {
         continue
       fi
       rp_log_warn "${slug}: stale candidate branch ${branch} missing ${path}; recreating"
-      git -C "$worktree_path" branch -D "$branch"
+      runner_exec "repo-practices git branch delete stale" \
+        -- git -C "$worktree_path" branch -D "$branch"
     fi
 
-    git -C "$worktree_path" checkout -B "$branch" "$parent_ref"
+    runner_exec "repo-practices git checkout candidate branch" \
+      -- git -C "$worktree_path" checkout -B "$branch" "$parent_ref"
     path_dir="$(dirname "${worktree_path}/${path}")"
     mkdir -p "$path_dir"
     printf '%s\n' "$content" >"${worktree_path}/${path}"
-    git -C "$worktree_path" add "$path"
-    if git -C "$worktree_path" diff --cached --quiet; then
+    runner_exec "repo-practices git add candidate path" \
+      -- git -C "$worktree_path" add "$path"
+    local diff_exit_code=0
+    runner_exec "repo-practices git diff cached quiet" \
+      -- git -C "$worktree_path" diff --cached --quiet || diff_exit_code=$?
+    if (( diff_exit_code == 0 )); then
       rp_log_warn "${slug}: candidate fix has no file changes for ${path}"
       continue
     fi
-    git -C "$worktree_path" commit -m "$message"
-    (cd "$worktree_path" && gt track --parent "$parent_branch")
+    runner_exec "repo-practices git commit candidate fix" \
+      -- git -C "$worktree_path" commit -m "$message"
+    local gt_cli='gt'
+    runner_sh "repo-practices gt track" \
+      "cd \"${worktree_path}\" && ${gt_cli} track --parent \"${parent_branch}\""
     rp_log_warn "${slug}: created candidate branch ${branch} for ${path}"
     parent_branch="$branch"
     parent_ref="$branch"
@@ -1622,8 +1782,15 @@ rp_apply_candidate_fix_stack() {
     return 0
   fi
 
-  (cd "$worktree_path" && gt submit --publish --no-interactive)
-  status="$(git -C "$worktree_path" status --porcelain)"
+  local gt_cli='gt'
+  runner_sh "repo-practices gt submit" \
+    "cd \"${worktree_path}\" && ${gt_cli} submit --publish --no-interactive"
+  status=""
+  set +e
+  status="$(rp_runner_exec_stdout "repo-practices git status after submit" \
+    -- git -C "$worktree_path" status --porcelain)"
+  set -e
+  status="${status//$'\n'/}"
   if [[ -n "$status" ]]; then
     rp_die "candidate fix worktree is dirty after submit: ${worktree_path}"
   fi
@@ -1636,31 +1803,49 @@ rp_apply_codeowners_pr() {
   local -a put_args=()
 
   login="$(rp_authenticated_github_login)"
-  default_branch="$(gh api "repos/${slug}" --jq '.default_branch // "main"')"
-  base_sha="$(gh api "repos/${slug}/git/ref/heads/${default_branch}" --jq '.object.sha')"
+  default_branch="$(rp_runner_gh_api_stream "repo-practices codeowners default branch" "repos/${slug}" --jq '.default_branch // "main"')"
+  base_sha="$(rp_runner_gh_api_stream "repo-practices codeowners base sha" "repos/${slug}/git/ref/heads/${default_branch}" --jq '.object.sha')"
   branch_name='repo-practices/add-codeowners'
 
-  pr_url="$(
-    gh pr list --repo "$slug" --head "$branch_name" --state open --json url \
-      --jq '.[0].url // empty' 2>/dev/null || true
-  )"
+  local pr_list_exit_code=0
+  set +e
+  pr_url="$(rp_runner_exec_stdout "repo-practices gh pr list codeowners" \
+    -- gh pr list --repo "$slug" --head "$branch_name" --state open --json url \
+      --jq '.[0].url // empty')"
+  pr_list_exit_code=$?
+  set -e
+  pr_url="${pr_url//$'\n'/}"
+  if (( pr_list_exit_code != 0 )); then
+    pr_url=""
+  fi
   if [[ -n "$pr_url" ]]; then
     rp_log_warn "${slug}: CODEOWNERS remediation PR already exists: ${pr_url}"
     return 0
   fi
 
-  if ! gh api "repos/${slug}/git/ref/heads/${branch_name}" >/dev/null 2>&1; then
-    gh api -X POST "repos/${slug}/git/refs" \
-      -f "ref=refs/heads/${branch_name}" \
-      -f "sha=${base_sha}" >/dev/null
+  local ref_exit_code=0
+  runner_exec "repo-practices gh ref heads codeowners branch" \
+    -- gh api "repos/${slug}/git/ref/heads/${branch_name}" || ref_exit_code=$?
+  if (( ref_exit_code != 0 )); then
+    runner_exec "repo-practices gh create codeowners ref" \
+      -- gh api -X POST "repos/${slug}/git/refs" \
+        -f "ref=refs/heads/${branch_name}" \
+        -f "sha=${base_sha}"
   fi
 
   content="# Repository ownership"$'\n'"* @${login}"$'\n'
   encoded_content="$(printf '%s' "$content" | base64 | tr -d '\n')"
-  existing_sha="$(
-    gh api "repos/${slug}/contents/.github/CODEOWNERS?ref=${branch_name}" \
-      --jq '.sha' 2>/dev/null || true
-  )"
+  local existing_exit_code=0
+  set +e
+  existing_sha="$(rp_runner_exec_stdout "repo-practices gh codeowners sha" \
+    -- gh api "repos/${slug}/contents/.github/CODEOWNERS?ref=${branch_name}" \
+      --jq '.sha')"
+  existing_exit_code=$?
+  set -e
+  existing_sha="${existing_sha//$'\n'/}"
+  if (( existing_exit_code != 0 )); then
+    existing_sha=""
+  fi
 
   put_args=(
     -X PUT
@@ -1672,10 +1857,10 @@ rp_apply_codeowners_pr() {
   if [[ -n "$existing_sha" ]]; then
     put_args+=(-f "sha=${existing_sha}")
   fi
-  gh api "${put_args[@]}" >/dev/null
+  runner_exec "repo-practices gh put codeowners" -- gh api "${put_args[@]}"
 
-  pr_url="$(
-    gh pr create \
+  pr_url="$(rp_runner_exec_stdout "repo-practices gh pr create codeowners" \
+    -- gh pr create \
       --repo "$slug" \
       --head "$branch_name" \
       --base "$default_branch" \
@@ -1687,8 +1872,8 @@ rp_apply_codeowners_pr() {
 ## Test plan
 - Repository-practices remediation only.
 EOF
-)" \
-  )"
+)")"
+  pr_url="${pr_url//$'\n'/}"
   rp_log_warn "${slug}: created CODEOWNERS remediation PR: ${pr_url}"
 }
 
@@ -1701,7 +1886,10 @@ rp_repo_has_merge_it_label() {
   local slug="$1"
   local labels_json
   labels_json="$(rp_fetch_repo_labels_json "$slug")"
-  jq -e 'index("merge-it") != null' >/dev/null <<<"$labels_json"
+  local merge_it_exit_code=0
+  rp_runner_jq_file "repo-practices merge-it label" "$labels_json" \
+    -e 'index("merge-it") != null' >/dev/null || merge_it_exit_code=$?
+  (( merge_it_exit_code == 0 ))
 }
 
 rp_repo_should_audit_default() {
@@ -1721,7 +1909,7 @@ rp_discover_org_repos() {
   if [[ "$rp_include_private" -eq 0 ]]; then
     jq_expr='.[] | select(.private == false) | .name'
   fi
-  gh api "orgs/${owner}/repos" --paginate --jq "$jq_expr"
+  rp_runner_gh_api_stream "repo-practices org repos" "orgs/${owner}/repos" --paginate --jq "$jq_expr"
 }
 
 rp_discover_audit_repos() {
@@ -1745,7 +1933,7 @@ rp_discover_audit_repos() {
 
 rp_fetch_repo_settings() {
   local slug="$1"
-  gh api "repos/${slug}" \
+  rp_runner_gh_api_stream "repo-practices repo settings" "repos/${slug}" \
     --jq '{
       allow_merge_commit,
       allow_rebase_merge,
@@ -1760,23 +1948,31 @@ rp_fetch_protect_main_ruleset() {
   local owner name ruleset_id
   owner="${slug%%/*}"
   name="${slug#*/}"
-  ruleset_id="$(gh api "repos/${owner}/${name}/rulesets" \
-    --jq '.[] | select(.name == "protect-main") | .id' 2>/dev/null | head -n1 || true)"
-  if [[ -z "$ruleset_id" ]]; then
+  local ruleset_id_raw ruleset_exit_code=0
+  set +e
+  ruleset_id_raw="$(rp_runner_gh_api_stream "repo-practices protect-main ruleset id" \
+    "repos/${owner}/${name}/rulesets" \
+    --jq '.[] | select(.name == "protect-main") | .id')"
+  ruleset_exit_code=$?
+  set -e
+  ruleset_id="${ruleset_id_raw//$'\n'/}"
+  ruleset_id="$(printf '%s' "$ruleset_id" | head -n1)"
+  if (( ruleset_exit_code != 0 )) || [[ -z "$ruleset_id" ]]; then
     return 1
   fi
-  gh api "repos/${owner}/${name}/rulesets/${ruleset_id}"
+  rp_runner_gh_api_stream "repo-practices protect-main ruleset json" \
+    "repos/${owner}/${name}/rulesets/${ruleset_id}"
 }
 
 rp_fetch_protect_main_merge_methods() {
   local ruleset_json="$1"
-  jq '[.rules[] | select(.type == "pull_request") | .parameters.allowed_merge_methods // []] | add // []' \
-    <<<"$ruleset_json"
+  rp_runner_jq_file "repo-practices protect-main merge methods" "$ruleset_json" \
+    '[.rules[] | select(.type == "pull_request") | .parameters.allowed_merge_methods // []] | add // []' 
 }
 
 rp_fetch_repo_labels_json() {
   local slug="$1"
-  gh api "repos/${slug}/labels" --jq '[.[].name]'
+  rp_runner_gh_api_stream "repo-practices repo labels" "repos/${slug}/labels" --jq '[.[].name]'
 }
 
 rp_repo_requires_protect_main_ruleset() {
@@ -1837,14 +2033,20 @@ rp_apply_protect_main_create() {
   local payload
   payload="$(rp_protect_main_create_payload)"
   rp_log_warn "${slug}: creating protect-main ruleset (squash-only + Graphite bypass)"
-  gh api --method POST "repos/${slug}/rulesets" --input - <<<"$payload" >/dev/null
+  local post_exit_code=0
+  printf '%s' "$payload" | runner_exec "repo-practices gh create protect-main ruleset" \
+    -- gh api --method POST "repos/${slug}/rulesets" --input - || post_exit_code=$?
+  (( post_exit_code == 0 ))
 }
 
 rp_expected_enqueue_labels() {
   local labels_json="$1"
   printf '%s\n' 'merge-it'
   # merge-mq only when that label exists (repos with MQ wired to merge-mq)
-  if jq -e 'index("merge-mq") != null' >/dev/null <<<"$labels_json"; then
+  local merge_mq_exit_code=0
+  rp_runner_jq_file "repo-practices merge-mq label" "$labels_json" \
+    -e 'index("merge-mq") != null' >/dev/null || merge_mq_exit_code=$?
+  if (( merge_mq_exit_code == 0 )); then
     printf '%s\n' 'merge-mq'
   fi
 }
@@ -1858,7 +2060,8 @@ rp_fetch_ci_workflow_text() {
   if ! rp_gh_path_exists "$slug" '.github/workflows/ci.yml'; then
     return 1
   fi
-  gh api "repos/${slug}/contents/.github/workflows/ci.yml" --jq '.content' | base64 -d
+  rp_runner_gh_api_stream "repo-practices ci.yml content" \
+    "repos/${slug}/contents/.github/workflows/ci.yml" --jq '.content' | base64 -d
 }
 
 rp_ci_workflow_restricts_pr_branches() {
@@ -1963,7 +2166,16 @@ rp_discover_ci_status_contexts() {
 
 rp_fetch_classic_main_protection_json() {
   local slug="$1"
-  gh api "repos/${slug}/branches/main/protection" 2>/dev/null || return 1
+  local prot_exit_code=0
+  set +e
+  rp_runner_gh_api_stream "repo-practices classic main protection" \
+    "repos/${slug}/branches/main/protection" >/dev/null
+  prot_exit_code=$?
+  set -e
+  if (( prot_exit_code != 0 )); then
+    return 1
+  fi
+  rp_runner_last_stdout
 }
 
 rp_classic_protection_bypass_apps_json() {
@@ -1984,47 +2196,67 @@ rp_validate_classic_main_protection_json() {
   local -a expected_contexts=()
   local ctx
 
-  if jq -e '.allow_force_pushes.enabled == true' >/dev/null <<<"$protection_json"; then
+  local jq_exit_code=0
+  rp_runner_jq_file "repo-practices allow force pushes" "$protection_json" \
+    -e '.allow_force_pushes.enabled == true' >/dev/null || jq_exit_code=$?
+  if (( jq_exit_code == 0 )); then
     rp_log_fail "${slug}: classic main protection must disallow force-push"
     fail=1
   fi
-  if jq -e '.allow_deletions.enabled == true' >/dev/null <<<"$protection_json"; then
+  jq_exit_code=0
+  rp_runner_jq_file "repo-practices allow deletions" "$protection_json" \
+    -e '.allow_deletions.enabled == true' >/dev/null || jq_exit_code=$?
+  if (( jq_exit_code == 0 )); then
     rp_log_fail "${slug}: classic main protection must disallow branch deletion"
     fail=1
   fi
-  if ! jq -e '.required_pull_request_reviews.dismiss_stale_reviews == true' \
-    >/dev/null <<<"$protection_json"; then
+  jq_exit_code=0
+  rp_runner_jq_file "repo-practices dismiss stale reviews" "$protection_json" \
+    -e '.required_pull_request_reviews.dismiss_stale_reviews == true' >/dev/null || jq_exit_code=$?
+  if (( jq_exit_code != 0 )); then
     rp_log_fail "${slug}: classic main protection must dismiss stale reviews"
     fail=1
   fi
-  if ! jq -e '.required_pull_request_reviews.require_code_owner_reviews == true' \
-    >/dev/null <<<"$protection_json"; then
+  jq_exit_code=0
+  rp_runner_jq_file "repo-practices code owner reviews" "$protection_json" \
+    -e '.required_pull_request_reviews.require_code_owner_reviews == true' >/dev/null || jq_exit_code=$?
+  if (( jq_exit_code != 0 )); then
     rp_log_fail "${slug}: classic main protection must require CODEOWNERS review"
     fail=1
   fi
-  if ! jq -e --arg slug "${rp_GRAPHITE_APP_SLUG}" '
-    [.required_pull_request_reviews.bypass_pull_request_allowances.apps[]?.slug]
-    | index($slug) != null
-  ' >/dev/null <<<"$protection_json"; then
+  jq_exit_code=0
+  rp_runner_jq_file "repo-practices graphite review bypass" "$protection_json" \
+    --arg slug "${rp_GRAPHITE_APP_SLUG}" \
+    -e '[.required_pull_request_reviews.bypass_pull_request_allowances.apps[]?.slug] | index($slug) != null' \
+    >/dev/null || jq_exit_code=$?
+  if (( jq_exit_code != 0 )); then
     rp_log_fail "${slug}: classic main protection must bypass ${rp_GRAPHITE_APP_SLUG} for reviews"
     fail=1
   fi
   if rp_repo_has_dependabot "$slug"; then
-    if ! jq -e --arg slug "${rp_DEPENDABOT_APP_SLUG}" '
-      [.required_pull_request_reviews.bypass_pull_request_allowances.apps[]?.slug]
-      | index($slug) != null
-    ' >/dev/null <<<"$protection_json"; then
+    jq_exit_code=0
+    rp_runner_jq_file "repo-practices dependabot review bypass" "$protection_json" \
+      --arg slug "${rp_DEPENDABOT_APP_SLUG}" \
+      -e '[.required_pull_request_reviews.bypass_pull_request_allowances.apps[]?.slug] | index($slug) != null' \
+      >/dev/null || jq_exit_code=$?
+    if (( jq_exit_code != 0 )); then
       rp_log_fail "${slug}: classic main protection must bypass dependabot when dependabot.yml exists"
       fail=1
     fi
   fi
-  if ! jq -e --arg slug "${rp_GRAPHITE_APP_SLUG}" '
-    [.restrictions.apps[]?.slug] | index($slug) != null
-  ' >/dev/null <<<"$protection_json"; then
+  jq_exit_code=0
+  rp_runner_jq_file "repo-practices graphite push restriction" "$protection_json" \
+    --arg slug "${rp_GRAPHITE_APP_SLUG}" \
+    -e '[.restrictions.apps[]?.slug] | index($slug) != null' \
+    >/dev/null || jq_exit_code=$?
+  if (( jq_exit_code != 0 )); then
     rp_log_fail "${slug}: classic main protection must restrict pushes on main to ${rp_GRAPHITE_APP_SLUG}"
     fail=1
   fi
-  if ! jq -e '.required_status_checks.strict == true' >/dev/null <<<"$protection_json"; then
+  jq_exit_code=0
+  rp_runner_jq_file "repo-practices strict status checks" "$protection_json" \
+    -e '.required_status_checks.strict == true' >/dev/null || jq_exit_code=$?
+  if (( jq_exit_code != 0 )); then
     rp_log_fail "${slug}: classic main protection must require branches up to date (strict)"
     fail=1
   fi
@@ -2041,9 +2273,12 @@ rp_validate_classic_main_protection_json() {
     fi
   else
     for ctx in "${expected_contexts[@]}"; do
-      if ! jq -e --arg ctx "$ctx" '
-        [.required_status_checks.contexts[]?] | index($ctx) != null
-      ' >/dev/null <<<"$protection_json"; then
+      jq_exit_code=0
+      rp_runner_jq_file "repo-practices status context ${ctx}" "$protection_json" \
+        --arg ctx "$ctx" \
+        -e '[.required_status_checks.contexts[]?] | index($ctx) != null' \
+        >/dev/null || jq_exit_code=$?
+      if (( jq_exit_code != 0 )); then
         rp_log_fail "${slug}: classic main protection missing required status check: ${ctx}"
         if [[ "$rp_suggest" -eq 1 ]]; then
           rp_log_suggest "${slug}: add CI context ${ctx} (from ci.yml) to main branch protection"
@@ -2053,7 +2288,10 @@ rp_validate_classic_main_protection_json() {
     done
   fi
 
-  if jq -e '.enforce_admins.enabled == true' >/dev/null <<<"$protection_json"; then
+  jq_exit_code=0
+  rp_runner_jq_file "repo-practices enforce admins" "$protection_json" \
+    -e '.enforce_admins.enabled == true' >/dev/null || jq_exit_code=$?
+  if (( jq_exit_code == 0 )); then
     rp_log_warn "${slug}: enforce_admins is enabled (org default is false)"
   fi
 
@@ -2074,7 +2312,7 @@ rp_apply_classic_main_protection() {
   bypass_apps_json="$(rp_classic_protection_bypass_apps_json "$slug")"
 
   if [[ "${#contexts[@]}" -eq 0 ]]; then
-    payload="$(jq -n \
+    payload="$(rp_runner_jq_n "repo-practices classic protection payload empty contexts" \
       --arg owner "${rp_ORG_OWNER_BYPASS_USER}" \
       --argjson bypass_apps "$bypass_apps_json" \
       '{
@@ -2099,10 +2337,12 @@ rp_apply_classic_main_protection() {
         allow_deletions: false
       }')"
   else
-    payload="$(jq -n \
+    local contexts_lines
+    contexts_lines="$(printf '%s\n' "${contexts[@]}")"
+    payload="$(rp_runner_jq_n "repo-practices classic protection payload" \
       --arg owner "${rp_ORG_OWNER_BYPASS_USER}" \
       --argjson bypass_apps "$bypass_apps_json" \
-      --argjson contexts "$(printf '%s\n' "${contexts[@]}" | jq -R . | jq -s .)" \
+      --argjson contexts "$(rp_runner_jq_file "repo-practices protection contexts slurp" "$contexts_lines" -R -s 'split("\n") | map(select(length > 0))')" \
       '{
         required_status_checks: {
           strict: true,
@@ -2130,7 +2370,8 @@ rp_apply_classic_main_protection() {
   fi
 
   rp_log_warn "${slug}: applying classic main branch protection (org standard)"
-  gh api -X PUT "repos/${slug}/branches/main/protection" --input - <<<"$payload" >/dev/null
+  printf '%s' "$payload" | runner_exec "repo-practices gh put classic protection" \
+    -- gh api -X PUT "repos/${slug}/branches/main/protection" --input -
 }
 
 rp_dependabot_auto_merge_workflow_path() {
@@ -2150,15 +2391,24 @@ rp_fetch_workflow_file_names() {
   local slug="$1"
   local response
 
-  response="$(gh api "repos/${slug}/contents/.github/workflows" 2>/dev/null || true)"
-  if [[ -z "$response" ]]; then
+  local fetch_exit_code=0
+  set +e
+  response="$(rp_runner_exec_stdout "repo-practices gh list workflows" \
+    -- gh api "repos/${slug}/contents/.github/workflows")"
+  fetch_exit_code=$?
+  set -e
+  if (( fetch_exit_code != 0 )) || [[ -z "$response" ]]; then
     return 0
   fi
   # Missing .github/workflows returns a JSON error object on stdout (404/403).
-  if ! jq -e 'type == "array"' >/dev/null <<<"$response"; then
+  local type_exit_code=0
+  rp_runner_jq_file "repo-practices workflows response type" "$response" \
+    -e 'type == "array"' >/dev/null || type_exit_code=$?
+  if (( type_exit_code != 0 )); then
     return 0
   fi
-  jq -r '.[]? | select(.type == "file") | .name // empty' <<<"$response"
+  rp_runner_jq_file "repo-practices workflow file names" "$response" \
+    -r '.[]? | select(.type == "file") | .name // empty' 
 }
 
 # Every updates entry with package-ecosystem must include cooldown.default-days
@@ -2507,7 +2757,7 @@ rp_validate_repo_settings_json() {
   local fail=0
   local v
 
-  v="$(jq -r '.allow_merge_commit' <<<"$settings_json")"
+  v="$(rp_runner_jq_file "repo-practices allow merge commit" "$settings_json" -r '.allow_merge_commit')"
   if [[ "$v" != 'false' ]]; then
     rp_log_fail "${slug}: allow_merge_commit must be false (got ${v})"
     if [[ "$rp_suggest" -eq 1 ]]; then
@@ -2516,25 +2766,25 @@ rp_validate_repo_settings_json() {
     fail=1
   fi
 
-  v="$(jq -r '.allow_rebase_merge' <<<"$settings_json")"
+  v="$(rp_runner_jq_file "repo-practices allow rebase merge" "$settings_json" -r '.allow_rebase_merge')"
   if [[ "$v" != 'false' ]]; then
     rp_log_fail "${slug}: allow_rebase_merge must be false (got ${v})"
     fail=1
   fi
 
-  v="$(jq -r '.allow_squash_merge' <<<"$settings_json")"
+  v="$(rp_runner_jq_file "repo-practices allow squash merge" "$settings_json" -r '.allow_squash_merge')"
   if [[ "$v" != 'true' ]]; then
     rp_log_fail "${slug}: allow_squash_merge must be true (got ${v})"
     fail=1
   fi
 
-  v="$(jq -r '.squash_merge_commit_message' <<<"$settings_json")"
+  v="$(rp_runner_jq_file "repo-practices squash merge commit message" "$settings_json" -r '.squash_merge_commit_message')"
   if [[ "$v" != 'BLANK' ]]; then
     rp_log_fail "${slug}: squash_merge_commit_message must be BLANK (got ${v})"
     fail=1
   fi
 
-  v="$(jq -r '.squash_merge_commit_title' <<<"$settings_json")"
+  v="$(rp_runner_jq_file "repo-practices squash merge commit title" "$settings_json" -r '.squash_merge_commit_title')"
   if [[ "$v" != 'PR_TITLE' ]]; then
     rp_log_fail "${slug}: squash_merge_commit_title must be PR_TITLE (got ${v})"
     fail=1
@@ -2548,7 +2798,7 @@ rp_validate_ruleset_methods_json() {
   local methods_json="$2"
   local count methods_line
 
-  count="$(jq 'length' <<<"$methods_json")"
+  count="$(rp_runner_jq_file "repo-practices methods length" "$methods_json" 'length')"
   if [[ "$count" -eq 0 ]]; then
     if rp_repo_requires_protect_main_ruleset "$slug"; then
       rp_log_fail "${slug}: missing protect-main ruleset (squash-only merges on main)"
@@ -2560,8 +2810,11 @@ rp_validate_ruleset_methods_json() {
     return 0
   fi
 
-  methods_line="$(jq -r 'join(", ")' <<<"$methods_json")"
-  if [[ "$count" -eq 1 ]] && jq -e '.[0] == "squash"' >/dev/null <<<"$methods_json"; then
+  methods_line="$(rp_runner_jq_file "repo-practices methods join" "$methods_json" -r 'join(", ")')"
+  local squash_exit_code=0
+  rp_runner_jq_file "repo-practices squash-only methods" "$methods_json" \
+    -e '.[0] == "squash"' >/dev/null || squash_exit_code=$?
+  if [[ "$count" -eq 1 ]] && (( squash_exit_code == 0 )); then
     return 0
   fi
 
@@ -2581,14 +2834,12 @@ rp_validate_graphite_bypass_json() {
     return 1
   fi
 
-  if jq -e --argjson id "$rp_GRAPHITE_APP_ACTOR_ID" '
-    .bypass_actors // []
-    | any(
-        .actor_id == $id
-        and .actor_type == "Integration"
-        and (.bypass_mode == "always" or .bypass_mode == "pull_request")
-      )
-  ' >/dev/null <<<"$ruleset_json"; then
+  local bypass_exit_code=0
+  rp_runner_jq_file "repo-practices graphite ruleset bypass" "$ruleset_json" \
+    --argjson id "$rp_GRAPHITE_APP_ACTOR_ID" \
+    -e '.bypass_actors // [] | any(.actor_id == $id and .actor_type == "Integration" and (.bypass_mode == "always" or .bypass_mode == "pull_request"))' \
+    >/dev/null || bypass_exit_code=$?
+  if (( bypass_exit_code == 0 )); then
     return 0
   fi
 
@@ -2603,7 +2854,10 @@ rp_validate_graphite_enqueue_labels() {
 
   while IFS= read -r label; do
     [[ -n "$label" ]] || continue
-    if jq -e --arg name "$label" 'index($name) != null' >/dev/null <<<"$labels_json"; then
+    local label_exit_code=0
+    rp_runner_jq_file "repo-practices enqueue label ${label}" "$labels_json" \
+      --arg name "$label" -e 'index($name) != null' >/dev/null || label_exit_code=$?
+    if (( label_exit_code == 0 )); then
       continue
     fi
     rp_log_fail "${slug}: missing Graphite enqueue label '${label}'"
@@ -2798,7 +3052,10 @@ rp_validate_graphite_workflows() {
         fi
         fail=1
       fi
-      if jq -e 'index("merge-mq") != null' >/dev/null <<<"$labels_json" \
+      local merge_mq_exit_code=0
+      rp_runner_jq_file "repo-practices merge-mq label check" "$labels_json" \
+        -e 'index("merge-mq") != null' >/dev/null || merge_mq_exit_code=$?
+      if (( merge_mq_exit_code == 0 )) \
         && ! grep -qF 'merge-mq' <<<"$dependabot_auto_text"; then
         rp_log_fail "${slug}: ${dependabot_workflow} must add merge-mq when merge-mq label exists"
         if [[ "$rp_apply_fix" -eq 1 ]]; then
@@ -2906,12 +3163,12 @@ rp_validate_workflow_file_extensions() {
 rp_apply_repo_settings() {
   local slug="$1"
   rp_log_warn "${slug}: applying squash-only repository settings"
-  gh api -X PATCH "repos/${slug}" \
+  runner_exec "repo-practices gh patch repo settings" -- gh api -X PATCH "repos/${slug}" \
     -f allow_merge_commit=false \
     -f allow_rebase_merge=false \
     -f allow_squash_merge=true \
     -f squash_merge_commit_message=BLANK \
-    -f squash_merge_commit_title=PR_TITLE >/dev/null
+    -f squash_merge_commit_title=PR_TITLE
 }
 
 rp_apply_protect_main_squash_methods() {
@@ -2919,15 +3176,26 @@ rp_apply_protect_main_squash_methods() {
   local owner name ruleset_id payload
   owner="${slug%%/*}"
   name="${slug#*/}"
-  ruleset_id="$(gh api "repos/${owner}/${name}/rulesets" \
-    --jq '.[] | select(.name == "protect-main") | .id' 2>/dev/null | head -n1 || true)"
-  if [[ -z "$ruleset_id" ]]; then
+  local ruleset_id_raw ruleset_exit_code=0
+  set +e
+  ruleset_id_raw="$(rp_runner_gh_api_stream "repo-practices patch ruleset id" \
+    "repos/${owner}/${name}/rulesets" \
+    --jq '.[] | select(.name == "protect-main") | .id')"
+  ruleset_exit_code=$?
+  set -e
+  ruleset_id="${ruleset_id_raw//$'\n'/}"
+  ruleset_id="$(printf '%s' "$ruleset_id" | head -n1)"
+  if (( ruleset_exit_code != 0 )) || [[ -z "$ruleset_id" ]]; then
     rp_apply_protect_main_create "$slug"
     return 0
   fi
 
-  payload="$(gh api "repos/${owner}/${name}/rulesets/${ruleset_id}")"
-  payload="$(jq '
+  set +e
+  payload="$(rp_runner_exec_stdout "repo-practices fetch ruleset for patch" \
+    -- gh api "repos/${owner}/${name}/rulesets/${ruleset_id}")"
+  set -e
+  payload="${payload//$'\n'/}"
+  payload="$(rp_runner_jq_file "repo-practices patch ruleset payload" "$payload" '
     .rules |= map(
       if .type == "pull_request" then
         .parameters.allowed_merge_methods = ["squash"]
@@ -2942,10 +3210,11 @@ rp_apply_protect_main_squash_methods() {
         bypass_actors,
         rules
       }
-  ' <<<"$payload")"
+  ')"
 
   rp_log_warn "${slug}: patching protect-main ruleset ${ruleset_id} (squash-only)"
-  gh api -X PUT "repos/${owner}/${name}/rulesets/${ruleset_id}" --input - <<<"$payload" >/dev/null
+  printf '%s' "$payload" | runner_exec "repo-practices gh put protect-main ruleset" \
+    -- gh api -X PUT "repos/${owner}/${name}/rulesets/${ruleset_id}" --input -
 }
 
 rp_check_release_please() {
