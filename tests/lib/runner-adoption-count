@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Count bare external command invocations (not via runner) for adoption ratchet.
+set -euo pipefail
+
+# rp_runner_adoption_skip_file <path>
+# Return 0 when file should be excluded from the scan.
+rp_runner_adoption_skip_file() {
+  local -r path="$1"
+  case "$path" in
+    scripts/lib/runner|scripts/lib/runner-bootstrap|scripts/lib/runner-ensure)
+      return 0
+      ;;
+    *.yml|*.mdc|*.snippet)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# rp_runner_adoption_line_is_bare <line>
+# Return 0 when the line looks like a direct external-tool invocation.
+rp_runner_adoption_line_is_bare() {
+  local -r line="$1"
+  local -r tools='git|gh|gt|jq|curl|pnpm|npm|yarn|uv|pip|poetry|cargo|actionlint|sendmail|timeout|flock|realpath|readlink'
+  local pat
+
+  [[ "$line" =~ ^[[:space:]]*# ]] && return 1
+  [[ "$line" =~ (run_command|runner_exec|runner_sh|run_command_or_die|runner_exec_stdout|runner_sh_stdout) ]] \
+    && return 1
+  [[ "$line" =~ command[[:space:]]+-v ]] && return 1
+
+  pat='^[[:space:]]*('"$tools"')[[:space:]/"]'
+  [[ "$line" =~ $pat ]] && return 0
+
+  pat='[;|][[:space:]]*('"$tools"')[[:space:]/"]'
+  [[ "$line" =~ $pat ]] && return 0
+
+  pat='&&[[:space:]]*('"$tools"')[[:space:]/"]'
+  [[ "$line" =~ $pat ]] && return 0
+
+  pat='\$\([[:space:]]*('"$tools"')[[:space:]/"]'
+  [[ "$line" =~ $pat ]] && return 0
+
+  # shellcheck disable=SC2016  # ERE alternation is assembled from the tools variable
+  pat='"\$('"$tools"')[[:space:]/"]'
+  [[ "$line" =~ $pat ]] && return 0
+
+  return 1
+}
+
+# rp_runner_adoption_count_file <adoption-root> <relative-path>
+# Prints the bare-invocation count for one file.
+rp_runner_adoption_count_file() {
+  local -r adoption_root="$1"
+  local -r rel_path="$2"
+  local path line count=0
+
+  path="${adoption_root}/${rel_path}"
+  [[ -f "$path" ]] || {
+    printf '0\n'
+    return 0
+  }
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if rp_runner_adoption_line_is_bare "$line"; then
+      count=$(( count + 1 ))
+    fi
+  done <"$path"
+  printf '%s\n' "$count"
+}
+
+# rp_runner_adoption_collect_counts <adoption-root>
+# Prints "count<TAB>relative-path" for every scanned file with count > 0.
+rp_runner_adoption_collect_counts() {
+  local -r adoption_root="$1"
+  local rel_path count
+
+  while IFS= read -r rel_path; do
+    [[ -n "$rel_path" ]] || continue
+    if rp_runner_adoption_skip_file "$rel_path"; then
+      continue
+    fi
+    count="$(rp_runner_adoption_count_file "$adoption_root" "$rel_path")"
+    if [[ "$count" -gt 0 ]]; then
+      printf '%s\t%s\n' "$count" "$rel_path"
+    fi
+  done < <(rp_runner_adoption_list_files "$adoption_root")
+}
+
+# rp_runner_adoption_list_files <adoption-root>
+# Lists scan targets relative to repo root (no duplicates).
+rp_runner_adoption_list_files() {
+  local -r adoption_root="$1"
+
+  {
+    find "${adoption_root}/scripts" -maxdepth 1 -type f 2>/dev/null || true
+    find "${adoption_root}/scripts/dev" -type f 2>/dev/null || true
+    find "${adoption_root}/scripts/lib" -type f 2>/dev/null || true
+  } | sed "s|^${adoption_root}/||" | sort -u
+}
+
+# rp_runner_adoption_total_count <adoption-root>
+rp_runner_adoption_total_count() {
+  local -r adoption_root="$1"
+  local total=0
+  local count
+
+  while IFS=$'\t' read -r count _path; do
+    [[ -n "$count" ]] || continue
+    total=$(( total + count ))
+  done < <(rp_runner_adoption_collect_counts "$adoption_root")
+  printf '%s\n' "$total"
+}
