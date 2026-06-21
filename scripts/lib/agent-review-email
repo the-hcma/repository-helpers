@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # agent-review-email — operator notifications for wait-for-agent-review.
+# shellcheck disable=SC2016  # jq filter strings use single quotes
 
 agent_review_email_require_config() {
   if [[ -z "${AGENT_REVIEW_REPORT_TO:-}" ]]; then
@@ -48,16 +49,39 @@ agent_review_email_send_plain() {
     | repo_helpers_smtp_send "${from_addr}" "${to_addr}"
 }
 
+agent_review_email_pr_meta() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local pr_json title url
+
+  pr_json="$(ar_runner_gh_pr_jq "agent-review email pr meta" "${repo}" "${pr}" "title,url")"
+  title="$(ar_runner_jq_file "agent-review email title" "${pr_json}" -r '.title')"
+  url="$(ar_runner_jq_file "agent-review email url" "${pr_json}" -r '.url')"
+  printf '%s\t%s\n' "${title}" "${url}"
+}
+
+agent_review_email_gh_user_login() {
+  local gh_user exit_code
+
+  exit_code=0
+  gh_user="$(ar_runner_gh_api_stream "agent-review email gh user login" user --jq '.login')" \
+    || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "${gh_user}" ]]; then
+    printf 'unknown'
+    return 0
+  fi
+  printf '%s' "${gh_user}"
+}
+
 agent_review_email_complete() {
   local -r repo="$1"
   local -r pr="$2"
   local title url body agent_id gh_user
 
   agent_review_require_cmd gh
-  title="$(gh pr view "${pr}" --repo "${repo}" --json title --jq '.title')"
-  url="$(gh pr view "${pr}" --repo "${repo}" --json url --jq '.url')"
+  IFS=$'\t' read -r title url < <(agent_review_email_pr_meta "${repo}" "${pr}")
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
-  gh_user="$(gh api user --jq '.login' 2>/dev/null || printf 'unknown')"
+  gh_user="$(agent_review_email_gh_user_login)"
   body="PR #${pr} passed the ${agent_id} agent review loop.
 
 URL: ${url}
@@ -143,12 +167,11 @@ agent_review_email_loop_stopped() {
   fi
 
   agent_review_require_cmd gh
-  title="$(gh pr view "${pr}" --repo "${repo}" --json title --jq '.title')"
-  url="$(gh pr view "${pr}" --repo "${repo}" --json url --jq '.url')"
+  IFS=$'\t' read -r title url < <(agent_review_email_pr_meta "${repo}" "${pr}")
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
-  pending_threads="$(printf '%s' "${context_json}" | jq -r '.pending_threads // empty')"
-  head_sha="$(printf '%s' "${context_json}" | jq -r '.head_sha // empty')"
-  ci_conclusion="$(printf '%s' "${context_json}" | jq -r '.ci_conclusion // empty')"
+  pending_threads="$(ar_runner_jq_file "agent-review email pending threads" "${context_json}" -r '.pending_threads // empty')"
+  head_sha="$(ar_runner_jq_file "agent-review email head sha" "${context_json}" -r '.head_sha // empty')"
+  ci_conclusion="$(ar_runner_jq_file "agent-review email ci conclusion" "${context_json}" -r '.ci_conclusion // empty')"
   headline="$(agent_review_loop_stop_human_headline \
     "${exit_code}" "${reason_code}" "${pending_threads}")"
   subject="PR agent review stopped: ${headline} — ${title} (#${pr})"
@@ -196,11 +219,10 @@ agent_review_post_fallback_comment() {
   local -r reason="$3"
   local -r from_agent="$4"
   local -r fallback_agent="$5"
-  local title url comment_body
+  local title url comment_body exit_code
 
   agent_review_require_cmd gh
-  title="$(gh pr view "${pr}" --repo "${repo}" --json title --jq '.title')"
-  url="$(gh pr view "${pr}" --repo "${repo}" --json url --jq '.url')"
+  IFS=$'\t' read -r title url < <(agent_review_email_pr_meta "${repo}" "${pr}")
   comment_body="## Agent review fallback
 
 **${from_agent}** review quota or usage limit is exhausted; continuing with **${fallback_agent}** instead.
@@ -212,8 +234,12 @@ ${reason}
 - **Previous agent:** ${from_agent}
 - **Fallback agent:** ${fallback_agent}"
 
-  gh pr comment "${pr}" --repo "${repo}" --body "${comment_body}" >/dev/null \
-    || return 1
+  exit_code=0
+  runner_exec "agent-review email fallback comment" -- gh pr comment "${pr}" --repo "${repo}" \
+    --body "${comment_body}" || exit_code=$?
+  if (( exit_code != 0 )); then
+    return 1
+  fi
   printf 'Posted fallback comment on PR #%s (%s → %s)\n' \
     "${pr}" "${from_agent}" "${fallback_agent}" >&2
 }
@@ -224,11 +250,10 @@ agent_review_post_loop_stopped_comment() {
   local -r exit_code="$3"
   local -r reason_code="$4"
   local -r reason_detail="$5"
-  local title url comment_body agent_id headline
+  local title url comment_body agent_id headline runner_exit
 
   agent_review_require_cmd gh
-  title="$(gh pr view "${pr}" --repo "${repo}" --json title --jq '.title')"
-  url="$(gh pr view "${pr}" --repo "${repo}" --json url --jq '.url')"
+  IFS=$'\t' read -r title url < <(agent_review_email_pr_meta "${repo}" "${pr}")
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
   headline="$(agent_review_loop_stop_human_headline "${exit_code}" "${reason_code}")"
   comment_body="## Agent review loop stopped: ${headline}
@@ -241,8 +266,12 @@ ${reason_detail}
 
 Manual follow-up required: triage remaining agent threads, push fixes, and re-run \`scripts/wait-for-agent-review loop --pr ${pr}\` when ready."
 
-  gh pr comment "${pr}" --repo "${repo}" --body "${comment_body}" >/dev/null \
-    || return 1
+  runner_exit=0
+  runner_exec "agent-review email loop stopped comment" -- gh pr comment "${pr}" --repo "${repo}" \
+    --body "${comment_body}" || runner_exit=$?
+  if (( runner_exit != 0 )); then
+    return 1
+  fi
   printf 'Posted loop-stopped comment on PR #%s\n' "${pr}" >&2
 }
 
