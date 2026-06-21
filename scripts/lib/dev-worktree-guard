@@ -4,19 +4,59 @@
 # Feature work must run from a Graphite stack worktree (.worktrees/<stack>-wt), not
 # the primary clone. The primary worktree must stay clean (empty git status --porcelain).
 
+_dwg_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _dwg_lib_dir
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_dwg_lib_dir}/runner-ensure"
+
+dwg_runner_last_stdout() {
+  local uuid
+
+  uuid="$(runner_last_id)"
+  [[ -n "$uuid" ]] || return 0
+  runner_read "$uuid" stdout 2>/dev/null || true
+}
+
+dwg_git_show_toplevel() {
+  local -r start_dir="$1"
+  local exit_code
+
+  exit_code=0
+  runner_exec "git rev-parse show-toplevel" -- git -C "$start_dir" rev-parse --show-toplevel \
+    || exit_code=$?
+  if (( exit_code != 0 )); then
+    return 1
+  fi
+  dwg_runner_last_stdout
+}
+
 dev_worktree_primary_path() {
   local start_dir="${1:-$PWD}"
-  local repo_root
+  local repo_root exit_code wt_list primary
 
-  repo_root="$(git -C "$start_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  repo_root="$(dwg_git_show_toplevel "$start_dir" || true)"
   [[ -n "$repo_root" ]] || return 1
-  git -C "$repo_root" worktree list --porcelain | awk 'NR==1{print $2}'
+  repo_root="${repo_root//$'\n'/}"
+  exit_code=0
+  runner_exec "git worktree list primary" -- git -C "$repo_root" worktree list --porcelain \
+    || exit_code=$?
+  if (( exit_code != 0 )); then
+    return 1
+  fi
+  wt_list="$(dwg_runner_last_stdout)"
+  primary="$(printf '%s' "$wt_list" | awk '/^worktree / { sub(/^worktree /, ""); print; exit }')"
+  [[ -n "$primary" ]] || return 1
+  printf '%s' "$primary"
 }
 
 dev_worktree_is_primary() {
-  local repo_dir="${1:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
-  local primary
+  local repo_dir="${1:-}"
+  local primary toplevel
 
+  if [[ -z "$repo_dir" ]]; then
+    toplevel="$(dwg_git_show_toplevel "$PWD" || true)"
+    repo_dir="${toplevel//$'\n'/}"
+  fi
   [[ -n "$repo_dir" ]] || return 1
   primary="$(dev_worktree_primary_path "$repo_dir")"
   [[ -n "$primary" ]] || return 1
@@ -25,7 +65,13 @@ dev_worktree_is_primary() {
 
 # Exit non-zero when cwd repo root is the primary (main) worktree.
 dev_assert_stack_worktree() {
-  local repo_dir="${1:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
+  local repo_dir="${1:-}"
+  local toplevel
+
+  if [[ -z "$repo_dir" ]]; then
+    toplevel="$(dwg_git_show_toplevel "$PWD" || true)"
+    repo_dir="${toplevel//$'\n'/}"
+  fi
 
   if dev_worktree_is_primary "$repo_dir"; then
     printf 'ERROR: Forbidden on primary worktree (%s).\n' "$repo_dir" >&2
@@ -38,11 +84,18 @@ dev_assert_stack_worktree() {
 # Exit non-zero when the primary worktree has any porcelain output.
 dev_assert_main_worktree_clean() {
   local start_dir="${1:-$PWD}"
-  local primary status
+  local primary status exit_code
 
   primary="$(dev_worktree_primary_path "$start_dir")"
   [[ -n "$primary" ]] || return 1
-  status="$(git -C "$primary" status --porcelain 2>/dev/null || true)"
+  exit_code=0
+  runner_exec "git status porcelain primary" -- git -C "$primary" status --porcelain \
+    || exit_code=$?
+  if (( exit_code != 0 )); then
+    printf 'ERROR: Could not read primary worktree status (%s).\n' "$primary" >&2
+    return 1
+  fi
+  status="$(dwg_runner_last_stdout)"
   if [[ -n "$status" ]]; then
     printf 'ERROR: Primary worktree has local changes (%s):\n' "$primary" >&2
     printf '%s\n' "$status" >&2
