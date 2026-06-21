@@ -483,8 +483,11 @@ gh_pr_state_for_number() {
 
 gh_pr_merged_for_number() {
   local -r pr_number="$1"
-  gh api "repos/${repo_owner}/${repo_name}/pulls/${pr_number}" \
-    --jq '(.merged_at != null)' 2>/dev/null || true
+  local raw
+
+  raw="$(dep_runner_gh_api_jq "gh pr merged check" \
+    "repos/${repo_owner}/${repo_name}/pulls/${pr_number}" '(.merged_at != null)' || true)"
+  printf '%s' "${raw:-}"
 }
 
 add_merge_it_label() {
@@ -828,29 +831,22 @@ pnpm_pkg_is_ignored_build() {
 npm_version_prefetch() {
   local -r pkg="$1"
   local -r version="$2"
-  local attempt registry http_status encoded_pkg
+  local attempt registry http_status encoded_pkg store_exit
 
-  # Read the registry URL from .npmrc / pnpmrc (default: registry.npmjs.org).
-  registry="$(pnpm config get registry 2>/dev/null | tr -d '[:space:]' || echo 'https://registry.npmjs.org/')"
-  # Ensure trailing slash.
-  [[ "$registry" != */ ]] && registry="${registry}/"
+  registry="$(dep_updater_npm_registry_base)"
+  encoded_pkg="$(dep_updater_npm_encode_pkg "$pkg")"
 
   for attempt in 1 2 3; do
-    # Query the registry directly for this exact version to bypass pnpm's
-    # metadata cache, which can return stale results for versions that were
-    # briefly published but then yanked or not yet fully propagated.
-    # Encode the package name: replace leading @ and / with URL-safe form.
-    encoded_pkg="${pkg//@/%40}"
-    encoded_pkg="${encoded_pkg//\//%2F}"
-    http_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
-      --max-time 10 \
-      "${registry}${encoded_pkg}/${version}" 2>/dev/null || echo '000')"
+    http_status="$(dep_runner_curl_http_code \
+      "npm registry version check ${pkg}@${version}" \
+      "${registry}${encoded_pkg}/${version}")"
     if [[ "$http_status" == "200" ]]; then
-      # Registry confirms the version — pre-fetch into the pnpm store.
-      if pnpm store add "${pkg}@${version}" >/dev/null 2>&1; then
+      store_exit=0
+      runner_exec "pnpm store add ${pkg}@${version}" -- pnpm store add "${pkg}@${version}" \
+        >/dev/null || store_exit=$?
+      if (( store_exit == 0 )); then
         return 0
       fi
-      # Store add failed despite registry confirming — fall through to retry.
     fi
     if [[ "$attempt" -lt 3 ]]; then
       log "[pnpm] WARNING: ${pkg}@${version} not yet available in registry (HTTP ${http_status}); attempt ${attempt}/2, retrying in 15s…"
@@ -871,20 +867,17 @@ npm_registry_dist_tag_latest() {
   local -r pkg="$1"
   local registry encoded_pkg body latest
 
-  # Tests set DEP_UPDATER_SKIP_NPM_REGISTRY=1 so packument fetch does not depend
-  # on live registry contents (report-json integration uses stubbed pnpm only).
   if [[ "${DEP_UPDATER_SKIP_NPM_REGISTRY:-0}" == '1' ]]; then
     return 1
   fi
 
-  registry="$(pnpm config get registry 2>/dev/null | tr -d '[:space:]' || echo 'https://registry.npmjs.org/')"
-  [[ "$registry" != */ ]] && registry="${registry}/"
-  encoded_pkg="${pkg//@/%40}"
-  encoded_pkg="${encoded_pkg//\//%2F}"
+  registry="$(dep_updater_npm_registry_base)"
+  encoded_pkg="$(dep_updater_npm_encode_pkg "$pkg")"
   body=""
-  body="$(curl --silent --max-time 15 "${registry}${encoded_pkg}" 2>/dev/null || true)"
+  body="$(dep_runner_curl_body "npm packument ${pkg}" "${registry}${encoded_pkg}" || true)"
   latest=""
-  latest="$(printf '%s' "$body" | jq -r '.["dist-tags"].latest // empty' 2>/dev/null || true)"
+  latest="$(dep_runner_jq_string "npm dist-tags.latest ${pkg}" "$body" '.["dist-tags"].latest // empty' \
+    || true)"
   if [[ -z "$latest" || "$latest" == 'null' ]]; then
     return 1
   fi
@@ -915,15 +908,13 @@ _npm_registry_stable_versions_desc() {
     return 0
   fi
 
-  registry="$(pnpm config get registry 2>/dev/null | tr -d '[:space:]' || echo 'https://registry.npmjs.org/')"
-  [[ "$registry" != */ ]] && registry="${registry}/"
-  encoded_pkg="${pkg//@/%40}"
-  encoded_pkg="${encoded_pkg//\//%2F}"
-  body="$(curl --silent --max-time 15 "${registry}${encoded_pkg}" 2>/dev/null || true)"
+  registry="$(dep_updater_npm_registry_base)"
+  encoded_pkg="$(dep_updater_npm_encode_pkg "$pkg")"
+  body="$(dep_runner_curl_body "npm packument ${pkg}" "${registry}${encoded_pkg}" || true)"
   if [[ -z "$body" ]]; then
     return 1
   fi
-  printf '%s' "$body" | jq -r '.versions | keys[]' 2>/dev/null \
+  dep_runner_jq_string "npm stable versions ${pkg}" "$body" '.versions | keys[]' 2>/dev/null \
     | while IFS= read -r ver; do
         [[ -z "$ver" ]] && continue
         if _npm_version_is_stable_release "$ver"; then
@@ -946,7 +937,7 @@ npm_pick_eligible_new_version() {
   # Integration tests stub pnpm only (DEP_UPDATER_SKIP_NPM_REGISTRY=1): walk the
   # registry packument is unavailable, so use pnpm view like the pre-walk path.
   if [[ "${DEP_UPDATER_SKIP_NPM_REGISTRY:-0}" == '1' ]]; then
-    latest_tag="$(pnpm view "$pkg" version 2>/dev/null || true)"
+    latest_tag="$(dep_runner_pnpm_view_version "pnpm view ${pkg}" "$pkg" "$scan_root" || true)"
     if [[ -z "$latest_tag" || "$latest_tag" == "$current" ]]; then
       return 1
     fi
@@ -1026,12 +1017,11 @@ npm_registry_version_published_epoch() {
     return 1
   fi
 
-  registry="$(pnpm config get registry 2>/dev/null | tr -d '[:space:]' || echo 'https://registry.npmjs.org/')"
-  [[ "$registry" != */ ]] && registry="${registry}/"
-  encoded_pkg="${pkg//@/%40}"
-  encoded_pkg="${encoded_pkg//\//%2F}"
-  body="$(curl --silent --max-time 15 "${registry}${encoded_pkg}" 2>/dev/null || true)"
-  published_iso="$(printf '%s' "$body" | jq -r --arg v "$version" '.time[$v] // empty' 2>/dev/null || true)"
+  registry="$(dep_updater_npm_registry_base)"
+  encoded_pkg="$(dep_updater_npm_encode_pkg "$pkg")"
+  body="$(dep_runner_curl_body "npm packument ${pkg}" "${registry}${encoded_pkg}" || true)"
+  published_iso="$(dep_runner_jq_string "npm publish time ${pkg}@${version}" "$body" \
+    ".time[\"${version}\"] // empty" || true)"
   if [[ -z "$published_iso" || "$published_iso" == 'null' ]]; then
     return 1
   fi
@@ -1105,8 +1095,10 @@ pypi_version_published_epoch() {
   fi
 
   encoded_pkg="${pkg//+/%2B}"
-  body="$(curl --silent --max-time 15 "https://pypi.org/pypi/${encoded_pkg}/${version}/json" 2>/dev/null || true)"
-  published_iso="$(printf '%s' "$body" | jq -r '.urls[0].upload_time // empty' 2>/dev/null || true)"
+  body="$(dep_runner_curl_body "pypi version json ${pkg}@${version}" \
+    "https://pypi.org/pypi/${encoded_pkg}/${version}/json" || true)"
+  published_iso="$(dep_runner_jq_string "pypi upload time ${pkg}@${version}" "$body" \
+    '.urls[0].upload_time // empty' || true)"
   if [[ -z "$published_iso" || "$published_iso" == 'null' ]]; then
     return 1
   fi
@@ -1176,8 +1168,8 @@ gha_release_published_epoch() {
     return 1
   fi
 
-  published_iso="$(gh api "repos/${action}/releases/tags/${ref}" \
-    --jq '.published_at // empty' 2>/dev/null || true)"
+  published_iso="$(dep_runner_gh_api_jq "gha release time ${action}@${ref}" \
+    "repos/${action}/releases/tags/${ref}" '.published_at // empty' || true)"
   if [[ -n "$published_iso" && "$published_iso" != 'null' ]]; then
     published_epoch="$(npm_parse_iso8601_to_epoch "$published_iso" 2>/dev/null || true)"
     if [[ -n "$published_epoch" ]]; then
@@ -1186,13 +1178,13 @@ gha_release_published_epoch() {
     fi
   fi
 
-  commit_sha="$(gh api "repos/${action}/git/ref/tags/${ref}" \
-    --jq '.object.sha // empty' 2>/dev/null || true)"
+  commit_sha="$(dep_runner_gh_api_jq "gha tag ref ${action}@${ref}" \
+    "repos/${action}/git/ref/tags/${ref}" '.object.sha // empty' || true)"
   if [[ -z "$commit_sha" || "$commit_sha" == 'null' ]]; then
     return 1
   fi
-  published_iso="$(gh api "repos/${action}/git/commits/${commit_sha}" \
-    --jq '.committer.date // .author.date // empty' 2>/dev/null || true)"
+  published_iso="$(dep_runner_gh_api_jq "gha commit time ${action}@${commit_sha}" \
+    "repos/${action}/git/commits/${commit_sha}" '.committer.date // .author.date // empty' || true)"
   if [[ -z "$published_iso" || "$published_iso" == 'null' ]]; then
     return 1
   fi
@@ -1239,11 +1231,10 @@ npm_registry_fetch_version_json() {
     return 0
   fi
 
-  registry="$(pnpm config get registry 2>/dev/null | tr -d '[:space:]' || echo 'https://registry.npmjs.org/')"
-  [[ "$registry" != */ ]] && registry="${registry}/"
-  encoded_pkg="${pkg//@/%40}"
-  encoded_pkg="${encoded_pkg//\//%2F}"
-  curl --silent --max-time 15 "${registry}${encoded_pkg}/${version}" 2>/dev/null || true
+  registry="$(dep_updater_npm_registry_base)"
+  encoded_pkg="$(dep_updater_npm_encode_pkg "$pkg")"
+  dep_runner_curl_body "npm version manifest ${pkg}@${version}" \
+    "${registry}${encoded_pkg}/${version}" || true
 }
 
 # npm_version_prefetch_closure <pkg> <version> [scan_root]
@@ -1282,7 +1273,7 @@ npm_version_prefetch_closure() {
       log "[pnpm] Filtering ${pkg} → ${version}: dependency ${dep}@${depver} is not published."
       return 1
     fi
-  done < <(printf '%s' "$manifest" | jq -r '
+  done < <(dep_runner_jq_string "npm manifest deps ${pkg}@${version}" "$manifest" '
     (.dependencies // {}), (.peerDependencies // {})
     | to_entries[]
     | select(.value | test("^[0-9]"))
@@ -1629,6 +1620,139 @@ dep_runner_git_rev_parse() {
   return 0
 }
 
+# dep_runner_last_stdout
+# Prints stdout from the most recent runner invocation in this session.
+dep_runner_last_stdout() {
+  local uuid
+
+  uuid="$(runner_last_id)"
+  [[ -n "$uuid" ]] || return 0
+  runner_read "$uuid" stdout 2>/dev/null || true
+}
+
+# dep_updater_npm_registry_base
+# Prints the npm registry URL with trailing slash.
+dep_updater_npm_registry_base() {
+  local registry exit_code uuid
+
+  if [[ "${DEP_UPDATER_SKIP_NPM_REGISTRY:-0}" == '1' ]]; then
+    printf '%s' 'https://registry.npmjs.org/'
+    return 0
+  fi
+
+  exit_code=0
+  runner_exec "pnpm config get registry" -- pnpm config get registry || exit_code=$?
+  uuid="$(runner_last_id)"
+  registry=""
+  if [[ -n "$uuid" ]]; then
+    registry="$(runner_read "$uuid" stdout | tr -d '[:space:]' || true)"
+  fi
+  if [[ -z "$registry" ]]; then
+    registry='https://registry.npmjs.org'
+  fi
+  [[ "$registry" != */ ]] && registry="${registry}/"
+  printf '%s' "$registry"
+}
+
+# dep_updater_npm_encode_pkg <pkg>
+dep_updater_npm_encode_pkg() {
+  local -r pkg="$1"
+  local encoded
+
+  encoded="${pkg//@/%40}"
+  encoded="${encoded//\//%2F}"
+  printf '%s' "$encoded"
+}
+
+# dep_runner_curl_http_code <label> <url>
+dep_runner_curl_http_code() {
+  local -r label="$1"
+  local -r url="$2"
+  local exit_code code
+
+  exit_code=0
+  runner_exec "$label" -- curl --silent --output /dev/null --write-out '%{http_code}' \
+    --max-time 10 "$url" || exit_code=$?
+  code="$(dep_runner_last_stdout | tr -d '[:space:]')"
+  if [[ -z "$code" ]]; then
+    code='000'
+  fi
+  printf '%s' "$code"
+  return "$exit_code"
+}
+
+# dep_runner_curl_body <label> <url>
+# Prints response body; returns curl exit code.
+dep_runner_curl_body() {
+  local -r label="$1"
+  local -r url="$2"
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" -- curl --silent --max-time 15 "$url" || exit_code=$?
+  dep_runner_last_stdout
+  return "$exit_code"
+}
+
+# dep_runner_jq_string <label> <json> <filter>
+# Prints jq -r output; returns jq exit code.
+dep_runner_jq_string() {
+  local -r label="$1"
+  local -r json="$2"
+  local -r filter="$3"
+  local tmp_json exit_code
+
+  tmp_json="$(mktemp)"
+  printf '%s' "$json" >"$tmp_json"
+  exit_code=0
+  runner_exec "$label" --stream-stdout -- jq -r "$filter" "$tmp_json" || exit_code=$?
+  rm -f "$tmp_json"
+  return "$exit_code"
+}
+
+# dep_runner_gh_api_jq <label> <endpoint> <jq-filter>
+# Prints gh api --jq output; returns gh exit code.
+dep_runner_gh_api_jq() {
+  local -r label="$1"
+  local -r endpoint="$2"
+  local -r jq_filter="$3"
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" -- gh api "$endpoint" --jq "$jq_filter" || exit_code=$?
+  dep_runner_last_stdout
+  return "$exit_code"
+}
+
+# dep_runner_gh_pr_jq <label> <pr-num> <json-fields> <jq-filter>
+dep_runner_gh_pr_jq() {
+  local -r label="$1"
+  local -r pr_num="$2"
+  local -r json_fields="$3"
+  local -r jq_filter="$4"
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" -- gh pr view "$pr_num" \
+    --repo "${repo_owner}/${repo_name}" --json "$json_fields" --jq "$jq_filter" || exit_code=$?
+  dep_runner_last_stdout
+  return "$exit_code"
+}
+
+# dep_runner_pnpm_view_version <label> <pkg> [project-root]
+dep_runner_pnpm_view_version() {
+  local -r label="$1"
+  local -r pkg="$2"
+  local -r project_root="${3:-$dir}"
+  local cmd_quoted exit_code
+
+  cmd_quoted="$(runner_quote_cmdline pnpm view "$pkg" version)"
+  exit_code=0
+  runner_sh "$label" --stream-stdout \
+    "cd $(printf '%q' "$project_root") && ${cmd_quoted}" || exit_code=$?
+  return "$exit_code"
+}
+
 # install_with_net_retry <label> <workdir> <cmd> [args…]
 # Runs <cmd> in <workdir> up to 4 times (30 / 60 / 90 s linear backoff) when
 # the output suggests a transient network error.  On success or a non-transient
@@ -1696,14 +1820,22 @@ pnpm_install_worktree() {
     args+=(--no-frozen-lockfile)
   fi
 
-  local pnpm_log pnpm_exit attempt delay p retryable
+  local pnpm_log pnpm_exit attempt delay p retryable uuid
   pnpm_log="$(mktemp)"
 
   for attempt in 1 2 3 4; do
-    set +e
-    (cd "$workdir" && pnpm "${args[@]}") >"$pnpm_log" 2>&1
-    pnpm_exit=$?
-    set -e
+    pnpm_exit=0
+    runner_sh "pnpm install attempt ${attempt}" \
+      "cd $(printf '%q' "$workdir") && $(runner_quote_cmdline pnpm "${args[@]}")" \
+      || pnpm_exit=$?
+    uuid="$(runner_last_id)"
+    : >"$pnpm_log"
+    if [[ -n "$uuid" ]]; then
+      {
+        runner_read "$uuid" stdout 2>/dev/null || true
+        runner_read "$uuid" stderr 2>/dev/null || true
+      } >"$pnpm_log"
+    fi
 
     if (( pnpm_exit == 0 )); then
       rm -f "$pnpm_log"
@@ -1889,7 +2021,13 @@ npm_repo_rel_path() {
 pnpm_in_project() {
   local -r project_root="$1"
   shift
-  (cd "$project_root" && pnpm "$@")
+  local cmd_quoted exit_code
+
+  cmd_quoted="$(runner_quote_cmdline pnpm "$@")"
+  exit_code=0
+  runner_sh "pnpm in ${project_root}" --stream-stdout \
+    "cd $(printf '%q' "$project_root") && ${cmd_quoted}" || exit_code=$?
+  return "$exit_code"
 }
 
 # ---------------------------------------------------------------------------
@@ -2840,7 +2978,7 @@ npm_outdated() {
       # source as npm_version_prefetch). When pnpm's cached view claims a version
       # strictly above registry latest, clamp to registry — otherwise take the
       # higher of the two so we still advance when pnpm is merely behind.
-      pv="$(pnpm view "$pkg" version 2>/dev/null || true)"
+      pv="$(dep_runner_pnpm_view_version "pnpm view ${pkg}" "$pkg" "$scan_root" || true)"
       reg="$(npm_registry_dist_tag_latest "$pkg" 2>/dev/null || true)"
       if [[ -n "$reg" && -n "$pv" ]]; then
         higher="$(printf '%s\n%s\n' "$reg" "$pv" | sort -V | tail -1)"
@@ -5192,7 +5330,8 @@ wait_for_ci() {
     cycles_since_mergeable_check=$(( cycles_since_mergeable_check + 1 ))
     if [[ -n "$pr_num" && $cycles_since_mergeable_check -ge $mergeable_check_interval ]]; then
       cycles_since_mergeable_check=0
-      merge_state="$(gh pr view "$pr_num" --repo "${repo_owner}/${repo_name}" --json mergeable --jq '.mergeable' 2>/dev/null || echo 'UNKNOWN')"
+      merge_state="$(dep_runner_gh_pr_jq "gh pr mergeable during CI wait" "$pr_num" mergeable '.mergeable' || true)"
+      [[ -n "$merge_state" ]] || merge_state='UNKNOWN'
       if [[ "$merge_state" == 'CONFLICTING' ]]; then
         die "PR #${pr_num} developed merge conflicts during CI wait. Rebase the stack and re-run."
       fi
@@ -5215,24 +5354,38 @@ wait_for_ci() {
 ci_run_exists_for_head() {
   local -r branch="$1"
   local -r target_sha="$2"
+  local exit_code uuid json jq_exit
 
-  gh run list --repo "${repo_owner}/${repo_name}" --branch "$branch" --limit 30 --json name,headSha 2>/dev/null \
-    | jq -e --arg sha "$target_sha" --arg names "$ci_workflow_names" \
-        'any(.[]; .headSha == $sha and ($names == "" or (.name as $n | $names | split("\n") | index($n) != null)))' >/dev/null
+  exit_code=0
+  runner_exec "gh run list for ci check" -- gh run list \
+    --repo "${repo_owner}/${repo_name}" --branch "$branch" --limit 30 --json name,headSha \
+    || exit_code=$?
+  uuid="$(runner_last_id)"
+  json="$(runner_read "$uuid" stdout 2>/dev/null || true)"
+  if [[ -z "$json" ]]; then
+    return 1
+  fi
+  jq_exit=0
+  tmp_json="$(mktemp)"
+  printf '%s' "$json" >"$tmp_json"
+  # shellcheck disable=SC2016  # jq filter uses $sha/$names variables, not shell expansion
+  runner_exec "jq ci run exists" -- jq -e --arg sha "$target_sha" --arg names "$ci_workflow_names" \
+    'any(.[]; .headSha == $sha and ($names == "" or (.name as $n | $names | split("\n") | index($n) != null)))' \
+    "$tmp_json" >/dev/null || jq_exit=$?
+  rm -f "$tmp_json"
+  return "$jq_exit"
 }
 
 ci_conclusion_for_head() {
   local -r branch="$1"
   local -r target_sha="$2"
+  local exit_code uuid json jq_filter
 
-  gh run list --repo "${repo_owner}/${repo_name}" --branch "$branch" --limit 30 --json name,headSha,status,conclusion,createdAt 2>/dev/null \
-    | jq -r --arg sha "$target_sha" --arg names "$ci_workflow_names" '
-        map(select(
+  # shellcheck disable=SC2016  # jq filter uses $sha/$names variables, not shell expansion
+  jq_filter='map(select(
           .headSha == $sha and
           ($names == "" or (.name as $n | $names | split("\n") | index($n) != null))
         ))
-        # When we know the expected workflows, require all of them to have a run
-        # before declaring success — avoids "all done" on a partial set.
         | . as $runs
         | if length == 0 then "missing"
           elif any(.[]; .conclusion == "failure" or .conclusion == "cancelled"
@@ -5240,8 +5393,24 @@ ci_conclusion_for_head() {
           elif ($names != "" and ([$names | split("\n") | .[]] | length) > ($runs | length)) then "pending"
           elif all(.[]; .conclusion != null) then "success"
           else "pending"
-          end
-      '
+          end'
+
+  exit_code=0
+  runner_exec "gh run list for ci conclusion" -- gh run list \
+    --repo "${repo_owner}/${repo_name}" --branch "$branch" --limit 30 \
+    --json name,headSha,status,conclusion,createdAt \
+    || exit_code=$?
+  uuid="$(runner_last_id)"
+  json="$(runner_read "$uuid" stdout 2>/dev/null || true)"
+  if [[ -z "$json" ]]; then
+    printf 'missing\n'
+    return 0
+  fi
+  tmp_json="$(mktemp)"
+  printf '%s' "$json" >"$tmp_json"
+  runner_exec "jq ci conclusion for head" --stream-stdout -- jq -r --arg sha "$target_sha" \
+    --arg names "$ci_workflow_names" "$jq_filter" "$tmp_json"
+  rm -f "$tmp_json"
 }
 
 ci_conclusion_for_pr() {
@@ -5271,7 +5440,8 @@ wait_for_mergeable() {
 
   log "Checking merge conflict status for PR #${pr_num}…"
   while true; do
-    state="$(gh pr view "$pr_num" --repo "${repo_owner}/${repo_name}" --json mergeable --jq '.mergeable' 2>/dev/null || echo 'UNKNOWN')"
+    state="$(dep_runner_gh_pr_jq "gh pr mergeable check" "$pr_num" mergeable '.mergeable' || true)"
+    [[ -n "$state" ]] || state='UNKNOWN'
     case "$state" in
       MERGEABLE)
         log "PR #${pr_num} is mergeable."
@@ -5305,7 +5475,8 @@ wait_for_mergeable_quick() {
 
   log "Checking merge conflict status (quick): pr=#${pr_num}"
   while true; do
-    state="$(gh pr view "$pr_num" --repo "${repo_owner}/${repo_name}" --json mergeable --jq '.mergeable' 2>/dev/null || echo 'UNKNOWN')"
+    state="$(dep_runner_gh_pr_jq "gh pr mergeable check" "$pr_num" mergeable '.mergeable' || true)"
+    [[ -n "$state" ]] || state='UNKNOWN'
     case "$state" in
       MERGEABLE)
         log "PR #${pr_num}: no merge conflicts detected."
