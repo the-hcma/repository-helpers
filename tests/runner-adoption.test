@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# Runner adoption ratchet and bootstrap/ensure scaffolding tests.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+repo_root="$(cd "${script_dir}/.." && pwd)"
+readonly repo_root
+
+baseline_file="${script_dir}/fixtures/runner-adoption-baseline.txt"
+readonly baseline_file
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/runner-adoption-count"
+
+test_init
+
+printf '\n=== static: runner-ensure and bootstrap exist ===\n'
+
+# shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars
+assert_contains 'runner-ensure sources runner' \
+  "$(cat "${repo_root}/scripts/lib/runner-ensure")" \
+  'source "${_runner_ensure_dir}/runner"'
+
+bootstrap_text="$(cat "${repo_root}/scripts/lib/runner-bootstrap")"
+assert_contains 'runner-bootstrap chains prior EXIT trap' \
+  "$bootstrap_text" '_runner_bootstrap_capture_exit_trap'
+assert_contains 'runner-bootstrap calls runner_session_end on exit' \
+  "$bootstrap_text" 'runner_session_end'
+assert_contains 'runner-bootstrap begins session' \
+  "$bootstrap_text" 'runner_session_begin'
+
+printf '\n=== static: dep-updater-notifier uses runner-bootstrap ===\n'
+
+notifier_text="$(cat "${repo_root}/scripts/dep-updater-notifier")"
+assert_contains 'notifier sources runner-bootstrap' \
+  "$notifier_text" 'lib/runner-bootstrap'
+assert_contains 'notifier calls run_command for dep-updater' \
+  "$notifier_text" 'run_command "dep-updater:'
+
+printf '\n=== behaviour: runner-bootstrap chains EXIT trap ===\n'
+
+marker_dir="$(
+  bash -c '
+    set -euo pipefail
+    marker="$(mktemp -d)"
+    prior_cleanup() { touch "${marker}/prior"; }
+    trap prior_cleanup EXIT
+    # shellcheck disable=SC1091
+    source "'"${repo_root}"'/scripts/lib/runner-bootstrap"
+    printf "%s\n" "${RUNNER_SESSION_DIR}" >"${marker}/session_path"
+    printf "%s" "${marker}"
+  '
+)"
+
+if [[ -f "${marker_dir}/prior" ]]; then
+  pass_case 'runner-bootstrap runs prior EXIT trap handler'
+else
+  fail_case 'runner-bootstrap runs prior EXIT trap handler'
+fi
+
+session_path=""
+if [[ -f "${marker_dir}/session_path" ]]; then
+  session_path="$(<"${marker_dir}/session_path")"
+fi
+if [[ -n "$session_path" && ! -d "$session_path" ]]; then
+  pass_case 'runner-bootstrap removes session directory on EXIT'
+else
+  fail_case 'runner-bootstrap removes session directory on EXIT'
+fi
+rm -rf "$marker_dir"
+
+printf '\n=== ratchet: bare external invocations match baseline ===\n'
+
+if [[ ! -f "$baseline_file" ]]; then
+  fail_case "baseline file exists at tests/fixtures/runner-adoption-baseline.txt"
+  test_summary
+  exit 1
+fi
+
+baseline_total=''
+declare -A baseline_counts=()
+while IFS=$'\t' read -r count rel_path; do
+  [[ "$count" =~ ^[0-9]+$ ]] || continue
+  [[ -n "$rel_path" ]] || continue
+  if [[ "$rel_path" == '__TOTAL__' ]]; then
+    baseline_total="$count"
+    continue
+  fi
+  baseline_counts["$rel_path"]="$count"
+done <"$baseline_file"
+
+current_total="$(rp_runner_adoption_total_count "$repo_root")"
+if [[ -n "$baseline_total" && "$current_total" -le "$baseline_total" ]]; then
+  pass_case "total bare invocations (${current_total}) is at or below baseline (${baseline_total})"
+else
+  fail_case "total bare invocations (${current_total}) exceeds baseline (${baseline_total:-?})"
+fi
+
+while IFS=$'\t' read -r current_count rel_path; do
+  [[ -n "$current_count" && -n "$rel_path" ]] || continue
+  baseline_count="${baseline_counts[$rel_path]:-}"
+  if [[ -z "$baseline_count" ]]; then
+    fail_case "new file with bare invocations needs baseline entry: ${rel_path} (${current_count})"
+    continue
+  fi
+  if [[ "$current_count" -le "$baseline_count" ]]; then
+    pass_case "bare count for ${rel_path} is at or below baseline (${current_count}<=${baseline_count})"
+  else
+    fail_case "bare count for ${rel_path} increased (${current_count}>${baseline_count})"
+  fi
+done < <(rp_runner_adoption_collect_counts "$repo_root")
+
+for rel_path in "${!baseline_counts[@]}"; do
+  current_count="$(rp_runner_adoption_count_file "$repo_root" "$rel_path")"
+  if [[ "$current_count" -eq 0 ]]; then
+    pass_case "baseline file ${rel_path} reached zero bare invocations (update baseline in follow-up PR)"
+  fi
+done
+
+printf '\n=== done ===\n'
+test_summary
