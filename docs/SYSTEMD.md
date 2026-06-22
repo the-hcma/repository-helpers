@@ -10,6 +10,30 @@ This repository ships systemd user services for daily repository maintenance:
 Both are oneshot services installed under `~/.config/systemd/user/`, with logs
 under `~/scratch/repository-helpers/`.
 
+### Timer oneshot conventions
+
+Every timer-driven oneshot in this repository follows the same pattern:
+
+1. **Timer-only activation** — the service unit has no `[Install]` section (no
+   `default.target` pull-in). Only the `.timer` unit starts the job.
+   `setup-service` enables the timer and disables any stale `default.target`
+   service symlink from older installs.
+2. **Singleton `flock`** — the entry script sources `scripts/lib/timer-singleton-lock`
+   and calls `timer_singleton_acquire_lock` before doing work. Lock files live under
+   `~/scratch/repository-helpers/` (one per service). A overlapping start exits 0
+   and appends a skip line to the service log instead of sending email.
+
+`ConditionPathExists` alone is not sufficient: it only gates scheduling and does
+not atomically claim the lock when two starts race (`Persistent` catch-up plus
+`OnCalendar`, or manual `systemctl start` during an active run). `flock` does.
+
+| Service | Lock file |
+| --- | --- |
+| `dep-updater.service` | `~/scratch/repository-helpers/dep-updater-batch.lock` |
+| `github-repo-lint.service` | `~/scratch/repository-helpers/github-repo-lint.lock` |
+
+New timer oneshots must use both conventions.
+
 Unit **templates** (with `@@REPO_DIR@@`) live in each repository's `etc/systemd/`.
 `setup-service` expands them into `~/.config/systemd/user/` and mirrors the
 expanded units under `~/.config/share/systemd-units/`.
@@ -164,6 +188,10 @@ This will:
 6. Run `scripts/on-deploy` to record the deployed commit
 7. Enable the **timer** when `dep-updater.timer` exists (not an immediate batch run)
 
+The service unit has **no `[Install]` section** — only `dep-updater.timer` starts it.
+Re-run `./scripts/setup-service` after upgrading to drop a stale
+`default.target.wants/dep-updater.service` symlink from older installs.
+
 ### Status and logs
 
 ```bash
@@ -223,6 +251,13 @@ chmod 600 ~/.config/github-repo-lint.env
 The wrapper uses `setup-service` with the `github-repo-lint` unit
 template. It does not run from `scripts/dev/start-development`; installation is
 explicit.
+
+The service unit has **no `[Install]` section** — only `github-repo-lint.timer`
+starts it (`OnCalendar=04:00`). Re-run `./scripts/setup-github-repo-lint` after
+upgrading to drop a stale `default.target.wants/github-repo-lint.service` symlink
+from older installs (that symlink caused a second run overlapping the timer).
+
+See **Timer oneshot conventions** above for the shared `flock` rule and lock paths.
 
 ### Remediate findings
 
