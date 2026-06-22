@@ -71,6 +71,50 @@ trap cleanup_tmpfiles EXIT INT TERM
 # shellcheck disable=SC1091  # shared helper sourced at runtime; CI shellcheck doesn't use -x
 source "${script_dir}/lib/runner-bootstrap"
 
+# dun_runner_jq_file <label> <file> [jq-args…]
+dun_runner_jq_file() {
+  local -r label="$1"
+  local -r file="$2"
+  shift 2
+  local exit_code
+  local out
+
+  exit_code=0
+  out="$(runner_exec_stdout "$label" -- jq "$@" "$file")" || exit_code=$?
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# dun_runner_jq_r <label> <json> <jq --raw-output filter>
+dun_runner_jq_r() {
+  local -r label="$1"
+  local -r json="$2"
+  local -r filter="$3"
+  local exit_code
+  local out
+
+  exit_code=0
+  # shellcheck disable=SC2016  # jq filter passed as bash -c positional arg
+  out="$(runner_exec_stdout "$label" -- bash -c 'printf "%s" "$2" | jq --raw-output "$1"' bash "$filter" "$json")" \
+    || exit_code=$?
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# dun_runner_exec_stdout <label> -- <cmd…>
+dun_runner_exec_stdout() {
+  local -r label="$1"
+  shift
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local exit_code out
+
+  exit_code=0
+  out="$(runner_exec_stdout "$label" -- "$@")" || exit_code=$?
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
 discover_repos() {
   local -r roots_csv="${DEP_UPDATER_NOTIFIER_ROOTS:-$default_repo_root}"
   local -r repos_csv="${DEP_UPDATER_NOTIFIER_REPOS:-}"
@@ -145,7 +189,7 @@ export TIME_LOG_ENABLED="$verbose"
 export TIME_LOG_WARN_TZ="$verbose"
 export TIME_LOG_WARN_PREFIX="WARNING:"
 
-scan_host="$(hostname -s 2>/dev/null || echo 'unknown')"
+scan_host="$(dun_runner_exec_stdout "dep-updater-notifier hostname" -- hostname --short 2>/dev/null || echo 'unknown')"
 report_lines=()
 notice_lines=()
 update_repos_paths=()
@@ -156,9 +200,10 @@ found_failure=0
 check_notifier_prereqs
 
 repos=()
-while IFS= read -r repo; do
-  repos+=("$repo")
-done < <(discover_repos | sort -u)
+_repo_discover_file="$(mktemp)"
+discover_repos >"$_repo_discover_file"
+mapfile -t repos < <(dun_runner_exec_stdout "dep-updater-notifier sort repos" -- sort --unique "$_repo_discover_file")
+rm -f "$_repo_discover_file"
 
 if (( ${#repos[@]} == 0 )); then
   found_failure=1
@@ -198,12 +243,18 @@ for repo in "${repos[@]}"; do
   fi
 
   if [[ "$verbose" == '1' ]]; then
+    pretty_json=""
     log "  json:"
-    (jq . <"$dep_out_file" 2>/dev/null || tail -n 80 "$dep_out_file") | sed 's/^/  /' >&2
+    if pretty_json="$(dun_runner_jq_file "dep-updater-notifier json pretty" "$dep_out_file" . 2>/dev/null)"; then
+      printf '%s\n' "$pretty_json" | sed 's/^/  /' >&2
+    else
+      dun_runner_exec_stdout "dep-updater-notifier tail invalid json" -- tail --lines=80 "$dep_out_file" \
+        | sed 's/^/  /' >&2
+    fi
   fi
 
   json_ok=0
-  if jq -e . <"$dep_out_file" >/dev/null 2>&1; then
+  if dun_runner_jq_file "dep-updater-notifier json validate" "$dep_out_file" --exit-status . >/dev/null 2>&1; then
     json_ok=1
   fi
 
@@ -227,7 +278,7 @@ for repo in "${repos[@]}"; do
     if (( exit_code == 0 )) && (( json_ok == 0 )); then
       append_report "dep-updater stdout (first 800 bytes, invalid JSON):"
       ohead=""
-      ohead="$(head -c 800 "$dep_out_file" 2>/dev/null || true)"
+      ohead="$(dun_runner_exec_stdout "dep-updater-notifier head invalid json" -- head --bytes=800 "$dep_out_file" 2>/dev/null || true)"
       while IFS= read -r oline || [[ -n "$oline" ]]; do
         append_report "  ${oline}"
       done <<<"$ohead"
@@ -236,8 +287,10 @@ for repo in "${repos[@]}"; do
     continue
   fi
 
-  has_updates="$(jq -r '.has_updates' <"$dep_out_file" 2>/dev/null || echo "")"
-  has_cves="$(jq -r '.has_cves' <"$dep_out_file" 2>/dev/null || echo "")"
+  has_updates="$(dun_runner_jq_file "dep-updater-notifier has_updates" "$dep_out_file" --raw-output '.has_updates' \
+    2>/dev/null || echo "")"
+  has_cves="$(dun_runner_jq_file "dep-updater-notifier has_cves" "$dep_out_file" --raw-output '.has_cves' \
+    2>/dev/null || echo "")"
 
   if [[ "$has_updates" != 'true' && "$has_cves" != 'true' ]]; then
     log "${repo_name}: up to date."
@@ -258,12 +311,12 @@ for repo in "${repos[@]}"; do
     report_lines+=("Security vulnerabilities with available fixes:")
     report_lines+=("  $(printf '%-24s  %-10s  %-10s  %s' 'PACKAGE' 'CURRENT' 'FIX' 'CVEs')")
     while IFS= read -r row; do
-      pkg="$(printf '%s' "$row" | jq -r '.package')"
-      current="$(printf '%s' "$row" | jq -r '.current')"
-      fix="$(printf '%s' "$row" | jq -r '.fix')"
-      cves="$(printf '%s' "$row" | jq -r '.cves')"
+      pkg="$(dun_runner_jq_r "dep-updater-notifier cve package" "$row" '.package')"
+      current="$(dun_runner_jq_r "dep-updater-notifier cve current" "$row" '.current')"
+      fix="$(dun_runner_jq_r "dep-updater-notifier cve fix" "$row" '.fix')"
+      cves="$(dun_runner_jq_r "dep-updater-notifier cve ids" "$row" '.cves')"
       report_lines+=("  $(printf '%-24s  %-10s  %-10s  %s' "$pkg" "$current" "$fix" "$cves")")
-    done < <(jq -c '.cves[]' <"$dep_out_file")
+    done < <(dun_runner_jq_file "dep-updater-notifier cves stream" "$dep_out_file" --compact-output '.cves[]')
     report_lines+=("")
   fi
 
@@ -282,10 +335,10 @@ for repo in "${repos[@]}"; do
     local_count=0
     local_pairs=""
     while IFS= read -r row; do
-      ecosystem="$(printf '%s' "$row" | jq -r '.ecosystem')"
-      pkg="$(printf '%s' "$row" | jq -r '.package')"
-      from="$(printf '%s' "$row" | jq -r '.from')"
-      to="$(printf '%s' "$row" | jq -r '.to')"
+      ecosystem="$(dun_runner_jq_r "dep-updater-notifier update ecosystem" "$row" '.ecosystem')"
+      pkg="$(dun_runner_jq_r "dep-updater-notifier update package" "$row" '.package')"
+      from="$(dun_runner_jq_r "dep-updater-notifier update from" "$row" '.from')"
+      to="$(dun_runner_jq_r "dep-updater-notifier update to" "$row" '.to')"
 
       ecosystems+=("$ecosystem")
       packages+=("$pkg")
@@ -296,7 +349,7 @@ for repo in "${repos[@]}"; do
       if (( local_count <= 3 )); then
         local_pairs="${local_pairs:+${local_pairs}, }${pkg} ${from}→${to}"
       fi
-    done < <(jq -c '.updates[]' <"$dep_out_file")
+    done < <(dun_runner_jq_file "dep-updater-notifier updates stream" "$dep_out_file" --compact-output '.updates[]')
 
     # Compute widths (cap PACKAGE to avoid huge lines in mail clients).
     for i in "${!ecosystems[@]}"; do
@@ -364,8 +417,8 @@ else
   body_lines+=("See each repo section below for dep-updater stderr; cron PATH is often smaller than a login shell (install tools under ~/.local/bin or widen PATH).")
 fi
 body_lines+=("")
-body_lines+=("Scanned:  $(date '+%Y-%m-%d %H:%M %z %Z')")
-body_lines+=("Host:     ${scan_host}  (user: $(id -un 2>/dev/null || echo '?'))")
+body_lines+=("Scanned:  $(dun_runner_exec_stdout "dep-updater-notifier scan timestamp" -- date '+%Y-%m-%d %H:%M %z %Z')")
+body_lines+=("Host:     ${scan_host}  (user: $(dun_runner_exec_stdout "dep-updater-notifier user id" -- id --user --name 2>/dev/null || echo '?'))")
 body_lines+=("Script:   ${BASH_SOURCE[0]}")
 body_lines+=("dep-updater: ${dep_updater}")
 body_lines+=("")
@@ -400,8 +453,8 @@ fi
 # Build a MIME multipart/alternative email so the HTML part can use a
 # monospace <pre> block, preserving column alignment in the report table.
 # Plain-text is kept as the first (fallback) part for clients that prefer it.
-boundary="dep-updater-$(date +%s%N | md5sum | head -c16)"
-html_body="$(printf '%s' "$body" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')"
+boundary="dep-updater-$(dun_runner_exec_stdout "dep-updater-notifier mime boundary" -- bash -c 'date +%s%N | md5sum | head --bytes=16')"
+html_body="$(dun_runner_exec_stdout "dep-updater-notifier html escape" -- sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' <<<"$body")"
 
 {
   printf 'To: %s\n' "$email_to"

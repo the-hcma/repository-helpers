@@ -214,12 +214,12 @@ stack_needs_rebase() {
     die "Could not read Graphite state (empty output from 'gt state')."
   fi
 
-  if ! printf '%s' "$gt_state_json" | jq -e . >/dev/null 2>&1; then
+  if ! dep_runner_jq_with_args "dep-updater gt state validate" "$gt_state_json" -e . >/dev/null 2>&1; then
     die "Could not parse Graphite state JSON from 'gt state'."
   fi
 
-  if printf '%s' "$gt_state_json" \
-    | jq -e --arg csv "$branches_csv" '
+  # shellcheck disable=SC2016  # jq filter uses $csv variable, not shell expansion
+  if dep_runner_jq_with_args "dep-updater gt state needs restack" "$gt_state_json" -e --arg csv "$branches_csv" '
         ($csv | split(",") | map(select(length > 0))) as $branches
         | any($branches[]; (. [.]?.needs_restack // false) == true)
       ' >/dev/null; then
@@ -231,19 +231,19 @@ stack_needs_rebase() {
 log_stack_rebase_context() {
   local branches_csv current_branch gt_state_json needs_restack_lines
   branches_csv="$(state_get "branches")"
-  current_branch="$(git -C "$worktree_path" branch --show-current 2>/dev/null || true)"
+  current_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current 2>/dev/null || true)"
   gt_state_json="$(run_in_worktree gt state 2>/dev/null || true)"
 
   if [[ -z "$gt_state_json" ]]; then
     die "Could not read Graphite state for rebase diagnostics (empty output from 'gt state')."
   fi
 
-  if ! printf '%s' "$gt_state_json" | jq -e . >/dev/null 2>&1; then
+  if ! dep_runner_jq_with_args "dep-updater gt state validate rebase ctx" "$gt_state_json" -e . >/dev/null 2>&1; then
     die "Could not parse Graphite state JSON for rebase diagnostics."
   fi
 
-  needs_restack_lines="$(printf '%s' "$gt_state_json" \
-    | jq -r --arg csv "$branches_csv" '
+  # shellcheck disable=SC2016  # jq filter uses $csv variable, not shell expansion
+  needs_restack_lines="$(dep_runner_jq_with_args "dep-updater gt state restack lines" "$gt_state_json" -r --arg csv "$branches_csv" '
         ($csv | split(",") | map(select(length > 0))) as $branches
         | [
             $branches[] as $b
@@ -274,10 +274,10 @@ log_stack_rebase_context() {
     local first_branch left_only right_only
     first_branch="$(cut -d',' -f1 <<< "$branches_csv")"
     if [[ -n "$first_branch" ]] \
-      && git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${first_branch}" \
-      && git -C "$worktree_path" show-ref --verify --quiet "refs/remotes/origin/main"; then
-      left_only="$(git -C "$worktree_path" rev-list --left-only --count "${first_branch}...origin/main" 2>/dev/null || echo 0)"
-      right_only="$(git -C "$worktree_path" rev-list --right-only --count "${first_branch}...origin/main" 2>/dev/null || echo 0)"
+      && run_command "git worktree" git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${first_branch}" \
+      && run_command "git worktree" git -C "$worktree_path" show-ref --verify --quiet "refs/remotes/origin/main"; then
+      left_only="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-list --left-only --count "${first_branch}...origin/main" 2>/dev/null || echo 0)"
+      right_only="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-list --right-only --count "${first_branch}...origin/main" 2>/dev/null || echo 0)"
       log "  reason (commit delta):"
       log "    - commits on stack base not on origin/main: ${left_only}"
       log "    - commits on origin/main not on stack base: ${right_only}"
@@ -325,18 +325,18 @@ _worktree_commit() {
   local -r msg="$1"
   local -a sign_flags=()
   local gpg_sign gpg_format sign_key
-  gpg_sign="$(git -C "$dir" config --bool commit.gpgsign 2>/dev/null || echo 'false')"
+  gpg_sign="$(dep_runner_git_c_stdout "git repo" "$dir" -- config --bool commit.gpgsign 2>/dev/null || echo 'false')"
   if [[ "$gpg_sign" == 'true' ]]; then
     sign_flags+=('-c' 'commit.gpgsign=true')
-    gpg_format="$(git -C "$dir" config gpg.format 2>/dev/null || true)"
+    gpg_format="$(dep_runner_git_c_stdout "git repo" "$dir" -- config gpg.format 2>/dev/null || true)"
     [[ -n "$gpg_format" ]] && sign_flags+=('-c' "gpg.format=${gpg_format}")
-    sign_key="$(git -C "$dir" config commit.signingkey 2>/dev/null || true)"
+    sign_key="$(dep_runner_git_c_stdout "git repo" "$dir" -- config commit.signingkey 2>/dev/null || true)"
     [[ -n "$sign_key" ]] && sign_flags+=('-c' "commit.signingkey=${sign_key}")
     log "[commit] GPG signing enabled (format: ${gpg_format:-default}, key: ${sign_key:-(from agent)})"
   else
     log "[commit] GPG signing disabled"
   fi
-  git -C "$worktree_path" "${sign_flags[@]}" commit -m "$msg"
+  run_command "git worktree" git -C "$worktree_path" "${sign_flags[@]}" commit -m "$msg"
 }
 
 # ---------------------------------------------------------------------------
@@ -388,7 +388,7 @@ _on_signal() {
 
 init_repo_api_context() {
   local remote_url
-  remote_url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+  remote_url="$(dep_runner_git_c_stdout "git repo" "$dir" -- remote get-url origin 2>/dev/null || true)"
   if [[ -z "$remote_url" ]]; then
     die "Could not resolve git remote 'origin' from: $dir"
   fi
@@ -409,7 +409,7 @@ gh_pr_number_for_branch() {
   local -r branch="$1"
   # Filter by state=open and the dep-updater label so closed/merged PRs from
   # previous runs are never confused with the current run's PR.
-  gh api "repos/${repo_owner}/${repo_name}/pulls" \
+  dep_runner_gh_stdout "gh api" -- api "repos/${repo_owner}/${repo_name}/pulls" \
     --method GET \
     -f state=open \
     -f head="${repo_owner}:${branch}" \
@@ -422,7 +422,7 @@ gh_pr_number_for_branch() {
 # Must not filter by label — the PR was just created and has no labels yet.
 gh_pr_number_for_new_branch() {
   local -r branch="$1"
-  gh pr view "$branch" --repo "${repo_owner}/${repo_name}" \
+  dep_runner_gh_stdout "gh pr" -- pr view "$branch" --repo "${repo_owner}/${repo_name}" \
     --json number --jq '.number' 2>/dev/null || true
 }
 
@@ -448,13 +448,13 @@ wait_for_pr_number_for_new_branch() {
 
 gh_pr_head_ref_for_number() {
   local -r pr_number="$1"
-  gh pr view "$pr_number" --repo "${repo_owner}/${repo_name}" \
+  dep_runner_gh_stdout "gh pr" -- pr view "$pr_number" --repo "${repo_owner}/${repo_name}" \
     --json headRefName --jq '.headRefName // empty' 2>/dev/null || true
 }
 
 gh_pr_head_sha_for_number() {
   local -r pr_number="$1"
-  gh pr view "$pr_number" --repo "${repo_owner}/${repo_name}" \
+  dep_runner_gh_stdout "gh pr" -- pr view "$pr_number" --repo "${repo_owner}/${repo_name}" \
     --json headRefOid --jq '.headRefOid // empty' 2>/dev/null || true
 }
 
@@ -477,7 +477,7 @@ gh_pr_number_resolve_for_gate() {
 
 gh_pr_state_for_number() {
   local -r pr_number="$1"
-  gh api "repos/${repo_owner}/${repo_name}/pulls/${pr_number}" \
+  dep_runner_gh_stdout "gh api" -- api "repos/${repo_owner}/${repo_name}/pulls/${pr_number}" \
     --jq '.state // empty' 2>/dev/null || true
 }
 
@@ -492,15 +492,13 @@ gh_pr_merged_for_number() {
 
 add_merge_it_label() {
   local -r pr_number="$1"
-  gh api "repos/${repo_owner}/${repo_name}/issues/${pr_number}/labels" \
+  dep_runner_gh "gh api merge-it label" -- api "repos/${repo_owner}/${repo_name}/issues/${pr_number}/labels" \
     --method POST \
     -f labels[]=merge-it >/dev/null
   # my-tracks uses Graphite's multi-partition merge queue, which requires the
   # 'merge-mq' label (in addition to 'merge-it') to enqueue a PR.
-  # my-tracks uses Graphite's multi-partition merge queue, which requires the
-  # 'merge-mq' label (in addition to 'merge-it') to enqueue a PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
-    gh api "repos/${repo_owner}/${repo_name}/issues/${pr_number}/labels" \
+    dep_runner_gh "gh api merge-mq label" -- api "repos/${repo_owner}/${repo_name}/issues/${pr_number}/labels" \
       --method POST \
       -f labels[]=merge-mq >/dev/null 2>/dev/null || true
   fi
@@ -510,7 +508,7 @@ add_merge_it_label() {
 pr_has_merge_it_label() {
   local -r pr_number="$1"
   local raw
-  raw="$(gh api "repos/${repo_owner}/${repo_name}/issues/${pr_number}" \
+  raw="$(dep_runner_gh_stdout "gh api" -- api "repos/${repo_owner}/${repo_name}/issues/${pr_number}" \
     --jq 'any(.labels[]?; .name == "merge-it")' 2>/dev/null || true)"
   case "$raw" in
     true|false) printf '%s' "$raw" ;;
@@ -572,13 +570,13 @@ Primary clone (--dir):
   When a run finishes, a clean primary clone is switched back to main automatically.
 
 Supported ecosystems:
-  npm           package.json present  → pnpm outdated + pnpm update
-  uv            uv.lock present       → uv pip list --outdated + uv add
-  poetry        poetry.lock present   → poetry show --outdated + poetry add
-  pipenv        Pipfile.lock present  → pipenv run pip list + pipenv install
-  pip           requirements.txt or pyproject.toml → pip list + pip freeze
+  [npm]         package.json present  → pnpm outdated + pnpm update
+  [uv]          uv.lock present       → uv pip list --outdated + uv add
+  [poetry]      poetry.lock present   → poetry show --outdated + poetry add
+  [pipenv]      Pipfile.lock present  → pipenv run pip list + pipenv install
+  [pip]         requirements.txt or pyproject.toml → pip list + pip freeze
   rust          Cargo.toml present  → cargo outdated + cargo add
-  gha             .github/workflows/*.yml present  → gh api releases/latest + sed patch
+  [gha]         .github/workflows/*.yml present  → gh api releases/latest + sed patch
 USAGE
 }
 
@@ -707,7 +705,7 @@ parse_args() {
     if [[ -n "$dir" ]]; then
       resolved_dir="$(cd "$dir" && pwd)"
     else
-      resolved_dir="$(git rev-parse --show-toplevel 2>/dev/null)" \
+      resolved_dir="$(dep_runner_git_stdout "git rev-parse" -- rev-parse --show-toplevel 2>/dev/null)" \
         || die "Not inside a git repository and --dir was not specified."
     fi
     dir="$resolved_dir"
@@ -784,7 +782,8 @@ check_core_prereqs() {
 pnpm_output_has_ignored_builds() {
   local -r output_file="$1"
   [[ -f "$output_file" ]] || return 1
-  rg -q 'ERR_PNPM_IGNORED_BUILDS|pnpm approve-builds|approve-builds' "$output_file"
+  dep_runner_rg "pnpm ignored builds marker" -- --quiet \
+    'ERR_PNPM_IGNORED_BUILDS|pnpm approve-builds|approve-builds' "$output_file"
 }
 
 pnpm_record_ignored_build_pkgs() {
@@ -1370,7 +1369,9 @@ npm_lines_to_updates_json() {
     [[ -z "$line" ]] && continue
     read -r pkg _cur latest <<<"$line"
     [[ -z "$pkg" || -z "$latest" ]] && continue
-    updates="$(printf '%s' "$updates" | jq --arg k "$pkg" --arg v "$latest" '. + {($k): $v}')"
+    # shellcheck disable=SC2016  # jq row accumulator uses jq variables, not shell expansion
+    updates="$(dep_runner_jq_with_args "npm lines to updates json" "$updates" \
+      --arg k "$pkg" --arg v "$latest" '. + {($k): $v}')"
   done
   printf '%s' "$updates"
 }
@@ -1502,7 +1503,7 @@ dep_updater_handle_ci_failure() {
 
   log "PR #${pr_num} failed CI: ${summary}"
   comment="Closed by dep-updater: CI failed (${summary}). Re-run to create a fresh update."
-  gh pr close "$pr_num" \
+  dep_runner_gh_stdout "gh pr" -- pr close "$pr_num" \
     --repo "${repo_owner}/${repo_name}" \
     --comment "$comment" \
     2>/dev/null || true
@@ -1530,8 +1531,8 @@ dep_updater_write_batch_child_report_json() {
   fi
 
   if [[ -n "${DEP_UPDATER_ECO_FAIL_FILE:-}" && -s "${DEP_UPDATER_ECO_FAIL_FILE}" ]]; then
-    details_json="$(jq -Rs 'split("\n") | map(select(length > 0))' \
-      "${DEP_UPDATER_ECO_FAIL_FILE}" 2>/dev/null || true)"
+    details_json="$(dep_runner_jq_file_args "dep-updater batch child report details" \
+      "${DEP_UPDATER_ECO_FAIL_FILE}" -Rs 'split("\n") | map(select(length > 0))' 2>/dev/null || true)"
     [[ -z "$details_json" ]] && details_json='[]'
     if [[ -z "$primary" ]]; then
       primary="$(head -n 1 "${DEP_UPDATER_ECO_FAIL_FILE}" 2>/dev/null || true)"
@@ -1542,15 +1543,17 @@ dep_updater_write_batch_child_report_json() {
     primary="dep-updater exited with code ${exit_code}"
   elif [[ "$primary" == "dep-updater exited with code ${exit_code}" ]] \
     && [[ "$details_json" != '[]' ]]; then
-    primary="$(jq -r '.[0] // empty' <<<"$details_json" 2>/dev/null || true)"
+    primary="$(dep_runner_jq_with_args "dep-updater batch child report primary" "$details_json" -r '.[0] // empty' 2>/dev/null || true)"
     [[ -z "$primary" ]] && primary="dep-updater exited with code ${exit_code}"
   fi
 
   if [[ -n "${_last_ci_failure_summary:-}" ]]; then
-    ci_failure_json="$(jq -n --arg s "$_last_ci_failure_summary" '$s')"
+    # shellcheck disable=SC2016  # jq -n filter uses $s variable, not shell expansion
+    ci_failure_json="$(dep_runner_jq_n "dep-updater batch child ci failure" --arg s "$_last_ci_failure_summary" '$s')"
   fi
 
-  jq -n \
+  # shellcheck disable=SC2016  # jq -n object template uses jq variables, not shell expansion
+  if ! dep_runner_jq_n "dep-updater batch child report emit" \
     --argjson exit_code "$exit_code" \
     --arg dir "$dir" \
     --arg primary "$primary" \
@@ -1559,13 +1562,16 @@ dep_updater_write_batch_child_report_json() {
     --arg capture_stderr "$capture_stderr" \
     --arg capture_stdout "$capture_stdout" \
     '{exit_code: $exit_code, dir: $dir, primary: $primary, details: $details, ci_failure: $ci_failure, capture_stderr: $capture_stderr, capture_stdout: $capture_stdout}' \
-    >"$out_file" 2>/dev/null \
-    || jq -n --argjson exit_code "$exit_code" --arg primary "$primary" \
-         --argjson ci_failure "${ci_failure_json}" \
-         --arg capture_stderr "$capture_stderr" \
-         --arg capture_stdout "$capture_stdout" \
-         '{exit_code: $exit_code, dir: "", primary: $primary, details: [], ci_failure: $ci_failure, capture_stderr: $capture_stderr, capture_stdout: $capture_stdout}' \
-         >"$out_file" 2>/dev/null || true
+    >"$out_file" 2>/dev/null; then
+    # shellcheck disable=SC2016  # jq -n fallback object uses jq variables, not shell expansion
+    dep_runner_jq_n "dep-updater batch child report emit fallback" \
+      --argjson exit_code "$exit_code" --arg primary "$primary" \
+      --argjson ci_failure "${ci_failure_json}" \
+      --arg capture_stderr "$capture_stderr" \
+      --arg capture_stdout "$capture_stdout" \
+      '{exit_code: $exit_code, dir: "", primary: $primary, details: [], ci_failure: $ci_failure, capture_stderr: $capture_stderr, capture_stdout: $capture_stdout}' \
+      >"$out_file" 2>/dev/null || true
+  fi
 }
 
 # When batch-all sets DEP_UPDATER_RUN_REPORT, emit structured failure JSON before
@@ -1598,7 +1604,7 @@ dep_updater_runner_realpath() {
     fi
     return 1
   fi
-  realpath "$path" 2>/dev/null
+  return 1
 }
 
 # dep_runner_git_rev_parse <label> <git-dir> <ref>
@@ -1618,6 +1624,75 @@ dep_runner_git_rev_parse() {
   out="$(runner_read "$uuid" stdout 2>/dev/null || true)"
   printf '%s' "$out"
   return 0
+}
+
+# dep_runner_git_c_stdout <label> <git-dir> -- <git-args…>
+dep_runner_git_c_stdout() {
+  local -r label="$1"
+  local -r git_dir="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local exit_code out
+
+  exit_code=0
+  out="$(runner_exec_stdout "$label" -- git -C "$git_dir" "$@")" || exit_code=$?
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# dep_runner_gh_stdout <label> -- <gh-args…>
+dep_runner_gh_stdout() {
+  local -r label="$1"
+  shift
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local exit_code out
+
+  exit_code=0
+  out="$(runner_exec_stdout "$label" -- gh "$@")" || exit_code=$?
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# dep_runner_gh <label> -- <gh-args…>
+dep_runner_gh() {
+  local -r label="$1"
+  shift
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" -- gh "$@" || exit_code=$?
+  return "$exit_code"
+}
+
+# dep_runner_git_stdout <label> -- <git-args…>
+dep_runner_git_stdout() {
+  local -r label="$1"
+  shift
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local exit_code out
+
+  exit_code=0
+  out="$(runner_exec_stdout "$label" -- git "$@")" || exit_code=$?
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# dep_runner_rg <label> -- <rg-args…>
+dep_runner_rg() {
+  local -r label="$1"
+  shift
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" -- rg "$@" || exit_code=$?
+  return "$exit_code"
 }
 
 # dep_runner_last_stdout
@@ -1707,6 +1782,48 @@ dep_runner_jq_string() {
   exit_code=0
   runner_exec "$label" --stream-stdout -- jq -r "$filter" "$tmp_json" || exit_code=$?
   rm -f "$tmp_json"
+  return "$exit_code"
+}
+
+# dep_runner_jq_with_args <label> <json> [jq-args…]
+# Runs jq on a JSON string; prints jq stdout; returns jq exit code.
+dep_runner_jq_with_args() {
+  local -r label="$1"
+  local -r json="$2"
+  shift 2
+  local tmp_json exit_code out
+
+  tmp_json="$(mktemp)"
+  printf '%s' "$json" >"$tmp_json"
+  exit_code=0
+  out="$(runner_exec_stdout "$label" -- jq "$@" "$tmp_json")" || exit_code=$?
+  rm -f "$tmp_json"
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# dep_runner_jq_file_args <label> <file> [jq-args…]
+dep_runner_jq_file_args() {
+  local -r label="$1"
+  local -r file="$2"
+  shift 2
+  local exit_code out
+
+  exit_code=0
+  out="$(runner_exec_stdout "$label" -- jq "$@" "$file")" || exit_code=$?
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# dep_runner_jq_n <label> [jq -n args…]
+dep_runner_jq_n() {
+  local -r label="$1"
+  shift
+  local exit_code out
+
+  exit_code=0
+  out="$(runner_exec_stdout "$label" -- jq -n "$@")" || exit_code=$?
+  printf '%s' "$out"
   return "$exit_code"
 }
 
@@ -1932,7 +2049,8 @@ check_auth_prereqs() {
   log "[auth]"
 
   local gh_user
-  if ! gh_user="$(gh auth status 2>&1 | grep -oP '(?<=account )\S+' | head -1)"; then
+  if ! gh_user="$(runner_sh_stdout "gh auth account" \
+      'gh auth status 2>&1 | grep -oP "(?<=account )\S+" | head -1')"; then
     die "'gh' is not authenticated. Run: gh auth login"
   fi
   if [[ -z "$gh_user" ]]; then
@@ -1941,7 +2059,7 @@ check_auth_prereqs() {
   log "  gh: logged in as ${gh_user}"
 
   local gt_out
-  if ! gt_out="$(gt auth 2>&1)"; then
+  if ! gt_out="$(runner_sh_stdout "gt auth status" 'gt auth 2>&1')"; then
     die "'gt' is not authenticated. Run: gt auth"
   fi
   local gt_user
@@ -1955,7 +2073,7 @@ check_auth_prereqs() {
   # Reconfigure git's credential helper to point at the gh binary currently in
   # PATH (idempotent). This fixes stale absolute paths like /usr/bin/gh that
   # were written when gh was first installed at a different location.
-  gh auth setup-git
+  dep_runner_gh "gh auth" -- auth setup-git
   log "  git credential helper: updated to current gh path"
 }
 
@@ -2045,7 +2163,7 @@ detect_ecosystem() {
   # Prefer origin/main manifests when available so detection matches what we scan
   # and bump (feature branches may lack lockfiles or workflows that exist on main).
   local detect_ref="worktree"
-  git -C "$dir" fetch origin main 2>/dev/null || true
+  run_command "git repo" git -C "$dir" fetch origin main 2>/dev/null || true
   if git -C "$dir" rev-parse origin/main >/dev/null 2>&1; then
     detect_ref="origin/main"
   fi
@@ -2053,7 +2171,7 @@ detect_ecosystem() {
   _repo_file_exists() {
     local rel="$1"
     if [[ "$detect_ref" == "origin/main" ]]; then
-      git -C "$dir" cat-file -e "origin/main:${rel}" 2>/dev/null
+      run_command "git repo" git -C "$dir" cat-file -e "origin/main:${rel}" 2>/dev/null
     else
       [[ -f "$dir/${rel}" ]]
     fi
@@ -2066,8 +2184,8 @@ detect_ecosystem() {
       prefixed="${npm_project_prefix}/${f}"
     fi
     if [[ "$detect_ref" == "origin/main" ]]; then
-      git -C "$dir" cat-file -e "origin/main:${prefixed}" 2>/dev/null \
-        || git -C "$dir" ls-tree --name-only origin/main -- "$prefixed" 2>/dev/null \
+      run_command "git cat-file lockfile" git -C "$dir" cat-file -e "origin/main:${prefixed}" 2>/dev/null \
+        || dep_runner_git_c_stdout "git ls-tree lockfile" "$dir" -- ls-tree --name-only origin/main -- "$prefixed" 2>/dev/null \
           | grep -q .
     else
       [[ -f "$dir/${prefixed}" ]]
@@ -2095,7 +2213,7 @@ detect_ecosystem() {
             nested_count=$((nested_count + 1))
             nested_parent="$top_entry"
           fi
-        done < <(git -C "$dir" ls-tree --name-only origin/main 2>/dev/null || true)
+        done < <(dep_runner_git_c_stdout "git ls-tree root entries" "$dir" -- ls-tree --name-only origin/main 2>/dev/null || true)
       else
         shopt -s nullglob
         for child_pkg in "$dir"/*/package.json; do
@@ -2297,12 +2415,12 @@ warn_if_dirty_workdir() {
 }
 
 primary_repo_current_branch() {
-  git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || true
+  run_command "git repo" git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || true
 }
 
 primary_repo_worktree_is_clean() {
-  git -C "$dir" diff --quiet 2>/dev/null \
-    && git -C "$dir" diff --cached --quiet 2>/dev/null
+  run_command "git repo" git -C "$dir" diff --quiet 2>/dev/null \
+    && run_command "git repo" git -C "$dir" diff --cached --quiet 2>/dev/null
 }
 
 primary_repo_warn_if_not_main() {
@@ -2543,9 +2661,9 @@ primary_repo_snapshot() {
   fi
   _primary_snapshot_taken=1
   _pri_reset_hard=0
-  _pri_main_sha="$(git -C "$dir" rev-parse refs/heads/main 2>/dev/null || true)"
-  _pri_head_sha="$(git -C "$dir" rev-parse HEAD)"
-  _pri_head_symref="$(git -C "$dir" symbolic-ref -q HEAD 2>/dev/null || true)"
+  _pri_main_sha="$(dep_runner_git_c_stdout "git repo" "$dir" -- rev-parse refs/heads/main 2>/dev/null || true)"
+  _pri_head_sha="$(dep_runner_git_c_stdout "git repo" "$dir" -- rev-parse HEAD)"
+  _pri_head_symref="$(dep_runner_git_c_stdout "git repo" "$dir" -- symbolic-ref -q HEAD 2>/dev/null || true)"
 }
 
 primary_repo_restore() {
@@ -2556,15 +2674,15 @@ primary_repo_restore() {
   snapshot_was_taken=1
   _primary_snapshot_taken=0
   if [[ -n "$_pri_main_sha" ]]; then
-    git -C "$dir" update-ref refs/heads/main "$_pri_main_sha" >/dev/null 2>&1 \
+    run_command "git repo" git -C "$dir" update-ref refs/heads/main "$_pri_main_sha" >/dev/null 2>&1 \
       || log "[worktree] Note: could not restore refs/heads/main on primary clone."
   fi
   if [[ "$_pri_reset_hard" == '1' && -n "$_pri_head_sha" ]]; then
     if [[ -n "$_pri_head_symref" ]]; then
-      git -C "$dir" checkout "${_pri_head_symref#refs/heads/}" >/dev/null 2>&1 \
+      run_command "git repo" git -C "$dir" checkout "${_pri_head_symref#refs/heads/}" >/dev/null 2>&1 \
         || log "[worktree] Note: could not checkout primary clone branch after restore."
     fi
-    git -C "$dir" reset --hard "$_pri_head_sha" >/dev/null 2>&1 \
+    run_command "git repo" git -C "$dir" reset --hard "$_pri_head_sha" >/dev/null 2>&1 \
       || log "[worktree] Note: could not reset primary clone working tree after restore."
   fi
   # Dry-run exercises the worktree lifecycle only; do not move the primary clone
@@ -2646,7 +2764,7 @@ create_worktree() {
       # with "trunk branch is out of date". git update-ref is used instead of
       # `git branch -f` because `main` is typically checked out in the primary
       # clone and `git branch -f` refuses to move a checked-out branch.
-      git -C "$dir" update-ref refs/heads/main "$main_sha" >/dev/null 2>&1
+      run_command "git repo" git -C "$dir" update-ref refs/heads/main "$main_sha" >/dev/null 2>&1
       # Also update the working tree when main is checked out and clean.
       # Without this, update-ref fast-forwards the branch pointer but leaves the
       # working tree at the old commit, making it appear dirty relative to HEAD.
@@ -2742,7 +2860,7 @@ create_worktree() {
 
 offer_worktree_reset() {
   local current_branch
-  current_branch="$(git -C "$worktree_path" branch --show-current 2>/dev/null || echo '(detached)')"
+  current_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current 2>/dev/null || echo '(detached)')"
 
   local branches_csv
   branches_csv="$(state_get "branches")"
@@ -2760,7 +2878,7 @@ offer_worktree_reset() {
 
   # Remove the broken worktree
   log "[worktree] Removing worktree: $worktree_path"
-  git -C "$dir" worktree remove --force "$worktree_path" 2>/dev/null \
+  run_command "git repo" git -C "$dir" worktree remove --force "$worktree_path" 2>/dev/null \
     || log "Note: worktree directory already removed."
 
   # Delete the throwaway wt_base_branch (it has no PRs stacked on it)
@@ -2768,7 +2886,7 @@ offer_worktree_reset() {
   wt_branch="$(state_get "wt_branch")"
   if [[ -n "$wt_branch" ]]; then
     log "[worktree] Deleting branch: $wt_branch"
-    git -C "$dir" branch -D "$wt_branch" 2>/dev/null \
+    run_command "git repo" git -C "$dir" branch -D "$wt_branch" 2>/dev/null \
       || log "Note: wt_branch '${wt_branch}' not found; skipping deletion."
   fi
 
@@ -2785,7 +2903,7 @@ offer_worktree_reset() {
 prepare_worktree() {
   # Best-effort cleanup: if the repo has stale worktree metadata, prune it so
   # subsequent worktree operations don’t fail.
-  git -C "$dir" worktree prune >/dev/null 2>&1 || true
+  run_command "git repo" git -C "$dir" worktree prune >/dev/null 2>&1 || true
 
   local existing_wt=""
   if [[ -f "$state_file" ]]; then
@@ -2814,13 +2932,13 @@ prepare_worktree() {
       # If the worktree has a detached HEAD (legacy worktree or stale state),
       # create a named branch so gt can operate — it refuses detached HEAD.
       local wt_current_branch
-      wt_current_branch="$(git -C "$worktree_path" branch --show-current)"
+      wt_current_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current)"
       if [[ -z "$wt_current_branch" ]]; then
         local wt_ts wt_pid
         wt_ts="$(time_log_date_utc '%Y%m%dT%H%M%S')"
         wt_pid="$$"
         wt_base_branch="dep-updater-wt-${wt_ts}-${wt_pid}"
-        git -C "$worktree_path" checkout -b "$wt_base_branch"
+        run_command "git worktree" git -C "$worktree_path" checkout -b "$wt_base_branch"
         state_set "wt_branch" "$wt_base_branch"
         log "Attached detached HEAD to new branch: $wt_base_branch"
         # Register the new branch with Graphite so gt create can stack on top of it.
@@ -2842,7 +2960,7 @@ prepare_worktree() {
       readonly worktree_path
 
       # Fetch latest main in case upstream has moved
-      git -C "$worktree_path" fetch origin main >/dev/null 2>&1 \
+      run_command "git worktree" git -C "$worktree_path" fetch origin main >/dev/null 2>&1 \
         || log "Note: could not fetch latest main; stack may be behind."
       
       # Check if stack needs rebase using Graphite's status
@@ -2867,7 +2985,7 @@ prepare_worktree() {
 
 ensure_gt_tracked() {
   local current_branch
-  current_branch="$(git -C "$worktree_path" branch --show-current)"
+  current_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current)"
   # On main — always known to Graphite; nothing to track.
   if [[ "$current_branch" == 'main' ]]; then
     return 0
@@ -2883,7 +3001,7 @@ ensure_gt_tracked() {
 
 branch_exists_in_worktree() {
   local -r branch="$1"
-  git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${branch}"
+  run_command "git worktree" git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${branch}"
 }
 
 register_existing_branch_state() {
@@ -3205,7 +3323,7 @@ npm_update_group() {
     existing_pr="$(gh_pr_number_for_branch "$branch")"
     if [[ -z "$existing_pr" ]]; then
       log "Branch ${branch} has no PR — submitting now."
-      git -C "$worktree_path" checkout "$branch"
+      run_command "git worktree" git -C "$worktree_path" checkout "$branch"
       run_in_worktree gt track -p main 2>/dev/null || true
       run_in_worktree gt submit --no-interactive --publish --no-stack
       existing_pr="$(gh_pr_number_for_branch "$branch")"
@@ -3214,7 +3332,7 @@ npm_update_group() {
       fi
     fi
     # Position worktree on this branch so the next update stacks on top of it.
-    git -C "$worktree_path" checkout "$branch"
+    run_command "git worktree" git -C "$worktree_path" checkout "$branch"
     return 0
   fi
 
@@ -3250,7 +3368,7 @@ npm_update_group() {
     yarn) lockfile="yarn.lock" ;;
     npm)  lockfile="package-lock.json" ;;
   esac
-  git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+  run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
   if [[ "$npm_tool" == 'npm' ]]; then
     # For npm, delete the lockfile rather than restoring it.  The committed
     # lockfile pins old versions; restoring it causes npm to read those pins
@@ -3258,7 +3376,7 @@ npm_update_group() {
     # With no lockfile, npm builds a fresh resolution tree from package.json.
     rm -f "${npm_root}/package-lock.json"
   else
-    git -C "$worktree_path" checkout -- "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
+    run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
   fi
 
   # Remove any stale node_modules left by a previous failed npm run.
@@ -3331,14 +3449,14 @@ npm_update_group() {
         if [[ "$pnpm_rc" -eq 2 ]]; then
           # A version in this group is not available on the registry — restore
           # manifests and skip the group so other packages can still update.
-          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
-          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path pnpm-lock.yaml)" 2>/dev/null || true
+          run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+          run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path pnpm-lock.yaml)" 2>/dev/null || true
           log "[${npm_tool}] WARNING: ${group_key}: skipping — one or more versions not available in registry."
           dep_updater_append_ecosystem_failure "npm|${group_key}: version not in registry (pnpm ERR_PNPM_NO_MATCHING_VERSION)"
           return 0
         elif [[ "$pnpm_rc" -ne 0 ]]; then
-          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
-          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path pnpm-lock.yaml)" 2>/dev/null || true
+          run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+          run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path pnpm-lock.yaml)" 2>/dev/null || true
           dep_updater_append_ecosystem_failure "npm|pnpm install failed for ${group_key} (exit ${pnpm_rc})"
           log "[${npm_tool}] ERROR: pnpm install failed for '${group_key}' (exit ${pnpm_rc}) — skipping group."
           return 0
@@ -3349,8 +3467,8 @@ npm_update_group() {
       local yarn_rc=0
       yarn --cwd "$npm_root" upgrade "${pkg_args[@]}" --latest || yarn_rc=$?
       if [[ "$yarn_rc" -ne 0 ]]; then
-        git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
-        git -C "$worktree_path" checkout -- "$(npm_repo_rel_path yarn.lock)" 2>/dev/null || true
+        run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+        run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path yarn.lock)" 2>/dev/null || true
         dep_updater_append_ecosystem_failure "npm|yarn upgrade failed for ${group_key} (exit ${yarn_rc})"
         log "[${npm_tool}] ERROR: yarn upgrade failed for '${group_key}' (exit ${yarn_rc}) — skipping group."
         return 0
@@ -3398,17 +3516,17 @@ npm_update_group() {
       local npm_inst_rc=0
       npm install --prefix "$npm_root" || npm_inst_rc=$?
       if [[ "$npm_inst_rc" -ne 0 ]]; then
-        git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+        run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
         dep_updater_append_ecosystem_failure "npm|npm install failed for ${group_key} (exit ${npm_inst_rc})"
         log "[${npm_tool}] ERROR: npm install failed for '${group_key}' (exit ${npm_inst_rc}) — skipping group."
         return 0
       fi
   esac
 
-  git -C "$worktree_path" add "$(npm_repo_rel_path package.json)"
+  run_command "git worktree" git -C "$worktree_path" add "$(npm_repo_rel_path package.json)"
   # Only stage the lockfile if the project tracks it (not gitignored).
   if ! git -C "$worktree_path" check-ignore -q "$(npm_repo_rel_path "$lockfile")" 2>/dev/null; then
-    git -C "$worktree_path" add "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
+    run_command "git worktree" git -C "$worktree_path" add "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
   fi
 
   # If the update made no changes, there is nothing to commit.
@@ -3420,11 +3538,11 @@ npm_update_group() {
 
   # Record the current branch so we know whether to reparent in Graphite.
   local parent_branch
-  parent_branch="$(git -C "$worktree_path" branch --show-current)"
+  parent_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current)"
 
   # Create branch and commit with git directly so commit.gpgsign/user.signingkey
   # from the global git config are respected. gt create -m bypasses GPG signing.
-  git -C "$worktree_path" checkout -b "$branch"
+  run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
   # Tell Graphite about the branch parentage.
   if [[ "$parent_branch" == "$wt_base_branch" ]]; then
@@ -3446,7 +3564,7 @@ npm_update_group() {
   write_npm_pr_body "$group_key" "$safe_key" "$entries" "$npm_audit_lines" "$npm_body_file"
   # gh pr edit exits 1 due to a non-actionable GitHub GraphQL deprecation warning;
   # the PR title and body are cosmetic — the PR itself was already created above.
-  gh pr edit "$pr_num" \
+  dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" \
     --repo "${repo_owner}/${repo_name}" \
     --title "$commit_msg" \
     --body-file "$npm_body_file" \
@@ -3454,7 +3572,7 @@ npm_update_group() {
   rm -f "$npm_body_file"
   # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
-    gh pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
+    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
   fi
 
   state_append "branches" "$branch"
@@ -3554,9 +3672,10 @@ py_audit() {
   set -e
 
   [[ -z "$raw" || "$raw" == 'null' ]] && return 0
-  if ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then return 0; fi
+  if ! dep_runner_jq_with_args "dep-updater py audit validate" "$raw" -e . >/dev/null 2>&1; then return 0; fi
 
-  printf '%s' "$raw" | jq -r '
+  # shellcheck disable=SC2016  # jq filter uses $dep variable, not shell expansion
+  dep_runner_jq_with_args "dep-updater py audit rows" "$raw" -r '
     .dependencies[]
     | select(.vulns | length > 0)
     | . as $dep
@@ -3592,13 +3711,13 @@ npm_audit() {
   set -e
 
   [[ -z "$raw" || "$raw" == '{}' || "$raw" == 'null' ]] && return 0
-  if ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then return 0; fi
+  if ! dep_runner_jq_with_args "dep-updater npm audit validate" "$raw" -e . >/dev/null 2>&1; then return 0; fi
 
   # npm/pnpm JSON: .vulnerabilities.<name>.{ isDirect, fixAvailable: bool | {name,version} }
   # yarn emits newline-delimited JSON events; filter to advisories.
   if [[ "$npm_tool" == 'yarn' ]]; then
     # yarn audit --json emits one JSON object per line; skip non-advisory lines.
-    printf '%s' "$raw" | jq -r '
+    dep_runner_jq_with_args "dep-updater npm audit yarn rows" "$raw" -r '
       select(.type == "auditAdvisory")
       | .data.advisory
       | select(.findings | any(.paths[]; . == "." or (test("^[^/]+$"))))
@@ -3607,7 +3726,7 @@ npm_audit() {
     ' 2>/dev/null | sort -u || true
   else
     # npm and pnpm share the same audit JSON format.
-    printf '%s' "$raw" | jq -r '
+    dep_runner_jq_with_args "dep-updater npm audit rows" "$raw" -r '
       .vulnerabilities
       | to_entries[]
       | select(.value.isDirect == true)
@@ -3671,13 +3790,13 @@ npm_security_update() {
     existing_pr="$(gh_pr_number_for_branch "$branch")"
     if [[ -z "$existing_pr" ]]; then
       log "Branch ${branch} has no PR — submitting now."
-      git -C "$worktree_path" checkout "$branch"
+      run_command "git worktree" git -C "$worktree_path" checkout "$branch"
       run_in_worktree gt track -p main 2>/dev/null || true
       run_in_worktree gt submit --no-interactive --publish --no-stack
       existing_pr="$(gh_pr_number_for_branch "$branch")"
       if [[ -n "$existing_pr" ]]; then state_append_pr "$existing_pr"; fi
     fi
-    git -C "$worktree_path" checkout "$branch"
+    run_command "git worktree" git -C "$worktree_path" checkout "$branch"
     return 0
   fi
 
@@ -3693,8 +3812,8 @@ npm_security_update() {
     yarn) lockfile="yarn.lock" ;;
     npm)  lockfile="package-lock.json" ;;
   esac
-  git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
-  git -C "$worktree_path" checkout -- "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
+  run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+  run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
 
   # Apply audit fixes. npm/pnpm patch manifests + lockfiles in one step.
   case "$npm_tool" in
@@ -3716,10 +3835,10 @@ npm_security_update() {
       ;;
   esac
 
-  git -C "$worktree_path" add "$(npm_repo_rel_path package.json)"
+  run_command "git worktree" git -C "$worktree_path" add "$(npm_repo_rel_path package.json)"
   # Only stage the lockfile if the project tracks it (not gitignored).
   if ! git -C "$worktree_path" check-ignore -q "$(npm_repo_rel_path "$lockfile")" 2>/dev/null; then
-    git -C "$worktree_path" add "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
+    run_command "git worktree" git -C "$worktree_path" add "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
   fi
 
   if git -C "$worktree_path" diff --cached --quiet; then
@@ -3728,10 +3847,10 @@ npm_security_update() {
   fi
 
   local parent_branch
-  parent_branch="$(git -C "$worktree_path" branch --show-current)"
+  parent_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current)"
 
   local commit_msg="fix(deps): patch CVE vulnerabilities in npm dependencies"
-  git -C "$worktree_path" checkout -b "$branch"
+  run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
 
   if [[ "$parent_branch" == "$wt_base_branch" ]]; then
@@ -3743,14 +3862,14 @@ npm_security_update() {
   run_in_worktree gt submit --no-interactive --publish --no-stack
 
   local submitted_head
-  submitted_head="$(git -C "$worktree_path" rev-parse "$branch")"
+  submitted_head="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-parse "$branch")"
 
   local pr_num
   pr_num="$(wait_for_pr_number_for_new_branch "$branch" || true)"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
 
   write_security_pr_body "${npm_tool}" "$audit_lines" "$body_file"
-  gh pr edit "$pr_num" \
+  dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" \
     --repo "${repo_owner}/${repo_name}" \
     --title "$commit_msg" \
     --body-file "$body_file" \
@@ -3759,7 +3878,7 @@ npm_security_update() {
   rm -f "$body_file"
   # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
-    gh pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
+    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
   fi
 
   state_append "branches" "$branch"
@@ -3796,13 +3915,13 @@ py_security_update() {
     existing_pr="$(gh_pr_number_for_branch "$branch")"
     if [[ -z "$existing_pr" ]]; then
       log "Branch ${branch} has no PR — submitting now."
-      git -C "$worktree_path" checkout "$branch"
+      run_command "git worktree" git -C "$worktree_path" checkout "$branch"
       run_in_worktree gt track -p main 2>/dev/null || true
       run_in_worktree gt submit --no-interactive --publish --no-stack
       existing_pr="$(gh_pr_number_for_branch "$branch")"
       if [[ -n "$existing_pr" ]]; then state_append_pr "$existing_pr"; fi
     fi
-    git -C "$worktree_path" checkout "$branch"
+    run_command "git worktree" git -C "$worktree_path" checkout "$branch"
     return 0
   fi
 
@@ -3849,10 +3968,10 @@ py_security_update() {
   fi
 
   local parent_branch
-  parent_branch="$(git -C "$worktree_path" branch --show-current)"
+  parent_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current)"
 
   local commit_msg="fix(deps): patch CVE vulnerabilities in Python dependencies"
-  git -C "$worktree_path" checkout -b "$branch"
+  run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
 
   if [[ "$parent_branch" == "$wt_base_branch" ]]; then
@@ -3864,14 +3983,14 @@ py_security_update() {
   run_in_worktree gt submit --no-interactive --publish --no-stack
 
   local submitted_head
-  submitted_head="$(git -C "$worktree_path" rev-parse "$branch")"
+  submitted_head="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-parse "$branch")"
 
   local pr_num
   pr_num="$(wait_for_pr_number_for_new_branch "$branch" || true)"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
 
   write_security_pr_body "python/${tool}" "$audit_lines" "$body_file"
-  gh pr edit "$pr_num" \
+  dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" \
     --repo "${repo_owner}/${repo_name}" \
     --title "$commit_msg" \
     --body-file "$body_file" \
@@ -3880,7 +3999,7 @@ py_security_update() {
   rm -f "$body_file"
   # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
-    gh pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
+    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
   fi
 
   state_append "branches" "$branch"
@@ -3980,8 +4099,9 @@ py_outdated() {
   installed_new=""
   case "$tool" in
     uv)
-      raw_lines="$(cd "$target_dir" && uv pip list --outdated --format=json 2>/dev/null \
-        | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
+      raw_lines="$(dep_runner_jq_with_args "dep-updater uv outdated rows" \
+        "$(cd "$target_dir" && uv pip list --outdated --format=json 2>/dev/null)" \
+        -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
       ;;
     poetry)
       # poetry show --outdated has no stable JSON output; parse the table instead
@@ -3989,12 +4109,14 @@ py_outdated() {
         | awk '/^[a-zA-Z]/ { print $1, $2, $3 }')"
       ;;
     pipenv)
-      raw_lines="$(cd "$target_dir" && pipenv run pip list --outdated --format=json 2>/dev/null \
-        | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
+      raw_lines="$(dep_runner_jq_with_args "dep-updater pipenv outdated rows" \
+        "$(cd "$target_dir" && pipenv run pip list --outdated --format=json 2>/dev/null)" \
+        -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
       ;;
     pip|pip3)
-      raw_lines="$(cd "$target_dir" && "$tool" list --outdated --format=json 2>/dev/null \
-        | jq -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
+      raw_lines="$(dep_runner_jq_with_args "dep-updater pip outdated rows" \
+        "$(cd "$target_dir" && "$tool" list --outdated --format=json 2>/dev/null)" \
+        -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
       ;;
     *)
       die "Unknown Python tool: '$tool'"
@@ -4145,7 +4267,7 @@ py_update_one() {
     existing_pr="$(gh_pr_number_for_branch "$branch")"
     if [[ -z "$existing_pr" ]]; then
       log "Branch ${branch} has no PR — submitting now."
-      git -C "$worktree_path" checkout "$branch"
+      run_command "git worktree" git -C "$worktree_path" checkout "$branch"
       run_in_worktree gt track -p main 2>/dev/null || true
       run_in_worktree gt submit --no-interactive --publish --no-stack
       existing_pr="$(gh_pr_number_for_branch "$branch")"
@@ -4154,7 +4276,7 @@ py_update_one() {
       fi
     fi
     # Position worktree on this branch so the next update stacks on top of it.
-    git -C "$worktree_path" checkout "$branch"
+    run_command "git worktree" git -C "$worktree_path" checkout "$branch"
     return 0
   fi
 
@@ -4184,13 +4306,13 @@ py_update_one() {
         # Revert pyproject.toml: sed already modified it for >= / == / ~= constraints
         # but the lock failed, so the change must not accumulate into a future commit.
         if [[ "$uv_constraint_op" == ">=" || "$uv_constraint_op" == "==" || "$uv_constraint_op" == "~=" ]]; then
-          git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
+          run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
         fi
         log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
         log "$uv_out"
         return 0
       fi
-      git -C "$worktree_path" add pyproject.toml uv.lock
+      run_command "git worktree" git -C "$worktree_path" add pyproject.toml uv.lock
       files_changed="pyproject.toml + uv.lock"
       ;;
     poetry)
@@ -4201,18 +4323,18 @@ py_update_one() {
         log "$poetry_out"
         return 0
       fi
-      git -C "$worktree_path" add pyproject.toml poetry.lock
+      run_command "git worktree" git -C "$worktree_path" add pyproject.toml poetry.lock
       files_changed="pyproject.toml + poetry.lock"
       ;;
     pipenv)
       run_in_worktree pipenv install "${pkg}==${new_ver}"
-      git -C "$worktree_path" add Pipfile Pipfile.lock
+      run_command "git worktree" git -C "$worktree_path" add Pipfile Pipfile.lock
       files_changed="Pipfile + Pipfile.lock"
       ;;
     pip|pip3)
       "$tool" install "${pkg}==${new_ver}"
       "$tool" freeze > "${worktree_path}/requirements.txt"
-      git -C "$worktree_path" add requirements.txt
+      run_command "git worktree" git -C "$worktree_path" add requirements.txt
       files_changed="requirements.txt"
       ;;
     *)
@@ -4229,11 +4351,11 @@ py_update_one() {
 
   # Record the current branch to determine whether reparenting is needed.
   local parent_branch
-  parent_branch="$(git -C "$worktree_path" branch --show-current)"
+  parent_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current)"
 
   # Create branch and commit with git directly so commit.gpgsign/user.signingkey
   # from the global git config are respected. gt create -m bypasses GPG signing.
-  git -C "$worktree_path" checkout -b "$branch"
+  run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
   # Tell Graphite about the branch parentage.
   if [[ "$parent_branch" == "$wt_base_branch" ]]; then
@@ -4258,7 +4380,7 @@ py_update_one() {
     "$py_body_file"
   # gh pr edit exits 1 due to a non-actionable GitHub GraphQL deprecation warning;
   # the PR title and body are cosmetic — the PR itself was already created above.
-  gh pr edit "$pr_num" \
+  dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" \
     --repo "${repo_owner}/${repo_name}" \
     --title "$commit_msg" \
     --body-file "$py_body_file" \
@@ -4266,7 +4388,7 @@ py_update_one() {
   rm -f "$py_body_file"
   # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
-    gh pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
+    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
   fi
 
   state_append "branches" "$branch"
@@ -4379,7 +4501,7 @@ rust_update_one() {
     existing_pr="$(gh_pr_number_for_branch "$branch")"
     if [[ -z "$existing_pr" ]]; then
       log "Branch ${branch} has no PR — submitting now."
-      git -C "$worktree_path" checkout "$branch"
+      run_command "git worktree" git -C "$worktree_path" checkout "$branch"
       run_in_worktree gt track -p main 2>/dev/null || true
       run_in_worktree gt submit --no-interactive --publish --no-stack
       existing_pr="$(gh_pr_number_for_branch "$branch")"
@@ -4387,7 +4509,7 @@ rust_update_one() {
         state_append_pr "$existing_pr"
       fi
     fi
-    git -C "$worktree_path" checkout "$branch"
+    run_command "git worktree" git -C "$worktree_path" checkout "$branch"
     return 0
   fi
 
@@ -4410,7 +4532,7 @@ rust_update_one() {
     return 0
   fi
 
-  git -C "$worktree_path" add -u
+  run_command "git worktree" git -C "$worktree_path" add -u
 
   if git -C "$worktree_path" diff --cached --quiet; then
     log "[rust] ${pkg}: no file changes after update — already at latest. Skipping PR."
@@ -4418,9 +4540,9 @@ rust_update_one() {
   fi
 
   local parent_branch
-  parent_branch="$(git -C "$worktree_path" branch --show-current)"
+  parent_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current)"
 
-  git -C "$worktree_path" checkout -b "$branch"
+  run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
   if [[ "$parent_branch" == "$wt_base_branch" ]]; then
     run_in_worktree gt track -p main
@@ -4437,14 +4559,14 @@ rust_update_one() {
   local rust_body_file
   rust_body_file="$(mktemp)"
   write_pr_body "$pkg" "$old_ver" "$new_ver" "rust/cargo" "$files_changed" "" "$rust_body_file"
-  gh pr edit "$pr_num" \
+  dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" \
     --repo "${repo_owner}/${repo_name}" \
     --title "$commit_msg" \
     --body-file "$rust_body_file" \
     --add-label "dep-updater" || true
   rm -f "$rust_body_file"
   if [[ "$repo_name" == 'my-tracks' ]]; then
-    gh pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
+    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
   fi
 
   state_append "branches" "$branch"
@@ -4474,9 +4596,9 @@ _gha_semver_release_tags_desc() {
   local -r action="$1"
   local releases tags
 
-  releases="$(gh api "repos/${action}/releases?per_page=100" \
+  releases="$(dep_runner_gh_stdout "gh api" -- api "repos/${action}/releases?per_page=100" \
     --jq '.[].tag_name' 2>/dev/null || true)"
-  tags="$(gh api "repos/${action}/tags?per_page=100" \
+  tags="$(dep_runner_gh_stdout "gh api" -- api "repos/${action}/tags?per_page=100" \
     --jq '.[].name' 2>/dev/null || true)"
   printf '%s\n%s\n' "$releases" "$tags" \
     | awk '/^v?[0-9]+([.][0-9]+){0,3}([-.].*)?$/ {print}' \
@@ -4588,7 +4710,7 @@ gha_update_one() {
     existing_pr="$(gh_pr_number_for_branch "$branch")"
     if [[ -z "$existing_pr" ]]; then
       log "Branch ${branch} has no PR — submitting now."
-      git -C "$worktree_path" checkout "$branch"
+      run_command "git worktree" git -C "$worktree_path" checkout "$branch"
       run_in_worktree gt track -p main 2>/dev/null || true
       run_in_worktree gt submit --no-interactive --publish --no-stack
       existing_pr="$(gh_pr_number_for_branch "$branch")"
@@ -4596,7 +4718,7 @@ gha_update_one() {
         state_append_pr "$existing_pr"
       fi
     fi
-    git -C "$worktree_path" checkout "$branch"
+    run_command "git worktree" git -C "$worktree_path" checkout "$branch"
     return 0
   fi
 
@@ -4610,7 +4732,7 @@ gha_update_one() {
       "s|uses: ${action}@${current_ref}|uses: ${action}@${new_ref}|g" \
       {} +
 
-  git -C "$worktree_path" add .github/workflows/
+  run_command "git worktree" git -C "$worktree_path" add .github/workflows/
 
   if git -C "$worktree_path" diff --cached --quiet; then
     log "[github-actions] ${action}: no file changes — already at latest. Skipping PR."
@@ -4618,9 +4740,9 @@ gha_update_one() {
   fi
 
   local parent_branch
-  parent_branch="$(git -C "$worktree_path" branch --show-current)"
+  parent_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current)"
 
-  git -C "$worktree_path" checkout -b "$branch"
+  run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
   if [[ "$parent_branch" == "$wt_base_branch" ]]; then
     run_in_worktree gt track -p main
@@ -4638,14 +4760,14 @@ gha_update_one() {
   gha_body_file="$(mktemp)"
   write_pr_body "$action" "$current_ref" "$new_ref" \
     "github-actions" ".github/workflows/" "" "$gha_body_file"
-  gh pr edit "$pr_num" \
+  dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" \
     --repo "${repo_owner}/${repo_name}" \
     --title "$commit_msg" \
     --body-file "$gha_body_file" \
     --add-label "dep-updater" || true
   rm -f "$gha_body_file"
   if [[ "$repo_name" == 'my-tracks' ]]; then
-    gh pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
+    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
   fi
 
   state_append "branches" "$branch"
@@ -4706,17 +4828,17 @@ batch_update_all() {
       break
     fi
   done < <({
-    git -C "$worktree_path" branch --format='%(refname:short)' 2>/dev/null
+    run_command "git worktree" git -C "$worktree_path" branch --format='%(refname:short)' 2>/dev/null
     # Also include remote tracking refs so an interrupted run whose worktree was
     # cleaned up can still find a batch branch that was pushed to origin.
-    git -C "$worktree_path" for-each-ref --format='%(refname:lstrip=3)' \
+    run_command "git worktree" git -C "$worktree_path" for-each-ref --format='%(refname:lstrip=3)' \
       'refs/remotes/origin/dep-updates/batch-*' 2>/dev/null
   } | sort -u)
 
   if [[ -n "$existing_batch_branch" ]]; then
     log "Reusing existing open batch branch: ${existing_batch_branch}"
     register_existing_branch_state "$existing_batch_branch"
-    git -C "$worktree_path" checkout "$existing_batch_branch"
+    run_command "git worktree" git -C "$worktree_path" checkout "$existing_batch_branch"
     return 0
   fi
 
@@ -4738,14 +4860,14 @@ batch_update_all() {
       npm)  lockfile="package-lock.json" ;;
     esac
 
-    git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+    run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
     if [[ "$npm_tool" == 'npm' ]]; then
       rm -f "${npm_root}/package-lock.json"
       if [[ -d "${npm_root}/node_modules" ]]; then
         rm -rf "${npm_root}/node_modules"
       fi
     else
-      git -C "$worktree_path" checkout -- "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
+      run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
     fi
 
     if [[ "$npm_tool" == 'yarn' ]]; then
@@ -4771,8 +4893,8 @@ batch_update_all() {
         local yarn_batch_rc=0
         yarn --cwd "$npm_root" upgrade "${yarn_args[@]}" || yarn_batch_rc=$?
         if [[ "$yarn_batch_rc" -ne 0 ]]; then
-          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
-          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path yarn.lock)" 2>/dev/null || true
+          run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+          run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path yarn.lock)" 2>/dev/null || true
           dep_updater_append_ecosystem_failure "npm|batch yarn upgrade failed (exit ${yarn_batch_rc})"
           log "[${npm_tool}] WARNING: batch yarn upgrade failed (exit ${yarn_batch_rc}); continuing."
         fi
@@ -4813,7 +4935,7 @@ batch_update_all() {
           ) | from_entries
         ' "${npm_root}/package.json" > "$tmp_pkg"; then
           rm -f "$tmp_pkg"
-          git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+          run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
           dep_updater_append_ecosystem_failure "npm|batch jq failed to patch package.json"
           log "[batch] ERROR: jq failed to patch package.json — npm batch section skipped."
         else
@@ -4823,8 +4945,8 @@ batch_update_all() {
               local pnpm_batch_rc=0
               pnpm_install_worktree no-frozen "$npm_root" || pnpm_batch_rc=$?
               if [[ "$pnpm_batch_rc" -ne 0 ]]; then
-                git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
-                git -C "$worktree_path" checkout -- "$(npm_repo_rel_path pnpm-lock.yaml)" 2>/dev/null || true
+                run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+                run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path pnpm-lock.yaml)" 2>/dev/null || true
                 dep_updater_append_ecosystem_failure "npm|batch pnpm install failed (exit ${pnpm_batch_rc})"
                 log "[${npm_tool}] WARNING: batch pnpm install failed (exit ${pnpm_batch_rc}); continuing."
               fi
@@ -4833,7 +4955,7 @@ batch_update_all() {
               local npm_batch_rc=0
               npm install --prefix "$npm_root" || npm_batch_rc=$?
               if [[ "$npm_batch_rc" -ne 0 ]]; then
-                git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
+                run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
                 dep_updater_append_ecosystem_failure "npm|batch npm install failed (exit ${npm_batch_rc})"
                 log "[${npm_tool}] WARNING: batch npm install failed (exit ${npm_batch_rc}); continuing."
               fi
@@ -4844,9 +4966,9 @@ batch_update_all() {
     fi
 
     if [[ "$any_npm" == '1' ]]; then
-      git -C "$worktree_path" add "$(npm_repo_rel_path package.json)"
+      run_command "git worktree" git -C "$worktree_path" add "$(npm_repo_rel_path package.json)"
       if ! git -C "$worktree_path" check-ignore -q "$(npm_repo_rel_path "$lockfile")" 2>/dev/null; then
-        git -C "$worktree_path" add "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
+        run_command "git worktree" git -C "$worktree_path" add "$(npm_repo_rel_path "$lockfile")" 2>/dev/null || true
       fi
     fi
   fi
@@ -4890,7 +5012,7 @@ batch_update_all() {
               # / == / ~= constraints. Restore the file so failed bumps don't accumulate
               # and cause all subsequent packages to fail with phantom conflicts.
               if [[ "$b_constraint_op" == ">=" || "$b_constraint_op" == "==" || "$b_constraint_op" == "~=" ]]; then
-                git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
+                run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
               fi
               log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
               log "$py_out"
@@ -4919,7 +5041,7 @@ batch_update_all() {
         pip|pip3)
           # pip freeze must be run from the project dir to produce correct output.
           "$py_tool" freeze > "${worktree_path}/requirements.txt"
-          git -C "$worktree_path" add requirements.txt
+          run_command "git worktree" git -C "$worktree_path" add requirements.txt
           ;;
       esac
     fi
@@ -4932,7 +5054,7 @@ batch_update_all() {
     if [[ "$any_py" == '1' ]]; then
       actual_py_lines="$(
         {
-          git -C "$worktree_path" diff --cached -- pyproject.toml 2>/dev/null || true
+          run_command "git worktree" git -C "$worktree_path" diff --cached -- pyproject.toml 2>/dev/null || true
           printf '%s\n' '__LISTED__'
           printf '%s\n' "$py_lines_arg"
           printf '%s\n' "$py_audit_lines_arg"
@@ -5007,7 +5129,7 @@ batch_update_all() {
         dep_updater_append_ecosystem_failure "rust|batch cargo add failed for ${pkg}"
       fi
     done <<< "$rust_lines_arg"
-    git -C "$worktree_path" add -u
+    run_command "git worktree" git -C "$worktree_path" add -u
     if ! git -C "$worktree_path" diff --cached --quiet; then
       any_rust=1
     fi
@@ -5025,7 +5147,7 @@ batch_update_all() {
           "s|uses: ${action}@${cur_ref}|uses: ${action}@${new_ref}|g" \
           {} +
     done <<< "$gha_lines_arg"
-    git -C "$worktree_path" add .github/workflows/ 2>/dev/null || true
+    run_command "git worktree" git -C "$worktree_path" add .github/workflows/ 2>/dev/null || true
     if ! git -C "$worktree_path" diff --cached --quiet -- .github/; then
       any_gha=1
     fi
@@ -5065,7 +5187,7 @@ batch_update_all() {
     commit_msg="chore(deps): batch dependency updates"
   fi
 
-  git -C "$worktree_path" checkout -b "$branch"
+  run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
   run_in_worktree gt track -p main
   log "[gate] Submitting batch PR for '${branch}'…"
@@ -5204,14 +5326,14 @@ batch_update_all() {
   } > "$body_file"
 
   if [[ "$has_cves" == '1' ]]; then
-    gh pr edit "$pr_num" \
+    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" \
       --repo "${repo_owner}/${repo_name}" \
       --title "$commit_msg" \
       --body-file "$body_file" \
       --add-label "dep-updater" \
       --add-label "security" || true
   else
-    gh pr edit "$pr_num" \
+    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" \
       --repo "${repo_owner}/${repo_name}" \
       --title "$commit_msg" \
       --body-file "$body_file" \
@@ -5220,7 +5342,7 @@ batch_update_all() {
   rm -f "$body_file"
   # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
   if [[ "$repo_name" == 'my-tracks' ]]; then
-    gh pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
+    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
   fi
 
   state_append "branches" "$branch"
@@ -5502,7 +5624,7 @@ wait_for_mergeable_quick() {
 ensure_dep_updater_label() {
   # Create the 'dep-updater' label on the repo if it doesn't already exist.
   # Idempotent: gh label create exits non-zero if the label exists; we ignore that.
-  gh label create 'dep-updater' \
+  dep_runner_gh "gh label" -- label create 'dep-updater' \
     --repo "${repo_owner}/${repo_name}" \
     --color '0075ca' \
     --description 'Automated dependency update via dep-updater' \
@@ -5554,7 +5676,7 @@ require_resume_ci_gate() {
   fi
 
   local current_head
-  current_head="$(git -C "$worktree_path" rev-parse "$last_branch" 2>/dev/null || true)"
+  current_head="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-parse "$last_branch" 2>/dev/null || true)"
   if [[ -z "$current_head" ]]; then
     log "Resume CI gate skipped: could not resolve head SHA for '${last_branch}'."
     return 0
@@ -5592,7 +5714,7 @@ require_resume_ci_gate() {
           wait_for_ci "$last_branch" "$current_head" "$last_pr"
         elif prompt_yes_no "Close PR #${last_pr} and start fresh?" "n"; then
           log "Closing PR #${last_pr}…"
-          gh pr close "$last_pr" \
+          dep_runner_gh_stdout "gh pr" -- pr close "$last_pr" \
             --repo "${repo_owner}/${repo_name}" \
             --comment "Closed by dep-updater: run was interrupted while CI was pending." \
             2>/dev/null || true
@@ -5617,13 +5739,13 @@ gate_branch_head_sha() {
   local -r pr_num="$2"
   local sha
 
-  sha="$(git -C "$worktree_path" rev-parse "$branch" 2>/dev/null || true)"
+  sha="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-parse "$branch" 2>/dev/null || true)"
   if [[ -n "$sha" ]]; then
     printf '%s' "$sha"
     return 0
   fi
   if git -C "$worktree_path" show-ref --verify --quiet "refs/remotes/origin/${branch}" 2>/dev/null; then
-    sha="$(git -C "$worktree_path" rev-parse "origin/${branch}" 2>/dev/null || true)"
+    sha="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-parse "origin/${branch}" 2>/dev/null || true)"
     if [[ -n "$sha" ]]; then
       printf '%s' "$sha"
       return 0
@@ -5794,7 +5916,7 @@ maybe_label_top_pr_for_merge() {
   fi
 
   local top_head ci_status
-  top_head="$(git -C "$worktree_path" rev-parse "$top_branch" 2>/dev/null || true)"
+  top_head="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-parse "$top_branch" 2>/dev/null || true)"
   [[ -z "$top_head" ]] && return 0
 
   ci_status="$(ci_conclusion_for_head "$top_branch" "$top_head")"
@@ -5910,8 +6032,8 @@ dep_updater_write_updates_report_json() {
 
   while IFS='|' read -r eco pkg from to cve_flag cve_ids pr; do
     [[ -z "$pkg" ]] && continue
-    updates_json="$(printf '%s' "$updates_json" \
-      | jq \
+    # shellcheck disable=SC2016  # jq row accumulator uses jq variables, not shell expansion
+    updates_json="$(dep_runner_jq_with_args "dep-updater updates report row" "$updates_json" \
           --arg repo "$dir" \
           --arg repo_name "$repo_name_for_report" \
           --arg ecosystem "$eco" \
@@ -5934,7 +6056,8 @@ dep_updater_write_updates_report_json() {
           }]')"
   done <<< "$summary_lines"
 
-  jq -n \
+  # shellcheck disable=SC2016  # jq -n emit object uses jq variables, not shell expansion
+  dep_runner_jq_n "dep-updater updates report emit" \
     --arg repo "$dir" \
     --arg repo_name "$repo_name_for_report" \
     --argjson updates "$updates_json" \
@@ -5945,11 +6068,12 @@ dep_updater_write_updates_report_json() {
 dep_updater_batch_all_append_child_updates() {
   local -r child_updates_file="$1"
   local tmp_updates
+  local merge_out
 
   if [[ -z "${DEP_UPDATER_UPDATES_REPORT:-}" || ! -s "$child_updates_file" ]]; then
     return 0
   fi
-  if ! jq -e '.updates | type == "array"' "$child_updates_file" >/dev/null 2>&1; then
+  if ! dep_runner_jq_file_args "dep-updater batch child updates validate" "$child_updates_file" -e '.updates | type == "array"' >/dev/null 2>&1; then
     return 0
   fi
 
@@ -5958,8 +6082,11 @@ dep_updater_batch_all_append_child_updates() {
   fi
 
   tmp_updates="$(mktemp)"
-  if jq -s '.[0] + (.[1].updates // [])' \
-      "${DEP_UPDATER_UPDATES_REPORT}" "$child_updates_file" >"$tmp_updates" 2>/dev/null; then
+  merge_out=""
+  if merge_out="$(runner_exec_stdout "dep-updater batch child updates merge" -- jq -s \
+      '.[0] + (.[1].updates // [])' \
+      "${DEP_UPDATER_UPDATES_REPORT}" "$child_updates_file" 2>/dev/null)"; then
+    printf '%s' "$merge_out" >"$tmp_updates"
     mv "$tmp_updates" "${DEP_UPDATER_UPDATES_REPORT}"
   else
     rm -f "$tmp_updates"
@@ -6037,18 +6164,18 @@ cleanup_on_error() {
         saved_state="$(gh_pr_state_for_number "$saved_p" 2>/dev/null || true)"
         if [[ "$saved_merged" != 'true' && "$saved_state" == 'open' ]]; then
           log "Closing PR #${saved_p} (cleanup on error — re-run to submit a fresh PR)."
-          gh pr close "$saved_p" --repo "${repo_owner}/${repo_name}" 2>/dev/null || true
+          dep_runner_gh_stdout "gh pr" -- pr close "$saved_p" --repo "${repo_owner}/${repo_name}" 2>/dev/null || true
         fi
       done
     fi
   fi
   if [[ -n "$worktree_path" && -d "$worktree_path" ]]; then
     log "[worktree] Removing worktree: $worktree_path"
-    git -C "$dir" worktree remove --force "$worktree_path" 2>/dev/null \
+    run_command "git repo" git -C "$dir" worktree remove --force "$worktree_path" 2>/dev/null \
       || log "Note: worktree directory already removed."
     if [[ -n "$wt_base_branch" ]]; then
       log "[worktree] Deleting branch: $wt_base_branch"
-      git -C "$dir" branch -D "$wt_base_branch" 2>/dev/null \
+      run_command "git repo" git -C "$dir" branch -D "$wt_base_branch" 2>/dev/null \
         || log "Note: wt_base_branch '${wt_base_branch}' not found; skipping deletion."
     fi
   fi
@@ -6062,13 +6189,13 @@ cleanup() {
   primary_repo_restore
   if [[ -n "$worktree_path" && -d "$worktree_path" ]]; then
     log "[worktree] Removing worktree: $worktree_path"
-    git -C "$dir" worktree remove --force "$worktree_path" 2>/dev/null \
+    run_command "git repo" git -C "$dir" worktree remove --force "$worktree_path" 2>/dev/null \
       || log "Note: worktree directory already removed."
     log "[worktree] Worktree removed."
   fi
   if [[ -n "$wt_base_branch" ]]; then
     log "[worktree] Deleting branch: $wt_base_branch"
-    git -C "$dir" branch -D "$wt_base_branch" 2>/dev/null \
+    run_command "git repo" git -C "$dir" branch -D "$wt_base_branch" 2>/dev/null \
       || log "Note: wt_base_branch '${wt_base_branch}' not found."
   fi
   rm -f "$state_file"
@@ -6108,7 +6235,7 @@ merge_pr_via_gh_single() {
   log "Enabling auto-merge for PR #${pr_num} via gh (squash)…"
   merge_out=""
   merge_exit=0
-  merge_out="$(gh pr merge "$pr_num" \
+  merge_out="$(dep_runner_gh_stdout "gh pr" -- pr merge "$pr_num" \
     --repo "${repo_owner}/${repo_name}" \
     --auto --squash --delete-branch 2>&1)" || merge_exit=$?
   if (( merge_exit != 0 )); then
@@ -6221,7 +6348,7 @@ poll_until_merged() {
         # Check statusCheckRollup: GitHub associates merge-queue CI runs back to
         # the original PR's head commit, so failures from the merge queue appear
         # here even though wait_for_ci only saw the initial push CI.
-        check_rollup="$(gh pr view "$p" \
+        check_rollup="$(dep_runner_gh_stdout "gh pr" -- pr view "$p" \
           --repo "${repo_owner}/${repo_name}" \
           --json statusCheckRollup \
           --jq '.statusCheckRollup // []' 2>/dev/null || echo '[]')"
@@ -6234,7 +6361,7 @@ poll_until_merged() {
               )) | if length > 0 then .[0].name else "" end
             ' 2>/dev/null || true)"
         if [[ -n "$failed_check" ]]; then
-          failed_branch="$(gh pr view "$p" \
+          failed_branch="$(dep_runner_gh_stdout "gh pr" -- pr view "$p" \
             --repo "${repo_owner}/${repo_name}" \
             --json headRefName --jq '.headRefName // ""' 2>/dev/null || true)"
           cleanup_on_error "PR #${p}: CI check '${failed_check}' failed in the merge queue"
@@ -6276,7 +6403,7 @@ poll_until_merged() {
         top_has_label="$(pr_has_merge_it_label "$top_pr")"
         top_ci_status="unknown"
         if git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${top_branch}"; then
-          top_head="$(git -C "$worktree_path" rev-parse "$top_branch" 2>/dev/null || true)"
+          top_head="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-parse "$top_branch" 2>/dev/null || true)"
           if [[ -n "$top_head" ]]; then
             top_ci_status="$(ci_conclusion_for_head "$top_branch" "$top_head" 2>/dev/null || echo 'unknown')"
           fi
@@ -6315,17 +6442,19 @@ _emit_report_json() {
   if [[ -n "$npm_audit_lines" ]]; then
     while IFS=' ' read -r pkg current fix cve_ids; do
       [[ -z "$pkg" ]] && continue
-      cves_json="$(printf '%s' "$cves_json" \
-        | jq --arg p "$pkg" --arg c "$current" --arg f "$fix" --arg ids "$cve_ids" \
-            '. + [{"ecosystem":"npm","package":$p,"current":$c,"fix":$f,"cves":$ids}]')"
+      # shellcheck disable=SC2016  # jq row accumulator uses jq variables, not shell expansion
+      cves_json="$(dep_runner_jq_with_args "dep-updater report-json npm cve row" "$cves_json" \
+        --arg p "$pkg" --arg c "$current" --arg f "$fix" --arg ids "$cve_ids" \
+        '. + [{"ecosystem":"npm","package":$p,"current":$c,"fix":$f,"cves":$ids}]')"
     done <<< "$npm_audit_lines"
   fi
   if [[ -n "$py_audit_lines" ]]; then
     while IFS=' ' read -r pkg current fix cve_ids; do
       [[ -z "$pkg" ]] && continue
-      cves_json="$(printf '%s' "$cves_json" \
-        | jq --arg e "python/${py_tool}" --arg p "$pkg" --arg c "$current" --arg f "$fix" --arg ids "$cve_ids" \
-            '. + [{"ecosystem":$e,"package":$p,"current":$c,"fix":$f,"cves":$ids}]')"
+      # shellcheck disable=SC2016  # jq row accumulator uses jq variables, not shell expansion
+      cves_json="$(dep_runner_jq_with_args "dep-updater report-json py cve row" "$cves_json" \
+        --arg e "python/${py_tool}" --arg p "$pkg" --arg c "$current" --arg f "$fix" --arg ids "$cve_ids" \
+        '. + [{"ecosystem":$e,"package":$p,"current":$c,"fix":$f,"cves":$ids}]')"
     done <<< "$py_audit_lines"
   fi
 
@@ -6333,37 +6462,42 @@ _emit_report_json() {
   if [[ -n "$npm_lines" ]]; then
     while IFS=' ' read -r pkg old_ver new_ver; do
       [[ -z "$pkg" ]] && continue
-      updates_json="$(printf '%s' "$updates_json" \
-        | jq --arg p "$pkg" --arg o "$old_ver" --arg n "$new_ver" \
-            '. + [{"ecosystem":"npm","package":$p,"from":$o,"to":$n}]')"
+      # shellcheck disable=SC2016  # jq row accumulator uses jq variables, not shell expansion
+      updates_json="$(dep_runner_jq_with_args "dep-updater report-json npm update row" "$updates_json" \
+        --arg p "$pkg" --arg o "$old_ver" --arg n "$new_ver" \
+        '. + [{"ecosystem":"npm","package":$p,"from":$o,"to":$n}]')"
     done <<< "$npm_lines"
   fi
   if [[ -n "$py_lines" ]]; then
     while IFS=' ' read -r pkg old_ver new_ver; do
       [[ -z "$pkg" ]] && continue
-      updates_json="$(printf '%s' "$updates_json" \
-        | jq --arg e "python/${py_tool}" --arg p "$pkg" --arg o "$old_ver" --arg n "$new_ver" \
-            '. + [{"ecosystem":$e,"package":$p,"from":$o,"to":$n}]')"
+      # shellcheck disable=SC2016  # jq row accumulator uses jq variables, not shell expansion
+      updates_json="$(dep_runner_jq_with_args "dep-updater report-json py update row" "$updates_json" \
+        --arg e "python/${py_tool}" --arg p "$pkg" --arg o "$old_ver" --arg n "$new_ver" \
+        '. + [{"ecosystem":$e,"package":$p,"from":$o,"to":$n}]')"
     done <<< "$py_lines"
   fi
   if [[ -n "$gha_lines" ]]; then
     while IFS=' ' read -r action cur_ref new_ref; do
       [[ -z "$action" ]] && continue
-      updates_json="$(printf '%s' "$updates_json" \
-        | jq --arg p "$action" --arg o "$cur_ref" --arg n "$new_ref" \
-            '. + [{"ecosystem":"github-actions","package":$p,"from":$o,"to":$n}]')"
+      # shellcheck disable=SC2016  # jq row accumulator uses jq variables, not shell expansion
+      updates_json="$(dep_runner_jq_with_args "dep-updater report-json gha update row" "$updates_json" \
+        --arg p "$action" --arg o "$cur_ref" --arg n "$new_ref" \
+        '. + [{"ecosystem":"github-actions","package":$p,"from":$o,"to":$n}]')"
     done <<< "$gha_lines"
   fi
   if [[ -n "$rust_lines" ]]; then
     while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
       [[ -z "$pkg" ]] && continue
-      updates_json="$(printf '%s' "$updates_json" \
-        | jq --arg p "$pkg" --arg o "$old_ver" --arg n "$new_ver" \
-            '. + [{"ecosystem":"rust/cargo","package":$p,"from":$o,"to":$n}]')"
+      # shellcheck disable=SC2016  # jq row accumulator uses jq variables, not shell expansion
+      updates_json="$(dep_runner_jq_with_args "dep-updater report-json rust update row" "$updates_json" \
+        --arg p "$pkg" --arg o "$old_ver" --arg n "$new_ver" \
+        '. + [{"ecosystem":"rust/cargo","package":$p,"from":$o,"to":$n}]')"
     done <<< "$rust_lines"
   fi
 
-  jq -n \
+  # shellcheck disable=SC2016  # jq -n emit object uses jq variables, not shell expansion
+  dep_runner_jq_n "dep-updater report-json emit" \
     --arg repo "$dir" \
     --argjson cves "$cves_json" \
     --argjson updates "$updates_json" \
@@ -6425,7 +6559,7 @@ rebase_stack_on_main() {
     return 0
   fi
 
-  git -C "$worktree_path" fetch origin main >/dev/null 2>&1 \
+  run_command "git worktree" git -C "$worktree_path" fetch origin main >/dev/null 2>&1 \
     || log "Note: could not fetch latest main."
 
   run_in_worktree gt sync --force 2>/dev/null \
@@ -6712,13 +6846,14 @@ batch_all_dispatch() {
       root_cause=""
       detail_count=0
       if [[ -s "$child_report" ]] \
-        && jq -e 'has("primary") and has("details") and has("exit_code")' "$child_report" >/dev/null 2>&1; then
-        root_cause="$(jq -r '.primary // empty' "$child_report" 2>/dev/null || true)"
+        && dep_runner_jq_file_args "dep-updater batch-all child report validate" "$child_report" -e \
+          'has("primary") and has("details") and has("exit_code")' >/dev/null 2>&1; then
+        root_cause="$(dep_runner_jq_file_args "dep-updater batch-all child report primary" "$child_report" -r '.primary // empty' 2>/dev/null || true)"
         while IFS= read -r report_line; do
           [[ -z "$report_line" ]] && continue
           failure_details+=("$(basename "$repo"): ${report_line}")
           detail_count=$((detail_count + 1))
-        done < <(jq -r '.details[]? // empty' "$child_report" 2>/dev/null || true)
+        done < <(dep_runner_jq_file_args "dep-updater batch-all child report details" "$child_report" -r '.details[]? // empty' 2>/dev/null || true)
       fi
       # Keep batch-all output actionable: strip ANSI noise; use log tail only if
       # no structured report (e.g. older child or crash before write).
@@ -6750,9 +6885,10 @@ batch_all_dispatch() {
       fi
 
       if [[ -s "$child_report" ]] \
-        && jq -e 'has("capture_stderr") or has("capture_stdout")' "$child_report" >/dev/null 2>&1; then
-        capture_stderr="$(jq -r '.capture_stderr // empty' "$child_report" 2>/dev/null || true)"
-        capture_stdout="$(jq -r '.capture_stdout // empty' "$child_report" 2>/dev/null || true)"
+        && dep_runner_jq_file_args "dep-updater batch-all child capture validate" "$child_report" -e \
+          'has("capture_stderr") or has("capture_stdout")' >/dev/null 2>&1; then
+        capture_stderr="$(dep_runner_jq_file_args "dep-updater batch-all child capture stderr" "$child_report" -r '.capture_stderr // empty' 2>/dev/null || true)"
+        capture_stdout="$(dep_runner_jq_file_args "dep-updater batch-all child capture stdout" "$child_report" -r '.capture_stdout // empty' 2>/dev/null || true)"
         if [[ -n "$capture_stderr" ]]; then
           log "[batch-all] Captured stderr ($(basename "$repo")):"
           while IFS= read -r cap_line || [[ -n "$cap_line" ]]; do
@@ -6928,8 +7064,8 @@ _dry_run_teardown() {
   primary_repo_restore
   log "[worktree] Removing: $wt"
   cd - >/dev/null 2>&1 || true
-  git -C "$dir" worktree remove --force "$wt" >/dev/null 2>&1 || true
-  git -C "$dir" branch -D "$wt_base_branch" >/dev/null 2>&1 || true
+  run_command "git repo" git -C "$dir" worktree remove --force "$wt" >/dev/null 2>&1 || true
+  run_command "git repo" git -C "$dir" branch -D "$wt_base_branch" >/dev/null 2>&1 || true
   log "[worktree] Removed: $wt"
 }
 
@@ -7224,7 +7360,7 @@ ensure_gt_tracked
 dep_updater_ensure_eco_fail_file
 _cleanup_trap_active=1
 
-git -C "$worktree_path" fetch origin --prune 2>/dev/null || true
+run_command "git worktree" git -C "$worktree_path" fetch origin --prune 2>/dev/null || true
 log "Working in: $worktree_path"
 
 # Scan only from a tree aligned with origin/main (never the primary clone).
