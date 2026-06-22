@@ -2,9 +2,48 @@
 # shellcheck shell=bash
 set -euo pipefail
 
+if declare -F lockfile_drift_check_repo >/dev/null 2>&1; then
+  return 0
+fi
+
 lockfile_drift_die() {
   echo "ERROR: $*" >&2
   exit 2
+}
+
+_lockfile_drift_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _lockfile_drift_lib_dir
+
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_lockfile_drift_lib_dir}/runner-ensure"
+
+# _lockfile_drift_runner_dir_stdout <label> <dir> -- <cmd-and-args…>
+_lockfile_drift_runner_dir_stdout() {
+  local -r label="$1"
+  local -r dir="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local exit_code out
+
+  exit_code=0
+  out="$(runner_sh_stdout "$label" "cd $(printf '%q' "$dir") && $*")" || exit_code=$?
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# _lockfile_drift_runner_dir_quiet <label> <dir> -- <cmd-and-args…>
+_lockfile_drift_runner_dir_quiet() {
+  local -r label="$1"
+  local -r dir="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local exit_code
+
+  exit_code=0
+  runner_sh "$label" "cd $(printf '%q' "$dir") && $* >/dev/null 2>&1" || exit_code=$?
+  return "$exit_code"
 }
 
 _lockfile_drift_has_cmd() {
@@ -42,7 +81,8 @@ _lockfile_drift_check_uv() {
 
   out=""
   rc=0
-  out="$(cd "$repo" && uv lock --check 2>&1)" || rc=$?
+  out="$(_lockfile_drift_runner_dir_stdout "lockfile-drift uv lock --check" "$repo" \
+    -- uv lock --check 2>&1)" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     _lockfile_drift_warn "uv.lock appears out of date vs pyproject.toml"
     _lockfile_drift_note "Workflow fix: run 'uv lock' (or 'uv sync') and commit uv.lock before deploy"
@@ -77,7 +117,8 @@ _lockfile_drift_check_cargo() {
 
   out=""
   rc=0
-  out="$(cd "$repo" && cargo metadata --locked --format-version 1 --no-deps 2>&1)" || rc=$?
+  out="$(_lockfile_drift_runner_dir_stdout "lockfile-drift cargo metadata --locked" "$repo" \
+    -- cargo metadata --locked --format-version 1 --no-deps 2>&1)" || rc=$?
   if [[ "$rc" -eq 0 ]]; then
     return 0
   fi
@@ -189,7 +230,8 @@ _lockfile_drift_check_pnpm_root() {
 
   out=""
   rc=0
-  out="$(cd "$install_root" && pnpm install --frozen-lockfile --ignore-scripts 2>&1)" || rc=$?
+  out="$(_lockfile_drift_runner_dir_stdout "lockfile-drift pnpm frozen install" "$install_root" \
+    -- pnpm install --frozen-lockfile --ignore-scripts 2>&1)" || rc=$?
   if [[ "$rc" -eq 0 ]]; then
     return 0
   fi
@@ -243,7 +285,8 @@ _lockfile_drift_uv_needs_fix() {
   fi
 
   rc=0
-  (cd "$repo" && uv lock --check >/dev/null 2>&1) || rc=$?
+  _lockfile_drift_runner_dir_quiet "lockfile-drift uv lock --check probe" "$repo" \
+    -- uv lock --check || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     return 1
   fi
@@ -276,7 +319,8 @@ _lockfile_drift_pnpm_root_needs_fix() {
   fi
 
   rc=0
-  (cd "$install_root" && pnpm install --frozen-lockfile --ignore-scripts >/dev/null 2>&1) || rc=$?
+  _lockfile_drift_runner_dir_quiet "lockfile-drift pnpm frozen probe" "$install_root" \
+    -- pnpm install --frozen-lockfile --ignore-scripts || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     return 1
   fi
@@ -297,7 +341,8 @@ _lockfile_drift_cargo_needs_fix() {
   fi
 
   rc=0
-  (cd "$repo" && cargo metadata --locked --format-version 1 --no-deps >/dev/null 2>&1) || rc=$?
+  _lockfile_drift_runner_dir_quiet "lockfile-drift cargo metadata probe" "$repo" \
+    -- cargo metadata --locked --format-version 1 --no-deps || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     return 1
   fi
@@ -316,7 +361,7 @@ _lockfile_drift_fix_uv() {
 
   _lockfile_drift_note "Regenerating uv.lock to match pyproject.toml..."
   rc=0
-  out="$(cd "$repo" && uv lock 2>&1)" || rc=$?
+  out="$(_lockfile_drift_runner_dir_stdout "lockfile-drift uv lock" "$repo" -- uv lock 2>&1)" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     _lockfile_drift_error "uv lock failed. Output:"
     printf '%s\n' "$out" >&2
@@ -337,7 +382,8 @@ _lockfile_drift_fix_pnpm() {
 
   _lockfile_drift_note "Regenerating pnpm-lock.yaml under ${install_root}..."
   rc=0
-  out="$(cd "$install_root" && pnpm install --ignore-scripts 2>&1)" || rc=$?
+  out="$(_lockfile_drift_runner_dir_stdout "lockfile-drift pnpm install" "$install_root" \
+    -- pnpm install --ignore-scripts 2>&1)" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     _lockfile_drift_error "pnpm install failed. Output:"
     printf '%s\n' "$out" >&2
@@ -357,12 +403,15 @@ _lockfile_drift_fix_cargo() {
   fi
 
   _lockfile_drift_note "Regenerating Cargo.lock to match Cargo.toml..."
-  if cargo generate-lockfile --help >/dev/null 2>&1; then
+  if runner_sh "lockfile-drift cargo generate-lockfile --help" \
+    "cargo generate-lockfile --help >/dev/null 2>&1"; then
     rc=0
-    out="$(cd "$repo" && cargo generate-lockfile 2>&1)" || rc=$?
+    out="$(_lockfile_drift_runner_dir_stdout "lockfile-drift cargo generate-lockfile" "$repo" \
+      -- cargo generate-lockfile 2>&1)" || rc=$?
   else
     rc=0
-    out="$(cd "$repo" && cargo check 2>&1)" || rc=$?
+    out="$(_lockfile_drift_runner_dir_stdout "lockfile-drift cargo check" "$repo" \
+      -- cargo check 2>&1)" || rc=$?
   fi
   if [[ "$rc" -ne 0 ]]; then
     _lockfile_drift_error "cargo lockfile regeneration failed. Output:"
