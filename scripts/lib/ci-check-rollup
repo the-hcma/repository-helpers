@@ -243,34 +243,104 @@ ci_rollup_failure_details_json() {
   ' 2>/dev/null || printf '[]\n'
 }
 
+# ci_rollup_jq_n <label> [jq -n args…]
+ci_rollup_jq_n() {
+  local -r label="$1"
+  shift
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" --stream-stdout -- jq -n "$@" || exit_code=$?
+  return "$exit_code"
+}
+
+# ci_failure_details_json_from_rollup <pr> <repo> <branch> <rollup-json>
+# Structured CI failure for emails and batch child reports (pr_url, check_url).
+ci_failure_details_json_from_rollup() {
+  local -r pr="$1"
+  local -r repo="${2:-}"
+  local -r branch="${3:-}"
+  local -r rollup="$4"
+  local first_line name conclusion check_url pr_url summary rest
+
+  if [[ -n "$repo" ]]; then
+    pr_url="https://github.com/${repo}/pull/${pr}"
+  else
+    pr_url=""
+  fi
+
+  name=""
+  conclusion=""
+  check_url=""
+  first_line="$(ci_rollup_failed_lines "$rollup" | head -n 1 || true)"
+  if [[ -n "$first_line" ]]; then
+    name="${first_line%%$'\t'*}"
+    rest="${first_line#*$'\t'}"
+    conclusion="${rest%%$'\t'*}"
+    check_url="${rest#*$'\t'}"
+    if [[ "$check_url" == "$conclusion" ]]; then
+      check_url=""
+    fi
+    summary="check ${name} ${conclusion}"
+  elif [[ -n "$branch" ]]; then
+    summary="branch ${branch}"
+  else
+    summary="CI checks failed"
+  fi
+
+  ci_rollup_jq_n "ci-failure details json" \
+    --argjson pr "$pr" \
+    --arg repo "$repo" \
+    --arg pr_url "$pr_url" \
+    --arg branch "$branch" \
+    --arg check_name "$name" \
+    --arg check_conclusion "$conclusion" \
+    --arg check_url "$check_url" \
+    --arg summary "$summary" \
+    '{
+      pr: $pr,
+      repo: $repo,
+      pr_url: $pr_url,
+      branch: $branch,
+      check_name: $check_name,
+      check_conclusion: $check_conclusion,
+      check_url: $check_url,
+      summary: $summary
+    }'
+}
+
+ci_failure_details_json_for_pr() {
+  local -r pr="$1"
+  local -r repo="${2:-}"
+  local -r branch="${3:-}"
+  local rollup
+
+  rollup="$(ci_rollup_json_for_pr "$pr" "$repo")"
+  ci_failure_details_json_from_rollup "$pr" "$repo" "$branch" "$rollup"
+}
+
+ci_failure_summary_from_details_json() {
+  local -r details="$1"
+
+  ci_rollup_jq_file "ci-failure summary text" "$details" -r '
+    if (.check_name // "") != "" then
+      "check=" + .check_name + " conclusion=" + (.check_conclusion // "") +
+      (if (.check_url // "") != "" then " url=" + .check_url else "" end) +
+      (if (.branch // "") != "" then " branch=" + .branch else "" end)
+    elif (.branch // "") != "" then
+      "branch=" + .branch
+    else
+      "CI checks failed"
+    end
+  ' 2>/dev/null || printf 'CI checks failed\n'
+}
+
 ci_failure_summary_for_pr() {
   local -r pr="$1"
   local -r repo="${2:-}"
   local -r branch="${3:-}"
-  local rollup first_line name conclusion url rest summary
+  local details
 
-  rollup="$(ci_rollup_json_for_pr "$pr" "$repo")"
-  first_line="$(ci_rollup_failed_lines "$rollup" | head -n 1 || true)"
-  if [[ -z "$first_line" ]]; then
-    if [[ -n "$branch" ]]; then
-      printf 'branch=%s' "$branch"
-    else
-      printf 'CI checks failed'
-    fi
-    return 0
-  fi
-
-  name="${first_line%%$'\t'*}"
-  rest="${first_line#*$'\t'}"
-  conclusion="${rest%%$'\t'*}"
-  url="${rest#*$'\t'}"
-
-  summary="check=${name} conclusion=${conclusion}"
-  if [[ -n "$url" && "$url" != "$conclusion" ]]; then
-    summary="${summary} url=${url}"
-  fi
-  if [[ -n "$branch" ]]; then
-    summary="${summary} branch=${branch}"
-  fi
-  printf '%s' "$summary"
+  details="$(ci_failure_details_json_for_pr "$pr" "$repo" "$branch")"
+  ci_failure_summary_from_details_json "$details"
 }

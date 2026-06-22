@@ -278,6 +278,109 @@ runner_format_failures() {
   done < <(runner_session_failed_ids)
 }
 
+# runner_failure_stderr_hint <uuid>
+# First non-empty stderr line, trimmed for email summaries.
+runner_failure_stderr_hint() {
+  local -r uuid="$1"
+  local hint
+
+  hint="$(runner_read "$uuid" "$_runner_artifact_stderr" 2>/dev/null \
+    | grep -m1 '.' || true)"
+  hint="${hint#"${hint%%[![:space:]]*}"}"
+  hint="${hint%"${hint##*[![:space:]]}"}"
+  if [[ ${#hint} -gt 160 ]]; then
+    hint="${hint:0:157}..."
+  fi
+  printf '%s' "$hint"
+}
+
+# runner_failures_to_json
+# JSON array of {label, exit_code, stderr_hint} for all failed commands.
+runner_failures_to_json() {
+  local uuid label exit_code hint
+  local -a rows=()
+  local row
+
+  while IFS= read -r uuid; do
+    [[ -n "$uuid" ]] || continue
+    label="$(runner_read "$uuid" "$_runner_artifact_label" 2>/dev/null || true)"
+    exit_code="$(runner_read_exit "$uuid" 2>/dev/null || printf '0')"
+    hint="$(runner_failure_stderr_hint "$uuid")"
+    if ! command -v jq >/dev/null 2>&1; then
+      continue
+    fi
+    row="$(jq -nc \
+      --arg label "$label" \
+      --argjson exit_code "$exit_code" \
+      --arg stderr_hint "$hint" \
+      '{label: $label, exit_code: $exit_code, stderr_hint: $stderr_hint}')"
+    rows+=("$row")
+  done < <(runner_session_failed_ids)
+
+  if [[ ${#rows[@]} -eq 0 ]]; then
+    printf '[]'
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '[]'
+    return 0
+  fi
+  printf '%s\n' "${rows[@]}" | jq -s '.'
+}
+
+# runner_report_append_command_failures <body_lines_array_name> [--log-file PATH]
+# Appends a concise email section listing every failed runner command in order.
+runner_report_append_command_failures() {
+  local -n _rr_body_lines="$1"
+  shift
+  local log_file=""
+  local uuid label exit_code hint count=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --log-file)
+        log_file="$2"
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+
+  while IFS= read -r uuid; do
+    [[ -n "$uuid" ]] || continue
+    count=$(( count + 1 ))
+  done < <(runner_session_failed_ids)
+
+  if (( count == 0 )); then
+    return 0
+  fi
+
+  _rr_body_lines+=("Command failures (${count}):")
+  _rr_body_lines+=("")
+  while IFS= read -r uuid; do
+    [[ -n "$uuid" ]] || continue
+    label="$(runner_read "$uuid" "$_runner_artifact_label" 2>/dev/null || true)"
+    exit_code="$(runner_read_exit "$uuid" 2>/dev/null || printf '?')"
+    hint="$(runner_failure_stderr_hint "$uuid")"
+    if [[ -z "$label" ]]; then
+      label="command ${uuid}"
+    fi
+    if [[ -n "$hint" ]]; then
+      _rr_body_lines+=("  - ${label} (exit ${exit_code}): ${hint}")
+    else
+      _rr_body_lines+=("  - ${label} (exit ${exit_code})")
+    fi
+  done < <(runner_session_failed_ids)
+  _rr_body_lines+=("")
+  if [[ -n "$log_file" ]]; then
+    _rr_body_lines+=("See log file for full command output:")
+    _rr_body_lines+=("  ${log_file}")
+    _rr_body_lines+=("")
+  fi
+}
+
 # runner_tail_lines <text> [max_lines]
 # Keeps the last N lines of captured output for email/report snippets.
 runner_tail_lines() {
