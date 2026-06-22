@@ -379,43 +379,62 @@ batch_report_update_lines() {
   ' "$updates_report" 2>/dev/null || true
 }
 
-# batch_report_append_repo_captures <repo_name> <clean_log> <body_lines_array_name>
-# Appends captured stderr/stdout blocks logged by batch-all for a failed repo.
-batch_report_append_repo_captures() {
+# batch_report_append_repo_failure_details <repo_name> <clean_log> <log_file> <body_lines_array_name>
+# Surfaces CI failures and per-command runner failures logged by batch-all.
+batch_report_append_repo_failure_details() {
   local -r repo_name="$1"
   local -r clean_log="$2"
-  local -n out_lines="$3"
-  local kind marker line
-  local -a capture_lines=()
+  local -r log_file="$3"
+  local -n out_lines="$4"
+  local ci_line pr_url check_url cause_line cmd_line ci_detail_re ci_pr_re
+  local -a cmd_lines=()
+  ci_detail_re='^pr=#([0-9]+) (.+) \(([^)]+)\)$'
+  ci_pr_re='^pr=#([0-9]+)'
 
-  for kind in stderr stdout; do
-    marker="[batch-all] Captured ${kind} (${repo_name}):"
-    if ! rg -qF "$marker" "$clean_log" 2>/dev/null; then
-      continue
+  ci_line="$(rg -m1 "^\[batch-all\] CI failure \\(${repo_name}\\): " "$clean_log" 2>/dev/null \
+    | sed "s/^\\[batch-all\\] CI failure (${repo_name}): //" || true)"
+  if [[ -n "$ci_line" ]]; then
+    pr_url="$(rg -m1 "^\[batch-all\] CI failure-link \\(${repo_name}\\) pr: " "$clean_log" 2>/dev/null \
+      | sed "s/^\\[batch-all\\] CI failure-link (${repo_name}) pr: //" || true)"
+    check_url="$(rg -m1 "^\[batch-all\] CI failure-link \\(${repo_name}\\) check: " "$clean_log" 2>/dev/null \
+      | sed "s/^\\[batch-all\\] CI failure-link (${repo_name}) check: //" || true)"
+    if [[ "$ci_line" =~ $ci_detail_re ]]; then
+      cause_line="CI failed on PR #${BASH_REMATCH[1]} — ${BASH_REMATCH[2]} (${BASH_REMATCH[3]})"
+    elif [[ "$ci_line" =~ $ci_pr_re ]]; then
+      cause_line="CI failed on PR #${BASH_REMATCH[1]}"
+    else
+      cause_line="CI failed — ${ci_line}"
     fi
-    capture_lines=()
-    while IFS= read -r line; do
-      [[ -n "$line" ]] || continue
-      capture_lines+=("$line")
-    done < <(awk -v m="$marker" '
-      index($0, m) {found=1; next}
-      found && /^\[batch-all\]   / {
-        sub(/^\[batch-all\]   /, "")
-        print
-        next
-      }
-      found { exit }
-    ' "$clean_log" 2>/dev/null || true)
-    if [[ ${#capture_lines[@]} -eq 0 ]]; then
-      continue
+    out_lines+=("  Cause: ${cause_line}")
+    if [[ -n "$pr_url" ]]; then
+      out_lines+=("  PR: ${pr_url}")
     fi
-    out_lines+=("  --- ${kind} ---")
-    for line in "${capture_lines[@]}"; do
-      out_lines+=("  ${line}")
-    done
-    out_lines+=("  --- end ${kind} ---")
+    if [[ -n "$check_url" ]]; then
+      out_lines+=("  Check run: ${check_url}")
+    fi
+    if [[ -z "$pr_url" && -z "$check_url" ]]; then
+      out_lines+=("  See log file for full output:")
+      out_lines+=("    ${log_file}")
+    fi
     out_lines+=("")
-  done
+    return 0
+  fi
+
+  while IFS= read -r cmd_line; do
+    [[ -n "$cmd_line" ]] || continue
+    cmd_lines+=("$cmd_line")
+  done < <(rg "^\[batch-all\] Command failure \\(${repo_name}\\): " "$clean_log" 2>/dev/null \
+    | sed "s/^\\[batch-all\\] Command failure (${repo_name}): //" || true)
+
+  if [[ ${#cmd_lines[@]} -gt 0 ]]; then
+    out_lines+=("  Failed commands:")
+    for cmd_line in "${cmd_lines[@]}"; do
+      out_lines+=("    - ${cmd_line}")
+    done
+    out_lines+=("  See log file for full output:")
+    out_lines+=("    ${log_file}")
+    out_lines+=("")
+  fi
 }
 
 # batch_report_build <clean_log> <exit_code> <started_at> <finished_at> [updates_report]
@@ -428,7 +447,7 @@ batch_report_build() {
   local -r updates_report="${5:-}"
   local ok_count fail_count update_count entry sline repo_name
   local update_repo update_eco update_pkg update_from update_to update_cve update_cves update_pr
-  local run_cmd
+  local run_cmd has_structured_failures=0
   local -a ok_lines fail_lines update_lines summary_lines body_lines
 
   ok_lines=()
@@ -472,6 +491,12 @@ batch_report_build() {
   body_lines+=("$report_separator")
   body_lines+=("")
 
+  if (( run_exit != 0 || fail_count > 0 )) \
+    && declare -F runner_report_append_command_failures >/dev/null 2>&1; then
+    runner_report_append_command_failures body_lines --log-file "$log_file"
+    has_structured_failures=1
+  fi
+
   if (( update_count > 0 )); then
     body_lines+=("Updates created (${update_count}):")
     body_lines+=("")
@@ -506,7 +531,11 @@ batch_report_build() {
     body_lines+=("=== ${repo_name} ===")
     body_lines+=("")
     body_lines+=("  Status: FAILED ${entry}")
-    batch_report_append_repo_captures "$repo_name" "$clean_log" body_lines
+    batch_report_append_repo_failure_details "$repo_name" "$clean_log" "$log_file" body_lines
+    if rg -qF "[batch-all] CI failure (${repo_name}):" "$clean_log" 2>/dev/null \
+      || rg -qF "[batch-all] Command failure (${repo_name}):" "$clean_log" 2>/dev/null; then
+      has_structured_failures=1
+    fi
     body_lines+=("")
   done
 
@@ -526,7 +555,7 @@ batch_report_build() {
     body_lines+=("")
   fi
 
-  if (( run_exit != 0 )); then
+  if (( run_exit != 0 )) && [[ "$has_structured_failures" -eq 0 ]]; then
     body_lines+=("--- last 80 lines of log ---")
     body_lines+=("")
     while IFS= read -r sline || [[ -n "$sline" ]]; do

@@ -126,7 +126,7 @@ _merge_it_poll_pr=""
 _merge_it_poll_had_label=""
 
 # Set when CI fails and the PR is closed (batch child report enrichment).
-_last_ci_failure_summary=""
+_last_ci_failure_json=""
 
 # Populated before npm_outdated (format: pkg current fix cve1,cve2,...).
 npm_cve_fix_audit_lines=""
@@ -1516,8 +1516,8 @@ dep_updater_handle_ci_failure() {
   local -r branch="${2:-}"
   local summary comment
 
-  summary="$(ci_failure_summary_for_pr "$pr_num" "${repo_owner}/${repo_name}" "$branch")"
-  _last_ci_failure_summary="$summary"
+  _last_ci_failure_json="$(ci_failure_details_json_for_pr "$pr_num" "${repo_owner}/${repo_name}" "$branch")"
+  summary="$(ci_failure_summary_from_details_json "$_last_ci_failure_json")"
 
   log "PR #${pr_num} failed CI: ${summary}"
   comment="Closed by dep-updater: CI failed (${summary}). Re-run to create a fresh update."
@@ -1533,14 +1533,21 @@ dep_updater_handle_ci_failure() {
 dep_updater_write_batch_child_report_json() {
   local -r exit_code="${1:?}"
   local -r first_failure="${2:-}"
-  local out_file primary details_json ci_failure_json capture_stderr capture_stdout
+  local out_file primary details_json ci_failure_json command_failures_json
+  local capture_stderr capture_stdout
 
   out_file="${DEP_UPDATER_RUN_REPORT:?}"
   primary="$first_failure"
   details_json='[]'
   ci_failure_json='null'
+  command_failures_json='[]'
   capture_stderr=""
   capture_stdout=""
+
+  if [[ -n "${RUNNER_SESSION_DIR:-}" ]] \
+    && declare -F runner_failures_to_json >/dev/null 2>&1; then
+    command_failures_json="$(runner_failures_to_json)"
+  fi
 
   if [[ -n "${RUNNER_SESSION_DIR:-}" ]] \
     && declare -F runner_last_failure_capture_stderr >/dev/null 2>&1; then
@@ -1565,9 +1572,8 @@ dep_updater_write_batch_child_report_json() {
     [[ -z "$primary" ]] && primary="dep-updater exited with code ${exit_code}"
   fi
 
-  if [[ -n "${_last_ci_failure_summary:-}" ]]; then
-    # shellcheck disable=SC2016  # jq -n filter uses $s variable, not shell expansion
-    ci_failure_json="$(dep_runner_jq_n "dep-updater batch child ci failure" --arg s "$_last_ci_failure_summary" '$s')"
+  if [[ -n "${_last_ci_failure_json:-}" && "$_last_ci_failure_json" != "null" ]]; then
+    ci_failure_json="$_last_ci_failure_json"
   fi
 
   # shellcheck disable=SC2016  # jq -n object template uses jq variables, not shell expansion
@@ -1577,17 +1583,19 @@ dep_updater_write_batch_child_report_json() {
     --arg primary "$primary" \
     --argjson details "${details_json}" \
     --argjson ci_failure "${ci_failure_json}" \
+    --argjson command_failures "${command_failures_json}" \
     --arg capture_stderr "$capture_stderr" \
     --arg capture_stdout "$capture_stdout" \
-    '{exit_code: $exit_code, dir: $dir, primary: $primary, details: $details, ci_failure: $ci_failure, capture_stderr: $capture_stderr, capture_stdout: $capture_stdout}' \
+    '{exit_code: $exit_code, dir: $dir, primary: $primary, details: $details, ci_failure: $ci_failure, command_failures: $command_failures, capture_stderr: $capture_stderr, capture_stdout: $capture_stdout}' \
     >"$out_file" 2>/dev/null; then
     # shellcheck disable=SC2016  # jq -n fallback object uses jq variables, not shell expansion
     dep_runner_jq_n "dep-updater batch child report emit fallback" \
       --argjson exit_code "$exit_code" --arg primary "$primary" \
       --argjson ci_failure "${ci_failure_json}" \
+      --argjson command_failures "${command_failures_json}" \
       --arg capture_stderr "$capture_stderr" \
       --arg capture_stdout "$capture_stdout" \
-      '{exit_code: $exit_code, dir: "", primary: $primary, details: [], ci_failure: $ci_failure, capture_stderr: $capture_stderr, capture_stdout: $capture_stdout}' \
+      '{exit_code: $exit_code, dir: "", primary: $primary, details: [], ci_failure: $ci_failure, command_failures: $command_failures, capture_stderr: $capture_stderr, capture_stdout: $capture_stdout}' \
       >"$out_file" 2>/dev/null || true
   fi
 }
@@ -6924,7 +6932,6 @@ batch_all_scrape_actionable_from_log() {
 
 batch_all_dispatch() {
   local dep_self repo child_exit worst_exit
-  local capture_stderr capture_stdout cap_line
   local -a child_args repos_found
   local -a failure_summaries=()
   local -a failure_details=()
@@ -7008,6 +7015,7 @@ batch_all_dispatch() {
     child_exit=0
     local child_log child_fifo child_pid child_report child_updates
     local root_cause child_clean report_line detail_count
+    local ci_type ci_pr ci_check_name ci_check_conclusion ci_pr_url ci_check_url ci_summary
     child_log="$(mktemp)"
     child_report="$(mktemp)"
     child_updates="$(mktemp)"
@@ -7092,24 +7100,53 @@ batch_all_dispatch() {
       fi
 
       if [[ -s "$child_report" ]] \
-        && dep_runner_jq_file_args "dep-updater batch-all child capture validate" "$child_report" -e \
-          'has("capture_stderr") or has("capture_stdout")' >/dev/null 2>&1; then
-        capture_stderr="$(dep_runner_jq_file_args "dep-updater batch-all child capture stderr" "$child_report" -r '.capture_stderr // empty' 2>/dev/null || true)"
-        capture_stdout="$(dep_runner_jq_file_args "dep-updater batch-all child capture stdout" "$child_report" -r '.capture_stdout // empty' 2>/dev/null || true)"
-        if [[ -n "$capture_stderr" ]]; then
-          log "[batch-all] Captured stderr ($(basename "$repo")):"
-          while IFS= read -r cap_line || [[ -n "$cap_line" ]]; do
-            [[ -z "$cap_line" ]] && continue
-            log "[batch-all]   ${cap_line}"
-          done <<< "$capture_stderr"
+        && dep_runner_jq_file_args "dep-updater batch-all child ci failure" "$child_report" -e \
+          'has("ci_failure") and .ci_failure != null' >/dev/null 2>&1; then
+        ci_type="$(dep_runner_jq_file_args "dep-updater batch-all child ci type" "$child_report" \
+          -r '.ci_failure | type' 2>/dev/null || true)"
+        if [[ "$ci_type" == "object" ]]; then
+          ci_pr="$(dep_runner_jq_file_args "dep-updater batch-all child ci pr" "$child_report" \
+            -r '.ci_failure.pr // empty' 2>/dev/null || true)"
+          ci_check_name="$(dep_runner_jq_file_args "dep-updater batch-all child ci check" "$child_report" \
+            -r '.ci_failure.check_name // empty' 2>/dev/null || true)"
+          ci_check_conclusion="$(dep_runner_jq_file_args "dep-updater batch-all child ci conclusion" "$child_report" \
+            -r '.ci_failure.check_conclusion // empty' 2>/dev/null || true)"
+          ci_pr_url="$(dep_runner_jq_file_args "dep-updater batch-all child ci pr url" "$child_report" \
+            -r '.ci_failure.pr_url // empty' 2>/dev/null || true)"
+          ci_check_url="$(dep_runner_jq_file_args "dep-updater batch-all child ci check url" "$child_report" \
+            -r '.ci_failure.check_url // empty' 2>/dev/null || true)"
+          if [[ -n "$ci_pr" ]]; then
+            if [[ -n "$ci_check_name" ]]; then
+              log "[batch-all] CI failure ($(basename "$repo")): pr=#${ci_pr} ${ci_check_name} (${ci_check_conclusion})"
+            else
+              log "[batch-all] CI failure ($(basename "$repo")): pr=#${ci_pr} CI checks failed"
+            fi
+            if [[ -n "$ci_pr_url" ]]; then
+              log "[batch-all] CI failure-link ($(basename "$repo")) pr: ${ci_pr_url}"
+            fi
+            if [[ -n "$ci_check_url" ]]; then
+              log "[batch-all] CI failure-link ($(basename "$repo")) check: ${ci_check_url}"
+            fi
+          fi
+        elif [[ "$ci_type" == "string" ]]; then
+          ci_summary="$(dep_runner_jq_file_args "dep-updater batch-all child ci summary" "$child_report" \
+            -r '.ci_failure // empty' 2>/dev/null || true)"
+          if [[ -n "$ci_summary" && "$ci_summary" != "null" ]]; then
+            log "[batch-all] CI failure ($(basename "$repo")): ${ci_summary}"
+          fi
         fi
-        if [[ -n "$capture_stdout" ]]; then
-          log "[batch-all] Captured stdout ($(basename "$repo")):"
-          while IFS= read -r cap_line || [[ -n "$cap_line" ]]; do
-            [[ -z "$cap_line" ]] && continue
-            log "[batch-all]   ${cap_line}"
-          done <<< "$capture_stdout"
-        fi
+      fi
+
+      if [[ -s "$child_report" ]] \
+        && dep_runner_jq_file_args "dep-updater batch-all child command failures" "$child_report" -e \
+          '(.command_failures // []) | length > 0' >/dev/null 2>&1; then
+        while IFS= read -r cmd_line; do
+          [[ -n "$cmd_line" ]] || continue
+          log "[batch-all] Command failure ($(basename "$repo")): ${cmd_line}"
+        done < <(dep_runner_jq_file_args "dep-updater batch-all child command failure lines" \
+          "$child_report" -r \
+          '(.command_failures // [])[] | "\(.label) (exit \(.exit_code)): \(.stderr_hint)"' \
+          2>/dev/null || true)
       fi
 
       # If pnpm ignored builds were encountered, surface the specific skipped packages.
