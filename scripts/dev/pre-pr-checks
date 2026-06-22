@@ -21,6 +21,7 @@ check_root=""
 restore_done=0
 prec_pr_jobs_dir=""
 prec_pr_job_count=0
+prec_pr_test_isolate_dir=""
 
 usage() {
   cat >&2 <<'USAGE'
@@ -36,7 +37,7 @@ Checks (same as CI, run in parallel where independent):
   - bash -n on scripts/*, scripts/dev/*, scripts/lib/*, tests/*, tests/lib/*
   - shellcheck -S info on the same paths
   - actionlint on GitHub workflows and repository-practices workflow templates
-  - bash tests/*.test (every test harness must pass)
+  - bash tests/*.test sequentially (CI parity), each in an isolated TMPDIR
 
 Before gt submit, run this script (or use scripts/dev/submit-stack).
 USAGE
@@ -143,6 +144,8 @@ require_tools() {
 
 init_parallel_jobs() {
   prec_pr_jobs_dir="$(mktemp -d "${TMPDIR:-/tmp}/pre-pr-checks-jobs.XXXXXX")"
+  prec_pr_test_isolate_dir="${prec_pr_jobs_dir}/test-isolate"
+  mkdir -p "$prec_pr_test_isolate_dir"
 }
 
 # Run one check in the background; writes ${job_name}.log and ${job_name}.rc under prec_pr_jobs_dir.
@@ -183,16 +186,21 @@ job_actionlint() {
 
 job_test_file() {
   local -r test_path="$1"
-  bash "$test_path"
+  local test_tmp rc
+
+  test_tmp="$(mktemp -d "${prec_pr_test_isolate_dir}/job.XXXXXX")"
+  rc=0
+  (
+    export TMPDIR="$test_tmp"
+    unset RUNNER_SESSION_DIR RUNNER_SESSION_KEEP
+    bash "$test_path"
+  ) || rc=$?
+  rm -rf "$test_tmp"
+  return "$rc"
 }
 
-start_parallel_checks() {
-  local t base
-
-  init_parallel_jobs
-  start_parallel_job 'bash-n' job_bash_n
-  start_parallel_job 'shellcheck' job_shellcheck
-  start_parallel_job 'actionlint' job_actionlint
+job_all_tests() {
+  local t base rc
 
   shopt -s nullglob
   local -a tests=( "${check_root}"/tests/*.test )
@@ -202,10 +210,24 @@ start_parallel_checks() {
   fi
   for t in "${tests[@]}"; do
     base="$(basename "$t" .test)"
-    start_parallel_job "test-${base}" job_test_file "$t"
+    rc=0
+    job_test_file "$t" || rc=$?
+    if (( rc != 0 )); then
+      printf 'FAILED: test-%s (exit %s)\n' "$base" "$rc" >&2
+      return "$rc"
+    fi
   done
+  return 0
+}
 
-  log_step "Running ${prec_pr_job_count} checks in parallel…"
+start_parallel_checks() {
+  init_parallel_jobs
+  start_parallel_job 'bash-n' job_bash_n
+  start_parallel_job 'shellcheck' job_shellcheck
+  start_parallel_job 'actionlint' job_actionlint
+  start_parallel_job 'tests' job_all_tests
+
+  log_step "Running ${prec_pr_job_count} checks in parallel (tests sequential, isolated TMPDIR)…"
 }
 
 wait_parallel_checks() {
