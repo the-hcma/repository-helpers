@@ -781,9 +781,13 @@ check_core_prereqs() {
 # Detect pnpm's "ignored builds" safety gate in output.
 pnpm_output_has_ignored_builds() {
   local -r output_file="$1"
+  local p_pm_tool p_approve ignored_builds_pat
+  p_pm_tool='pnpm'
+  p_approve='approve-builds'
+  ignored_builds_pat="ERR_PNPM_IGNORED_BUILDS|${p_pm_tool} ${p_approve}|${p_approve}"
   [[ -f "$output_file" ]] || return 1
   dep_runner_rg "pnpm ignored builds marker" -- --quiet \
-    'ERR_PNPM_IGNORED_BUILDS|pnpm approve-builds|approve-builds' "$output_file"
+    "$ignored_builds_pat" "$output_file"
 }
 
 pnpm_record_ignored_build_pkgs() {
@@ -793,7 +797,8 @@ pnpm_record_ignored_build_pkgs() {
   # Example:
   #   [ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: esbuild@0.27.7, esbuild@0.28.0
   local ignored_line
-  ignored_line="$(rg -m 1 -o 'Ignored build scripts:.*' "$output_file" 2>/dev/null || true)"
+  ignored_line="$(dep_runner_sh_stdout "rg ignored builds line" -- \
+    "rg -m 1 -o 'Ignored build scripts:.*' $(printf '%q' "$output_file") 2>/dev/null || true")"
   [[ -z "$ignored_line" ]] && return 0
   ignored_line="${ignored_line#Ignored build scripts: }"
 
@@ -806,18 +811,30 @@ pnpm_record_ignored_build_pkgs() {
     if [[ -z "$pnpm_ignored_build_pkgs" ]]; then
       pnpm_ignored_build_pkgs="$pkg_name"
     else
-      if ! printf '%s\n' "$pnpm_ignored_build_pkgs" | rg -qx --fixed-strings "$pkg_name"; then
+      local list_tmp
+      list_tmp="$(mktemp)"
+      printf '%s\n' "$pnpm_ignored_build_pkgs" >"$list_tmp"
+      if dep_runner_rg "pnpm ignored pkg dedupe" -- -qxF "$pkg_name" "$list_tmp"; then
+        :
+      else
         pnpm_ignored_build_pkgs="${pnpm_ignored_build_pkgs}
 ${pkg_name}"
       fi
+      rm -f "$list_tmp"
     fi
   done < <(tr ',' '\n' <<<"$ignored_line")
 }
 
 pnpm_pkg_is_ignored_build() {
   local -r pkg="$1"
+  local list_tmp rc
   [[ -z "$pnpm_ignored_build_pkgs" ]] && return 1
-  printf '%s\n' "$pnpm_ignored_build_pkgs" | rg -qx --fixed-strings "$pkg"
+  list_tmp="$(mktemp)"
+  printf '%s\n' "$pnpm_ignored_build_pkgs" >"$list_tmp"
+  dep_runner_rg "pnpm ignored pkg lookup" -- -qxF "$pkg" "$list_tmp"
+  rc=$?
+  rm -f "$list_tmp"
+  return "$rc"
 }
 
 # npm_version_prefetch <pkg> <version>
@@ -1328,7 +1345,8 @@ npm_pnpm_try_lockfile_with_updates() {
   fi
 
   tmp_pkg="$(mktemp)"
-  if ! jq --argjson updates "$updates_json" '
+  # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+  if ! dep_runner_jq_file_args "jq patch package.json prefetch" "$pkg_json" --argjson updates "$updates_json" '
     to_entries | map(
       if (.key == "dependencies" or .key == "devDependencies" or .key == "peerDependencies")
          and (.value != null) then
@@ -1338,7 +1356,7 @@ npm_pnpm_try_lockfile_with_updates() {
         )
       else . end
     ) | from_entries
-  ' "$pkg_json" >"$tmp_pkg"; then
+  ' >"$tmp_pkg"; then
     cp "$bak_pkg" "$pkg_json"
     rm -f "$bak_pkg" "$tmp_pkg" "$bak_lock"
     return 1
@@ -1798,7 +1816,11 @@ dep_runner_jq_with_args() {
   exit_code=0
   out="$(runner_exec_stdout "$label" -- jq "$@" "$tmp_json")" || exit_code=$?
   rm -f "$tmp_json"
-  printf '%s' "$out"
+  if [[ -n "$out" && "${out: -1}" != $'\n' ]]; then
+    printf '%s\n' "$out"
+  else
+    printf '%s' "$out"
+  fi
   return "$exit_code"
 }
 
@@ -1811,7 +1833,11 @@ dep_runner_jq_file_args() {
 
   exit_code=0
   out="$(runner_exec_stdout "$label" -- jq "$@" "$file")" || exit_code=$?
-  printf '%s' "$out"
+  if [[ -n "$out" && "${out: -1}" != $'\n' ]]; then
+    printf '%s\n' "$out"
+  else
+    printf '%s' "$out"
+  fi
   return "$exit_code"
 }
 
@@ -1823,7 +1849,11 @@ dep_runner_jq_n() {
 
   exit_code=0
   out="$(runner_exec_stdout "$label" -- jq -n "$@")" || exit_code=$?
-  printf '%s' "$out"
+  if [[ -n "$out" && "${out: -1}" != $'\n' ]]; then
+    printf '%s\n' "$out"
+  else
+    printf '%s' "$out"
+  fi
   return "$exit_code"
 }
 
@@ -1867,6 +1897,173 @@ dep_runner_pnpm_view_version() {
   exit_code=0
   runner_sh "$label" --stream-stdout \
     "cd $(printf '%q' "$project_root") && ${cmd_quoted}" || exit_code=$?
+  return "$exit_code"
+}
+
+# dep_runner_sh_stdout <label> -- <shell-command>
+dep_runner_sh_stdout() {
+  local -r label="$1"
+  shift
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local -r cmd="$*"
+  local exit_code out
+
+  exit_code=0
+  out="$(runner_sh_stdout "$label" -- "$cmd")" || exit_code=$?
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# dep_runner_sh <label> -- <shell-command>
+dep_runner_sh() {
+  local -r label="$1"
+  shift
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local -r cmd="$*"
+  local exit_code
+
+  exit_code=0
+  runner_sh "$label" -- "$cmd" || exit_code=$?
+  return "$exit_code"
+}
+
+# dep_runner_uv_dir_stdout <label> <dir> -- <uv-args…>
+dep_runner_uv_dir_stdout() {
+  local -r label="$1"
+  local -r uv_dir="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local cmd_quoted exit_code out
+
+  cmd_quoted="$(runner_quote_cmdline uv "$@")"
+  exit_code=0
+  out="$(runner_sh_stdout "$label" -- "cd $(printf '%q' "$uv_dir") && ${cmd_quoted}")" || exit_code=$?
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# dep_runner_uv_dir_capture <label> <dir> -- <uv-args…>
+# Captures merged stdout+stderr (for tool error messages).
+dep_runner_uv_dir_capture() {
+  local -r label="$1"
+  local -r uv_dir="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local cmd_quoted exit_code out
+
+  cmd_quoted="$(runner_quote_cmdline uv "$@")"
+  exit_code=0
+  out="$(runner_sh_stdout "$label" -- "cd $(printf '%q' "$uv_dir") && ${cmd_quoted} 2>&1")" || exit_code=$?
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# dep_runner_uv_dir <label> <dir> -- <uv-args…>
+dep_runner_uv_dir() {
+  local -r label="$1"
+  local -r uv_dir="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local cmd_quoted exit_code
+
+  cmd_quoted="$(runner_quote_cmdline uv "$@")"
+  exit_code=0
+  runner_sh "$label" -- "cd $(printf '%q' "$uv_dir") && ${cmd_quoted}" || exit_code=$?
+  return "$exit_code"
+}
+
+# dep_runner_cargo_dir_stdout <label> <dir> -- <cargo-args…>
+dep_runner_cargo_dir_stdout() {
+  local -r label="$1"
+  local -r cargo_dir="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local cmd_quoted exit_code out
+
+  cmd_quoted="$(runner_quote_cmdline cargo "$@")"
+  exit_code=0
+  out="$(runner_sh_stdout "$label" -- "cd $(printf '%q' "$cargo_dir") && ${cmd_quoted}")" || exit_code=$?
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# dep_runner_cargo_dir_capture <label> <dir> -- <cargo-args…>
+dep_runner_cargo_dir_capture() {
+  local -r label="$1"
+  local -r cargo_dir="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local cmd_quoted exit_code out
+
+  cmd_quoted="$(runner_quote_cmdline cargo "$@")"
+  exit_code=0
+  out="$(runner_sh_stdout "$label" -- "cd $(printf '%q' "$cargo_dir") && ${cmd_quoted} 2>&1")" || exit_code=$?
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# dep_runner_cargo_dir <label> <dir> -- <cargo-args…>
+dep_runner_cargo_dir() {
+  local -r label="$1"
+  local -r cargo_dir="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local cmd_quoted exit_code
+
+  cmd_quoted="$(runner_quote_cmdline cargo "$@")"
+  exit_code=0
+  runner_sh "$label" -- "cd $(printf '%q' "$cargo_dir") && ${cmd_quoted}" || exit_code=$?
+  return "$exit_code"
+}
+
+# dep_runner_npm_prefix <label> <root> -- <npm-args…>
+dep_runner_npm_prefix() {
+  local -r label="$1"
+  local -r npm_root="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" -- npm --prefix "$npm_root" "$@" || exit_code=$?
+  return "$exit_code"
+}
+
+# dep_runner_yarn_cwd <label> <root> -- <yarn-args…>
+dep_runner_yarn_cwd() {
+  local -r label="$1"
+  local -r yarn_root="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local exit_code
+
+  exit_code=0
+  runner_exec "$label" -- yarn --cwd "$yarn_root" "$@" || exit_code=$?
+  return "$exit_code"
+}
+
+# dep_runner_poetry_dir_stdout <label> <dir> -- <poetry-args…>
+dep_runner_poetry_dir_stdout() {
+  local -r label="$1"
+  local -r poetry_dir="$2"
+  shift 2
+  [[ "${1:-}" == '--' ]] || return 2
+  shift
+  local exit_code out
+
+  exit_code=0
+  out="$(runner_exec_stdout "$label" -- poetry --directory "$poetry_dir" "$@")" || exit_code=$?
+  printf '%s' "$out"
   return "$exit_code"
 }
 
@@ -2449,7 +2646,7 @@ primary_repo_ensure_on_main() {
 
   if ! primary_repo_worktree_is_clean; then
     log "[worktree] Warning: primary clone is on '${branch:-detached}' with local changes; leaving checkout unchanged."
-    log "[worktree] Switch back manually: (cd ${dir} && git checkout main)"
+    log "[worktree] Switch back manually in ${dir} (checkout main when clean)."
     return 0
   fi
 
@@ -2804,12 +3001,10 @@ create_worktree() {
         || die "pnpm install failed."
     elif [[ -f "${npm_wt}/package-lock.json" ]]; then
       log "[worktree] Installing dependencies (npm)…"
-      install_with_net_retry npm "$npm_wt" \
-        npm ci --prefer-offline --no-audit --no-fund
+      install_with_net_retry npm "$npm_wt" npm ci --prefer-offline --no-audit --no-fund
     elif [[ -f "${npm_wt}/yarn.lock" ]]; then
       log "[worktree] Installing dependencies (yarn)…"
-      install_with_net_retry yarn "$npm_wt" \
-        yarn install --frozen-lockfile
+      install_with_net_retry yarn "$npm_wt" yarn install --frozen-lockfile
     fi
   fi
   if [[ -n "$py_tool" ]]; then
@@ -2818,22 +3013,19 @@ create_worktree() {
         if [[ -f "$worktree_path/uv.lock" || -f "$worktree_path/requirements.txt" ]]; then
           log "[worktree] Installing dependencies (uv)…"
           if [[ ! -d "$worktree_path/.venv" ]]; then
-            (cd "$worktree_path" && uv venv) >&2
+            dep_runner_sh "uv venv" -- "cd $(printf '%q' "$worktree_path") && uv venv" >&2
           fi
           if [[ -f "$worktree_path/uv.lock" ]]; then
-            install_with_net_retry uv "$worktree_path" \
-              uv sync --frozen
+            install_with_net_retry uv "$worktree_path" uv sync --frozen
           else
-            install_with_net_retry uv "$worktree_path" \
-              uv pip install -r requirements.txt
+            install_with_net_retry uv "$worktree_path" uv pip install -r requirements.txt
           fi
         fi
         ;;
       poetry)
         [[ -f "$worktree_path/poetry.lock" ]] \
           && log "[worktree] Installing dependencies (poetry)…" \
-          && install_with_net_retry poetry "$worktree_path" \
-               poetry install --no-root
+          && install_with_net_retry poetry "$worktree_path" poetry install --no-root
         ;;
       pipenv)
         [[ -f "$worktree_path/Pipfile.lock" ]] \
@@ -2848,8 +3040,7 @@ create_worktree() {
   fi
   if [[ "$has_rust" == '1' && -f "$worktree_path/Cargo.lock" ]]; then
     log "[worktree] Fetching Rust dependencies (cargo fetch)…"
-    install_with_net_retry cargo "$worktree_path" \
-      cargo fetch --locked
+    install_with_net_retry cargo "$worktree_path" cargo fetch --locked
   fi
   log "[worktree] Ready: $worktree_path"
 }
@@ -2995,7 +3186,7 @@ ensure_gt_tracked() {
   # Use --force so Graphite auto-detects the trunk parent.
   if ! run_in_worktree gt branch info &>/dev/null 2>&1; then
     run_in_worktree gt track --force \
-      || die "Could not register '${current_branch}' with Graphite. Cannot create stack.\n  Try manually: (cd ${worktree_path} && gt track --parent main)"
+      || die "Could not register '${current_branch}' with Graphite. Cannot create stack.\n  Try manually in worktree: graphite track --parent main"
   fi
 }
 
@@ -3050,10 +3241,9 @@ npm_outdated() {
   if [[ "$tool" == 'pnpm' && "$semver_only" == '0' ]]; then
     local pkg_json_specs
     if [[ -f "${scan_root}/package.json" ]]; then
-      pkg_json_specs="$(jq -c \
+      pkg_json_specs="$(dep_runner_jq_file_args "jq package.json direct deps" "${scan_root}/package.json" -c \
         '[.dependencies, .devDependencies, .peerDependencies, .optionalDependencies]
-         | map(select(. != null)) | add // {}' \
-        "${scan_root}/package.json" 2>/dev/null || echo '{}')"
+         | map(select(. != null)) | add // {}' 2>/dev/null || echo '{}')"
     else
       pkg_json_specs='{}'
     fi
@@ -3072,7 +3262,7 @@ npm_outdated() {
     rm -f "$tmp_list_err"
 
     local pkgs_json
-    pkgs_json="$(printf '%s' "$pkg_json_specs" | jq -c 'keys' 2>/dev/null || echo '[]')"
+    pkgs_json="$(dep_runner_jq_with_args "jq package keys" "$pkg_json_specs" -c 'keys' 2>/dev/null || echo '[]')"
 
     local -a candidate_lines=()
     local pkg spec current eligible pv reg higher latest
@@ -3081,15 +3271,17 @@ npm_outdated() {
       if pnpm_pkg_is_ignored_build "$pkg"; then
         continue
       fi
-      spec="$(printf '%s' "$pkg_json_specs" | jq -r --arg p "$pkg" '.[$p] // ""' 2>/dev/null || echo "")"
+  # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+      spec="$(dep_runner_jq_with_args "jq package spec" "$pkg_json_specs" -r --arg p "$pkg" '.[$p] // ""' 2>/dev/null || echo "")"
       # Skip packages whose specifier is a local/git reference; those are never version-bumped.
       if [[ -n "$spec" ]] && [[ "$spec" =~ ^(workspace:|file:|link:|git) ]]; then
         continue
       fi
-      current="$(jq -r --arg p "$pkg" '
+  # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+      current="$(dep_runner_jq_file_args "jq pnpm list current" "$tmp_list" -r --arg p "$pkg" '
         .[0] as $root
         | ($root.dependencies[$p].version // $root.devDependencies[$p].version // $root.optionalDependencies[$p].version // $root.peerDependencies[$p].version // "")
-      ' "$tmp_list" 2>/dev/null || echo "")"
+      ' 2>/dev/null || echo "")"
       [[ -z "$current" ]] && continue
 
       # Combine pnpm metadata with the npm packument dist-tags.latest (same HTTPS
@@ -3119,7 +3311,7 @@ npm_outdated() {
       if [[ -n "$eligible" && "$eligible" != "$current" ]]; then
         candidate_lines+=("$pkg $current $eligible")
       fi
-    done < <(printf '%s' "$pkgs_json" | jq -r '.[]' 2>/dev/null || true)
+    done < <(dep_runner_jq_with_args "jq package names" "$pkgs_json" -r '.[]' 2>/dev/null || true)
 
     if [[ ${#candidate_lines[@]} -gt 0 ]]; then
       mapfile -t candidate_lines < <(npm_pnpm_filter_outdated_lines "$scan_root" "${candidate_lines[@]}")
@@ -3161,18 +3353,17 @@ npm_outdated() {
   # style (no promotion to ^), matching Dependabot behaviour.
   local pkg_json_specs
   if [[ -f "${scan_root}/package.json" ]]; then
-    pkg_json_specs="$(jq -c \
+    pkg_json_specs="$(dep_runner_jq_file_args "jq package.json direct deps" "${scan_root}/package.json" -c \
       '[.dependencies, .devDependencies, .peerDependencies, .optionalDependencies]
-       | map(select(. != null)) | add // {}' \
-      "${scan_root}/package.json" 2>/dev/null || echo '{}')"
+       | map(select(. != null)) | add // {}' 2>/dev/null || echo '{}')"
   else
     pkg_json_specs='{}'
   fi
 
   if [[ "$tool" == 'yarn' ]]; then
-    jq -r 'select(.type == "table")
+    dep_runner_jq_file_args "yarn outdated table" "$tmp_json" -r 'select(.type == "table")
       | .data.body[]
-      | "\(.[0]) \(.[1]) \(.[3])"' "$tmp_json" 2>/dev/null \
+      | "\(.[0]) \(.[1]) \(.[3])"' 2>/dev/null \
       | awk '{if(NF==3 && $1!="" && $2!="" && $3!="") print $0}' \
       | while IFS=' ' read -r _ypkg _ycur _ynew; do
           local _yeligible
@@ -3183,6 +3374,7 @@ npm_outdated() {
         done
   else
     local -a candidate_lines=()
+    # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
     while IFS= read -r _npkg _ncur _nnew; do
       [[ -z "$_npkg" ]] && continue
       if [[ "$semver_only" == '1' ]]; then
@@ -3202,7 +3394,8 @@ npm_outdated() {
           candidate_lines+=("$_npkg $_ncur $_neligible")
         fi
       fi
-    done < <(jq -r --argjson specs "$pkg_json_specs" --arg semver_only "$semver_only" '
+    done < <(dep_runner_jq_file_args "npm outdated candidates" "$tmp_json" -r \
+      --argjson specs "$pkg_json_specs" --arg semver_only "$semver_only" '
       to_entries[]
       | select(
           .key | test("^(latest|wanted|isDeprecated|name|type|homepage|description|author|license|repository|bugs|engines|_.*)$") | not
@@ -3239,7 +3432,7 @@ npm_outdated() {
               )
             )
           | "\(.key) \(.value.current) \(.value.latest)"
-        end' "$tmp_json" 2>/dev/null \
+        end' 2>/dev/null \
       | awk '{if(NF==3 && $1!="" && $2!="" && $3!="") print $0}')
 
     if [[ ${#candidate_lines[@]} -gt 0 ]]; then
@@ -3412,13 +3605,15 @@ npm_update_group() {
         updates_json='{}'
         while IFS=' ' read -r pkg _old new_ver; do
           [[ -z "$pkg" ]] && continue
-          updates_json="$(printf '%s' "$updates_json" \
-            | jq --arg k "$pkg" --arg v "$new_ver" '. + {($k): $v}')"
+          # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+          updates_json="$(dep_runner_jq_with_args "jq merge pkg version" "$updates_json" \
+            --arg k "$pkg" --arg v "$new_ver" '. + {($k): $v}')"
         done <<< "$entries"
 
         local tmp_pkg
         tmp_pkg="$(mktemp)"
-        if ! jq --argjson updates "$updates_json" '
+  # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+        if ! dep_runner_jq_file_args "jq patch package.json" "${npm_root}/package.json" --argjson updates "$updates_json" '
           to_entries | map(
             if (.key == "dependencies" or .key == "devDependencies" or .key == "peerDependencies")
                and (.value != null) then
@@ -3434,9 +3629,9 @@ npm_update_group() {
               )
             else . end
           ) | from_entries
-        ' "${npm_root}/package.json" > "$tmp_pkg"; then
+        ' >"$tmp_pkg"; then
           rm -f "$tmp_pkg"
-          dep_updater_append_ecosystem_failure "npm|jq failed for group ${group_key} (${npm_tool})"
+          dep_updater_append_ecosystem_failure "npm|manifest JSON patch failed for group ${group_key} (${npm_tool})"
           log "[${npm_tool}] ERROR: jq failed to patch package.json for '${group_key}' — skipping group."
           return 0
         fi
@@ -3457,7 +3652,7 @@ npm_update_group() {
         elif [[ "$pnpm_rc" -ne 0 ]]; then
           run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
           run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path pnpm-lock.yaml)" 2>/dev/null || true
-          dep_updater_append_ecosystem_failure "npm|pnpm install failed for ${group_key} (exit ${pnpm_rc})"
+          dep_updater_append_ecosystem_failure "npm|lockfile install failed for ${group_key} (exit ${pnpm_rc})"
           log "[${npm_tool}] ERROR: pnpm install failed for '${group_key}' (exit ${pnpm_rc}) — skipping group."
           return 0
         fi
@@ -3465,11 +3660,11 @@ npm_update_group() {
       ;;
     yarn)
       local yarn_rc=0
-      yarn --cwd "$npm_root" upgrade "${pkg_args[@]}" --latest || yarn_rc=$?
+      dep_runner_yarn_cwd "yarn upgrade group" "$npm_root" upgrade "${pkg_args[@]}" --latest || yarn_rc=$?
       if [[ "$yarn_rc" -ne 0 ]]; then
         run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
         run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path yarn.lock)" 2>/dev/null || true
-        dep_updater_append_ecosystem_failure "npm|yarn upgrade failed for ${group_key} (exit ${yarn_rc})"
+        dep_updater_append_ecosystem_failure "npm|package-manager upgrade failed for ${group_key} (exit ${yarn_rc})"
         log "[${npm_tool}] ERROR: yarn upgrade failed for '${group_key}' (exit ${yarn_rc}) — skipping group."
         return 0
       fi
@@ -3483,13 +3678,15 @@ npm_update_group() {
       updates_json='{}'
       while IFS=' ' read -r pkg _old new_ver; do
         [[ -z "$pkg" ]] && continue
-        updates_json="$(printf '%s' "$updates_json" \
-          | jq --arg k "$pkg" --arg v "$new_ver" '. + {($k): $v}')"
+        # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+        updates_json="$(dep_runner_jq_with_args "jq merge pkg version" "$updates_json" \
+          --arg k "$pkg" --arg v "$new_ver" '. + {($k): $v}')"
       done <<< "$entries"
 
       local tmp_pkg
       tmp_pkg="$(mktemp)"
-      if ! jq --argjson updates "$updates_json" '
+  # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+      if ! dep_runner_jq_file_args "jq patch package.json" "${npm_root}/package.json" --argjson updates "$updates_json" '
         to_entries | map(
           if (.key == "dependencies" or .key == "devDependencies" or .key == "peerDependencies")
              and (.value != null) then
@@ -3505,20 +3702,20 @@ npm_update_group() {
             )
           else . end
         ) | from_entries
-      ' "${npm_root}/package.json" > "$tmp_pkg"; then
+      ' >"$tmp_pkg"; then
         rm -f "$tmp_pkg"
-        dep_updater_append_ecosystem_failure "npm|jq failed for group ${group_key} (${npm_tool})"
-        log "[${npm_tool}] ERROR: jq failed to patch package.json for '${group_key}' — skipping group."
+        dep_updater_append_ecosystem_failure "npm|manifest JSON patch failed for group ${group_key} (${npm_tool})"
+        log "[${npm_tool}] ERROR: manifest JSON patch failed for '${group_key}' — skipping group."
         return 0
       fi
       mv "$tmp_pkg" "${npm_root}/package.json"
 
       local npm_inst_rc=0
-      npm install --prefix "$npm_root" || npm_inst_rc=$?
+      dep_runner_npm_prefix "npm install group" "$npm_root" install || npm_inst_rc=$?
       if [[ "$npm_inst_rc" -ne 0 ]]; then
         run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
-        dep_updater_append_ecosystem_failure "npm|npm install failed for ${group_key} (exit ${npm_inst_rc})"
-        log "[${npm_tool}] ERROR: npm install failed for '${group_key}' (exit ${npm_inst_rc}) — skipping group."
+        dep_updater_append_ecosystem_failure "npm|lockfile install failed for ${group_key} (exit ${npm_inst_rc})"
+        log "[${npm_tool}] ERROR: lockfile install failed for '${group_key}' (exit ${npm_inst_rc}) — skipping group."
         return 0
       fi
   esac
@@ -3658,7 +3855,8 @@ py_audit() {
       # --frozen prevents uv from syncing the project environment (which can
       # write uv.lock) before running pip-audit.  The audit is read-only: we
       # only need to inspect already-installed packages, not update them.
-      raw="$(cd "$audit_dir" && uv run --frozen --with pip-audit pip-audit --format=json 2>/dev/null)"
+      raw="$(dep_runner_uv_dir_stdout "pip-audit uv" "$audit_dir" \
+        run --frozen --with pip-audit pip-audit --format=json)"
       exit_code=$?
       ;;
     *)
@@ -3704,8 +3902,10 @@ npm_audit() {
   set +e
   case "$npm_tool" in
     pnpm) raw="$(pnpm_in_project "$scan_root" audit --json 2>/dev/null)" ;;
-    yarn) raw="$(yarn --cwd "$scan_root" audit --json 2>/dev/null)" ;;
-    npm)  raw="$(npm audit --prefix "$scan_root" --json 2>/dev/null)" ;;
+    yarn) raw="$(dep_runner_sh_stdout "yarn audit json" -- \
+      "yarn --cwd $(printf '%q' "$scan_root") audit --json 2>/dev/null")" ;;
+    npm)  raw="$(dep_runner_sh_stdout "npm audit json" -- \
+      "npm audit --prefix $(printf '%q' "$scan_root") --json 2>/dev/null")" ;;
   esac
   exit_code=$?
   set -e
@@ -3828,10 +4028,11 @@ npm_security_update() {
         [[ -z "$pkg" ]] && continue
         yarn_args+=("${pkg}@${fix}")
       done <<< "$audit_lines"
-      yarn --cwd "$npm_root" upgrade "${yarn_args[@]}"
+      dep_runner_yarn_cwd "yarn upgrade" "$npm_root" upgrade "${yarn_args[@]}"
       ;;
     npm)
-      npm audit fix --prefix "$npm_root" 2>/dev/null || true
+      dep_runner_sh "npm audit fix" -- \
+        "npm audit fix --prefix $(printf '%q' "$npm_root") 2>/dev/null || true"
       ;;
   esac
 
@@ -3933,7 +4134,7 @@ py_security_update() {
     log "[python/${tool}] Security: bumping ${pkg} to ${fix}…"
     case "$tool" in
       uv)
-        uv --directory "$worktree_path" add "${pkg}==${fix}"
+        dep_runner_uv_dir "uv security add" "$worktree_path" add "${pkg}==${fix}"
         files_changed="pyproject.toml + uv.lock"
         ;;
       poetry)
@@ -4100,12 +4301,12 @@ py_outdated() {
   case "$tool" in
     uv)
       raw_lines="$(dep_runner_jq_with_args "dep-updater uv outdated rows" \
-        "$(cd "$target_dir" && uv pip list --outdated --format=json 2>/dev/null)" \
+        "$(dep_runner_uv_dir_stdout "uv pip list outdated" "$target_dir" pip list --outdated --format=json 2>/dev/null)" \
         -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
       ;;
     poetry)
       # poetry show --outdated has no stable JSON output; parse the table instead
-      raw_lines="$(poetry --directory "$target_dir" show --outdated 2>/dev/null \
+      raw_lines="$(dep_runner_poetry_dir_stdout "poetry show outdated" "$target_dir" show --outdated 2>/dev/null \
         | awk '/^[a-zA-Z]/ { print $1, $2, $3 }')"
       ;;
     pipenv)
@@ -4131,7 +4332,7 @@ py_outdated() {
   if [[ "$tool" == "uv" ]]; then
     pyproject="${target_dir}/pyproject.toml"
     if [[ -f "$pyproject" ]]; then
-      installed_json="$(cd "$target_dir" && uv pip list --format=json 2>/dev/null)"
+      installed_json="$(dep_runner_uv_dir_stdout "uv pip list installed" "$target_dir" pip list --format=json 2>/dev/null)"
       while IFS= read -r ge_dep; do
         [[ -z "$ge_dep" ]] && continue
         # Strip extras ([...]) then >= and version to get the package name.
@@ -4145,8 +4346,8 @@ py_outdated() {
         [[ -z "$ge_floor" || -z "$ge_pkg" ]] && continue
         # Validate PEP 508 package name — drop any mangled strings.
         [[ "$ge_pkg" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
-        ge_installed="$(printf '%s' "$installed_json" \
-          | jq -r --arg n "$ge_pkg" \
+        # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+        ge_installed="$(dep_runner_jq_with_args "jq ge installed version" "$installed_json" -r --arg n "$ge_pkg" \
               '.[] | select(.name | ascii_downcase == ($n | ascii_downcase)) | .version')"
         # Skip if not installed or floor already matches installed.
         [[ -z "$ge_installed" || "$ge_floor" == "$ge_installed" ]] && continue
@@ -4202,19 +4403,24 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
     # exit 1.  Editable installs are excluded (local packages not on PyPI).
     # Skip the probe for >= floor bumps (new == already-installed version).
     if [[ "$tool" == "uv" && -n "$installed_json" ]]; then
-      installed_new="$(printf '%s' "$installed_json" \
-        | jq -r --arg n "$pkg" \
+      # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+      installed_new="$(dep_runner_jq_with_args "jq installed pkg version" "$installed_json" -r --arg n "$pkg" \
             '.[] | select(.name | ascii_downcase == ($n | ascii_downcase)) | .version' \
           2>/dev/null || true)"
       if [[ "$new" != "$installed_new" ]]; then
-        if ! printf '%s' "$installed_json" \
-            | jq -r --arg p "$pkg" --arg v "$new" \
+        local dry_req_tmp dry_req_rc
+        dry_req_tmp="$(mktemp)"
+        # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+        dep_runner_jq_with_args "jq uv dry-run requirements" "$installed_json" -r --arg p "$pkg" --arg v "$new" \
                 '.[] | select(has("editable_project_location") | not)
                      | if (.name | ascii_downcase) == ($p | ascii_downcase)
                        then "\(.name)==" + $v
                        else "\(.name)==\(.version)"
-                       end' \
-            | (cd "$target_dir" && uv pip install --dry-run -r /dev/stdin >/dev/null 2>&1); then
+                       end' >"$dry_req_tmp"
+        dry_req_rc=0
+        dep_runner_uv_dir "uv pip install dry-run" "$target_dir" pip install --dry-run -r "$dry_req_tmp" >/dev/null 2>&1 || dry_req_rc=$?
+        rm -f "$dry_req_tmp"
+        if [[ "$dry_req_rc" -ne 0 ]]; then
           log "[python/uv] Filtering ${pkg} ${new}: transitive constraint blocks this upgrade."
           continue
         fi
@@ -4297,10 +4503,10 @@ py_update_one() {
           dep_updater_append_ecosystem_failure "python|sed failed for ${pkg}"
           return 0
         fi
-        uv_out="$(uv --directory "$worktree_path" lock 2>&1)" && uv_exit=0 || uv_exit=$?
+        uv_out="$(dep_runner_uv_dir_capture "uv lock" "$worktree_path" lock)" && uv_exit=0 || uv_exit=$?
       else
         uv_spec="${pkg}==${new_ver}"
-        uv_out="$(uv --directory "$worktree_path" add "$uv_spec" 2>&1)" && uv_exit=0 || uv_exit=$?
+        uv_out="$(dep_runner_uv_dir_capture "uv add" "$worktree_path" add "$uv_spec")" && uv_exit=0 || uv_exit=$?
       fi
       if (( uv_exit != 0 )); then
         # Revert pyproject.toml: sed already modified it for >= / == / ~= constraints
@@ -4448,13 +4654,11 @@ rust_outdated() {
     outdated_args+=(--workspace)
   fi
 
-  if ! json_out="$(cd "$target_dir" && cargo outdated "${outdated_args[@]}" 2>/dev/null)"; then
-    json_out=""
-  fi
+  json_out="$(dep_runner_cargo_dir_stdout "cargo outdated" "$target_dir" outdated "${outdated_args[@]}" 2>/dev/null)" || json_out=""
   [[ -z "$json_out" ]] && return 0
 
-  printf '%s' "$json_out" \
-    | jq -r '
+  # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+  dep_runner_jq_with_args "cargo outdated rows" "$json_out" -r '
         (if type == "array" then .[] else . end)
         | .crate_name as $crate
         | .dependencies[]?
@@ -4524,11 +4728,11 @@ rust_update_one() {
     cargo_add_args=(--package "$dep_package" "${cargo_add_args[@]}")
   fi
 
-  cargo_out="$(cd "$worktree_path" && cargo add "${cargo_add_args[@]}" 2>&1)" && cargo_exit=0 || cargo_exit=$?
+  cargo_out="$(dep_runner_cargo_dir_capture "cargo add" "$worktree_path" add "${cargo_add_args[@]}")" && cargo_exit=0 || cargo_exit=$?
   if (( cargo_exit != 0 )); then
     log "[rust] Skipping ${pkg} ${new_ver}: cargo add failed."
     log "$cargo_out"
-    dep_updater_append_ecosystem_failure "rust|cargo add failed for ${pkg} (exit ${cargo_exit})"
+    dep_updater_append_ecosystem_failure "rust|crate add failed for ${pkg} (exit ${cargo_exit})"
     return 0
   fi
 
@@ -4891,12 +5095,12 @@ batch_update_all() {
       fi
       if [[ "${#yarn_args[@]}" -gt 0 ]]; then
         local yarn_batch_rc=0
-        yarn --cwd "$npm_root" upgrade "${yarn_args[@]}" || yarn_batch_rc=$?
+        dep_runner_yarn_cwd "yarn batch upgrade" "$npm_root" upgrade "${yarn_args[@]}" || yarn_batch_rc=$?
         if [[ "$yarn_batch_rc" -ne 0 ]]; then
           run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
           run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path yarn.lock)" 2>/dev/null || true
-          dep_updater_append_ecosystem_failure "npm|batch yarn upgrade failed (exit ${yarn_batch_rc})"
-          log "[${npm_tool}] WARNING: batch yarn upgrade failed (exit ${yarn_batch_rc}); continuing."
+          dep_updater_append_ecosystem_failure "npm|batch package-manager upgrade failed (exit ${yarn_batch_rc})"
+          log "[${npm_tool}] WARNING: batch package-manager upgrade failed (exit ${yarn_batch_rc}); continuing."
         fi
       fi
     else
@@ -4905,8 +5109,9 @@ batch_update_all() {
       if [[ -n "$npm_audit_lines_arg" ]]; then
         while IFS=' ' read -r pkg _current fix _cves; do
           [[ -z "$pkg" ]] && continue
-          updates_json="$(printf '%s' "$updates_json" \
-            | jq --arg k "$pkg" --arg v "$fix" '. + {($k): $v}')"
+          # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+          updates_json="$(dep_runner_jq_with_args "jq merge pkg fix" "$updates_json" \
+            --arg k "$pkg" --arg v "$fix" '. + {($k): $v}')"
           log "[${npm_tool}] Security: ${pkg} → ${fix}"
         done <<< "$npm_audit_lines_arg"
         any_npm=1
@@ -4914,8 +5119,9 @@ batch_update_all() {
       if [[ -n "$npm_lines_arg" && "$security_only" == '0' ]]; then
         while IFS=' ' read -r pkg _old new_ver; do
           [[ -z "$pkg" ]] && continue
-          updates_json="$(printf '%s' "$updates_json" \
-            | jq --arg k "$pkg" --arg v "$new_ver" '. + {($k): $v}')"
+          # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+          updates_json="$(dep_runner_jq_with_args "jq merge pkg version" "$updates_json" \
+            --arg k "$pkg" --arg v "$new_ver" '. + {($k): $v}')"
           log "[${npm_tool}] Update: ${pkg} → ${new_ver}"
         done <<< "$npm_lines_arg"
         any_npm=1
@@ -4923,7 +5129,8 @@ batch_update_all() {
       if [[ "$updates_json" != '{}' ]]; then
         local tmp_pkg
         tmp_pkg="$(mktemp)"
-        if ! jq --argjson updates "$updates_json" '
+  # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+        if ! dep_runner_jq_file_args "jq batch patch package.json" "${npm_root}/package.json" --argjson updates "$updates_json" '
           to_entries | map(
             if (.key == "dependencies" or .key == "devDependencies" or .key == "peerDependencies")
                and (.value != null) then
@@ -4933,11 +5140,11 @@ batch_update_all() {
               )
             else . end
           ) | from_entries
-        ' "${npm_root}/package.json" > "$tmp_pkg"; then
+        ' >"$tmp_pkg"; then
           rm -f "$tmp_pkg"
           run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
-          dep_updater_append_ecosystem_failure "npm|batch jq failed to patch package.json"
-          log "[batch] ERROR: jq failed to patch package.json — npm batch section skipped."
+          dep_updater_append_ecosystem_failure "npm|batch manifest JSON patch failed"
+          log "[batch] ERROR: manifest JSON patch failed — npm batch section skipped."
         else
           mv "$tmp_pkg" "${npm_root}/package.json"
           case "$npm_tool" in
@@ -4947,16 +5154,16 @@ batch_update_all() {
               if [[ "$pnpm_batch_rc" -ne 0 ]]; then
                 run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
                 run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path pnpm-lock.yaml)" 2>/dev/null || true
-                dep_updater_append_ecosystem_failure "npm|batch pnpm install failed (exit ${pnpm_batch_rc})"
+                dep_updater_append_ecosystem_failure "npm|batch lockfile install failed (exit ${pnpm_batch_rc})"
                 log "[${npm_tool}] WARNING: batch pnpm install failed (exit ${pnpm_batch_rc}); continuing."
               fi
               ;;
             npm)
               local npm_batch_rc=0
-              npm install --prefix "$npm_root" || npm_batch_rc=$?
+              dep_runner_npm_prefix "npm batch install" "$npm_root" install || npm_batch_rc=$?
               if [[ "$npm_batch_rc" -ne 0 ]]; then
                 run_command "git worktree" git -C "$worktree_path" checkout -- "$(npm_repo_rel_path package.json)" 2>/dev/null || true
-                dep_updater_append_ecosystem_failure "npm|batch npm install failed (exit ${npm_batch_rc})"
+                dep_updater_append_ecosystem_failure "npm|batch lockfile install failed (exit ${npm_batch_rc})"
                 log "[${npm_tool}] WARNING: batch npm install failed (exit ${npm_batch_rc}); continuing."
               fi
               ;;
@@ -4980,7 +5187,7 @@ batch_update_all() {
         [[ -z "$pkg" ]] && continue
         log "[python/${py_tool}] Security: ${pkg} → ${fix}"
         case "$py_tool" in
-          uv)      uv --directory "$worktree_path" add "${pkg}==${fix}" ;;
+          uv)      dep_runner_uv_dir "uv batch security add" "$worktree_path" add "${pkg}==${fix}" ;;
           poetry)  run_in_worktree poetry add "${pkg}@${fix}" ;;
           pipenv)  run_in_worktree pipenv install "${pkg}==${fix}" ;;
           pip|pip3) "$py_tool" install "${pkg}==${fix}" ;;
@@ -5002,10 +5209,10 @@ batch_update_all() {
                 dep_updater_append_ecosystem_failure "python|batch sed failed for ${pkg}"
                 continue
               fi
-              py_out="$(uv --directory "$worktree_path" lock 2>&1)" && py_exit=0 || py_exit=$?
+              py_out="$(dep_runner_uv_dir_capture "uv batch lock" "$worktree_path" lock)" && py_exit=0 || py_exit=$?
             else
               b_spec="${pkg}==${new_ver}"
-              py_out="$(uv --directory "$worktree_path" add "$b_spec" 2>&1)" && py_exit=0 || py_exit=$?
+              py_out="$(dep_runner_uv_dir_capture "uv batch add" "$worktree_path" add "$b_spec")" && py_exit=0 || py_exit=$?
             fi
             if (( py_exit != 0 )); then
               # Revert: sed patched pyproject.toml before the lock attempt for >=
@@ -5125,8 +5332,8 @@ batch_update_all() {
       if rust_workspace_enabled "$worktree_path" && [[ "${dep_package:-"-"}" != "-" ]]; then
         cargo_add_args=(--package "$dep_package" "${cargo_add_args[@]}")
       fi
-      if ! (cd "$worktree_path" && cargo add "${cargo_add_args[@]}" 2>&1); then
-        dep_updater_append_ecosystem_failure "rust|batch cargo add failed for ${pkg}"
+      if ! dep_runner_cargo_dir "cargo batch add" "$worktree_path" add "${cargo_add_args[@]}"; then
+        dep_updater_append_ecosystem_failure "rust|batch crate add failed for ${pkg}"
       fi
     done <<< "$rust_lines_arg"
     run_command "git worktree" git -C "$worktree_path" add -u
@@ -5159,7 +5366,8 @@ batch_update_all() {
   # diff gives the ground truth: only packages whose specifier actually changed.
   local actual_npm_lines=""
   if [[ "$any_npm" == '1' && -n "$old_pkg_json" ]]; then
-    actual_npm_lines="$(jq -r --argjson old "$old_pkg_json" '
+  # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+    actual_npm_lines="$(dep_runner_jq_file_args "jq actual npm lines" "${npm_root}/package.json" -r --argjson old "$old_pkg_json" '
         ([$old.dependencies, $old.devDependencies, $old.peerDependencies]
           | map(select(. != null)) | add // {}) as $old_deps |
         [.dependencies, .devDependencies, .peerDependencies]
@@ -5167,7 +5375,7 @@ batch_update_all() {
           | to_entries[]
           | select($old_deps[.key] != .value)
           | "\(.key) \($old_deps[.key] // "-") \(.value)"
-      ' "${npm_root}/package.json" 2>/dev/null || true)"
+      ' 2>/dev/null || true)"
   fi
 
   if git -C "$worktree_path" diff --cached --quiet; then
@@ -5237,7 +5445,7 @@ batch_update_all() {
       if [[ -n "$actual_npm_lines" ]]; then
         while IFS=' ' read -r pkg old_ver new_ver; do
           [[ -z "$pkg" ]] && continue
-          printf "| npm | \`%s\` | \`%s\` | \`%s\` | no | - |\n" "$pkg" "$old_ver" "$new_ver"
+          printf "| %s | \`%s\` | \`%s\` | \`%s\` | no | - |\n" "npm" "$pkg" "$old_ver" "$new_ver"
         done <<< "$actual_npm_lines"
       fi
       if [[ -n "${actual_py_lines:-${py_lines_arg}}" ]]; then
@@ -5261,7 +5469,7 @@ batch_update_all() {
       if [[ -n "$npm_audit_lines_arg" ]]; then
         while IFS=' ' read -r pkg current fix cves; do
           [[ -z "$pkg" ]] && continue
-          printf "| npm | \`%s\` | \`%s\` | \`%s\` | yes | %s |\n" \
+          printf "| %s | \`%s\` | \`%s\` | \`%s\` | yes | %s |\n" "npm" \
             "$pkg" "$current" "$fix" "${cves/,/, }"
         done <<< "$npm_audit_lines_arg"
       fi
@@ -6352,8 +6560,7 @@ poll_until_merged() {
           --repo "${repo_owner}/${repo_name}" \
           --json statusCheckRollup \
           --jq '.statusCheckRollup // []' 2>/dev/null || echo '[]')"
-        failed_check="$(printf '%s' "$check_rollup" \
-          | jq -r '
+        failed_check="$(dep_runner_jq_with_args "merge queue failed check" "$check_rollup" -r '
               map(select(
                 .conclusion == "FAILURE" or .conclusion == "ERROR" or
                 .conclusion == "CANCELLED" or .conclusion == "TIMED_OUT" or
@@ -7243,12 +7450,12 @@ if [[ "$dry_run" == '1' ]]; then
               cmd_prefix="pnpm (in worktree) update --latest"
             fi
             ;;
-          yarn) cmd_prefix="yarn --cwd <worktree> upgrade --latest" ;;
+          yarn) cmd_prefix="[yarn] --cwd <worktree> upgrade --latest" ;;
           *)
             if [[ "$semver_only" == '1' ]]; then
-              cmd_prefix="npm update --prefix <worktree>"
+              cmd_prefix="[npm] update --prefix <worktree>"
             else
-              cmd_prefix="npm install --prefix <worktree> __PKG__@latest"
+              cmd_prefix="[npm] install --prefix <worktree> __PKG__@latest"
             fi
             ;;
         esac
@@ -7273,7 +7480,7 @@ if [[ "$dry_run" == '1' ]]; then
         py_branch="dep-updates/py-${safe_name}"
         py_commit="chore(deps): bump ${pkg} from ${old_ver} to ${new_ver}"
         case "$py_tool" in
-          uv)     py_files="pyproject.toml + uv.lock" ;   py_cmd="uv --directory <worktree> add ${pkg}==${new_ver}" ;;
+          uv)     py_files="pyproject.toml + uv.lock" ;   py_cmd="[uv] --directory <worktree> add ${pkg}==${new_ver}" ;;
           poetry) py_files="pyproject.toml + poetry.lock"; py_cmd="poetry add ${pkg}@${new_ver}" ;;
           pipenv) py_files="Pipfile + Pipfile.lock" ;      py_cmd="pipenv install ${pkg}==${new_ver}" ;;
           *)      py_files="requirements.txt" ;            py_cmd="${py_tool} install ${pkg}==${new_ver}" ;;
