@@ -485,7 +485,7 @@ gh_pr_merged_for_number() {
   local -r pr_number="$1"
   local raw
 
-  raw="$(dep_runner_gh_api_jq "gh pr merged check" \
+  raw="$(dep_runner_gh_api_jq "gh pr merged check" --probe \
     "repos/${repo_owner}/${repo_name}/pulls/${pr_number}" '(.merged_at != null)' || true)"
   printf '%s' "${raw:-}"
 }
@@ -1184,7 +1184,7 @@ gha_release_published_epoch() {
     return 1
   fi
 
-  published_iso="$(dep_runner_gh_api_jq "gha release time ${action}@${ref}" \
+  published_iso="$(dep_runner_gh_api_jq "gha release time ${action}@${ref}" --probe \
     "repos/${action}/releases/tags/${ref}" '.published_at // empty' || true)"
   if [[ -n "$published_iso" && "$published_iso" != 'null' ]]; then
     published_epoch="$(npm_parse_iso8601_to_epoch "$published_iso" 2>/dev/null || true)"
@@ -1194,12 +1194,12 @@ gha_release_published_epoch() {
     fi
   fi
 
-  commit_sha="$(dep_runner_gh_api_jq "gha tag ref ${action}@${ref}" \
+  commit_sha="$(dep_runner_gh_api_jq "gha tag ref ${action}@${ref}" --probe \
     "repos/${action}/git/ref/tags/${ref}" '.object.sha // empty' || true)"
   if [[ -z "$commit_sha" || "$commit_sha" == 'null' ]]; then
     return 1
   fi
-  published_iso="$(dep_runner_gh_api_jq "gha commit time ${action}@${commit_sha}" \
+  published_iso="$(dep_runner_gh_api_jq "gha commit time ${action}@${commit_sha}" --probe \
     "repos/${action}/git/commits/${commit_sha}" '.committer.date // .author.date // empty' || true)"
   if [[ -z "$published_iso" || "$published_iso" == 'null' ]]; then
     return 1
@@ -1865,16 +1865,27 @@ dep_runner_jq_n() {
   return "$exit_code"
 }
 
-# dep_runner_gh_api_jq <label> <endpoint> <jq-filter>
+# dep_runner_gh_api_jq <label> [--probe] <endpoint> <jq-filter>
 # Prints gh api --jq output; returns gh exit code.
+# With --probe, non-zero exits are omitted from email failure reports.
 dep_runner_gh_api_jq() {
   local -r label="$1"
-  local -r endpoint="$2"
-  local -r jq_filter="$3"
+  local probe=0
+  shift
+  if [[ "${1:-}" == '--probe' ]]; then
+    probe=1
+    shift
+  fi
+  local -r endpoint="$1"
+  local -r jq_filter="$2"
   local exit_code
 
   exit_code=0
-  runner_exec "$label" -- gh api "$endpoint" --jq "$jq_filter" || exit_code=$?
+  if (( probe )); then
+    runner_exec "$label" --probe -- gh api "$endpoint" --jq "$jq_filter" || exit_code=$?
+  else
+    runner_exec "$label" -- gh api "$endpoint" --jq "$jq_filter" || exit_code=$?
+  fi
   dep_runner_last_stdout
   return "$exit_code"
 }
@@ -2375,8 +2386,11 @@ detect_ecosystem() {
 
   _repo_file_exists() {
     local rel="$1"
+    local probe_exit=0
     if [[ "$detect_ref" == "origin/main" ]]; then
-      run_command "git repo" git -C "$dir" cat-file -e "origin/main:${rel}" 2>/dev/null
+      runner_exec "git repo probe ${rel}" --probe \
+        -- git -C "$dir" cat-file -e "origin/main:${rel}" 2>/dev/null || probe_exit=$?
+      (( probe_exit == 0 ))
     else
       [[ -f "$dir/${rel}" ]]
     fi
@@ -2389,9 +2403,14 @@ detect_ecosystem() {
       prefixed="${npm_project_prefix}/${f}"
     fi
     if [[ "$detect_ref" == "origin/main" ]]; then
-      run_command "git cat-file lockfile" git -C "$dir" cat-file -e "origin/main:${prefixed}" 2>/dev/null \
-        || dep_runner_git_c_stdout "git ls-tree lockfile" "$dir" -- ls-tree --name-only origin/main -- "$prefixed" 2>/dev/null \
-          | grep -q .
+      local probe_exit=0
+      runner_exec "git cat-file lockfile ${prefixed}" --probe \
+        -- git -C "$dir" cat-file -e "origin/main:${prefixed}" 2>/dev/null || probe_exit=$?
+      if (( probe_exit == 0 )); then
+        return 0
+      fi
+      dep_runner_git_c_stdout "git ls-tree lockfile" "$dir" -- ls-tree --name-only origin/main -- "$prefixed" 2>/dev/null \
+        | grep -q .
     else
       [[ -f "$dir/${prefixed}" ]]
     fi
@@ -7092,13 +7111,12 @@ batch_all_dispatch() {
         root_cause="$(tail -n 1 "$child_clean" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
       fi
 
-      if [[ -n "$root_cause" ]]; then
-        if [[ "$detail_count" -eq 0 ]]; then
-          failure_details+=("$(basename "$repo"): ${root_cause}")
-        fi
-        log "[batch-all] Root cause: ${root_cause}"
-      fi
-
+      ci_type=""
+      ci_pr=""
+      ci_check_name=""
+      ci_check_conclusion=""
+      ci_pr_url=""
+      ci_check_url=""
       if [[ -s "$child_report" ]] \
         && dep_runner_jq_file_args "dep-updater batch-all child ci failure" "$child_report" -e \
           'has("ci_failure") and .ci_failure != null' >/dev/null 2>&1; then
@@ -7117,23 +7135,55 @@ batch_all_dispatch() {
             -r '.ci_failure.check_url // empty' 2>/dev/null || true)"
           if [[ -n "$ci_pr" ]]; then
             if [[ -n "$ci_check_name" ]]; then
-              log "[batch-all] CI failure ($(basename "$repo")): pr=#${ci_pr} ${ci_check_name} (${ci_check_conclusion})"
+              failure_details+=("$(basename "$repo"): CI failed on PR #${ci_pr} — ${ci_check_name} (${ci_check_conclusion})")
             else
-              log "[batch-all] CI failure ($(basename "$repo")): pr=#${ci_pr} CI checks failed"
+              failure_details+=("$(basename "$repo"): CI failed on PR #${ci_pr}")
             fi
             if [[ -n "$ci_pr_url" ]]; then
-              log "[batch-all] CI failure-link ($(basename "$repo")) pr: ${ci_pr_url}"
+              failure_details+=("$(basename "$repo"): PR: ${ci_pr_url}")
             fi
             if [[ -n "$ci_check_url" ]]; then
-              log "[batch-all] CI failure-link ($(basename "$repo")) check: ${ci_check_url}"
+              failure_details+=("$(basename "$repo"): Check run: ${ci_check_url}")
+            fi
+            detail_count=$((detail_count + 1))
+            if [[ -n "$root_cause" && "$root_cause" != *pr_url=* && -n "$ci_pr_url" ]]; then
+              root_cause="${root_cause} pr_url=${ci_pr_url}"
             fi
           fi
         elif [[ "$ci_type" == "string" ]]; then
           ci_summary="$(dep_runner_jq_file_args "dep-updater batch-all child ci summary" "$child_report" \
             -r '.ci_failure // empty' 2>/dev/null || true)"
           if [[ -n "$ci_summary" && "$ci_summary" != "null" ]]; then
-            log "[batch-all] CI failure ($(basename "$repo")): ${ci_summary}"
+            failure_details+=("$(basename "$repo"): ${ci_summary}")
+            detail_count=$((detail_count + 1))
           fi
+        fi
+      fi
+
+      if [[ -n "$root_cause" ]]; then
+        if [[ "$detail_count" -eq 0 ]]; then
+          failure_details+=("$(basename "$repo"): ${root_cause}")
+        fi
+        log "[batch-all] Root cause: ${root_cause}"
+      fi
+
+      if [[ -n "$ci_pr" ]]; then
+        if [[ -n "$ci_check_name" ]]; then
+          log "[batch-all] CI failure ($(basename "$repo")): pr=#${ci_pr} ${ci_check_name} (${ci_check_conclusion})"
+        else
+          log "[batch-all] CI failure ($(basename "$repo")): pr=#${ci_pr} CI checks failed"
+        fi
+        if [[ -n "$ci_pr_url" ]]; then
+          log "[batch-all] CI failure-link ($(basename "$repo")) pr: ${ci_pr_url}"
+        fi
+        if [[ -n "$ci_check_url" ]]; then
+          log "[batch-all] CI failure-link ($(basename "$repo")) check: ${ci_check_url}"
+        fi
+      elif [[ -n "$ci_type" && "$ci_type" == "string" ]]; then
+        ci_summary="$(dep_runner_jq_file_args "dep-updater batch-all child ci summary repeat" "$child_report" \
+          -r '.ci_failure // empty' 2>/dev/null || true)"
+        if [[ -n "$ci_summary" && "$ci_summary" != "null" ]]; then
+          log "[batch-all] CI failure ($(basename "$repo")): ${ci_summary}"
         fi
       fi
 

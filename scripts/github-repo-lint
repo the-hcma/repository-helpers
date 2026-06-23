@@ -92,13 +92,17 @@ enforcer_print_only=0
 enforcer_run_log=""
 enforcer_clean_log=""
 enforcer_check_log=""
+enforcer_discover_notes_file=""
 enforcer_repo_count=0
 enforcer_failure_count=0
 enforcer_invocation_cmd=""
+enforcer_check_cmd=""
+declare -a enforcer_discover_notes=()
 
 # shellcheck disable=SC2317  # invoked by EXIT trap
 enforcer_cleanup_temp_files() {
-  rm -f "${enforcer_run_log:-}" "${enforcer_clean_log:-}" "${enforcer_check_log:-}" 2>/dev/null || true
+  rm -f "${enforcer_run_log:-}" "${enforcer_clean_log:-}" "${enforcer_check_log:-}" \
+    "${enforcer_discover_notes_file:-}" 2>/dev/null || true
 }
 trap enforcer_cleanup_temp_files EXIT
 
@@ -243,15 +247,194 @@ enforcer_discover_repo_slugs() {
   fi
 }
 
-# Discovery runs inside mapfile process substitution; never write to stdout there.
+# Discovery runs inside mapfile process substitution; persist notes via
+# enforcer_discover_notes_file because the subshell cannot update arrays.
 enforcer_discover_note() {
+  if [[ -n "${enforcer_discover_notes_file:-}" ]]; then
+    printf '%s\n' "$*" >>"$enforcer_discover_notes_file"
+  fi
   if [[ -n "${enforcer_run_log:-}" ]]; then
     printf '%s\n' "$*" >>"$enforcer_run_log"
   fi
 }
 
+enforcer_load_discover_notes() {
+  enforcer_discover_notes=()
+  if [[ -n "${enforcer_discover_notes_file:-}" && -s "$enforcer_discover_notes_file" ]]; then
+    mapfile -t enforcer_discover_notes <"$enforcer_discover_notes_file"
+  fi
+}
+
+# enforcer_join_short_names <name> ...
+enforcer_join_short_names() {
+  local first=1 name
+  for name in "$@"; do
+    if (( first )); then
+      printf '%s' "$name"
+      first=0
+    else
+      printf ', %s' "$name"
+    fi
+  done
+}
+
+# enforcer_short_name_from_note <discovery-note>
+# Pulls OWNER/NAME from skip/warning lines and returns the repository short name.
+enforcer_short_name_from_note() {
+  local -r note="$1"
+  local slug
+
+  slug="$(sed -n 's/.*\([[:alnum:]_.-]*\/[[:alnum:]_.-]*\).*/\1/p' <<<"$note")"
+  if [[ -n "$slug" ]]; then
+    rp_repo_short_name "$slug"
+    return 0
+  fi
+  printf '%s' "$note"
+}
+
+# enforcer_format_passed_slugs <comma-separated OWNER/NAME list>
+enforcer_format_passed_slugs() {
+  local -r passed_content="$1"
+  local trimmed part
+  local -a short_names=()
+
+  if [[ -z "$passed_content" || "$passed_content" == "none" ]]; then
+    printf 'none'
+    return 0
+  fi
+
+  local IFS=','
+  for part in $passed_content; do
+    trimmed="${part#"${part%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    [[ -n "$trimmed" ]] || continue
+    short_names+=("$(rp_repo_short_name "$trimmed")")
+  done
+
+  if [[ ${#short_names[@]} -eq 0 ]]; then
+    printf 'none'
+    return 0
+  fi
+  enforcer_join_short_names "${short_names[@]}"
+}
+
+# enforcer_print_failed_line <line>
+# Reformats compact Failed-block lines for email (short repo names, indented findings).
+enforcer_print_failed_line() {
+  local -r line="$1"
+  local slug_short trimmed
+
+  if [[ "$line" =~ ^([[:alnum:]_.-]+/[[:alnum:]_.-]+):$ ]]; then
+    slug_short="$(rp_repo_short_name "${BASH_REMATCH[1]}")"
+    printf '  %s:\n' "$slug_short"
+    return 0
+  fi
+
+  trimmed="${line#"${line%%[![:space:]]*}"}"
+  if [[ "$trimmed" == Fix:* ]]; then
+    printf '      %s\n' "$trimmed"
+    return 0
+  fi
+  if [[ "$trimmed" == -* ]]; then
+    printf '    %s\n' "$trimmed"
+    return 0
+  fi
+  if [[ -n "$trimmed" ]]; then
+    printf '    %s\n' "$trimmed"
+  fi
+}
+
+enforcer_print_repo_sections() {
+  local line passed_line passed_content printed_failed=0
+  local -a skipped_short_names=()
+
+  if [[ ! -s "${enforcer_clean_log:-}" ]]; then
+    return 0
+  fi
+
+  printf 'Skipped:\n'
+  if [[ ${#enforcer_discover_notes[@]} -gt 0 ]]; then
+    for line in "${enforcer_discover_notes[@]}"; do
+      skipped_short_names+=("$(enforcer_short_name_from_note "$line")")
+    done
+    printf '  %s\n' "$(enforcer_join_short_names "${skipped_short_names[@]}")"
+  else
+    printf '  none\n'
+  fi
+  printf '\n'
+
+  passed_line="$(grep -E '^Passed: ' "$enforcer_clean_log" 2>/dev/null | tail -n 1 || true)"
+  passed_content="${passed_line#Passed: }"
+  printf 'Passed:\n'
+  printf '  %s\n' "$(enforcer_format_passed_slugs "$passed_content")"
+  printf '\n'
+
+  printf 'Failed:\n'
+  if ! grep -qE '^Failed:$' "$enforcer_clean_log" 2>/dev/null; then
+    printf '  none\n'
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    enforcer_print_failed_line "$line"
+    printed_failed=1
+  done < <(awk '
+      /^Failed:$/ { show = 1; next }
+      show && /^Passed:|^Started:|^Root:|^Checks:|^Finished:/ { exit }
+      show && /^all [0-9]+ repositories passed$/ { exit }
+      show && /^[0-9]+ of [0-9]+ repositories failed/ { exit }
+      show { print }
+    ' "$enforcer_clean_log")
+
+  if (( printed_failed == 0 )); then
+    printf '  none\n'
+  fi
+}
+
+enforcer_quote_cmdline() {
+  local arg
+  local -a quoted=()
+
+  for arg in "$@"; do
+    quoted+=("$(printf '%q' "$arg")")
+  done
+  local IFS=' '
+  printf '%s' "${quoted[*]}"
+}
+
+enforcer_run_context_command() {
+  if [[ -n "$enforcer_check_cmd" ]]; then
+    if [[ -n "$enforcer_invocation_cmd" ]]; then
+      printf '%s (runs: %s)' "$enforcer_invocation_cmd" "$enforcer_check_cmd"
+    else
+      printf '%s' "$enforcer_check_cmd"
+    fi
+    return 0
+  fi
+  printf '%s' "$enforcer_invocation_cmd"
+}
+
 enforcer_log() {
   printf '%s\n' "$*" | tee -a "$enforcer_run_log"
+}
+
+# enforcer_append_runner_stderr <target-file>
+# run_command only replays stdout; compact checker output (Passed/Failed) is on stderr.
+enforcer_append_runner_stderr() {
+  local -r target_file="$1"
+  local checker_uuid stderr_text
+
+  checker_uuid="$(runner_last_id)"
+  [[ -n "$checker_uuid" ]] || return 0
+
+  stderr_text="$(runner_read "$checker_uuid" stderr 2>/dev/null || true)"
+  [[ -n "$stderr_text" ]] || return 0
+
+  printf '%s' "$stderr_text" >>"$target_file"
+  if [[ "$stderr_text" != *$'\n' ]]; then
+    printf '\n' >>"$target_file"
+  fi
 }
 
 enforcer_run_checks() {
@@ -260,7 +443,12 @@ enforcer_run_checks() {
   local -a check_args=()
   local -a slugs=()
 
+  enforcer_discover_notes_file="$(mktemp)"
+  : >"$enforcer_discover_notes_file"
   mapfile -t slugs < <(enforcer_discover_repo_slugs "$root")
+  enforcer_load_discover_notes
+  rm -f "$enforcer_discover_notes_file"
+  enforcer_discover_notes_file=""
   enforcer_repo_count="${#slugs[@]}"
   enforcer_failure_count=0
 
@@ -279,15 +467,19 @@ enforcer_run_checks() {
   done
   check_args+=(--strict-onboarding --compact)
 
+  enforcer_check_cmd="env NO_COLOR=1 $(enforcer_quote_cmdline "$enforcer_checker" "${check_args[@]}")"
+
   check_exit=0
   enforcer_check_log="$(mktemp)"
   run_command "github-repo-lint enforcer checks" \
     env NO_COLOR=1 "$enforcer_checker" "${check_args[@]}" \
     >"$enforcer_check_log" 2>&1 || check_exit=$?
+  enforcer_append_runner_stderr "$enforcer_check_log"
   tee -a "$enforcer_run_log" <"$enforcer_check_log"
   parsed_failure_count="$(
-    awk '/^[0-9]+ of [0-9]+ repositories failed practices check$/ { count = $1 }
-      END { print count + 0 }' "$enforcer_check_log"
+    sed -E $'s/\x1b\\[[0-9;]*[mK]//g' "$enforcer_check_log" \
+      | awk '/^[0-9]+ of [0-9]+ repositories failed practices check$/ { count = $1 }
+        END { print count + 0 }'
   )"
   rm -f "$enforcer_check_log"
   enforcer_check_log=""
@@ -305,7 +497,7 @@ enforcer_run_checks() {
 }
 
 enforcer_clean_report_log() {
-  sed -E 's/\\x1B\\[[0-9;]*[mK]//g' "$enforcer_run_log" >"$enforcer_clean_log"
+  sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' "$enforcer_run_log" >"$enforcer_clean_log"
 }
 
 enforcer_report_body() {
@@ -333,17 +525,13 @@ enforcer_report_body() {
       runner_report_append_command_failures failure_lines --log-file "$enforcer_log_file"
       if [[ ${#failure_lines[@]} -gt 0 ]]; then
         printf '%s\n' "${failure_lines[@]}"
+        printf '\n'
       fi
     fi
-    printf 'Practices output:\n'
-    printf '%s\n' "$enforcer_report_separator"
-    if [[ -s "$enforcer_clean_log" ]]; then
-      sed -n '1,240p' "$enforcer_clean_log"
-    else
-      printf '(no output)\n'
-    fi
+    enforcer_print_repo_sections
+    printf '\n'
     repo_helpers_run_context_footer_full \
-      "${enforcer_invocation_cmd}" "$lint_repo_dir" "$started_at" "$finished_at" \
+      "$(enforcer_run_context_command)" "$lint_repo_dir" "$started_at" "$finished_at" \
       "$enforcer_log_file" "$enforcer_report_separator"
   }
 }
@@ -351,7 +539,9 @@ enforcer_report_body() {
 enforcer_write_sample_log() {
   enforcer_repo_count=1
   enforcer_failure_count=0
+  enforcer_discover_notes=('Skipping private repository: the-hcma/demo-private')
   {
+    printf 'Skipping private repository: the-hcma/demo-private\n'
     printf 'Started:  %s\n' "$(date -Is)"
     printf 'Root:     %s\n' "$(enforcer_resolve_scan_root)"
     printf 'Checks:   github-repo-lint --strict-onboarding --compact\n'
@@ -387,10 +577,7 @@ enforcer_send_report() {
 
 enforcer_main() {
   enforcer_require_libs
-  enforcer_invocation_cmd="${BASH_SOURCE[0]}"
-  if [[ "$#" -gt 0 ]]; then
-    enforcer_invocation_cmd+=" $*"
-  fi
+  enforcer_invocation_cmd="$(enforcer_quote_cmdline "${BASH_SOURCE[0]}" "$@")"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -422,6 +609,8 @@ enforcer_main() {
 
   enforcer_run_log="$(mktemp)"
   enforcer_clean_log="$(mktemp)"
+  enforcer_discover_notes=()
+  enforcer_check_cmd=""
   started_at="$(date -Is)"
 
   if [[ "$enforcer_print_only" -eq 1 ]]; then

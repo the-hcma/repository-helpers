@@ -352,6 +352,20 @@ batch_report_repo_name_from_parens() {
   basename "$inner"
 }
 
+# batch_report_join_slugs <slug> ...
+# Comma-joins repository short names for compact Passed/OK lines.
+batch_report_join_slugs() {
+  local first=1 slug
+  for slug in "$@"; do
+    if (( first )); then
+      printf '%s' "$slug"
+      first=0
+    else
+      printf ', %s' "$slug"
+    fi
+  done
+}
+
 # batch_report_update_lines <updates_report>
 # Reads dep-updater's structured update JSON as tab-separated rows:
 # repo_name ecosystem package from to cve_flag cves pr
@@ -379,44 +393,191 @@ batch_report_update_lines() {
   ' "$updates_report" 2>/dev/null || true
 }
 
-# batch_report_append_repo_failure_details <repo_name> <clean_log> <log_file> <body_lines_array_name>
-# Surfaces CI failures and per-command runner failures logged by batch-all.
+# batch_report_collect_final_run_summary_lines <clean_log>
+# Prints the last Finished-with-failures (or success) block including summary/details.
+batch_report_collect_final_run_summary_lines() {
+  local -r clean_log="$1"
+
+  awk '
+    function flush() {
+      if (finished == "") {
+        return
+      }
+      print finished
+      if (summary_hdr != "") {
+        print summary_hdr
+      }
+      for (i = 1; i <= n_summary; i++) {
+        print summary[i]
+      }
+      if (details_hdr != "") {
+        print details_hdr
+      }
+      for (i = 1; i <= n_details; i++) {
+        print details[i]
+      }
+    }
+    /\[batch-all\] Finished with failures/ {
+      flush()
+      finished = $0
+      summary_hdr = ""
+      details_hdr = ""
+      n_summary = 0
+      n_details = 0
+      in_summary = 0
+      in_details = 0
+      next
+    }
+    /\[batch-all\] All repos completed successfully/ {
+      flush()
+      finished = $0
+      summary_hdr = ""
+      details_hdr = ""
+      n_summary = 0
+      n_details = 0
+      in_summary = 0
+      in_details = 0
+      next
+    }
+    /\[batch-all\] Failure summary:/ {
+      if (finished != "") {
+        summary_hdr = $0
+      }
+      in_summary = 1
+      in_details = 0
+      next
+    }
+    /\[batch-all\] Failure details:/ {
+      if (finished != "") {
+        details_hdr = $0
+      }
+      in_details = 1
+      in_summary = 0
+      next
+    }
+    in_summary && /\[batch-all\]   / {
+      summary[++n_summary] = $0
+      next
+    }
+    in_details && /\[batch-all\]   / {
+      details[++n_details] = $0
+      next
+    }
+    END {
+      flush()
+    }
+  ' "$clean_log"
+}
+
+# batch_report_append_repo_failure_details <repo_name> <clean_log> <log_file> <body_lines_array_name> [indent]
+# Surfaces CI failures, wait timeouts, and per-command runner failures logged by batch-all.
 batch_report_append_repo_failure_details() {
   local -r repo_name="$1"
   local -r clean_log="$2"
   local -r log_file="$3"
   local -n out_lines="$4"
-  local ci_line pr_url check_url cause_line cmd_line ci_detail_re ci_pr_re
-  local -a cmd_lines=()
+  local -r indent="${5:-    }"
+  local ci_line pr_url check_url cause_line cmd_line ci_detail_re ci_pr_re detail_text
+  local parsed_pr_url parsed_check_url timeout_detail summary_cause
+  local detail_indent="${indent}  "
+  local -a cmd_lines=() detail_lines=()
   ci_detail_re='^pr=#([0-9]+) (.+) \(([^)]+)\)$'
   ci_pr_re='^pr=#([0-9]+)'
 
+  while IFS= read -r detail_text; do
+    [[ -n "$detail_text" ]] || continue
+    detail_lines+=("$detail_text")
+  done < <(rg "\[batch-all\]   ${repo_name}:" "$clean_log" 2>/dev/null \
+    | sed "s/^.*\\[batch-all\\]   ${repo_name}: //" || true)
+
+  for detail_text in "${detail_lines[@]}"; do
+    [[ "$detail_text" == *WAIT_TIMEOUT* ]] || continue
+    timeout_detail="$detail_text"
+    break
+  done
+  if [[ -z "${timeout_detail:-}" ]]; then
+    timeout_detail="$(rg -m1 "\[batch-all\]   ${repo_name}: exit [0-9]+ — .*WAIT_TIMEOUT" "$clean_log" 2>/dev/null \
+      | sed "s/^.*\\[batch-all\\]   ${repo_name}: exit [0-9]* — //" || true)"
+  fi
+  if [[ -n "${timeout_detail:-}" ]]; then
+    if [[ "$timeout_detail" =~ pr=#([0-9]+) ]]; then
+      cause_line="CI wait timed out on PR #${BASH_REMATCH[1]}"
+    else
+      cause_line="Wait timed out — ${timeout_detail}"
+    fi
+    out_lines+=("${indent}Cause: ${cause_line}")
+    for detail_text in "${detail_lines[@]}"; do
+      [[ -z "$pr_url" ]] && parsed_pr_url="$(sed -n 's/.* pr_url=\([^ ]*\).*/\1/p' <<<"$detail_text")"
+      [[ -n "$parsed_pr_url" ]] && pr_url="$parsed_pr_url"
+    done
+    if [[ -z "$pr_url" ]]; then
+      pr_url="$(rg -m1 "^\[batch-all\] CI failure-link \\(${repo_name}\\) pr: " "$clean_log" 2>/dev/null \
+        | sed "s/^\\[batch-all\\] CI failure-link (${repo_name}) pr: //" || true)"
+    fi
+    if [[ -n "$pr_url" ]]; then
+      out_lines+=("${indent}PR: ${pr_url}")
+    fi
+    return 0
+  fi
+
   ci_line="$(rg -m1 "^\[batch-all\] CI failure \\(${repo_name}\\): " "$clean_log" 2>/dev/null \
     | sed "s/^\\[batch-all\\] CI failure (${repo_name}): //" || true)"
+  if [[ -z "$ci_line" && ${#detail_lines[@]} -gt 0 ]]; then
+    for detail_text in "${detail_lines[@]}"; do
+      [[ "$detail_text" == *'CI failed'* || "$detail_text" == *'pr=#'* ]] || continue
+      if [[ "$detail_text" == *' — '* ]]; then
+        ci_line="${detail_text#* — }"
+      else
+        ci_line="$detail_text"
+      fi
+      ci_line="${ci_line#CI failed: }"
+      break
+    done
+  fi
   if [[ -n "$ci_line" ]]; then
     pr_url="$(rg -m1 "^\[batch-all\] CI failure-link \\(${repo_name}\\) pr: " "$clean_log" 2>/dev/null \
       | sed "s/^\\[batch-all\\] CI failure-link (${repo_name}) pr: //" || true)"
     check_url="$(rg -m1 "^\[batch-all\] CI failure-link \\(${repo_name}\\) check: " "$clean_log" 2>/dev/null \
       | sed "s/^\\[batch-all\\] CI failure-link (${repo_name}) check: //" || true)"
+    if [[ -z "$pr_url" || -z "$check_url" ]]; then
+      for detail_text in "${detail_lines[@]}"; do
+        [[ -z "$pr_url" ]] && parsed_pr_url="$(sed -n 's/.* pr_url=\([^ ]*\).*/\1/p' <<<"$detail_text")"
+        [[ -n "$parsed_pr_url" ]] && pr_url="$parsed_pr_url"
+        [[ -z "$check_url" ]] && parsed_check_url="$(sed -n 's/.* url=\([^ ]*\).*/\1/p' <<<"$detail_text")"
+        [[ -n "$parsed_check_url" ]] && check_url="$parsed_check_url"
+      done
+    fi
     if [[ "$ci_line" =~ $ci_detail_re ]]; then
       cause_line="CI failed on PR #${BASH_REMATCH[1]} — ${BASH_REMATCH[2]} (${BASH_REMATCH[3]})"
     elif [[ "$ci_line" =~ $ci_pr_re ]]; then
       cause_line="CI failed on PR #${BASH_REMATCH[1]}"
+    elif [[ "$ci_line" =~ check=([^[:space:]]+)[[:space:]]+conclusion=([^[:space:]]+) ]]; then
+      cause_line="CI failed — ${BASH_REMATCH[1]} (${BASH_REMATCH[2]})"
     else
       cause_line="CI failed — ${ci_line}"
     fi
-    out_lines+=("  Cause: ${cause_line}")
+    out_lines+=("${indent}Cause: ${cause_line}")
     if [[ -n "$pr_url" ]]; then
-      out_lines+=("  PR: ${pr_url}")
+      out_lines+=("${indent}PR: ${pr_url}")
     fi
     if [[ -n "$check_url" ]]; then
-      out_lines+=("  Check run: ${check_url}")
+      out_lines+=("${indent}Check run: ${check_url}")
     fi
     if [[ -z "$pr_url" && -z "$check_url" ]]; then
-      out_lines+=("  See log file for full output:")
-      out_lines+=("    ${log_file}")
+      out_lines+=("${indent}See log file for full output:")
+      out_lines+=("${detail_indent}${log_file}")
     fi
-    out_lines+=("")
+    return 0
+  fi
+
+  if [[ ${#detail_lines[@]} -gt 0 ]]; then
+    out_lines+=("${indent}Cause: ${detail_lines[0]}")
+    if [[ ${#detail_lines[@]} -gt 1 ]]; then
+      out_lines+=("${indent}Details:")
+      for detail_text in "${detail_lines[@]:1}"; do
+        out_lines+=("${detail_indent}- ${detail_text}")
+      done
+    fi
     return 0
   fi
 
@@ -427,14 +588,22 @@ batch_report_append_repo_failure_details() {
     | sed "s/^\\[batch-all\\] Command failure (${repo_name}): //" || true)
 
   if [[ ${#cmd_lines[@]} -gt 0 ]]; then
-    out_lines+=("  Failed commands:")
+    out_lines+=("${indent}Failed commands:")
     for cmd_line in "${cmd_lines[@]}"; do
-      out_lines+=("    - ${cmd_line}")
+      out_lines+=("${detail_indent}- ${cmd_line}")
     done
-    out_lines+=("  See log file for full output:")
-    out_lines+=("    ${log_file}")
-    out_lines+=("")
+    return 0
   fi
+
+  summary_cause="$(rg -m1 "\[batch-all\]   ${repo_name}: exit " "$clean_log" 2>/dev/null \
+    | sed "s/^.*\\[batch-all\\]   ${repo_name}: //" || true)"
+  if [[ -n "$summary_cause" ]]; then
+    out_lines+=("${indent}Cause: ${summary_cause}")
+    return 0
+  fi
+
+  out_lines+=("${indent}See log file for full output:")
+  out_lines+=("${detail_indent}${log_file}")
 }
 
 # batch_report_build <clean_log> <exit_code> <started_at> <finished_at> [updates_report]
@@ -445,10 +614,12 @@ batch_report_build() {
   local -r started_at="$3"
   local -r finished_at="$4"
   local -r updates_report="${5:-}"
-  local ok_count fail_count update_count entry sline repo_name
-  local update_repo update_eco update_pkg update_from update_to update_cve update_cves update_pr
+  local ok_count fail_count update_count entry sline repo_name joined_slugs
+  local update_repo update_eco update_pkg update_from update_to update_cve update_cves update_pr u_repo
   local run_cmd has_structured_failures=0
   local -a ok_lines fail_lines update_lines summary_lines body_lines
+  local -a ok_no_update=() update_repo_order=()
+  declare -A repos_with_updates=()
 
   ok_lines=()
   fail_lines=()
@@ -482,7 +653,7 @@ batch_report_build() {
     body_lines+=("The Dependency Updater batch run completed successfully (${ok_count} repositories).")
   elif (( fail_count > 0 )); then
     body_lines+=("The Dependency Updater batch run finished with failures.")
-    body_lines+=("See each repository section below for details.")
+    body_lines+=("See the Failed section below for details.")
   else
     body_lines+=("The Dependency Updater batch run exited with an error.")
     body_lines+=("See the log excerpt below.")
@@ -497,60 +668,84 @@ batch_report_build() {
     has_structured_failures=1
   fi
 
-  if (( update_count > 0 )); then
-    body_lines+=("Updates created (${update_count}):")
-    body_lines+=("")
-    for entry in "${update_lines[@]}"; do
-      IFS=$'\t' read -r update_repo update_eco update_pkg update_from update_to \
-        update_cve update_cves update_pr <<<"$entry"
-      sline="  - ${update_repo}: ${update_eco} ${update_pkg} ${update_from} → ${update_to}"
-      if [[ "$update_cve" == "yes" ]]; then
-        sline="${sline} (CVE: ${update_cves})"
-      fi
-      if [[ -n "$update_pr" && "$update_pr" != "#-" ]]; then
-        sline="${sline} (${update_pr})"
-      fi
-      body_lines+=("$sline")
-    done
-    body_lines+=("")
-  else
-    body_lines+=("No dependencies were updated.")
-    body_lines+=("")
-  fi
+  for entry in "${update_lines[@]}"; do
+    IFS=$'\t' read -r update_repo update_eco update_pkg update_from update_to \
+      update_cve update_cves update_pr <<<"$entry"
+    if [[ -z "${repos_with_updates[$update_repo]:-}" ]]; then
+      repos_with_updates["$update_repo"]=1
+      update_repo_order+=("$update_repo")
+    fi
+  done
 
   for entry in "${ok_lines[@]}"; do
     repo_name="$(batch_report_repo_name_from_parens "$entry")"
-    body_lines+=("=== ${repo_name} ===")
-    body_lines+=("")
-    body_lines+=("  Status: OK ${entry}")
-    body_lines+=("")
+    if [[ -z "${repos_with_updates[$repo_name]:-}" ]]; then
+      ok_no_update+=("$repo_name")
+    fi
   done
 
-  for entry in "${fail_lines[@]}"; do
-    repo_name="$(batch_report_repo_name_from_parens "$entry")"
-    body_lines+=("=== ${repo_name} ===")
+  body_lines+=("OK (no updates):")
+  if [[ ${#ok_no_update[@]} -gt 0 ]]; then
+    joined_slugs="$(batch_report_join_slugs "${ok_no_update[@]}")"
+    body_lines+=("  ${joined_slugs}")
+  else
+    body_lines+=("  none")
+  fi
+  body_lines+=("")
+
+  if (( update_count > 0 )); then
+    body_lines+=("Updated:")
+    for update_repo in "${update_repo_order[@]}"; do
+      body_lines+=("  ${update_repo}:")
+      for entry in "${update_lines[@]}"; do
+        IFS=$'\t' read -r u_repo update_eco update_pkg update_from update_to \
+          update_cve update_cves update_pr <<<"$entry"
+        [[ "$u_repo" == "$update_repo" ]] || continue
+        sline="    - ${update_eco} ${update_pkg} ${update_from} → ${update_to}"
+        if [[ "$update_cve" == "yes" ]]; then
+          sline="${sline} (CVE: ${update_cves})"
+        fi
+        if [[ -n "$update_pr" && "$update_pr" != "#-" ]]; then
+          sline="${sline} (${update_pr})"
+        fi
+        body_lines+=("$sline")
+      done
+    done
     body_lines+=("")
-    body_lines+=("  Status: FAILED ${entry}")
-    batch_report_append_repo_failure_details "$repo_name" "$clean_log" "$log_file" body_lines
-    if rg -qF "[batch-all] CI failure (${repo_name}):" "$clean_log" 2>/dev/null \
-      || rg -qF "[batch-all] Command failure (${repo_name}):" "$clean_log" 2>/dev/null; then
-      has_structured_failures=1
-    fi
-    body_lines+=("")
-  done
+  fi
+
+  body_lines+=("Failed:")
+  if (( fail_count == 0 )); then
+    body_lines+=("  none")
+  else
+    for entry in "${fail_lines[@]}"; do
+      repo_name="$(batch_report_repo_name_from_parens "$entry")"
+      body_lines+=("  ${repo_name}:")
+      batch_report_append_repo_failure_details "$repo_name" "$clean_log" "$log_file" body_lines
+      if rg -qF "[batch-all] CI failure (${repo_name}):" "$clean_log" 2>/dev/null \
+        || rg -qF "[batch-all] Command failure (${repo_name}):" "$clean_log" 2>/dev/null; then
+        has_structured_failures=1
+      fi
+      body_lines+=("")
+    done
+  fi
+  body_lines+=("")
 
   summary_lines=()
   while IFS= read -r repo_line; do
     [[ -n "$repo_line" ]] || continue
     summary_lines+=("$repo_line")
-  done < <(rg '\[batch-all\] (Failure summary|Failure details|   |Root cause|Finished with|All repos completed)' \
-    "$clean_log" 2>/dev/null | sed -E 's/^[0-9]+://' | tail -n 40 || true)
+  done < <(batch_report_collect_final_run_summary_lines "$clean_log" 2>/dev/null || true)
 
   if [[ ${#summary_lines[@]} -gt 0 ]]; then
     body_lines+=("Run summary:")
     body_lines+=("")
     for sline in "${summary_lines[@]}"; do
-      body_lines+=("  ${sline}")
+      if [[ "$sline" =~ \[batch-all\][[:space:]]+(.*)$ ]]; then
+        body_lines+=("  ${BASH_REMATCH[1]}")
+      else
+        body_lines+=("  ${sline}")
+      fi
     done
     body_lines+=("")
   fi

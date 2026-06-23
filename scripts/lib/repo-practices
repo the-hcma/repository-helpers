@@ -69,14 +69,23 @@ rp_runner_exec_stdout() {
   runner_exec_stdout "$label" "$@"
 }
 
-# rp_runner_gh_api_stream <label> [gh-api-args…]
+# rp_runner_gh_api_stream <label> [--probe] [gh-api-args…]
 rp_runner_gh_api_stream() {
   local -r label="$1"
+  local probe=0
   shift
+  if [[ "${1:-}" == '--probe' ]]; then
+    probe=1
+    shift
+  fi
   local exit_code
 
   exit_code=0
-  runner_exec "$label" --stream-stdout -- gh api "$@" || exit_code=$?
+  if (( probe )); then
+    runner_exec "$label" --probe --stream-stdout -- gh api "$@" || exit_code=$?
+  else
+    runner_exec "$label" --stream-stdout -- gh api "$@" || exit_code=$?
+  fi
   return "$exit_code"
 }
 
@@ -92,16 +101,28 @@ rp_runner_git_stream() {
 }
 
 # rp_runner_jq_file <label> <input-json> [jq-args…]
+# jq invocations with -e are treated as boolean probes (omitted from email failures).
 rp_runner_jq_file() {
   local -r label="$1"
   local -r input="$2"
   shift 2
-  local tmp exit_code
+  local tmp exit_code probe=0 arg
+
+  for arg in "$@"; do
+    if [[ "$arg" == '-e' ]]; then
+      probe=1
+      break
+    fi
+  done
 
   tmp="$(mktemp)"
   printf '%s' "$input" >"$tmp"
   exit_code=0
-  runner_exec "$label" --stream-stdout -- jq "$@" "$tmp" || exit_code=$?
+  if (( probe )); then
+    runner_exec "$label" --probe -- jq "$@" "$tmp" || exit_code=$?
+  else
+    runner_exec "$label" --stream-stdout -- jq "$@" "$tmp" || exit_code=$?
+  fi
   rm -f "$tmp"
   return "$exit_code"
 }
@@ -529,7 +550,7 @@ rp_gh_path_exists() {
   local path="$2"
   local exit_code=0
 
-  runner_exec "repo-practices gh path exists ${path}" \
+  runner_exec "repo-practices gh path exists ${path}" --probe \
     -- gh api "repos/${slug}/contents/${path}" || exit_code=$?
   (( exit_code == 0 ))
 }
@@ -540,7 +561,7 @@ rp_fetch_github_text_file() {
   local response encoded
   local fetch_exit_code=0
   set +e
-  response="$(rp_runner_exec_stdout "repo-practices gh fetch ${path}" \
+  response="$(rp_runner_exec_stdout "repo-practices gh fetch ${path}" --probe \
     -- gh api "repos/${slug}/contents/${path}")"
   fetch_exit_code=$?
   set -e
@@ -1414,11 +1435,25 @@ rp_ci_workflow_has_brittle_gitleaks_install() {
     || grep -qF 'releases/latest' <<<"$text"
 }
 
+rp_ci_secret_scan_normalize_for_compare() {
+  local text="$1"
+  # Treat shellcheck reflows (&& vs split lines, literal \n in format strings,
+  # indentation) as equivalent when no semantic script content changed.
+  printf '%s' "$text" \
+    | tr -d '\r' \
+    | sed 's/ && / /g; s/\\n/ /g; s/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+
 rp_ci_secret_scan_script_is_canonical() {
   local text="$1"
-  local canonical
+  local canonical norm_text norm_canonical
   canonical="$(rp_candidate_secret_scan_script)"
-  [[ "$text" == "$canonical" ]]
+  if [[ "$text" == "$canonical" ]]; then
+    return 0
+  fi
+  norm_text="$(rp_ci_secret_scan_normalize_for_compare "$text")"
+  norm_canonical="$(rp_ci_secret_scan_normalize_for_compare "$canonical")"
+  [[ "$norm_text" == "$norm_canonical" ]]
 }
 
 rp_fix_ci_workflow_secret_scan_job() {
@@ -1603,7 +1638,7 @@ rp_check_cursor_rules_gitignore() {
 
   if repo_dir="$(rp_resolve_local_repo_dir "$slug" 2>/dev/null)"; then
     local ignore_exit_code=0
-    runner_exec "repo-practices git check-ignore cursor rules" \
+    runner_exec "repo-practices git check-ignore cursor rules" --probe \
       -- git -C "$repo_dir" check-ignore --no-index -q "$rp_cursor_rules_gitignore_probe_path" \
       || ignore_exit_code=$?
     if (( ignore_exit_code == 0 )); then
@@ -2003,7 +2038,7 @@ rp_fetch_protect_main_ruleset() {
   local ruleset_id_raw ruleset_exit_code=0
   local ruleset_json ruleset_json_exit=0
   set +e
-  ruleset_id_raw="$(rp_runner_gh_api_stream "repo-practices protect-main ruleset id" \
+  ruleset_id_raw="$(rp_runner_gh_api_stream "repo-practices protect-main ruleset id" --probe \
     "repos/${owner}/${name}/rulesets" \
     --jq '.[] | select(.name == "protect-main") | .id')"
   ruleset_exit_code=$?
@@ -2017,7 +2052,7 @@ rp_fetch_protect_main_ruleset() {
     return 1
   fi
   set +e
-  ruleset_json="$(rp_runner_gh_api_stream "repo-practices protect-main ruleset json" \
+  ruleset_json="$(rp_runner_gh_api_stream "repo-practices protect-main ruleset json" --probe \
     "repos/${owner}/${name}/rulesets/${ruleset_id}")"
   ruleset_json_exit=$?
   set -e
@@ -2041,8 +2076,8 @@ rp_fetch_repo_labels_json() {
   local exit_code=0
 
   set +e
-  rp_runner_gh_api_stream "repo-practices repo labels" \
-    "repos/${slug}/labels" --paginate --jq '[.[].name]'
+  rp_runner_exec_stdout "repo-practices repo labels" \
+    -- gh api "repos/${slug}/labels" --paginate --jq '[.[].name]'
   exit_code=$?
   set -e
   if (( exit_code != 0 )); then
@@ -2136,7 +2171,7 @@ rp_fetch_ci_workflow_text() {
   if ! rp_gh_path_exists "$slug" '.github/workflows/ci.yml'; then
     return 1
   fi
-  rp_runner_gh_api_stream "repo-practices ci.yml content" \
+  rp_runner_gh_api_stream "repo-practices ci.yml content" --probe \
     "repos/${slug}/contents/.github/workflows/ci.yml" --jq '.content' | base64 -d
 }
 
@@ -2247,7 +2282,7 @@ rp_fetch_classic_main_protection_json() {
   local slug="$1"
   local prot_exit_code=0
   set +e
-  rp_runner_gh_api_stream "repo-practices classic main protection" \
+  rp_runner_gh_api_stream "repo-practices classic main protection" --probe \
     "repos/${slug}/branches/main/protection" >/dev/null
   prot_exit_code=$?
   set -e
@@ -3491,10 +3526,9 @@ rp_check_graphite_merge_queue() {
   local merge_it_exit=0
 
   set +e
-  rp_fetch_repo_labels_json "$slug"
+  labels_json="$(rp_fetch_repo_labels_json "$slug")"
   labels_fetch_exit=$?
   set -e
-  labels_json="$(rp_runner_last_stdout)"
   if (( labels_fetch_exit == 2 )); then
     rp_log_gh_api_fail "$slug" 'could not list repository labels'
     rp_log_check_fail "$slug" 'Graphite merge queue setup (GitHub API error; retry)' \
