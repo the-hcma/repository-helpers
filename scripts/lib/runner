@@ -35,6 +35,7 @@ readonly _runner_artifact_stderr='stderr'
 readonly _runner_artifact_exit_status='exit_status'
 readonly _runner_artifact_cmdline='cmdline'
 readonly _runner_artifact_label='label'
+readonly _runner_artifact_probe='probe'
 
 # runner_session_begin
 # Creates RUNNER_SESSION_DIR and exports it. Idempotent when already set.
@@ -89,14 +90,19 @@ runner_new_uuid() {
   printf '%s-%s-%s\n' "$(date +%s%N)" "$$" "$RANDOM"
 }
 
-# runner_exec <label> [--stream-stdout] -- <cmd> [args…]
+# runner_exec <label> [--probe] [--stream-stdout] -- <cmd> [args…]
 # Captures stdout/stderr/exit in a UUID directory. Returns the command exit code.
+# With --probe, non-zero exits are omitted from failure reports (expected checks).
 # With --stream-stdout, copies stdout to file descriptor 1 after completion.
 runner_exec() {
-  local label stream_stdout=0
+  local label stream_stdout=0 probe=0
   label="${1:?}"
   shift
 
+  if [[ "${1:-}" == '--probe' ]]; then
+    probe=1
+    shift
+  fi
   if [[ "${1:-}" == '--stream-stdout' ]]; then
     stream_stdout=1
     shift
@@ -115,6 +121,9 @@ runner_exec() {
   mkdir -p "$run_dir"
 
   printf '%s\n' "$label" >"${run_dir}/${_runner_artifact_label}"
+  if (( probe )); then
+    printf '1\n' >"${run_dir}/${_runner_artifact_probe}"
+  fi
   cmdline_quoted="$(runner_quote_cmdline "$@")"
   printf '%s' "$cmdline_quoted" >"${run_dir}/${_runner_artifact_cmdline}"
 
@@ -130,7 +139,7 @@ runner_exec() {
   return "$exit_code"
 }
 
-# runner_sh <label> [--stream-stdout] <script>
+# runner_sh <label> [--stream-stdout] [--] <script>
 # Runs bash -c with capture (pipelines and compound commands).
 runner_sh() {
   local label stream_stdout=0 script
@@ -138,6 +147,9 @@ runner_sh() {
   shift
   if [[ "${1:-}" == '--stream-stdout' ]]; then
     stream_stdout=1
+    shift
+  fi
+  if [[ "${1:-}" == '--' ]]; then
     shift
   fi
   script="${1:?}"
@@ -174,11 +186,16 @@ runner_last_id() {
   tail -n 1 "${RUNNER_SESSION_DIR}/.order"
 }
 
-# runner_exec_stdout <label> -- <cmd> [args…]
+# runner_exec_stdout <label> [--probe] -- <cmd> [args…]
 # Runs command; prints captured stdout on success or failure. Returns exit code.
 runner_exec_stdout() {
-  local label="$1"
+  local label probe=0
+  label="$1"
   shift
+  if [[ "${1:-}" == '--probe' ]]; then
+    probe=1
+    shift
+  fi
   [[ "${1:-}" == '--' ]] || {
     printf 'runner_exec_stdout: expected -- before command (label=%s)\n' "$label" >&2
     return 2
@@ -186,7 +203,11 @@ runner_exec_stdout() {
   shift
   local uuid exit_code
   exit_code=0
-  runner_exec "$label" -- "$@" || exit_code=$?
+  if (( probe )); then
+    runner_exec "$label" --probe -- "$@" || exit_code=$?
+  else
+    runner_exec "$label" -- "$@" || exit_code=$?
+  fi
   uuid="$(runner_last_id)"
   if [[ -n "$uuid" ]]; then
     runner_read "$uuid" "$_runner_artifact_stdout" || true
@@ -194,13 +215,17 @@ runner_exec_stdout() {
   return "$exit_code"
 }
 
-# runner_sh_stdout <label> <script>
+# runner_sh_stdout <label> [--] <script>
 runner_sh_stdout() {
   local label script exit_code uuid
   label="${1:?}"
-  script="${2:?}"
+  shift
+  if [[ "${1:-}" == '--' ]]; then
+    shift
+  fi
+  script="${1:?}"
   exit_code=0
-  runner_sh "$label" "$script" || exit_code=$?
+  runner_sh "$label" -- "$script" || exit_code=$?
   uuid="$(runner_last_id)"
   if [[ -n "$uuid" ]]; then
     runner_read "$uuid" "$_runner_artifact_stdout" || true
@@ -223,11 +248,14 @@ runner_session_ids() {
 }
 
 # runner_session_failed_ids
-# Lists UUIDs whose exit_status is not 0.
+# Lists UUIDs whose exit_status is not 0 (probe runs are omitted).
 runner_session_failed_ids() {
   local uuid exit_code
   while IFS= read -r uuid; do
     [[ -n "$uuid" ]] || continue
+    if [[ -f "${RUNNER_SESSION_DIR}/${uuid}/${_runner_artifact_probe}" ]]; then
+      continue
+    fi
     exit_code="$(runner_read_exit "$uuid" 2>/dev/null || printf '0')"
     if [[ -n "$exit_code" && "$exit_code" -ne 0 ]]; then
       printf '%s\n' "$uuid"
