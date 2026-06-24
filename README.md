@@ -146,7 +146,7 @@ Graphite app merge queue configuration remains a manual step and is reported as 
 
 `scripts/setup-service` reads unit templates from `etc/systemd/<unit>.service`
 in the invoking repository, substitutes `@@REPO_DIR@@`, injects `DEPLOYED_COMMIT`
-and `ConditionMachineId=`, installs under `~/.config/systemd/user/`, and mirrors expanded
+and `ConditionHost=|<machine-id>` guards, installs under `~/.config/systemd/user/`, and mirrors expanded
 units to `~/.config/share/systemd-units/`. Enables companion timers when
 `etc/systemd/<unit>.timer` exists.
 

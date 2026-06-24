@@ -20,6 +20,8 @@ readonly script_dir
 
 # shellcheck disable=SC1091  # runner-bootstrap begins session for runner_exec calls
 source "${script_dir}/lib/runner-bootstrap"
+# shellcheck disable=SC1091  # service-host-guard is a sibling lib, not a package
+source "${script_dir}/lib/service-host-guard"
 
 # ss_runner_git_c_stdout <repo> <label> -- <git-args…>
 ss_runner_git_c_stdout() {
@@ -79,10 +81,13 @@ readonly kernel_name
 readonly deployed_commit_env_name="DEPLOYED_COMMIT"
 readonly expanded_units_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/share/systemd-units"
 readonly condition_host_config_path="${HOME}/.config/user-services-host"
+readonly condition_host_fqdn_config_path="${HOME}/.config/user-services-host-fqdn"
 readonly condition_machine_id_config_path="${HOME}/.config/user-services-machine-id"
 condition_host_value=""
+condition_host_fqdn_value=""
 condition_host_machine_id=""
 condition_host_cli=""
+condition_host_fqdn_cli=""
 service_host_machine_id_failure=""
 
 # current_hostname_short
@@ -117,8 +122,21 @@ config_file_first_line() {
     head -n1 "$path"
 }
 
+# read_local_hostname_fqdn
+# Prints the FQDN from hostname(1) when available, else the short hostname.
+read_local_hostname_fqdn() {
+    local fqdn short
+
+    short="$(current_hostname_short)"
+    fqdn="$(hostname --fqdn 2>/dev/null || true)"
+    fqdn="${fqdn#"${fqdn%%[![:space:]]*}"}"
+    fqdn="${fqdn%"${fqdn##*[![:space:]]}"}"
+    [[ -n "$fqdn" ]] || fqdn="$short"
+    printf '%s\n' "$fqdn"
+}
+
 # read_local_machine_id
-# Prints this machine's ID from /etc/machine-id (systemd ConditionMachineId source).
+# Prints this machine's ID from /etc/machine-id (used in ConditionHost=|… guards).
 read_local_machine_id() {
     local id
 
@@ -151,6 +169,13 @@ save_condition_host_config() {
     printf '%s\n' "$condition_host_value" >"$condition_host_config_path"
 }
 
+# save_condition_host_fqdn_config
+# Persists the service-host FQDN (from hostname on that machine).
+save_condition_host_fqdn_config() {
+    mkdir -p "$(dirname "$condition_host_fqdn_config_path")"
+    printf '%s\n' "$condition_host_fqdn_value" >"$condition_host_fqdn_config_path"
+}
+
 # save_condition_machine_id_config
 # Persists the service-host machine-id (from /etc/machine-id on that host).
 save_condition_machine_id_config() {
@@ -169,7 +194,7 @@ prompt_for_condition_host() {
         die "Service host required: create ${condition_host_config_path} or pass --condition-host NAME"
     fi
 
-    echo "Systemd user units run on a single host (ConditionMachineId from /etc/machine-id)."
+    echo "Systemd user units run on a single host (ConditionHost=|<machine-id>)."
     read -r -p "Hostname where services should run [${default_host}]: " input
     input="${input#"${input%%[![:space:]]*}"}"
     input="${input%"${input##*[![:space:]]}"}"
@@ -200,6 +225,39 @@ resolve_condition_host() {
     fi
 
     prompt_for_condition_host
+}
+
+# resolve_condition_host_fqdn
+# Uses --condition-host-fqdn, then ~/.config/user-services-host-fqdn, then captures on the service host.
+resolve_condition_host_fqdn() {
+    if [[ -n "$condition_host_fqdn_cli" ]]; then
+        condition_host_fqdn_value="$condition_host_fqdn_cli"
+        save_condition_host_fqdn_config
+        return 0
+    fi
+
+    if [[ -f "$condition_host_fqdn_config_path" ]]; then
+        condition_host_fqdn_value="$(
+            tr -d '[:space:]' <<<"$(config_file_first_line "$condition_host_fqdn_config_path")"
+        )"
+        if [[ -n "$condition_host_fqdn_value" ]]; then
+            return 0
+        fi
+    fi
+
+    if host_name_matches_service_host; then
+        condition_host_fqdn_value="$(read_local_hostname_fqdn)"
+        save_condition_host_fqdn_config
+        echo "✅ Service host FQDN captured into ${condition_host_fqdn_config_path}"
+        return 0
+    fi
+
+    condition_host_fqdn_value=""
+    if [[ "$status_only" == "1" ]]; then
+        return 1
+    fi
+
+    die "Service host FQDN not configured (${condition_host_fqdn_config_path}). Run setup-service on ${condition_host_value} once to capture hostname -f, or pass --condition-host-fqdn."
 }
 
 # resolve_service_host_machine_id
@@ -244,9 +302,9 @@ resolve_service_host_machine_id() {
 }
 
 # load_machine_id_from_installed_units_for_status
-# Sets condition_host_machine_id from ConditionMachineId= in a repo-managed installed unit.
+# Sets condition_host_machine_id from ConditionHost=|… or a legacy bogus unit line in installed units.
 load_machine_id_from_installed_units_for_status() {
-    local unit_path machine_id_line candidate
+    local unit_path candidate
 
     if [[ ! -d "$target_dir" ]]; then
         return 1
@@ -259,11 +317,7 @@ load_machine_id_from_installed_units_for_status() {
         if ! unit_is_repo_managed "$unit_path"; then
             continue
         fi
-        machine_id_line="$(grep -m1 '^ConditionMachineId=' "$unit_path" 2>/dev/null || true)"
-        if [[ -z "$machine_id_line" ]]; then
-            continue
-        fi
-        candidate="$(normalize_machine_id "${machine_id_line#ConditionMachineId=}")"
+        candidate="$(service_host_guard_machine_id_from_unit_file "$unit_path" 2>/dev/null || true)"
         if machine_id_is_valid "$candidate"; then
             condition_host_machine_id="$candidate"
             return 0
@@ -291,36 +345,6 @@ warn_host_skips_service() {
     if ! host_runs_units; then
         echo "⚠️  WARNING: Service host ${condition_host_value} (machine-id ${condition_host_machine_id}) but this machine is ${current_host}; systemd will not run these units here."
     fi
-}
-
-# inject_service_host_machine_id_into_unit <unit_text> <host_label> <machine_id>
-# Inserts ConditionMachineId (and readable hostname comment) in [Unit].
-inject_service_host_machine_id_into_unit() {
-    local generated="$1"
-    local host_label="$2"
-    local machine_id="$3"
-    local guard_comment guard_line
-
-    guard_comment="# Service host: ${host_label} (machine-id from /etc/machine-id on that host)"
-    guard_line="ConditionMachineId=${machine_id}"
-
-    generated="$(
-        printf '%s\n' "$generated" \
-            | grep -vE '^ConditionHost=|^ConditionMachineId=|^ExecCondition=.*/service-host-exec-condition|^# Service host:' \
-            || true
-    )"
-
-    awk -v comment="$guard_comment" -v cond="$guard_line" '
-        BEGIN { inserted = 0 }
-        /^\[Unit\]/ && !inserted {
-            print
-            print comment
-            print cond
-            inserted = 1
-            next
-        }
-        { print }
-    ' <<<"$generated"
 }
 
 # discover_unit_basenames
@@ -471,7 +495,7 @@ generate_service_unit() {
     if [[ -z "$condition_host_machine_id" ]]; then
         die "Service host machine-id is not set (internal error)"
     fi
-    generated="$(inject_service_host_machine_id_into_unit "$generated" "$condition_host_value" "$condition_host_machine_id")"
+    generated="$(service_host_guard_inject_into_unit "$generated" "$condition_host_value" "$condition_host_fqdn_value" "$condition_host_machine_id")"
     printf '%s' "$generated"
 }
 
@@ -489,7 +513,7 @@ generate_timer_unit() {
     if [[ -z "$condition_host_machine_id" ]]; then
         die "Service host machine-id is not set (internal error)"
     fi
-    inject_service_host_machine_id_into_unit "$generated" "$condition_host_value" "$condition_host_machine_id"
+    service_host_guard_inject_into_unit "$generated" "$condition_host_value" "$condition_host_fqdn_value" "$condition_host_machine_id"
 }
 
 # service_unit_is_oneshot [unit_file]
@@ -933,12 +957,18 @@ OPTIONS:
         Default is warn-only.
 
     --condition-host NAME
-        Hostname label for the single machine where systemd should run these units.
-        Saved to ~/.config/user-services-host. setup-service captures that host's
-        /etc/machine-id into ~/.config/user-services-machine-id (on first run on
-        the service host) and injects ConditionMachineId= into each unit. When the
-        config file is missing, setup-service prompts interactively (or requires
-        this flag).
+        Short hostname label for the machine where systemd should run these units
+        (e.g. meerkat). Saved to ~/.config/user-services-host.
+
+    --condition-host-fqdn NAME
+        Fully qualified hostname for the service host (e.g. meerkat.house.hcma).
+        Saved to ~/.config/user-services-host-fqdn. When omitted, setup-service
+        captures hostname -f on the first run on the service host.
+
+        setup-service also captures /etc/machine-id into
+        ~/.config/user-services-machine-id and injects ConditionHost=|<machine-id>
+        into each unit so timers and services run only on that host even when
+        jobs run on one designated host even when unit files live on NFS.
 
     -h, --help
         Display this help message and exit.
@@ -1010,11 +1040,30 @@ check_status() {
         condition_host_value=""
     fi
     if [[ -n "$condition_host_value" ]]; then
+        if [[ -f "$condition_host_fqdn_config_path" ]]; then
+            condition_host_fqdn_value="$(
+                tr -d '[:space:]' <<<"$(config_file_first_line "$condition_host_fqdn_config_path")"
+            )"
+        else
+            condition_host_fqdn_value=""
+        fi
         if resolve_service_host_machine_id; then
             if host_runs_units; then
-                echo "✅ Host:     ${condition_host_value} (machine-id ${condition_host_machine_id}) — this machine"
+                if [[ -n "$condition_host_fqdn_value" ]]; then
+                    echo "✅ Host:     ${condition_host_value} (${condition_host_fqdn_value}; machine-id ${condition_host_machine_id}) — this machine"
+                else
+                    echo "✅ Host:     ${condition_host_value} (machine-id ${condition_host_machine_id}) — this machine"
+                fi
             else
-                echo "⚠️  Host:     ${condition_host_value} (machine-id ${condition_host_machine_id}) — this machine is $(current_hostname_short); units skip here"
+                if [[ -n "$condition_host_fqdn_value" ]]; then
+                    echo "⚠️  Host:     ${condition_host_value} (${condition_host_fqdn_value}; machine-id ${condition_host_machine_id}) — this machine is $(current_hostname_short); units skip here"
+                else
+                    echo "⚠️  Host:     ${condition_host_value} (machine-id ${condition_host_machine_id}) — this machine is $(current_hostname_short); units skip here"
+                fi
+                overall_good=false
+            fi
+            if [[ -z "$condition_host_fqdn_value" ]]; then
+                echo "⚠️  Host FQDN: not configured (${condition_host_fqdn_config_path}); re-run setup-service on ${condition_host_value} to capture hostname -f"
                 overall_good=false
             fi
         else
@@ -1222,6 +1271,20 @@ while [[ $# -gt 0 ]]; do
             fi
             shift
             ;;
+        --condition-host-fqdn)
+            if [[ $# -lt 2 ]]; then
+                die "--condition-host-fqdn requires a hostname argument"
+            fi
+            condition_host_fqdn_cli="$2"
+            shift 2
+            ;;
+        --condition-host-fqdn=*)
+            condition_host_fqdn_cli="${1#--condition-host-fqdn=}"
+            if [[ -z "$condition_host_fqdn_cli" ]]; then
+                die "--condition-host-fqdn requires a hostname argument"
+            fi
+            shift
+            ;;
         *)
             echo "❌ Error: Unknown option: $1"
             echo "Run './scripts/setup-service --help' for usage information"
@@ -1295,6 +1358,7 @@ fi
 mkdir -p "$target_dir"
 
 resolve_condition_host
+resolve_condition_host_fqdn
 resolve_service_host_machine_id
 warn_host_skips_service
 
