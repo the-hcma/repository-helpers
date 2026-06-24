@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# service-host-guard — inject ConditionHost guards into systemd unit text.
+#
+# Pin units to one host with `ConditionHost=|<machine-id>` (see docs/SYSTEMD.md).
+set -euo pipefail
+
+if declare -F service_host_guard_inject_into_unit >/dev/null 2>&1; then
+  return 0
+fi
+
+lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly lib_dir
+# Bogus key from older installs (systemd ignores it); strip/parse only during upgrade.
+readonly service_host_guard_legacy_bogus_prefix='ConditionMachineId='
+# shellcheck disable=SC1091  # runner-ensure is a sibling lib, not a package
+source "${lib_dir}/runner-ensure"
+
+# service_host_guard_strip_legacy_lines <unit_text>
+# Removes prior service-host guard lines before re-injecting.
+service_host_guard_strip_legacy_lines() {
+  local -r unit_text="$1"
+  local -r legacy_re="${service_host_guard_legacy_bogus_prefix}"
+
+  printf '%s\n' "$unit_text" \
+    | grep -vE "^ConditionHost=|^${legacy_re}|^ExecCondition=.*/service-host-exec-condition|^# Service host:" \
+    || true
+}
+
+# service_host_guard_inject_into_unit <unit_text> <host_short> <host_fqdn> <machine_id>
+# Inserts ConditionHost=|<machine-id> after [Unit]. host_short/fqdn label the comment only.
+service_host_guard_inject_into_unit() {
+  local generated="$1"
+  local -r host_short="$2"
+  local -r host_fqdn="$3"
+  local -r machine_id="$4"
+  local guard_comment
+
+  if [[ -z "$host_short" || -z "$machine_id" ]]; then
+    printf 'service_host_guard_inject_into_unit: host_short and machine_id are required\n' >&2
+    return 2
+  fi
+
+  generated="$(service_host_guard_strip_legacy_lines "$generated")"
+
+  if [[ -n "$host_fqdn" && "$host_fqdn" != "$host_short" ]]; then
+    guard_comment="# Service host: ${host_short} (${host_fqdn}; machine-id ${machine_id})"
+  else
+    guard_comment="# Service host: ${host_short} (machine-id ${machine_id})"
+  fi
+
+  awk -v comment="$guard_comment" -v mid="$machine_id" '
+    BEGIN { inserted = 0 }
+    /^\[Unit\]/ && !inserted {
+      print
+      print comment
+      print "ConditionHost=|" mid
+      inserted = 1
+      next
+    }
+    { print }
+  ' <<<"$generated"
+}
+
+# service_host_guard_machine_id_from_unit_file <path>
+# Prints machine-id from ConditionHost=|… or a legacy bogus unit line from older installs.
+service_host_guard_machine_id_from_unit_file() {
+  local -r unit_path="$1"
+  local line candidate
+  local -r legacy_prefix="${service_host_guard_legacy_bogus_prefix}"
+
+  if [[ ! -f "$unit_path" ]]; then
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^ConditionHost=\|([0-9a-f]{32})$ ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done <"$unit_path"
+
+  line="$(grep -m1 "^${legacy_prefix}" "$unit_path" 2>/dev/null || true)"
+  if [[ -n "$line" ]]; then
+    candidate="${line#"${legacy_prefix}"}"
+    candidate="$(tr -d '[:space:]' <<<"$candidate")"
+    candidate="${candidate,,}"
+    if [[ "$candidate" =~ ^[0-9a-f]{32}$ ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+# service_host_guard_legacy_bogus_prefix_value
+# Prints the legacy bogus unit-line prefix (upgrade-only; not used in new units).
+service_host_guard_legacy_bogus_prefix_value() {
+  printf '%s' "$service_host_guard_legacy_bogus_prefix"
+}
