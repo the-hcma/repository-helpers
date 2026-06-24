@@ -370,19 +370,19 @@ agent_review_load_agent_profile() {
   local agent_id profile_path profiles_dir
 
   # Reset optional hooks so profile switches cannot leak prior implementations.
-  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  # shellcheck disable=SC2317,SC2329  # default stubs replaced when profile defines a hook
   agent_review_profile_review_is_quota_exhausted() { return 1; }
-  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  # shellcheck disable=SC2317,SC2329  # default stubs replaced when profile defines a hook
   agent_review_profile_text_is_quota_exhausted() { return 1; }
-  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  # shellcheck disable=SC2317,SC2329  # default stubs replaced when profile defines a hook
   agent_review_profile_head_check_has_findings() { return 1; }
-  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  # shellcheck disable=SC2317,SC2329  # default stubs replaced when profile defines a hook
   agent_review_profile_head_check_is_clean() { return 1; }
-  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  # shellcheck disable=SC2317,SC2329  # default stubs replaced when profile defines a hook
   agent_review_profile_head_check_is_complete() { return 1; }
-  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  # shellcheck disable=SC2317,SC2329  # default stubs replaced when profile defines a hook
   agent_review_profile_head_check_is_quota_exhausted() { return 1; }
-  # shellcheck disable=SC2317  # default stubs replaced when profile defines a hook
+  # shellcheck disable=SC2317,SC2329  # default stubs replaced when profile defines a hook
   agent_review_profile_head_check_is_error() { return 1; }
   agent_review_profile_uses_head_check=false
   agent_review_profile_check_name_regex=''
@@ -925,13 +925,12 @@ agent_review_threads_json_from_snapshot() {
           }]'
 }
 
-# All unresolved review threads on the PR (any author).
+# All threads that still need a reply or resolve (unresolved or human follow-up).
 agent_review_open_thread_count_from_snapshot() {
   local -r snapshot="$1"
 
-  ar_runner_jq_file "agent-review open thread count" "${snapshot}" \
-    '[.data.repository.pullRequest.reviewThreads.nodes[]
-        | select(.isResolved == false)] | length'
+  ar_runner_jq_file "agent-review open thread count" \
+    "$(agent_review_pending_threads_json_from_snapshot "${snapshot}")" 'length'
 }
 
 # Unresolved threads with no human (User) reply after the opening comment.
@@ -1079,24 +1078,80 @@ agent_review_human_threads_needs_resolve_json_from_snapshot() {
           }]'
 }
 
+# Threads whose last comment is a human follow-up (including on resolved threads).
+# Excludes short "Done|Fixed|Addressed in <sha>" replies so addressed threads stay quiet.
+agent_review_follow_up_threads_json_from_snapshot() {
+  local -r snapshot="$1"
+  local bots
+
+  bots="$(agent_review_bot_login_regex)"
+  ar_runner_jq_file "agent-review follow-up threads json" "${snapshot}" --arg bots "${bots}" '
+      def is_bot_login($login):
+        ($bots | split("|")) as $patterns
+        | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
+      def is_human_user($author):
+        ($author.__typename == "User") and (is_bot_login($author.login) | not);
+      def is_fix_reply_body($body):
+        ($body // "") | test("^(Done|Fixed|Addressed) in [0-9a-f]{7,}"; "i");
+      [.data.repository.pullRequest.reviewThreads.nodes[]
+        | .comments.nodes[-1] as $last
+        | select(is_human_user($last.author))
+        | select(is_fix_reply_body($last.body) | not)
+        | select(
+            (.isResolved == false)
+            or (($last.body // "") | test("\\?"))
+          )
+        | {
+            thread_id: .id,
+            is_resolved: .isResolved,
+            author: ($last.author.login // ""),
+            comment_id: $last.databaseId,
+            comment_url: $last.url,
+            path: ($last.path // ""),
+            line: ($last.line // null),
+            body: $last.body,
+            reply_count: ([.comments.nodes[1:][]] | length),
+            follow_up: true
+          }]'
+}
+
+# Unique pending threads (unaddressed, needs-resolve, or human follow-up).
+agent_review_pending_threads_json_from_snapshot() {
+  local -r snapshot="$1"
+  local unaddressed needs_resolve follow_up
+
+  unaddressed="$(agent_review_unaddressed_threads_json_from_snapshot "${snapshot}")"
+  needs_resolve="$(agent_review_all_threads_needs_resolve_json_from_snapshot "${snapshot}")"
+  follow_up="$(agent_review_follow_up_threads_json_from_snapshot "${snapshot}")"
+  ar_runner_jq_n "agent-review pending threads json" \
+    --argjson unaddressed "${unaddressed}" \
+    --argjson needs_resolve "${needs_resolve}" \
+    --argjson follow_up "${follow_up}" \
+    '($unaddressed + $needs_resolve + $follow_up) | unique_by(.thread_id)'
+}
+
 agent_review_human_open_threads_json_from_snapshot() {
   local -r snapshot="$1"
-  local unaddressed needs_resolve
+  local unaddressed needs_resolve follow_up
 
   unaddressed="$(agent_review_human_threads_json_from_snapshot "${snapshot}")"
   needs_resolve="$(agent_review_human_threads_needs_resolve_json_from_snapshot "${snapshot}")"
+  follow_up="$(agent_review_follow_up_threads_json_from_snapshot "${snapshot}")"
   ar_runner_jq_n "agent-review human open threads json" \
-    --argjson unaddressed "${unaddressed}" --argjson needs_resolve "${needs_resolve}" \
-    '$unaddressed + $needs_resolve'
+    --argjson unaddressed "${unaddressed}" \
+    --argjson needs_resolve "${needs_resolve}" \
+    --argjson follow_up "${follow_up}" \
+    '($unaddressed + $needs_resolve + $follow_up) | unique_by(.thread_id)'
 }
 
 agent_review_triage_threads_json_from_snapshot() {
   local -r snapshot="$1"
-  local bots unaddressed needs_resolve agent_json human_json agent_needs_resolve human_needs_resolve
+  local bots unaddressed needs_resolve follow_up agent_json human_json agent_needs_resolve human_needs_resolve human_follow_up
 
   bots="$(agent_review_bot_login_regex)"
   unaddressed="$(agent_review_unaddressed_threads_json_from_snapshot "${snapshot}")"
   needs_resolve="$(agent_review_all_threads_needs_resolve_json_from_snapshot "${snapshot}")"
+  follow_up="$(agent_review_follow_up_threads_json_from_snapshot "${snapshot}")"
   agent_json="$(ar_runner_jq_file "agent-review triage agent unaddressed" "${unaddressed}" --arg bots "${bots}" '
     def is_bot_login($login):
       ($bots | split("|")) as $patterns
@@ -1117,28 +1172,31 @@ agent_review_triage_threads_json_from_snapshot() {
       ($bots | split("|")) as $patterns
       | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
     [.[] | select(is_bot_login(.author // "") | not)]')"
+  human_follow_up="$(ar_runner_jq_file "agent-review triage human follow-up" "${follow_up}" --arg bots "${bots}" '
+    def is_bot_login($login):
+      ($bots | split("|")) as $patterns
+      | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
+    [.[] | select(is_bot_login(.author // "") | not)]')"
   ar_runner_jq_n "agent-review triage threads json" \
     --argjson agent "${agent_json}" \
     --argjson human "${human_json}" \
     --argjson agent_needs_resolve "${agent_needs_resolve}" \
     --argjson human_needs_resolve "${human_needs_resolve}" \
+    --argjson human_follow_up "${human_follow_up}" \
     '{
       agent: $agent,
-      human: $human,
+      human: ($human + $human_follow_up | unique_by(.thread_id)),
       agent_needs_resolve: $agent_needs_resolve,
-      human_needs_resolve: $human_needs_resolve
+      human_needs_resolve: $human_needs_resolve,
+      human_follow_up: $human_follow_up
     }'
 }
 
 agent_review_pending_thread_count_from_snapshot() {
   local -r snapshot="$1"
-  local unaddressed_json needs_resolve_json unaddressed needs_resolve
 
-  unaddressed_json="$(agent_review_unaddressed_threads_json_from_snapshot "${snapshot}")"
-  needs_resolve_json="$(agent_review_all_threads_needs_resolve_json_from_snapshot "${snapshot}")"
-  unaddressed="$(ar_runner_jq_file "agent-review unaddressed thread count" "${unaddressed_json}" 'length')"
-  needs_resolve="$(ar_runner_jq_file "agent-review needs resolve thread count" "${needs_resolve_json}" 'length')"
-  printf '%s\n' "$(( unaddressed + needs_resolve ))"
+  ar_runner_jq_file "agent-review pending thread count" \
+    "$(agent_review_pending_threads_json_from_snapshot "${snapshot}")" 'length'
 }
 
 # Exit 3 with triage JSON when review threads still need a reply or resolve; else 0.

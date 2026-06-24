@@ -37,27 +37,46 @@ New timer oneshots must use both conventions.
 Unit **templates** (with `@@REPO_DIR@@`) live in each repository's `etc/systemd/`.
 `setup-service` expands them into `~/.config/systemd/user/` and mirrors the
 expanded units under `~/.config/share/systemd-units/`.
-`setup-service` injects `ConditionMachineId=` (from `/etc/machine-id` on the
-service host, saved in `~/.config/user-services-machine-id`) using the hostname
-label in `~/.config/user-services-host` (or
-`--condition-host` / an interactive prompt on first install) so units run on one
-designated machine even when `~/.config/systemd/user/` is on NFS.
+`setup-service` injects **`ConditionHost=|<machine-id>`** using the value in
+`~/.config/user-services-machine-id` (and records short hostname / FQDN in
+`user-services-host` / `user-services-host-fqdn` for status output) so units
+run on one designated machine even when `~/.config/systemd/user/` is on NFS.
+Re-run `setup-service` after changing the service host so installed units pick up
+fresh guard lines.
 
 ### Service host (single-machine guard)
 
-Units are pinned to one physical host with native **`ConditionMachineId=`**
-(systemd matches `/etc/machine-id` on the running machine):
+Units are pinned with a single **`ConditionHost=|<machine-id>`** line — the
+32-character hex value from `/etc/machine-id` on the service host
+(`ConditionHost` accepts machine-id as a host identifier on systemd 259+).
+
+```ini
+# Service host: meerkat (meerkat.house.hcma; machine-id 7aeaef81…)
+ConditionHost=|7aeaef81ca2647d09d2c2ef67e36bc84
+```
+
+The `|` prefix marks a **triggering** condition (see
+[systemd unit conditions](https://www.freedesktop.org/software/systemd/man/systemd.unit.html#Conditions%20and%20Asserts)).
+Only the machine-id line is injected into units; hostname labels in the comment
+and config files are for humans running `setup-service --status`.
 
 | File | Purpose |
 | --- | --- |
-| `~/.config/user-services-host` | Readable hostname label (e.g. `meerkat`) — used in unit comments and prompts |
+| `~/.config/user-services-host` | Short hostname label (e.g. `meerkat`) — prompts and status |
+| `~/.config/user-services-host-fqdn` | FQDN from `hostname` on the service host (e.g. `meerkat.house.hcma`) |
 | `~/.config/user-services-machine-id` | 32-char hex ID from `/etc/machine-id` on the service host |
 
 On the **first** `setup-service` run on the configured service host, the script
-captures `/etc/machine-id` into `user-services-machine-id`. Other machines can
+captures FQDN and `/etc/machine-id` into the files above. Other machines can
 run `setup-service` to install or refresh units (e.g. over NFS), but systemd will
 not start them there. `setup-service --status` reports whether this machine
 matches the configured service host.
+
+**Standby hosts** (e.g. a backup machine with the same NFS home): leave timer
+units **disabled** (`systemctl --user disable --now dep-updater.timer`
+`github-repo-lint.timer`). `setup-service` enables timers only on the service
+host (`host_runs_units`); re-running it on a standby host must not pass
+`--now` to timers.
 
 Use `scripts/show-services` for a read-only overview of every service template in
 this repo:
@@ -180,10 +199,11 @@ This will:
 
 1. Read templates from `etc/systemd/`, expand into `~/.config/systemd/user/`
 2. Substitute `@@REPO_DIR@@` with the checkout you invoked setup from
-3. Resolve the service-host label from `~/.config/user-services-host` (or
-   `--condition-host` / an interactive prompt) and load or capture machine-id
-   into `~/.config/user-services-machine-id`
-4. Inject `ConditionMachineId=` into each unit (plus a readable hostname comment)
+3. Resolve the service-host short name from `~/.config/user-services-host` (or
+   `--condition-host`), FQDN from `~/.config/user-services-host-fqdn` (captured
+   on first run on the service host or `--condition-host-fqdn`), and machine-id
+   in `~/.config/user-services-machine-id`
+4. Inject `ConditionHost=|<machine-id>` into each unit
 5. Enable lingering on the service host (when this machine's machine-id matches)
 6. Run `scripts/on-deploy` to record the deployed commit
 7. Enable the **timer** when `dep-updater.timer` exists (not an immediate batch run)
