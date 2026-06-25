@@ -458,6 +458,64 @@ gh_pr_head_sha_for_number() {
     --json headRefOid --jq '.headRefOid // empty' 2>/dev/null || true
 }
 
+gh_pr_base_ref_for_number() {
+  local -r pr_number="$1"
+  dep_runner_gh_stdout "gh pr" -- pr view "$pr_number" --repo "${repo_owner}/${repo_name}" \
+    --json baseRefName --jq '.baseRefName // empty' 2>/dev/null || true
+}
+
+# When GitHub leaves mergeable=UNKNOWN, compare base...head: ahead with behind_by=0
+# means the PR head is a direct extension of the base branch (no missing main commits,
+# no divergence). Safe to treat as conflict-free for batch gating.
+gh_pr_compare_ff_mergeable_for_number() {
+  local -r pr_num="$1"
+  local base_ref head_sha raw cmp_status behind_by
+
+  base_ref="$(gh_pr_base_ref_for_number "$pr_num")"
+  [[ -n "$base_ref" ]] || return 1
+
+  head_sha="$(gh_pr_head_sha_for_number "$pr_num")"
+  [[ -n "$head_sha" ]] || return 1
+
+  raw="$(dep_runner_gh_api_jq "gh pr compare ff check" --probe \
+    "repos/${repo_owner}/${repo_name}/compare/${base_ref}...${head_sha}" \
+    '{status: (.status // ""), behind_by: (.behind_by // -1)}' || true)"
+  [[ -n "$raw" ]] || return 1
+
+  cmp_status="$(dep_runner_jq_string "gh pr compare ff status" "$raw" '.status')"
+  behind_by="$(dep_runner_jq_string "gh pr compare ff behind_by" "$raw" '.behind_by')"
+  [[ "$cmp_status" == 'ahead' && "$behind_by" == '0' ]]
+}
+
+# Best-effort audit trail when compare fallback bypasses mergeable=UNKNOWN.
+# GitHub/API failures must not block batch gating.
+gh_pr_post_mergeable_compare_fallback_comment_optional() {
+  local -r pr_num="$1"
+  local -r waited_sec="$2"
+  local base_ref head_sha comment_body waited_fmt exit_code
+
+  base_ref="$(gh_pr_base_ref_for_number "$pr_num")"
+  head_sha="$(gh_pr_head_sha_for_number "$pr_num")"
+  if (( waited_sec < 60 )); then
+    waited_fmt="${waited_sec}s"
+  else
+    waited_fmt="$(( waited_sec / 60 ))m $(( waited_sec % 60 ))s"
+  fi
+
+  comment_body="$(cat <<EOF
+dep-updater: GitHub \`mergeable\` stayed \`UNKNOWN\` for ${waited_fmt}; used compare fallback (\`${base_ref}...${head_sha}\`: ahead, \`behind_by=0\`) and continuing.
+EOF
+)"
+
+  exit_code=0
+  runner_exec "gh pr compare fallback comment" --probe -- gh pr comment "$pr_num" \
+    --repo "${repo_owner}/${repo_name}" \
+    --body "$comment_body" || exit_code=$?
+  if (( exit_code != 0 )); then
+    log "PR #${pr_num}: optional compare-fallback comment not posted (waited ${waited_fmt})."
+  fi
+}
+
 gh_pr_number_resolve_for_gate() {
   local -r branch="$1"
   local pr
@@ -5965,12 +6023,22 @@ wait_for_mergeable() {
         die "PR #${pr_num} has merge conflicts. Rebase the stack and re-run."
         ;;
       UNKNOWN|'')
+        if gh_pr_compare_ff_mergeable_for_number "$pr_num"; then
+          log "PR #${pr_num}: mergeable=UNKNOWN; compare fallback (ahead, behind_by=0) — treating as mergeable."
+          gh_pr_post_mergeable_compare_fallback_comment_optional "$pr_num" "$(( elapsed * 10 ))"
+          return 0
+        fi
         log "Still waiting for merge conflict status: pr=#${pr_num} mergeable=${state}"
         ;;
     esac
     sleep 10
     elapsed=$(( elapsed + 1 ))
     if (( elapsed * 10 >= timeout_min * 60 )); then
+      if gh_pr_compare_ff_mergeable_for_number "$pr_num"; then
+        log "PR #${pr_num}: mergeable UNKNOWN after ${timeout_min}m; compare fallback (ahead, behind_by=0) — treating as mergeable."
+        gh_pr_post_mergeable_compare_fallback_comment_optional "$pr_num" "$(( timeout_min * 60 ))"
+        return 0
+      fi
       die "Timed out waiting for PR #${pr_num} mergeable state after ${timeout_min} min."
     fi
   done
