@@ -858,7 +858,8 @@ rp_ci_workflow_has_hardened_concurrency() {
     ' <<<"$text"
   )"
   [[ -n "$group_line" ]] || return 1
-  grep -qF 'github.event.pull_request.head.sha' <<<"$group_line"
+  grep -qF 'github.event.pull_request.head.sha' <<<"$group_line" \
+    && grep -qF 'github.event.action' <<<"$group_line"
 }
 
 rp_fix_ci_workflow_concurrency() {
@@ -918,8 +919,18 @@ rp_candidate_ci_guard_push_dedup_yaml() {
   rp_candidate_workflow_template 'ci-guard-push-dedup.snippet'
 }
 
+rp_candidate_ci_guard_coderabbit_edited_yaml() {
+  rp_candidate_workflow_template 'ci-guard-coderabbit-edited.snippet'
+}
+
 rp_candidate_ci_guard_permissions_yaml() {
   rp_candidate_workflow_template 'ci-guard-permissions.snippet'
+}
+
+rp_ci_workflow_guard_has_coderabbit_edited_skip() {
+  local text="$1"
+  grep -qF 'coderabbitai[bot]' <<<"$text" \
+    && grep -qF 'CodeRabbit description edit' <<<"$text"
 }
 
 rp_ci_workflow_has_pull_request_edited_type() {
@@ -1190,6 +1201,7 @@ rp_candidate_ci_guard_skip_run_yaml() {
   local -r skip_false_line='          echo "skip=false" >> "$GITHUB_OUTPUT"'
   template_name="$(rp_ci_guard_skip_run_template_name "$text")"
   rp_candidate_workflow_template "$template_name"
+  rp_candidate_ci_guard_coderabbit_edited_yaml
   rp_candidate_ci_guard_push_dedup_yaml
   printf '%s\n' "$skip_false_line"
 }
@@ -1394,12 +1406,58 @@ rp_fix_ci_workflow_guard_push_dedup() {
   rm -f "$run_path"
 }
 
+rp_fix_ci_workflow_guard_coderabbit_edited() {
+  local text="$1"
+  local block_path
+  if rp_ci_workflow_guard_has_coderabbit_edited_skip "$text"; then
+    printf '%s' "$text"
+    return 0
+  fi
+  block_path="$(mktemp)"
+  rp_candidate_ci_guard_coderabbit_edited_yaml >"$block_path"
+  awk -v block_path="$block_path" '
+    BEGIN {
+      while ((getline block_line < block_path) > 0) {
+        block = block block_line "\n"
+      }
+      close(block_path)
+      in_guard = 0
+      in_skip_step = 0
+      inserted = 0
+    }
+    in_guard && in_skip_step && /^          # Skip push CI when an open PR already covers this branch\./ {
+      if (!inserted) {
+        printf "%s", block
+        inserted = 1
+      }
+      print
+      next
+    }
+    /^  guard:/ { in_guard = 1; print; next }
+    in_guard && /^  [a-zA-Z0-9_.-]+:/ && $0 !~ /^  guard:/ {
+      in_guard = 0
+      in_skip_step = 0
+      print
+      next
+    }
+    in_guard && /^      - id: (check|set-skip)$/ {
+      in_skip_step = 1
+      print
+      next
+    }
+    in_guard && in_skip_step && /^      - id: / { in_skip_step = 0 }
+    { print }
+  ' <<<"$text"
+  rm -f "$block_path"
+}
+
 rp_fix_ci_workflow_graphite_restack_triggers() {
   local text="$1"
   text="$(rp_fix_ci_workflow_pull_request_edited_type "$text")"
   text="$(rp_fix_ci_workflow_feature_branch_push_trigger "$text")"
   text="$(rp_fix_ci_workflow_guard_permissions "$text")"
   text="$(rp_fix_ci_workflow_guard_push_dedup "$text")"
+  text="$(rp_fix_ci_workflow_guard_coderabbit_edited "$text")"
   printf '%s' "$text"
 }
 
