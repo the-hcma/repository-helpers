@@ -1099,6 +1099,157 @@ npm_version_meets_minimum_release_age() {
   return 0
 }
 
+# _py_version_is_stable_release <version>
+# Returns 0 for PEP 440 release/post-release versions (excludes a/b/rc/dev pre-releases).
+_py_version_is_stable_release() {
+  local -r version="$1"
+
+  if [[ "$version" =~ [0-9](a|b|rc)[0-9] ]]; then
+    return 1
+  fi
+  if [[ "$version" =~ [0-9]\.(dev|a|b|rc)[0-9] ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# _pypi_fetch_project_json <pkg>
+# Prints the PyPI project JSON document, or nothing on failure.
+_pypi_fetch_project_json() {
+  local -r pkg="$1"
+  local encoded_pkg
+
+  if [[ "${DEP_UPDATER_SKIP_PYPI_REGISTRY:-0}" == '1' ]]; then
+    return 1
+  fi
+
+  encoded_pkg="${pkg//+/%2B}"
+  dep_runner_curl_body "pypi project json ${pkg}" \
+    "https://pypi.org/pypi/${encoded_pkg}/json" || true
+}
+
+# _pypi_stable_versions_desc_from_body <json_body>
+# Prints stable published versions newest-first from a cached project JSON body.
+_pypi_stable_versions_desc_from_body() {
+  local -r body="$1"
+
+  if [[ -z "$body" ]]; then
+    return 1
+  fi
+  dep_runner_jq_string "pypi stable versions from body" "$body" '.releases | keys[]' 2>/dev/null \
+    | while IFS= read -r ver; do
+        [[ -z "$ver" ]] && continue
+        if _py_version_is_stable_release "$ver"; then
+          printf '%s\n' "$ver"
+        fi
+      done \
+    | sort -V -r
+}
+
+# _pypi_version_upload_epoch_from_project_json <json_body> <version>
+# Prints publish-time epoch from a cached project JSON body, or empty when unknown.
+_pypi_version_upload_epoch_from_project_json() {
+  local -r body="$1"
+  local -r version="$2"
+  local published_iso published_epoch
+
+  if [[ -z "$body" ]]; then
+    return 1
+  fi
+  # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+  published_iso="$(dep_runner_jq_with_args "pypi upload time from project json" "$body" -r --arg v "$version" \
+    '.releases[$v][0].upload_time // empty' 2>/dev/null || true)"
+  if [[ -z "$published_iso" || "$published_iso" == 'null' ]]; then
+    return 1
+  fi
+  published_epoch="$(npm_parse_iso8601_to_epoch "$published_iso" 2>/dev/null || true)"
+  if [[ -z "$published_epoch" ]]; then
+    return 1
+  fi
+  printf '%s' "$published_epoch"
+  return 0
+}
+
+# _py_version_meets_minimum_release_age_from_json <json_body> <pkg> <version>
+# Like py_version_meets_minimum_release_age but reads upload times from cached project JSON.
+_py_version_meets_minimum_release_age_from_json() {
+  local -r body="$1"
+  local -r pkg="$2"
+  local -r version="$3"
+  local published_epoch now_epoch age_minutes
+
+  if [[ "${DEP_UPDATER_SKIP_PYPI_REGISTRY:-0}" == '1' ]]; then
+    return 0
+  fi
+
+  if py_pkg_has_cve_fix_in_audit "$pkg"; then
+    return 0
+  fi
+
+  published_epoch="$(_pypi_version_upload_epoch_from_project_json "$body" "$version" 2>/dev/null || true)"
+  if [[ -z "$published_epoch" ]]; then
+    return 0
+  fi
+  now_epoch="$(time_log_now_utc_epoch)"
+  age_minutes=$(( (now_epoch - published_epoch) / 60 ))
+  if (( age_minutes < dep_updater_minimum_release_age_minutes )); then
+    log "[python] Skipping ${pkg}==${version}: published ${age_minutes}m ago; minimum release age is ${dep_updater_minimum_release_age_minutes}m."
+    return 1
+  fi
+  return 0
+}
+
+# py_pick_eligible_new_version <pkg> <current>
+# Prints the newest PyPI version newer than current that passes release-age policy.
+# When the registry latest is too new, walks back to the newest eligible stable
+# version (same behaviour as npm_pick_eligible_new_version / Dependabot cooldown).
+py_pick_eligible_new_version() {
+  local -r pkg="$1"
+  local -r current="$2"
+  local body registry_latest ver picked
+
+  if [[ "${DEP_UPDATER_SKIP_PYPI_REGISTRY:-0}" == '1' ]]; then
+    return 1
+  fi
+
+  if py_pkg_has_cve_fix_in_audit "$pkg"; then
+    return 1
+  fi
+
+  body="$(_pypi_fetch_project_json "$pkg")"
+  if [[ -z "$body" ]]; then
+    return 1
+  fi
+
+  registry_latest="$(dep_runner_jq_string "pypi info version ${pkg}" "$body" '.info.version // empty' || true)"
+  picked=""
+  while IFS= read -r ver; do
+    [[ -z "$ver" ]] && continue
+    if [[ "$ver" == "$current" ]]; then
+      continue
+    fi
+    if [[ "$(printf '%s\n%s\n' "$current" "$ver" | sort -V | tail -1)" != "$ver" ]]; then
+      continue
+    fi
+    if _py_version_meets_minimum_release_age_from_json "$body" "$pkg" "$ver"; then
+      picked="$ver"
+      break
+    fi
+    if [[ "$(printf '%s\n%s\n' "$ver" "$current" | sort -V | tail -1)" == "$current" && "$ver" != "$current" ]]; then
+      break
+    fi
+  done < <(_pypi_stable_versions_desc_from_body "$body")
+
+  if [[ -z "$picked" ]]; then
+    return 1
+  fi
+  if [[ -n "$registry_latest" && "$picked" != "$registry_latest" ]]; then
+    log "[python] ${pkg}: proposing ${picked} (newest eligible; latest ${registry_latest} is too new)."
+  fi
+  printf '%s' "$picked"
+  return 0
+}
+
 # pypi_version_published_epoch <pkg> <version>
 # Prints publish-time epoch from PyPI, or empty when unknown.
 pypi_version_published_epoch() {
@@ -3882,8 +4033,7 @@ py_audit() {
       # --frozen prevents uv from syncing the project environment (which can
       # write uv.lock) before running pip-audit.  The audit is read-only: we
       # only need to inspect already-installed packages, not update them.
-      raw="$(dep_runner_uv_dir_stdout "pip-audit uv" "$audit_dir" \
-        run --frozen --with pip-audit pip-audit --format=json)"
+      raw="$(dep_runner_uv_dir_stdout "pip-audit uv" "$audit_dir" -- run --frozen --with pip-audit pip-audit --format=json)"
       exit_code=$?
       ;;
     *)
@@ -4161,7 +4311,7 @@ py_security_update() {
     log "[python/${tool}] Security: bumping ${pkg} to ${fix}…"
     case "$tool" in
       uv)
-        dep_runner_uv_dir "uv security add" "$worktree_path" add "${pkg}==${fix}"
+        dep_runner_uv_dir "uv security add" "$worktree_path" -- add "${pkg}==${fix}"
         files_changed="pyproject.toml + uv.lock"
         ;;
       poetry)
@@ -4322,13 +4472,13 @@ py_outdated() {
   local -r tool="$1"
   local -r target_dir="${2:-$dir}"
   local raw_lines pyproject installed_json ge_dep ge_pkg ge_floor ge_installed ge_lower
-  local installed_new
+  local installed_new eligible dry_req_tmp dry_req_rc
   installed_json=""
   installed_new=""
   case "$tool" in
     uv)
       raw_lines="$(dep_runner_jq_with_args "dep-updater uv outdated rows" \
-        "$(dep_runner_uv_dir_stdout "uv pip list outdated" "$target_dir" pip list --outdated --format=json 2>/dev/null)" \
+        "$(dep_runner_uv_dir_stdout "uv pip list outdated" "$target_dir" -- pip list --outdated --format=json 2>/dev/null)" \
         -r '.[] | "\(.name) \(.version) \(.latest_version)"')"
       ;;
     poetry)
@@ -4359,7 +4509,7 @@ py_outdated() {
   if [[ "$tool" == "uv" ]]; then
     pyproject="${target_dir}/pyproject.toml"
     if [[ -f "$pyproject" ]]; then
-      installed_json="$(dep_runner_uv_dir_stdout "uv pip list installed" "$target_dir" pip list --format=json 2>/dev/null)"
+      installed_json="$(dep_runner_uv_dir_stdout "uv pip list installed" "$target_dir" -- pip list --format=json 2>/dev/null)"
       while IFS= read -r ge_dep; do
         [[ -z "$ge_dep" ]] && continue
         # Strip extras ([...]) then >= and version to get the package name.
@@ -4418,6 +4568,22 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
       log "[python/${tool}] Skipping exactly-pinned package: ${pkg} (${cur})"
       continue
     fi
+    if [[ "$tool" == "uv" && -n "$installed_json" ]]; then
+      # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+      installed_new="$(dep_runner_jq_with_args "jq installed pkg version" "$installed_json" -r --arg n "$pkg" \
+            '.[] | select(.name | ascii_downcase == ($n | ascii_downcase)) | .version' \
+          2>/dev/null || true)"
+    else
+      installed_new=""
+    fi
+    # When uv pip list --outdated reports a too-new latest, walk PyPI for the
+    # newest eligible stable version (npm/GHA already do this).
+    if [[ -z "$installed_new" || "$new" != "$installed_new" ]]; then
+      eligible="$(py_pick_eligible_new_version "$pkg" "$cur" 2>/dev/null || true)"
+      if [[ -n "$eligible" ]]; then
+        new="$eligible"
+      fi
+    fi
     # For uv projects, probe whether the upgrade is actually resolvable before
     # reporting it.  'uv pip list --outdated' reports PyPI availability only and
     # does not check transitive constraints from other installed packages (e.g.
@@ -4430,12 +4596,7 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
     # exit 1.  Editable installs are excluded (local packages not on PyPI).
     # Skip the probe for >= floor bumps (new == already-installed version).
     if [[ "$tool" == "uv" && -n "$installed_json" ]]; then
-      # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
-      installed_new="$(dep_runner_jq_with_args "jq installed pkg version" "$installed_json" -r --arg n "$pkg" \
-            '.[] | select(.name | ascii_downcase == ($n | ascii_downcase)) | .version' \
-          2>/dev/null || true)"
       if [[ "$new" != "$installed_new" ]]; then
-        local dry_req_tmp dry_req_rc
         dry_req_tmp="$(mktemp)"
         # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
         dep_runner_jq_with_args "jq uv dry-run requirements" "$installed_json" -r --arg p "$pkg" --arg v "$new" \
@@ -4445,7 +4606,7 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
                        else "\(.name)==\(.version)"
                        end' >"$dry_req_tmp"
         dry_req_rc=0
-        dep_runner_uv_dir "uv pip install dry-run" "$target_dir" pip install --dry-run -r "$dry_req_tmp" >/dev/null 2>&1 || dry_req_rc=$?
+        dep_runner_uv_dir "uv pip install dry-run" "$target_dir" -- pip install --dry-run -r "$dry_req_tmp" >/dev/null 2>&1 || dry_req_rc=$?
         rm -f "$dry_req_tmp"
         if [[ "$dry_req_rc" -ne 0 ]]; then
           log "[python/uv] Filtering ${pkg} ${new}: transitive constraint blocks this upgrade."
@@ -4530,10 +4691,10 @@ py_update_one() {
           dep_updater_append_ecosystem_failure "python|sed failed for ${pkg}"
           return 0
         fi
-        uv_out="$(dep_runner_uv_dir_capture "uv lock" "$worktree_path" lock)" && uv_exit=0 || uv_exit=$?
+        uv_out="$(dep_runner_uv_dir_capture "uv lock" "$worktree_path" -- lock)" && uv_exit=0 || uv_exit=$?
       else
         uv_spec="${pkg}==${new_ver}"
-        uv_out="$(dep_runner_uv_dir_capture "uv add" "$worktree_path" add "$uv_spec")" && uv_exit=0 || uv_exit=$?
+        uv_out="$(dep_runner_uv_dir_capture "uv add" "$worktree_path" -- add "$uv_spec")" && uv_exit=0 || uv_exit=$?
       fi
       if (( uv_exit != 0 )); then
         # Revert pyproject.toml: sed already modified it for >= / == / ~= constraints
@@ -5214,7 +5375,7 @@ batch_update_all() {
         [[ -z "$pkg" ]] && continue
         log "[python/${py_tool}] Security: ${pkg} → ${fix}"
         case "$py_tool" in
-          uv)      dep_runner_uv_dir "uv batch security add" "$worktree_path" add "${pkg}==${fix}" ;;
+          uv)      dep_runner_uv_dir "uv batch security add" "$worktree_path" -- add "${pkg}==${fix}" ;;
           poetry)  run_in_worktree poetry add "${pkg}@${fix}" ;;
           pipenv)  run_in_worktree pipenv install "${pkg}==${fix}" ;;
           pip|pip3) "$py_tool" install "${pkg}==${fix}" ;;
@@ -5236,10 +5397,10 @@ batch_update_all() {
                 dep_updater_append_ecosystem_failure "python|batch sed failed for ${pkg}"
                 continue
               fi
-              py_out="$(dep_runner_uv_dir_capture "uv batch lock" "$worktree_path" lock)" && py_exit=0 || py_exit=$?
+              py_out="$(dep_runner_uv_dir_capture "uv batch lock" "$worktree_path" -- lock)" && py_exit=0 || py_exit=$?
             else
               b_spec="${pkg}==${new_ver}"
-              py_out="$(dep_runner_uv_dir_capture "uv batch add" "$worktree_path" add "$b_spec")" && py_exit=0 || py_exit=$?
+              py_out="$(dep_runner_uv_dir_capture "uv batch add" "$worktree_path" -- add "$b_spec")" && py_exit=0 || py_exit=$?
             fi
             if (( py_exit != 0 )); then
               # Revert: sed patched pyproject.toml before the lock attempt for >=
