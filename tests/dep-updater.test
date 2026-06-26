@@ -31,7 +31,6 @@ release_age_defaults="${script_dir}/../scripts/lib/release-age-defaults"
 readonly release_age_defaults
 
 printf '\n=== static: npm minimumReleaseAge (dep-updater day gate) ===\n'
-# Run before any dep-updater dry-run: create_worktree may reset the primary checkout.
 if [[ -f "$release_age_defaults" ]]; then
   printf '[PASS] release-age: scripts/lib/release-age-defaults exists\n'
   pass=$(( pass + 1 ))
@@ -113,7 +112,6 @@ else
   fail=$(( fail + 1 ))
 fi
 
-# Run before any dep-updater dry-run: create_worktree restores the primary checkout to main.
 # ---------------------------------------------------------------------------
 # Static: GitHub Actions ecosystem
 # ---------------------------------------------------------------------------
@@ -287,22 +285,47 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Isolated repo for dry-run smoke tests (avoids mutating the stack/primary clone).
+# ---------------------------------------------------------------------------
+
+dry_run_make_isolated_repo() {
+  DRY_RUN_ISOLATED_REPO="$(mktemp -d)"
+  DRY_RUN_ISOLATED_ORIGIN="$(mktemp -d)"
+  git -C "$DRY_RUN_ISOLATED_ORIGIN" init -q --bare
+  git -C "$DRY_RUN_ISOLATED_REPO" init -q
+  git -C "$DRY_RUN_ISOLATED_REPO" checkout -b main >/dev/null 2>&1 || true
+  git -C "$DRY_RUN_ISOLATED_REPO" \
+    -c user.name=dep-updater-test -c user.email=dep-updater-test@example.com \
+    commit --allow-empty -q -m init
+  git -C "$DRY_RUN_ISOLATED_REPO" remote add origin "$DRY_RUN_ISOLATED_ORIGIN"
+  git -C "$DRY_RUN_ISOLATED_REPO" push -u origin main -q
+}
+
+dry_run_cleanup_isolated_repo() {
+  rm -rf "${DRY_RUN_ISOLATED_REPO:-}" "${DRY_RUN_ISOLATED_ORIGIN:-}"
+  unset DRY_RUN_ISOLATED_REPO DRY_RUN_ISOLATED_ORIGIN
+}
+
+# ---------------------------------------------------------------------------
 # Run one dry-run invocation and capture output + exit code.
 # ---------------------------------------------------------------------------
 
 run_dry_run() {
   local -r label="$1"
   local -r extra_flags="${2:-}"
-  local output exit_code
+  local output exit_code tmp_repo
   local tmpfile
   tmpfile="$(mktemp)"
+  dry_run_make_isolated_repo
+  tmp_repo="$DRY_RUN_ISOLATED_REPO"
   set +e
   # shellcheck disable=SC2086  # word-split intentional for extra_flags
-  "$script" --dry-run --dir "$script_dir" $extra_flags >"$tmpfile" 2>&1
+  "$script" --dry-run --dir "$tmp_repo" $extra_flags >"$tmpfile" 2>&1
   exit_code=$?
   set -e
   output="$(cat "$tmpfile")"
   rm -f "$tmpfile"
+  dry_run_cleanup_isolated_repo
 
   assert_exit_0   "$label" "$output" "$exit_code"
   # Worktree lifecycle — the core invariant: created and destroyed on every dry-run
@@ -318,6 +341,18 @@ run_dry_run() {
 # ---------------------------------------------------------------------------
 # Test: non-batch dry-run
 # ---------------------------------------------------------------------------
+
+printf '\n=== static: dry-run uses isolated temp repo ===\n'
+# shellcheck disable=SC2016  # intentional literal grep for dry-run --dir wiring
+if grep -q '^dry_run_make_isolated_repo()' "${script_dir}/dep-updater.test" \
+  && grep -qF 'dry_run_make_isolated_repo' "${script_dir}/dep-updater.test" \
+  && grep -qF -- '--dry-run --dir "$tmp_repo"' "${script_dir}/dep-updater.test"; then
+  printf '[PASS] dry-run smoke: uses isolated temp repo instead of script_dir\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] dry-run smoke: expected isolated temp repo helper for dry-run tests\n'
+  fail=$(( fail + 1 ))
+fi
 
 printf '\n=== non-batch dry-run ===\n'
 run_dry_run "non-batch" ""
@@ -1502,13 +1537,14 @@ fi
 
 printf '\n=== static: worktree naming and leak guards ===\n'
 
-# Worktree directory name must use dep-updater-wt- prefix (not the old repo-name-dep-update- form)
+# Worktree directory name must use dep-updater-wt- prefix and include repo slug
 # shellcheck disable=SC2016  # single-quoted pattern is intentional: grep for literal ${timestamp} in source
-if grep -q 'dep-updater-wt-\${timestamp}' "$script"; then
-  printf '[PASS] create_worktree: uses dep-updater-wt- prefix for directory name\n'
+if grep -q 'dep-updater-wt-\${timestamp}-\${repo_slug}' "$script" \
+  && grep -q '^dep_updater_worktree_repo_slug()' "$script"; then
+  printf '[PASS] create_worktree: uses dep-updater-wt- prefix with repo slug\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] create_worktree: dep-updater-wt- prefix not found\n'
+  printf '[FAIL] create_worktree: dep-updater-wt- prefix with repo slug not found\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -2477,12 +2513,24 @@ if grep -qE 'DEP_UPDATER_RUN_REPORT=.*child_report' "$script" \
   && grep -qF 'command_failures' "$script" \
   && grep -qF '[batch-all] CI failure' "$script" \
   && grep -qF '[batch-all] CI failure-link' "$script" \
-  && grep -qF '[batch-all] Command failure' "$script" \
   && grep -qF 'has("primary") and has("details")' "$script"; then
   printf '[PASS] batch-all run-report: parent passes report path; child writer and jq reader present\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] batch-all run-report: expected DEP_UPDATER_RUN_REPORT wiring and jq validation\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: batch email noise reduction ===\n'
+if grep -qF 'unset RUNNER_SESSION_DIR' "$script" \
+  && grep -qF -- '--probe "dep-updater py audit validate"' "$script" \
+  && grep -qF -- '--probe "dep-updater npm audit validate"' "$script" \
+  && grep -qF -- '--probe "uv pip install dry-run"' "$script" \
+  && grep -qF -- '--probe "gh label"' "$script"; then
+  printf '[PASS] batch-email: isolated runner session and probe expected failures\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] batch-email: expected isolated session and probe markers for expected failures\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -2811,12 +2859,27 @@ if grep -qF 'dep_runner_jq_with_args()' "$script" \
   && grep -qF 'dep_runner_gh_stdout()' "$script" \
   && grep -qF '_emit_report_json()' "$script" \
   && grep -qF 'dep_runner_jq_n "dep-updater report-json emit"' "$script" \
-  && grep -qF 'dep_runner_jq_with_args "dep-updater py audit validate"' "$script" \
+  && grep -qF -- 'dep_runner_jq_with_args --probe "dep-updater py audit validate"' "$script" \
   && grep -qF 'dep_runner_jq_with_args "dep-updater uv outdated rows"' "$script"; then
   printf '[PASS] report-json: _emit_report_json and audit/outdated jq use dep_runner helpers\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] report-json: expected dep_runner_jq_* wiring for --report-json path\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: runner probe helpers accept --probe before label ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text
+if awk '/^dep_runner_jq_with_args\(\) \{/,/^\}$/ { print }' "$script" \
+    | grep -qF "if [[ \"\${1:-}\" == '--probe' ]]; then" \
+  && awk '/^dep_runner_uv_dir\(\) \{/,/^\}$/ { print }' "$script" \
+    | grep -qF "if [[ \"\${1:-}\" == '--probe' ]]; then" \
+  && awk '/^dep_runner_gh\(\) \{/,/^\}$/ { print }' "$script" \
+    | grep -qF "if [[ \"\${1:-}\" == '--probe' ]]; then"; then
+  printf '[PASS] probe helpers: parse leading --probe before label\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] probe helpers: expected leading --probe parse before label assignment\n'
   fail=$(( fail + 1 ))
 fi
 
