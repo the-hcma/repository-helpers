@@ -115,6 +115,61 @@ dun_runner_exec_stdout() {
   return "$exit_code"
 }
 
+# dun_actionable_fail_reason_from_stderr <stderr_text> <exit_code>
+# Prefer dep-updater ERROR lines or nested runner stderr hints over generic exit codes.
+dun_actionable_fail_reason_from_stderr() {
+  local -r stderr_text="$1"
+  local -r exit_code="$2"
+  local line label in_stderr block_line trimmed
+
+  if [[ -z "$stderr_text" ]]; then
+    printf 'exit code %s' "$exit_code"
+    return 0
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == ERROR:\ * ]]; then
+      printf '%s' "${line#ERROR: }"
+      return 0
+    fi
+  done <<<"$stderr_text"
+
+  label=""
+  in_stderr=0
+  block_line=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == \[FAIL\]\ * ]]; then
+      label="${line#\[FAIL\] }"
+      continue
+    fi
+    if [[ "$line" == '  --- stderr ---' ]]; then
+      in_stderr=1
+      block_line=""
+      continue
+    fi
+    if (( in_stderr )) && [[ "$line" == '  --- end stderr ---' ]]; then
+      if [[ -n "$block_line" ]]; then
+        if [[ -n "$label" ]]; then
+          printf '%s: %s' "$label" "$block_line"
+        else
+          printf '%s' "$block_line"
+        fi
+        return 0
+      fi
+      in_stderr=0
+      continue
+    fi
+    if (( in_stderr )); then
+      trimmed="${line#"${line%%[![:space:]]*}"}"
+      if [[ -z "$block_line" && -n "$trimmed" ]]; then
+        block_line="$trimmed"
+      fi
+    fi
+  done <<<"$stderr_text"
+
+  printf 'exit code %s' "$exit_code"
+}
+
 discover_repos() {
   local -r roots_csv="${DEP_UPDATER_NOTIFIER_ROOTS:-$default_repo_root}"
   local -r repos_csv="${DEP_UPDATER_NOTIFIER_REPOS:-}"
@@ -259,9 +314,10 @@ for repo in "${repos[@]}"; do
   fi
 
   if (( exit_code != 0 )) || (( json_ok == 0 )); then
-    fail_reason="exit code ${exit_code}"
     if (( exit_code == 0 )) && (( json_ok == 0 )); then
       fail_reason="invalid JSON on stdout (exit code 0)"
+    else
+      fail_reason="$(dun_actionable_fail_reason_from_stderr "$dep_err_text" "$exit_code")"
     fi
 
     log "${repo_name}: scan failed (${fail_reason})."
