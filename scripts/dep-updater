@@ -1740,11 +1740,22 @@ dep_updater_handle_ci_failure() {
   die "CI failed: pr=#${pr_num} ${summary}. PR closed; re-run to create a fresh update."
 }
 
+# dep_updater_primary_is_generic <primary> <exit_code>
+dep_updater_primary_is_generic() {
+  runner_primary_is_generic_exit "$1" "dep-updater" "$2"
+}
+
+# dep_updater_actionable_primary_from_report <report_file> <exit_code>
+# Prefer structured runner failures over generic exit-code placeholders.
+dep_updater_actionable_primary_from_report() {
+  runner_actionable_primary_from_report "$1" "$2" "dep-updater"
+}
+
 dep_updater_write_batch_child_report_json() {
   local -r exit_code="${1:?}"
   local -r first_failure="${2:-}"
   local out_file primary details_json ci_failure_json command_failures_json
-  local capture_stderr capture_stdout
+  local capture_stderr capture_stdout resolved_primary tmp_report
 
   out_file="${DEP_UPDATER_RUN_REPORT:?}"
   primary="$first_failure"
@@ -1776,7 +1787,7 @@ dep_updater_write_batch_child_report_json() {
 
   if [[ -z "$primary" ]]; then
     primary="dep-updater exited with code ${exit_code}"
-  elif [[ "$primary" == "dep-updater exited with code ${exit_code}" ]] \
+  elif dep_updater_primary_is_generic "$primary" "$exit_code" \
     && [[ "$details_json" != '[]' ]]; then
     primary="$(dep_runner_jq_with_args "dep-updater batch child report primary" "$details_json" -r '.[0] // empty' 2>/dev/null || true)"
     [[ -z "$primary" ]] && primary="dep-updater exited with code ${exit_code}"
@@ -1785,6 +1796,28 @@ dep_updater_write_batch_child_report_json() {
   if [[ -n "${_last_ci_failure_json:-}" && "$_last_ci_failure_json" != "null" ]]; then
     ci_failure_json="$_last_ci_failure_json"
   fi
+
+  tmp_report="$(mktemp)"
+  # shellcheck disable=SC2016  # jq -n object template uses jq variables, not shell expansion
+  dep_runner_jq_n "dep-updater batch child report emit draft" \
+    --argjson exit_code "$exit_code" \
+    --arg dir "$dir" \
+    --arg primary "$primary" \
+    --argjson details "${details_json}" \
+    --argjson ci_failure "${ci_failure_json}" \
+    --argjson command_failures "${command_failures_json}" \
+    --arg capture_stderr "$capture_stderr" \
+    --arg capture_stdout "$capture_stdout" \
+    '{exit_code: $exit_code, dir: $dir, primary: $primary, details: $details, ci_failure: $ci_failure, command_failures: $command_failures, capture_stderr: $capture_stderr, capture_stdout: $capture_stdout}' \
+    >"$tmp_report" 2>/dev/null || true
+
+  if [[ -s "$tmp_report" ]]; then
+    resolved_primary="$(dep_updater_actionable_primary_from_report "$tmp_report" "$exit_code")"
+    if [[ -n "$resolved_primary" ]]; then
+      primary="$resolved_primary"
+    fi
+  fi
+  rm -f "$tmp_report"
 
   # shellcheck disable=SC2016  # jq -n object template uses jq variables, not shell expansion
   if ! dep_runner_jq_n "dep-updater batch child report emit" \
@@ -1909,9 +1942,6 @@ dep_runner_gh() {
   [[ -n "$label" ]] || return 2
   [[ "${1:-}" == '--' ]] || return 2
   shift
-  shift
-  local exit_code
-
   exit_code=0
   if (( probe )); then
     runner_exec "$label" --probe -- gh "$@" || exit_code=$?
@@ -7261,6 +7291,29 @@ batch_all_scrape_actionable_from_log() {
     return 0
   fi
 
+  line="$(grep -E '^\[FAIL\] ' "$log_file" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$line" ]]; then
+    stripped="${line#\[FAIL\] }"
+    printf '%s' "$stripped"
+    return 0
+  fi
+
+  line="$(grep -E '^  --- stderr ---$' "$log_file" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$line" ]]; then
+    line="$(awk '
+        /^  --- stderr ---$/ { show=1; buf=""; next }
+        show && /^  --- end stderr ---$/ { last=buf; show=0; next }
+        show { buf = buf $0 "\n" }
+        END { if (show) last=buf; printf "%s", last }
+      ' "$log_file" 2>/dev/null \
+      | awk '/[^[:space:]]/ { print; exit }' \
+      | sed 's/^  //' || true)"
+    if [[ -n "$line" ]]; then
+      printf '%s' "$line"
+      return 0
+    fi
+  fi
+
   return 1
 }
 
@@ -7397,12 +7450,21 @@ batch_all_dispatch() {
       if [[ -s "$child_report" ]] \
         && dep_runner_jq_file_args "dep-updater batch-all child report validate" "$child_report" -e \
           'has("primary") and has("details") and has("exit_code")' >/dev/null 2>&1; then
-        root_cause="$(dep_runner_jq_file_args "dep-updater batch-all child report primary" "$child_report" -r '.primary // empty' 2>/dev/null || true)"
+        root_cause="$(dep_updater_actionable_primary_from_report "$child_report" "$child_exit")"
         while IFS= read -r report_line; do
           [[ -z "$report_line" ]] && continue
           failure_details+=("$(basename "$repo"): ${report_line}")
           detail_count=$((detail_count + 1))
         done < <(dep_runner_jq_file_args "dep-updater batch-all child report details" "$child_report" -r '.details[]? // empty' 2>/dev/null || true)
+        while IFS= read -r report_line; do
+          [[ -z "$report_line" ]] && continue
+          failure_details+=("$(basename "$repo"): ${report_line}")
+          detail_count=$((detail_count + 1))
+          log "[batch-all] Command failure ($(basename "$repo")): ${report_line}"
+        done < <(dep_runner_jq_file_args "dep-updater batch-all child command failures" "$child_report" -r \
+          '.command_failures[]? | select(. != null)
+            | if (.stderr_hint // "") != "" then "\(.label) (exit \(.exit_code)) — \(.stderr_hint)"
+              else "\(.label) (exit \(.exit_code))" end' 2>/dev/null || true)
       fi
       # Keep batch-all output actionable: strip ANSI noise; use log tail only if
       # no structured report (e.g. older child or crash before write).
@@ -7410,7 +7472,7 @@ batch_all_dispatch() {
       sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' "$child_log" >"$child_clean" 2>/dev/null || cp "$child_log" "$child_clean"
 
       if [[ -z "$root_cause" ]] \
-        || [[ "$root_cause" =~ ^dep-updater\ exited\ with\ code ]]; then
+        || dep_updater_primary_is_generic "$root_cause" "$child_exit"; then
         scraped=""
         scraped="$(batch_all_scrape_actionable_from_log "$child_clean" 2>/dev/null || true)"
         if [[ -n "$scraped" ]]; then
