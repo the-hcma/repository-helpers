@@ -136,6 +136,10 @@ runner_exec() {
     cat "${run_dir}/${_runner_artifact_stdout}"
   fi
 
+  if (( exit_code != 0 )) && ! (( probe )); then
+    runner_report_command_failure "$label" "$exit_code" "$uuid"
+  fi
+
   return "$exit_code"
 }
 
@@ -456,6 +460,84 @@ record_first_failure() {
   fi
 }
 
+# runner_report_command_failure <label> <exit_code> [uuid]
+# Records first-failure text and prints a structured [FAIL] block to stderr.
+runner_report_command_failure() {
+  local -r label="$1"
+  local -r exit_code="$2"
+  local failed_uuid="${3:-}"
+  local stderr_first_line
+
+  if [[ -z "$failed_uuid" ]]; then
+    failed_uuid="$(runner_last_id)"
+  fi
+  if [[ -n "$failed_uuid" ]]; then
+    stderr_first_line="$(runner_read "$failed_uuid" "$_runner_artifact_stderr" 2>/dev/null \
+      | grep -m1 '.' || true)"
+    if [[ -n "$stderr_first_line" ]]; then
+      record_first_failure "${label}: ${stderr_first_line}"
+    else
+      record_first_failure "${label} (exit ${exit_code})"
+    fi
+    runner_format_failure "$failed_uuid" >&2
+  else
+    record_first_failure "${label} (exit ${exit_code})"
+    printf '[FAIL] %s\n' "$label" >&2
+    printf '  exit code: %d\n' "$exit_code" >&2
+  fi
+}
+
+# runner_primary_is_generic_exit <primary> <tool_name> <exit_code>
+# True when primary is only a generic "<tool> exited with code N" placeholder.
+runner_primary_is_generic_exit() {
+  local -r primary="$1"
+  local -r tool_name="$2"
+  local -r exit_code="$3"
+
+  [[ -n "$tool_name" && "$primary" == "${tool_name} exited with code ${exit_code}" ]]
+}
+
+# runner_actionable_primary_from_report <report_file> <exit_code> [tool_name]
+# Prefer structured runner failures over generic exit-code placeholders.
+runner_actionable_primary_from_report() {
+  local -r report_file="$1"
+  local -r exit_code="$2"
+  local -r tool_name="${3:-}"
+  local primary derived line
+
+  if [[ ! -s "$report_file" ]] || ! command -v jq >/dev/null 2>&1; then
+    return 0
+  fi
+
+  primary="$(jq -r '.primary // empty' "$report_file" 2>/dev/null || true)"
+  if [[ -n "$primary" ]] \
+    && ! runner_primary_is_generic_exit "$primary" "$tool_name" "$exit_code"; then
+    printf '%s' "$primary"
+    return 0
+  fi
+
+  derived="$(jq -r '.command_failures[-1]? | select(. != null)
+    | if (.stderr_hint // "") != "" then "\(.label): \(.stderr_hint)"
+      else "\(.label) (exit \(.exit_code))" end' "$report_file" 2>/dev/null || true)"
+  if [[ -n "$derived" && "$derived" != "null" ]]; then
+    printf '%s' "$derived"
+    return 0
+  fi
+
+  line="$(jq -r '.capture_stderr // empty' "$report_file" 2>/dev/null \
+    | awk '/[^[:space:]]/ { print; exit }' || true)"
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  if [[ -n "$primary" ]]; then
+    printf '%s' "$primary"
+  fi
+}
+
 run_command() {
   local -r label="$1"
   shift
@@ -463,25 +545,6 @@ run_command() {
   local exit_code
   exit_code=0
   runner_exec "$label" --stream-stdout -- "$@" || exit_code=$?
-
-  if [[ "$exit_code" -ne 0 ]]; then
-    local failed_uuid stderr_first_line
-    failed_uuid="$(runner_last_id)"
-    if [[ -n "$failed_uuid" ]]; then
-      stderr_first_line="$(runner_read "$failed_uuid" "$_runner_artifact_stderr" 2>/dev/null \
-        | grep -m1 '.' || true)"
-      if [[ -n "$stderr_first_line" ]]; then
-        record_first_failure "${label}: ${stderr_first_line}"
-      else
-        record_first_failure "${label} (exit ${exit_code})"
-      fi
-      runner_format_failure "$failed_uuid" >&2
-    else
-      record_first_failure "${label} (exit ${exit_code})"
-      printf '[FAIL] %s\n' "$label" >&2
-      printf '  exit code: %d\n' "$exit_code" >&2
-    fi
-  fi
 
   return "$exit_code"
 }
