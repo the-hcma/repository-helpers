@@ -394,6 +394,17 @@ rp_log_fail() {
   printf 'FAIL: %s\n' "$*" >&2
 }
 
+# Indented detail under a failure (compact email/report and verbose stderr).
+rp_log_fail_detail() {
+  local line="$1"
+
+  if rp_should_record_failure && [[ "$rp_compact" -eq 1 && -n "$rp_current_slug" ]]; then
+    rp_compact_append_entry "$rp_current_slug" "    ${line}"
+    return 0
+  fi
+  printf '     %s\n' "$line" >&2
+}
+
 rp_check_line_prefix() {
   local slug="$1"
   if [[ "$rp_single_repo" -eq 1 ]]; then
@@ -1512,6 +1523,88 @@ rp_ci_secret_scan_script_is_canonical() {
   norm_text="$(rp_ci_secret_scan_normalize_for_compare "$text")"
   norm_canonical="$(rp_ci_secret_scan_normalize_for_compare "$canonical")"
   [[ "$norm_text" == "$norm_canonical" ]]
+}
+
+rp_ci_secret_scan_unified_diff() {
+  local label_left="$1"
+  local text_left="$2"
+  local label_right="$3"
+  local text_right="$4"
+  local max_lines="${5:-48}"
+  local tmp_left tmp_right diff_out diff_lines diff_exit
+
+  tmp_left="$(mktemp)"
+  tmp_right="$(mktemp)"
+  diff_out="$(mktemp)"
+  printf '%s' "$text_left" >"$tmp_left"
+  printf '%s' "$text_right" >"$tmp_right"
+  diff_exit=0
+  runner_exec "repo-practices secret-scan diff" \
+    -- diff -u --label "$label_left" --label "$label_right" "$tmp_left" "$tmp_right" \
+    >"$diff_out" 2>/dev/null || diff_exit=$?
+  if [[ -s "$diff_out" ]]; then
+    diff_lines="$(wc -l <"$diff_out")"
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      rp_log_fail_detail "$line"
+    done < <(head -n "$max_lines" "$diff_out")
+    if (( diff_lines > max_lines )); then
+      rp_log_fail_detail "... (diff truncated at ${max_lines} lines)"
+    fi
+  elif (( diff_exit != 0 )) && [[ "$text_left" != "$text_right" ]]; then
+    rp_log_fail_detail "(installed and canonical content differ)"
+  fi
+  rm -f "$tmp_left" "$tmp_right" "$diff_out"
+}
+
+# Log specific secret-scan drift reasons with unified diffs. Returns 1 when drift exists.
+rp_ci_secret_scan_install_report_drift() {
+  local slug="$1"
+  local secret_scan_script="$2"
+  local ci_text="$3"
+  local canonical_script canonical_job job drift=0
+
+  canonical_script="$(rp_candidate_secret_scan_script)"
+  canonical_job="$(rp_candidate_ci_secret_scan_job_yaml)"
+  job="$(rp_ci_workflow_extract_secret_scan_job "$ci_text")"
+
+  if [[ -z "$secret_scan_script" ]]; then
+    rp_log_fail "${slug}: secret-scan: missing .github/ci/secret-scan (copy from scripts/lib/ci-secret-scan)"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: sync .github/ci/secret-scan and ci.yml secret-scan job (scripts/github-repo-lint --apply-fix)"
+    fi
+    drift=1
+  elif ! rp_ci_secret_scan_script_is_canonical "$secret_scan_script"; then
+    rp_log_fail "${slug}: secret-scan: .github/ci/secret-scan drift from scripts/lib/ci-secret-scan"
+    rp_ci_secret_scan_unified_diff \
+      '.github/ci/secret-scan (installed)' "$secret_scan_script" \
+      'scripts/lib/ci-secret-scan (canonical)' "$canonical_script"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: sync .github/ci/secret-scan (scripts/github-repo-lint --apply-fix)"
+    fi
+    drift=1
+  fi
+
+  if ! rp_ci_workflow_secret_scan_job_is_canonical "$ci_text"; then
+    rp_log_fail \
+      "${slug}: secret-scan: ci.yml secret-scan job drift from scripts/lib/repo-practices-workflows/ci-secret-scan-job.snippet"
+    rp_ci_secret_scan_unified_diff \
+      'ci.yml secret-scan job (installed)' "$job" \
+      'ci-secret-scan-job.snippet (canonical)' "$canonical_job"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: sync ci.yml secret-scan job (scripts/github-repo-lint --apply-fix)"
+    fi
+    drift=1
+  fi
+
+  if rp_ci_workflow_has_brittle_gitleaks_install "$ci_text"; then
+    rp_log_fail "${slug}: secret-scan: ci.yml uses brittle inline gitleaks install (use bash .github/ci/secret-scan)"
+    drift=1
+  fi
+
+  if (( drift == 0 )); then
+    return 0
+  fi
+  return 1
 }
 
 rp_fix_ci_workflow_secret_scan_job() {
@@ -3168,14 +3261,7 @@ rp_validate_graphite_workflows() {
     if rp_ci_workflow_has_secret_scan_coverage "$ci_text"; then
       secret_scan_script=""
       secret_scan_script="$(rp_fetch_github_text_file "$slug" '.github/ci/secret-scan' || true)"
-      if [[ -z "$secret_scan_script" ]] \
-        || ! rp_ci_secret_scan_script_is_canonical "$secret_scan_script" \
-        || ! rp_ci_workflow_secret_scan_job_is_canonical "$ci_text" \
-        || rp_ci_workflow_has_brittle_gitleaks_install "$ci_text"; then
-        rp_log_fail "${slug}: secret-scan must use the canonical scripts/lib/ci-secret-scan install"
-        if [[ "$rp_suggest" -eq 1 ]]; then
-          rp_log_suggest "${slug}: sync .github/ci/secret-scan and ci.yml secret-scan job (scripts/github-repo-lint --apply-fix)"
-        fi
+      if ! rp_ci_secret_scan_install_report_drift "$slug" "$secret_scan_script" "$ci_text"; then
         if [[ "$rp_apply_fix" -eq 1 ]]; then
           rp_queue_ci_secret_scan_candidate_fixes "$slug" "$ci_text" 'sync'
         fi
