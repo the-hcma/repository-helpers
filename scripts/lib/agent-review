@@ -1673,3 +1673,109 @@ agent_review_quota_summary_for_email() {
   done < <(agent_review_cycle_quota_agent_ids)
   (IFS=$'\n'; printf '%s' "${parts[*]}")
 }
+
+# True when a PR issue comment from the active agent profile today reports quota exhaustion.
+agent_review_pr_has_quota_issue_comment_today() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r comments_json="$3"
+  local today created_at body
+
+  if [[ -z "${agent_review_profile_request_login_regex:-}" ]] \
+    || [[ -z "${comments_json}" ]]; then
+    return 1
+  fi
+  today="$(agent_review_copilot_quota_local_day)"
+  while IFS=$'\t' read -r created_at body; do
+    [[ -n "${created_at}" ]] || continue
+    if ! agent_review_quota_timestamp_on_local_day "${created_at}" "${today}"; then
+      continue
+    fi
+    if agent_review_profile_text_is_quota_exhausted "${body}"; then
+      return 0
+    fi
+  done < <(ar_runner_jq_file "agent-review quota issue comment scan" "${comments_json}" -rs \
+    --arg re "${agent_review_profile_request_login_regex}" '
+      [ .[] | .[] | select((.user.login // "") | test($re;"i")) ]
+      | .[]
+      | [.created_at, .body]
+      | @tsv')
+  return 1
+}
+
+# Fetch PR issue comments once for quota observation (REST paginate).
+agent_review_pr_issue_comments_json() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local owner name exit_code api_json
+
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  exit_code=0
+  api_json="$(ar_runner_gh_api_stream "agent-review pr issue comments" \
+    "repos/${owner}/${name}/issues/${pr}/comments" --paginate)" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "${api_json}" ]]; then
+    printf '[]\n'
+    return 0
+  fi
+  printf '%s' "${api_json}"
+}
+
+# Scan Copilot, Bugbot, and CodeRabbit quota signals on the current PR head and persist
+# exhaustion for the local calendar day (source=observed). Returns 0 when any agent was
+# newly marked exhausted.
+agent_review_observe_all_agent_quota_on_pr() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r snapshot="${4:-}"
+  local saved_agent agent profiles_dir profile_path reason review_body run_json comments_json
+  local observed=0
+
+  [[ -n "${repo}" && -n "${pr}" && -n "${head}" ]] || return 1
+  saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
+  profiles_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/agent-review-profiles" && pwd)"
+  comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
+  while IFS= read -r agent || [[ -n "${agent}" ]]; do
+    [[ -z "${agent}" ]] && continue
+    if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
+      continue
+    fi
+    profile_path="${profiles_dir}/${agent}"
+    if [[ ! -f "${profile_path}" ]]; then
+      continue
+    fi
+    agent_review_use_agent "${agent}"
+    if [[ "${agent_review_profile_uses_head_check:-false}" == 'true' ]]; then
+      run_json="$(agent_review_head_check_run_json_for_head "${repo}" "${head}")"
+      if [[ -n "${run_json}" && "${run_json}" != 'null' ]] \
+        && agent_review_profile_head_check_is_quota_exhausted "${run_json}"; then
+        reason="${agent} GitHub check on head ${head:0:7} reports quota or usage limit (PR #${pr})."
+        agent_review_quota_mark_exhausted_for_agent "${agent}" "${reason}"
+        observed=1
+        continue
+      fi
+    fi
+    if [[ -n "${snapshot}" ]] \
+      && agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
+      review_body="$(agent_review_latest_agent_review_body_on_head "${snapshot}" "${head}")"
+      if agent_review_profile_review_is_quota_exhausted "${review_body}"; then
+        reason="${agent} review on head ${head:0:7} reports quota exhaustion (PR #${pr})."
+        agent_review_quota_mark_exhausted_for_agent "${agent}" "${reason}"
+        observed=1
+        continue
+      fi
+    fi
+    if agent_review_pr_has_quota_issue_comment_today "${repo}" "${pr}" "${comments_json}"; then
+      reason="${agent} PR comment today reports quota or usage limit (PR #${pr})."
+      agent_review_quota_mark_exhausted_for_agent "${agent}" "${reason}"
+      observed=1
+    fi
+  done < <(agent_review_cycle_quota_agent_ids)
+  agent_review_use_agent "${saved_agent}"
+  if (( observed > 0 )); then
+    return 0
+  fi
+  return 1
+}

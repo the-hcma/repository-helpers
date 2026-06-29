@@ -114,7 +114,7 @@ EOF
 }
 
 cmd_status() {
-  local repo pr owner name snapshot
+  local repo pr owner name snapshot head
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   read -r owner name < <(agent_review_repo_parts "${repo}")
@@ -123,6 +123,8 @@ cmd_status() {
   agent_review_require_cmd jq
   snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
   agent_review_assert_snapshot_complete "${snapshot}"
+  head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
+  agent_review_observe_all_agent_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}" || true
   agent_review_status_json_from_snapshot "${snapshot}" "${repo}" "${pr}"
 }
 
@@ -237,6 +239,9 @@ cmd_loop_exit_notify() {
   if (( exit_code == 0 )); then
     return 0
   fi
+  if (( exit_code == 3 )); then
+    return 0
+  fi
   if (( agent_review_loop_notified == 1 )); then
     return 0
   fi
@@ -317,6 +322,7 @@ cmd_wait() {
     fi
     snapshot="$(agent_review_graphql_wait_snapshot "${owner}" "${name}" "${pr}")"
     head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
+    agent_review_observe_all_agent_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}" || true
     now_epoch="$(agent_review_last_activity_epoch_from_snapshot "${snapshot}")"
     if (( now_epoch > last_activity )); then
       last_activity="${now_epoch}"
@@ -348,20 +354,8 @@ cmd_wait() {
       if agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
         review_body="$(agent_review_latest_agent_review_body_on_head "${snapshot}" "${head}")"
         if agent_review_profile_review_is_quota_exhausted "${review_body}"; then
-          case "${AGENT_REVIEW_AGENT:-copilot}" in
-            copilot)
-              agent_review_copilot_quota_mark_exhausted \
-                "Copilot review on head ${head:0:7} reports quota exhaustion (PR #${pr})."
-              ;;
-            bugbot)
-              agent_review_bugbot_quota_mark_exhausted \
-                "Bugbot review on head ${head:0:7} reports usage limit reached (PR #${pr})."
-              ;;
-            coderabbit)
-              agent_review_coderabbit_quota_mark_exhausted \
-                "CodeRabbit review on head ${head:0:7} reports usage limit reached (PR #${pr})."
-              ;;
-          esac
+          agent_review_quota_mark_exhausted_for_agent "${AGENT_REVIEW_AGENT:-copilot}" \
+            "${AGENT_REVIEW_AGENT:-copilot} review on head ${head:0:7} reports quota exhaustion (PR #${pr})."
           printf '%s review on head %s reports quota exhaustion (PR #%s)\n' \
             "${AGENT_REVIEW_AGENT:-copilot}" "${head:0:7}" "${pr}" >&2
           return 7
@@ -374,8 +368,8 @@ cmd_wait() {
         check_state_json="$(agent_review_head_check_state_json "${repo}" "${head}")"
         quota_hit="$(wait_ar_jq_check_state "$check_state_json" '.quota')"
         if [[ "${quota_hit}" == 'true' ]]; then
-          agent_review_agent_quota_mark_exhausted \
-            "Bugbot check on head ${head:0:7} reports usage limit reached (PR #${pr})."
+          agent_review_quota_mark_exhausted_for_agent "${AGENT_REVIEW_AGENT:-copilot}" \
+            "${AGENT_REVIEW_AGENT:-copilot} check on head ${head:0:7} reports usage limit reached (PR #${pr})."
           printf '%s GitHub check reports usage limit for head %s (PR #%s)\n' \
             "${AGENT_REVIEW_AGENT:-copilot}" "${head:0:7}" "${pr}" >&2
           return 7
@@ -449,6 +443,8 @@ cmd_check() {
   agent_review_require_cmd jq
   snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
   agent_review_assert_snapshot_complete "${snapshot}"
+  head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
+  agent_review_observe_all_agent_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}" || true
   status="$(agent_review_status_json_from_snapshot "${snapshot}" "${repo}" "${pr}")"
   pr_merged="$(wait_ar_jq_status "$status" '.pr_merged')"
   if [[ "${pr_merged}" == 'true' ]]; then
@@ -482,7 +478,7 @@ cmd_check() {
     return 3
   fi
   if [[ "${agent_quota}" == 'true' ]] && [[ "${all_quotas_exhausted}" != 'true' ]]; then
-    agent_review_agent_quota_mark_exhausted \
+    agent_review_quota_mark_exhausted_for_agent "${AGENT_REVIEW_AGENT:-copilot}" \
       "${AGENT_REVIEW_AGENT:-copilot} review on the current PR head reports quota or usage limit exhaustion."
     printf '%s\n' "${status}"
     printf 'wait-for-agent-review: %s review quota or usage limit exhausted on current head\n' \
@@ -800,16 +796,13 @@ cmd_give_up() {
   return "${exit_code}"
 }
 
-cmd_loop_observe_quota_from_status() {
-  local -r status="$1"
-  local agent_quota head_check_quota
+cmd_loop_observe_quota_on_pr() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r snapshot="$4"
 
-  agent_quota="$(wait_ar_jq_status "$status" '.agent_quota_exhausted')"
-  head_check_quota="$(wait_ar_jq_status "$status" '.head_check_quota')"
-  if [[ "${agent_quota}" == 'true' ]] || [[ "${head_check_quota}" == 'true' ]]; then
-    agent_review_agent_quota_mark_exhausted \
-      "${AGENT_REVIEW_AGENT:-copilot} review or check on the current PR head reports quota or usage limit exhaustion."
-  fi
+  agent_review_observe_all_agent_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}" || true
 }
 
 # True when all feedback is addressed and we may start the idle-success timer.
@@ -858,6 +851,8 @@ cmd_loop_maybe_request_agents_on_head() {
     request_exit=0
     cmd_request "${repo}" "${pr}" || request_exit=$?
     if (( request_exit == 7 )); then
+      agent_review_quota_mark_exhausted_for_agent "${agent}" \
+        "${agent} review quota or usage limit exhausted while requesting a review."
       cmd_handle_quota_exhaustion "${repo}" "${pr}" \
         "${agent} review quota or usage limit exhausted while requesting a review." || true
     fi
@@ -978,6 +973,7 @@ cmd_loop() {
       last_activity="${activity_epoch}"
       idle_started=0
     fi
+    cmd_loop_observe_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}"
     if [[ "${head}" != "${last_head}" ]]; then
       cmd_loop_maybe_request_agents_on_head "${repo}" "${pr}" "${head}" "${last_head}"
       last_head="${head}"
@@ -1046,7 +1042,6 @@ cmd_loop() {
     esac
 
     status="$(cmd_status "${repo}" "${pr}")"
-    cmd_loop_observe_quota_from_status "${status}"
 
     if cmd_loop_ready_for_idle_wait "${status}"; then
       if (( idle_started == 0 )); then
