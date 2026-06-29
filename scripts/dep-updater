@@ -4583,14 +4583,22 @@ py_security_update() {
 py_constraint_op() {
   local -r pkg="$1"
   local -r pyproject="${2:-${dir}/pyproject.toml}"
-  local norm_hyp norm_und
+  local norm_hyp norm_und op
   norm_hyp="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
   norm_und="$(printf '%s' "$norm_hyp" | tr '-' '_')"
-  # Find the first line in pyproject.toml that mentions the package and
-  # extract the constraint operator that follows (>=, ==, ~=).
-  grep -iE "\"(${norm_hyp}|${norm_und})(\[[^]]*\])?\s*(>=|==|~=)" "$pyproject" 2>/dev/null \
+  # Only [project] dependency tables — not [tool.uv] constraint-dependencies.
+  op="$(awk '
+    BEGIN { in_direct = 0 }
+    /^\[[[:space:]]*(project|project\.[^]]*)[[:space:]]*\]/ { in_direct = 1; next }
+    /^\[/ { in_direct = 0; next }
+    !in_direct { next }
+    /constraint-dependencies/ { next }
+    { print }
+  ' "$pyproject" 2>/dev/null \
+    | grep -iE "\"(${norm_hyp}|${norm_und})(\[[^]]*\])?(>=|==|~=)" 2>/dev/null \
     | grep -oE '>=|==|~=' \
-    | head -1 || true
+    | head -1 || true)"
+  printf '%s' "$op"
 }
 
 # Invariant: dep-updater never introduces == pins; it only bumps >= floors.
@@ -4646,7 +4654,7 @@ py_outdated() {
   local -r tool="$1"
   local -r target_dir="${2:-$dir}"
   local raw_lines pyproject installed_json ge_dep ge_pkg ge_floor ge_installed ge_lower
-  local installed_new eligible dry_req_tmp dry_req_rc
+  local installed_new eligible
   installed_json=""
   installed_new=""
   case "$tool" in
@@ -4734,6 +4742,14 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
     fi
   fi
 
+  local -a candidate_lines=()
+  local -a direct_candidates=()
+  local -a transitive_candidates=()
+  local -a filtered_direct=()
+  local -a direct_passing=()
+  local -a direct_failing=()
+  local constraint_op pkg cur new line
+
   while IFS=' ' read -r pkg cur new; do
     [[ -z "$pkg" ]] && continue
     # Validate PEP 508 package name — drop any mangled strings from raw_lines.
@@ -4758,42 +4774,55 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
         new="$eligible"
       fi
     fi
-    # For uv projects, probe whether the upgrade is actually resolvable before
-    # reporting it.  'uv pip list --outdated' reports PyPI availability only and
-    # does not check transitive constraints from other installed packages (e.g.
-    # amqtt pins typer==0.15.4 which requires click<8.2, so click 8.3.2 would
-    # show up as "outdated" even though the upgrade is impossible).
-    # Strategy: write all currently-installed packages at their current pinned
-    # versions (substituting pkg -> new_ver) as a requirements list and pass it
-    # to 'uv pip install --dry-run'.  The resolver sees typer==0.15.4 and knows
-    # its Requires-Dist includes click<8.2, so it rejects click==8.3.2 with
-    # exit 1.  Editable installs are excluded (local packages not on PyPI).
-    # Skip the probe for >= floor bumps (new == already-installed version).
-    if [[ "$tool" == "uv" && -n "$installed_json" ]]; then
-      if [[ "$new" != "$installed_new" ]]; then
-        dry_req_tmp="$(mktemp)"
-        # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
-        dep_runner_jq_with_args "jq uv dry-run requirements" "$installed_json" -r --arg p "$pkg" --arg v "$new" \
-                '.[] | select(has("editable_project_location") | not)
-                     | if (.name | ascii_downcase) == ($p | ascii_downcase)
-                       then "\(.name)==" + $v
-                       else "\(.name)==\(.version)"
-                       end' >"$dry_req_tmp"
-        dry_req_rc=0
-        dep_runner_uv_dir --probe "uv pip install dry-run" "$target_dir" -- pip install --dry-run -r "$dry_req_tmp" \
-          >/dev/null 2>&1 || dry_req_rc=$?
-        rm -f "$dry_req_tmp"
-        if [[ "$dry_req_rc" -ne 0 ]]; then
-          log "[python/uv] Filtering ${pkg} ${new}: transitive constraint blocks this upgrade."
-          continue
-        fi
-      fi
-    fi
     if ! py_version_meets_minimum_release_age "$pkg" "$new"; then
       continue
     fi
-    printf '%s %s %s\n' "$pkg" "$cur" "$new"
+    candidate_lines+=("$pkg $cur $new")
   done <<< "$raw_lines"
+
+  if [[ "$tool" != "uv" ]]; then
+    for line in "${candidate_lines[@]}"; do
+      printf '%s\n' "$line"
+    done
+    return 0
+  fi
+
+  for line in "${candidate_lines[@]}"; do
+    read -r pkg _cur _new <<<"$line"
+    constraint_op="$(py_constraint_op "$pkg" "${target_dir}/pyproject.toml")"
+    if [[ "$constraint_op" == ">=" || "$constraint_op" == "==" || "$constraint_op" == "~=" ]]; then
+      direct_candidates+=("$line")
+    else
+      transitive_candidates+=("$line")
+    fi
+  done
+
+  for line in "${direct_candidates[@]}"; do
+    read -r pkg cur new <<<"$line"
+    if py_uv_probe_transitive_upgrade "$target_dir" "$installed_json" "$pkg" "$cur" "$new"; then
+      direct_passing+=("$line")
+    else
+      direct_failing+=("$line")
+    fi
+  done
+
+  for line in "${direct_passing[@]}"; do
+    printf '%s\n' "$line"
+  done
+
+  if [[ ${#direct_failing[@]} -gt 0 ]]; then
+    mapfile -t filtered_direct < <(py_uv_filter_outdated_lines "$target_dir" "${direct_failing[@]}")
+    for line in "${filtered_direct[@]}"; do
+      [[ -n "$line" ]] && printf '%s\n' "$line"
+    done
+  fi
+
+  for line in "${transitive_candidates[@]}"; do
+    read -r pkg cur new <<<"$line"
+    if py_uv_probe_transitive_upgrade "$target_dir" "$installed_json" "$pkg" "$cur" "$new"; then
+      printf '%s\n' "$line"
+    fi
+  done
 }
 
 # py_uv_rewrite_version_floor <pyproject_path> <pkg> <new_ver>
@@ -4813,6 +4842,216 @@ py_uv_rewrite_version_floor() {
     -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?)(~=|>=|==)([0-9][0-9a-zA-Z.]*)\\\"#\\1>=${sed_new_ver}\\\"#" \
     -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?\")[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*#\\1 >= ${sed_new_ver}#" \
     "$path" 2>/dev/null || return 1
+  return 0
+}
+
+# py_uv_parse_blame_direct_dep <logfile>
+# Prints a pyproject.toml direct dependency name blocking resolution (empty if unknown).
+py_uv_parse_blame_direct_dep() {
+  local -r log_file="$1"
+  local line blame
+
+  line="$(grep -E 'you require |your project depends on ' "$log_file" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$line" ]]; then
+    return 1
+  fi
+  blame="$(printf '%s' "$line" \
+    | sed -nE 's/.*(you require|your project depends on) ([A-Za-z0-9][A-Za-z0-9._-]*).*/\2/p' \
+    | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+  if [[ -z "$blame" ]]; then
+    return 1
+  fi
+  printf '%s' "$blame"
+  return 0
+}
+
+# py_uv_try_lockfile_with_updates <scan_root> <logfile> <line>...
+# Patches pyproject.toml floors for direct deps, runs uv lock, restores originals.
+# Returns 0 when the lockfile resolves.
+py_uv_try_lockfile_with_updates() {
+  local -r scan_root="$1"
+  local -r log_file="$2"
+  shift 2
+  local -a lines=("$@")
+  local pyproject lockfile bak_proj bak_lock line pkg _cur new_ver op rc
+
+  if [[ ${#lines[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  pyproject="${scan_root}/pyproject.toml"
+  lockfile="${scan_root}/uv.lock"
+  if [[ ! -f "$pyproject" ]]; then
+    return 1
+  fi
+
+  bak_proj="$(mktemp)"
+  cp "$pyproject" "$bak_proj"
+  bak_lock=""
+  if [[ -f "$lockfile" ]]; then
+    bak_lock="$(mktemp)"
+    cp "$lockfile" "$bak_lock"
+  fi
+
+  for line in "${lines[@]}"; do
+    [[ -z "$line" ]] && continue
+    read -r pkg _cur new_ver <<<"$line"
+    [[ -z "$pkg" || -z "$new_ver" ]] && continue
+    op="$(py_constraint_op "$pkg" "$pyproject")"
+    if [[ "$op" == ">=" || "$op" == "==" || "$op" == "~=" ]]; then
+      if ! py_uv_rewrite_version_floor "$pyproject" "$pkg" "$new_ver"; then
+        cp "$bak_proj" "$pyproject"
+        rm -f "$bak_proj" "$bak_lock"
+        return 1
+      fi
+    fi
+  done
+
+  set +e
+  dep_runner_uv_dir_capture "uv lock verify" "$scan_root" -- lock >"$log_file" 2>&1
+  rc=$?
+  set -e
+
+  cp "$bak_proj" "$pyproject"
+  rm -f "$bak_proj"
+  if [[ -n "$bak_lock" ]]; then
+    cp "$bak_lock" "$lockfile"
+    rm -f "$bak_lock"
+  else
+    rm -f "$lockfile"
+  fi
+
+  return "$rc"
+}
+
+# py_uv_filter_outdated_lines <scan_root> <line>...
+# Drops direct pyproject.toml updates that cannot resolve together (batch uv lock).
+py_uv_filter_outdated_lines() {
+  local -r scan_root="$1"
+  shift
+  local -a pending_outdated=("$@")
+  local -a next_outdated filtered_lines
+  local log_file blame_pkg line pkg _cur lat norm_blame norm_pkg
+  local found_blame_in_pending=0 found_conflict_in_pending=0
+
+  if [[ ${#pending_outdated[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ "${DEP_UPDATER_SKIP_PYPI_REGISTRY:-0}" == '1' ]]; then
+    printf '%s\n' "${pending_outdated[@]}"
+    return 0
+  fi
+
+  log_file="$(mktemp)"
+
+  while [[ ${#pending_outdated[@]} -gt 0 ]]; do
+    if py_uv_try_lockfile_with_updates "$scan_root" "$log_file" "${pending_outdated[@]}"; then
+      filtered_lines=("${pending_outdated[@]}")
+      rm -f "$log_file"
+      printf '%s\n' "${filtered_lines[@]}"
+      return 0
+    fi
+
+    if ! grep -qF 'No solution found when resolving dependencies' "$log_file"; then
+      log "[python/uv] WARNING: could not verify proposed updates against lockfile; skipping python direct updates for this scan."
+      rm -f "$log_file"
+      return 0
+    fi
+
+    blame_pkg="$(py_uv_parse_blame_direct_dep "$log_file" 2>/dev/null || true)"
+    if [[ -z "$blame_pkg" ]]; then
+      log "[python/uv] WARNING: lockfile verification failed (unparsed uv resolver error); skipping python direct updates."
+      rm -f "$log_file"
+      return 0
+    fi
+
+    next_outdated=()
+    found_blame_in_pending=0
+    for line in "${pending_outdated[@]}"; do
+      read -r pkg _cur lat <<<"$line"
+      norm_pkg="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+      norm_blame="$(printf '%s' "$blame_pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+      if [[ "$norm_pkg" == "$norm_blame" ]]; then
+        log "[python/uv] Filtering ${pkg} → ${lat}: lockfile resolution failed (coupled or incompatible upgrade)."
+        found_blame_in_pending=1
+        continue
+      fi
+      next_outdated+=("$line")
+    done
+
+    if [[ "$found_blame_in_pending" -eq 1 ]]; then
+      pending_outdated=("${next_outdated[@]}")
+      continue
+    fi
+
+    next_outdated=()
+    found_conflict_in_pending=0
+    for line in "${pending_outdated[@]}"; do
+      read -r pkg _cur lat <<<"$line"
+      if grep -qiF "${pkg}" "$log_file" && grep -qiF "${lat}" "$log_file"; then
+        log "[python/uv] Filtering ${pkg} → ${lat}: lockfile resolution failed (blocked by ${blame_pkg})."
+        found_conflict_in_pending=1
+        continue
+      fi
+      next_outdated+=("$line")
+    done
+
+    if [[ "$found_conflict_in_pending" -eq 1 ]]; then
+      pending_outdated=("${next_outdated[@]}")
+      continue
+    fi
+
+    read -r pkg _cur lat <<<"${pending_outdated[0]}"
+    log "[python/uv] Filtering ${pkg} → ${lat}: lockfile resolution failed (blocked by ${blame_pkg})."
+    pending_outdated=("${pending_outdated[@]:1}")
+
+    if [[ ${#pending_outdated[@]} -eq 0 ]]; then
+      rm -f "$log_file"
+      return 0
+    fi
+  done
+
+  rm -f "$log_file"
+  return 0
+}
+
+# py_uv_probe_transitive_upgrade <scan_root> <installed_json> <pkg> <cur> <new>
+# Per-package dry-run for outdated packages not declared in pyproject.toml.
+py_uv_probe_transitive_upgrade() {
+  local -r scan_root="$1"
+  local -r installed_json="$2"
+  local -r pkg="$3"
+  local -r cur="$4"
+  local -r new="$5"
+  local installed_new dry_req_tmp dry_req_rc
+
+  [[ -n "$installed_json" ]] || return 0
+
+  # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+  installed_new="$(dep_runner_jq_with_args "jq installed pkg version" "$installed_json" -r --arg n "$pkg" \
+        '.[] | select(.name | ascii_downcase == ($n | ascii_downcase)) | .version' \
+      2>/dev/null || true)"
+  if [[ "$new" == "$installed_new" ]]; then
+    return 0
+  fi
+
+  dry_req_tmp="$(mktemp)"
+  # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+  dep_runner_jq_with_args "jq uv dry-run requirements" "$installed_json" -r --arg p "$pkg" --arg v "$new" \
+          '.[] | select(has("editable_project_location") | not)
+               | if (.name | ascii_downcase) == ($p | ascii_downcase)
+                 then "\(.name)==" + $v
+                 else "\(.name)==\(.version)"
+                 end' >"$dry_req_tmp"
+  dry_req_rc=0
+  dep_runner_uv_dir --probe "uv pip install dry-run" "$scan_root" -- pip install --dry-run -r "$dry_req_tmp" \
+    >/dev/null 2>&1 || dry_req_rc=$?
+  rm -f "$dry_req_tmp"
+  if [[ "$dry_req_rc" -ne 0 ]]; then
+    log "[python/uv] Filtering ${pkg} ${new}: transitive constraint blocks this upgrade."
+    return 1
+  fi
   return 0
 }
 
@@ -5559,34 +5798,23 @@ batch_update_all() {
       any_py=1
     fi
     if [[ -n "$py_lines_arg" && "$security_only" == '0' ]]; then
+      local uv_floor_batch=0 uv_add_success=0
+      local -a uv_add_specs=()
       while IFS=' ' read -r pkg _old new_ver; do
         [[ -z "$pkg" ]] && continue
         log "[python/${py_tool}] Update: ${pkg} → ${new_ver}"
         case "$py_tool" in
           uv)
-            b_constraint_op="$(py_constraint_op "$pkg" "${dir}/pyproject.toml")"
+            b_constraint_op="$(py_constraint_op "$pkg" "${worktree_path}/pyproject.toml")"
             if [[ "$b_constraint_op" == ">=" || "$b_constraint_op" == "==" || "$b_constraint_op" == "~=" ]]; then
-              # Direct floor bump: match py_update_one (py_uv_rewrite_version_floor + uv lock).
               if ! py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$pkg" "$new_ver"; then
                 log "[python/uv] ERROR: batch sed failed for ${pkg} — skipping."
                 dep_updater_append_ecosystem_failure "python|batch sed failed for ${pkg}"
                 continue
               fi
-              py_out="$(dep_runner_uv_dir_capture "uv batch lock" "$worktree_path" -- lock)" && py_exit=0 || py_exit=$?
+              uv_floor_batch=1
             else
-              b_spec="${pkg}==${new_ver}"
-              py_out="$(dep_runner_uv_dir_capture "uv batch add" "$worktree_path" -- add "$b_spec")" && py_exit=0 || py_exit=$?
-            fi
-            if (( py_exit != 0 )); then
-              # Revert: sed patched pyproject.toml before the lock attempt for >=
-              # / == / ~= constraints. Restore the file so failed bumps don't accumulate
-              # and cause all subsequent packages to fail with phantom conflicts.
-              if [[ "$b_constraint_op" == ">=" || "$b_constraint_op" == "==" || "$b_constraint_op" == "~=" ]]; then
-                run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
-              fi
-              log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
-              log "$py_out"
-              continue
+              uv_add_specs+=("${pkg}==${new_ver}")
             fi
             ;;
           poetry)
@@ -5601,7 +5829,33 @@ batch_update_all() {
           pip|pip3) "$py_tool" install "${pkg}==${new_ver}" ;;
         esac
       done <<< "$py_lines_arg"
-      any_py=1
+      if [[ "$py_tool" == "uv" ]]; then
+        if [[ "$uv_floor_batch" == '1' ]]; then
+          py_out="$(dep_runner_uv_dir_capture "uv batch lock" "$worktree_path" -- lock)" && py_exit=0 || py_exit=$?
+          if (( py_exit != 0 )); then
+            run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml uv.lock 2>/dev/null || true
+            run_command "git worktree" git -C "$worktree_path" clean --force -- uv.lock 2>/dev/null || true
+            log "[python/uv] Skipping python batch floor bumps: dependency resolution failed."
+            log "$py_out"
+            dep_updater_append_ecosystem_failure "python|batch uv lock failed (exit ${py_exit})"
+            uv_floor_batch=0
+          fi
+        fi
+        for b_spec in "${uv_add_specs[@]}"; do
+          py_out="$(dep_runner_uv_dir_capture "uv batch add" "$worktree_path" -- add "$b_spec")" && py_exit=0 || py_exit=$?
+          if (( py_exit != 0 )); then
+            log "[python/uv] Skipping ${b_spec}: dependency resolution failed."
+            log "$py_out"
+            continue
+          fi
+          uv_add_success=1
+        done
+        if [[ "$uv_floor_batch" == '1' || "$uv_add_success" == '1' ]]; then
+          any_py=1
+        fi
+      else
+        any_py=1
+      fi
     fi
     if [[ "$any_py" == '1' ]]; then
       case "$py_tool" in
