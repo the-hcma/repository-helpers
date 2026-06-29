@@ -8,6 +8,7 @@ agent_review_default_poll_interval_s=15
 agent_review_default_cycle_timeout_s=1800
 agent_review_default_pr_timeout_s=43200
 agent_review_default_idle_break_s=900
+agent_review_default_human_activity_timeout_s=600
 
 _ar_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly _ar_lib_dir
@@ -269,6 +270,13 @@ agent_review_load_env() {
       agent_review_die "invalid AGENT_REVIEW_IDLE_BREAK_TIMEOUT: ${AGENT_REVIEW_IDLE_BREAK_TIMEOUT@Q}"
     fi
     agent_review_default_idle_break_s="${parsed_idle}"
+  fi
+  if [[ -n "${AGENT_REVIEW_HUMAN_ACTIVITY_TIMEOUT:-}" ]]; then
+    local parsed_human
+    if ! parsed_human="$(agent_review_parse_duration_seconds "${AGENT_REVIEW_HUMAN_ACTIVITY_TIMEOUT}")"; then
+      agent_review_die "invalid AGENT_REVIEW_HUMAN_ACTIVITY_TIMEOUT: ${AGENT_REVIEW_HUMAN_ACTIVITY_TIMEOUT@Q}"
+    fi
+    agent_review_default_human_activity_timeout_s="${parsed_human}"
   fi
 }
 
@@ -1252,6 +1260,50 @@ agent_review_last_activity_epoch_from_snapshot() {
     | max // 0'
 }
 
+agent_review_last_human_activity_epoch_from_snapshot() {
+  local -r snapshot="$1"
+  local bots
+
+  bots="$(agent_review_bot_login_regex)"
+  ar_runner_jq_file "agent-review last human activity epoch" "${snapshot}" --arg bots "${bots}" -r '
+    def is_bot_login($login):
+      ($bots | split("|")) as $patterns
+      | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
+    def human_review_ts:
+      [.data.repository.pullRequest.reviews.nodes[]?
+        | select(.author.__typename == "User")
+        | select(is_bot_login(.author.login) | not)
+        | .submittedAt // empty];
+    def human_comment_ts:
+      [.data.repository.pullRequest.reviewThreads.nodes[]?.comments.nodes[]?
+        | select(.author.__typename == "User")
+        | select(is_bot_login(.author.login) | not)
+        | .createdAt // empty];
+    def human_issue_comment_ts:
+      [.data.repository.pullRequest.comments.nodes[]?
+        | select(.author.__typename == "User")
+        | select(is_bot_login(.author.login) | not)
+        | .createdAt // empty];
+    (human_review_ts + human_comment_ts + human_issue_comment_ts)
+    | map(select(. != ""))
+    | map(fromdateiso8601?)
+    | max // 0'
+}
+
+agent_review_recent_human_activity_within_s() {
+  local -r snapshot="$1"
+  local -r threshold_s="$2"
+  local now_epoch last_human idle_s
+
+  now_epoch="$(date +%s)"
+  last_human="$(agent_review_last_human_activity_epoch_from_snapshot "${snapshot}")"
+  if (( last_human <= 0 )); then
+    return 1
+  fi
+  idle_s=$(( now_epoch - last_human ))
+  (( idle_s <= threshold_s ))
+}
+
 agent_review_status_json_from_snapshot() {
   local -r snapshot="$1"
   local -r repo="$2"
@@ -1610,4 +1662,60 @@ agent_review_activate_first_requestable_agent() {
     return 0
   done < <(agent_review_requestable_agent_candidates "${current}")
   return 1
+}
+
+# True for Copilot/Bugbot — reviews that may not appear as pending GitHub reviewers.
+agent_review_agent_is_primary_automation() {
+  local -r agent="${1:-${AGENT_REVIEW_AGENT:-copilot}}"
+
+  [[ "${agent}" == 'copilot' || "${agent}" == 'bugbot' ]]
+}
+
+agent_review_primary_automation_agents_exhausted() {
+  agent_review_agent_quota_exhausted_for_agent 'copilot' \
+    && agent_review_agent_quota_exhausted_for_agent 'bugbot'
+}
+
+# Switch to CodeRabbit (or next non-exhausted agent) for collaborative review monitoring.
+agent_review_enter_collaborative_mode() {
+  local saved_agent
+
+  saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
+  if agent_review_activate_first_requestable_agent >/dev/null; then
+    return 0
+  fi
+  if [[ "${saved_agent}" != 'coderabbit' ]] \
+    && ! agent_review_agent_quota_exhausted_for_agent 'coderabbit' \
+    && [[ -f "$(cd "$(dirname "${BASH_SOURCE[0]}")/agent-review-profiles" && pwd)/coderabbit" ]]; then
+    agent_review_use_agent 'coderabbit'
+    return 0
+  fi
+  return 1
+}
+
+# Exit 0 when a named PR check (e.g. CodeRabbit) is pending or in progress.
+agent_review_named_pr_check_is_pending() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r check_name="$3"
+  local rollup latest conclusion
+
+  agent_review_load_ci_rollup_lib
+  rollup="$(ci_rollup_json_for_pr "${pr}" "${repo}")"
+  rollup="$(ci_rollup_normalize_json "${rollup}")"
+  latest="$(ci_rollup_latest_by_name_json "${rollup}")"
+  if [[ "$(ar_runner_jq_file "agent-review named check exists" "${latest}" --arg name "${check_name}" -r \
+    '[.[]? | select((.name // .context // "") == $name)] | length')" == '0' ]]; then
+    return 1
+  fi
+  conclusion="$(ar_runner_jq_file "agent-review named check conclusion" "${latest}" --arg name "${check_name}" -r \
+    '[.[]? | select((.name // .context // "") == $name)] | .[0].conclusion // ""')"
+  case "${conclusion}" in
+    '' | IN_PROGRESS | QUEUED | PENDING)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
