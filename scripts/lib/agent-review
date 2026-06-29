@@ -5,7 +5,7 @@
 
 agent_review_default_wait_timeout_s=300
 agent_review_default_poll_interval_s=15
-agent_review_default_cycle_timeout_s=1800
+agent_review_default_cycle_timeout_s=900
 agent_review_default_pr_timeout_s=43200
 agent_review_default_idle_break_s=900
 
@@ -1610,4 +1610,66 @@ agent_review_activate_first_requestable_agent() {
     return 0
   done < <(agent_review_requestable_agent_candidates "${current}")
   return 1
+}
+
+# Exit 0 when a named PR check (e.g. CodeRabbit) is pending or in progress.
+agent_review_named_pr_check_is_pending() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r check_name="$3"
+  local rollup latest conclusion
+
+  agent_review_load_ci_rollup_lib
+  rollup="$(ci_rollup_json_for_pr "${pr}" "${repo}")"
+  rollup="$(ci_rollup_normalize_json "${rollup}")"
+  latest="$(ci_rollup_latest_by_name_json "${rollup}")"
+  if [[ "$(ar_runner_jq_file "agent-review named check exists" "${latest}" --arg name "${check_name}" -r \
+    '[.[]? | select((.name // .context // "") == $name)] | length')" == '0' ]]; then
+    return 1
+  fi
+  conclusion="$(ar_runner_jq_file "agent-review named check conclusion" "${latest}" --arg name "${check_name}" -r \
+    '[.[]? | select((.name // .context // "") == $name)] | .[0].conclusion // ""')"
+  case "${conclusion}" in
+    '' | IN_PROGRESS | QUEUED | PENDING)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# True when we should not wait on this agent (daily quota established exhausted).
+agent_review_agent_wait_is_skipped() {
+  agent_review_agent_quota_exhausted_for_agent "${1:-${AGENT_REVIEW_AGENT:-copilot}}"
+}
+
+# JSON array of agent ids whose daily quota is not exhausted.
+agent_review_agents_with_quota_json() {
+  local agents_json='[]' agent
+
+  while IFS= read -r agent || [[ -n "${agent}" ]]; do
+    [[ -z "${agent}" ]] && continue
+    if ! agent_review_agent_quota_exhausted_for_agent "${agent}"; then
+      agents_json="$(ar_runner_jq_n "agent-review agents with quota" \
+        --argjson arr "${agents_json}" --arg a "${agent}" '$arr + [$a]')"
+    fi
+  done < <(agent_review_cycle_quota_agent_ids)
+  printf '%s' "${agents_json}"
+}
+
+# Human-readable quota summary for operator emails (copilot/bugbot/coderabbit).
+agent_review_quota_summary_for_email() {
+  local agent status parts=()
+
+  while IFS= read -r agent || [[ -n "${agent}" ]]; do
+    [[ -z "${agent}" ]] && continue
+    if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
+      status='exhausted (not waiting)'
+    else
+      status='available'
+    fi
+    parts+=("${agent}: ${status}")
+  done < <(agent_review_cycle_quota_agent_ids)
+  (IFS=$'\n'; printf '%s' "${parts[*]}")
 }
