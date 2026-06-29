@@ -1346,27 +1346,44 @@ else
   fail=$(( fail + 1 ))
 fi
 
-# py_outdated must probe resolvability with 'uv pip install --dry-run' so that
-# packages blocked by transitive constraints (e.g. amqtt pinning click<8.2) are
-# filtered from the report before being shown as available updates.
-if grep -q 'uv pip install --dry-run' "$script"; then
-  printf '[PASS] py_outdated: probes resolvability with uv pip install --dry-run\n'
+# py_outdated must probe transitive-only upgrades with per-package dry-run
+# (e.g. amqtt pinning click<8.2). Direct pyproject.toml bumps use batch uv lock.
+py_probe_fn="$(awk '/^py_uv_probe_transitive_upgrade\(\)/,/^\}/' "$script")"
+if grep -q '^py_uv_probe_transitive_upgrade()' "$script" \
+  && printf '%s' "$py_probe_fn" | grep -q 'pip install --dry-run'; then
+  printf '[PASS] py_outdated: transitive probe uses uv pip install --dry-run\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] py_outdated: uv pip install --dry-run probe missing\n'
+  printf '[FAIL] py_outdated: py_uv_probe_transitive_upgrade with dry-run missing\n'
   fail=$(( fail + 1 ))
 fi
 
-# The probe must pass all installed packages as pinned requirements (not just
-# --constraint), so that the resolver sees transitive Requires-Dist from other
-# packages and fails when they conflict with the candidate upgrade.
 # shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars
-if grep -q -- '-r /dev/stdin' "$script" \
-  || grep -qF 'pip install --dry-run -r "$dry_req_tmp"' "$script"; then
-  printf '[PASS] py_outdated: probe uses -r /dev/stdin (requirements, not constraints)\n'
+if printf '%s' "$py_probe_fn" | grep -qF 'pip install --dry-run -r "$dry_req_tmp"'; then
+  printf '[PASS] py_outdated: transitive probe uses -r requirements file\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] py_outdated: probe must use -r /dev/stdin to catch Requires-Dist conflicts\n'
+  printf '[FAIL] py_outdated: transitive probe must use -r requirements file\n'
+  fail=$(( fail + 1 ))
+fi
+
+py_outdated_fn="$(awk '/^py_outdated\(\)/,/^\}/' "$script")"
+if printf '%s' "$py_outdated_fn" | grep -qF 'py_uv_filter_outdated_lines' \
+  && printf '%s' "$py_outdated_fn" | grep -qF 'direct_failing' \
+  && printf '%s' "$py_outdated_fn" | grep -qF 'py_uv_probe_transitive_upgrade'; then
+  printf '[PASS] py_outdated: failing direct deps use batch lock filter; transitives use probe\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py_outdated: must batch-filter direct_failing and probe transitives\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'constraint-dependencies' "$script" \
+  && awk '/^py_constraint_op\(\)/,/^\}/' "$script" | grep -qF 'in_direct'; then
+  printf '[PASS] py_constraint_op: scopes operator lookup to project dependencies\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py_constraint_op: must ignore tool.uv constraint-dependencies\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -1470,9 +1487,30 @@ else
   fi
 fi
 
-# ---------------------------------------------------------------------------
-# Static: >= floor revert on failure
-# ---------------------------------------------------------------------------
+printf '\n=== static: uv batch lockfile verification restores manifests ===\n'
+# shellcheck disable=SC2016  # intentional literal grep for cp "$bak_proj" in script
+if grep -q '^py_uv_try_lockfile_with_updates()' "$script" \
+  && grep -qF 'cp "$bak_proj" "$pyproject"' "$script" \
+  && grep -qF 'cp "$bak_lock" "$lockfile"' "$script" \
+  && grep -qF 'py_uv_filter_outdated_lines' "$script"; then
+  printf '[PASS] uv-lockfile-verify: dry-run lock restores pyproject.toml and uv.lock\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv-lockfile-verify: expected py_uv_try_lockfile_with_updates with restore\n'
+  fail=$(( fail + 1 ))
+fi
+
+batch_update_fn="$(awk '/^batch_update_all\(\)/,/^\}/' "$script")"
+batch_uv_lock_count=0
+batch_uv_lock_count="$(printf '%s' "$batch_update_fn" | grep -c 'dep_runner_uv_dir_capture "uv batch lock"' || true)"
+if (( batch_uv_lock_count == 1 )) \
+  && printf '%s' "$batch_update_fn" | grep -qF 'uv_floor_batch'; then
+  printf '[PASS] uv-batch-apply: single uv lock after all pyproject floor rewrites\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv-batch-apply: batch_update_all must run one uv lock for floor bumps\n'
+  fail=$(( fail + 1 ))
+fi
 
 printf '\n=== static: >= floor revert on failure ===\n'
 
