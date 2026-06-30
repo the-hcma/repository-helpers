@@ -305,7 +305,9 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 
 ### Agent review after submit
 
-After `scripts/dev/submit-stack` and green `scripts/dev/post-pr-submission-checks`, run the **agent review loop** documented in **`.cursor/rules/pr-ship-and-review.mdc`**:
+After every push, **`scripts/dev/post-pr-submission-checks --pr <n>`** must pass (CI green on the PR head). It waits for GitHub Actions and, on failure, prints **`==> CI failure details for coding agent`** with filtered job log excerpts so the agent can fix and re-push. `scripts/dev/submit-stack` invokes this by default; do not skip CI monitoring unless the user opts out (`--no-wait-ci`).
+
+When CI is green, run the **agent review loop** documented in **`.cursor/rules/pr-ship-and-review.mdc`**:
 
 1. `scripts/trigger-agent-review --pr <n>` — request review from the configured agent (default: Copilot)
 2. Iterate with `scripts/wait-for-agent-review` (`wait`, `check`, thread triage, `restack`) until `complete_ready`

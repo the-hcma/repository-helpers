@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+# agent-review-copilot-billing — Copilot AI credit quota from billing API or usage CSV.
+#
+# Org admins can query GET /orgs/{org}/settings/billing/ai_credit/usage?user=LOGIN
+# with normal gh auth. Enterprise premium_request filters and GitHub App tokens are
+# more restricted; a downloaded ai_credit/detailed CSV (see GitHub usage report exports)
+# is the most reliable per-user signal when API access is limited.
+#
+# Configure via agent-review.env:
+#   AGENT_REVIEW_COPILOT_BILLING_USER
+#   AGENT_REVIEW_COPILOT_BILLING_ORG
+#   AGENT_REVIEW_COPILOT_BILLING_CSV
+#   AGENT_REVIEW_COPILOT_AI_CREDITS_MONTHLY_INCLUDED  (fallback when CSV lacks quota column)
+
+if [[ "${_agent_review_copilot_billing_loaded:-}" == '1' ]]; then
+  return 0
+fi
+_agent_review_copilot_billing_loaded=1
+
+_ar_copilot_billing_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _ar_copilot_billing_lib_dir
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_ar_copilot_billing_lib_dir}/runner-ensure"
+
+agent_review_copilot_billing_unknown_high_quota=2147483647
+
+# _copilot_billing_jq_json <label> <json> [jq args…]
+_copilot_billing_jq_json() {
+  local -r label="$1"
+  local -r json="$2"
+  shift 2
+  local tmp exit_code out
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/copilot-billing-jq.XXXXXX")"
+  printf '%s' "${json}" >"${tmp}"
+  exit_code=0
+  out="$(runner_exec_stdout "copilot billing ${label}" -- jq "$@" "${tmp}")" || exit_code=$?
+  rm -f "${tmp}"
+  if (( exit_code != 0 )); then
+    return "${exit_code}"
+  fi
+  printf '%s' "${out}"
+}
+
+# agent_review_copilot_billing_expand_path <path>
+agent_review_copilot_billing_expand_path() {
+  local -r raw="${1:-}"
+
+  if [[ -z "${raw}" ]]; then
+    return 1
+  fi
+  printf '%s' "${raw//%h/${HOME}}"
+}
+
+# agent_review_copilot_billing_gh_api_json <label> <api-path>
+agent_review_copilot_billing_gh_api_json() {
+  local -r label="$1"
+  local -r api_path="$2"
+  local exit_code out
+
+  if declare -F ar_runner_gh_api_stream >/dev/null 2>&1; then
+    exit_code=0
+    ar_runner_gh_api_stream "${label}" "${api_path}" || exit_code=$?
+    if (( exit_code != 0 )); then
+      return "${exit_code}"
+    fi
+    out="$(ar_runner_last_stdout 2>/dev/null || true)"
+  else
+    exit_code=0
+    out="$(runner_exec_stdout "${label}" -- gh api "${api_path}")" || exit_code=$?
+    if (( exit_code != 0 )); then
+      return "${exit_code}"
+    fi
+  fi
+  if [[ -z "${out}" ]]; then
+    return 1
+  fi
+  printf '%s' "${out}"
+}
+
+agent_review_copilot_billing_resolve_user() {
+  local user exit_code
+
+  user="${AGENT_REVIEW_COPILOT_BILLING_USER:-}"
+  if [[ -n "${user}" ]]; then
+    printf '%s\n' "${user}"
+    return 0
+  fi
+  exit_code=0
+  user="$(agent_review_copilot_billing_gh_api_json "copilot billing gh user" user --jq '.login // empty')" \
+    || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "${user}" ]]; then
+    return 1
+  fi
+  printf '%s\n' "${user}"
+}
+
+agent_review_copilot_billing_resolve_org() {
+  local org repo owner
+
+  org="${AGENT_REVIEW_COPILOT_BILLING_ORG:-}"
+  if [[ -n "${org}" ]]; then
+    printf '%s\n' "${org}"
+    return 0
+  fi
+  repo="${AGENT_REVIEW_GITHUB_REPO:-}"
+  if [[ -n "${repo}" ]]; then
+    owner="${repo%%/*}"
+    if [[ -n "${owner}" && "${owner}" != "${repo}" ]]; then
+      printf '%s\n' "${owner}"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+agent_review_copilot_billing_csv_path() {
+  local path expanded default_path
+
+  path="${AGENT_REVIEW_COPILOT_BILLING_CSV:-}"
+  if [[ -n "${path}" ]]; then
+    expanded="$(agent_review_copilot_billing_expand_path "${path}")"
+    printf '%s\n' "${expanded}"
+    return 0
+  fi
+  default_path="${HOME}/scratch/repository-helpers/copilot-ai-credit-usage.csv"
+  if [[ -f "${default_path}" ]]; then
+    printf '%s\n' "${default_path}"
+    return 0
+  fi
+  return 1
+}
+
+agent_review_copilot_billing_month_prefix() {
+  date +%Y-%m
+}
+
+agent_review_copilot_billing_monthly_included_limit() {
+  local -r limit="${AGENT_REVIEW_COPILOT_AI_CREDITS_MONTHLY_INCLUDED:-}"
+
+  [[ -n "${limit}" && "${limit}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${limit}"
+}
+
+# agent_review_copilot_billing_parse_csv <csv-file> <username> <month-yyyy-mm>
+# Sets agent_review_copilot_billing_csv_used and _csv_quota; returns 0 when parsed.
+agent_review_copilot_billing_parse_csv() {
+  local -r csv_file="$1"
+  local -r username="$2"
+  local -r month_prefix="$3"
+  local parsed exit_code
+
+  agent_review_copilot_billing_csv_used=''
+  agent_review_copilot_billing_csv_quota=''
+  [[ -f "${csv_file}" ]] || return 1
+
+  exit_code=0
+  # shellcheck disable=SC2016  # awk program uses $0 for current CSV row
+  parsed="$(runner_exec_stdout "copilot billing parse csv" -- awk -v user="${username}" \
+    -v month="${month_prefix}" \
+    -v unknown_high="${agent_review_copilot_billing_unknown_high_quota}" '
+    BEGIN {
+      FS = ","
+      used = 0
+      quota = 0
+      found = 0
+      date_col = 0
+      user_col = 0
+      qty_col = 0
+      quota_col = 0
+      unit_col = 0
+      sku_col = 0
+    }
+    NR == 1 {
+      for (i = 1; i <= NF; i++) {
+        col = $i
+        gsub(/^[ \t"]+|[ \t"]+$/, "", col)
+        if (col == "date") date_col = i
+        if (col == "username") user_col = i
+        if (col == "quantity") qty_col = i
+        if (col == "total_monthly_quota") quota_col = i
+        if (col == "unit_type") unit_col = i
+        if (col == "sku") sku_col = i
+        if (col == "aic_quantity" && qty_col == 0) qty_col = i
+      }
+      next
+    }
+    {
+      if (user_col == 0 || qty_col == 0) next
+      row_user = $user_col
+      gsub(/^[ \t"]+|[ \t"]+$/, "", row_user)
+      if (tolower(row_user) != tolower(user)) next
+      if (date_col > 0) {
+        row_date = $date_col
+        gsub(/^[ \t"]+|[ \t"]+$/, "", row_date)
+        if (substr(row_date, 1, length(month)) != month) next
+      }
+      is_ai = 0
+      if (unit_col > 0) {
+        row_unit = $unit_col
+        gsub(/^[ \t"]+|[ \t"]+$/, "", row_unit)
+        if (row_unit == "ai-credits") is_ai = 1
+      }
+      if (sku_col > 0 && is_ai == 0) {
+        row_sku = $sku_col
+        gsub(/^[ \t"]+|[ \t"]+$/, "", row_sku)
+        if (index(tolower(row_sku), "copilot") > 0) is_ai = 1
+      }
+      if (is_ai == 0) next
+      qty = $qty_col + 0
+      used += qty
+      if (quota_col > 0) {
+        row_quota = $quota_col + 0
+        if (row_quota > 0 && row_quota < unknown_high && row_quota > quota) {
+          quota = row_quota
+        }
+      }
+      found = 1
+    }
+    END {
+      if (!found) exit 2
+      printf "%s %s", used, quota
+    }' "${csv_file}")" || exit_code=$?
+
+  if (( exit_code != 0 )) || [[ -z "${parsed}" ]]; then
+    return 1
+  fi
+  agent_review_copilot_billing_csv_used="${parsed%% *}"
+  agent_review_copilot_billing_csv_quota="${parsed#* }"
+  return 0
+}
+
+# agent_review_copilot_billing_sum_json_usage <json> — prints "used quota" (quota 0 when unknown).
+agent_review_copilot_billing_sum_json_usage() {
+  local -r json="$1"
+  local tmp exit_code
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/copilot-billing-json.XXXXXX")"
+  printf '%s' "${json}" >"${tmp}"
+  exit_code=0
+  if declare -F ar_runner_jq_file >/dev/null 2>&1; then
+    ar_runner_jq_file "copilot billing sum json usage" "${json}" -r '
+      [ .usageItems[]?
+        | select((.unitType // .unit_type // "") == "ai-credits"
+          or ((.sku // "") | test("copilot"; "i"))
+          or ((.product // "") | test("copilot"; "i")))
+        | (.netQuantity // .grossQuantity // .quantity // 0)
+      ] | add // 0
+    ' || exit_code=$?
+  else
+    runner_exec_stdout "copilot billing sum json usage" -- jq -r '
+      [ .usageItems[]?
+        | select((.unitType // .unit_type // "") == "ai-credits"
+          or ((.sku // "") | test("copilot"; "i"))
+          or ((.product // "") | test("copilot"; "i")))
+        | (.netQuantity // .grossQuantity // .quantity // 0)
+      ] | add // 0
+    ' "${tmp}" || exit_code=$?
+  fi
+  rm -f "${tmp}"
+  if (( exit_code != 0 )); then
+    return 1
+  fi
+}
+
+agent_review_copilot_billing_fetch_org_ai_credit_json() {
+  local org user year month api_path json exit_code
+
+  org="$(agent_review_copilot_billing_resolve_org)" || return 1
+  user="$(agent_review_copilot_billing_resolve_user)" || return 1
+  year="$(date +%Y)"
+  month="$(date +%-m 2>/dev/null || date +%m | sed 's/^0//')"
+  api_path="orgs/${org}/settings/billing/ai_credit/usage?user=${user}&year=${year}&month=${month}"
+  exit_code=0
+  json="$(agent_review_copilot_billing_gh_api_json "copilot billing org ai credit" "${api_path}")" \
+    || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "${json}" ]]; then
+    return 1
+  fi
+  printf '%s' "${json}"
+}
+
+# agent_review_copilot_billing_eval_used_vs_limit <used> <limit>
+# Sets agent_review_copilot_billing_exhausted (0|1) and agent_review_copilot_billing_reason.
+# Returns 0 when a definitive quota decision was made, 1 when inconclusive.
+agent_review_copilot_billing_eval_used_vs_limit() {
+  local -r used="$1"
+  local -r limit="$2"
+  local -r source_tag="$3"
+  local -r subject="$4"
+
+  if [[ ! "${used}" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ ! "${limit}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    return 1
+  fi
+  if awk -v used="${used}" -v limit="${limit}" 'BEGIN { exit !(used + 0 >= limit + 0) }'; then
+    agent_review_copilot_billing_exhausted=1
+    agent_review_copilot_billing_reason="${subject} used ${used} of ${limit} AI credits (${source_tag})."
+    return 0
+  fi
+  agent_review_copilot_billing_exhausted=0
+  agent_review_copilot_billing_reason="${subject} used ${used} of ${limit} AI credits; quota remains (${source_tag})."
+  return 0
+}
+
+# agent_review_copilot_billing_probe_from_csv — returns 0 when cache-worthy decision made.
+agent_review_copilot_billing_probe_from_csv() {
+  local csv_path user month used quota limit
+
+  csv_path="$(agent_review_copilot_billing_csv_path || true)"
+  [[ -n "${csv_path}" ]] || return 1
+  user="$(agent_review_copilot_billing_resolve_user || true)"
+  [[ -n "${user}" ]] || return 1
+  month="$(agent_review_copilot_billing_month_prefix)"
+  if ! agent_review_copilot_billing_parse_csv "${csv_path}" "${user}" "${month}"; then
+    return 1
+  fi
+  used="${agent_review_copilot_billing_csv_used:-}"
+  quota="${agent_review_copilot_billing_csv_quota:-0}"
+  limit="${quota}"
+  if [[ -z "${limit}" || "${limit}" == '0' ]]; then
+    limit="$(agent_review_copilot_billing_monthly_included_limit || true)"
+  fi
+  [[ -n "${limit}" ]] || return 1
+  if agent_review_copilot_billing_eval_used_vs_limit "${used}" "${limit}" billing_csv \
+    "Copilot billing CSV for ${user} (${month})"; then
+    return 0
+  fi
+  return 1
+}
+
+# agent_review_copilot_billing_probe_from_org_api — returns 0 when cache-worthy decision made.
+agent_review_copilot_billing_probe_from_org_api() {
+  local json used limit used_raw subject user org
+
+  json="$(agent_review_copilot_billing_fetch_org_ai_credit_json || true)"
+  [[ -n "${json}" ]] || return 1
+  user="$(agent_review_copilot_billing_resolve_user || true)"
+  org="$(agent_review_copilot_billing_resolve_org || true)"
+  subject="Copilot billing API for ${user}@${org} ($(agent_review_copilot_billing_month_prefix))"
+
+  if declare -F ar_runner_jq_file >/dev/null 2>&1; then
+    used_raw="$(ar_runner_jq_file "copilot billing json used total" "${json}" -r '
+      [ .usageItems[]?
+        | select((.unitType // .unit_type // "") == "ai-credits"
+          or ((.sku // "") | test("copilot"; "i"))
+          or ((.product // "") | test("copilot"; "i")))
+        | (.netQuantity // .grossQuantity // .quantity // 0)
+      ] | add // 0
+    ' 2>/dev/null || printf '')"
+  else
+    used_raw="$(_copilot_billing_jq_json "copilot billing json used total" "${json}" -r '
+      [ .usageItems[]?
+        | select((.unitType // .unit_type // "") == "ai-credits"
+          or ((.sku // "") | test("copilot"; "i"))
+          or ((.product // "") | test("copilot"; "i")))
+        | (.netQuantity // .grossQuantity // .quantity // 0)
+      ] | add // 0
+    ' 2>/dev/null || printf '')"
+  fi
+  used="${used_raw:-0}"
+  limit="$(agent_review_copilot_billing_monthly_included_limit || true)"
+  [[ -n "${limit}" ]] || return 1
+  if agent_review_copilot_billing_eval_used_vs_limit "${used}" "${limit}" billing_api "${subject}"; then
+    return 0
+  fi
+  return 1
+}
+
+# agent_review_copilot_billing_probe — try CSV then org API; update daily copilot quota cache.
+# Returns 0 when billing probe updated the cache, 1 when inconclusive or unavailable.
+agent_review_copilot_billing_probe() {
+  local exhausted reason
+
+  agent_review_copilot_billing_exhausted=''
+  agent_review_copilot_billing_reason=''
+
+  if agent_review_copilot_billing_probe_from_csv; then
+    exhausted="${agent_review_copilot_billing_exhausted}"
+    reason="${agent_review_copilot_billing_reason}"
+    if [[ "${exhausted}" == '1' ]]; then
+      agent_review_copilot_quota_mark_exhausted "${reason}"
+    else
+      agent_review_copilot_quota_mark_confirmed "${reason}"
+    fi
+    return 0
+  fi
+
+  if agent_review_copilot_billing_probe_from_org_api; then
+    exhausted="${agent_review_copilot_billing_exhausted}"
+    reason="${agent_review_copilot_billing_reason}"
+    if [[ "${exhausted}" == '1' ]]; then
+      agent_review_copilot_quota_mark_exhausted "${reason}"
+    else
+      agent_review_copilot_quota_mark_confirmed "${reason}"
+    fi
+    return 0
+  fi
+
+  return 1
+}
