@@ -1465,6 +1465,11 @@ agent_review_status_json_from_snapshot() {
 
 agent_review_resolve_thread_id() {
   local -r thread_id="$1"
+  local force="${2:-0}"
+
+  if [[ "${force}" != '1' ]]; then
+    agent_review_assert_thread_has_human_reply "${thread_id}"
+  fi
 
   # shellcheck disable=SC2016  # GraphQL mutation uses single-quoted $variables
   ar_runner_gh_api_stream "agent-review resolve thread" graphql -f query='
@@ -1473,6 +1478,71 @@ mutation($id:ID!) {
     thread { isResolved }
   }
 }' -f id="${thread_id}" >/dev/null
+}
+
+agent_review_reply_thread_id() {
+  local -r thread_id="$1"
+  local -r body="$2"
+  local reply_json reply_url
+
+  if [[ -z "${body}" ]]; then
+    agent_review_die 'reply-thread requires non-empty --body'
+  fi
+
+  # shellcheck disable=SC2016  # GraphQL mutation uses single-quoted $variables
+  reply_json="$(ar_runner_gh_api_stream "agent-review reply thread" graphql -f query='
+mutation($threadId:ID!, $body:String!) {
+  addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId, body:$body}) {
+    comment { id url }
+  }
+}' -f threadId="${thread_id}" -f body="${body}")"
+  reply_url="$(ar_runner_jq_file "agent-review reply thread url" "${reply_json}" \
+    -r '.data.addPullRequestReviewThreadReply.comment.url // empty')"
+  if [[ -n "${reply_url}" ]]; then
+    printf 'Replied on thread %s (%s)\n' "${thread_id}" "${reply_url}" >&2
+  else
+    printf 'Replied on thread %s\n' "${thread_id}" >&2
+  fi
+}
+
+agent_review_authenticated_login() {
+  local login
+
+  login="$(ar_runner_gh_api_stream "agent-review authenticated login" user --jq '.login')"
+  if [[ -z "${login}" ]]; then
+    agent_review_die 'could not determine authenticated GitHub login (run gh auth login)'
+  fi
+  printf '%s' "${login}"
+}
+
+agent_review_thread_has_human_reply() {
+  local -r thread_id="$1"
+  local thread_json has_reply viewer_login
+
+  viewer_login="$(agent_review_authenticated_login)"
+  # shellcheck disable=SC2016  # GraphQL query uses single-quoted $variables
+  thread_json="$(ar_runner_gh_api_stream "agent-review thread human reply check" graphql -f query='
+query($id:ID!) {
+  node(id:$id) {
+    ... on PullRequestReviewThread {
+      comments(first:100) {
+        nodes { author { __typename login } }
+      }
+    }
+  }
+}' -f id="${thread_id}")"
+  has_reply="$(ar_runner_jq_file "agent-review thread has human reply" "${thread_json}" \
+    --arg login "${viewer_login}" \
+    -r '[.data.node.comments.nodes[1:][] | select(.author.__typename == "User" and .author.login == $login)] | length > 0')"
+  [[ "${has_reply}" == 'true' ]]
+}
+
+agent_review_assert_thread_has_human_reply() {
+  local -r thread_id="$1"
+
+  if ! agent_review_thread_has_human_reply "${thread_id}"; then
+    agent_review_die "thread ${thread_id} has no on-thread human reply — run reply-thread before resolve-thread"
+  fi
 }
 
 # shellcheck disable=SC1091  # quota helpers sourced at runtime from scripts/lib
