@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Tests for scripts/lib/agent-review-copilot-billing and quota integration.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+billing_lib="${script_dir}/../scripts/lib/agent-review-copilot-billing"
+quota_lib="${script_dir}/../scripts/lib/agent-review-quota"
+readonly billing_lib quota_lib
+
+printf '\n=== static: billing lib wiring ===\n'
+if grep -qF 'agent_review_copilot_billing_probe_from_csv' "$billing_lib" \
+  && grep -qF 'agent_review_copilot_billing_fetch_org_ai_credit_json' "$billing_lib" \
+  && grep -qF 'total_monthly_quota' "$billing_lib" \
+  && grep -qF 'agent_review_copilot_quota_ensure_billing_loaded' "$quota_lib"; then
+  printf '[PASS] copilot billing: csv parse, org ai_credit API, and quota refresh hook\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot billing: missing csv parse, org ai_credit API, or quota refresh hook\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: csv parse marks exhausted when over monthly quota ===\n'
+tmp="$(mktemp -d)"
+csv="${tmp}/usage.csv"
+cat >"${csv}" <<'CSV'
+date,username,product,sku,model,quantity,unit_type,applied_cost_per_quantity,gross_amount,discount_amount,net_amount,total_monthly_quota,organization,cost_center_name
+2026-06-15,thehcma,GitHub Copilot,copilot_ai_credits,GPT-5,250,ai-credits,0.01,2.50,0,2.50,300,the-hcma,
+2026-06-20,thehcma,GitHub Copilot,copilot_ai_credits,GPT-5,60,ai-credits,0.01,0.60,0,0.60,300,the-hcma,
+CSV
+
+if bash -c "
+  source '${billing_lib}'
+  agent_review_copilot_billing_parse_csv '${csv}' 'thehcma' '2026-06'
+  [[ \"\${agent_review_copilot_billing_csv_used}\" == '310' && \"\${agent_review_copilot_billing_csv_quota}\" == '300' ]]
+  agent_review_copilot_billing_eval_used_vs_limit 310 300 billing_csv 'fixture user'
+  [[ \"\${agent_review_copilot_billing_exhausted}\" == '1' ]]
+"; then
+  printf '[PASS] copilot billing: csv over total_monthly_quota is exhausted\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot billing: csv over total_monthly_quota should be exhausted\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: csv parse marks available when under monthly quota ===\n'
+cat >"${csv}" <<'CSV'
+date,username,product,sku,model,quantity,unit_type,applied_cost_per_quantity,gross_amount,discount_amount,net_amount,total_monthly_quota,organization,cost_center_name
+2026-06-15,thehcma,GitHub Copilot,copilot_ai_credits,GPT-5,50,ai-credits,0.01,0.50,0,0.50,300,the-hcma,
+CSV
+
+if bash -c "
+  source '${billing_lib}'
+  agent_review_copilot_billing_parse_csv '${csv}' 'thehcma' '2026-06'
+  agent_review_copilot_billing_eval_used_vs_limit 50 300 billing_csv 'fixture user'
+  [[ \"\${agent_review_copilot_billing_exhausted}\" == '0' ]]
+"; then
+  printf '[PASS] copilot billing: csv under total_monthly_quota is available\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot billing: csv under total_monthly_quota should be available\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: org ai_credit API with monthly included limit ===\n'
+mock_bin="${tmp}/bin"
+mkdir -p "${mock_bin}"
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'user --jq .login'* ]]; then
+  printf 'thehcma\n'
+  exit 0
+fi
+if [[ "$args" == *'billing/ai_credit/usage'* ]]; then
+  printf '%s\n' '{"usageItems":[{"product":"GitHub Copilot","sku":"copilot_ai_credits","unitType":"ai-credits","netQuantity":295}]}'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+if env PATH="${mock_bin}:${PATH}" \
+  AGENT_REVIEW_COPILOT_BILLING_ORG=the-hcma \
+  AGENT_REVIEW_COPILOT_BILLING_USER=thehcma \
+  AGENT_REVIEW_COPILOT_AI_CREDITS_MONTHLY_INCLUDED=300 \
+  bash -c "
+    source '${billing_lib}'
+    agent_review_copilot_billing_probe_from_org_api
+    [[ \"\${agent_review_copilot_billing_exhausted}\" == '0' ]]
+  "; then
+  printf '[PASS] copilot billing: org ai_credit API below included limit is available\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot billing: org ai_credit API below included limit should be available\n'
+  fail=$(( fail + 1 ))
+fi
+
+rm -rf "${tmp}"
+
+test_summary

@@ -374,3 +374,126 @@ ci_failure_summary_for_pr() {
   details="$(ci_failure_details_json_for_pr "$pr" "$repo" "$branch")"
   ci_failure_summary_from_details_json "$details"
 }
+
+# ci_rollup_discover_repo_slug — owner/name for the current gh repository context.
+ci_rollup_discover_repo_slug() {
+  local slug exit_code
+
+  exit_code=0
+  slug="$(runner_exec_stdout "ci-rollup discover repo slug" -- gh repo view --json nameWithOwner \
+    --jq '.nameWithOwner // empty')" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$slug" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$slug"
+}
+
+# ci_failed_workflow_run_id_for_pr <pr> [repo]
+# Newest failed Actions run for the PR head SHA (empty when none).
+ci_failed_workflow_run_id_for_pr() {
+  local -r pr="$1"
+  local -r repo="${2:-}"
+  local head_sha branch runs_json run_id exit_code
+
+  exit_code=0
+  if [[ -n "$repo" ]]; then
+    head_sha="$(runner_exec_stdout "ci-rollup pr head sha" -- gh pr view "$pr" --repo "$repo" \
+      --json headRefOid --jq '.headRefOid // empty')" || exit_code=$?
+    branch="$(runner_exec_stdout "ci-rollup pr head branch" -- gh pr view "$pr" --repo "$repo" \
+      --json headRefName --jq '.headRefName // empty')" || exit_code=$?
+    runs_json="$(runner_exec_stdout "ci-rollup list failed runs" -- gh run list --repo "$repo" \
+      --branch "$branch" --limit 15 --json databaseId,headSha,conclusion)" || exit_code=$?
+  else
+    head_sha="$(runner_exec_stdout "ci-rollup pr head sha" -- gh pr view "$pr" \
+      --json headRefOid --jq '.headRefOid // empty')" || exit_code=$?
+    branch="$(runner_exec_stdout "ci-rollup pr head branch" -- gh pr view "$pr" \
+      --json headRefName --jq '.headRefName // empty')" || exit_code=$?
+    runs_json="$(runner_exec_stdout "ci-rollup list failed runs" -- gh run list \
+      --branch "$branch" --limit 15 --json databaseId,headSha,conclusion)" || exit_code=$?
+  fi
+  if (( exit_code != 0 )) || [[ -z "$head_sha" || -z "$branch" || -z "$runs_json" ]]; then
+    return 1
+  fi
+  run_id="$(ci_rollup_jq_file "ci-rollup pick failed run" "$runs_json" -r --arg head "$head_sha" '
+    [ .[]?
+      | select(.headSha == $head and (.conclusion // "") == "failure")
+    ]
+    | .[0].databaseId // empty
+  ' 2>/dev/null || printf '')"
+  if [[ -z "$run_id" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$run_id"
+}
+
+# ci_agent_filter_failed_log_lines — stdin: gh run view --log-failed; stdout: agent-actionable lines.
+ci_agent_filter_failed_log_lines() {
+  grep -E \
+    '^\[FAIL\] [^:]+: |^--- results: .*[^0] failed|^ERROR:|unbound variable|##\[error\]Process completed|Process completed with exit code [1-9]' \
+    || true
+}
+
+# ci_agent_report_failed_logs_for_pr <pr> [repo]
+# Prints failed-check summary plus filtered job log excerpts for coding agents.
+ci_agent_report_failed_logs_for_pr() {
+  local -r pr="$1"
+  local repo="${2:-}"
+  local run_id run_url log_text filtered max_lines line_count exit_code
+
+  if [[ -z "$repo" ]]; then
+    repo="$(ci_rollup_discover_repo_slug || true)"
+  fi
+
+  max_lines="${POST_PR_CHECKS_LOG_LINES:-80}"
+  run_id=""
+  exit_code=0
+  run_id="$(ci_failed_workflow_run_id_for_pr "$pr" "$repo")" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$run_id" ]]; then
+    printf '==> CI failure details for coding agent: no failed Actions run found for PR #%s head (see check URLs above)\n' \
+      "$pr" >&2
+    return 0
+  fi
+
+  run_url=""
+  if [[ -n "$repo" ]]; then
+    run_url="$(runner_exec_stdout "ci-rollup failed run url" -- gh run view "$run_id" --repo "$repo" \
+      --json url --jq '.url // empty')" || run_url=""
+  else
+    run_url="$(runner_exec_stdout "ci-rollup failed run url" -- gh run view "$run_id" \
+      --json url --jq '.url // empty')" || run_url=""
+  fi
+
+  printf '==> CI failure details for coding agent (PR #%s, run %s%s%s):\n' \
+    "$pr" "$run_id" \
+    "$( [[ -n "$run_url" ]] && printf ', %s' "$run_url" || printf '' )" \
+    "$( [[ -n "$repo" ]] && printf ', repo=%s' "$repo" || printf '' )" >&2
+
+  log_text=""
+  exit_code=0
+  if [[ -n "$repo" ]]; then
+    log_text="$(runner_exec_stdout "ci-rollup failed run logs" -- gh run view "$run_id" --repo "$repo" \
+      --log-failed 2>/dev/null)" || exit_code=$?
+  else
+    log_text="$(runner_exec_stdout "ci-rollup failed run logs" -- gh run view "$run_id" \
+      --log-failed 2>/dev/null)" || exit_code=$?
+  fi
+  if (( exit_code != 0 )) || [[ -z "$log_text" ]]; then
+    printf '    (failed to fetch --log-failed; inspect the run URL manually)\n' >&2
+    return 0
+  fi
+
+  filtered="$(printf '%s\n' "$log_text" | ci_agent_filter_failed_log_lines | tail -n "$max_lines")"
+  if [[ -z "$filtered" ]]; then
+    printf '    (no filtered failure lines; run: gh run view %s --log-failed)\n' "$run_id" >&2
+    return 0
+  fi
+
+  line_count=0
+  while IFS= read -r line; do
+    printf '    %s\n' "$line" >&2
+    line_count=$(( line_count + 1 ))
+  done <<<"$filtered"
+  if (( line_count >= max_lines )); then
+    printf '    … (truncated to %s lines; set POST_PR_CHECKS_LOG_LINES to raise)\n' "$max_lines" >&2
+  fi
+}

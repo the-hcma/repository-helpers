@@ -160,5 +160,119 @@ assert_exit_nonzero "timeout" "$out" "$exit_code"
 assert_contains "timeout line" "$out" "ERROR: WAIT_TIMEOUT post-pr-submission-checks"
 rm -rf "$tmp"
 
+printf '\n=== static: CI failure agent report wiring ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'ci_agent_report_failed_logs_for_pr' "$script" \
+  && grep -qF 'CI failure details for coding agent' "$script" \
+  && grep -qF 'POST_PR_CHECKS_LOG_LINES' "$script"; then
+  printf '[PASS] post-pr-submission-checks: exposes filtered CI failure logs for agents\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] post-pr-submission-checks: missing CI failure agent report wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+ci_lib="${script_dir}/../scripts/lib/ci-check-rollup"
+if grep -qF 'ci_agent_filter_failed_log_lines' "$ci_lib" \
+  && grep -qF 'ci_failed_workflow_run_id_for_pr' "$ci_lib"; then
+  printf '[PASS] ci-check-rollup: failed-run discovery and log filter helpers\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] ci-check-rollup: missing agent CI failure report helpers\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: CI failure prints agent log report ===\n'
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin"
+
+cat >"${mock_bin}/git" <<'MOCK_GIT'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *'branch --show-current'* ]]; then
+  printf '%s\n' 'my-branch'
+  exit 0
+fi
+if [[ "$*" == *'rev-parse --abbrev-ref @{u}'* ]]; then
+  printf '%s\n' 'origin/my-branch'
+  exit 0
+fi
+printf 'unexpected git call: %s\n' "$*" >&2
+exit 1
+MOCK_GIT
+chmod +x "${mock_bin}/git"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'repo view'* && "$args" == *'nameWithOwner'* ]]; then
+  printf 'the-hcma/mock-repo\n'
+  exit 0
+fi
+if [[ "$args" == *'pr list'* ]]; then
+  printf '42\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json state'* ]]; then
+  printf 'OPEN\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json isDraft'* ]]; then
+  printf 'false\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json body'* ]]; then
+  printf '%s\n' $'## Summary\n- ok\n\n## Test plan\n- ok\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'headRefOid'* ]]; then
+  printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'headRefName'* ]]; then
+  printf 'my-branch\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'statusCheckRollup'* ]]; then
+  printf '%s\n' '[{"name":"shellcheck + tests","conclusion":"FAILURE","detailsUrl":"https://example.invalid/job/1"}]'
+  exit 0
+fi
+if [[ "$args" == *'run list'* ]]; then
+  printf '%s\n' '[{"databaseId":999,"headSha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","conclusion":"failure"}]'
+  exit 0
+fi
+if [[ "$args" == *'run view 999'* && "$args" == *'--json url'* ]]; then
+  printf 'https://example.invalid/run/999\n'
+  exit 0
+fi
+if [[ "$args" == *'run view 999'* && "$args" == *'--log-failed'* ]]; then
+  printf '%s\n' '[FAIL] mock profile: rejected fixture
+--- results: 1 passed, 1 failed ---'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(PATH="${mock_bin}:${PATH}" POST_PR_CHECKS_TIMEOUT=1s POST_PR_CHECKS_POLL_SECS=1 bash "$script" 2>&1)"
+exit_code=$?
+set -e
+
+assert_exit_nonzero "ci failure" "$out" "$exit_code"
+assert_contains "ci failure summary" "$out" "ERROR: CI failures for PR #42"
+assert_contains "ci failure agent report" "$out" "CI failure details for coding agent"
+assert_contains "ci failure log excerpt" "$out" "[FAIL] mock profile: rejected fixture"
+rm -rf "$tmp"
+
 test_summary
 
