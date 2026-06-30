@@ -311,7 +311,8 @@ When CI is green, run the **agent review loop** documented in **`.cursor/rules/p
 
 1. `scripts/trigger-agent-review --pr <n>` — request review from the configured agent (default: Copilot)
 2. Iterate with `scripts/wait-for-agent-review` (`wait`, `check`, thread triage, `restack`) until `complete_ready`
-3. `scripts/wait-for-agent-review complete --pr <n>` — **approve PR** (authenticated `gh` user) and email `AGENT_REVIEW_REPORT_TO` when Copilot reports **“generated no new comments”**
+3. On exit **3**, triage each thread: fix → **`reply-thread`** (on-thread human reply) → **`resolve-thread`** — never resolve without replying first
+4. `scripts/wait-for-agent-review complete --pr <n>` — **approve PR** (authenticated `gh` user) and email `AGENT_REVIEW_REPORT_TO` when Copilot reports **“generated no new comments”**
 
 Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`. Set `AGENT_REVIEW_AGENT=copilot` or another supported profile under `scripts/lib/agent-review-profiles/`.
 
