@@ -21,7 +21,6 @@
 # shellcheck disable=SC2016  # jq filter strings passed to ar_runner_jq_file helpers
 set -euo pipefail
 
-agent_review_loop_fallback_index=0
 agent_review_loop_notified=0
 agent_review_loop_stop_reason_code=''
 agent_review_loop_stop_reason_detail=''
@@ -78,8 +77,8 @@ Commands:
 
 Environment:
   AGENT_REVIEW_AGENT            Agent profile name (default: copilot)
-  AGENT_REVIEW_FALLBACK_AGENT   First quota fallback when chain unset (default: bugbot)
-  AGENT_REVIEW_QUOTA_FALLBACK_CHAIN  Comma-separated quota fallbacks (default: bugbot,coderabbit)
+  AGENT_REVIEW_FALLBACK_AGENT   Legacy; ignored when AGENT_REVIEW_QUOTA_FALLBACK_CHAIN is unset
+  AGENT_REVIEW_QUOTA_FALLBACK_CHAIN  Comma-separated quota escalation (default: coderabbit,copilot,bugbot)
   AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE  Daily Copilot quota cache (default: ~/scratch/repository-helpers/copilot-review-quota.env)
   AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE   Daily Bugbot usage cache (default: ~/scratch/repository-helpers/bugbot-review-quota.env)
   AGENT_REVIEW_GITHUB_REPO      Default repo (OWNER/NAME; else git remote origin)
@@ -270,7 +269,12 @@ cmd_request() {
   fi
   snapshot="$(agent_review_graphql_request_snapshot "${owner}" "${name}" "${pr}")"
   agent_review_assert_review_requests_complete "${snapshot}"
-  if agent_review_agent_requested_from_snapshot "${snapshot}"; then
+  if declare -F agent_review_profile_request_already_sent >/dev/null 2>&1; then
+    if agent_review_profile_request_already_sent "${repo}" "${pr}"; then
+      printf '%s review already requested on PR #%s\n' "${AGENT_REVIEW_AGENT:-copilot}" "${pr}" >&2
+      return 0
+    fi
+  elif agent_review_agent_requested_from_snapshot "${snapshot}"; then
     printf '%s review already requested on PR #%s\n' "${AGENT_REVIEW_AGENT:-copilot}" "${pr}" >&2
     return 0
   fi
@@ -350,20 +354,23 @@ cmd_wait() {
         "${AGENT_REVIEW_AGENT:-copilot}" "${pr}" >&2
       return 7
     fi
-    if agent_review_fresh_agent_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
-      if agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
-        review_body="$(agent_review_latest_agent_review_body_on_head "${snapshot}" "${head}")"
-        if agent_review_profile_review_is_quota_exhausted "${review_body}"; then
-          agent_review_quota_mark_exhausted_for_agent "${AGENT_REVIEW_AGENT:-copilot}" \
-            "${AGENT_REVIEW_AGENT:-copilot} review on head ${head:0:7} reports quota exhaustion (PR #${pr})."
-          printf '%s review on head %s reports quota exhaustion (PR #%s)\n' \
-            "${AGENT_REVIEW_AGENT:-copilot}" "${head:0:7}" "${pr}" >&2
-          return 7
-        fi
-        printf '%s review posted for head %s (PR #%s)\n' \
+    if agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
+      review_body="$(agent_review_latest_agent_review_body_on_head "${snapshot}" "${head}")"
+      if [[ -n "${review_body}" ]] \
+        && agent_review_profile_review_is_quota_exhausted "${review_body}"; then
+        agent_review_quota_mark_exhausted_for_agent "${AGENT_REVIEW_AGENT:-copilot}" \
+          "${AGENT_REVIEW_AGENT:-copilot} review on head ${head:0:7} reports quota exhaustion (PR #${pr})."
+        printf '%s review on head %s reports quota exhaustion (PR #%s)\n' \
           "${AGENT_REVIEW_AGENT:-copilot}" "${head:0:7}" "${pr}" >&2
-        return 0
+        return 7
       fi
+      agent_review_quota_mark_confirmed_for_agent "${AGENT_REVIEW_AGENT:-copilot}" \
+        "${AGENT_REVIEW_AGENT:-copilot} review on head ${head:0:7} confirms quota available (PR #${pr})."
+      printf '%s review posted for head %s (PR #%s)\n' \
+        "${AGENT_REVIEW_AGENT:-copilot}" "${head:0:7}" "${pr}" >&2
+      return 0
+    fi
+    if agent_review_fresh_agent_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
       if [[ "${agent_review_profile_uses_head_check:-false}" == 'true' ]]; then
         check_state_json="$(agent_review_head_check_state_json "${repo}" "${head}")"
         quota_hit="$(wait_ar_jq_check_state "$check_state_json" '.quota')"
@@ -375,6 +382,10 @@ cmd_wait() {
           return 7
         fi
         check_state="$(wait_ar_jq_check_state "$check_state_json" 'if .error then "error" elif .clean then "clean" elif .findings then "findings" else .conclusion end')"
+        if [[ "${quota_hit}" != 'true' ]] && [[ "${check_state}" != 'error' ]]; then
+          agent_review_quota_mark_confirmed_for_agent "${AGENT_REVIEW_AGENT:-copilot}" \
+            "${AGENT_REVIEW_AGENT:-copilot} check on head ${head:0:7} confirms quota available (PR #${pr})."
+        fi
         printf '%s GitHub check completed (%s) for head %s (PR #%s)\n' \
           "${AGENT_REVIEW_AGENT:-copilot}" "${check_state}" "${head:0:7}" "${pr}" >&2
         return 0
@@ -715,7 +726,7 @@ cmd_handle_quota_exhaustion() {
 }
 
 cmd_try_quota_fallback() {
-  local repo pr from_agent reason fallback_agent profile_path profiles_dir
+  local repo pr from_agent reason fallback_agent profile_path profiles_dir current_agent candidate
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
@@ -723,26 +734,29 @@ cmd_try_quota_fallback() {
   reason="${4:-Agent review quota exhausted.}"
 
   profiles_dir="$(cd "${script_dir}/lib/agent-review-profiles" && pwd)"
-  while true; do
-    if ! fallback_agent="$(agent_review_quota_fallback_agent_at "${agent_review_loop_fallback_index}")"; then
-      printf 'wait-for-agent-review: %s — continuing review monitoring (humans + agents with quota)\n' \
-        "${reason}" >&2
-      return 0
-    fi
-    agent_review_loop_fallback_index=$(( agent_review_loop_fallback_index + 1 ))
-    profile_path="${profiles_dir}/${fallback_agent}"
-    if [[ ! -f "${profile_path}" ]]; then
-      printf 'wait-for-agent-review: fallback profile %s missing — continuing review monitoring\n' \
-        "${fallback_agent}" >&2
-      return 0
-    fi
-    if agent_review_agent_quota_exhausted_for_agent "${fallback_agent}"; then
+  current_agent="${from_agent}"
+  fallback_agent=''
+  while candidate="$(agent_review_quota_escalation_next_agent "${current_agent}" 2>/dev/null)"; do
+    current_agent="${candidate}"
+    if agent_review_agent_quota_exhausted_for_agent "${candidate}"; then
       printf 'wait-for-agent-review: skipping fallback to %s — daily quota exhausted\n' \
-        "${fallback_agent}" >&2
+        "${candidate}" >&2
       continue
     fi
+    fallback_agent="${candidate}"
     break
   done
+  if [[ -z "${fallback_agent}" ]]; then
+    printf 'wait-for-agent-review: %s — continuing review monitoring (humans + agents with quota)\n' \
+      "${reason}" >&2
+    return 0
+  fi
+  profile_path="${profiles_dir}/${fallback_agent}"
+  if [[ ! -f "${profile_path}" ]]; then
+    printf 'wait-for-agent-review: fallback profile %s missing — continuing review monitoring\n' \
+      "${fallback_agent}" >&2
+    return 0
+  fi
   printf 'wait-for-agent-review: %s — falling back to %s\n' \
     "${reason}" "${fallback_agent}" >&2
   if ! agent_review_post_fallback_comment \
@@ -819,35 +833,49 @@ cmd_loop_ready_for_idle_wait() {
   [[ "${ci_ready}" == 'true' && "${merge_ready}" == 'true' ]]
 }
 
-# Request copilot/bugbot on a new head (skip quota-exhausted and auto-review agents).
+# Request one probe agent on a new head (coderabbit → copilot → bugbot). Manual agents
+# get a review request unless today's quota is already cached exhausted; auto-review
+# agents rely on the PR update. Escalates to the next agent when a request is blocked.
 cmd_loop_maybe_request_agents_on_head() {
   local repo pr head last_head agent profiles_dir profile_path request_exit saved_agent
+  local current_agent
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
   head="${3:-}"
   last_head="${4:-}"
-  if [[ -z "${head}" ]] || [[ "${head}" == "${last_head}" ]]; then
+  if [[ -z "${head}" ]]; then
+    return 0
+  fi
+  if [[ -n "${last_head}" && "${head}" == "${last_head}" ]]; then
     return 0
   fi
   profiles_dir="$(cd "${script_dir}/lib/agent-review-profiles" && pwd)"
   saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
-  while IFS= read -r agent || [[ -n "${agent}" ]]; do
-    [[ -z "${agent}" ]] && continue
-    if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
-      continue
+  current_agent=''
+  while true; do
+    if ! agent="$(agent_review_quota_probe_agent_for_today 2>/dev/null)"; then
+      printf 'wait-for-agent-review: all agent quotas exhausted for today — no review requests on PR #%s\n' \
+        "${pr}" >&2
+      break
     fi
+    if [[ "${agent}" == "${current_agent}" ]]; then
+      break
+    fi
+    current_agent="${agent}"
     profile_path="${profiles_dir}/${agent}"
     if [[ ! -f "${profile_path}" ]]; then
-      continue
+      break
     fi
     # shellcheck disable=SC1090  # agent profile contract loaded at runtime
     # shellcheck disable=SC1091
     source "${profile_path}"
-    if [[ "${agent_review_profile_auto_review:-false}" == 'true' ]]; then
-      continue
-    fi
     agent_review_use_agent "${agent}"
+    if [[ "${agent_review_profile_auto_review:-false}" == 'true' ]]; then
+      printf 'wait-for-agent-review: %s reviews run automatically — skipping manual request; will establish quota on PR #%s\n' \
+        "${agent}" "${pr}" >&2
+      break
+    fi
     request_exit=0
     cmd_request "${repo}" "${pr}" || request_exit=$?
     if (( request_exit == 7 )); then
@@ -855,9 +883,17 @@ cmd_loop_maybe_request_agents_on_head() {
         "${agent} review quota or usage limit exhausted while requesting a review."
       cmd_handle_quota_exhaustion "${repo}" "${pr}" \
         "${agent} review quota or usage limit exhausted while requesting a review." || true
+      continue
     fi
-  done < <(agent_review_cycle_quota_agent_ids)
-  agent_review_use_agent "${saved_agent}"
+    if (( request_exit != 0 )); then
+      agent_review_die 'failed to request agent review'
+    fi
+    agent_review_quota_mark_probe_requested_for_agent "${agent}" \
+      "${agent} review requested on PR #${pr} to probe quota."
+    agent_review_use_agent "${agent}"
+    return 0
+  done
+  agent_review_sync_active_probe_agent || agent_review_use_agent "${saved_agent}"
 }
 
 cmd_loop_give_up_non_convergence() {
@@ -890,6 +926,10 @@ cmd_complete_idle() {
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
   idle_s="${3:-0}"
   cycle_cap="${4:-0}"
+  if ! agent_review_daily_quota_probe_satisfied; then
+    printf 'wait-for-agent-review: idle wait elapsed but daily quota probe is unsatisfied — not completing\n' >&2
+    return 2
+  fi
   status="$(cmd_status "${repo}" "${pr}")"
   complete_ready="$(wait_ar_jq_status "$status" '.complete_ready')"
   if [[ "${complete_ready}" == 'true' ]]; then
@@ -907,11 +947,10 @@ cmd_complete_idle() {
 cmd_loop() {
   local repo pr pr_started idle_started last_activity last_head head now
   local pr_cap cycle_cap check_exit ci_exit pending_exit status activity_epoch
-  local owner name snapshot idle_s remaining
+  local owner name snapshot idle_s remaining complete_exit
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
-  agent_review_loop_fallback_index=0
   # shellcheck disable=SC2154  # agent_review_default_* timeout constants from sourced lib
   pr_cap="${agent_review_default_pr_timeout_s}"
   # shellcheck disable=SC2154  # agent_review_default_cycle_timeout_s from sourced lib
@@ -923,6 +962,7 @@ cmd_loop() {
   last_activity=0
   last_head=''
   agent_review_log_cycle_quota_preamble
+  agent_review_sync_active_probe_agent || true
   printf 'Agent review loop for PR #%s (idle-success cycle=%ss, PR cap=%ss)\n' \
     "${pr}" "${cycle_cap}" "${pr_cap}" >&2
 
@@ -934,8 +974,13 @@ cmd_loop() {
         && (( idle_started > 0 )) \
         && (( now - idle_started >= cycle_cap )); then
         idle_s=$(( now - idle_started ))
-        cmd_complete_idle "${repo}" "${pr}" "${idle_s}" "${cycle_cap}"
-        return $?
+        complete_exit=0
+        cmd_complete_idle "${repo}" "${pr}" "${idle_s}" "${cycle_cap}" || complete_exit=$?
+        if (( complete_exit == 2 )); then
+          cmd_loop_give_up_non_convergence "${repo}" "${pr}" "${pr_cap}"
+          return $?
+        fi
+        return "${complete_exit}"
       fi
       cmd_loop_give_up_non_convergence "${repo}" "${pr}" "${pr_cap}"
       return $?
@@ -974,7 +1019,12 @@ cmd_loop() {
       idle_started=0
     fi
     cmd_loop_observe_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}"
-    if [[ "${head}" != "${last_head}" ]]; then
+    agent_review_sync_active_probe_agent || true
+    if [[ -z "${last_head}" ]]; then
+      cmd_loop_maybe_request_agents_on_head "${repo}" "${pr}" "${head}" ""
+      last_head="${head}"
+      idle_started=0
+    elif [[ "${head}" != "${last_head}" ]]; then
       cmd_loop_maybe_request_agents_on_head "${repo}" "${pr}" "${head}" "${last_head}"
       last_head="${head}"
       idle_started=0
@@ -1050,8 +1100,15 @@ cmd_loop() {
           "${cycle_cap}" "${pr}" >&2
       elif (( now - idle_started >= cycle_cap )); then
         idle_s=$(( now - idle_started ))
-        cmd_complete_idle "${repo}" "${pr}" "${idle_s}" "${cycle_cap}"
-        return $?
+        complete_exit=0
+        cmd_complete_idle "${repo}" "${pr}" "${idle_s}" "${cycle_cap}" || complete_exit=$?
+        if (( complete_exit == 2 )); then
+          cmd_loop_maybe_request_agents_on_head "${repo}" "${pr}" "${head}" ""
+          idle_started=0
+          sleep "${agent_review_default_poll_interval_s}"
+          continue
+        fi
+        return "${complete_exit}"
       else
         remaining=$(( cycle_cap - (now - idle_started) ))
         printf 'wait-for-agent-review loop: idle wait on PR #%s (%ss remaining before success)…\n' \

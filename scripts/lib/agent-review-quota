@@ -2,8 +2,9 @@
 # agent-review-quota — daily agent review quota caches and programmatic probes.
 #
 # GitHub does not expose per-user Copilot or Bugbot quota APIs. We cache exhaustion
-# for the local calendar day under ~/scratch/repository-helpers and refresh once per
-# day by scanning recent agent signals on the viewer's open PRs.
+# and confirmed availability for the local calendar day under ~/scratch/repository-helpers.
+# Passive scans may record exhaustion from prior signals; availability is confirmed only
+# after a successful review or GitHub check on the PR under review (not from stale probes).
 # shellcheck disable=SC2016  # GraphQL and jq filter strings use single quotes
 
 agent_review_copilot_quota_state_file() {
@@ -32,6 +33,27 @@ agent_review_quota_quote_env_value() {
   printf '%q' "${value}"
 }
 
+# Read valid_date and exhausted from a scratch cache without sourcing (avoids clobbering callers).
+agent_review_quota_cache_read_fields() {
+  local -r state_file="$1"
+  local line
+
+  agent_review_quota_cache_valid_date=''
+  agent_review_quota_cache_exhausted=''
+  agent_review_quota_cache_confirmed=''
+  agent_review_quota_cache_probe_requested=''
+  [[ -f "${state_file}" ]] || return 1
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    case "${line}" in
+      valid_date=*) agent_review_quota_cache_valid_date="${line#valid_date=}" ;;
+      exhausted=*) agent_review_quota_cache_exhausted="${line#exhausted=}" ;;
+      confirmed=*) agent_review_quota_cache_confirmed="${line#confirmed=}" ;;
+      probe_requested=*) agent_review_quota_cache_probe_requested="${line#probe_requested=}" ;;
+    esac
+  done <"${state_file}"
+  [[ -n "${agent_review_quota_cache_valid_date}" ]]
+}
+
 agent_review_copilot_quota_ensure_state_dir() {
   local state_file state_dir
 
@@ -55,10 +77,28 @@ agent_review_copilot_quota_text_is_exhausted() {
     "source '${copilot_profile}'; agent_review_profile_text_is_quota_exhausted \"\${COPILOT_QUOTA_PROBE_TEXT}\""
 }
 
+agent_review_copilot_quota_issue_comment_is_exhausted() {
+  local -r login="${1:-}"
+  local -r body="${2:-}"
+  local profiles_dir copilot_profile
+
+  profiles_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/agent-review-profiles" && pwd)"
+  copilot_profile="${profiles_dir}/copilot"
+  if [[ ! -f "${copilot_profile}" ]]; then
+    agent_review_die 'copilot profile missing for quota detection'
+  fi
+  COPILOT_QUOTA_PROBE_LOGIN="${login}" COPILOT_QUOTA_PROBE_BODY="${body}" bash -c \
+    "source '${copilot_profile}';
+     agent_review_profile_issue_comment_is_quota_exhausted \
+       \"\${COPILOT_QUOTA_PROBE_LOGIN}\" \"\${COPILOT_QUOTA_PROBE_BODY}\""
+}
+
 agent_review_copilot_quota_read_cache() {
-  local state_file today valid_date exhausted source reason
+  local state_file today valid_date exhausted confirmed probe_requested source reason
 
   agent_review_copilot_quota_exhausted_today=0
+  agent_review_copilot_quota_confirmed_today=0
+  agent_review_copilot_quota_probe_requested_today=0
   agent_review_copilot_quota_cache_source=''
   agent_review_copilot_quota_cache_reason=''
   today="$(agent_review_copilot_quota_local_day)"
@@ -70,6 +110,8 @@ agent_review_copilot_quota_read_cache() {
   source "${state_file}"
   valid_date="${valid_date:-}"
   exhausted="${exhausted:-0}"
+  confirmed="${confirmed:-0}"
+  probe_requested="${probe_requested:-0}"
   source="${source:-cache}"
   reason="${reason:-}"
   if [[ "${valid_date}" != "${today}" ]]; then
@@ -82,6 +124,16 @@ agent_review_copilot_quota_read_cache() {
   else
     agent_review_copilot_quota_exhausted_today=0
   fi
+  if [[ "${confirmed}" == '1' ]]; then
+    agent_review_copilot_quota_confirmed_today=1
+  else
+    agent_review_copilot_quota_confirmed_today=0
+  fi
+  if [[ "${probe_requested}" == '1' ]]; then
+    agent_review_copilot_quota_probe_requested_today=1
+  else
+    agent_review_copilot_quota_probe_requested_today=0
+  fi
   return 0
 }
 
@@ -89,21 +141,57 @@ agent_review_copilot_quota_write_cache() {
   local -r exhausted_flag="$1"
   local -r source_tag="$2"
   local -r reason_text="${3:-}"
+  local confirmed_flag="${4:-}"
+  local probe_requested_flag="${5:-}"
   local state_file today checked_at reason_quoted
 
-  agent_review_copilot_quota_ensure_state_dir
+  if [[ -z "${confirmed_flag}" ]]; then
+    if [[ "${exhausted_flag}" == '1' ]]; then
+      confirmed_flag=0
+    elif [[ "${source_tag}" == 'confirmed' ]]; then
+      confirmed_flag=1
+    else
+      confirmed_flag=0
+    fi
+  fi
   state_file="$(agent_review_copilot_quota_state_file)"
   today="$(agent_review_copilot_quota_local_day)"
+  if [[ -z "${probe_requested_flag}" ]] \
+    && agent_review_quota_cache_read_fields "${state_file}" \
+    && [[ "${agent_review_quota_cache_valid_date}" == "${today}" ]]; then
+    probe_requested_flag="${agent_review_quota_cache_probe_requested:-0}"
+  fi
+  probe_requested_flag="${probe_requested_flag:-0}"
+  if [[ "${exhausted_flag}" == '0' && "${confirmed_flag}" != '1' ]] \
+    && agent_review_quota_cache_read_fields "${state_file}" \
+    && [[ "${agent_review_quota_cache_valid_date}" == "${today}" \
+      && "${agent_review_quota_cache_exhausted}" == '1' \
+      && "${agent_review_quota_cache_confirmed:-0}" != '1' ]]; then
+    return 0
+  fi
+  agent_review_copilot_quota_ensure_state_dir
   checked_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   reason_quoted="$(agent_review_quota_quote_env_value "${reason_text}")"
   cat >"${state_file}" <<EOF
 valid_date=${today}
 exhausted=${exhausted_flag}
+confirmed=${confirmed_flag}
+probe_requested=${probe_requested_flag}
 source=${source_tag}
 checked_at=${checked_at}
 reason=${reason_quoted}
 EOF
   agent_review_copilot_quota_exhausted_today="${exhausted_flag}"
+  if [[ "${confirmed_flag}" == '1' ]]; then
+    agent_review_copilot_quota_confirmed_today=1
+  else
+    agent_review_copilot_quota_confirmed_today=0
+  fi
+  if [[ "${probe_requested_flag}" == '1' ]]; then
+    agent_review_copilot_quota_probe_requested_today=1
+  else
+    agent_review_copilot_quota_probe_requested_today=0
+  fi
   # shellcheck disable=SC2034  # cache metadata read by wait-for-agent-review logging
   agent_review_copilot_quota_cache_source="${source_tag}"
   # shellcheck disable=SC2034  # cache metadata read by wait-for-agent-review logging
@@ -116,14 +204,26 @@ agent_review_copilot_quota_mark_exhausted() {
   agent_review_copilot_quota_write_cache 1 observed "${reason}"
 }
 
-agent_review_copilot_quota_mark_available() {
-  agent_review_copilot_quota_write_cache 0 probe 'Recent Copilot reviews show quota is available.'
+agent_review_copilot_quota_mark_confirmed() {
+  local -r reason="${1:-Copilot review today confirms quota is available.}"
+
+  agent_review_copilot_quota_write_cache 0 confirmed "${reason}" 1
 }
 
-# Probe open PRs for the authenticated viewer without requesting a new review.
-# Exit 0 when quota exhausted today, 1 when available/unknown (not exhausted).
+agent_review_copilot_quota_mark_probe_requested() {
+  local -r reason="${1:-Copilot review requested to probe quota.}"
+
+  agent_review_copilot_quota_read_cache || true
+  agent_review_copilot_quota_write_cache \
+    "${agent_review_copilot_quota_exhausted_today:-0}" \
+    probe_requested "${reason}" \
+    "${agent_review_copilot_quota_confirmed_today:-0}" 1
+}
+
+# Probe open PRs for Copilot reviews and issue comments without requesting a new review.
+# Exit 0 when quota exhausted today, 1 when not exhausted (may still be unconfirmed).
 agent_review_copilot_quota_probe_recent_reviews() {
-  local probe_json today repo pr at body reason found_today
+  local probe_json today repo pr at body login reason
 
   agent_review_require_cmd gh
   agent_review_require_cmd jq
@@ -135,6 +235,9 @@ query {
       nodes {
         number
         repository { nameWithOwner }
+        comments(last: 30) {
+          nodes { author { login } body createdAt }
+        }
         reviews(last: 8) {
           nodes { author { login } body submittedAt }
         }
@@ -142,13 +245,40 @@ query {
     }
   }
 }')"
-  found_today=0
+  while IFS=$'\t' read -r repo pr at body login; do
+    [[ -n "${at}" ]] || continue
+    if ! agent_review_quota_timestamp_on_local_day "${at}" "${today}"; then
+      continue
+    fi
+    if agent_review_copilot_quota_issue_comment_is_exhausted "${login}" "${body}"; then
+      reason="Copilot comment on ${repo}#${pr} at ${at} reports quota exhaustion."
+      agent_review_copilot_quota_write_cache 1 probe_recent_comments "${reason}"
+      return 0
+    fi
+  done < <(
+    ar_runner_jq_file "agent-review quota copilot comments tsv" "${probe_json}" -r '
+      [.data.viewer.pullRequests.nodes[]
+        | . as $pr
+        | .comments.nodes[]
+        | select((.body // "") | length > 0)
+        | {
+            repo: $pr.repository.nameWithOwner,
+            pr: ($pr.number | tostring),
+            body: .body,
+            at: .createdAt,
+            login: (.author.login // "")
+          }
+      ]
+      | sort_by(.at)
+      | .[]
+      | [.repo, .pr, .at, .body, .login]
+      | @tsv'
+  )
   while IFS=$'\t' read -r repo pr at body; do
     [[ -n "${at}" ]] || continue
     if ! agent_review_quota_timestamp_on_local_day "${at}" "${today}"; then
       continue
     fi
-    found_today=1
     if agent_review_copilot_quota_text_is_exhausted "${body}"; then
       reason="Copilot review on ${repo}#${pr} at ${at} reports quota exhaustion."
       agent_review_copilot_quota_write_cache 1 probe_recent_reviews "${reason}"
@@ -168,11 +298,6 @@ query {
       | [.repo, .pr, .at, .body]
       | @tsv'
   )
-  if [[ "${found_today}" == '1' ]]; then
-    agent_review_copilot_quota_mark_available
-    return 1
-  fi
-  agent_review_copilot_quota_write_cache 0 probe 'No Copilot reviews found for today on open PRs.'
   return 1
 }
 
@@ -257,9 +382,11 @@ agent_review_bugbot_quota_check_run_is_available() {
 }
 
 agent_review_bugbot_quota_read_cache() {
-  local state_file today valid_date exhausted source reason
+  local state_file today valid_date exhausted confirmed probe_requested source reason
 
   agent_review_bugbot_quota_exhausted_today=0
+  agent_review_bugbot_quota_confirmed_today=0
+  agent_review_bugbot_quota_probe_requested_today=0
   agent_review_bugbot_quota_cache_source=''
   agent_review_bugbot_quota_cache_reason=''
   today="$(agent_review_copilot_quota_local_day)"
@@ -271,6 +398,8 @@ agent_review_bugbot_quota_read_cache() {
   source "${state_file}"
   valid_date="${valid_date:-}"
   exhausted="${exhausted:-0}"
+  confirmed="${confirmed:-0}"
+  probe_requested="${probe_requested:-0}"
   source="${source:-cache}"
   reason="${reason:-}"
   if [[ "${valid_date}" != "${today}" ]]; then
@@ -283,6 +412,16 @@ agent_review_bugbot_quota_read_cache() {
   else
     agent_review_bugbot_quota_exhausted_today=0
   fi
+  if [[ "${confirmed}" == '1' ]]; then
+    agent_review_bugbot_quota_confirmed_today=1
+  else
+    agent_review_bugbot_quota_confirmed_today=0
+  fi
+  if [[ "${probe_requested}" == '1' ]]; then
+    agent_review_bugbot_quota_probe_requested_today=1
+  else
+    agent_review_bugbot_quota_probe_requested_today=0
+  fi
   return 0
 }
 
@@ -290,21 +429,57 @@ agent_review_bugbot_quota_write_cache() {
   local -r exhausted_flag="$1"
   local -r source_tag="$2"
   local -r reason_text="${3:-}"
+  local confirmed_flag="${4:-}"
+  local probe_requested_flag="${5:-}"
   local state_file today checked_at reason_quoted
 
-  agent_review_bugbot_quota_ensure_state_dir
+  if [[ -z "${confirmed_flag}" ]]; then
+    if [[ "${exhausted_flag}" == '1' ]]; then
+      confirmed_flag=0
+    elif [[ "${source_tag}" == 'confirmed' ]]; then
+      confirmed_flag=1
+    else
+      confirmed_flag=0
+    fi
+  fi
   state_file="$(agent_review_bugbot_quota_state_file)"
   today="$(agent_review_copilot_quota_local_day)"
+  if [[ -z "${probe_requested_flag}" ]] \
+    && agent_review_quota_cache_read_fields "${state_file}" \
+    && [[ "${agent_review_quota_cache_valid_date}" == "${today}" ]]; then
+    probe_requested_flag="${agent_review_quota_cache_probe_requested:-0}"
+  fi
+  probe_requested_flag="${probe_requested_flag:-0}"
+  if [[ "${exhausted_flag}" == '0' && "${confirmed_flag}" != '1' ]] \
+    && agent_review_quota_cache_read_fields "${state_file}" \
+    && [[ "${agent_review_quota_cache_valid_date}" == "${today}" \
+      && "${agent_review_quota_cache_exhausted}" == '1' \
+      && "${agent_review_quota_cache_confirmed:-0}" != '1' ]]; then
+    return 0
+  fi
+  agent_review_bugbot_quota_ensure_state_dir
   checked_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   reason_quoted="$(agent_review_quota_quote_env_value "${reason_text}")"
   cat >"${state_file}" <<EOF
 valid_date=${today}
 exhausted=${exhausted_flag}
+confirmed=${confirmed_flag}
+probe_requested=${probe_requested_flag}
 source=${source_tag}
 checked_at=${checked_at}
 reason=${reason_quoted}
 EOF
   agent_review_bugbot_quota_exhausted_today="${exhausted_flag}"
+  if [[ "${confirmed_flag}" == '1' ]]; then
+    agent_review_bugbot_quota_confirmed_today=1
+  else
+    agent_review_bugbot_quota_confirmed_today=0
+  fi
+  if [[ "${probe_requested_flag}" == '1' ]]; then
+    agent_review_bugbot_quota_probe_requested_today=1
+  else
+    agent_review_bugbot_quota_probe_requested_today=0
+  fi
   # shellcheck disable=SC2034  # cache metadata read by wait-for-agent-review logging
   agent_review_bugbot_quota_cache_source="${source_tag}"
   # shellcheck disable=SC2034  # cache metadata read by wait-for-agent-review logging
@@ -335,26 +510,37 @@ agent_review_bugbot_quota_clear_observed_cache() {
   if [[ "${valid_date}" == "${today}" && "${exhausted}" == '1' && "${source}" == 'observed' ]]; then
     rm -f "${state_file}"
     agent_review_bugbot_quota_exhausted_today=0
+    agent_review_bugbot_quota_confirmed_today=0
     agent_review_bugbot_quota_cache_source=''
     agent_review_bugbot_quota_cache_reason=''
   fi
 }
 
-agent_review_bugbot_quota_mark_available() {
-  agent_review_bugbot_quota_write_cache 0 probe 'Recent Bugbot checks show usage is available.'
+agent_review_bugbot_quota_mark_confirmed() {
+  local -r reason="${1:-Bugbot check today confirms usage is available.}"
+
+  agent_review_bugbot_quota_write_cache 0 confirmed "${reason}" 1
+}
+
+agent_review_bugbot_quota_mark_probe_requested() {
+  local -r reason="${1:-Bugbot review requested to probe quota.}"
+
+  agent_review_bugbot_quota_read_cache || true
+  agent_review_bugbot_quota_write_cache \
+    "${agent_review_bugbot_quota_exhausted_today:-0}" \
+    probe_requested "${reason}" \
+    "${agent_review_bugbot_quota_confirmed_today:-0}" 1
 }
 
 # Probe open PRs for Bugbot PR comments, reviews, and head checks without requesting a new review.
-# Exit 0 when usage limit exhausted today, 1 when available/unknown (not exhausted).
+# Exit 0 when usage limit exhausted today, 1 when not exhausted (may still be unconfirmed).
 agent_review_bugbot_quota_probe_recent_signals() {
-  local probe_json today repo pr at body head run_json reason lib_dir found_today found_available
+  local probe_json today repo pr at body head run_json reason lib_dir
 
   agent_review_require_cmd gh
   agent_review_require_cmd jq
   lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   today="$(agent_review_copilot_quota_local_day)"
-  found_today=0
-  found_available=0
   probe_json="$(ar_runner_gh_api_stream "agent-review quota bugbot probe graphql" graphql -f query='
 query {
   viewer {
@@ -378,13 +564,11 @@ query {
     if ! agent_review_quota_timestamp_on_local_day "${at}" "${today}"; then
       continue
     fi
-    found_today=1
     if agent_review_bugbot_quota_text_is_exhausted "${body}"; then
       reason="Bugbot comment on ${repo}#${pr} at ${at} reports usage limit reached."
       agent_review_bugbot_quota_write_cache 1 probe_recent_comments "${reason}"
       return 0
     fi
-    found_available=1
   done < <(
     ar_runner_jq_file "agent-review quota bugbot comments tsv" "${probe_json}" -r '
       [.data.viewer.pullRequests.nodes[]
@@ -432,29 +616,16 @@ query {
         "$(ar_runner_jq_file "agent-review quota bugbot completed_at" "${run_json}" -r '.completed_at // ""')" "${today}"; then
       continue
     fi
-    found_today=1
     if agent_review_bugbot_quota_check_run_is_exhausted "${run_json}"; then
       reason="Bugbot check on ${repo} head ${head:0:7} reports usage limit reached."
       agent_review_bugbot_quota_write_cache 1 probe_head_checks "${reason}"
       return 0
-    fi
-    if agent_review_bugbot_quota_check_run_is_available "${run_json}"; then
-      found_available=1
     fi
   done < <(
     ar_runner_jq_file "agent-review quota bugbot pr heads" "${probe_json}" -r '
       .data.viewer.pullRequests.nodes[]
       | "\(.repository.nameWithOwner)\t\(.headRefOid)"'
   )
-  if [[ "${found_available}" == '1' ]]; then
-    agent_review_bugbot_quota_mark_available
-    return 1
-  fi
-  if [[ "${found_today}" == '1' ]]; then
-    agent_review_bugbot_quota_mark_available
-    return 1
-  fi
-  agent_review_bugbot_quota_write_cache 0 probe 'No Bugbot signals found for today on open PRs.'
   return 1
 }
 
@@ -495,6 +666,32 @@ agent_review_quota_mark_exhausted_for_agent() {
     copilot) agent_review_copilot_quota_mark_exhausted "${reason}" ;;
     bugbot) agent_review_bugbot_quota_mark_exhausted "${reason}" ;;
     coderabbit) agent_review_coderabbit_quota_mark_exhausted "${reason}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Persist confirmed daily availability after a successful review or check on the PR under review.
+agent_review_quota_mark_confirmed_for_agent() {
+  local -r agent_id="$1"
+  local -r reason="${2:-Agent review today confirms quota is available.}"
+
+  case "${agent_id}" in
+    copilot) agent_review_copilot_quota_mark_confirmed "${reason}" ;;
+    bugbot) agent_review_bugbot_quota_mark_confirmed "${reason}" ;;
+    coderabbit) agent_review_coderabbit_quota_mark_confirmed "${reason}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Record that a manual review request was sent to probe quota for this agent today.
+agent_review_quota_mark_probe_requested_for_agent() {
+  local -r agent_id="$1"
+  local -r reason="${2:-Review requested to probe quota.}"
+
+  case "${agent_id}" in
+    copilot) agent_review_copilot_quota_mark_probe_requested "${reason}" ;;
+    bugbot) agent_review_bugbot_quota_mark_probe_requested "${reason}" ;;
+    coderabbit) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -542,10 +739,28 @@ agent_review_coderabbit_quota_text_is_exhausted() {
     "source '${coderabbit_profile}'; agent_review_profile_text_is_quota_exhausted \"\${CODERABBIT_QUOTA_PROBE_TEXT}\""
 }
 
+agent_review_coderabbit_quota_issue_comment_is_exhausted() {
+  local -r login="${1:-}"
+  local -r body="${2:-}"
+  local profiles_dir coderabbit_profile
+
+  profiles_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/agent-review-profiles" && pwd)"
+  coderabbit_profile="${profiles_dir}/coderabbit"
+  if [[ ! -f "${coderabbit_profile}" ]]; then
+    agent_review_die 'coderabbit profile missing for quota detection'
+  fi
+  CODERABBIT_QUOTA_PROBE_LOGIN="${login}" CODERABBIT_QUOTA_PROBE_BODY="${body}" bash -c \
+    "source '${coderabbit_profile}';
+     agent_review_profile_issue_comment_is_quota_exhausted \
+       \"\${CODERABBIT_QUOTA_PROBE_LOGIN}\" \"\${CODERABBIT_QUOTA_PROBE_BODY}\""
+}
+
 agent_review_coderabbit_quota_read_cache() {
-  local state_file today valid_date exhausted source reason
+  local state_file today valid_date exhausted confirmed probe_requested source reason
 
   agent_review_coderabbit_quota_exhausted_today=0
+  agent_review_coderabbit_quota_confirmed_today=0
+  agent_review_coderabbit_quota_probe_requested_today=0
   agent_review_coderabbit_quota_cache_source=''
   agent_review_coderabbit_quota_cache_reason=''
   today="$(agent_review_copilot_quota_local_day)"
@@ -557,6 +772,8 @@ agent_review_coderabbit_quota_read_cache() {
   source "${state_file}"
   valid_date="${valid_date:-}"
   exhausted="${exhausted:-0}"
+  confirmed="${confirmed:-0}"
+  probe_requested="${probe_requested:-0}"
   source="${source:-cache}"
   reason="${reason:-}"
   if [[ "${valid_date}" != "${today}" ]]; then
@@ -569,6 +786,16 @@ agent_review_coderabbit_quota_read_cache() {
   else
     agent_review_coderabbit_quota_exhausted_today=0
   fi
+  if [[ "${confirmed}" == '1' ]]; then
+    agent_review_coderabbit_quota_confirmed_today=1
+  else
+    agent_review_coderabbit_quota_confirmed_today=0
+  fi
+  if [[ "${probe_requested}" == '1' ]]; then
+    agent_review_coderabbit_quota_probe_requested_today=1
+  else
+    agent_review_coderabbit_quota_probe_requested_today=0
+  fi
   return 0
 }
 
@@ -576,21 +803,57 @@ agent_review_coderabbit_quota_write_cache() {
   local -r exhausted_flag="$1"
   local -r source_tag="$2"
   local -r reason_text="${3:-}"
+  local confirmed_flag="${4:-}"
+  local probe_requested_flag="${5:-}"
   local state_file today checked_at reason_quoted
 
-  agent_review_coderabbit_quota_ensure_state_dir
+  if [[ -z "${confirmed_flag}" ]]; then
+    if [[ "${exhausted_flag}" == '1' ]]; then
+      confirmed_flag=0
+    elif [[ "${source_tag}" == 'confirmed' ]]; then
+      confirmed_flag=1
+    else
+      confirmed_flag=0
+    fi
+  fi
   state_file="$(agent_review_coderabbit_quota_state_file)"
   today="$(agent_review_copilot_quota_local_day)"
+  if [[ -z "${probe_requested_flag}" ]] \
+    && agent_review_quota_cache_read_fields "${state_file}" \
+    && [[ "${agent_review_quota_cache_valid_date}" == "${today}" ]]; then
+    probe_requested_flag="${agent_review_quota_cache_probe_requested:-0}"
+  fi
+  probe_requested_flag="${probe_requested_flag:-0}"
+  if [[ "${exhausted_flag}" == '0' && "${confirmed_flag}" != '1' ]] \
+    && agent_review_quota_cache_read_fields "${state_file}" \
+    && [[ "${agent_review_quota_cache_valid_date}" == "${today}" \
+      && "${agent_review_quota_cache_exhausted}" == '1' \
+      && "${agent_review_quota_cache_confirmed:-0}" != '1' ]]; then
+    return 0
+  fi
+  agent_review_coderabbit_quota_ensure_state_dir
   checked_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   reason_quoted="$(agent_review_quota_quote_env_value "${reason_text}")"
   cat >"${state_file}" <<EOF
 valid_date=${today}
 exhausted=${exhausted_flag}
+confirmed=${confirmed_flag}
+probe_requested=${probe_requested_flag}
 source=${source_tag}
 checked_at=${checked_at}
 reason=${reason_quoted}
 EOF
   agent_review_coderabbit_quota_exhausted_today="${exhausted_flag}"
+  if [[ "${confirmed_flag}" == '1' ]]; then
+    agent_review_coderabbit_quota_confirmed_today=1
+  else
+    agent_review_coderabbit_quota_confirmed_today=0
+  fi
+  if [[ "${probe_requested_flag}" == '1' ]]; then
+    agent_review_coderabbit_quota_probe_requested_today=1
+  else
+    agent_review_coderabbit_quota_probe_requested_today=0
+  fi
   # shellcheck disable=SC2034  # cache metadata read by wait-for-agent-review logging
   agent_review_coderabbit_quota_cache_source="${source_tag}"
   # shellcheck disable=SC2034  # cache metadata read by wait-for-agent-review logging
@@ -603,14 +866,16 @@ agent_review_coderabbit_quota_mark_exhausted() {
   agent_review_coderabbit_quota_write_cache 1 observed "${reason}"
 }
 
-agent_review_coderabbit_quota_mark_available() {
-  agent_review_coderabbit_quota_write_cache 0 probe 'Recent CodeRabbit comments show usage is available.'
+agent_review_coderabbit_quota_mark_confirmed() {
+  local -r reason="${1:-CodeRabbit comment today confirms usage is available.}"
+
+  agent_review_coderabbit_quota_write_cache 0 confirmed "${reason}" 1
 }
 
 # Probe open PR issue comments for CodeRabbit quota signals without requesting a review.
-# Exit 0 when usage limit exhausted today, 1 when available/unknown (not exhausted).
+# Exit 0 when usage limit exhausted today, 1 when not exhausted (may still be unconfirmed).
 agent_review_coderabbit_quota_probe_recent_comments() {
-  local probe_json today repo pr at body reason found_today
+  local probe_json today repo pr at body reason
 
   agent_review_require_cmd gh
   agent_review_require_cmd jq
@@ -629,14 +894,12 @@ query {
     }
   }
 }')"
-  found_today=0
-  while IFS=$'\t' read -r repo pr at body; do
+  while IFS=$'\t' read -r repo pr at body login; do
     [[ -n "${at}" ]] || continue
     if ! agent_review_quota_timestamp_on_local_day "${at}" "${today}"; then
       continue
     fi
-    found_today=1
-    if agent_review_coderabbit_quota_text_is_exhausted "${body}"; then
+    if agent_review_coderabbit_quota_issue_comment_is_exhausted "${login}" "${body}"; then
       reason="CodeRabbit comment on ${repo}#${pr} at ${at} reports usage limit reached."
       agent_review_coderabbit_quota_write_cache 1 probe_recent_comments "${reason}"
       return 0
@@ -646,20 +909,20 @@ query {
       [.data.viewer.pullRequests.nodes[]
         | . as $pr
         | .comments.nodes[]
-        | select((.author.login // "") | test("coderabbit|rabbit";"i"))
         | select((.body // "") | length > 0)
-        | {repo: $pr.repository.nameWithOwner, pr: ($pr.number | tostring), body: .body, at: .createdAt}
+        | {
+            repo: $pr.repository.nameWithOwner,
+            pr: ($pr.number | tostring),
+            body: .body,
+            at: .createdAt,
+            login: (.author.login // "")
+          }
       ]
       | sort_by(.at)
       | .[]
-      | [.repo, .pr, .at, .body]
+      | [.repo, .pr, .at, .body, .login]
       | @tsv'
   )
-  if [[ "${found_today}" == '1' ]]; then
-    agent_review_coderabbit_quota_mark_available
-    return 1
-  fi
-  agent_review_coderabbit_quota_write_cache 0 probe 'No CodeRabbit comments found for today on open PRs.'
   return 1
 }
 
@@ -670,9 +933,107 @@ agent_review_coderabbit_quota_refresh_for_today() {
   agent_review_coderabbit_quota_probe_recent_comments || true
 }
 
+# Ordered agent ids for daily quota escalation (default: coderabbit,copilot,bugbot).
+agent_review_quota_escalation_chain_raw() {
+  local chain="${AGENT_REVIEW_QUOTA_FALLBACK_CHAIN:-}"
+
+  if [[ -z "${chain}" ]]; then
+    chain='coderabbit,copilot,bugbot'
+  fi
+  printf '%s' "${chain}"
+}
+
+# Only one agent is probed per PR head to conserve review quota.
+agent_review_quota_escalation_agent_ids() {
+  local chain remaining part trimmed
+
+  chain="$(agent_review_quota_escalation_chain_raw)"
+  remaining="${chain},"
+  while [[ "${remaining}" == *,* ]]; do
+    part="${remaining%%,*}"
+    remaining="${remaining#*,}"
+    trimmed="${part#"${part%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ -n "${trimmed}" ]]; then
+      printf '%s\n' "${trimmed}"
+    fi
+  done
+}
+
+# Prints the next escalation agent after <from_agent>, or returns 1 when none remain.
+agent_review_quota_escalation_next_agent() {
+  local -r from_agent="$1"
+  local found=0 agent
+
+  [[ -n "${from_agent}" ]] || return 1
+  while IFS= read -r agent || [[ -n "${agent}" ]]; do
+    [[ -z "${agent}" ]] && continue
+    if [[ "${found}" == '1' ]]; then
+      printf '%s\n' "${agent}"
+      return 0
+    fi
+    if [[ "${agent}" == "${from_agent}" ]]; then
+      found=1
+    fi
+  done < <(agent_review_quota_escalation_agent_ids)
+  return 1
+}
+
+# Pick the single agent to use for today's quota probe / reviews on this PR.
+# Prefers the first confirmed agent in escalation order; otherwise the first agent
+# that is not cached exhausted and has not already had an inconclusive manual probe.
+agent_review_quota_probe_agent_for_today() {
+  local agent
+
+  while IFS= read -r agent || [[ -n "${agent}" ]]; do
+    [[ -z "${agent}" ]] && continue
+    if agent_review_agent_quota_confirmed_for_agent "${agent}"; then
+      printf '%s\n' "${agent}"
+      return 0
+    fi
+  done < <(agent_review_quota_escalation_agent_ids)
+  while IFS= read -r agent || [[ -n "${agent}" ]]; do
+    [[ -z "${agent}" ]] && continue
+    if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
+      continue
+    fi
+    if agent_review_agent_quota_probe_requested_for_agent "${agent}" \
+      && ! agent_review_agent_is_auto_review "${agent}"; then
+      continue
+    fi
+    printf '%s\n' "${agent}"
+    return 0
+  done < <(agent_review_quota_escalation_agent_ids)
+  return 1
+}
+
+# True when at least one agent is confirmed available today, or every agent is exhausted.
+agent_review_daily_quota_probe_satisfied() {
+  local agent any_confirmed=0 any_unresolved=0
+
+  while IFS= read -r agent || [[ -n "${agent}" ]]; do
+    [[ -z "${agent}" ]] && continue
+    if agent_review_agent_quota_confirmed_for_agent "${agent}"; then
+      any_confirmed=1
+      continue
+    fi
+    if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
+      continue
+    fi
+    any_unresolved=1
+  done < <(agent_review_quota_escalation_agent_ids)
+  if (( any_confirmed == 1 )); then
+    return 0
+  fi
+  if (( any_unresolved == 0 )); then
+    return 0
+  fi
+  return 1
+}
+
 # Ordered agent ids reported at the start of each review cycle.
 agent_review_cycle_quota_agent_ids() {
-  printf '%s\n' copilot bugbot coderabbit
+  agent_review_quota_escalation_agent_ids
 }
 
 # Human-readable quota status for one agent (no side effects beyond cache refresh).
@@ -683,11 +1044,23 @@ agent_review_agent_quota_status_label() {
     printf 'exhausted (will not request)\n'
     return 0
   fi
-  if [[ "${agent_id}" == 'coderabbit' ]]; then
-    printf 'available (auto-review; no manual request)\n'
+  if agent_review_agent_quota_confirmed_for_agent "${agent_id}"; then
+    if [[ "${agent_id}" == 'coderabbit' ]]; then
+      printf 'available (auto-review; no manual request)\n'
+    else
+      printf 'available\n'
+    fi
     return 0
   fi
-  printf 'available\n'
+  if [[ "${agent_id}" == 'coderabbit' ]]; then
+    printf 'unconfirmed (auto-review; no manual request)\n'
+    return 0
+  fi
+  if agent_review_agent_quota_probe_requested_for_agent "${agent_id}"; then
+    printf 'probe requested (awaiting review)\n'
+    return 0
+  fi
+  printf 'unconfirmed (will request to probe)\n'
 }
 
 # Log Copilot, Bugbot, and CodeRabbit quota status once at loop start / cycle preamble.
@@ -701,6 +1074,48 @@ agent_review_log_cycle_quota_preamble() {
     status="$(agent_review_agent_quota_status_label "${agent}")"
     printf '    %s: %s' "${agent}" "${status}" >&2
   done < <(agent_review_cycle_quota_agent_ids)
+}
+
+# True when <agent_id> daily quota cache reports a manual probe request was sent today.
+agent_review_agent_quota_probe_requested_for_agent() {
+  local -r agent_id="$1"
+
+  case "${agent_id}" in
+    copilot)
+      agent_review_copilot_quota_refresh_for_today
+      [[ "${agent_review_copilot_quota_probe_requested_today:-0}" == '1' ]]
+      ;;
+    bugbot)
+      agent_review_bugbot_quota_refresh_for_today
+      [[ "${agent_review_bugbot_quota_probe_requested_today:-0}" == '1' ]]
+      ;;
+    coderabbit)
+      agent_review_coderabbit_quota_refresh_for_today
+      [[ "${agent_review_coderabbit_quota_probe_requested_today:-0}" == '1' ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# True when <agent_id> daily quota cache reports confirmed availability today.
+agent_review_agent_quota_confirmed_for_agent() {
+  local -r agent_id="$1"
+
+  case "${agent_id}" in
+    copilot)
+      agent_review_copilot_quota_refresh_for_today
+      [[ "${agent_review_copilot_quota_confirmed_today:-0}" == '1' ]]
+      ;;
+    bugbot)
+      agent_review_bugbot_quota_refresh_for_today
+      [[ "${agent_review_bugbot_quota_confirmed_today:-0}" == '1' ]]
+      ;;
+    coderabbit)
+      agent_review_coderabbit_quota_refresh_for_today
+      [[ "${agent_review_coderabbit_quota_confirmed_today:-0}" == '1' ]]
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 # True when <agent_id> daily quota cache reports exhaustion (no log output).
