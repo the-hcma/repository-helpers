@@ -5,9 +5,43 @@
 agent_review_profile_id='copilot'
 agent_review_profile_request_login_regex='copilot'
 agent_review_profile_thread_login_regex='copilot'
-agent_review_profile_reviewer_slug='copilot-pull-request-reviewer'
-# gh pr edit --add-reviewer succeeds but Copilot does not appear in reviewRequests.
-agent_review_profile_request_visible='false'
+# Copilot is triggered by mentioning @copilot in a PR comment (not --add-reviewer).
+agent_review_profile_request_visible='true'
+
+if [[ -z "${_copilot_lib_dir:-}" ]]; then
+  _copilot_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  readonly _copilot_lib_dir
+fi
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_copilot_lib_dir}/../runner-ensure"
+
+# _copilot_runner_jq_file <label> <input-json> [jq-args…]
+_copilot_runner_jq_file() {
+  local -r label="$1"
+  local -r input_json="$2"
+  shift 2
+  local tmp exit_code
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/copilot-jq.XXXXXX")"
+  printf '%s' "${input_json}" >"${tmp}"
+  exit_code=0
+  runner_exec "copilot profile ${label}" --stream-stdout -- jq "$@" "${tmp}" || exit_code=$?
+  rm -f "${tmp}"
+  return "${exit_code}"
+}
+
+# _copilot_jq <label> <json> [jq args…]
+_copilot_jq() {
+  local -r label="$1"
+  local -r json="$2"
+  shift 2
+
+  if declare -F ar_runner_jq_file >/dev/null 2>&1; then
+    ar_runner_jq_file "copilot profile ${label}" "${json}" "$@"
+  else
+    _copilot_runner_jq_file "${label}" "${json}" "$@"
+  fi
+}
 
 # agent_review_profile_login_matches <github_login>
 agent_review_profile_login_matches() {
@@ -56,7 +90,68 @@ agent_review_profile_text_is_quota_exhausted() {
   if [[ "${lower}" =~ \"code\"[[:space:]]*:[[:space:]]*\"quota_exceeded\" ]]; then
     return 0
   fi
+  if [[ "${lower}" =~ run[[:space:]]+out[[:space:]]+of[[:space:]]+your[[:space:]]+included[[:space:]]+ai[[:space:]]+credits ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ included[[:space:]]+ai[[:space:]]+credits[[:space:]]+for[[:space:]]+the[[:space:]]+month ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ monthly[[:space:]]+credit[[:space:]]+limit ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ copilot[[:space:]]+stopped[[:space:]]+work ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ session[[:space:]]+could[[:space:]]+not[[:space:]]+start ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ manage[[:space:]]+your[[:space:]]+ai[[:space:]]+credit[[:space:]]+budget ]]; then
+    return 0
+  fi
   return 1
+}
+
+# agent_review_profile_text_is_copilot_billing_block <text>
+# True when quota exhaustion text is unmistakably from Copilot billing (not generic agent limits).
+agent_review_profile_text_is_copilot_billing_block() {
+  local -r text="${1:-}"
+  local lower
+
+  if [[ -z "${text}" ]]; then
+    return 1
+  fi
+  lower="${text,,}"
+  if [[ "${lower}" =~ run[[:space:]]+out[[:space:]]+of[[:space:]]+your[[:space:]]+included[[:space:]]+ai[[:space:]]+credits ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ copilot[[:space:]]+stopped[[:space:]]+work ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ included[[:space:]]+ai[[:space:]]+credits[[:space:]]+for[[:space:]]+the[[:space:]]+month ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ manage[[:space:]]+your[[:space:]]+ai[[:space:]]+credit[[:space:]]+budget ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ session[[:space:]]+could[[:space:]]+not[[:space:]]+start.*included[[:space:]]+ai[[:space:]]+credits ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# agent_review_profile_issue_comment_is_quota_exhausted <login> <body>
+# GitHub may post Copilot billing failures without a copilot* login on the comment author.
+agent_review_profile_issue_comment_is_quota_exhausted() {
+  local -r login="${1:-}"
+  local -r body="${2:-}"
+
+  if ! agent_review_profile_text_is_quota_exhausted "${body}"; then
+    return 1
+  fi
+  if agent_review_profile_login_matches "${login}"; then
+    return 0
+  fi
+  agent_review_profile_text_is_copilot_billing_block "${body}"
 }
 
 # agent_review_profile_review_is_quota_exhausted <review_body>
@@ -74,17 +169,155 @@ agent_review_profile_review_is_empty() {
   [[ "${body}" =~ [Gg]enerated[[:space:]]+no[[:space:]]+new[[:space:]]+comments ]]
 }
 
+# agent_review_copilot_request_marker <head_oid>
+agent_review_copilot_request_marker() {
+  local -r head="${1:-}"
+
+  printf 'wait-for-agent-review:copilot:%s' "${head:0:7}"
+}
+
+# agent_review_copilot_pr_head <repo> <pr>
+agent_review_copilot_pr_head() {
+  local -r repo="$1"
+  local -r pr="$2"
+
+  runner_exec_stdout "copilot profile pr head" -- gh pr view "${pr}" --repo "${repo}" --json headRefOid -q .headRefOid
+}
+
+# agent_review_copilot_request_comment_body <head_oid>
+agent_review_copilot_request_comment_body() {
+  local -r head="$1"
+  local marker
+
+  marker="$(agent_review_copilot_request_marker "${head}")"
+  printf '@copilot please review this pull request.\n\n<!-- %s -->' "${marker}"
+}
+
+# agent_review_copilot_comments_contain_marker <comments_json> <marker> [paginated]
+# When paginated is "true", comments_json is gh api --paginate output (slurp pages).
+agent_review_copilot_comments_contain_marker() {
+  local -r comments_json="$1"
+  local -r marker="$2"
+  local -r paginated="${3:-false}"
+  local exit_code tmp_comments
+
+  [[ -n "${comments_json}" && -n "${marker}" ]] || return 1
+  exit_code=0
+  if declare -F ar_runner_jq_file >/dev/null 2>&1; then
+    if [[ "${paginated}" == 'true' ]]; then
+      # shellcheck disable=SC2016  # jq filter uses $marker variable, not shell expansion
+      ar_runner_jq_file "copilot profile comment marker jq" "${comments_json}" -res \
+        --arg marker "${marker}" \
+        '[ .[] | .[] | .body // "" | select(contains($marker)) ] | length > 0' \
+        >/dev/null || exit_code=$?
+      if (( exit_code == 0 )); then
+        return 0
+      fi
+      exit_code=0
+      # shellcheck disable=SC2016  # jq filter uses $marker variable, not shell expansion
+      ar_runner_jq_file "copilot profile comment marker jq flat" "${comments_json}" -re \
+        --arg marker "${marker}" \
+        '[ .[] | .body // "" | select(contains($marker)) ] | length > 0' \
+        >/dev/null || exit_code=$?
+    else
+      # shellcheck disable=SC2016  # jq filter uses $marker variable, not shell expansion
+      ar_runner_jq_file "copilot profile comment marker jq" "${comments_json}" -re \
+        --arg marker "${marker}" \
+        '[ .[] | .body // "" | select(contains($marker)) ] | length > 0' \
+        >/dev/null || exit_code=$?
+    fi
+    (( exit_code == 0 ))
+    return $?
+  fi
+  tmp_comments="$(mktemp "${TMPDIR:-/tmp}/copilot-comments.XXXXXX")"
+  printf '%s' "${comments_json}" >"${tmp_comments}"
+  if [[ "${paginated}" == 'true' ]]; then
+    # shellcheck disable=SC2016  # jq filter uses $marker variable, not shell expansion
+    _copilot_runner_jq_file "comment marker jq" "${comments_json}" -res --arg marker "${marker}" \
+      '[ .[] | .[] | .body // "" | select(contains($marker)) ] | length > 0' \
+      >/dev/null || exit_code=$?
+    if (( exit_code == 0 )); then
+      rm -f "${tmp_comments}"
+      return 0
+    fi
+    exit_code=0
+    # shellcheck disable=SC2016  # jq filter uses $marker variable, not shell expansion
+    _copilot_runner_jq_file "comment marker jq flat" "${comments_json}" -re --arg marker "${marker}" \
+      '[ .[] | .body // "" | select(contains($marker)) ] | length > 0' \
+      >/dev/null || exit_code=$?
+  else
+    # shellcheck disable=SC2016  # jq filter uses $marker variable, not shell expansion
+    _copilot_runner_jq_file "comment marker jq" "${comments_json}" -re --arg marker "${marker}" \
+      '[ .[] | .body // "" | select(contains($marker)) ] | length > 0' \
+      >/dev/null || exit_code=$?
+  fi
+  rm -f "${tmp_comments}"
+  (( exit_code == 0 ))
+}
+
+# agent_review_copilot_probe_comment_sent_for_head <comments_json> <head_oid>
+# True when wait-for-agent-review already posted an @copilot probe comment for this head.
+agent_review_copilot_probe_comment_sent_for_head() {
+  local -r comments_json="$1"
+  local -r head="$2"
+  local marker
+
+  [[ -n "${comments_json}" && -n "${head}" ]] || return 1
+  marker="$(agent_review_copilot_request_marker "${head}")"
+  agent_review_copilot_comments_contain_marker "${comments_json}" "${marker}" false
+}
+
+# agent_review_profile_request_already_sent <repo> <pr>
+# True when this head already has an @copilot probe comment from wait-for-agent-review.
+agent_review_profile_request_already_sent() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local head marker comments_json
+
+  head="$(agent_review_copilot_pr_head "${repo}" "${pr}")"
+  [[ -n "${head}" ]] || return 1
+  marker="$(agent_review_copilot_request_marker "${head}")"
+  comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
+  agent_review_copilot_comments_contain_marker "${comments_json}" "${marker}" true
+}
+
+# agent_review_profile_agent_requested_from_snapshot <snapshot>
+agent_review_profile_agent_requested_from_snapshot() {
+  local -r snapshot="$1"
+  local head marker comments_json tmp_snapshot exit_code
+
+  tmp_snapshot="$(mktemp "${TMPDIR:-/tmp}/copilot-snapshot.XXXXXX")"
+  printf '%s' "${snapshot}" >"${tmp_snapshot}"
+  exit_code=0
+  head="$(runner_exec_stdout "copilot profile snapshot head" -- jq -r '.data.repository.pullRequest.headRefOid // ""' "${tmp_snapshot}")" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "${head}" ]]; then
+    rm -f "${tmp_snapshot}"
+    return 1
+  fi
+  marker="$(agent_review_copilot_request_marker "${head}")"
+  comments_json="$(runner_exec_stdout "copilot profile snapshot comments" -- jq -c '.data.repository.pullRequest.comments.nodes // []' "${tmp_snapshot}")" || comments_json=''
+  rm -f "${tmp_snapshot}"
+  if [[ -z "${comments_json}" || "${comments_json}" == 'null' || "${comments_json}" == '[]' ]]; then
+    return 1
+  fi
+  agent_review_copilot_comments_contain_marker "${comments_json}" "${marker}" false
+}
+
 # agent_review_profile_request <repo> <pr>
 # Exit 7 when Copilot review quota/billing blocks the request.
 agent_review_profile_request() {
   local -r repo="$1"
   local -r pr="$2"
-  local err_file err_text request_exit
+  local head body err_file err_text request_exit
 
+  if agent_review_profile_request_already_sent "${repo}" "${pr}"; then
+    return 0
+  fi
+  head="$(agent_review_copilot_pr_head "${repo}" "${pr}")"
+  body="$(agent_review_copilot_request_comment_body "${head}")"
   err_file="$(mktemp "${TMPDIR:-/tmp}/agent-review-request.XXXXXX")"
   request_exit=0
-  if gh pr edit "${pr}" --repo "${repo}" --add-reviewer "${agent_review_profile_reviewer_slug}" \
-    2>"${err_file}"; then
+  if runner_exec "copilot profile request comment" -- gh pr comment "${pr}" --repo "${repo}" --body "${body}" 2>"${err_file}"; then
     rm -f "${err_file}"
     return 0
   fi

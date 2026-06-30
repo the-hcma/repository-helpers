@@ -36,11 +36,13 @@ assert_contains "trigger help lists request" "$trigger_out" "request"
 printf '\n=== static: agent profile copilot ===\n'
 if grep -qF 'agent_review_profile_review_is_empty' "$profile" \
   && grep -qF 'agent_review_profile_request' "$profile" \
-  && grep -qF 'copilot-pull-request-reviewer' "$profile"; then
-  printf '[PASS] copilot profile: empty review regex and reviewer slug\n'
+  && grep -qF '@copilot' "$profile" \
+  && grep -qF 'runner_exec "copilot profile request comment"' "$profile" \
+  && grep -qF 'gh pr comment' "$profile"; then
+  printf '[PASS] copilot profile: @copilot PR comment request via runner\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] copilot profile: missing empty review detection or reviewer slug\n'
+  printf '[FAIL] copilot profile: missing @copilot comment request wiring\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -235,6 +237,24 @@ else
   fail=$(( fail + 1 ))
 fi
 
+copilot_credits_msg='Copilot stopped work on behalf of thehcma due to an error. Your session could not start because you have run out of your included AI credits for the month. Manage your AI credit budget at https://github.com/settings/copilot/features.'
+copilot_credits_msg_q="$(printf '%q' "${copilot_credits_msg}")"
+if bash -c "source '${profile}'; agent_review_profile_text_is_quota_exhausted ${copilot_credits_msg_q}"; then
+  printf '[PASS] copilot profile: detects included AI credits exhaustion text\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot profile: rejected included AI credits exhaustion text\n'
+  fail=$(( fail + 1 ))
+fi
+
+if bash -c "source '${profile}'; agent_review_profile_issue_comment_is_quota_exhausted 'github-actions' ${copilot_credits_msg_q}"; then
+  printf '[PASS] copilot profile: billing comment without copilot login\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot profile: rejected billing comment without copilot login\n'
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== static: copilot profile empty review function ===\n'
 if bash -c "source '${profile}'; agent_review_profile_review_is_empty 'Copilot reviewed 2 files and generated no new comments.'"; then
   printf '[PASS] copilot profile: detects empty review body\n'
@@ -341,17 +361,27 @@ else
   pass=$(( pass + 1 ))
 fi
 
-if AGENT_REVIEW_FALLBACK_AGENT=bugbot bash -c \
+if bash -c \
   "source '${lib}'; printf '%s' \"\$(agent_review_quota_fallback_chain_raw)\"" \
-  | grep -qxF 'bugbot,coderabbit'; then
-  printf '[PASS] agent-review: default quota fallback chain is bugbot,coderabbit\n'
+  | grep -qxF 'coderabbit,copilot,bugbot'; then
+  printf '[PASS] agent-review: default quota fallback chain is coderabbit,copilot,bugbot\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] agent-review: unexpected default quota fallback chain\n'
   fail=$(( fail + 1 ))
 fi
 
-if AGENT_REVIEW_QUOTA_FALLBACK_CHAIN='bugbot, coderabbit' bash -c \
+if next="$(bash -c \
+  "source '${lib}'; source '${quota_lib}'; agent_review_quota_escalation_next_agent copilot")" \
+  && [[ "${next}" == 'bugbot' ]]; then
+  printf '[PASS] agent-review: quota escalation advances copilot to bugbot\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] agent-review: quota escalation next after copilot (got %s)\n' "${next:-<empty>}"
+  fail=$(( fail + 1 ))
+fi
+
+if AGENT_REVIEW_QUOTA_FALLBACK_CHAIN='coderabbit, copilot, bugbot' bash -c \
   "source '${lib}'; agent_review_quota_fallback_agent_at 1"; then
   printf '[PASS] agent-review: quota fallback chain trims whitespace\n'
   pass=$(( pass + 1 ))
@@ -371,6 +401,94 @@ else
   printf '[FAIL] copilot quota: missing daily cache or probe wiring\n'
   fail=$(( fail + 1 ))
 fi
+
+printf '\n=== quota: confirmed only after review, not passive probe ===\n'
+if grep -qF 'agent_review_quota_escalation_chain_raw' "$quota_lib" \
+  && grep -qF 'AGENT_REVIEW_QUOTA_FALLBACK_CHAIN' "$quota_lib" \
+  && grep -qF 'agent_review_agent_quota_confirmed_for_agent' "$quota_lib" \
+  && grep -qF 'unconfirmed (not probed today)' "$lib" \
+  && grep -qF 'unconfirmed (will request to probe)' "$quota_lib" \
+  && ! grep -qF 'mark_available' "$quota_lib"; then
+  printf '[PASS] quota: confirmed helpers and unconfirmed status labels\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota: missing confirmed helpers or still marks passive availability\n'
+  fail=$(( fail + 1 ))
+fi
+
+tmp_copilot_probe="$(mktemp)"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_copilot_probe}'
+  agent_review_copilot_quota_write_cache 1 observed 'Copilot exhausted from review.'
+  agent_review_copilot_quota_mark_confirmed 'Successful review clears stale exhaustion.'
+  ! agent_review_agent_quota_exhausted_for_agent copilot \
+    && agent_review_agent_quota_confirmed_for_agent copilot
+"; then
+  printf '[PASS] quota cache: confirmed write clears stale observed exhaustion\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota cache: confirmed write did not clear stale observed exhaustion\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_copilot_probe}"
+
+tmp_copilot_probe_block="$(mktemp)"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_copilot_probe_block}'
+  agent_review_copilot_quota_write_cache 1 observed 'Copilot exhausted from review.'
+  agent_review_copilot_quota_write_cache 0 probe 'stale passive probe' 0
+  agent_review_agent_quota_exhausted_for_agent copilot \
+    && ! agent_review_agent_quota_confirmed_for_agent copilot
+"; then
+  printf '[PASS] quota cache: non-confirmed write does not downgrade observed exhaustion\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota cache: non-confirmed write downgraded observed exhaustion\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_copilot_probe_block}"
+
+tmp_copilot_status="$(mktemp)"
+if status="$(bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_copilot_status}'
+  agent_review_copilot_quota_write_cache 0 test_isolation 'quota status test harness' 0
+  agent_review_agent_quota_status_label copilot
+")" && [[ "${status}" == 'unconfirmed (will request to probe)' ]]; then
+  printf '[PASS] quota status: copilot is unconfirmed before a review today\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota status: expected unconfirmed copilot (got %s)\n' "${status:-<empty>}"
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_copilot_status}"
+
+tmp_escalation_probe="$(mktemp)"
+tmp_escalation_probe2="$(mktemp)"
+tmp_escalation_probe3="$(mktemp)"
+if picked="$(bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_escalation_probe}'
+  AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${tmp_escalation_probe2}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_escalation_probe3}'
+  agent_review_coderabbit_quota_write_cache 0 test_isolation 'test harness' 0
+  agent_review_copilot_quota_write_cache 1 observed 'Copilot exhausted.'
+  agent_review_quota_probe_agent_for_today
+")" && [[ "${picked}" == 'coderabbit' ]]; then
+  printf '[PASS] quota probe: escalation picks coderabbit when copilot exhausted\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota probe: expected coderabbit when copilot exhausted (got %s)\n' \
+    "${picked:-<empty>}"
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_escalation_probe}" "${tmp_escalation_probe2}" "${tmp_escalation_probe3}"
 
 printf '\n=== static: bugbot daily quota cache ===\n'
 if grep -qF 'scratch/repository-helpers/bugbot-review-quota.env' "$quota_lib" \
@@ -506,11 +624,12 @@ else
 fi
 
 if grep -qF 'request_exit=$?' "$profile" \
-  && ! grep -qF 'if ! gh pr edit' "$profile"; then
+  && grep -qF 'runner_exec "copilot profile request comment"' "$profile" \
+  && ! grep -qF 'gh pr edit' "$profile"; then
   printf '[PASS] copilot profile: captures gh exit code outside negated if\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] copilot profile: still reads $? inside if ! gh block\n'
+  printf '[FAIL] copilot profile: still uses gh pr edit or bad exit capture\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -594,6 +713,7 @@ if grep -qF 'agent_review_human_threads_json_from_snapshot' "$lib" \
   && grep -qF 'cmd_list_human_threads' "$wait_script" \
   && grep -qF 'cmd_resolve_human_addressed' "$wait_script" \
   && grep -qF 'cmd_complete_idle' "$wait_script" \
+  && grep -qF 'agent_review_daily_quota_probe_satisfied' "$wait_script" \
   && grep -qF 'agent_review_default_cycle_timeout_s=900' "$lib"; then
   printf '[PASS] human threads and idle-success wired into wait loop\n'
   pass=$(( pass + 1 ))
@@ -635,27 +755,33 @@ else
 fi
 
 printf '\n=== static: skip exhausted quota agents ===\n'
-if ! grep -qF 'agent_review_loop_fallback_index == 0' "$wait_script" \
+if grep -qF 'agent_review_quota_probe_agent_for_today' "$quota_lib" \
+  && grep -qF 'agent_review_quota_escalation_agent_ids' "$quota_lib" \
+  && grep -qF 'agent_review_sync_active_probe_agent' "$lib" \
   && grep -qF 'agent_review_agent_quota_exhausted_for_agent' "$quota_lib" \
   && grep -qF 'agent_review_activate_first_requestable_agent' "$lib" \
   && grep -qF 'will not request' "$lib" \
   && grep -qF 'skipping fallback to' "$wait_script" \
   && grep -qF 'agent_review_skip_wait_for_quota_exhausted_agent' "$lib" \
-  && grep -qF 'skipping wait for pending review/check' "$wait_script"; then
-  printf '[PASS] quota exhausted: skip request, fallback chain, and pending wait\n'
+  && grep -qF 'skipping wait for pending review/check' "$wait_script" \
+  && ! grep -qF 'done < <(agent_review_cycle_quota_agent_ids)' "$wait_script"; then
+  printf '[PASS] quota exhausted: escalation probe, skip request, fallback, and pending wait\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] quota exhausted: missing skip request/fallback/wait wiring\n'
+  printf '[FAIL] quota exhausted: missing escalation probe or skip request/fallback/wait wiring\n'
   fail=$(( fail + 1 ))
 fi
 
 tmp_copilot_quota="$(mktemp)"
 tmp_bugbot_quota="$(mktemp)"
+tmp_coderabbit_quota="$(mktemp)"
 if bash -c "
   source '${lib}'
   source '${quota_lib}'
   AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_copilot_quota}'
   AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${tmp_bugbot_quota}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_coderabbit_quota}'
+  agent_review_coderabbit_quota_write_cache 0 test_isolation 'test harness' 0
   agent_review_copilot_quota_write_cache 1 probe 'Copilot exhausted.'
   agent_review_bugbot_quota_write_cache 1 probe 'Bugbot exhausted.'
   agent_review_agent_quota_exhausted_for_agent copilot
@@ -668,7 +794,7 @@ else
   printf '[FAIL] quota lib: agent_quota_exhausted_for_agent cache lookup failed\n'
   fail=$(( fail + 1 ))
 fi
-rm -f "${tmp_copilot_quota}" "${tmp_bugbot_quota}"
+rm -f "${tmp_copilot_quota}" "${tmp_bugbot_quota}" "${tmp_coderabbit_quota}"
 
 printf '\n=== static: observe all agent quota on PR ===\n'
 observe_call_count=0
@@ -676,6 +802,8 @@ observe_call_count=0
 observe_call_count="$(grep -cF 'agent_review_observe_all_agent_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}"' "$wait_script" || true)"
 # shellcheck disable=SC2016  # grep for literal observe call with shell variables in source
 if grep -qF 'agent_review_quota_mark_exhausted_for_agent' "$quota_lib" \
+  && grep -qF 'agent_review_quota_mark_confirmed_for_agent' "$lib" \
+  && grep -qF 'agent_review_quota_observe_agent_on_pr' "$lib" \
   && grep -qF 'agent_review_observe_all_agent_quota_on_pr' "$lib" \
   && grep -qF 'cmd_loop_observe_quota_on_pr' "$wait_script" \
   && grep -qF 'agent_review_pr_has_quota_issue_comment_today' "$lib" \
@@ -722,13 +850,105 @@ else
 fi
 rm -f "${tmp_bugbot_observe}" "${tmp_copilot_observe}"
 
+tmp_copilot_observe2="$(mktemp)"
+tmp_copilot_observe2_json="$(mktemp)"
+observe_comment_ts2="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+observe_copilot_credits_msg='Copilot stopped work on behalf of thehcma due to an error. Your session could not start because you have run out of your included AI credits for the month.'
+printf '[{"user":{"login":"github-actions"},"created_at":"%s","body":"%s"}]' \
+  "${observe_comment_ts2}" "${observe_copilot_credits_msg}" >"${tmp_copilot_observe2_json}"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_copilot_observe2}'
+  agent_review_use_agent copilot
+  agent_review_pr_issue_comments_json() {
+    cat '${tmp_copilot_observe2_json}'
+  }
+  agent_review_head_check_run_json_for_head() {
+    printf 'null\n'
+  }
+  agent_review_observe_all_agent_quota_on_pr \
+    'the-hcma/mock-repo' 1 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' ''
+  copilot_cache_contents=\"\$(cat '${tmp_copilot_observe2}')\"
+  agent_review_agent_quota_exhausted_for_agent copilot \
+    && grep -q '^source=observed$' <<<\"\${copilot_cache_contents}\"
+"; then
+  printf '[PASS] quota observe: Copilot AI credits comment marks copilot exhausted\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota observe: Copilot AI credits comment did not mark copilot exhausted\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_copilot_observe2}" "${tmp_copilot_observe2_json}"
+
+tmp_coderabbit_observe="$(mktemp)"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_coderabbit_observe}'
+  agent_review_coderabbit_quota_write_cache 1 observed 'stale exhaustion from other PR.'
+  agent_review_use_agent coderabbit
+  agent_review_fresh_agent_review_on_head() { [[ \"\${2}\" == 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' ]]; }
+  agent_review_latest_agent_review_body_on_head() { printf ''; }
+  agent_review_pr_issue_comments_json() { printf '[]\n'; }
+  agent_review_head_check_run_json_for_head() { printf 'null\n'; }
+  agent_review_observe_all_agent_quota_on_pr \
+    'the-hcma/mock-repo' 1 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' '{}'
+  ! agent_review_agent_quota_exhausted_for_agent coderabbit \
+    && agent_review_agent_quota_confirmed_for_agent coderabbit
+"; then
+  printf '[PASS] quota observe: fresh head review clears stale CodeRabbit exhaustion\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota observe: fresh head review did not clear stale CodeRabbit exhaustion\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_coderabbit_observe}"
+
+if bash -c "source '${profile}'; agent_review_profile_issue_comment_is_quota_exhausted 'coderabbitai' '<!-- summarize by coderabbit.ai -->quota caches in walkthrough'"; then
+  printf '[FAIL] coderabbit profile: walkthrough comment falsely matches billing exhaustion\n'
+  fail=$(( fail + 1 ))
+else
+  printf '[PASS] coderabbit profile: walkthrough comment is not billing exhaustion\n'
+  pass=$(( pass + 1 ))
+fi
+
+tmp_copilot_inconclusive="$(mktemp)"
+tmp_copilot_inconclusive_json="$(mktemp)"
+observe_copilot_probe_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '[{"user":{"login":"thehcma"},"created_at":"%s","body":"@copilot please review this pull request.\\n\\n<!-- wait-for-agent-review:copilot:39913c8 -->"}]' \
+  "${observe_copilot_probe_ts}" >"${tmp_copilot_inconclusive_json}"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_copilot_inconclusive}'
+  agent_review_copilot_quota_mark_probe_requested 'probe sent on PR #306'
+  agent_review_use_agent copilot
+  agent_review_fresh_agent_review_on_head() { return 1; }
+  agent_review_pr_issue_comments_json() { cat '${tmp_copilot_inconclusive_json}'; }
+  agent_review_head_check_run_json_for_head() { printf 'null\n'; }
+  agent_review_observe_all_agent_quota_on_pr \
+    'the-hcma/mock-repo' 306 '39913c8503c7062cbc257c5a0c3f3de02fb786cb' '{}'
+  agent_review_agent_quota_exhausted_for_agent copilot
+"; then
+  printf '[PASS] quota observe: inconclusive Copilot probe marks copilot exhausted\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota observe: inconclusive Copilot probe did not mark copilot exhausted\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_copilot_inconclusive}" "${tmp_copilot_inconclusive_json}"
+
 tmp_copilot_quota2="$(mktemp)"
 tmp_bugbot_quota2="$(mktemp)"
+tmp_coderabbit_quota2="$(mktemp)"
 if selected="$(bash -c "
   source '${lib}'
   source '${quota_lib}'
   AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_copilot_quota2}'
   AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${tmp_bugbot_quota2}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_coderabbit_quota2}'
+  agent_review_coderabbit_quota_write_cache 0 test_isolation 'test harness' 0
   agent_review_copilot_quota_write_cache 1 probe 'Copilot exhausted.'
   agent_review_bugbot_quota_write_cache 1 probe 'Bugbot exhausted.'
   agent_review_activate_first_requestable_agent
@@ -740,7 +960,7 @@ else
     "${selected:-<empty>}"
   fail=$(( fail + 1 ))
 fi
-rm -f "${tmp_copilot_quota2}" "${tmp_bugbot_quota2}"
+rm -f "${tmp_copilot_quota2}" "${tmp_bugbot_quota2}" "${tmp_coderabbit_quota2}"
 
 printf '\n=== static: dual-timeout idle-success loop ===\n'
 if grep -qF 'agent_review_log_cycle_quota_preamble' "$quota_lib" \
@@ -805,6 +1025,66 @@ else
   printf '[FAIL] coderabbit profile: rejected usage limit text\n'
   fail=$(( fail + 1 ))
 fi
+
+if bash -c "source '${script_dir}/../scripts/lib/agent-review-profiles/coderabbit'; \
+  ! agent_review_profile_text_is_quota_exhausted 'Review completed. Discuss usage limit gate in agent_review_quota.'"; then
+  printf '[PASS] coderabbit profile: rejects quota discussion in normal review text\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: treated quota code discussion as billing exhaustion\n'
+  fail=$(( fail + 1 ))
+fi
+
+tmp_escalation_probe4="$(mktemp)"
+tmp_escalation_probe5="$(mktemp)"
+tmp_escalation_probe6="$(mktemp)"
+if picked="$(bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_escalation_probe4}'
+  AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${tmp_escalation_probe5}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_escalation_probe6}'
+  agent_review_coderabbit_quota_write_cache 1 observed 'false positive exhaustion' 0
+  agent_review_copilot_quota_mark_probe_requested 'Copilot probe inconclusive.'
+  agent_review_quota_probe_agent_for_today
+")" && [[ "${picked}" == 'bugbot' ]]; then
+  printf '[PASS] quota probe: escalates past inconclusive copilot probe to bugbot\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota probe: expected bugbot after copilot probe_requested (got %s)\n' \
+    "${picked:-<empty>}"
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_escalation_probe4}" "${tmp_escalation_probe5}" "${tmp_escalation_probe6}"
+
+tmp_probe_satisfied="$(mktemp)"
+tmp_probe_satisfied2="$(mktemp)"
+tmp_probe_satisfied3="$(mktemp)"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_probe_satisfied}'
+  AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${tmp_probe_satisfied2}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_probe_satisfied3}'
+  agent_review_coderabbit_quota_write_cache 1 observed 'false positive' 0
+  agent_review_copilot_quota_mark_probe_requested 'inconclusive'
+  ! agent_review_daily_quota_probe_satisfied
+" && bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_probe_satisfied}'
+  AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${tmp_probe_satisfied2}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_probe_satisfied3}'
+  agent_review_copilot_quota_mark_confirmed 'confirmed after review'
+  agent_review_daily_quota_probe_satisfied
+"; then
+  printf '[PASS] quota probe: daily probe unsatisfied until an agent confirms\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota probe: daily_quota_probe_satisfied gate wrong\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_probe_satisfied}" "${tmp_probe_satisfied2}" "${tmp_probe_satisfied3}"
 
 printf '\n=== functional: bot thread triage spans all agents ===\n'
 cr_thread_fixture='{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"PRRT_cr","isResolved":false,"comments":{"nodes":[{"databaseId":1,"url":"https://example.com/cr/1","author":{"__typename":"Bot","login":"coderabbitai"},"body":"Actionable","path":"a.sh","line":1,"createdAt":"2026-06-19T16:00:00Z"}]}}]}}}}}'
@@ -1021,18 +1301,33 @@ fi
 
 printf '\n=== static: agent-review satellite runner adoption ===\n'
 # shellcheck disable=SC2016  # static assert matches literal source text
-if grep -qF 'ar_runner_gh_pr_jq' "$email_lib" \
-  && grep -qF 'ar_runner_jq_file' "$email_lib" \
+if grep -qF 'runner_exec_stdout "agent-review email pr meta"' "$email_lib" \
+  && grep -qF 'agent_review_email_read_pr_meta' "$email_lib" \
+  && grep -qF 'github.com/${owner}/${name}/pull/${pr}' "$email_lib" \
   && grep -qF 'runner_exec "agent-review email fallback comment"' "$email_lib"; then
-  printf '[PASS] agent-review-email: gh/jq via ar_runner helpers\n'
+  printf '[PASS] agent-review-email: gh/jq via runner helpers with PR meta fallback\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] agent-review-email: missing runner adoption wiring\n'
+  printf '[FAIL] agent-review-email: missing runner adoption or PR meta fallback\n'
+  fail=$(( fail + 1 ))
+fi
+
+if bash -c "
+  source '${lib}'
+  source '${email_lib}'
+  agent_review_email_read_pr_meta 'the-hcma/repository-helpers' 306
+  [[ -n \"\${agent_review_email_pr_url}\" && -n \"\${agent_review_email_pr_title}\" ]]
+"; then
+  printf '[PASS] agent-review-email: PR meta resolves title and URL for live PR\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] agent-review-email: PR meta missing title or URL\n'
   fail=$(( fail + 1 ))
 fi
 
 # shellcheck disable=SC2016  # static assert matches literal source text
 if grep -qF 'ar_runner_gh_api_stream "agent-review quota copilot probe graphql"' "$quota_lib" \
+  && grep -qF 'ar_runner_jq_file "agent-review quota copilot comments tsv"' "$quota_lib" \
   && grep -qF 'ar_runner_jq_file "agent-review quota copilot reviews tsv"' "$quota_lib" \
   && grep -qF 'runner_exec_stdout "agent-review quota bugbot head check"' "$quota_lib"; then
   printf '[PASS] agent-review-quota: graphql/jq via ar_runner helpers\n'
@@ -1066,17 +1361,32 @@ else
   fail=$(( fail + 1 ))
 fi
 
-printf '\n=== static: copilot invisible review request ===\n'
-if grep -qF "agent_review_profile_request_visible='false'" "$profile" \
-  && grep -qF 'agent_review_print_wait_for_review' "$lib" \
-  && grep -qF 'agent_request_visible' "$lib" \
-  && grep -qF 'wait_reason' "$lib" \
-  && grep -qF 'agent_review_print_wait_for_review' "$wait_script" \
-  && grep -qF 'may not appear as pending reviewers on GitHub' "$wait_script"; then
-  printf '[PASS] copilot: wait/status explain invisible review requests\n'
+printf '\n=== static: copilot comment review request ===\n'
+if grep -qF "agent_review_profile_request_visible='true'" "$profile" \
+  && grep -qF 'agent_review_profile_request_already_sent' "$profile" \
+  && grep -qF 'agent_review_profile_agent_requested_from_snapshot' "$profile" \
+  && grep -qF 'agent_review_profile_request_already_sent' "$wait_script" \
+  && grep -qF 'agent_review_profile_agent_requested_from_snapshot' "$lib"; then
+  printf '[PASS] copilot: requests via @copilot PR comment with per-head idempotency\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] copilot: missing invisible review request messaging\n'
+  printf '[FAIL] copilot: missing @copilot comment request or idempotency wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+if bash -c "
+  source '${lib}'
+  agent_review_use_agent copilot
+  comments='[{\"body\":\"unrelated walkthrough\"}]'
+  marker='wait-for-agent-review:copilot:deadbeef'
+  ! agent_review_copilot_comments_contain_marker \"\${comments}\" \"\${marker}\" false
+  comments='[{\"body\":\"@copilot please review\\n\\n<!-- wait-for-agent-review:copilot:deadbeef -->\"}]'
+  agent_review_copilot_comments_contain_marker \"\${comments}\" \"\${marker}\" false
+"; then
+  printf '[PASS] copilot: comment marker jq rejects unrelated bodies\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot: comment marker jq false positive or missed real marker\n'
   fail=$(( fail + 1 ))
 fi
 

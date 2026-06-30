@@ -52,12 +52,48 @@ agent_review_email_send_plain() {
 agent_review_email_pr_meta() {
   local -r repo="$1"
   local -r pr="$2"
-  local pr_json title url
+  local pr_json title url owner name exit_code
 
-  pr_json="$(ar_runner_gh_pr_jq "agent-review email pr meta" "${repo}" "${pr}" "title,url")"
-  title="$(ar_runner_jq_file "agent-review email title" "${pr_json}" -r '.title')"
-  url="$(ar_runner_jq_file "agent-review email url" "${pr_json}" -r '.url')"
-  printf '%s\t%s\n' "${title}" "${url}"
+  agent_review_require_cmd gh
+  exit_code=0
+  pr_json="$(runner_exec_stdout "agent-review email pr meta" -- gh pr view "${pr}" --repo "${repo}" --json title,url)" || exit_code=$?
+  if (( exit_code == 0 )) && [[ -n "${pr_json}" ]]; then
+    title="$(ar_runner_jq_file "agent-review email title" "${pr_json}" -r '.title // empty')"
+    url="$(ar_runner_jq_file "agent-review email url" "${pr_json}" -r '.url // empty')"
+  else
+    title=''
+    url=''
+  fi
+  if [[ -z "${url}" ]]; then
+    read -r owner name < <(agent_review_repo_parts "${repo}")
+    url="https://github.com/${owner}/${name}/pull/${pr}"
+  fi
+  if [[ -z "${title}" ]]; then
+    exit_code=0
+    title="$(runner_exec_stdout "agent-review email title retry" -- gh pr view "${pr}" --repo "${repo}" --json title -q .title)" || exit_code=$?
+    if (( exit_code != 0 )) || [[ -z "${title}" ]]; then
+      title="(title unavailable — see PR #${pr})"
+    fi
+  fi
+  printf '%s\n' "${title}"
+  printf '%s\n' "${url}"
+}
+
+# Load PR title and URL for operator emails (newline-delimited; safe for titles with tabs).
+agent_review_email_read_pr_meta() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -a meta_lines=()
+
+  mapfile -t meta_lines < <(agent_review_email_pr_meta "${repo}" "${pr}")
+  agent_review_email_pr_title="${meta_lines[0]:-}"
+  agent_review_email_pr_url="${meta_lines[1]:-}"
+  if [[ -z "${agent_review_email_pr_url}" ]]; then
+    agent_review_die "could not resolve PR #${pr} URL for email (repo=${repo})"
+  fi
+  if [[ -z "${agent_review_email_pr_title}" ]]; then
+    agent_review_email_pr_title="(title unavailable — see PR #${pr})"
+  fi
 }
 
 agent_review_email_gh_user_login() {
@@ -76,16 +112,16 @@ agent_review_email_gh_user_login() {
 agent_review_email_complete() {
   local -r repo="$1"
   local -r pr="$2"
-  local title url body agent_id gh_user
+  local body agent_id gh_user
 
   agent_review_require_cmd gh
-  IFS=$'\t' read -r title url < <(agent_review_email_pr_meta "${repo}" "${pr}")
+  agent_review_email_read_pr_meta "${repo}" "${pr}"
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
   gh_user="$(agent_review_email_gh_user_login)"
   body="PR #${pr} passed the ${agent_id} agent review loop.
 
-URL: ${url}
-Title: ${title}
+URL: ${agent_review_email_pr_url}
+Title: ${agent_review_email_pr_title}
 
 Agent: ${agent_id} review on current head reports no new comments.
 Action: PR approved via gh as ${gh_user}.
@@ -93,7 +129,8 @@ Merge: mergeStateStatus is CLEAN or BLOCKED (verify with gh pr checks ${pr} befo
 
 Do not add merge-it unless you intend to merge."
 
-  agent_review_email_send_plain "PR approved after ${agent_id} review: ${title} (#${pr})" "${body}"
+  agent_review_email_send_plain \
+    "PR approved after ${agent_id} review: ${agent_review_email_pr_title} (#${pr})" "${body}"
   printf 'Sent complete email for PR #%s to %s\n' "${pr}" "${AGENT_REVIEW_REPORT_TO}" >&2
 }
 
@@ -101,16 +138,16 @@ agent_review_email_idle_complete() {
   local -r repo="$1"
   local -r pr="$2"
   local -r idle_s="$3"
-  local title url body gh_user quota_summary
+  local body gh_user quota_summary
 
   agent_review_require_cmd gh
-  IFS=$'\t' read -r title url < <(agent_review_email_pr_meta "${repo}" "${pr}")
+  agent_review_email_read_pr_meta "${repo}" "${pr}"
   gh_user="$(agent_review_email_gh_user_login)"
   quota_summary="$(agent_review_quota_summary_for_email)"
   body="PR #${pr} review cycle complete — no new feedback for ${idle_s}s.
 
-URL: ${url}
-Title: ${title}
+URL: ${agent_review_email_pr_url}
+Title: ${agent_review_email_pr_title}
 
 All review threads are addressed and responded to. No new reviews or comments
 arrived within AGENT_REVIEW_CYCLE_TIMEOUT (${idle_s}s).
@@ -121,7 +158,8 @@ ${quota_summary}
 Action: PR approved via gh as ${gh_user} when merge checks pass.
 Merge: verify with gh pr checks ${pr} before merge-it."
 
-  agent_review_email_send_plain "PR review cycle complete (idle): ${title} (#${pr})" "${body}"
+  agent_review_email_send_plain \
+    "PR review cycle complete (idle): ${agent_review_email_pr_title} (#${pr})" "${body}"
   printf 'Sent idle-complete email for PR #%s to %s\n' "${pr}" "${AGENT_REVIEW_REPORT_TO}" >&2
 }
 
@@ -195,18 +233,18 @@ agent_review_email_loop_stopped() {
   fi
 
   agent_review_require_cmd gh
-  IFS=$'\t' read -r title url < <(agent_review_email_pr_meta "${repo}" "${pr}")
+  agent_review_email_read_pr_meta "${repo}" "${pr}"
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
   pending_threads="$(ar_runner_jq_file "agent-review email pending threads" "${context_json}" -r '.pending_threads // empty')"
   head_sha="$(ar_runner_jq_file "agent-review email head sha" "${context_json}" -r '.head_sha // empty')"
   ci_conclusion="$(ar_runner_jq_file "agent-review email ci conclusion" "${context_json}" -r '.ci_conclusion // empty')"
   headline="$(agent_review_loop_stop_human_headline \
     "${exit_code}" "${reason_code}" "${pending_threads}")"
-  subject="PR agent review stopped: ${headline} — ${title} (#${pr})"
+  subject="PR agent review stopped: ${headline} — ${agent_review_email_pr_title} (#${pr})"
   body="The automated agent review loop stopped without reaching complete_ready.
 
-PR #${pr}: ${url}
-Title: ${title}
+PR #${pr}: ${agent_review_email_pr_url}
+Title: ${agent_review_email_pr_title}
 Reason: ${headline}
 Agent: ${agent_id}"
 
@@ -250,15 +288,15 @@ agent_review_post_fallback_comment() {
   local title url comment_body exit_code
 
   agent_review_require_cmd gh
-  IFS=$'\t' read -r title url < <(agent_review_email_pr_meta "${repo}" "${pr}")
+  agent_review_email_read_pr_meta "${repo}" "${pr}"
   comment_body="## Agent review fallback
 
 **${from_agent}** review quota or usage limit is exhausted; continuing with **${fallback_agent}** instead.
 
 ${reason}
 
-- **PR:** ${url}
-- **Title:** ${title}
+- **PR:** ${agent_review_email_pr_url}
+- **Title:** ${agent_review_email_pr_title}
 - **Previous agent:** ${from_agent}
 - **Fallback agent:** ${fallback_agent}"
 
@@ -281,15 +319,15 @@ agent_review_post_loop_stopped_comment() {
   local title url comment_body agent_id headline runner_exit
 
   agent_review_require_cmd gh
-  IFS=$'\t' read -r title url < <(agent_review_email_pr_meta "${repo}" "${pr}")
+  agent_review_email_read_pr_meta "${repo}" "${pr}"
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
   headline="$(agent_review_loop_stop_human_headline "${exit_code}" "${reason_code}")"
   comment_body="## Agent review loop stopped: ${headline}
 
 ${reason_detail}
 
-- **PR:** ${url}
-- **Title:** ${title}
+- **PR:** ${agent_review_email_pr_url}
+- **Title:** ${agent_review_email_pr_title}
 - **Agent:** ${agent_id}
 
 Manual follow-up required: triage remaining agent threads, push fixes, and re-run \`scripts/wait-for-agent-review loop --pr ${pr}\` when ready."

@@ -303,6 +303,18 @@ agent_review_use_agent() {
   agent_review_load_agent_profile
 }
 
+# True when the agent profile is auto-review only (no manual request).
+agent_review_agent_is_auto_review() {
+  local -r agent_id="$1"
+  local saved_agent auto_review
+
+  saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
+  agent_review_use_agent "${agent_id}"
+  auto_review="${agent_review_profile_auto_review:-false}"
+  agent_review_use_agent "${saved_agent}"
+  [[ "${auto_review}" == 'true' ]]
+}
+
 # Epoch seconds of the last successful agent_review_profile_request in this process.
 agent_review_last_request_epoch=0
 
@@ -331,12 +343,7 @@ agent_review_print_wait_for_review() {
 
 # Ordered fallback agents when the active profile hits quota (comma-separated).
 agent_review_quota_fallback_chain_raw() {
-  local chain="${AGENT_REVIEW_QUOTA_FALLBACK_CHAIN:-}"
-
-  if [[ -z "${chain}" ]]; then
-    chain="${AGENT_REVIEW_FALLBACK_AGENT:-bugbot},coderabbit"
-  fi
-  printf '%s' "${chain}"
+  agent_review_quota_escalation_chain_raw
 }
 
 # agent_review_quota_fallback_agent_at <index> — prints agent id or empty when exhausted.
@@ -523,7 +530,7 @@ query($owner:String!, $name:String!, $number:Int!) {
       }
       comments(last:30) {
         pageInfo { hasNextPage }
-        nodes { createdAt author { login __typename } }
+        nodes { createdAt author { login __typename } body }
       }
     }
   }
@@ -540,9 +547,14 @@ agent_review_graphql_request_snapshot() {
 query($owner:String!, $name:String!, $number:Int!) {
   repository(owner:$owner, name:$name) {
     pullRequest(number:$number) {
+      headRefOid
       reviewRequests(first:10) {
         pageInfo { hasNextPage }
         nodes { requestedReviewer { ... on User { login } ... on Bot { login } ... on Team { slug } } }
+      }
+      comments(last:30) {
+        pageInfo { hasNextPage }
+        nodes { body author { login } createdAt }
       }
     }
   }
@@ -831,6 +843,10 @@ agent_review_agent_requested_from_snapshot() {
   local -r snapshot="$1"
   local exit_code
 
+  if declare -F agent_review_profile_agent_requested_from_snapshot >/dev/null 2>&1; then
+    agent_review_profile_agent_requested_from_snapshot "${snapshot}"
+    return $?
+  fi
   # shellcheck disable=SC2154  # agent_review_profile_request_login_regex from sourced profile
   exit_code=0
   ar_runner_jq_file "agent-review agent requested" "${snapshot}" -e \
@@ -1585,7 +1601,8 @@ agent_review_requestable_agent_candidates() {
   done
 }
 
-# Activate the first profile whose daily quota is not cached exhausted. Returns 1 when none exist.
+# Activate the first profile in quota escalation order that is not cached exhausted
+# today (coderabbit → copilot → bugbot). Returns 1 when all are exhausted.
 agent_review_activate_first_requestable_agent() {
   local profiles_dir profile_path agent current
 
@@ -1604,12 +1621,27 @@ agent_review_activate_first_requestable_agent() {
     fi
     if [[ "${agent}" != "${current}" ]]; then
       agent_review_use_agent "${agent}"
-      printf 'wait-for-agent-review: using %s (skipped quota-exhausted agents)\n' "${agent}" >&2
+      printf 'wait-for-agent-review: using %s (quota escalation)\n' "${agent}" >&2
     fi
     printf '%s\n' "${agent}"
     return 0
-  done < <(agent_review_requestable_agent_candidates "${current}")
+  done < <(agent_review_quota_escalation_agent_ids)
   return 1
+}
+
+# Align AGENT_REVIEW_AGENT with the single probe agent for today (escalation order).
+agent_review_sync_active_probe_agent() {
+  local agent current
+
+  current="${AGENT_REVIEW_AGENT:-copilot}"
+  if ! agent="$(agent_review_quota_probe_agent_for_today 2>/dev/null)"; then
+    return 1
+  fi
+  if [[ "${agent}" != "${current}" ]]; then
+    agent_review_use_agent "${agent}"
+    printf 'wait-for-agent-review: active agent %s (quota escalation)\n' "${agent}" >&2
+  fi
+  return 0
 }
 
 # Exit 0 when a named PR check (e.g. CodeRabbit) is pending or in progress.
@@ -1666,8 +1698,12 @@ agent_review_quota_summary_for_email() {
     [[ -z "${agent}" ]] && continue
     if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
       status='exhausted (not waiting)'
-    else
+    elif agent_review_agent_quota_confirmed_for_agent "${agent}"; then
       status='available'
+    elif agent_review_agent_quota_probe_requested_for_agent "${agent}"; then
+      status='probe requested (awaiting review)'
+    else
+      status='unconfirmed (not probed today)'
     fi
     parts+=("${agent}: ${status}")
   done < <(agent_review_cycle_quota_agent_ids)
@@ -1686,6 +1722,21 @@ agent_review_pr_has_quota_issue_comment_today() {
     return 1
   fi
   today="$(agent_review_copilot_quota_local_day)"
+  if declare -F agent_review_profile_issue_comment_is_quota_exhausted >/dev/null; then
+    while IFS=$'\t' read -r created_at body login; do
+      [[ -n "${created_at}" ]] || continue
+      if ! agent_review_quota_timestamp_on_local_day "${created_at}" "${today}"; then
+        continue
+      fi
+      if agent_review_profile_issue_comment_is_quota_exhausted "${login}" "${body}"; then
+        return 0
+      fi
+    done < <(ar_runner_jq_file "agent-review quota issue comment scan" "${comments_json}" -rs '
+        [ .[] | .[] | [.created_at, (.body // ""), (.user.login // "")] ]
+        | .[]
+        | @tsv')
+    return 1
+  fi
   while IFS=$'\t' read -r created_at body; do
     [[ -n "${created_at}" ]] || continue
     if ! agent_review_quota_timestamp_on_local_day "${created_at}" "${today}"; then
@@ -1722,6 +1773,72 @@ agent_review_pr_issue_comments_json() {
   printf '%s' "${api_json}"
 }
 
+# Observe quota for one agent on the current PR head. Head reviews/checks run first so a
+# successful review on this PR clears stale exhaustion cached from other PRs. Returns 0 when
+# the daily cache was updated.
+agent_review_quota_observe_agent_on_pr() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r snapshot="$4"
+  local -r comments_json="$5"
+  local agent_id review_body run_json reason
+
+  agent_id="${agent_review_profile_id:-}"
+  [[ -n "${agent_id}" ]] || return 1
+
+  if [[ -n "${snapshot}" ]] && agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
+    review_body="$(agent_review_latest_agent_review_body_on_head "${snapshot}" "${head}")"
+    if [[ -n "${review_body}" ]] \
+      && agent_review_profile_review_is_quota_exhausted "${review_body}"; then
+      reason="${agent_id} review on ${repo}#${pr} head ${head:0:7} reports quota exhaustion."
+      agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}"
+      return 0
+    fi
+    reason="${agent_id} review on ${repo}#${pr} head ${head:0:7} confirms quota available."
+    agent_review_quota_mark_confirmed_for_agent "${agent_id}" "${reason}"
+    return 0
+  fi
+
+  if [[ -n "${snapshot}" && "${agent_review_profile_uses_head_check:-false}" == 'true' ]]; then
+    run_json="$(agent_review_head_check_run_json_for_head "${repo}" "${head}")"
+    if [[ -n "${run_json}" && "${run_json}" != 'null' ]] \
+      && agent_review_profile_head_check_is_quota_exhausted "${run_json}"; then
+      reason="${agent_id} check on ${repo}#${pr} head ${head:0:7} reports quota or usage limit."
+      agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}"
+      return 0
+    fi
+    if [[ -n "${run_json}" && "${run_json}" != 'null' ]] \
+      && declare -F agent_review_profile_head_check_is_complete >/dev/null 2>&1 \
+      && agent_review_profile_head_check_is_complete "${run_json}" \
+      && ! agent_review_profile_head_check_is_quota_exhausted "${run_json}"; then
+      reason="${agent_id} check on ${repo}#${pr} head ${head:0:7} confirms usage available."
+      agent_review_quota_mark_confirmed_for_agent "${agent_id}" "${reason}"
+      return 0
+    fi
+  fi
+
+  if [[ "${agent_id}" == 'copilot' ]] \
+    && agent_review_copilot_probe_comment_sent_for_head "${comments_json}" "${head}" \
+    && declare -F agent_review_agent_quota_probe_requested_for_agent >/dev/null 2>&1 \
+    && agent_review_agent_quota_probe_requested_for_agent copilot \
+    && ! agent_review_agent_quota_exhausted_for_agent copilot \
+    && [[ -n "${snapshot}" ]] \
+    && ! agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
+    reason="Copilot probe on ${repo}#${pr} head ${head:0:7}: no review after request (likely quota)."
+    agent_review_quota_mark_exhausted_for_agent copilot "${reason}"
+    return 0
+  fi
+
+  if agent_review_pr_has_quota_issue_comment_today "${repo}" "${pr}" "${comments_json}"; then
+    reason="${agent_id} billing comment on ${repo}#${pr} reports quota or usage limit."
+    agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}"
+    return 0
+  fi
+
+  return 1
+}
+
 # Scan Copilot, Bugbot, and CodeRabbit quota signals on the current PR head and persist
 # exhaustion for the local calendar day (source=observed). Returns 0 when any agent was
 # newly marked exhausted.
@@ -1730,7 +1847,7 @@ agent_review_observe_all_agent_quota_on_pr() {
   local -r pr="$2"
   local -r head="$3"
   local -r snapshot="${4:-}"
-  local saved_agent agent profiles_dir profile_path reason review_body run_json comments_json
+  local saved_agent agent profiles_dir profile_path comments_json
   local observed=0
 
   [[ -n "${repo}" && -n "${pr}" && -n "${head}" ]] || return 1
@@ -1739,37 +1856,13 @@ agent_review_observe_all_agent_quota_on_pr() {
   comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
   while IFS= read -r agent || [[ -n "${agent}" ]]; do
     [[ -z "${agent}" ]] && continue
-    if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
-      continue
-    fi
     profile_path="${profiles_dir}/${agent}"
     if [[ ! -f "${profile_path}" ]]; then
       continue
     fi
     agent_review_use_agent "${agent}"
-    if [[ "${agent_review_profile_uses_head_check:-false}" == 'true' ]]; then
-      run_json="$(agent_review_head_check_run_json_for_head "${repo}" "${head}")"
-      if [[ -n "${run_json}" && "${run_json}" != 'null' ]] \
-        && agent_review_profile_head_check_is_quota_exhausted "${run_json}"; then
-        reason="${agent} GitHub check on head ${head:0:7} reports quota or usage limit (PR #${pr})."
-        agent_review_quota_mark_exhausted_for_agent "${agent}" "${reason}"
-        observed=1
-        continue
-      fi
-    fi
-    if [[ -n "${snapshot}" ]] \
-      && agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
-      review_body="$(agent_review_latest_agent_review_body_on_head "${snapshot}" "${head}")"
-      if agent_review_profile_review_is_quota_exhausted "${review_body}"; then
-        reason="${agent} review on head ${head:0:7} reports quota exhaustion (PR #${pr})."
-        agent_review_quota_mark_exhausted_for_agent "${agent}" "${reason}"
-        observed=1
-        continue
-      fi
-    fi
-    if agent_review_pr_has_quota_issue_comment_today "${repo}" "${pr}" "${comments_json}"; then
-      reason="${agent} PR comment today reports quota or usage limit (PR #${pr})."
-      agent_review_quota_mark_exhausted_for_agent "${agent}" "${reason}"
+    if agent_review_quota_observe_agent_on_pr \
+      "${repo}" "${pr}" "${head}" "${snapshot}" "${comments_json}"; then
       observed=1
     fi
   done < <(agent_review_cycle_quota_agent_ids)
