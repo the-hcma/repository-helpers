@@ -5,7 +5,8 @@
 ![Bash 5.x](https://img.shields.io/badge/bash-5.x-4EAA25?logo=gnu-bash&logoColor=white)
 
 Pure Bash helpers for keeping repositories maintained: dependency update PRs, repository
-practice audits, systemd user services, and Graphite-based development workflow support.
+practice audits, agent review automation, systemd user services, and Graphite-based
+development workflow support.
 
 ## Highlights
 
@@ -18,6 +19,11 @@ practice audits, systemd user services, and Graphite-based development workflow 
   and Dependabot auto-merge.
 - `scripts/github-repo-lint --enforcer` runs those practice checks daily across local
   clones and emails a compliance report.
+- `scripts/wait-for-agent-review` runs the PR agent review loop (CodeRabbit, Copilot,
+  Bugbot, humans): CI gating, thread triage, dual-timeout idle-success, quota skip,
+  approve, and operator email.
+- `scripts/dev/ship-and-review` submits a Graphite stack, waits for CI, then runs the
+  agent review loop end-to-end.
 - `scripts/setup-service` installs worktree-aware systemd user services from templates.
 - `scripts/dev/start-development` creates and resumes Graphite worktrees safely.
 
@@ -164,21 +170,71 @@ staleness checks. See [AGENTS.md](AGENTS.md#on-deploy-hooks) and
 
 ## Development
 
-Start work in a Graphite worktree:
+Start work in a Graphite worktree (never edit the primary clone directly):
 
 ```bash
 scripts/dev/start-development --worktree my-change --no-interactive
+cd .worktrees/my-change-wt
+gt create my-change/topic -m 'feat: …'
 ```
 
-Before submitting a stack:
+Local quality gates and submit:
 
 ```bash
-scripts/dev/pre-pr-checks
-scripts/dev/submit-stack
+scripts/dev/pre-pr-checks          # bash -n, shellcheck, all tests/*.test
+scripts/dev/submit-stack           # pre-pr-checks + gt submit + CI wait
 ```
 
-See [AGENTS.md](AGENTS.md) for coding conventions and [GRAPHITE.md](GRAPHITE.md) for
-the branch stacking and PR workflow.
+End-to-end ship (submit + CI + agent review loop):
+
+```bash
+scripts/dev/ship-and-review
+# or, when the PR already exists:
+scripts/dev/ship-and-review --no-submit --pr <n>
+```
+
+After every push, wait for CI on the PR head (included in `submit-stack` by default):
+
+```bash
+scripts/dev/post-pr-submission-checks --pr <n>
+```
+
+When CI is green, run the agent review loop (reply on-thread before resolving threads):
+
+```bash
+scripts/wait-for-agent-review loop --pr <n>
+```
+
+Configure `~/.config/agent-review.env` from `etc/agent-review.env.example` (SMTP,
+`AGENT_REVIEW_REPORT_TO`, dual-timeout defaults: **15m** idle-success,
+**12h** PR non-convergence cap).
+
+See [AGENTS.md](AGENTS.md) for coding conventions, utility index, and agent-review
+details; [GRAPHITE.md](GRAPHITE.md) for branch stacking and the merge queue.
+
+## Scripts reference
+
+| Script | Purpose |
+| --- | --- |
+| `scripts/dep-updater` | Dependency bumps → Graphite PR(s) for one repo. |
+| `scripts/dep-updater-batch-run` | Daily batch across a scan root; email report. |
+| `scripts/github-repo-lint` | Org repo practices audit / `--apply-fix`. |
+| `scripts/check-merge-settings` | Merge + Graphite settings only. |
+| `scripts/check-lockfile-drift` | Lockfile vs manifest drift check. |
+| `scripts/grandfather-pnpm-release-age` | One-time pnpm release-age cutover helper. |
+| `scripts/wait-for-agent-review` | Agent review loop, triage, approve, email. |
+| `scripts/trigger-agent-review` | Request a review from the configured agent profile. |
+| `scripts/setup-service` | Install worktree-aware systemd user unit. |
+| `scripts/setup-github-repo-lint` | Install repo-lint timer/service. |
+| `scripts/show-services` | Status of all service templates in this repo. |
+| `scripts/dev/start-development` | Worktree + Graphite sync entry point. |
+| `scripts/dev/pre-pr-checks` | Full local CI mirror. |
+| `scripts/dev/submit-stack` | Checks, submit, CI wait. |
+| `scripts/dev/post-pr-submission-checks` | PR CI poll + agent-friendly failure logs. |
+| `scripts/dev/ship-and-review` | Submit + CI + agent review loop. |
+
+Shared libraries: `scripts/lib/` (`runner`, `repo-practices`, `agent-review`,
+`on-deploy-deps`, `release-age-defaults`, …).
 
 ## Testing
 

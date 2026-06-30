@@ -1,6 +1,31 @@
-# AGENTS.md — Ground Rules for dep-updater
+# AGENTS.md — Ground Rules for repository-helpers
 
 This file defines the non-negotiable standards for all contributors (human or AI) working on this codebase. Every change must comply with these rules before it is considered complete.
+
+---
+
+## Utilities overview
+
+Top-level scripts (see [README.md](./README.md) for operator-oriented summaries):
+
+| Area | Script | Role |
+| --- | --- | --- |
+| Dependencies | `scripts/dep-updater` | Create stacked dependency-update PRs (npm, Python, Rust, Actions). |
+| Batch automation | `scripts/dep-updater-batch-run` | Daily `--batch --all` across a scan root; email report. |
+| Repo practices | `scripts/github-repo-lint` | Audit/onboard org repos (merge queue, `protect-main`, workflows). |
+| Merge settings | `scripts/check-merge-settings` | Thin wrapper (merge + Graphite only). |
+| Lockfile drift | `scripts/check-lockfile-drift` | Compare lockfiles to registry constraints. |
+| pnpm cutover | `scripts/grandfather-pnpm-release-age` | One-time `minimumReleaseAgeExclude` for existing lockfiles. |
+| Systemd | `scripts/setup-service`, `scripts/setup-github-repo-lint`, `scripts/show-services` | Install timers/units; status summary. |
+| Deploy hook | `scripts/on-deploy` | Example hook; consumer repos implement their own. |
+| Agent review | `scripts/wait-for-agent-review`, `scripts/trigger-agent-review` | PR review loop, triage, approve, operator email. |
+| Dev workflow | `scripts/dev/start-development` | Worktree + Graphite sync entry point. |
+| Dev workflow | `scripts/dev/pre-pr-checks` | Local CI mirror (`bash -n`, `shellcheck`, all tests). |
+| Dev workflow | `scripts/dev/submit-stack` | `pre-pr-checks` → `gt submit` → `post-pr-submission-checks`. |
+| Dev workflow | `scripts/dev/post-pr-submission-checks` | Wait for PR CI; print agent-friendly failure excerpts. |
+| Dev workflow | `scripts/dev/ship-and-review` | Submit + CI wait + `wait-for-agent-review loop`. |
+
+Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review, on-deploy-deps, release-age-defaults, …).
 
 ---
 
@@ -309,10 +334,23 @@ After every push, **`scripts/dev/post-pr-submission-checks --pr <n>`** must pass
 
 When CI is green, run the **agent review loop** documented in **`.cursor/rules/pr-ship-and-review.mdc`**:
 
-1. `scripts/trigger-agent-review --pr <n>` — request review from the configured agent (default: Copilot)
-2. Iterate with `scripts/wait-for-agent-review` (`wait`, `check`, thread triage, `restack`) until `complete_ready`
-3. On exit **3**, triage each thread: fix → **`reply-thread`** (on-thread human reply) → **`resolve-thread`** — never resolve without replying first
-4. `scripts/wait-for-agent-review complete --pr <n>` — **approve PR** (authenticated `gh` user) and email `AGENT_REVIEW_REPORT_TO` when Copilot reports **“generated no new comments”**
+1. Prefer **`./scripts/wait-for-agent-review loop --pr <n>`** (or `scripts/dev/ship-and-review` from submit).
+2. On exit **3**, triage each thread: fix → **`reply-thread`** (on-thread human reply) → **`resolve-thread`** — never resolve without replying first.
+3. **`./scripts/wait-for-agent-review complete --pr <n>`** when `check` reports `complete_ready`, or let **`loop`** exit **0** via idle-success (15m with no new activity).
+4. Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`.
+
+#### Dual-timeout loop and per-agent quota skip
+
+- **`AGENT_REVIEW_CYCLE_TIMEOUT`** (default **15m**): **idle-success** window after all threads are
+  addressed, CI is green, and the PR is merge-ready. Any new review or comment from any party
+  (CodeRabbit, Copilot, Bugbot, humans) resets the clock. When no activity arrives for 15m,
+  `cmd_complete_idle` approves and emails — **without** requiring Copilot **“generated no new comments”**.
+- **`AGENT_REVIEW_PR_TIMEOUT`** (default **12h**): non-convergence cap when review cycles keep
+  iterating without reaching idle-success; exit **6** triggers give-up (not the idle-success path).
+
+Per-agent daily quota caches skip review requests for exhausted agents (CodeRabbit, Copilot, Bugbot)
+and probe the next agent in `AGENT_REVIEW_QUOTA_FALLBACK_CHAIN` (see
+`.cursor/rules/pr-ship-and-review.mdc`).
 
 Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`. Set `AGENT_REVIEW_AGENT=copilot` or another supported profile under `scripts/lib/agent-review-profiles/`.
 
