@@ -75,13 +75,17 @@ captures FQDN and `/etc/machine-id` into the files above. Other machines can
 run `setup-service` to install or refresh units (e.g. over NFS), but scheduled
 jobs must not run there.
 
-`host_runs_units` (used by `setup-service`) requires **both**:
+`host_runs_units` (used by `setup-service`) is true when local `/etc/machine-id`
+matches `~/.config/user-services-machine-id` **and** the hostname matches
+`~/.config/user-services-host`. Timers enable on that host only; standbys get
+`timer_standby_disable`.
 
-1. Local `/etc/machine-id` matches `~/.config/user-services-machine-id`, **and**
-2. Local **systemd ≥ 259** (so machine-id `ConditionHost` is reliable).
+**systemd ≥ 259** is required for machine-id `ConditionHost` to be reliable in
+units. On older systemd (e.g. meerkat today), the hostname `ConditionHost` line
+is the active guard; upgrade systemd when possible so both guards apply.
 
 `setup-service --status` reports whether this machine matches the configured
-service host and systemd version.
+service host and notes when systemd is below 259.
 
 **Standby hosts** (same NFS home, e.g. keylime): `setup-service` **disables**
 timer units (`systemctl --user disable --now …`) so shared
