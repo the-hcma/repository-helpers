@@ -37,46 +37,66 @@ New timer oneshots must use both conventions.
 Unit **templates** (with `@@REPO_DIR@@`) live in each repository's `etc/systemd/`.
 `setup-service` expands them into `~/.config/systemd/user/` and mirrors the
 expanded units under `~/.config/share/systemd-units/`.
-`setup-service` injects **`ConditionHost=|<machine-id>`** using the value in
-`~/.config/user-services-machine-id` (and records short hostname / FQDN in
-`user-services-host` / `user-services-host-fqdn` for status output) so units
+`setup-service` injects **`ConditionHost=|<machine-id>`** and **`ConditionHost=|<hostname>`** (both triggering) using the values in
+`~/.config/user-services-machine-id` and `~/.config/user-services-host`
+(and records FQDN in `user-services-host-fqdn` for status output) so units
 run on one designated machine even when `~/.config/systemd/user/` is on NFS.
 Re-run `setup-service` after changing the service host so installed units pick up
 fresh guard lines.
 
 ### Service host (single-machine guard)
 
-Units are pinned with a single **`ConditionHost=|<machine-id>`** line — the
-32-character hex value from `/etc/machine-id` on the service host
-(`ConditionHost` accepts machine-id as a host identifier on systemd 259+).
+Units are pinned with **two** `ConditionHost=` lines after `[Unit]`:
+
+| Line | Purpose |
+| --- | --- |
+| `ConditionHost=\|<machine-id>` | 32-char hex from `/etc/machine-id` on the service host (**systemd 259+**). |
+| `ConditionHost=\|<short-hostname>` | Hostname OR-fallback — active guard on **older systemd**; also matches on 259+. |
 
 ```ini
 # Service host: meerkat (meerkat.house.hcma; machine-id 7aeaef81…)
 ConditionHost=|7aeaef81ca2647d09d2c2ef67e36bc84
+ConditionHost=|meerkat
 ```
 
-The `|` prefix marks a **triggering** condition (see
-[systemd unit conditions](https://www.freedesktop.org/software/systemd/man/systemd.unit.html#Conditions%20and%20Asserts)).
-Only the machine-id line is injected into units; hostname labels in the comment
-and config files are for humans running `setup-service --status`.
+Both lines use the `|` (**triggering**) prefix, giving **OR** semantics: the unit
+runs when the local machine-id matches (systemd 259+) **or** when the hostname
+matches (all systemd versions). See
+[systemd unit conditions](https://www.freedesktop.org/software/systemd/man/systemd.unit.html#Conditions%20and%20Asserts).
+
+> **Why both triggering?** A non-triggering `ConditionHost=<hostname>` would be
+> blocked on pre-259 systemd because `ConditionHost=|<machine-id>` (the only
+> triggering condition) always fails there — a hostname string never equals a
+> 32-char hex machine-id. Making the hostname condition triggering too restores OR
+> semantics so units run correctly on the designated host at any systemd version.
 
 | File | Purpose |
 | --- | --- |
-| `~/.config/user-services-host` | Short hostname label (e.g. `meerkat`) — prompts and status |
+| `~/.config/user-services-host` | Short hostname label (e.g. `meerkat`) — prompts, status, and hostname `ConditionHost` |
 | `~/.config/user-services-host-fqdn` | FQDN from `hostname` on the service host (e.g. `meerkat.house.hcma`) |
 | `~/.config/user-services-machine-id` | 32-char hex ID from `/etc/machine-id` on the service host |
 
 On the **first** `setup-service` run on the configured service host, the script
 captures FQDN and `/etc/machine-id` into the files above. Other machines can
-run `setup-service` to install or refresh units (e.g. over NFS), but systemd will
-not start them there. `setup-service --status` reports whether this machine
-matches the configured service host.
+run `setup-service` to install or refresh units (e.g. over NFS), but scheduled
+jobs must not run there.
 
-**Standby hosts** (e.g. a backup machine with the same NFS home): leave timer
-units **disabled** (`systemctl --user disable --now dep-updater.timer`
-`github-repo-lint.timer`). `setup-service` enables timers only on the service
-host (`host_runs_units`); re-running it on a standby host must not pass
-`--now` to timers.
+`host_runs_units` (used by `setup-service`) is true when local `/etc/machine-id`
+matches `~/.config/user-services-machine-id` **and** the hostname matches
+`~/.config/user-services-host`. Timers enable on that host only; standbys get
+`timer_standby_disable`.
+
+**systemd ≥ 259** is required for machine-id `ConditionHost` to be reliable in
+units. On older systemd (e.g. meerkat today), the hostname `ConditionHost` line
+is the active guard; upgrade systemd when possible so both guards apply.
+
+`setup-service --status` reports whether this machine matches the configured
+service host and notes when systemd is below 259.
+
+**Standby hosts** (same NFS home, e.g. keylime): `setup-service` **disables**
+timer units (`systemctl --user disable --now …`) so shared
+`timers.target.wants/` symlinks do not arm the wrong machine. Re-run
+`setup-service` on **meerkat** after changes to re-enable timers there.
 
 Use `scripts/show-services` for a read-only overview of every service template in
 this repo:
