@@ -83,6 +83,7 @@ readonly expanded_units_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/share/systemd-u
 readonly condition_host_config_path="${HOME}/.config/user-services-host"
 readonly condition_host_fqdn_config_path="${HOME}/.config/user-services-host-fqdn"
 readonly condition_machine_id_config_path="${HOME}/.config/user-services-machine-id"
+readonly service_host_min_systemd_version=259
 condition_host_value=""
 condition_host_fqdn_value=""
 condition_host_machine_id=""
@@ -194,7 +195,7 @@ prompt_for_condition_host() {
         die "Service host required: create ${condition_host_config_path} or pass --condition-host NAME"
     fi
 
-    echo "Systemd user units run on a single host (ConditionHost=|<machine-id>)."
+    echo "Systemd user units run on a single host (ConditionHost=|<machine-id> on systemd ${service_host_min_systemd_version}+, plus hostname fallback)."
     read -r -p "Hostname where services should run [${default_host}]: " input
     input="${input#"${input%%[![:space:]]*}"}"
     input="${input%"${input##*[![:space:]]}"}"
@@ -326,14 +327,58 @@ load_machine_id_from_installed_units_for_status() {
     return 1
 }
 
-# host_runs_units
+# systemd_user_version_major
+# Prints the systemd user-session version major (first integer on the version line).
+systemd_user_version_major() {
+    local version_line major
+
+    version_line="$(systemctl --version 2>/dev/null | head -n1 || true)"
+    if [[ "$version_line" =~ ^systemd[[:space:]]+([0-9]+) ]]; then
+        major="${BASH_REMATCH[1]}"
+        printf '%s\n' "$major"
+        return 0
+    fi
+    return 1
+}
+
+# systemd_supports_machine_id_condition_host
+# True when ConditionHost=|<machine-id> is understood (systemd 259+).
+systemd_supports_machine_id_condition_host() {
+    local major
+
+    major="$(systemd_user_version_major)" || return 1
+    (( major >= service_host_min_systemd_version ))
+}
+
+# host_machine_id_matches
 # True when this machine's /etc/machine-id matches the configured service host.
-host_runs_units() {
+host_machine_id_matches() {
     local local_id
 
     [[ -n "$condition_host_machine_id" ]] || return 1
     local_id="$(read_local_machine_id)" || return 1
     [[ "$local_id" == "$condition_host_machine_id" ]]
+}
+
+# host_runs_units
+# True when this machine is the designated service host (machine-id + systemd 259+).
+host_runs_units() {
+    host_machine_id_matches && systemd_supports_machine_id_condition_host
+}
+
+# timer_standby_disable
+# On NFS-shared homes, disable timer symlinks on hosts that must not run scheduled jobs.
+timer_standby_disable() {
+    local -r timer_filename="$1"
+    local enabled_state
+
+    enabled_state="$(systemctl --user is-enabled "$timer_filename" 2>/dev/null || true)"
+    case "$enabled_state" in
+        enabled|linked|linked-runtime)
+            systemctl --user disable --now "$timer_filename" 2>/dev/null || true
+            echo "⏭️  ${timer_filename}: disabled on $(current_hostname_short) (shared NFS — timers run only on ${condition_host_value})."
+            ;;
+    esac
 }
 
 # warn_host_skips_service
@@ -342,9 +387,14 @@ warn_host_skips_service() {
     local current_host
 
     current_host="$(current_hostname_short)"
-    if ! host_runs_units; then
-        echo "⚠️  WARNING: Service host ${condition_host_value} (machine-id ${condition_host_machine_id}) but this machine is ${current_host}; systemd will not run these units here."
+    if host_runs_units; then
+        return 0
     fi
+    if host_machine_id_matches && ! systemd_supports_machine_id_condition_host; then
+        echo "⚠️  WARNING: Service host ${condition_host_value} (machine-id ${condition_host_machine_id}) matches this machine, but systemd $(systemd_user_version_major 2>/dev/null || echo '?') is older than ${service_host_min_systemd_version}; upgrade systemd or rely on hostname ConditionHost only."
+        return 0
+    fi
+    echo "⚠️  WARNING: Service host ${condition_host_value} (machine-id ${condition_host_machine_id}) but this machine is ${current_host}; systemd will not run these units here."
 }
 
 # discover_unit_basenames
@@ -1050,10 +1100,13 @@ check_status() {
         if resolve_service_host_machine_id; then
             if host_runs_units; then
                 if [[ -n "$condition_host_fqdn_value" ]]; then
-                    echo "✅ Host:     ${condition_host_value} (${condition_host_fqdn_value}; machine-id ${condition_host_machine_id}) — this machine"
+                    echo "✅ Host:     ${condition_host_value} (${condition_host_fqdn_value}; machine-id ${condition_host_machine_id}; systemd $(systemd_user_version_major)) — this machine"
                 else
-                    echo "✅ Host:     ${condition_host_value} (machine-id ${condition_host_machine_id}) — this machine"
+                    echo "✅ Host:     ${condition_host_value} (machine-id ${condition_host_machine_id}; systemd $(systemd_user_version_major)) — this machine"
                 fi
+            elif host_machine_id_matches && ! systemd_supports_machine_id_condition_host; then
+                echo "❌ Host:     ${condition_host_value} (machine-id ${condition_host_machine_id}) — systemd $(systemd_user_version_major 2>/dev/null || echo '?') < ${service_host_min_systemd_version}; cannot enable timers here"
+                overall_good=false
             else
                 if [[ -n "$condition_host_fqdn_value" ]]; then
                     echo "⚠️  Host:     ${condition_host_value} (${condition_host_fqdn_value}; machine-id ${condition_host_machine_id}) — this machine is $(current_hostname_short); units skip here"
@@ -1543,29 +1596,26 @@ while IFS= read -r unit_basename; do
         # default.target (that caused a second run on every user-session start, overlapping
         # the daily timer and doubling GitHub API traffic).
         timer_only_drop_stale_default_target_link "$service_filename"
-        echo "⏰ Enabling timer: ${timer_filename}"
         if host_runs_units; then
+            echo "⏰ Enabling timer: ${timer_filename}"
             systemctl --user enable --now "$timer_filename"
-        else
-            systemctl --user enable "$timer_filename"
-            echo "⏭️  ${timer_filename}: enabled but not started on $(current_hostname_short) (service host ${condition_host_value} / ${condition_host_machine_id})."
-        fi
-        if host_runs_units; then
             echo "⏭️  ${service_filename}: oneshot — runs on timer schedule (not started now)."
         else
+            timer_standby_disable "$timer_filename"
             echo "⏭️  ${service_filename}: oneshot — skipped on $(current_hostname_short) (service host ${condition_host_value} / ${condition_host_machine_id})."
         fi
         continue
     fi
 
-    systemctl --user enable "$service_filename"
+    if host_runs_units; then
+        systemctl --user enable "$service_filename"
+    fi
     if [[ -f "$local_source_timer" ]]; then
-        echo "⏰ Enabling timer: ${timer_filename}"
         if host_runs_units; then
+            echo "⏰ Enabling timer: ${timer_filename}"
             systemctl --user enable --now "$timer_filename"
         else
-            systemctl --user enable "$timer_filename"
-            echo "⏭️  ${timer_filename}: enabled but not started on $(current_hostname_short) (service host ${condition_host_value} / ${condition_host_machine_id})."
+            timer_standby_disable "$timer_filename"
         fi
     fi
 

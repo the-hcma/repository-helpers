@@ -46,37 +46,47 @@ fresh guard lines.
 
 ### Service host (single-machine guard)
 
-Units are pinned with a single **`ConditionHost=|<machine-id>`** line — the
-32-character hex value from `/etc/machine-id` on the service host
-(`ConditionHost` accepts machine-id as a host identifier on systemd 259+).
+Units are pinned with **two** `ConditionHost=` lines after `[Unit]`:
+
+| Line | Purpose |
+| --- | --- |
+| `ConditionHost=\|<machine-id>` | 32-char hex from `/etc/machine-id` on the service host (**systemd 259+**). |
+| `ConditionHost=<short-hostname>` | Hostname fallback for **older systemd** on NFS standbys. |
 
 ```ini
 # Service host: meerkat (meerkat.house.hcma; machine-id 7aeaef81…)
 ConditionHost=|7aeaef81ca2647d09d2c2ef67e36bc84
+ConditionHost=meerkat
 ```
 
-The `|` prefix marks a **triggering** condition (see
+The `|` prefix on the machine-id line marks a **triggering** condition (see
 [systemd unit conditions](https://www.freedesktop.org/software/systemd/man/systemd.unit.html#Conditions%20and%20Asserts)).
-Only the machine-id line is injected into units; hostname labels in the comment
-and config files are for humans running `setup-service --status`.
+Hostname labels in the comment and config files are for humans running
+`setup-service --status`.
 
 | File | Purpose |
 | --- | --- |
-| `~/.config/user-services-host` | Short hostname label (e.g. `meerkat`) — prompts and status |
+| `~/.config/user-services-host` | Short hostname label (e.g. `meerkat`) — prompts, status, and hostname `ConditionHost` |
 | `~/.config/user-services-host-fqdn` | FQDN from `hostname` on the service host (e.g. `meerkat.house.hcma`) |
 | `~/.config/user-services-machine-id` | 32-char hex ID from `/etc/machine-id` on the service host |
 
 On the **first** `setup-service` run on the configured service host, the script
 captures FQDN and `/etc/machine-id` into the files above. Other machines can
-run `setup-service` to install or refresh units (e.g. over NFS), but systemd will
-not start them there. `setup-service --status` reports whether this machine
-matches the configured service host.
+run `setup-service` to install or refresh units (e.g. over NFS), but scheduled
+jobs must not run there.
 
-**Standby hosts** (e.g. a backup machine with the same NFS home): leave timer
-units **disabled** (`systemctl --user disable --now dep-updater.timer`
-`github-repo-lint.timer`). `setup-service` enables timers only on the service
-host (`host_runs_units`); re-running it on a standby host must not pass
-`--now` to timers.
+`host_runs_units` (used by `setup-service`) requires **both**:
+
+1. Local `/etc/machine-id` matches `~/.config/user-services-machine-id`, **and**
+2. Local **systemd ≥ 259** (so machine-id `ConditionHost` is reliable).
+
+`setup-service --status` reports whether this machine matches the configured
+service host and systemd version.
+
+**Standby hosts** (same NFS home, e.g. keylime): `setup-service` **disables**
+timer units (`systemctl --user disable --now …`) so shared
+`timers.target.wants/` symlinks do not arm the wrong machine. Re-run
+`setup-service` on **meerkat** after changes to re-enable timers there.
 
 Use `scripts/show-services` for a read-only overview of every service template in
 this repo:
