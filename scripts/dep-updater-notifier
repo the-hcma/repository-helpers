@@ -170,6 +170,43 @@ dun_actionable_fail_reason_from_stderr() {
   printf 'exit code %s' "$exit_code"
 }
 
+# dun_scan_cmd_display <repo_dir>
+dun_scan_cmd_display() {
+  local -r repo="$1"
+  printf '%s --report-json --dir %s' "$dep_updater" "$repo"
+}
+
+# dun_runner_last_failure_cmdline
+# Quoted cmdline from the most recent failed run_command in this session.
+dun_runner_last_failure_cmdline() {
+  local uuid
+  uuid="$(runner_session_failed_ids | tail -n 1)"
+  [[ -n "$uuid" ]] || return 0
+  runner_read "$uuid" cmdline 2>/dev/null || true
+}
+
+# dun_record_failure <summary> [command]
+dun_record_failure() {
+  local -r summary="$1"
+  local -r cmd="${2:-}"
+
+  found_failure=1
+  failure_summary_lines+=("$summary")
+  failure_cmd_lines+=("$cmd")
+}
+
+# dun_append_failure_report <repo_name> <fail_reason> <command>
+dun_append_failure_report() {
+  local -r repo_name="$1"
+  local -r fail_reason="$2"
+  local -r cmd="$3"
+
+  append_report "=== ${repo_name} === (scan failed: ${fail_reason})"
+  if [[ -n "$cmd" ]]; then
+    append_report "command: ${cmd}"
+  fi
+}
+
 discover_repos() {
   local -r roots_csv="${DEP_UPDATER_NOTIFIER_ROOTS:-$default_repo_root}"
   local -r repos_csv="${DEP_UPDATER_NOTIFIER_REPOS:-}"
@@ -196,12 +233,15 @@ discover_repos() {
 
 check_notifier_prereqs() {
   local missing=0
+  local -r prereq_cmd='dep-updater-notifier prerequisite check'
   if ! command -v jq >/dev/null 2>&1; then
     missing=$(( missing + 1 ))
     warn "Missing required tool in PATH: jq"
     append_report "=== notifier prerequisites ==="
     append_report "Missing required tool in PATH: jq"
+    append_report "command: ${prereq_cmd}"
     append_report ""
+    dun_record_failure 'missing required tool in PATH: jq' "$prereq_cmd"
   fi
   if (( print_only == 0 )); then
     if [[ "${REPO_HELPERS_TEST_MODE:-0}" != '1' ]] \
@@ -210,13 +250,43 @@ check_notifier_prereqs() {
       warn "Missing required tool in PATH: sendmail (MTA)"
       append_report "=== notifier prerequisites ==="
       append_report "Missing required tool in PATH: sendmail (MTA)"
+      append_report "command: ${prereq_cmd}"
       append_report ""
+      dun_record_failure 'missing required tool in PATH: sendmail (MTA)' "$prereq_cmd"
     fi
   fi
+}
 
-  if (( missing > 0 )); then
-    found_failure=1
+dun_emit_failure_stderr() {
+  local i line cmd
+
+  if (( found_failure == 0 )); then
+    return 0
   fi
+
+  if (( ${#failure_summary_lines[@]} == 0 )); then
+    printf 'ERROR: dep-updater-notifier failed (see email for repo details)\n' >&2
+    return 0
+  fi
+
+  if (( ${#failure_summary_lines[@]} == 1 )); then
+    printf 'ERROR: dep-updater-notifier failed: %s\n' "${failure_summary_lines[0]}" >&2
+    cmd="${failure_cmd_lines[0]:-}"
+    if [[ -n "$cmd" ]]; then
+      printf '  command: %s\n' "$cmd" >&2
+    fi
+    return 0
+  fi
+
+  printf 'ERROR: dep-updater-notifier failed (%d issue(s)):\n' \
+    "${#failure_summary_lines[@]}" >&2
+  for i in "${!failure_summary_lines[@]}"; do
+    printf '  - %s\n' "${failure_summary_lines[$i]}" >&2
+    cmd="${failure_cmd_lines[$i]:-}"
+    if [[ -n "$cmd" ]]; then
+      printf '    command: %s\n' "$cmd" >&2
+    fi
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -248,6 +318,8 @@ scan_host="$(dun_runner_exec_stdout "dep-updater-notifier hostname" -- hostname 
 report_lines=()
 notice_lines=()
 update_repos_paths=()
+failure_summary_lines=()
+failure_cmd_lines=()
 found_any=0
 found_cve=0
 found_failure=0
@@ -261,11 +333,15 @@ mapfile -t repos < <(dun_runner_exec_stdout "dep-updater-notifier sort repos" --
 rm -f "$_repo_discover_file"
 
 if (( ${#repos[@]} == 0 )); then
-  found_failure=1
+  discover_cmd="discover_repos (roots: ${DEP_UPDATER_NOTIFIER_ROOTS:-$default_repo_root})"
+  dun_record_failure \
+    'no git repos discovered (set DEP_UPDATER_NOTIFIER_ROOTS/DEP_UPDATER_NOTIFIER_REPOS)' \
+    "$discover_cmd"
   warn "No git repos discovered (set DEP_UPDATER_NOTIFIER_ROOTS/DEP_UPDATER_NOTIFIER_REPOS)."
   append_report "=== notifier ==="
   append_report "No git repos discovered."
   append_report "Set DEP_UPDATER_NOTIFIER_ROOTS (colon-separated) and/or DEP_UPDATER_NOTIFIER_REPOS."
+  append_report "command: ${discover_cmd}"
   append_report ""
 fi
 
@@ -293,8 +369,13 @@ for repo in "${repos[@]}"; do
   set -e
 
   dep_err_text=""
+  dep_scan_cmd=""
   if [[ "$exit_code" -ne 0 ]]; then
     dep_err_text="$(runner_last_failure_capture_stderr 200 2>/dev/null || true)"
+    dep_scan_cmd="$(dun_runner_last_failure_cmdline)"
+  fi
+  if [[ -z "$dep_scan_cmd" ]]; then
+    dep_scan_cmd="$(dun_scan_cmd_display "$repo")"
   fi
 
   if [[ "$verbose" == '1' ]]; then
@@ -321,8 +402,8 @@ for repo in "${repos[@]}"; do
     fi
 
     log "${repo_name}: scan failed (${fail_reason})."
-    found_failure=1
-    append_report "=== ${repo_name} === (scan failed: ${fail_reason})"
+    dun_record_failure "${repo_name}: ${fail_reason}" "$dep_scan_cmd"
+    dun_append_failure_report "$repo_name" "$fail_reason" "$dep_scan_cmd"
     if [[ -n "$dep_err_text" ]]; then
       append_report "dep-updater stderr:"
       while IFS= read -r eline || [[ -n "$eline" ]]; do
@@ -501,6 +582,7 @@ if (( print_only == 1 )); then
   printf 'Subject: %s\n\n' "$subject"
   printf '%s\n' "$body"
   if (( found_failure == 1 )); then
+    dun_emit_failure_stderr
     exit 1
   fi
   exit 0
@@ -541,6 +623,6 @@ html_body="$(dun_runner_exec_stdout "dep-updater-notifier html escape" -- sed 's
   || die "sendmail failed — is a mail transfer agent configured?"
 
 if (( found_failure == 1 )); then
-  printf 'ERROR: dep-updater-notifier failed\n' >&2
+  dun_emit_failure_stderr
   exit 1
 fi
