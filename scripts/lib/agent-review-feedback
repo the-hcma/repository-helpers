@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# agent-review-feedback — unified triage for review threads and PR issue comments.
+# shellcheck disable=SC2016  # jq filter strings use $variables, not shell expansion
+
+lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "${lib_dir}/runner-ensure"
+
+agent_review_feedback_resolved_state_file() {
+  printf '%s\n' \
+    "${AGENT_REVIEW_RESOLVED_COMMENTS_FILE:-${HOME}/scratch/repository-helpers/agent-review-resolved-issue-comments.env}"
+}
+
+agent_review_feedback_resolved_state_key() {
+  local -r repo="$1"
+  local -r pr="$2"
+
+  printf '%s#%s' "${repo}" "${pr}"
+}
+
+agent_review_feedback_resolved_ids_for_pr() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local state_file key line ids
+
+  state_file="$(agent_review_feedback_resolved_state_file)"
+  key="$(agent_review_feedback_resolved_state_key "${repo}" "${pr}")"
+  ids=""
+  if [[ -f "${state_file}" ]]; then
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      [[ "${line}" == "${key}="* ]] || continue
+      ids="${line#"${key}"=}"
+      break
+    done <"${state_file}"
+  fi
+  printf '%s' "${ids}"
+}
+
+agent_review_feedback_mark_issue_comment_resolved() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r comment_id="$3"
+  local state_file key dir existing ids new_ids tmp
+
+  [[ -n "${comment_id}" ]] || agent_review_die 'resolve-comment requires a comment id'
+  state_file="$(agent_review_feedback_resolved_state_file)"
+  key="$(agent_review_feedback_resolved_state_key "${repo}" "${pr}")"
+  dir="$(dirname "${state_file}")"
+  if [[ ! -d "${dir}" ]]; then
+    run_command_or_die "agent-review feedback mkdir state dir" mkdir --parents "${dir}"
+  fi
+  existing="$(agent_review_feedback_resolved_ids_for_pr "${repo}" "${pr}")"
+  if [[ -n "${existing}" ]]; then
+    if [[ ",${existing}," == *",${comment_id},"* ]]; then
+      return 0
+    fi
+    new_ids="${existing},${comment_id}"
+  else
+    new_ids="${comment_id}"
+  fi
+  tmp="$(runner_exec_stdout "agent-review feedback mktemp" -- mktemp "${TMPDIR:-/tmp}/agent-review-resolved.XXXXXX")"
+  if [[ -f "${state_file}" ]]; then
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      [[ "${line}" == "${key}="* ]] && continue
+      printf '%s\n' "${line}" >>"${tmp}"
+    done <"${state_file}"
+  else
+    : >"${tmp}"
+  fi
+  printf '%s=%s\n' "${key}" "${new_ids}" >>"${tmp}"
+  run_command_or_die "agent-review feedback persist resolved state" mv "${tmp}" "${state_file}"
+}
+
+agent_review_feedback_issue_comment_is_probe() {
+  local -r body="${1:-}"
+  local lower
+
+  [[ -n "${body}" ]] || return 0
+  lower="${body,,}"
+  if [[ "${lower}" == *'wait-for-agent-review:'* ]]; then
+    return 0
+  fi
+  if [[ "${lower}" =~ ^@copilot[[:space:]]+please[[:space:]]+review ]]; then
+    return 0
+  fi
+  if [[ "${lower}" == *'summarize by coderabbit.ai'* ]] \
+    || [[ "${lower}" == *'walkthrough_start'* ]]; then
+    return 0
+  fi
+  return 1
+}
+
+agent_review_feedback_issue_comment_is_resolved() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r comment_id="$3"
+  local ids
+
+  ids="$(agent_review_feedback_resolved_ids_for_pr "${repo}" "${pr}")"
+  [[ -n "${ids}" ]] && [[ ",${ids}," == *",${comment_id},"* ]]
+}
+
+# Chronological issue comments as JSON array: [{id,login,body,html_url,created_at}, ...]
+agent_review_feedback_issue_comments_array_json() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local api_json
+
+  api_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
+  ar_runner_jq_file "agent-review feedback issue comments array" "${api_json}" -rs '
+    [ .[] | .[]
+      | {
+          id: (.id | tostring),
+          login: (.user.login // ""),
+          body: (.body // ""),
+          html_url: (.html_url // ""),
+          created_at: (.created_at // "")
+        }
+    ]
+    | sort_by(.created_at)'
+}
+
+agent_review_feedback_issue_comments_pending_json() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local operator_login comments_json resolved_csv
+
+  operator_login="$(agent_review_authenticated_login)"
+  comments_json="$(agent_review_feedback_issue_comments_array_json "${repo}" "${pr}")"
+  resolved_csv="$(agent_review_feedback_resolved_ids_for_pr "${repo}" "${pr}")"
+  ar_runner_jq_file "agent-review feedback pending issue comments" "${comments_json}" \
+    --arg operator "${operator_login}" \
+    --arg resolved_csv "${resolved_csv}" '
+      def is_probe($body):
+        ($body // "") | test("wait-for-agent-review:";"i")
+        or test("^@copilot[[:space:]]+please[[:space:]]+review";"i")
+        or test("summarize by coderabbit\\.ai";"i")
+        or test("walkthrough_start";"i");
+      def resolved_set:
+        if ($resolved_csv | length) == 0 then []
+        else ($resolved_csv | split(","))
+        end;
+      . as $all
+      | [ range(0; ($all | length)) as $i
+        | $all[$i] as $c
+        | select(is_probe($c.body) | not)
+        | select($c.login != $operator)
+        | select((resolved_set | index($c.id)) | not)
+        | {
+            kind: "issue_comment",
+            feedback_id: ("IC_" + $c.id),
+            comment_id: $c.id,
+            author: $c.login,
+            comment_url: $c.html_url,
+            body: $c.body,
+            state: (
+              if [ range($i + 1; ($all | length))
+                   | $all[.] | select(.login == $operator) ] | length > 0
+              then "needs_resolve"
+              else "unaddressed"
+              end
+            )
+          }
+        | select(.state == "unaddressed" or .state == "needs_resolve")
+      ]'
+}
+
+agent_review_feedback_threads_pending_json() {
+  local -r snapshot="$1"
+
+  agent_review_pending_threads_json_from_snapshot "${snapshot}"
+}
+
+agent_review_feedback_pending_json() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r snapshot="$3"
+  local threads_json issue_json
+
+  threads_json="$(agent_review_feedback_threads_pending_json "${snapshot}")"
+  issue_json="$(agent_review_feedback_issue_comments_pending_json "${repo}" "${pr}")"
+  ar_runner_jq_n "agent-review feedback pending merge" \
+    --argjson threads "${threads_json}" \
+    --argjson issues "${issue_json}" '
+      ($threads | map(. + {kind: "review_thread", feedback_id: .thread_id}))
+      + $issues
+      | unique_by(.feedback_id)'
+}
+
+agent_review_feedback_pending_count() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r snapshot="$3"
+
+  ar_runner_jq_file "agent-review feedback pending count" \
+    "$(agent_review_feedback_pending_json "${repo}" "${pr}" "${snapshot}")" 'length'
+}
+
+agent_review_feedback_triage_json() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r snapshot="$3"
+  local thread_triage pending_json
+
+  thread_triage="$(agent_review_triage_threads_json_from_snapshot "${snapshot}")"
+  pending_json="$(agent_review_feedback_pending_json "${repo}" "${pr}" "${snapshot}")"
+  ar_runner_jq_n "agent-review feedback triage json" \
+    --argjson threads "${thread_triage}" \
+    --argjson pending "${pending_json}" \
+    '{threads: $threads, issue_comments: ($pending | map(select(.kind == "issue_comment"))), pending_feedback: $pending}'
+}
+
+agent_review_feedback_issue_comment_has_operator_reply() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r comment_id="$3"
+  local comments_json operator_login
+
+  operator_login="$(agent_review_authenticated_login)"
+  comments_json="$(agent_review_feedback_issue_comments_array_json "${repo}" "${pr}")"
+  ar_runner_jq_file "agent-review feedback issue comment has reply" "${comments_json}" \
+    --arg id "${comment_id}" \
+    --arg operator "${operator_login}" \
+    -e '
+      . as $all
+      | (first(range(0; length) | select($all[.] | .id == $id)) // null) as $idx
+      | if $idx == null then false
+        else [ range($idx + 1; length) | $all[.] | select(.login == $operator) ] | length > 0
+        end'
+}
+
+agent_review_reply_issue_comment() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r comment_id="$3"
+  local -r body="$4"
+  local full_body comment_url
+
+  agent_review_require_cmd gh
+  [[ -n "${body}" ]] || agent_review_die 'reply-comment requires --body'
+  comment_url="$(ar_runner_jq_file "agent-review feedback reply target url" \
+    "$(agent_review_feedback_issue_comments_array_json "${repo}" "${pr}")" \
+    --arg id "${comment_id}" -r 'map(select(.id == $id)) | first | .html_url // ""')"
+  if [[ -n "${comment_url}" ]]; then
+    full_body="${body}
+
+(In reply to ${comment_url})"
+  else
+    full_body="${body}"
+  fi
+  runner_exec "agent-review reply issue comment" -- gh pr comment "${pr}" --repo "${repo}" --body "${full_body}" >/dev/null
+  printf 'Replied on issue comment %s (PR #%s)\n' "${comment_id}" "${pr}" >&2
+}
+
+agent_review_resolve_issue_comment() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r comment_id="$3"
+  local force="${4:-0}"
+
+  if [[ "${force}" != '1' ]]; then
+    if ! agent_review_feedback_issue_comment_has_operator_reply "${repo}" "${pr}" "${comment_id}"; then
+      agent_review_die "issue comment ${comment_id} has no operator reply — run reply-comment before resolve-comment"
+    fi
+  fi
+  agent_review_feedback_mark_issue_comment_resolved "${repo}" "${pr}" "${comment_id}"
+  printf 'Resolved issue comment %s\n' "${comment_id}" >&2
+}
+
+# True when the active agent profile has a non-probe issue comment on the current head.
+agent_review_feedback_agent_issue_comment_on_head() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local body short_head login_regex comments_json
+
+  if declare -F agent_review_profile_fresh_on_head >/dev/null 2>&1; then
+    if agent_review_profile_fresh_on_head '{}' "${head}" "${repo}" "${pr}"; then
+      return 0
+    fi
+  fi
+  login_regex="${agent_review_profile_request_login_regex:-}"
+  [[ -n "${login_regex}" ]] || return 1
+  comments_json="$(agent_review_feedback_issue_comments_array_json "${repo}" "${pr}")"
+  body="$(ar_runner_jq_file "agent-review feedback latest agent issue body" "${comments_json}" \
+    --arg re "${login_regex}" -r '
+      [ .[] | select((.login // "") | test($re;"i")) ] | last | .body // ""')"
+  [[ -n "${body}" ]] || return 1
+  if agent_review_feedback_issue_comment_is_probe "${body}"; then
+    return 1
+  fi
+  if [[ "${body}" == *"${head}"* ]]; then
+    return 0
+  fi
+  short_head="${head:0:7}"
+  [[ -n "${short_head}" ]] && [[ "${body}" == *"${short_head}"* ]]
+}

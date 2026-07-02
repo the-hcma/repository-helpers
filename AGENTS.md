@@ -335,7 +335,7 @@ After every push, **`scripts/dev/post-pr-submission-checks --pr <n>`** must pass
 When CI is green, run the **agent review loop** documented in **`.cursor/rules/pr-ship-and-review.mdc`**:
 
 1. Prefer **`./scripts/wait-for-agent-review loop --pr <n>`** (or `scripts/dev/ship-and-review` from submit).
-2. On exit **3**, triage each thread: fix → **`reply-thread`** (on-thread human reply) → **`resolve-thread`** — never resolve without replying first.
+2. On exit **3**, triage each feedback item (inline thread or top-level issue comment): fix → **`reply-thread`** / **`reply-comment`** → **`resolve-thread`** / **`resolve-comment`** — never resolve without replying first. Use **`list-feedback`** to see pending items.
 3. **`./scripts/wait-for-agent-review complete --pr <n>`** when `check` reports `complete_ready`, or let **`loop`** exit **0** via idle-success (15m with no new activity).
 4. Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`.
 
