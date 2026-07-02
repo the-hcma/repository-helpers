@@ -108,6 +108,8 @@ _pri_main_sha=""
 _pri_head_sha=""
 _pri_head_symref=""
 _pri_reset_hard=0
+# Set after successful finalize_prs or --cleanup; sync primary clone to origin/main on teardown.
+_primary_repo_sync_after_merge=0
 
 prompt_color=""
 prompt_color_reset=""
@@ -626,7 +628,8 @@ Options:
 Primary clone (--dir):
   Keep the project checkout on main. Stack work (gt sync, gt checkout, gt submit)
   runs only in the dep-updater worktree under --tmpdir — not from the primary clone.
-  When a run finishes, a clean primary clone is switched back to main automatically.
+  After PRs merge (or --cleanup post-merge), a clean primary clone is fast-forwarded
+  to origin/main. Failed or no-wait runs restore the pre-run snapshot instead.
 
 Supported ecosystems:
   [npm]         package.json present  → pnpm outdated + pnpm update
@@ -3197,7 +3200,60 @@ primary_repo_snapshot() {
   _pri_head_symref="$(dep_runner_git_c_stdout "git repo" "$dir" -- symbolic-ref -q HEAD 2>/dev/null || true)"
 }
 
+# Fast-forward refs/heads/main on the primary clone to origin/main (or a known SHA).
+# When main is checked out and clean, also reset --hard the working tree.
+# Args: context (log suffix), optional main_sha (skip fetch when already resolved).
+primary_repo_sync_to_origin_main() {
+  local -r context="${1:-after merge}"
+  local main_sha="${2:-}"
+  local checked_out_branch sym_exit
+
+  if [[ -z "$main_sha" ]]; then
+    log "Fetching origin/main…"
+    runner_exec "git fetch origin main" -- git -C "$dir" fetch origin main 2>/dev/null || true
+    main_sha=""
+    main_sha="$(dep_runner_git_rev_parse "git rev-parse origin/main" "$dir" "origin/main" || true)"
+  fi
+  if [[ -z "$main_sha" ]]; then
+    log "[worktree] Warning: could not resolve origin/main for primary clone (${context})."
+    return 1
+  fi
+
+  runner_exec "git repo" --probe -- git -C "$dir" update-ref refs/heads/main "$main_sha" >/dev/null 2>&1 \
+    || log "[worktree] Note: could not update refs/heads/main on primary clone (${context})."
+
+  checked_out_branch=""
+  sym_exit=0
+  runner_exec "git symbolic-ref HEAD" --probe -- git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || sym_exit=$?
+  if (( sym_exit == 0 )); then
+    checked_out_branch="$(runner_read "$(runner_last_id)" stdout 2>/dev/null || true)"
+  fi
+  if [[ "$checked_out_branch" == 'main' ]] \
+      && runner_exec "git diff clean check" --probe -- git -C "$dir" diff --quiet 2>/dev/null \
+      && runner_exec "git diff --cached clean check" --probe -- git -C "$dir" diff --cached --quiet 2>/dev/null; then
+    if runner_exec "git reset --hard origin/main" --probe -- git -C "$dir" reset --hard "$main_sha" >/dev/null 2>&1; then
+      _pri_reset_hard=1
+      log "[worktree] Fast-forwarded working tree at ${dir} to origin/main (${context})"
+    else
+      log "[worktree] Warning: could not fast-forward working tree at ${dir} (${context})"
+    fi
+  elif [[ "$checked_out_branch" == 'main' ]]; then
+    log "[worktree] Primary clone on main with local changes; updated refs/heads/main only (${context})."
+  else
+    log "[worktree] Updated refs/heads/main; checkout remains on ${checked_out_branch:-detached} (${context})."
+  fi
+  return 0
+}
+
 primary_repo_restore() {
+  if [[ "$_primary_repo_sync_after_merge" == '1' && "$report_json" != '1' && "$dry_run" != '1' ]]; then
+    log "[worktree] Syncing primary clone to origin/main after merge…"
+    primary_repo_sync_to_origin_main "after merge" || true
+    _primary_snapshot_taken=0
+    primary_repo_ensure_on_main
+    return 0
+  fi
+
   local snapshot_was_taken=0
   if [[ "$_primary_snapshot_taken" != '1' ]]; then
     return 0
@@ -3298,30 +3354,8 @@ create_worktree() {
     if [[ "$report_json" != '1' ]]; then
       primary_repo_snapshot
       # Fast-forward local main to origin/main so that `gt submit` doesn't abort
-      # with "trunk branch is out of date". git update-ref is used instead of
-      # `git branch -f` because `main` is typically checked out in the primary
-      # clone and `git branch -f` refuses to move a checked-out branch.
-      runner_exec "git repo" --probe -- git -C "$dir" update-ref refs/heads/main "$main_sha" >/dev/null 2>&1
-      # Also update the working tree when main is checked out and clean.
-      # Without this, update-ref fast-forwards the branch pointer but leaves the
-      # working tree at the old commit, making it appear dirty relative to HEAD.
-      local checked_out_branch sym_exit
-      checked_out_branch=""
-      sym_exit=0
-      runner_exec "git symbolic-ref HEAD" --probe -- git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || sym_exit=$?
-      if (( sym_exit == 0 )); then
-        checked_out_branch="$(runner_read "$(runner_last_id)" stdout 2>/dev/null || true)"
-      fi
-      if [[ "$checked_out_branch" == 'main' ]] \
-          && runner_exec "git diff clean check" --probe -- git -C "$dir" diff --quiet 2>/dev/null \
-          && runner_exec "git diff --cached clean check" --probe -- git -C "$dir" diff --cached --quiet 2>/dev/null; then
-        if runner_exec "git reset --hard origin/main" --probe -- git -C "$dir" reset --hard "$main_sha" >/dev/null 2>&1; then
-          _pri_reset_hard=1
-          log "[worktree] Fast-forwarded working tree at ${dir} to origin/main"
-        else
-          log "[worktree] Warning: could not fast-forward working tree at ${dir}"
-        fi
-      fi
+      # with "trunk branch is out of date".
+      primary_repo_sync_to_origin_main "before worktree" "$main_sha" || true
     fi
   fi
   wt_base_branch="dep-updater-wt-${timestamp}-$$"
@@ -7941,6 +7975,7 @@ main() {
     worktree_path="$wt"
     wt_base_branch="$(state_get "wt_branch")"
     log "Running cleanup for worktree: ${worktree_path}"
+    _primary_repo_sync_after_merge=1
     cleanup
     exit 0
   fi
@@ -8336,10 +8371,16 @@ if [[ -z "$npm_lines" && -z "$py_lines" && -z "$rust_lines" && -z "$gha_lines" ]
     exit 0
   fi
 
-  local final_prs_wt
+  local final_prs_wt final_poll_rc=0
   final_prs_wt="$(collect_tracked_prs_csv)"
   if [[ -n "$final_prs_wt" ]]; then
+    set +e
     finalize_prs "$final_prs_wt"
+    final_poll_rc=$?
+    set -e
+    if (( final_poll_rc == 0 )); then
+      _primary_repo_sync_after_merge=1
+    fi
   else
     log "No tracked PRs found; nothing to monitor."
   fi
@@ -8449,7 +8490,9 @@ set +e
 finalize_prs "$all_prs_csv"
 poll_rc=$?
 set -e
-if (( poll_rc != 0 )); then
+if (( poll_rc == 0 )); then
+  _primary_repo_sync_after_merge=1
+elif (( poll_rc != 0 )); then
   run_exit_rc=1
 fi
 _cleanup_trap_active=0
