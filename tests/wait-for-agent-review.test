@@ -117,7 +117,8 @@ fi
 
 printf '\n=== static: wait timeouts ===\n'
 if grep -qF 'ERROR: WAIT_TIMEOUT wait-for-agent-review' "$wait_script" \
-  && grep -A1 'ERROR: WAIT_TIMEOUT restack' "$wait_script" | grep -qF 'return 4' \
+  && grep -qF 'ERROR: WAIT_TIMEOUT restack' "$wait_script" \
+  && grep -A4 'ERROR: WAIT_TIMEOUT restack' "$wait_script" | grep -qF 'return 2' \
   && grep -qF 'select(.isResolved == false)' "$lib"; then
   printf '[PASS] wait script: machine-parseable timeouts and unresolved thread filter\n'
   pass=$(( pass + 1 ))
@@ -932,6 +933,27 @@ else
   pass=$(( pass + 1 ))
 fi
 
+coderabbit_profile="${script_dir}/../scripts/lib/agent-review-profiles/coderabbit"
+# shellcheck disable=SC2016  # fixture body is literal HTML/markdown, not shell expansions
+rate_limit_body='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->
+
+> [!WARNING]
+> ## Review limit reached
+>
+> @operator has reached their review limit.'
+if RATE_LIMIT_BODY="${rate_limit_body}" bash -c "
+  source '${coderabbit_profile}'
+  agent_review_profile_text_is_quota_exhausted \"\${RATE_LIMIT_BODY}\"
+  agent_review_profile_issue_comment_is_quota_exhausted 'coderabbitai[bot]' \"\${RATE_LIMIT_BODY}\"
+"; then
+  printf '[PASS] coderabbit profile: rate-limited summarize comment is quota exhaustion\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: rate-limited summarize comment not detected as quota\n'
+  fail=$(( fail + 1 ))
+fi
+
 tmp_copilot_inconclusive="$(mktemp)"
 tmp_copilot_inconclusive_json="$(mktemp)"
 observe_copilot_probe_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -1351,6 +1373,112 @@ if grep -qF "context_json='{}'" "$email_lib" \
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] loop notify: missing jq-safe context JSON fallback\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: merge state classification and transient retries ===\n'
+
+if grep -qF 'agent_review_merge_state_class()' "$lib" \
+  && grep -qF "printf 'ready" "$lib" \
+  && grep -qF "printf 'behind" "$lib" \
+  && grep -qF "printf 'transient" "$lib" \
+  && grep -qF "printf 'blocked" "$lib"; then
+  printf '[PASS] merge state: classifier defines ready/behind/transient/blocked\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] merge state: missing agent_review_merge_state_class\n'
+  fail=$(( fail + 1 ))
+fi
+
+merge_class_out="$(bash -c "
+  source '${lib}'
+  agent_review_merge_state_class UNSTABLE
+  agent_review_merge_state_class BEHIND
+  agent_review_merge_state_class DIRTY
+  agent_review_merge_state_class CLEAN
+")"
+if [[ "${merge_class_out}" == $'transient\nbehind\nblocked\nready' ]]; then
+  printf '[PASS] merge state: UNSTABLE=transient BEHIND=behind DIRTY=blocked CLEAN=ready\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] merge state: unexpected classification output: %s\n' "${merge_class_out}"
+  fail=$(( fail + 1 ))
+fi
+
+check_body="$(awk '/^cmd_check\(\)/,/^}$/' "$wait_script")"
+if printf '%s' "$check_body" | grep -qF 'CI pending on PR' \
+  && printf '%s' "$check_body" | grep -qF 'return 2'; then
+  printf '[PASS] cmd_check: pending CI returns wait (exit 2 path)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cmd_check: must wait on pending CI instead of restack\n'
+  fail=$(( fail + 1 ))
+fi
+
+if printf '%s' "$check_body" | grep -qF 'agent_review_merge_state_class' \
+  && printf '%s' "$check_body" | grep -qF 'return 11' \
+  && printf '%s' "$check_body" | grep -qF 'waiting for mergeability'; then
+  printf '[PASS] cmd_check: classifies behind/transient/blocked merge states\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cmd_check: missing merge-state classification branches\n'
+  fail=$(( fail + 1 ))
+fi
+
+restack_body="$(awk '/^cmd_restack\(\)/,/^}$/' "$wait_script")"
+if printf '%s' "$restack_body" | grep -qF 'return 2' \
+  && printf '%s' "$restack_body" | grep -qF 'agent_review_loop_set_last_error' \
+  && printf '%s' "$restack_body" | grep -qF 'WAIT_TIMEOUT restack'; then
+  printf '[PASS] cmd_restack: transient failures return 2 with last_error\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cmd_restack: must return 2 for transient failures\n'
+  fail=$(( fail + 1 ))
+fi
+
+loop_body="$(awk '/^cmd_loop\(\)/,/^}$/' "$wait_script")"
+if printf '%s' "$loop_body" | grep -qF 'transient_retries' \
+  && printf '%s' "$loop_body" | grep -qF 'agent_review_default_transient_retries' \
+  && printf '%s' "$loop_body" | grep -qF 'transient_retries >= transient_max' \
+  && printf '%s' "$loop_body" | grep -qF 'return 11' \
+  && printf '%s' "$loop_body" | grep -qF 'MERGE_STATE_BLOCKED'; then
+  printf '[PASS] cmd_loop: retries transient restack and stops on permanent block\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cmd_loop: missing transient retry / exit 11 handling\n'
+  fail=$(( fail + 1 ))
+fi
+
+check_clear="$(awk '/^cmd_check\(\)/,/^}$/' "$wait_script")"
+restack_clear="$(awk '/^cmd_restack\(\)/,/^}$/' "$wait_script")"
+if printf '%s' "$check_clear" | grep -qF "agent_review_loop_last_error=''" \
+  && printf '%s' "$restack_clear" | grep -qF "agent_review_loop_last_error=''" \
+  && printf '%s' "$loop_body" | grep -qF "agent_review_loop_last_error=''"; then
+  printf '[PASS] loop: clears last_error on check/restack entry and successful restack\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] loop: must clear stale last_error between polls\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'last_error' "$email_lib" \
+  && grep -qF 'merge_state_status' "$email_lib" \
+  && grep -qF 'Attempts:' "$email_lib" \
+  && grep -qF 'Last error:' "$email_lib"; then
+  printf '[PASS] email: loop-stopped includes merge state, attempts, last error\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] email: missing actionable loop-stopped fields\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'AGENT_REVIEW_TRANSIENT_RETRIES' "$lib" \
+  && grep -qF 'AGENT_REVIEW_TRANSIENT_RETRY_SLEEP' "$lib" \
+  && grep -qF 'agent_review_default_transient_retries' "$wait_script"; then
+  printf '[PASS] config: transient retry env vars are wired\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] config: missing AGENT_REVIEW_TRANSIENT_* wiring\n'
   fail=$(( fail + 1 ))
 fi
 

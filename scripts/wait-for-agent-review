@@ -28,6 +28,10 @@ set -euo pipefail
 agent_review_loop_notified=0
 agent_review_loop_stop_reason_code=''
 agent_review_loop_stop_reason_detail=''
+agent_review_loop_last_error=''
+agent_review_loop_last_merge_state=''
+agent_review_loop_attempt_count=0
+agent_review_loop_attempt_max=0
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
@@ -95,6 +99,8 @@ Environment:
   AGENT_REVIEW_REPORT_FROM      Email sender (required for complete/email-failure)
   AGENT_REVIEW_CYCLE_TIMEOUT    Idle-success window after all feedback addressed (default: 15m)
   AGENT_REVIEW_PR_TIMEOUT       Non-convergence cap while review cycles keep iterating (default: 12h)
+  AGENT_REVIEW_TRANSIENT_RETRIES  Retries for transient merge/restack failures (default: 5)
+  AGENT_REVIEW_TRANSIENT_RETRY_SLEEP  Sleep between transient retries (default: 30s)
   AGENT_REVIEW_IDLE_BREAK_TIMEOUT  Deprecated; use AGENT_REVIEW_CYCLE_TIMEOUT idle-success semantics
   AGENT_REVIEW_BOT_LOGIN_REGEX  Bot logins excluded from human thread triage
   AGENT_REVIEW_LOOP_TIMEOUT     Deprecated alias for AGENT_REVIEW_CYCLE_TIMEOUT
@@ -104,15 +110,16 @@ Environment:
 Exit codes:
   0  success / complete_ready / PR merged
   1  usage / prerequisite error
-  2  timed out waiting for agent review (wait) or not fresh on head (check)
+  2  wait: not fresh on head, pending CI, or transient mergeability (UNSTABLE/UNKNOWN)
   3  agent or human feedback still lacks a reply or resolve (check; JSON on stdout)
-  4  mergeStateStatus is BEHIND/DIRTY/CONFLICTING (run restack)
+  4  mergeStateStatus is BEHIND (restack) or restack permanently failed / retries exhausted
   5  fresh review but agent did not report "no new comments" yet (check/complete)
   6  loop give-up (PR non-convergence timeout; email + PR comment posted)
   7  agent review quota exhausted with no fallback (give-up email + PR comment posted)
   8  agent GitHub check failed to run (non-quota; see check output on PR)
   9  wait idle break — no PR activity with all agent quotas exhausted (loop continues to check)
  10  required CI checks failed (fix CI before agent review or thread triage)
+ 11  permanent merge block (DIRTY/CONFLICTING/DRAFT) — human intervention required
 
 Non-success loop exits (2–8, 10, and other failures) email AGENT_REVIEW_REPORT_TO and post a PR
 comment when the loop command exits. Success (0 after complete, or PR merged) sends no failure notify.
@@ -152,9 +159,41 @@ cmd_loop_abort_if_ci_failed() {
   return 0
 }
 
+agent_review_loop_set_last_error() {
+  agent_review_loop_last_error="${1:-}"
+}
+
 agent_review_loop_set_stop() {
-  agent_review_loop_stop_reason_code="${1:-}"
-  agent_review_loop_stop_reason_detail="${2:-}"
+  local code="${1:-}"
+  local detail="${2:-}"
+  local runner_fail
+
+  agent_review_loop_stop_reason_code="${code}"
+  if [[ -z "${detail}" && -n "${agent_review_loop_last_error}" ]]; then
+    detail="${agent_review_loop_last_error}"
+  fi
+  runner_fail="$(agent_review_runner_last_failure_text || true)"
+  if [[ -n "${runner_fail}" ]]; then
+    if [[ -z "${detail}" ]]; then
+      detail="${runner_fail}"
+    elif [[ "${detail}" != *"${runner_fail}"* ]]; then
+      detail="${detail}
+Last command failure: ${runner_fail}"
+    fi
+  fi
+  if [[ -n "${agent_review_loop_last_merge_state}" ]]; then
+    if [[ -z "${detail}" ]]; then
+      detail="mergeStateStatus=${agent_review_loop_last_merge_state}"
+    elif [[ "${detail}" != *"mergeStateStatus=${agent_review_loop_last_merge_state}"* ]]; then
+      detail="mergeStateStatus=${agent_review_loop_last_merge_state}
+${detail}"
+    fi
+  fi
+  if (( agent_review_loop_attempt_max > 0 )); then
+    detail="${detail}
+Attempts: ${agent_review_loop_attempt_count}/${agent_review_loop_attempt_max}"
+  fi
+  agent_review_loop_stop_reason_detail="${detail}"
 }
 
 agent_review_loop_default_stop_for_exit() {
@@ -171,7 +210,7 @@ agent_review_loop_default_stop_for_exit() {
       ;;
     4)
       agent_review_loop_set_stop 'RESTACK_FAILED' \
-        'Branch is BEHIND or restack failed — human intervention required.'
+        'Restack failed or transient merge/restack retries exhausted — human intervention required.'
       ;;
     6)
       agent_review_loop_set_stop 'TIMEOUT' \
@@ -189,6 +228,10 @@ agent_review_loop_default_stop_for_exit() {
       agent_review_loop_set_stop 'CI_FAILED' \
         'Required CI checks failed.'
       ;;
+    11)
+      agent_review_loop_set_stop 'MERGE_STATE_BLOCKED' \
+        'Permanent merge block (DIRTY/CONFLICTING/DRAFT) — human intervention required.'
+      ;;
     *)
       agent_review_loop_set_stop 'LOOP_STOPPED' \
         "Agent review loop stopped (exit ${exit_code})."
@@ -203,14 +246,22 @@ agent_review_loop_status_context_json() {
 
   status="$(cmd_status "${repo}" "${pr}" 2>/dev/null || true)"
   if [[ -z "${status}" ]]; then
-    printf '{}'
-    return 0
+    status='{}'
   fi
-  ar_runner_jq_file "wait-for-agent-review status context" "$status" -c '{
-    pending_threads: (.pending_threads // 0),
-    head_sha: (.head_sha // ""),
-    ci_conclusion: (.ci_conclusion // "")
-  }' 2>/dev/null || printf '{}'
+  ar_runner_jq_file "wait-for-agent-review status context" "$status" \
+    --arg last_error "${agent_review_loop_last_error}" \
+    --arg merge_state "${agent_review_loop_last_merge_state}" \
+    --argjson attempts "${agent_review_loop_attempt_count}" \
+    --argjson max_attempts "${agent_review_loop_attempt_max}" \
+    -c '{
+      pending_threads: (.pending_threads // 0),
+      head_sha: (.head_sha // ""),
+      ci_conclusion: (.ci_conclusion // ""),
+      merge_state_status: (if $merge_state != "" then $merge_state else (.merge_state_status // "") end),
+      last_error: $last_error,
+      attempts: $attempts,
+      max_attempts: $max_attempts
+    }' 2>/dev/null || printf '{}'
 }
 
 agent_review_loop_notify_stopped() {
@@ -467,6 +518,11 @@ cmd_list_feedback() {
 cmd_check() {
   local repo pr owner name snapshot status complete_ready fresh merge_state pr_merged agent_empty agent_quota
   local head_check_error head_check_findings head review_body all_quotas_exhausted pending_count
+  local ci_conclusion merge_class
+
+  # Drop stale diagnostics from prior polls so stop emails stay actionable.
+  agent_review_loop_last_error=''
+  agent_review_loop_last_merge_state=''
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   read -r owner name < <(agent_review_repo_parts "${repo}")
@@ -484,10 +540,18 @@ cmd_check() {
     printf 'wait-for-agent-review: PR #%s is merged — loop complete\n' "${pr}" >&2
     return 0
   fi
-  if [[ "$(wait_ar_jq_status "$status" '.ci_conclusion // ""')" == 'failure' ]]; then
+  ci_conclusion="$(wait_ar_jq_status "$status" '.ci_conclusion // ""')"
+  if [[ "${ci_conclusion}" == 'failure' ]]; then
     agent_review_print_ci_failures "${repo}" "${pr}"
     printf '%s\n' "${status}" >&2
     return 10
+  fi
+  if [[ "${ci_conclusion}" == 'pending' ]] \
+    || [[ "$(wait_ar_jq_status "$status" '.ci_ready')" != 'true' ]]; then
+    printf '%s\n' "${status}"
+    printf 'wait-for-agent-review: CI pending on PR #%s (ci_conclusion=%s) — waiting\n' \
+      "${pr}" "${ci_conclusion:-unknown}" >&2
+    return 2
   fi
   complete_ready="$(wait_ar_jq_status "$status" '.complete_ready')"
   all_quotas_exhausted="$(wait_ar_jq_status "$status" '.all_quotas_exhausted')"
@@ -498,6 +562,7 @@ cmd_check() {
   head_check_error="$(wait_ar_jq_status "$status" '.head_check_error')"
   head_check_findings="$(wait_ar_jq_status "$status" '.head_check_findings')"
   merge_state="$(wait_ar_jq_status "$status" '.merge_state_status')"
+  agent_review_loop_last_merge_state="${merge_state}"
   if [[ "${complete_ready}" == 'true' ]]; then
     printf '%s\n' "${status}"
     return 0
@@ -533,12 +598,36 @@ cmd_check() {
       "${AGENT_REVIEW_AGENT:-copilot}" >&2
     return 5
   fi
-  if ! agent_review_merge_state_ready "${merge_state}"; then
-    printf '%s\n' "${status}"
-    printf 'wait-for-agent-review: mergeStateStatus=%s — run restack (BEHIND) or fix conflicts\n' \
-      "${merge_state}" >&2
-    return 4
-  fi
+  merge_class="$(agent_review_merge_state_class "${merge_state}")"
+  case "${merge_class}" in
+    ready)
+      :
+      ;;
+    behind)
+      printf '%s\n' "${status}"
+      agent_review_loop_set_last_error \
+        "mergeStateStatus=${merge_state} — branch is BEHIND base; restack required."
+      printf 'wait-for-agent-review: mergeStateStatus=%s — restack required\n' \
+        "${merge_state}" >&2
+      return 4
+      ;;
+    transient)
+      printf '%s\n' "${status}"
+      agent_review_loop_set_last_error \
+        "mergeStateStatus=${merge_state} — transient mergeability; waiting (not restackable)."
+      printf 'wait-for-agent-review: mergeStateStatus=%s — waiting for mergeability\n' \
+        "${merge_state}" >&2
+      return 2
+      ;;
+    *)
+      printf '%s\n' "${status}"
+      agent_review_loop_set_last_error \
+        "mergeStateStatus=${merge_state} — permanent merge block; resolve conflicts or undraft the PR."
+      printf 'wait-for-agent-review: mergeStateStatus=%s — permanent merge block\n' \
+        "${merge_state}" >&2
+      return 11
+      ;;
+  esac
   if [[ "${agent_empty}" != 'true' ]]; then
     if [[ "${AGENT_REVIEW_AGENT:-copilot}" == 'coderabbit' ]] \
       && [[ "$(wait_ar_jq_status "$status" '.pending_threads // 0')" == '0' ]]; then
@@ -717,8 +806,14 @@ cmd_resolve_human_addressed() {
   done
 }
 
+# Restack when BEHIND.
+# Exit 0 success, 2 transient (retry), 4 permanent failure.
 cmd_restack() {
   local repo pr merge_state head_branch pr_head_branch attempt base_branch pr_fields_json
+  local merge_class runner_fail msg
+
+  agent_review_loop_last_error=''
+  agent_review_loop_last_merge_state=''
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
@@ -742,29 +837,67 @@ cmd_restack() {
   fi
   merge_state="$(ar_runner_jq_file "wait-for-agent-review mergeStateStatus" "${pr_fields_json}" \
     -r '.mergeStateStatus')"
-  if [[ "${merge_state}" != 'BEHIND' ]]; then
-    if agent_review_merge_state_ready "${merge_state}"; then
+  agent_review_loop_last_merge_state="${merge_state}"
+  merge_class="$(agent_review_merge_state_class "${merge_state}")"
+  case "${merge_class}" in
+    ready)
       printf 'PR #%s mergeStateStatus=%s (no restack needed)\n' "${pr}" "${merge_state}" >&2
       return 0
-    fi
-    printf 'PR #%s mergeStateStatus=%s — cannot restack (resolve conflicts or fix merge state)\n' \
-      "${pr}" "${merge_state}" >&2
-    return 4
-  fi
+      ;;
+    behind)
+      :
+      ;;
+    transient)
+      msg="PR #${pr} mergeStateStatus=${merge_state} — cannot restack yet (transient mergeability)."
+      agent_review_loop_set_last_error "${msg}"
+      printf '%s\n' "${msg}" >&2
+      return 2
+      ;;
+    *)
+      msg="PR #${pr} mergeStateStatus=${merge_state} — cannot restack (permanent merge block)."
+      agent_review_loop_set_last_error "${msg}"
+      printf '%s\n' "${msg}" >&2
+      return 4
+      ;;
+  esac
   base_branch="$(ar_runner_jq_file "wait-for-agent-review baseRefName" "${pr_fields_json}" \
     -r '.baseRefName')"
   printf 'PR #%s is BEHIND %s — running gt sync and gt restack…\n' "${pr}" "${base_branch}" >&2
   if ! runner_exec "wait-for-agent-review gt sync" -- gt sync; then
-    printf 'gt sync failed during restack for PR #%s\n' "${pr}" >&2
-    return 4
+    runner_fail="$(agent_review_runner_last_failure_text || true)"
+    msg="gt sync failed during restack for PR #${pr}"
+    if [[ -n "${runner_fail}" ]]; then
+      msg="${msg}: ${runner_fail}"
+    fi
+    agent_review_loop_set_last_error "${msg}"
+    printf '%s\n' "${msg}" >&2
+    return 2
   fi
   if ! runner_exec "wait-for-agent-review gt restack" -- gt restack; then
-    printf 'gt restack failed for PR #%s\n' "${pr}" >&2
-    return 4
+    runner_fail="$(agent_review_runner_last_failure_text || true)"
+    msg="gt restack failed for PR #${pr}"
+    if [[ -n "${runner_fail}" ]]; then
+      msg="${msg}: ${runner_fail}"
+    fi
+    agent_review_loop_set_last_error "${msg}"
+    printf '%s\n' "${msg}" >&2
+    # Conflicts and hard Graphite errors are permanent; network-ish failures retry.
+    if [[ "${runner_fail}" == *[Cc]onflict* ]] \
+      || [[ "${runner_fail}" == *[Cc]onflicting* ]] \
+      || [[ "${runner_fail}" == *'uncommitted changes'* ]]; then
+      return 4
+    fi
+    return 2
   fi
   if ! runner_exec "wait-for-agent-review gt submit after restack" -- gt submit --no-interactive --publish; then
-    printf 'gt submit failed after restack for PR #%s\n' "${pr}" >&2
-    return 4
+    runner_fail="$(agent_review_runner_last_failure_text || true)"
+    msg="gt submit failed after restack for PR #${pr}"
+    if [[ -n "${runner_fail}" ]]; then
+      msg="${msg}: ${runner_fail}"
+    fi
+    agent_review_loop_set_last_error "${msg}"
+    printf '%s\n' "${msg}" >&2
+    return 2
   fi
   attempt=0
   while (( attempt < 12 )); do
@@ -772,19 +905,36 @@ cmd_restack() {
       mergeStateStatus)"
     merge_state="$(ar_runner_jq_file "wait-for-agent-review mergeStateStatus poll" "${pr_fields_json}" \
       -r '.mergeStateStatus')"
-    if [[ "${merge_state}" != 'BEHIND' ]]; then
-      if agent_review_merge_state_ready "${merge_state}"; then
+    agent_review_loop_last_merge_state="${merge_state}"
+    merge_class="$(agent_review_merge_state_class "${merge_state}")"
+    case "${merge_class}" in
+      ready)
         printf 'After restack: mergeStateStatus=%s\n' "${merge_state}" >&2
         return 0
-      fi
-      printf 'After restack: mergeStateStatus=%s — still not merge-ready\n' "${merge_state}" >&2
-      return 4
-    fi
+        ;;
+      behind)
+        :
+        ;;
+      transient)
+        msg="After restack: mergeStateStatus=${merge_state} — waiting for mergeability."
+        agent_review_loop_set_last_error "${msg}"
+        printf '%s\n' "${msg}" >&2
+        return 2
+        ;;
+      *)
+        msg="After restack: mergeStateStatus=${merge_state} — permanent merge block."
+        agent_review_loop_set_last_error "${msg}"
+        printf '%s\n' "${msg}" >&2
+        return 4
+        ;;
+    esac
     sleep 5
     attempt=$((attempt + 1))
   done
-  printf 'ERROR: WAIT_TIMEOUT restack pr=%s waited=60s\n' "${pr}" >&2
-  return 4
+  msg="ERROR: WAIT_TIMEOUT restack pr=${pr} waited=60s (still BEHIND)"
+  agent_review_loop_set_last_error "${msg}"
+  printf '%s\n' "${msg}" >&2
+  return 2
 }
 
 cmd_handle_quota_exhaustion() {
@@ -1029,6 +1179,7 @@ cmd_loop() {
   local repo pr pr_started idle_started last_activity last_head head now
   local pr_cap cycle_cap check_exit ci_exit pending_exit status activity_epoch
   local owner name snapshot idle_s remaining complete_exit
+  local transient_retries transient_max transient_sleep restack_exit
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
@@ -1036,16 +1187,22 @@ cmd_loop() {
   pr_cap="${agent_review_default_pr_timeout_s}"
   # shellcheck disable=SC2154  # agent_review_default_cycle_timeout_s from sourced lib
   cycle_cap="${agent_review_default_cycle_timeout_s}"
+  # shellcheck disable=SC2154  # agent_review_default_transient_* from sourced lib
+  transient_max="${agent_review_default_transient_retries}"
+  # shellcheck disable=SC2154
+  transient_sleep="${agent_review_default_transient_retry_sleep_s}"
   agent_review_require_cmd gh
   agent_review_require_cmd jq
   pr_started="$(date +%s)"
   idle_started=0
   last_activity=0
   last_head=''
+  transient_retries=0
+  agent_review_loop_attempt_max="${transient_max}"
   agent_review_log_cycle_quota_preamble
   agent_review_sync_active_probe_agent || true
-  printf 'Agent review loop for PR #%s (idle-success cycle=%ss, PR cap=%ss)\n' \
-    "${pr}" "${cycle_cap}" "${pr_cap}" >&2
+  printf 'Agent review loop for PR #%s (idle-success cycle=%ss, PR cap=%ss, transient retries=%s)\n' \
+    "${pr}" "${cycle_cap}" "${pr_cap}" "${transient_max}" >&2
 
   while true; do
     now="$(date +%s)"
@@ -1131,13 +1288,36 @@ cmd_loop() {
         return 3
         ;;
       4)
-        if ! cmd_restack "${repo}" "${pr}"; then
+        restack_exit=0
+        cmd_restack "${repo}" "${pr}" || restack_exit=$?
+        if (( restack_exit == 0 )); then
+          transient_retries=0
+          agent_review_loop_attempt_count=0
+          agent_review_loop_last_error=''
+          agent_review_loop_last_merge_state=''
+          last_head=''
+          idle_started=0
+          continue
+        fi
+        if (( restack_exit == 4 )); then
+          agent_review_loop_attempt_count=$((transient_retries + 1))
           agent_review_loop_set_stop 'RESTACK_FAILED' \
-            'Branch is BEHIND or restack failed — human intervention required.'
+            "${agent_review_loop_last_error:-Restack failed permanently — human intervention required.}"
           return 4
         fi
-        last_head=''
+        # Transient restack / mergeability failure — retry with backoff.
+        # Count this failure toward the cap; stop when attempts reach the max.
+        transient_retries=$((transient_retries + 1))
+        agent_review_loop_attempt_count="${transient_retries}"
+        if (( transient_retries >= transient_max )); then
+          agent_review_loop_set_stop 'RESTACK_FAILED' \
+            "${agent_review_loop_last_error:-Transient restack/mergeability failures exhausted.}"
+          return 4
+        fi
+        printf 'wait-for-agent-review loop: transient restack/mergeability issue on PR #%s (retry %s/%s)…\n' \
+          "${pr}" "${transient_retries}" "${transient_max}" >&2
         idle_started=0
+        sleep "${transient_sleep}"
         continue
         ;;
       7)
@@ -1157,12 +1337,18 @@ cmd_loop() {
         agent_review_loop_set_stop 'CI_FAILED' 'Required CI checks failed.'
         return 10
         ;;
+      11)
+        agent_review_loop_set_stop 'MERGE_STATE_BLOCKED' \
+          "${agent_review_loop_last_error:-Permanent merge block — human intervention required.}"
+        return 11
+        ;;
       5)
         idle_started=0
         sleep "${agent_review_default_poll_interval_s}"
         continue
         ;;
       2)
+        # Pending CI, transient mergeability, or no fresh review yet — keep polling.
         :
         ;;
       *)
