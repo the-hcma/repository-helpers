@@ -102,14 +102,10 @@ summary_lines=""
 # Set to 1 once the worktree is live so the EXIT trap knows cleanup is needed.
 _cleanup_trap_active=0
 
-# Primary clone ($dir) snapshot — create_worktree may fast-forward refs/heads/main.
-_primary_snapshot_taken=0
-_pri_main_sha=""
-_pri_head_sha=""
-_pri_head_symref=""
-_pri_reset_hard=0
-# Set after successful finalize_prs or --cleanup; sync primary clone to origin/main on teardown.
-_primary_repo_sync_after_merge=0
+# Primary clone ($dir) — stash local changes at entry, pop on teardown.
+_primary_stash_msg_prefix='dep-updater: preserved local changes'
+_primary_preserve_active=0
+_primary_stash_ref=""
 
 prompt_color=""
 prompt_color_reset=""
@@ -370,6 +366,8 @@ _on_exit() {
       reason="$first_fail_for_report"
     fi
     cleanup_on_error "$reason"
+  elif [[ "$_primary_preserve_active" == '1' ]]; then
+    primary_repo_recover || true
   fi
   rm -f "${RUNNER_FIRST_FAILURE_FILE:-}"
 }
@@ -383,6 +381,8 @@ _on_signal() {
     log ""
     log "Interrupted (SIG${sig}) — cleaning up…"
     cleanup_on_error "interrupted by SIG${sig}"
+  elif [[ "$_primary_preserve_active" == '1' ]]; then
+    primary_repo_recover || true
   fi
   # Re-raise with the conventional signal exit code so the caller's $? is right.
   kill -s "$sig" "$$"
@@ -626,10 +626,10 @@ Options:
   -h, --help        Print this help and exit
 
 Primary clone (--dir):
-  Keep the project checkout on main. Stack work (gt sync, gt checkout, gt submit)
-  runs only in the dep-updater worktree under --tmpdir — not from the primary clone.
-  After PRs merge (or --cleanup post-merge), a clean primary clone is fast-forwarded
-  to origin/main. Failed or no-wait runs restore the pre-run snapshot instead.
+  Stack work (gt sync, gt checkout, gt submit) runs only in the dep-updater worktree
+  under --tmpdir — not from the primary clone. Uncommitted primary-clone changes are
+  stashed at the start of a run and restored when the run finishes (including on error).
+  The primary checkout branch and refs are not modified.
 
 Supported ecosystems:
   [npm]         package.json present  → pnpm outdated + pnpm update
@@ -2940,21 +2940,37 @@ detect_ci_required_contexts() {
 # Working directory state note
 # ---------------------------------------------------------------------------
 
+primary_repo_has_local_changes() {
+  if ! runner_exec "git diff clean check" --probe -- git -C "$dir" diff --quiet 2>/dev/null; then
+    return 0
+  fi
+  if ! runner_exec "git diff --cached clean check" --probe -- git -C "$dir" diff --cached --quiet 2>/dev/null; then
+    return 0
+  fi
+  local untracked
+  untracked=""
+  untracked="$(dep_runner_git_c_stdout "git ls-files untracked" "$dir" -- \
+    ls-files --others --exclude-standard 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$untracked" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 warn_if_dirty_workdir() {
-  if ! git -C "$dir" diff --quiet 2>/dev/null \
-    || ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
+  if primary_repo_has_local_changes; then
     log "Working directory has local changes."
-    log "dep-updater runs in a clean dep-updater worktree from 'main' (created or reused); uncommitted local changes are not included."
+    if [[ "$report_json" == '1' ]]; then
+      log "Report-json mode does not stash primary-clone changes; scans use a temporary worktree only."
+    else
+      log "dep-updater stashes primary-clone changes for this run and restores them when finished."
+    fi
+    log "Update scans and stack work run in a separate worktree under --tmpdir."
   fi
 }
 
 primary_repo_current_branch() {
   run_command "git repo" git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || true
-}
-
-primary_repo_worktree_is_clean() {
-  run_command "git repo" git -C "$dir" diff --quiet 2>/dev/null \
-    && run_command "git repo" git -C "$dir" diff --cached --quiet 2>/dev/null
 }
 
 primary_repo_warn_if_not_main() {
@@ -2967,31 +2983,7 @@ primary_repo_warn_if_not_main() {
   log "[worktree] Warning: primary clone is checked out on '${branch}', not main."
   log "[worktree] dep-updater runs stacks in a separate worktree under --tmpdir."
   log "[worktree] Do not run 'gt sync', 'gt checkout', or 'gt submit' from the primary clone."
-  if primary_repo_worktree_is_clean; then
-    log "[worktree] Primary checkout will be restored to main when this run finishes."
-  else
-    log "[worktree] Primary clone has local changes; checkout will not be changed automatically."
-  fi
-}
-
-primary_repo_ensure_on_main() {
-  local branch
-  branch="$(primary_repo_current_branch)"
-  if [[ "$branch" == 'main' ]]; then
-    return 0
-  fi
-
-  if ! primary_repo_worktree_is_clean; then
-    log "[worktree] Warning: primary clone is on '${branch:-detached}' with local changes; leaving checkout unchanged."
-    log "[worktree] Switch back manually in ${dir} (checkout main when clean)."
-    return 0
-  fi
-
-  log "[worktree] Restoring primary clone checkout to main (was: ${branch:-detached})."
-  if git -C "$dir" checkout main >/dev/null 2>&1; then
-    return 0
-  fi
-  log "[worktree] Note: could not checkout main on primary clone."
+  log "[worktree] The primary checkout branch is not changed by dep-updater."
 }
 
 # ---------------------------------------------------------------------------
@@ -3186,98 +3178,64 @@ write_initial_state() {
 }
 
 # ---------------------------------------------------------------------------
-# Primary clone ($dir) — snapshot before create_worktree, restore on teardown
+# Primary clone ($dir) — stash before worktree work, pop on teardown
 # ---------------------------------------------------------------------------
 
-primary_repo_snapshot() {
-  if [[ "$_primary_snapshot_taken" == '1' ]]; then
+primary_repo_preserve() {
+  local stash_msg stash_exit
+
+  if [[ "$_primary_preserve_active" == '1' ]]; then
     return 0
   fi
-  _primary_snapshot_taken=1
-  _pri_reset_hard=0
-  _pri_main_sha="$(dep_runner_git_c_stdout "git repo" "$dir" -- rev-parse refs/heads/main 2>/dev/null || true)"
-  _pri_head_sha="$(dep_runner_git_c_stdout "git repo" "$dir" -- rev-parse HEAD)"
-  _pri_head_symref="$(dep_runner_git_c_stdout "git repo" "$dir" -- symbolic-ref -q HEAD 2>/dev/null || true)"
+  if [[ "$report_json" == '1' ]]; then
+    return 0
+  fi
+  if ! primary_repo_has_local_changes; then
+    return 0
+  fi
+
+  _primary_preserve_active=1
+  stash_msg="${_primary_stash_msg_prefix} ($$)"
+  log "[worktree] Stashing primary-clone local changes before dep-updater worktree run…"
+  stash_exit=0
+  run_command "git stash" git -C "$dir" stash push -u -m "$stash_msg" >/dev/null 2>&1 || stash_exit=$?
+  if (( stash_exit != 0 )); then
+    _primary_preserve_active=0
+    die "Could not stash primary-clone local changes in: ${dir}"
+  fi
+  _primary_stash_ref=""
+  _primary_stash_ref="$(dep_runner_git_c_stdout "git stash list" "$dir" -- stash list 2>/dev/null \
+    | awk -F: -v msg="$stash_msg" 'index($0, msg) { print $1; exit }' || true)"
+  if [[ -z "$_primary_stash_ref" ]]; then
+    _primary_preserve_active=0
+    die "Could not locate dep-updater preservation stash after git stash push"
+  fi
+  log "[worktree] Primary-clone changes stashed as ${_primary_stash_ref}."
 }
 
-# Fast-forward refs/heads/main on the primary clone to origin/main (or a known SHA).
-# When main is checked out and clean, also reset --hard the working tree.
-# Args: context (log suffix), optional main_sha (skip fetch when already resolved).
-primary_repo_sync_to_origin_main() {
-  local -r context="${1:-after merge}"
-  local main_sha="${2:-}"
-  local checked_out_branch sym_exit
+primary_repo_recover() {
+  local pop_exit
 
-  if [[ -z "$main_sha" ]]; then
-    log "Fetching origin/main…"
-    runner_exec "git fetch origin main" -- git -C "$dir" fetch origin main 2>/dev/null || true
-    main_sha=""
-    main_sha="$(dep_runner_git_rev_parse "git rev-parse origin/main" "$dir" "origin/main" || true)"
+  if [[ "$report_json" == '1' ]]; then
+    return 0
   fi
-  if [[ -z "$main_sha" ]]; then
-    log "[worktree] Warning: could not resolve origin/main for primary clone (${context})."
-    return 1
+  if [[ "$_primary_preserve_active" != '1' || -z "$_primary_stash_ref" ]]; then
+    _primary_preserve_active=0
+    _primary_stash_ref=""
+    return 0
   fi
 
-  runner_exec "git repo" --probe -- git -C "$dir" update-ref refs/heads/main "$main_sha" >/dev/null 2>&1 \
-    || log "[worktree] Note: could not update refs/heads/main on primary clone (${context})."
-
-  checked_out_branch=""
-  sym_exit=0
-  runner_exec "git symbolic-ref HEAD" --probe -- git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || sym_exit=$?
-  if (( sym_exit == 0 )); then
-    checked_out_branch="$(runner_read "$(runner_last_id)" stdout 2>/dev/null || true)"
-  fi
-  if [[ "$checked_out_branch" == 'main' ]] \
-      && runner_exec "git diff clean check" --probe -- git -C "$dir" diff --quiet 2>/dev/null \
-      && runner_exec "git diff --cached clean check" --probe -- git -C "$dir" diff --cached --quiet 2>/dev/null; then
-    if runner_exec "git reset --hard origin/main" --probe -- git -C "$dir" reset --hard "$main_sha" >/dev/null 2>&1; then
-      _pri_reset_hard=1
-      log "[worktree] Fast-forwarded working tree at ${dir} to origin/main (${context})"
-    else
-      log "[worktree] Warning: could not fast-forward working tree at ${dir} (${context})"
-    fi
-  elif [[ "$checked_out_branch" == 'main' ]]; then
-    log "[worktree] Primary clone on main with local changes; updated refs/heads/main only (${context})."
-  else
-    log "[worktree] Updated refs/heads/main; checkout remains on ${checked_out_branch:-detached} (${context})."
+  log "[worktree] Restoring stashed primary-clone local changes (${_primary_stash_ref})…"
+  pop_exit=0
+  run_command "git stash pop" git -C "$dir" stash pop "$_primary_stash_ref" >/dev/null 2>&1 || pop_exit=$?
+  _primary_stash_ref=""
+  _primary_preserve_active=0
+  if (( pop_exit != 0 )); then
+    log "[worktree] ERROR: git stash pop failed (exit ${pop_exit}); preservation stash may remain."
+    record_first_failure "primary clone stash pop failed (exit ${pop_exit})"
+    return "$pop_exit"
   fi
   return 0
-}
-
-primary_repo_restore() {
-  if [[ "$_primary_repo_sync_after_merge" == '1' && "$report_json" != '1' && "$dry_run" != '1' ]]; then
-    log "[worktree] Syncing primary clone to origin/main after merge…"
-    primary_repo_sync_to_origin_main "after merge" || true
-    _primary_snapshot_taken=0
-    primary_repo_ensure_on_main
-    return 0
-  fi
-
-  local snapshot_was_taken=0
-  if [[ "$_primary_snapshot_taken" != '1' ]]; then
-    return 0
-  fi
-  snapshot_was_taken=1
-  _primary_snapshot_taken=0
-  if [[ -n "$_pri_main_sha" ]]; then
-    run_command "git repo" git -C "$dir" update-ref refs/heads/main "$_pri_main_sha" >/dev/null 2>&1 \
-      || log "[worktree] Note: could not restore refs/heads/main on primary clone."
-  fi
-  if [[ "$_pri_reset_hard" == '1' && -n "$_pri_head_sha" ]]; then
-    if [[ -n "$_pri_head_symref" ]]; then
-      run_command "git repo" git -C "$dir" checkout "${_pri_head_symref#refs/heads/}" >/dev/null 2>&1 \
-        || log "[worktree] Note: could not checkout primary clone branch after restore."
-    fi
-    run_command "git repo" git -C "$dir" reset --hard "$_pri_head_sha" >/dev/null 2>&1 \
-      || log "[worktree] Note: could not reset primary clone working tree after restore."
-  fi
-  # Dry-run exercises the worktree lifecycle only; do not move the primary clone
-  # checkout to main (that would reset tracked files — e.g. scripts/dep-updater on
-  # this repo — to origin/main while tests still grep the PR branch version).
-  if [[ "$snapshot_was_taken" == '1' && "$report_json" != '1' && "$dry_run" != '1' ]]; then
-    primary_repo_ensure_on_main
-  fi
 }
 
 # Before scanning for outdated packages, align the dep-updater worktree with
@@ -3348,15 +3306,6 @@ create_worktree() {
     main_sha="$(dep_runner_git_rev_parse "git rev-parse HEAD" "$dir" "HEAD" || true)" \
       || die "Could not resolve origin/main or HEAD in: $dir"
     log "[worktree] origin/main not available; using local HEAD as base"
-  else
-    # --report-json (notifier/cron) only needs a throwaway worktree; never move the
-    # primary clone's main or restore it afterward (restore git output leaked to stdout).
-    if [[ "$report_json" != '1' ]]; then
-      primary_repo_snapshot
-      # Fast-forward local main to origin/main so that `gt submit` doesn't abort
-      # with "trunk branch is out of date".
-      primary_repo_sync_to_origin_main "before worktree" "$main_sha" || true
-    fi
   fi
   wt_base_branch="dep-updater-wt-${timestamp}-$$"
   run_command "git worktree add" git -C "$dir" worktree add -b "$wt_base_branch" "$worktree_path" "$main_sha" >&2
@@ -7012,7 +6961,7 @@ print_summary() {
 cleanup_on_error() {
   local -r reason="$1"
   log "Cleaning up after error: ${reason}"
-  primary_repo_restore
+  primary_repo_recover || true
   # Close any open PRs created in this session so a subsequent run starts fresh.
   if [[ -n "$state_file" && -f "$state_file" ]]; then
     local saved_prs=""
@@ -7050,7 +6999,7 @@ cleanup_on_error() {
 
 cleanup() {
   log "Cleaning up worktree…"
-  primary_repo_restore
+  primary_repo_recover || true
   if [[ -n "$worktree_path" && -d "$worktree_path" ]]; then
     log "[worktree] Removing worktree: $worktree_path"
     run_command "git repo" git -C "$dir" worktree remove --force "$worktree_path" 2>/dev/null \
@@ -7975,7 +7924,6 @@ main() {
     worktree_path="$wt"
     wt_base_branch="$(state_get "wt_branch")"
     log "Running cleanup for worktree: ${worktree_path}"
-    _primary_repo_sync_after_merge=1
     cleanup
     exit 0
   fi
@@ -8003,6 +7951,7 @@ main() {
   warn_if_dirty_workdir
   if [[ "$report_json" != '1' ]]; then
     primary_repo_warn_if_not_main
+    primary_repo_preserve
   fi
 
 # ---------------------------------------------------------------------------
@@ -8012,7 +7961,7 @@ main() {
 _dry_run_teardown() {
   local -r wt="$1"
   _cleanup_trap_active=0
-  primary_repo_restore
+  primary_repo_recover || true
   log "[worktree] Removing: $wt"
   cd - >/dev/null 2>&1 || true
   run_command "git repo" git -C "$dir" worktree remove --force "$wt" >/dev/null 2>&1 || true
@@ -8296,9 +8245,6 @@ fi
 # ---------------------------------------------------------------------------
 init_state_file
 sanitize_state_prs
-if [[ "$report_json" != '1' ]]; then
-  primary_repo_snapshot
-fi
 # Read any open-PR state from a prior interrupted run BEFORE prepare_worktree
 # can overwrite the state file.  cleanup_on_error intentionally preserves the
 # state file so these values survive a SIGINT.
@@ -8369,20 +8315,16 @@ if [[ -z "$npm_lines" && -z "$py_lines" && -z "$rust_lines" && -z "$gha_lines" ]
     log ""
     log "Stack submitted. To clean up after all PRs are merged, run:"
     log "  dep-updater --cleanup --dir ${dir}"
-    primary_repo_restore
+    primary_repo_recover || true
     exit 0
   fi
 
-  local final_prs_wt final_poll_rc=0
+  local final_prs_wt
   final_prs_wt="$(collect_tracked_prs_csv)"
   if [[ -n "$final_prs_wt" ]]; then
     set +e
     finalize_prs "$final_prs_wt"
-    final_poll_rc=$?
     set -e
-    if (( final_poll_rc == 0 )); then
-      _primary_repo_sync_after_merge=1
-    fi
   else
     log "No tracked PRs found; nothing to monitor."
   fi
@@ -8474,7 +8416,7 @@ if [[ "$no_wait_merge" == '1' ]]; then
   log "Stack submitted. To clean up after all PRs are merged, run:"
   log "  $0 --cleanup --dir ${dir}"
   _cleanup_trap_active=0
-  primary_repo_restore
+  primary_repo_recover || true
   dep_updater_emit_batch_child_report "$run_exit_rc"
   exit "$run_exit_rc"
 fi
@@ -8492,9 +8434,7 @@ set +e
 finalize_prs "$all_prs_csv"
 poll_rc=$?
 set -e
-if (( poll_rc == 0 )); then
-  _primary_repo_sync_after_merge=1
-elif (( poll_rc != 0 )); then
+if (( poll_rc != 0 )); then
   run_exit_rc=1
 fi
 _cleanup_trap_active=0
