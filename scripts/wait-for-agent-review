@@ -32,6 +32,9 @@ agent_review_loop_last_error=''
 agent_review_loop_last_merge_state=''
 agent_review_loop_attempt_count=0
 agent_review_loop_attempt_max=0
+# Per-head agents we requested and are still waiting on (space-separated).
+agent_review_loop_wait_head=''
+agent_review_loop_wait_agents=''
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
@@ -97,7 +100,7 @@ Environment:
   AGENT_REVIEW_PR_NUMBER        Default PR number when --pr is omitted
   AGENT_REVIEW_REPORT_TO        Operator email recipient (required for complete/email-failure)
   AGENT_REVIEW_REPORT_FROM      Email sender (required for complete/email-failure)
-  AGENT_REVIEW_CYCLE_TIMEOUT    Idle-success window after all feedback addressed (default: 15m)
+  AGENT_REVIEW_CYCLE_TIMEOUT    Legacy idle dwell (default: 15m); loop completes early when nothing is outstanding
   AGENT_REVIEW_PR_TIMEOUT       Non-convergence cap while review cycles keep iterating (default: 12h)
   AGENT_REVIEW_TRANSIENT_RETRIES  Retries for transient merge/restack failures (default: 5)
   AGENT_REVIEW_TRANSIENT_RETRY_SLEEP  Sleep between transient retries (default: 30s)
@@ -1058,6 +1061,120 @@ cmd_loop_ready_for_idle_wait() {
   [[ "${ci_ready}" == 'true' && "${merge_ready}" == 'true' ]]
 }
 
+agent_review_loop_wait_reset_head() {
+  local -r head="$1"
+
+  if [[ "${agent_review_loop_wait_head}" != "${head}" ]]; then
+    agent_review_loop_wait_head="${head}"
+    agent_review_loop_wait_agents=''
+  fi
+}
+
+agent_review_loop_wait_add() {
+  local -r agent="$1"
+  local -r head="$2"
+
+  if [[ -z "${agent}" || -z "${head}" ]]; then
+    return 0
+  fi
+  agent_review_loop_wait_reset_head "${head}"
+  if [[ " ${agent_review_loop_wait_agents} " == *" ${agent} "* ]]; then
+    return 0
+  fi
+  if [[ -z "${agent_review_loop_wait_agents}" ]]; then
+    agent_review_loop_wait_agents="${agent}"
+  else
+    agent_review_loop_wait_agents="${agent_review_loop_wait_agents} ${agent}"
+  fi
+}
+
+agent_review_loop_wait_remove() {
+  local -r agent="$1"
+  local out='' a
+
+  for a in ${agent_review_loop_wait_agents}; do
+    if [[ "${a}" != "${agent}" ]]; then
+      if [[ -z "${out}" ]]; then
+        out="${a}"
+      else
+        out="${out} ${a}"
+      fi
+    fi
+  done
+  agent_review_loop_wait_agents="${out}"
+}
+
+agent_review_loop_wait_any() {
+  [[ -n "${agent_review_loop_wait_agents}" ]]
+}
+
+# True when the agent has responded on this head (or is exhausted — stop waiting).
+cmd_loop_agent_response_seen() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r agent="$4"
+  local -r snapshot="$5"
+  local saved_agent
+
+  if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
+    return 0
+  fi
+  saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
+  agent_review_use_agent "${agent}"
+  if agent_review_fresh_agent_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    agent_review_use_agent "${saved_agent}"
+    return 0
+  fi
+  if agent_review_head_check_complete_on_head "${repo}" "${head}"; then
+    agent_review_use_agent "${saved_agent}"
+    return 0
+  fi
+  agent_review_use_agent "${saved_agent}"
+  return 1
+}
+
+cmd_loop_refresh_waiting_agents() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r snapshot="$4"
+  local agent agents
+
+  agent_review_loop_wait_reset_head "${head}"
+  agents="${agent_review_loop_wait_agents}"
+  for agent in ${agents}; do
+    if cmd_loop_agent_response_seen "${repo}" "${pr}" "${head}" "${agent}" "${snapshot}"; then
+      agent_review_loop_wait_remove "${agent}"
+    fi
+  done
+}
+
+# True when feedback/CI/merge are green and no agent wait remains for this head
+# (requested Copilot/Bugbot, or expected CodeRabbit auto-review).
+cmd_loop_nothing_outstanding() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r status="$3"
+  local -r snapshot="$4"
+  local -r head="$5"
+
+  if ! cmd_loop_ready_for_idle_wait "${status}"; then
+    return 1
+  fi
+  # Also block while a CodeRabbit workflow is actively running (even if wait list
+  # was cleared by a stale prior-head signal).
+  if ! agent_review_agent_quota_exhausted_for_agent 'coderabbit' \
+    && agent_review_named_pr_check_is_pending "${repo}" "${pr}" 'CodeRabbit'; then
+    return 1
+  fi
+  cmd_loop_refresh_waiting_agents "${repo}" "${pr}" "${head}" "${snapshot}"
+  if agent_review_loop_wait_any; then
+    return 1
+  fi
+  return 0
+}
+
 # Request one probe agent on a new head (coderabbit → copilot → bugbot). Manual agents
 # get a review request unless today's quota is already cached exhausted; auto-review
 # agents rely on the PR update. Escalates to the next agent when a request is blocked.
@@ -1099,6 +1216,8 @@ cmd_loop_maybe_request_agents_on_head() {
     if [[ "${agent_review_profile_auto_review:-false}" == 'true' ]]; then
       printf 'wait-for-agent-review: %s reviews run automatically — skipping manual request; will establish quota on PR #%s\n' \
         "${agent}" "${pr}" >&2
+      # Expect an auto-review on this head; clear once fresh/check-complete/exhausted.
+      agent_review_loop_wait_add "${agent}" "${head}"
       break
     fi
     request_exit=0
@@ -1115,6 +1234,7 @@ cmd_loop_maybe_request_agents_on_head() {
     fi
     agent_review_quota_mark_probe_requested_for_agent "${agent}" \
       "${agent} review requested on PR #${pr} to probe quota."
+    agent_review_loop_wait_add "${agent}" "${head}"
     agent_review_use_agent "${agent}"
     return 0
   done
@@ -1146,12 +1266,15 @@ The PR kept receiving reviews or still has unaddressed feedback. Triage open thr
 
 cmd_complete_idle() {
   local repo pr idle_s cycle_cap status complete_ready owner name snapshot head
+  local mode approve_body
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
   idle_s="${3:-0}"
   cycle_cap="${4:-0}"
-  if ! agent_review_daily_quota_probe_satisfied; then
+  mode="${5:-idle}"
+  # Early complete (nothing outstanding) must not block on daily quota probes.
+  if [[ "${mode}" != 'early' ]] && ! agent_review_daily_quota_probe_satisfied; then
     printf 'wait-for-agent-review: idle wait elapsed but daily quota probe is unsatisfied — not completing\n' >&2
     return 2
   fi
@@ -1168,17 +1291,26 @@ cmd_complete_idle() {
     cmd_complete "${repo}" "${pr}"
     return $?
   fi
+  if [[ "${mode}" == 'early' ]]; then
+    approve_body='Agent review cycle: nothing outstanding (no pending feedback; not waiting on agents; CodeRabbit idle).'
+  else
+    approve_body="Agent review cycle: all feedback addressed; no new activity for ${cycle_cap}s."
+  fi
   runner_exec "wait-for-agent-review pr approve idle" -- gh pr review "${pr}" --repo "${repo}" --approve \
-    --body "Agent review cycle: all feedback addressed; no new activity for ${cycle_cap}s."
-  agent_review_email_idle_complete "${repo}" "${pr}" "${idle_s}"
-  printf 'PR #%s review cycle complete (idle %ss)\n' "${pr}" "${idle_s}" >&2
+    --body "${approve_body}"
+  agent_review_email_idle_complete "${repo}" "${pr}" "${idle_s}" "${mode}"
+  if [[ "${mode}" == 'early' ]]; then
+    printf 'PR #%s review cycle complete (nothing outstanding)\n' "${pr}" >&2
+  else
+    printf 'PR #%s review cycle complete (idle %ss)\n' "${pr}" "${idle_s}" >&2
+  fi
   return 0
 }
 
 cmd_loop() {
-  local repo pr pr_started idle_started last_activity last_head head now
-  local pr_cap cycle_cap check_exit ci_exit pending_exit status activity_epoch
-  local owner name snapshot idle_s remaining complete_exit
+  local repo pr pr_started last_head head now
+  local pr_cap cycle_cap check_exit ci_exit pending_exit status
+  local owner name snapshot complete_exit
   local transient_retries transient_max transient_sleep restack_exit
 
   repo="$(agent_review_resolve_repo "${1:-}")"
@@ -1194,31 +1326,30 @@ cmd_loop() {
   agent_review_require_cmd gh
   agent_review_require_cmd jq
   pr_started="$(date +%s)"
-  idle_started=0
-  last_activity=0
   last_head=''
   transient_retries=0
+  agent_review_loop_wait_head=''
+  agent_review_loop_wait_agents=''
   agent_review_loop_attempt_max="${transient_max}"
   agent_review_log_cycle_quota_preamble
   agent_review_sync_active_probe_agent || true
-  printf 'Agent review loop for PR #%s (idle-success cycle=%ss, PR cap=%ss, transient retries=%s)\n' \
-    "${pr}" "${cycle_cap}" "${pr_cap}" "${transient_max}" >&2
+  printf 'Agent review loop for PR #%s (early-complete when idle, PR cap=%ss, transient retries=%s)\n' \
+    "${pr}" "${pr_cap}" "${transient_max}" >&2
 
   while true; do
     now="$(date +%s)"
     if (( now - pr_started >= pr_cap )); then
       status="$(cmd_status "${repo}" "${pr}" 2>/dev/null || true)"
-      if cmd_loop_ready_for_idle_wait "${status}" \
-        && (( idle_started > 0 )) \
-        && (( now - idle_started >= cycle_cap )); then
-        idle_s=$(( now - idle_started ))
+      read -r owner name < <(agent_review_repo_parts "${repo}")
+      snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}" 2>/dev/null || true)"
+      head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid' 2>/dev/null || true)"
+      if [[ -n "${snapshot}" && -n "${head}" ]] \
+        && cmd_loop_nothing_outstanding "${repo}" "${pr}" "${status}" "${snapshot}" "${head}"; then
         complete_exit=0
-        cmd_complete_idle "${repo}" "${pr}" "${idle_s}" "${cycle_cap}" || complete_exit=$?
-        if (( complete_exit == 2 )); then
-          cmd_loop_give_up_non_convergence "${repo}" "${pr}" "${pr_cap}"
-          return $?
+        cmd_complete_idle "${repo}" "${pr}" 0 "${cycle_cap}" early || complete_exit=$?
+        if (( complete_exit == 0 )); then
+          return 0
         fi
-        return "${complete_exit}"
       fi
       cmd_loop_give_up_non_convergence "${repo}" "${pr}" "${pr_cap}"
       return $?
@@ -1251,21 +1382,14 @@ cmd_loop() {
     snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
     agent_review_assert_snapshot_complete "${snapshot}"
     head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
-    activity_epoch="$(agent_review_last_activity_epoch_from_snapshot "${snapshot}")"
-    if (( activity_epoch > last_activity )); then
-      last_activity="${activity_epoch}"
-      idle_started=0
-    fi
     cmd_loop_observe_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}"
     agent_review_sync_active_probe_agent || true
     if [[ -z "${last_head}" ]]; then
       cmd_loop_maybe_request_agents_on_head "${repo}" "${pr}" "${head}" ""
       last_head="${head}"
-      idle_started=0
     elif [[ "${head}" != "${last_head}" ]]; then
       cmd_loop_maybe_request_agents_on_head "${repo}" "${pr}" "${head}" "${last_head}"
       last_head="${head}"
-      idle_started=0
     fi
 
     if ! agent_review_agent_quota_exhausted_for_agent 'coderabbit' \
@@ -1296,7 +1420,6 @@ cmd_loop() {
           agent_review_loop_last_error=''
           agent_review_loop_last_merge_state=''
           last_head=''
-          idle_started=0
           continue
         fi
         if (( restack_exit == 4 )); then
@@ -1316,7 +1439,6 @@ cmd_loop() {
         fi
         printf 'wait-for-agent-review loop: transient restack/mergeability issue on PR #%s (retry %s/%s)…\n' \
           "${pr}" "${transient_retries}" "${transient_max}" >&2
-        idle_started=0
         sleep "${transient_sleep}"
         continue
         ;;
@@ -1324,7 +1446,6 @@ cmd_loop() {
         cmd_handle_quota_exhaustion "${repo}" "${pr}" \
           "${AGENT_REVIEW_AGENT:-copilot} review quota or usage limit exhausted on the current PR head." \
           || true
-        idle_started=0
         sleep "${agent_review_default_poll_interval_s}"
         continue
         ;;
@@ -1343,7 +1464,6 @@ cmd_loop() {
         return 11
         ;;
       5)
-        idle_started=0
         sleep "${agent_review_default_poll_interval_s}"
         continue
         ;;
@@ -1359,30 +1479,27 @@ cmd_loop() {
     esac
 
     status="$(cmd_status "${repo}" "${pr}")"
+    cmd_loop_refresh_waiting_agents "${repo}" "${pr}" "${head}" "${snapshot}"
+
+    if cmd_loop_nothing_outstanding "${repo}" "${pr}" "${status}" "${snapshot}" "${head}"; then
+      printf 'wait-for-agent-review loop: nothing outstanding — completing on PR #%s\n' \
+        "${pr}" >&2
+      complete_exit=0
+      cmd_complete_idle "${repo}" "${pr}" 0 "${cycle_cap}" early || complete_exit=$?
+      return "${complete_exit}"
+    fi
 
     if cmd_loop_ready_for_idle_wait "${status}"; then
-      if (( idle_started == 0 )); then
-        idle_started="${now}"
-        printf 'wait-for-agent-review loop: all feedback addressed — idle wait for new reviews (%ss) on PR #%s\n' \
-          "${cycle_cap}" "${pr}" >&2
-      elif (( now - idle_started >= cycle_cap )); then
-        idle_s=$(( now - idle_started ))
-        complete_exit=0
-        cmd_complete_idle "${repo}" "${pr}" "${idle_s}" "${cycle_cap}" || complete_exit=$?
-        if (( complete_exit == 2 )); then
-          cmd_loop_maybe_request_agents_on_head "${repo}" "${pr}" "${head}" ""
-          idle_started=0
-          sleep "${agent_review_default_poll_interval_s}"
-          continue
-        fi
-        return "${complete_exit}"
+      # Feedback/CI/merge are green but we are still waiting on a requested agent
+      # or a running CodeRabbit workflow — keep polling (no mandatory idle dwell).
+      if agent_review_loop_wait_any; then
+        printf 'wait-for-agent-review loop: waiting on agent review(s) [%s] for head %s on PR #%s…\n' \
+          "${agent_review_loop_wait_agents}" "${head:0:7}" "${pr}" >&2
       else
-        remaining=$(( cycle_cap - (now - idle_started) ))
-        printf 'wait-for-agent-review loop: idle wait on PR #%s (%ss remaining before success)…\n' \
-          "${pr}" "${remaining}" >&2
+        printf 'wait-for-agent-review loop: waiting for CodeRabbit workflow on PR #%s…\n' \
+          "${pr}" >&2
       fi
     else
-      idle_started=0
       printf 'wait-for-agent-review loop: waiting for reviews (agents with quota + humans) on PR #%s…\n' \
         "${pr}" >&2
     fi
