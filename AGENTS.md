@@ -336,17 +336,17 @@ When CI is green, run the **agent review loop** documented in **`.cursor/rules/p
 
 1. Prefer **`./scripts/wait-for-agent-review loop --pr <n>`** (or `scripts/dev/ship-and-review` from submit).
 2. On exit **3**, triage each feedback item (inline thread or top-level issue comment): fix → **`reply-thread`** / **`reply-comment`** → **`resolve-thread`** / **`resolve-comment`** — never resolve without replying first. Use **`list-feedback`** to see pending items.
-3. **`./scripts/wait-for-agent-review complete --pr <n>`** when `check` reports `complete_ready`, or let **`loop`** exit **0** via idle-success (15m with no new activity).
+3. **`./scripts/wait-for-agent-review complete --pr <n>`** when `check` reports `complete_ready`, or let **`loop`** exit **0** when nothing is outstanding (no pending feedback, no in-flight agent wait, CodeRabbit idle).
 4. Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`.
 
-#### Dual-timeout loop and per-agent quota skip
+#### Early-complete loop and per-agent quota skip
 
-- **`AGENT_REVIEW_CYCLE_TIMEOUT`** (default **15m**): **idle-success** window after all threads are
-  addressed, CI is green, and the PR is merge-ready. Any new review or comment from any party
-  (CodeRabbit, Copilot, Bugbot, humans) resets the clock. When no activity arrives for 15m,
-  `cmd_complete_idle` approves and emails — **without** requiring Copilot **“generated no new comments”**.
+- **Nothing outstanding:** after all threads are addressed, CI is green, and the PR is merge-ready,
+  `loop` completes as soon as it is not waiting on a requested Copilot/Bugbot review and CodeRabbit
+  is idle. `cmd_complete_idle` (early) approves and emails — **without** requiring Copilot
+  **“generated no new comments”**. `AGENT_REVIEW_CYCLE_TIMEOUT` is retained for compatibility only.
 - **`AGENT_REVIEW_PR_TIMEOUT`** (default **12h**): non-convergence cap when review cycles keep
-  iterating without reaching idle-success; exit **6** triggers give-up (not the idle-success path).
+  iterating without reaching early-complete; exit **6** triggers give-up.
 
 Per-agent daily quota caches skip review requests for exhausted agents (CodeRabbit, Copilot, Bugbot)
 and probe the next agent in `AGENT_REVIEW_QUOTA_FALLBACK_CHAIN` (see
