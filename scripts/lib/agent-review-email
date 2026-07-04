@@ -109,23 +109,114 @@ agent_review_email_gh_user_login() {
   printf '%s' "${gh_user}"
 }
 
+# Friendly display name for known review agents; humans keep their login.
+agent_review_email_reviewer_display_name() {
+  local -r login="$1"
+  local lower
+
+  lower="${login,,}"
+  case "${lower}" in
+    *copilot*)
+      printf 'copilot'
+      ;;
+    *bugbot*|*cursor*)
+      printf 'bugbot'
+      ;;
+    *coderabbit*|*rabbit*)
+      printf 'coderabbitai'
+      ;;
+    *)
+      printf '%s' "${login}"
+      ;;
+  esac
+}
+
+# Comma-separated reviewers (bots + humans) from PR reviews, deduped by login.
+agent_review_email_reviewers_list() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local reviews_json exit_code login display result
+  local -a logins=()
+  local -a displays=()
+  local -A seen_logins=()
+  local -A seen_display=()
+
+  exit_code=0
+  reviews_json="$(runner_exec_stdout "agent-review email pr reviews" -- gh pr view "${pr}" --repo "${repo}" --json reviews)" \
+    || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "${reviews_json}" ]]; then
+    printf 'unknown'
+    return 0
+  fi
+
+  mapfile -t logins < <(ar_runner_jq_file "agent-review email review logins" "${reviews_json}" -r '
+    [.reviews[]?
+      | select(.state != "PENDING")
+      | (.author.login // empty)
+      | select(. != "")]
+    | reduce .[] as $l ([]; if index($l) then . else . + [$l] end)
+    | .[]')
+
+  for login in "${logins[@]}"; do
+    [[ -z "${login}" ]] && continue
+    [[ -n "${seen_logins[${login}]+x}" ]] && continue
+    seen_logins["${login}"]=1
+    display="$(agent_review_email_reviewer_display_name "${login}")"
+    [[ -n "${seen_display[${display}]+x}" ]] && continue
+    seen_display["${display}"]=1
+    displays+=("${display}")
+  done
+
+  if (( ${#displays[@]} == 0 )); then
+    printf 'none'
+    return 0
+  fi
+
+  result="$(printf '%s, ' "${displays[@]}")"
+  printf '%s' "${result%, }"
+}
+
+# Actual mergeStateStatus from the PR (e.g. CLEAN, BLOCKED), or unknown.
+agent_review_email_merge_state_status() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local merge_json merge_state exit_code
+
+  exit_code=0
+  merge_json="$(agent_review_pr_merge_json "${repo}" "${pr}")" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "${merge_json}" ]]; then
+    printf 'unknown'
+    return 0
+  fi
+  merge_state="$(ar_runner_jq_file "agent-review email mergeStateStatus" "${merge_json}" \
+    -r '.mergeStateStatus // empty')"
+  if [[ -z "${merge_state}" ]]; then
+    printf 'unknown'
+    return 0
+  fi
+  printf '%s' "${merge_state}"
+}
+
 agent_review_email_complete() {
   local -r repo="$1"
   local -r pr="$2"
-  local body agent_id gh_user
+  local body agent_id gh_user reviewers merge_state
 
   agent_review_require_cmd gh
   agent_review_email_read_pr_meta "${repo}" "${pr}"
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
   gh_user="$(agent_review_email_gh_user_login)"
+  reviewers="$(agent_review_email_reviewers_list "${repo}" "${pr}")"
+  merge_state="$(agent_review_email_merge_state_status "${repo}" "${pr}")"
   body="PR #${pr} passed the ${agent_id} agent review loop.
 
 URL: ${agent_review_email_pr_url}
 Title: ${agent_review_email_pr_title}
 
-Agent: ${agent_id} review on current head reports no new comments.
+Reviewers: ${reviewers}
+Open feedback: none
 Action: PR approved via gh as ${gh_user}.
-Merge: mergeStateStatus is CLEAN or BLOCKED (verify with gh pr checks ${pr} before merge-it).
+Merge: mergeStateStatus=${merge_state}
 
 Do not add merge-it unless you intend to merge."
 
@@ -139,11 +230,13 @@ agent_review_email_idle_complete() {
   local -r pr="$2"
   local -r idle_s="$3"
   local mode="${4:-idle}"
-  local body gh_user quota_summary subject
+  local body gh_user quota_summary subject reviewers merge_state
 
   agent_review_require_cmd gh
   agent_review_email_read_pr_meta "${repo}" "${pr}"
   gh_user="$(agent_review_email_gh_user_login)"
+  reviewers="$(agent_review_email_reviewers_list "${repo}" "${pr}")"
+  merge_state="$(agent_review_email_merge_state_status "${repo}" "${pr}")"
   quota_summary="$(agent_review_quota_summary_for_email)"
   if [[ "${mode}" == 'early' ]]; then
     subject="PR review cycle complete (nothing outstanding): ${agent_review_email_pr_title} (#${pr})"
@@ -152,6 +245,9 @@ agent_review_email_idle_complete() {
 URL: ${agent_review_email_pr_url}
 Title: ${agent_review_email_pr_title}
 
+Reviewers: ${reviewers}
+Open feedback: none
+
 All feedback items (review threads and PR comments) are addressed and responded to.
 No agent review is in flight (no outstanding Copilot/Bugbot request; CodeRabbit idle).
 
@@ -159,13 +255,16 @@ Agent quota today:
 ${quota_summary}
 
 Action: PR approved via gh as ${gh_user} when merge checks pass.
-Merge: verify with gh pr checks ${pr} before merge-it."
+Merge: mergeStateStatus=${merge_state}"
   else
     subject="PR review cycle complete (idle): ${agent_review_email_pr_title} (#${pr})"
     body="PR #${pr} review cycle complete — no new feedback for ${idle_s}s.
 
 URL: ${agent_review_email_pr_url}
 Title: ${agent_review_email_pr_title}
+
+Reviewers: ${reviewers}
+Open feedback: none
 
 All feedback items (review threads and PR comments) are addressed and responded to.
 No new reviews or comments arrived within AGENT_REVIEW_CYCLE_TIMEOUT (${idle_s}s).
@@ -174,7 +273,7 @@ Agent quota today:
 ${quota_summary}
 
 Action: PR approved via gh as ${gh_user} when merge checks pass.
-Merge: verify with gh pr checks ${pr} before merge-it."
+Merge: mergeStateStatus=${merge_state}"
   fi
 
   agent_review_email_send_plain "${subject}" "${body}"
