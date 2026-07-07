@@ -180,26 +180,75 @@ agent_review_profile_review_is_empty() {
   return 1
 }
 
-# agent_review_profile_fresh_on_head <snapshot> <head> <repo> <pr>
-# Copilot may reply via PR issue comments instead of formal reviews.
-agent_review_profile_fresh_on_head() {
+# agent_review_copilot_review_requests_pending_in_snapshot <snapshot>
+# True when GitHub still shows a pending Copilot review request on the PR.
+agent_review_copilot_review_requests_pending_in_snapshot() {
+  local -r snapshot="$1"
+  local exit_code
+
+  exit_code=0
+  ar_runner_jq_file "copilot profile review requests pending" "${snapshot}" -e \
+    --arg re "${agent_review_profile_request_login_regex}" \
+    '[.data.repository.pullRequest.reviewRequests.nodes[]
+      | .requestedReviewer | (.login // .slug // "")
+      | select(test($re;"i"))] | length > 0' >/dev/null || exit_code=$?
+  (( exit_code == 0 ))
+}
+
+# agent_review_copilot_review_delivered_on_head <snapshot> <head> <repo> <pr>
+# True when Copilot posted a formal review or substantive issue-comment reply for this head.
+agent_review_copilot_review_delivered_on_head() {
+  local -r snapshot="$1"
   local -r head="$2"
   local -r repo="$3"
   local -r pr="$4"
-  local body short_head
+  local comments_json body
 
-  body="$(agent_review_latest_issue_comment_body_for_profile "${repo}" "${pr}")"
-  if [[ -z "${body}" ]]; then
-    return 1
-  fi
-  if agent_review_copilot_issue_comment_is_probe "${body}"; then
-    return 1
-  fi
-  if [[ "${body}" == *"${head}"* ]]; then
+  if agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
     return 0
   fi
-  short_head="${head:0:7}"
-  [[ -n "${short_head}" ]] && [[ "${body}" == *"${short_head}"* ]]
+  comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
+  body="$(agent_review_copilot_success_issue_comment_for_head "${comments_json}" "${head}")"
+  [[ -n "${body}" ]]
+}
+
+# agent_review_profile_review_outstanding <snapshot> <head> <repo> <pr>
+# True while a Copilot review was requested but has not finished on the current head.
+agent_review_profile_review_outstanding() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local -r repo="$3"
+  local -r pr="$4"
+  local comments_json
+
+  if agent_review_copilot_review_requests_pending_in_snapshot "${snapshot}"; then
+    return 0
+  fi
+  comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
+  if agent_review_copilot_probe_comment_sent_for_head "${comments_json}" "${head}" \
+    && ! agent_review_copilot_review_delivered_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    return 0
+  fi
+  return 1
+}
+
+# agent_review_profile_review_complete_on_head <snapshot> <head> <repo> <pr>
+agent_review_profile_review_complete_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local -r repo="$3"
+  local -r pr="$4"
+
+  if agent_review_profile_review_outstanding "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    return 1
+  fi
+  agent_review_copilot_review_delivered_on_head "${snapshot}" "${head}" "${repo}" "${pr}"
+}
+
+# agent_review_profile_fresh_on_head <snapshot> <head> <repo> <pr>
+# Copilot review is fresh only when the requested review has actually completed.
+agent_review_profile_fresh_on_head() {
+  agent_review_profile_review_complete_on_head "${1}" "${2}" "${3}" "${4}"
 }
 
 # agent_review_profile_latest_review_body_on_head <snapshot> <head> <repo> <pr>
@@ -451,6 +500,9 @@ agent_review_profile_agent_requested_from_snapshot() {
   local -r snapshot="$1"
   local head marker comments_json tmp_snapshot exit_code
 
+  if agent_review_copilot_review_requests_pending_in_snapshot "${snapshot}"; then
+    return 0
+  fi
   tmp_snapshot="$(mktemp "${TMPDIR:-/tmp}/copilot-snapshot.XXXXXX")"
   printf '%s' "${snapshot}" >"${tmp_snapshot}"
   exit_code=0

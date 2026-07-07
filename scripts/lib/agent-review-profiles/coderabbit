@@ -117,6 +117,43 @@ agent_review_profile_text_is_coderabbit_billing_block() {
   return 1
 }
 
+# agent_review_profile_text_quota_retry_after_iso <text> <comment_created_at_iso>
+# Prints UTC ISO-8601 when a rate-limited comment says the next review is available.
+agent_review_profile_text_quota_retry_after_iso() {
+  local -r text="${1:-}"
+  local -r comment_created_at="${2:-}"
+  local lower minutes hours retry_at
+
+  if [[ -z "${text}" || -z "${comment_created_at}" ]]; then
+    return 1
+  fi
+  lower="${text,,}"
+  if [[ "${lower}" =~ next[[:space:]]+review[[:space:]]+available[[:space:]]+in[^0-9]*([0-9]+)[[:space:]]*minutes? ]]; then
+    minutes="${BASH_REMATCH[1]}"
+    retry_at="$(date -u -d "${comment_created_at} + ${minutes} minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+    if [[ -n "${retry_at}" ]]; then
+      printf '%s' "${retry_at}"
+      return 0
+    fi
+  fi
+  if [[ "${lower}" =~ next[[:space:]]+review[[:space:]]+available[[:space:]]+in[^0-9]*([0-9]+)[[:space:]]*hours? ]]; then
+    hours="${BASH_REMATCH[1]}"
+    retry_at="$(date -u -d "${comment_created_at} + ${hours} hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+    if [[ -n "${retry_at}" ]]; then
+      printf '%s' "${retry_at}"
+      return 0
+    fi
+  fi
+  if [[ "${lower}" =~ (resets?[[:space:]]+at|available[[:space:]]+again[[:space:]]+at)[[:space:]]*:*[[:space:]]*([0-9]{4}-[0-9]{2}-[0-9]{2}[^[:space:]<]+) ]]; then
+    retry_at="$(date -u -d "${BASH_REMATCH[2]}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+    if [[ -n "${retry_at}" ]]; then
+      printf '%s' "${retry_at}"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 # agent_review_profile_issue_comment_is_quota_exhausted <login> <body>
 agent_review_profile_issue_comment_is_quota_exhausted() {
   local -r login="${1:-}"
@@ -135,7 +172,7 @@ agent_review_profile_issue_comment_is_quota_exhausted() {
 agent_review_profile_review_is_quota_exhausted() {
   local -r body="${1:-}"
 
-  agent_review_profile_text_is_quota_exhausted "${body}"
+  agent_review_profile_text_is_coderabbit_billing_block "${body}"
 }
 
 # agent_review_profile_review_has_actionable_feedback <review_body>
@@ -292,7 +329,55 @@ agent_review_profile_latest_review_body_on_head() {
 }
 
 # agent_review_profile_request <repo> <pr>
-# Not used — cmd_request skips manual triggers when agent_review_profile_auto_review is true.
+# Not used for routine probes — cmd_request skips when agent_review_profile_auto_review is true.
+# agent_review_profile_post_rate_limit_retry <repo> <pr> <head>
+# Posts @coderabbitai review after a temporary rate-limit window (CodeRabbit docs).
+agent_review_coderabbit_rate_limit_retry_marker() {
+  local -r head="${1:-}"
+
+  printf 'wait-for-agent-review:coderabbit-rate-limit-retry:%s' "${head:0:7}"
+}
+
+agent_review_coderabbit_rate_limit_retry_sent_for_head() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local marker comments_json exit_code
+
+  [[ -n "${head}" ]] || return 1
+  marker="$(agent_review_coderabbit_rate_limit_retry_marker "${head}")"
+  comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
+  exit_code=0
+  # shellcheck disable=SC2016  # jq filter uses $marker variable, not shell expansion
+  ar_runner_jq_file "coderabbit rate limit retry marker" "${comments_json}" -res \
+    --arg marker "${marker}" \
+    '[ .[] | .[] | .body // "" | select(contains($marker)) ] | length > 0' \
+    >/dev/null || exit_code=$?
+  (( exit_code == 0 ))
+}
+
+agent_review_profile_post_rate_limit_retry() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local marker body
+
+  if agent_review_coderabbit_rate_limit_retry_sent_for_head "${repo}" "${pr}" "${head}"; then
+    printf 'wait-for-agent-review: CodeRabbit rate-limit retry already posted for head %s on PR #%s\n' \
+      "${head:0:7}" "${pr}" >&2
+    return 0
+  fi
+  marker="$(agent_review_coderabbit_rate_limit_retry_marker "${head}")"
+  body="@coderabbitai review
+
+<!-- ${marker} -->"
+  if ! runner_exec "coderabbit profile rate-limit retry comment" -- gh pr comment "${pr}" --repo "${repo}" --body "${body}"; then
+    return 1
+  fi
+  printf 'wait-for-agent-review: posted CodeRabbit rate-limit retry on PR #%s (head %s)\n' \
+    "${pr}" "${head:0:7}" >&2
+}
+
 agent_review_profile_request() {
   local -r repo="$1"
   local -r pr="$2"

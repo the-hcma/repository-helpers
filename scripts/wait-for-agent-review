@@ -1118,10 +1118,22 @@ cmd_loop_agent_response_seen() {
   local saved_agent
 
   if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
+    if agent_review_agent_quota_rate_limited_for_agent "${agent}"; then
+      return 1
+    fi
     return 0
   fi
   saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
   agent_review_use_agent "${agent}"
+  if [[ "${agent}" == 'copilot' ]] \
+    && declare -F agent_review_profile_review_complete_on_head >/dev/null 2>&1; then
+    if agent_review_profile_review_complete_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+      agent_review_use_agent "${saved_agent}"
+      return 0
+    fi
+    agent_review_use_agent "${saved_agent}"
+    return 1
+  fi
   if agent_review_fresh_agent_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
     agent_review_use_agent "${saved_agent}"
     return 0
@@ -1170,6 +1182,27 @@ cmd_loop_refresh_waiting_agents() {
   done
 }
 
+cmd_loop_track_outstanding_agent_reviews() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r snapshot="$4"
+  local saved_agent agent
+
+  saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
+  for agent in copilot bugbot; do
+    agent_review_use_agent "${agent}"
+    if declare -F agent_review_profile_review_outstanding >/dev/null 2>&1 \
+      && agent_review_profile_review_outstanding "${snapshot}" "${head}" "${repo}" "${pr}"; then
+      agent_review_loop_wait_add "${agent}" "${head}"
+    elif agent_review_agent_requested_from_snapshot "${snapshot}" \
+      && ! cmd_loop_agent_response_seen "${repo}" "${pr}" "${head}" "${agent}" "${snapshot}"; then
+      agent_review_loop_wait_add "${agent}" "${head}"
+    fi
+  done
+  agent_review_use_agent "${saved_agent}"
+}
+
 # True when feedback/CI/merge are green and no agent wait remains for this head
 # (requested Copilot/Bugbot, or expected CodeRabbit auto-review).
 cmd_loop_nothing_outstanding() {
@@ -1178,6 +1211,7 @@ cmd_loop_nothing_outstanding() {
   local -r status="$3"
   local -r snapshot="$4"
   local -r head="$5"
+  local saved_agent agent
 
   if ! cmd_loop_ready_for_idle_wait "${status}"; then
     return 1
@@ -1192,10 +1226,70 @@ cmd_loop_nothing_outstanding() {
     && agent_review_named_pr_check_is_pending "${repo}" "${pr}" 'CodeRabbit'; then
     return 1
   fi
+  if agent_review_agent_quota_rate_limited_for_agent 'coderabbit'; then
+    return 1
+  fi
+  saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
+  for agent in copilot bugbot; do
+    agent_review_use_agent "${agent}"
+    if declare -F agent_review_profile_review_outstanding >/dev/null 2>&1 \
+      && agent_review_profile_review_outstanding "${snapshot}" "${head}" "${repo}" "${pr}"; then
+      agent_review_use_agent "${saved_agent}"
+      return 1
+    fi
+    if agent_review_agent_requested_from_snapshot "${snapshot}" \
+      && ! cmd_loop_agent_response_seen "${repo}" "${pr}" "${head}" "${agent}" "${snapshot}"; then
+      agent_review_use_agent "${saved_agent}"
+      return 1
+    fi
+  done
+  agent_review_use_agent "${saved_agent}"
   cmd_loop_refresh_waiting_agents "${repo}" "${pr}" "${head}" "${snapshot}"
   if agent_review_loop_wait_any; then
     return 1
   fi
+  return 0
+}
+
+# Sleep until CodeRabbit retry_after (if any), then post @coderabbitai review once.
+# Returns 0 when this iteration should continue (rate-limit handling consumed the turn).
+cmd_loop_handle_coderabbit_rate_limit() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local saved_agent retry_after remaining sleep_s
+
+  retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent 'coderabbit')"
+  if [[ -z "${retry_after}" ]]; then
+    return 1
+  fi
+  saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
+  agent_review_use_agent 'coderabbit'
+  if agent_review_agent_quota_rate_limited_for_agent 'coderabbit'; then
+    remaining="$(agent_review_agent_quota_seconds_until_retry_for_agent 'coderabbit' || true)"
+    if [[ -z "${remaining}" ]]; then
+      remaining="${agent_review_default_poll_interval_s}"
+    fi
+    if (( remaining > 0 )); then
+      sleep_s=$((remaining + 5))
+    else
+      sleep_s=5
+    fi
+    agent_review_loop_wait_add 'coderabbit' "${head}"
+    printf 'wait-for-agent-review: CodeRabbit rate-limited until %s — sleeping %ss on PR #%s\n' \
+      "${retry_after}" "${sleep_s}" "${pr}" >&2
+    agent_review_use_agent "${saved_agent}"
+    sleep "${sleep_s}"
+    return 0
+  fi
+  agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
+  if declare -F agent_review_profile_post_rate_limit_retry >/dev/null 2>&1; then
+    agent_review_profile_post_rate_limit_retry "${repo}" "${pr}" "${head}"
+  fi
+  agent_review_loop_wait_add 'coderabbit' "${head}"
+  printf 'wait-for-agent-review: CodeRabbit rate-limit window elapsed — retry posted on PR #%s\n' \
+    "${pr}" >&2
+  agent_review_use_agent "${saved_agent}"
   return 0
 }
 
@@ -1310,6 +1404,12 @@ cmd_complete_idle() {
   head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
   agent_review_observe_all_agent_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}" || true
   status="$(cmd_status "${repo}" "${pr}")"
+  if [[ "${mode}" == 'early' ]] \
+    && ! cmd_loop_nothing_outstanding "${repo}" "${pr}" "${status}" "${snapshot}" "${head}"; then
+    printf 'wait-for-agent-review: refusing early complete — agent review still outstanding on PR #%s\n' \
+      "${pr}" >&2
+    return 2
+  fi
   complete_ready="$(wait_ar_jq_status "$status" '.complete_ready')"
   if [[ "${complete_ready}" == 'true' ]]; then
     cmd_complete "${repo}" "${pr}"
@@ -1416,6 +1516,9 @@ cmd_loop() {
     fi
     cmd_loop_observe_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}"
     agent_review_sync_active_probe_agent || true
+    if cmd_loop_handle_coderabbit_rate_limit "${repo}" "${pr}" "${head}"; then
+      continue
+    fi
     if [[ -z "${last_head}" ]]; then
       cmd_loop_maybe_request_agents_on_head "${repo}" "${pr}" "${head}" ""
       last_head="${head}"
@@ -1511,6 +1614,7 @@ cmd_loop() {
     esac
 
     status="$(cmd_status "${repo}" "${pr}")"
+    cmd_loop_track_outstanding_agent_reviews "${repo}" "${pr}" "${head}" "${snapshot}"
     cmd_loop_refresh_waiting_agents "${repo}" "${pr}" "${head}" "${snapshot}"
 
     if cmd_loop_nothing_outstanding "${repo}" "${pr}" "${status}" "${snapshot}" "${head}"; then
@@ -1518,7 +1622,11 @@ cmd_loop() {
         "${pr}" >&2
       complete_exit=0
       cmd_complete_idle "${repo}" "${pr}" 0 "${cycle_cap}" early || complete_exit=$?
-      return "${complete_exit}"
+      if (( complete_exit == 0 )); then
+        return 0
+      fi
+      printf 'wait-for-agent-review loop: early complete aborted (exit %s) — continuing on PR #%s\n' \
+        "${complete_exit}" "${pr}" >&2
     fi
 
     if cmd_loop_ready_for_idle_wait "${status}"; then

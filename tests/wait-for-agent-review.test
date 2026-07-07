@@ -348,11 +348,12 @@ fi
 if grep -qF 'agent_review_profile_auto_review=true' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
   && grep -qF 'agent_review_profile_auto_review' "$wait_script" \
   && grep -qF 'reviews run automatically — skipping manual request' "$wait_script" \
-  && ! grep -qF 'gh pr comment' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit"; then
-  printf '[PASS] coderabbit profile: auto-review only (no manual @coderabbitai request)\n'
+  && grep -qF 'agent_review_profile_post_rate_limit_retry' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
+  && ! awk '/gh pr comment/ && !/runner_exec/' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" | grep -q .; then
+  printf '[PASS] coderabbit profile: auto-review with rate-limit retry only via runner\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] coderabbit profile: still posts manual review trigger\n'
+  printf '[FAIL] coderabbit profile: routine probe posts manual review or bare gh comment\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -1282,6 +1283,220 @@ else
 fi
 rm -f "${tmp_quota_evidence}"
 
+printf '\n=== quota: retry-after and evidence URL hygiene ===\n'
+if retry_iso="$(bash -c "
+  source '${coderabbit_profile}'
+  agent_review_profile_text_quota_retry_after_iso \
+    'Review limit reached. Next review available in: 40 minutes' \
+    '2026-07-07T18:00:00Z'
+")" && [[ -n "${retry_iso}" ]] && [[ "${retry_iso}" == *'T18:40:00Z' ]]; then
+  printf '[PASS] coderabbit profile: parses next-review-in minutes as retry_after ISO\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: retry_after parsing failed (got %s)\n' "${retry_iso:-empty}"
+  fail=$(( fail + 1 ))
+fi
+
+# Real rate-limit wording from the-hcma/domesti-bot#420 (comment 4906831815).
+# shellcheck disable=SC2016  # fixture body is literal markdown, not shell expansions
+domesti_bot_420_rate_limit_body='> **Next review available in:** **40 minutes**'
+if retry_iso="$(BODY="${domesti_bot_420_rate_limit_body}" bash -c "
+  source '${coderabbit_profile}'
+  agent_review_profile_text_quota_retry_after_iso \"\${BODY}\" '2026-07-07T17:44:23Z'
+")" \
+  && [[ "${retry_iso}" == '2026-07-07T18:24:23Z' ]]; then
+  printf '[PASS] coderabbit profile: domesti-bot#420 rate-limit comment parses retry_after\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: domesti-bot#420 rate-limit parse failed (retry=%s)\n' \
+    "${retry_iso:-empty}"
+  fail=$(( fail + 1 ))
+fi
+
+tmp_quota_stale="$(mktemp)"
+tmp_quota_fresh="$(mktemp)"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_quota_stale}'
+  agent_review_coderabbit_quota_write_cache 1 observed \
+    'stale evidence' '' '' 'https://github.com/the-hcma/mock-repo/pull/1#issuecomment-old'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_quota_fresh}'
+  agent_review_coderabbit_quota_write_cache 1 observed 'fresh signal without URL'
+  ! grep -qF 'evidence_url=' '${tmp_quota_fresh}'
+"; then
+  printf '[PASS] quota cache: new observe without evidence_url does not inherit stale link\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota cache: stale evidence_url inherited on rewrite\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_quota_stale}" "${tmp_quota_fresh}"
+
+tmp_quota_retry="$(mktemp)"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_quota_retry}'
+  agent_review_coderabbit_quota_write_cache 1 observed \
+    'CodeRabbit rate limit.' '' '' \
+    'https://github.com/the-hcma/mock-repo/pull/1#issuecomment-2' \
+    '2099-01-01T00:00:00Z'
+  agent_review_agent_quota_exhausted_for_agent coderabbit
+" && summary="$(bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_quota_retry}'
+  agent_review_quota_summary_for_email
+")" && grep -qF 'rate-limited until 2099-01-01T00:00:00Z' <<<"${summary}"; then
+  printf '[PASS] quota email summary: temporary rate limit shows retry time\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota email summary: missing rate-limited until retry time\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_quota_retry}"
+
+tmp_quota_expired="$(mktemp)"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_quota_expired}'
+  agent_review_coderabbit_quota_write_cache 1 observed \
+    'expired rate limit.' '' '' '' '2000-01-01T00:00:00Z'
+  ! agent_review_agent_quota_exhausted_for_agent coderabbit
+"; then
+  printf '[PASS] quota cache: retry_after in the past is not treated as exhausted\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota cache: expired retry_after still blocks requests\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_quota_expired}"
+
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'agent_review_profile_review_outstanding' "${script_dir}/../scripts/lib/agent-review-profiles/copilot" \
+  && grep -qF 'cmd_loop_track_outstanding_agent_reviews' "$wait_script" \
+  && grep -qF 'agent_review_profile_review_complete_on_head' "$wait_script" \
+  && grep -qF 'refusing early complete' "$wait_script"; then
+  printf '[PASS] loop: waits for Copilot review completion before early exit\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] loop: missing Copilot review completion wait wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'awaiting review completion' "${email_lib}" \
+  && grep -qF 'agent_review_profile_review_outstanding' "${email_lib}"; then
+  printf '[PASS] email: distinguishes awaiting Copilot review completion\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] email: missing awaiting Copilot review completion wording\n'
+  fail=$(( fail + 1 ))
+fi
+
+copilot_profile="${script_dir}/../scripts/lib/agent-review-profiles/copilot"
+tmp_copilot_snapshot="$(mktemp)"
+cat >"${tmp_copilot_snapshot}" <<'EOF'
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "headRefOid": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "reviewRequests": {
+          "pageInfo": { "hasNextPage": false },
+          "nodes": [{ "requestedReviewer": { "login": "copilot-pull-request-reviewer" } }]
+        },
+        "reviews": { "pageInfo": { "hasPreviousPage": false }, "nodes": [] },
+        "comments": { "pageInfo": { "hasNextPage": false }, "nodes": [] }
+      }
+    }
+  }
+}
+EOF
+if bash -c "
+  source '${lib}'
+  source '${copilot_profile}'
+  agent_review_use_agent copilot
+  agent_review_copilot_review_requests_pending_in_snapshot \"\$(cat '${tmp_copilot_snapshot}')\"
+  agent_review_profile_review_outstanding \"\$(cat '${tmp_copilot_snapshot}')\" \
+    'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' 'the-hcma/mock-repo' 1
+"; then
+  printf '[PASS] copilot profile: pending reviewRequests keep review outstanding\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot profile: did not treat pending reviewRequests as outstanding\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_copilot_snapshot}"
+
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'agent_review_agent_requested_from_snapshot "${snapshot}"' "$wait_script" \
+  && grep -qF 'cmd_loop_agent_response_seen "${repo}" "${pr}" "${head}" "${agent}" "${snapshot}"' "$wait_script"; then
+  printf '[PASS] loop: blocks early-complete while manual agent review is requested\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] loop: missing outstanding manual review request guard\n'
+  fail=$(( fail + 1 ))
+fi
+
+feedback_lib="${script_dir}/../scripts/lib/agent-review-feedback"
+if grep -qF 'agent_review_feedback_stats_line_for_email' "${feedback_lib}" \
+  && grep -qF 'agent_review_feedback_stats_line_for_email' "${email_lib}" \
+  && grep -qF 'posted' "${feedback_lib}"; then
+  printf '[PASS] email: includes agent feedback posted/addressed stats\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] email: missing agent feedback posted/addressed stats\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'agent_review_quota_exhaustion_issue_comment_signal_today' "${lib}" \
+  && grep -qF 'agent_review_profile_text_quota_retry_after_iso' "${coderabbit_profile}"; then
+  printf '[PASS] quota observe: issue-comment signal captures retry_after\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota observe: missing issue-comment retry_after signal wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'cmd_loop_handle_coderabbit_rate_limit' "$wait_script" \
+  && grep -qF 'agent_review_agent_quota_rate_limited_for_agent' "${quota_lib}" \
+  && grep -qF 'agent_review_profile_post_rate_limit_retry' "${coderabbit_profile}" \
+  && grep -qF 'agent_review_coderabbit_quota_clear_observed_cache' "${quota_lib}"; then
+  printf '[PASS] loop: CodeRabbit rate-limit wait and automatic retry wiring\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] loop: missing CodeRabbit rate-limit automatic retry wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+tmp_rate_limit_wait="$(mktemp)"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_rate_limit_wait}'
+  agent_review_coderabbit_quota_write_cache 1 observed \
+    'rate limited' '' '' '' '2099-06-01T12:00:00Z'
+  agent_review_agent_quota_rate_limited_for_agent coderabbit
+"; then
+  printf '[PASS] quota: rate_limited_for_agent true while retry_after is in the future\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota: rate_limited_for_agent not true during retry window\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_rate_limit_wait}"
+
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'agent_review_agent_quota_rate_limited_for_agent "${agent}"' "$wait_script"; then
+  printf '[PASS] loop: temporary rate limit does not clear agent wait as response seen\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] loop: rate-limited agent still treated as response seen\n'
+  fail=$(( fail + 1 ))
+fi
+
 tmp_copilot_quota3="$(mktemp)"
 tmp_bugbot_quota3="$(mktemp)"
 tmp_coderabbit_quota3="$(mktemp)"
@@ -1525,12 +1740,12 @@ else
   fail=$(( fail + 1 ))
 fi
 
-if grep -qF 'agent_review_profile_fresh_on_head' "${script_dir}/../scripts/lib/agent-review-profiles/copilot" \
+if grep -qF 'agent_review_profile_review_outstanding' "${script_dir}/../scripts/lib/agent-review-profiles/copilot" \
   && grep -qF 'agent_review_profile_latest_review_body_on_head' "${script_dir}/../scripts/lib/agent-review-profiles/copilot"; then
-  printf '[PASS] copilot: issue-comment freshness and body hooks\n'
+  printf '[PASS] copilot: review completion hooks and body helpers\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] copilot: missing issue-comment freshness wiring\n'
+  printf '[FAIL] copilot: missing review completion hooks\n'
   fail=$(( fail + 1 ))
 fi
 

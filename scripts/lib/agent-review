@@ -1935,14 +1935,20 @@ agent_review_agents_with_quota_json() {
 
 # Human-readable quota summary for operator emails (copilot/bugbot/coderabbit).
 agent_review_quota_summary_for_email() {
-  local agent status reason evidence_url parts=()
+  local agent status reason evidence_url retry_after parts=()
 
   while IFS= read -r agent || [[ -n "${agent}" ]]; do
     [[ -z "${agent}" ]] && continue
     reason=''
     evidence_url=''
+    retry_after=''
     if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
-      status='exhausted (not waiting)'
+      retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent "${agent}")"
+      if [[ -n "${retry_after}" ]]; then
+        status="rate-limited until ${retry_after}"
+      else
+        status='exhausted (not waiting)'
+      fi
       reason="$(agent_review_agent_quota_cache_reason_for_agent "${agent}")"
       evidence_url="$(agent_review_agent_quota_cache_evidence_url_for_agent "${agent}")"
     elif agent_review_agent_quota_confirmed_for_agent "${agent}"; then
@@ -1970,16 +1976,19 @@ agent_review_quota_summary_for_email() {
   (IFS=$'\n'; printf '%s' "${parts[*]}")
 }
 
-# Prints html_url of the latest quota-exhaustion issue comment from the active profile today.
-agent_review_quota_exhaustion_issue_comment_url_today() {
+# Prints html_url and optional retry-after (tab-separated) for the latest quota-exhaustion
+# issue comment from the active profile today.
+agent_review_quota_exhaustion_issue_comment_signal_today() {
   local -r comments_json="$1"
-  local today created_at body login url match_url=''
+  local today created_at body login url match_url match_retry retry_after
 
   if [[ -z "${agent_review_profile_request_login_regex:-}" ]] \
     || [[ -z "${comments_json}" ]]; then
     return 1
   fi
   today="$(agent_review_copilot_quota_local_day)"
+  match_url=''
+  match_retry=''
   if declare -F agent_review_profile_issue_comment_is_quota_exhausted >/dev/null; then
     while IFS=$'\t' read -r created_at body login url; do
       [[ -n "${created_at}" ]] || continue
@@ -1988,8 +1997,13 @@ agent_review_quota_exhaustion_issue_comment_url_today() {
       fi
       if agent_review_profile_issue_comment_is_quota_exhausted "${login}" "${body}"; then
         match_url="${url}"
+        retry_after=''
+        if declare -F agent_review_profile_text_quota_retry_after_iso >/dev/null; then
+          retry_after="$(agent_review_profile_text_quota_retry_after_iso "${body}" "${created_at}" || true)"
+        fi
+        match_retry="${retry_after}"
       fi
-    done < <(ar_runner_jq_file "agent-review quota exhaustion comment url scan" "${comments_json}" -rs '
+    done < <(ar_runner_jq_file "agent-review quota exhaustion comment signal scan" "${comments_json}" -rs '
         [ .[] | .[] | [.created_at, (.body // ""), (.user.login // ""), (.html_url // "")] ]
         | .[]
         | @tsv')
@@ -2001,8 +2015,13 @@ agent_review_quota_exhaustion_issue_comment_url_today() {
       fi
       if agent_review_profile_text_is_quota_exhausted "${body}"; then
         match_url="${url}"
+        retry_after=''
+        if declare -F agent_review_profile_text_quota_retry_after_iso >/dev/null; then
+          retry_after="$(agent_review_profile_text_quota_retry_after_iso "${body}" "${created_at}" || true)"
+        fi
+        match_retry="${retry_after}"
       fi
-    done < <(ar_runner_jq_file "agent-review quota exhaustion comment url scan" "${comments_json}" -rs \
+    done < <(ar_runner_jq_file "agent-review quota exhaustion comment signal scan" "${comments_json}" -rs \
       --arg re "${agent_review_profile_request_login_regex}" '
       [ .[] | .[] | select((.user.login // "") | test($re;"i")) ]
       | .[]
@@ -2010,7 +2029,21 @@ agent_review_quota_exhaustion_issue_comment_url_today() {
       | @tsv')
   fi
   if [[ -n "${match_url}" ]]; then
-    printf '%s' "${match_url}"
+    printf '%s\t%s' "${match_url}" "${match_retry}"
+    return 0
+  fi
+  return 1
+}
+
+# Prints html_url of the latest quota-exhaustion issue comment from the active profile today.
+agent_review_quota_exhaustion_issue_comment_url_today() {
+  local -r comments_json="$1"
+  local signal url
+
+  signal="$(agent_review_quota_exhaustion_issue_comment_signal_today "${comments_json}" || true)"
+  url="${signal%%$'\t'*}"
+  if [[ -n "${url}" ]]; then
+    printf '%s' "${url}"
     return 0
   fi
   return 1
@@ -2073,6 +2106,23 @@ agent_review_latest_agent_review_url_on_head() {
     | if length > 0 then (sort_by(.submittedAt) | last | .url // "") else "" end')"
   if [[ -n "${url}" ]]; then
     printf '%s' "${url}"
+    return 0
+  fi
+  return 1
+}
+
+# Prints submittedAt for the latest non-empty agent review on <head> (ISO-8601).
+agent_review_latest_agent_review_submitted_at_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local reviews_json submitted_at
+
+  reviews_json="$(agent_review_agent_reviews_on_head "${snapshot}" "${head}")"
+  submitted_at="$(ar_runner_jq_file "agent-review latest agent review submitted at" "${reviews_json}" -r \
+    '[.[] | select((.body // "") | length > 0)]
+    | if length > 0 then (sort_by(.submittedAt) | last | .submittedAt // "") else "" end')"
+  if [[ -n "${submitted_at}" ]]; then
+    printf '%s' "${submitted_at}"
     return 0
   fi
   return 1
@@ -2167,7 +2217,7 @@ agent_review_quota_observe_agent_on_pr() {
   local -r head="$3"
   local -r snapshot="$4"
   local -r comments_json="$5"
-  local agent_id review_body run_json reason evidence_url
+  local agent_id review_body run_json reason evidence_url retry_after submitted_at signal
 
   agent_id="${agent_review_profile_id:-}"
   [[ -n "${agent_id}" ]] || return 1
@@ -2202,7 +2252,13 @@ agent_review_quota_observe_agent_on_pr() {
       && agent_review_profile_review_is_quota_exhausted "${review_body}"; then
       reason="${agent_id} review on ${repo}#${pr} head ${head:0:7} reports quota exhaustion."
       evidence_url="$(agent_review_quota_exhaustion_review_url_on_head "${snapshot}" "${head}" || true)"
-      agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}" "${evidence_url}"
+      retry_after=''
+      submitted_at="$(agent_review_latest_agent_review_submitted_at_on_head "${snapshot}" "${head}" || true)"
+      if [[ -n "${submitted_at}" ]] \
+        && declare -F agent_review_profile_text_quota_retry_after_iso >/dev/null; then
+        retry_after="$(agent_review_profile_text_quota_retry_after_iso "${review_body}" "${submitted_at}" || true)"
+      fi
+      agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}" "${evidence_url}" "${retry_after}"
       return 0
     fi
     reason="${agent_id} review on ${repo}#${pr} head ${head:0:7} confirms quota available."
@@ -2233,8 +2289,13 @@ agent_review_quota_observe_agent_on_pr() {
 
   if agent_review_pr_has_quota_issue_comment_today "${repo}" "${pr}" "${comments_json}"; then
     reason="${agent_id} billing comment on ${repo}#${pr} reports quota or usage limit."
-    evidence_url="$(agent_review_quota_exhaustion_issue_comment_url_today "${comments_json}" || true)"
-    agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}" "${evidence_url}"
+    signal="$(agent_review_quota_exhaustion_issue_comment_signal_today "${comments_json}" || true)"
+    evidence_url="${signal%%$'\t'*}"
+    retry_after="${signal#*$'\t'}"
+    if [[ "${retry_after}" == "${signal}" ]]; then
+      retry_after=''
+    fi
+    agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}" "${evidence_url}" "${retry_after}"
     return 0
   fi
 
