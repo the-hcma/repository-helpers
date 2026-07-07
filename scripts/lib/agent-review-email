@@ -197,6 +197,54 @@ agent_review_email_merge_state_status() {
   printf '%s' "${merge_state}"
 }
 
+# Multi-line checklist proving no open feedback or in-flight agent work (for operator emails).
+agent_review_email_work_complete_checklist() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local owner name snapshot head pending_count open_threads coderabbit_pending bugbot_pending
+  local copilot_pending ci_conclusion lines=()
+
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
+  head="$(ar_runner_jq_file "agent-review email head sha" "${snapshot}" -r '.data.repository.pullRequest.headRefOid')"
+  pending_count="$(agent_review_pending_thread_count_from_snapshot "${repo}" "${pr}" "${snapshot}")"
+  open_threads="$(ar_runner_jq_file "agent-review email open threads" \
+    "$(agent_review_pending_threads_json_from_snapshot "${snapshot}")" 'length')"
+  if agent_review_named_pr_check_is_pending "${repo}" "${pr}" 'CodeRabbit'; then
+    coderabbit_pending='running'
+  else
+    coderabbit_pending='not running'
+  fi
+  if agent_review_named_pr_check_is_pending "${repo}" "${pr}" 'Cursor Bugbot'; then
+    bugbot_pending='running'
+  else
+    bugbot_pending='not running'
+  fi
+  if agent_review_agent_requested_from_snapshot "${snapshot}"; then
+    copilot_pending='review requested (visible on PR)'
+  else
+    copilot_pending='no outstanding request'
+  fi
+  ci_conclusion="$(ar_runner_jq_file "agent-review email ci conclusion" \
+    "$(agent_review_ci_status_json_for_pr "${repo}" "${pr}")" -r '.ci_conclusion // "unknown"')"
+
+  lines+=("Work complete (verified at email time):")
+  lines+=("  Pending feedback (threads + PR comments): ${pending_count}")
+  lines+=("  Open review threads needing action: ${open_threads}")
+  lines+=("  Copilot review request: ${copilot_pending}")
+  lines+=("  Bugbot check workflow: ${bugbot_pending}")
+  lines+=("  CodeRabbit workflow: ${coderabbit_pending}")
+  if agent_review_coderabbit_head_feedback_needs_operator_triage "${repo}" "${pr}" "${head}" "${snapshot}"; then
+    lines+=("  CodeRabbit review body feedback: needs operator PR comment")
+  else
+    lines+=("  CodeRabbit review body feedback: none pending")
+  fi
+  lines+=("  Required CI: ${ci_conclusion}")
+  (IFS=$'\n'; printf '%s' "${lines[*]}")
+}
+
 agent_review_email_complete() {
   local -r repo="$1"
   local -r pr="$2"
@@ -230,7 +278,7 @@ agent_review_email_idle_complete() {
   local -r pr="$2"
   local -r idle_s="$3"
   local mode="${4:-idle}"
-  local body gh_user quota_summary subject reviewers merge_state
+  local body gh_user quota_summary subject reviewers merge_state work_checklist
 
   agent_review_require_cmd gh
   agent_review_email_read_pr_meta "${repo}" "${pr}"
@@ -238,6 +286,7 @@ agent_review_email_idle_complete() {
   reviewers="$(agent_review_email_reviewers_list "${repo}" "${pr}")"
   merge_state="$(agent_review_email_merge_state_status "${repo}" "${pr}")"
   quota_summary="$(agent_review_quota_summary_for_email)"
+  work_checklist="$(agent_review_email_work_complete_checklist "${repo}" "${pr}")"
   if [[ "${mode}" == 'early' ]]; then
     subject="PR review cycle complete (nothing outstanding): ${agent_review_email_pr_title} (#${pr})"
     body="PR #${pr} review cycle complete — nothing outstanding.
@@ -246,10 +295,8 @@ URL: ${agent_review_email_pr_url}
 Title: ${agent_review_email_pr_title}
 
 Reviewers: ${reviewers}
-Open feedback: none
 
-All feedback items (review threads and PR comments) are addressed and responded to.
-No agent review is in flight (no outstanding Copilot/Bugbot request; CodeRabbit idle).
+${work_checklist}
 
 Agent quota today:
 ${quota_summary}
@@ -264,9 +311,9 @@ URL: ${agent_review_email_pr_url}
 Title: ${agent_review_email_pr_title}
 
 Reviewers: ${reviewers}
-Open feedback: none
 
-All feedback items (review threads and PR comments) are addressed and responded to.
+${work_checklist}
+
 No new reviews or comments arrived within AGENT_REVIEW_CYCLE_TIMEOUT (${idle_s}s).
 
 Agent quota today:

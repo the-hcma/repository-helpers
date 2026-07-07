@@ -996,7 +996,8 @@ else
   printf '[FAIL] quota observe: inconclusive Copilot probe falsely marked copilot exhausted\n'
   fail=$(( fail + 1 ))
 fi
-rm -f "${tmp_copilot_inconclusive}" "${tmp_copilot_inconclusive_json}"
+rm -f "${tmp_copilot_inconclusive}" "${tmp_copilot_inconclusive}.cr" "${tmp_copilot_inconclusive}.bb" \
+  "${tmp_copilot_inconclusive_json}"
 
 tmp_copilot_success="$(mktemp)"
 tmp_copilot_success_json="$(mktemp)"
@@ -1026,6 +1027,91 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -f "${tmp_copilot_success}" "${tmp_copilot_success_json}"
+
+tmp_loop_copilot_json="$(mktemp)"
+loop_copilot_probe_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+loop_copilot_reply_ts="$(date -u -d "${loop_copilot_probe_ts} + 3 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '[{"user":{"login":"thehcma"},"created_at":"%s","body":"@copilot please review this pull request.\\n\\n<!-- wait-for-agent-review:copilot:39913c8 -->"},{"user":{"login":"Copilot"},"created_at":"%s","body":"> @copilot please review\\n\\nReviewed. I do not see any blocking issues in this PR."}]' \
+  "${loop_copilot_probe_ts}" "${loop_copilot_reply_ts}" >"${tmp_loop_copilot_json}"
+if bash -c "
+  script_dir='${script_dir}/../scripts'
+  # shellcheck disable=SC1091
+  source \"\${script_dir}/lib/runner-bootstrap\"
+  source '${lib}'
+  source '${profile}'
+  $(awk '/^cmd_loop_agent_response_seen\(\)/,/^}/' "${wait_script}")
+  agent_review_agent_quota_exhausted_for_agent() { return 1; }
+  agent_review_fresh_agent_on_head() { return 1; }
+  agent_review_head_check_complete_on_head() { return 1; }
+  agent_review_pr_issue_comments_json() { cat '${tmp_loop_copilot_json}'; }
+  cmd_loop_agent_response_seen \
+    'the-hcma/mock-repo' 414 '39913c8503c7062cbc257c5a0c3f3de02fb786cb' 'copilot' '{}'
+"; then
+  printf '[PASS] loop: Copilot issue-comment reply clears agent wait\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] loop: Copilot issue-comment reply did not clear agent wait\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_loop_copilot_json}"
+
+tmp_loop_coderabbit_json="$(mktemp)"
+if bash -c "
+  script_dir='${script_dir}/../scripts'
+  # shellcheck disable=SC1091
+  source \"\${script_dir}/lib/runner-bootstrap\"
+  source '${lib}'
+  source '${script_dir}/../scripts/lib/agent-review-profiles/coderabbit'
+  $(awk '/^cmd_loop_agent_response_seen\(\)/,/^}/' "${wait_script}")
+  agent_review_agent_quota_exhausted_for_agent() { return 1; }
+  agent_review_fresh_agent_on_head() { return 1; }
+  agent_review_fresh_agent_review_on_head() { return 0; }
+  agent_review_named_pr_check_is_pending() { return 1; }
+  agent_review_head_has_inline_actionable_review_on_head() { return 0; }
+  agent_review_head_check_complete_on_head() { return 1; }
+  agent_review_pr_issue_comments_json() { printf '[]\n'; }
+  agent_review_use_agent() { return 0; }
+  cmd_loop_agent_response_seen \
+    'the-hcma/mock-repo' 333 '29c0e6b719655599bd10349772df5826086b70f4' 'coderabbit' '{}'
+"; then
+  printf '[PASS] loop: CodeRabbit review after workflow clears agent wait\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] loop: CodeRabbit review after workflow did not clear agent wait\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_loop_coderabbit_json}"
+
+if bash -c "source '${coderabbit_profile}'; \
+  agent_review_profile_review_has_inline_actionable_feedback '**Actionable comments posted: 2**' \
+  && ! agent_review_profile_review_has_inline_actionable_feedback \$'<summary>Nitpick comments (2)</summary>'"; then
+  printf '[PASS] coderabbit profile: inline actionable excludes nitpick-only summaries\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: inline actionable detection wrong for nitpick-only\n'
+  fail=$(( fail + 1 ))
+fi
+
+tmp_coderabbit_triage="$(mktemp)"
+# shellcheck disable=SC2016  # fixture body is literal HTML/markdown, not shell expansions
+nitpick_only_body='<details><summary>Nitpick comments (2)</summary><blockquote>scripts/lib/agent-review-quota</blockquote></details>'
+if bash -c "
+  source '${lib}'
+  source '${coderabbit_profile}'
+  agent_review_use_agent coderabbit
+  agent_review_agent_reviews_on_head() {
+    printf '[{\"body\":\"${nitpick_only_body}\",\"submittedAt\":\"2026-07-07T16:34:02Z\"}]'
+  }
+  agent_review_pr_has_operator_issue_comment_after() { return 1; }
+  agent_review_profile_head_feedback_needs_operator_triage '{}' '29c0e6b719655599bd10349772df5826086b70f4' 'the-hcma/mock-repo' 333
+"; then
+  printf '[PASS] coderabbit profile: nitpick-only head review needs operator triage\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: nitpick-only head review should need operator triage\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_coderabbit_triage}"
 
 tmp_coderabbit_actionable="$(mktemp)"
 coderabbit_actionable_body='**Actionable comments posted: 4**'
@@ -1165,6 +1251,36 @@ else
   printf '[FAIL] email: missing idle-success completion notification\n'
   fail=$(( fail + 1 ))
 fi
+
+email_lib="${script_dir}/../scripts/lib/agent-review-email"
+if grep -qF 'agent_review_email_work_complete_checklist' "${email_lib}" \
+  && grep -qF 'CodeRabbit workflow:' "${email_lib}" \
+  && grep -qF 'agent_review_agent_quota_cache_evidence_url_for_agent' "${quota_lib}" \
+  && grep -qF 'evidence:' "${lib}"; then
+  printf '[PASS] email: work-complete checklist and quota evidence URLs\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] email: missing work-complete checklist or quota evidence URLs\n'
+  fail=$(( fail + 1 ))
+fi
+
+tmp_quota_evidence="$(mktemp)"
+if summary="$(bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_quota_evidence}'
+  agent_review_coderabbit_quota_write_cache 1 observed \
+    'CodeRabbit rate limit on mock#1.' '' '' \
+    'https://github.com/the-hcma/mock-repo/pull/1#issuecomment-1'
+  agent_review_quota_summary_for_email
+")" && grep -qF 'evidence: https://github.com/the-hcma/mock-repo/pull/1#issuecomment-1' <<<"${summary}"; then
+  printf '[PASS] quota email summary: exhausted agent includes evidence URL\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota email summary: missing evidence URL for exhausted agent\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_quota_evidence}"
 
 tmp_copilot_quota3="$(mktemp)"
 tmp_bugbot_quota3="$(mktemp)"
