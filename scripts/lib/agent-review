@@ -529,6 +529,7 @@ query($owner:String!, $name:String!, $number:Int!) {
           state
           submittedAt
           body
+          url
           commit { oid }
         }
       }
@@ -594,6 +595,7 @@ query($owner:String!, $name:String!, $number:Int!) {
           state
           body
           submittedAt
+          url
           commit { oid }
         }
       }
@@ -622,7 +624,8 @@ agent_review_agent_reviews_on_head() {
   # shellcheck disable=SC2154  # agent_review_profile_request_login_regex from sourced profile
   ar_runner_jq_file "agent-review agent reviews on head" "${snapshot}" -c \
     --arg head "${head}" --arg re "${agent_review_profile_request_login_regex}" '
-    [.data.repository.pullRequest.reviews.nodes[]
+    [(.data.repository.pullRequest.reviews.nodes // [])
+      | .[]
       | select((.author.login // "") | test($re;"i"))
       | select(.state != "PENDING")
       | select(.commit.oid == $head)]'
@@ -852,6 +855,94 @@ agent_review_latest_agent_review_body_on_head() {
   reviews_json="$(agent_review_agent_reviews_on_head "${snapshot}" "${head}")"
   ar_runner_jq_file "agent-review latest agent review body" "${reviews_json}" -r \
     'sort_by(.submittedAt) | last | .body // ""'
+}
+
+# Last non-empty GraphQL review body on <head> (trailing empty reviews are common).
+agent_review_latest_nonempty_agent_review_body_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local reviews_json
+
+  reviews_json="$(agent_review_agent_reviews_on_head "${snapshot}" "${head}")"
+  ar_runner_jq_file "agent-review latest nonempty agent review body" "${reviews_json}" -r \
+    '[.[] | (.body // "") | select(length > 0)] | if length > 0 then last else "" end'
+}
+
+# True when any agent review on <head> has actionable inline feedback (CodeRabbit, etc.).
+agent_review_head_has_actionable_agent_review_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local reviews_json body
+
+  if ! declare -F agent_review_profile_review_has_actionable_feedback >/dev/null 2>&1; then
+    return 1
+  fi
+  reviews_json="$(agent_review_agent_reviews_on_head "${snapshot}" "${head}")"
+  while IFS= read -r body || [[ -n "${body}" ]]; do
+    [[ -z "${body}" ]] && continue
+    if agent_review_profile_review_has_actionable_feedback "${body}"; then
+      return 0
+    fi
+  done < <(ar_runner_jq_file "agent-review actionable review bodies on head" "${reviews_json}" -r \
+    '[.[] | .body // "" | select(length > 0)] | .[]')
+  return 1
+}
+
+# True when any agent review on <head> has inline actionable feedback (not nitpick-only).
+agent_review_head_has_inline_actionable_review_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local reviews_json body
+
+  if ! declare -F agent_review_profile_review_has_inline_actionable_feedback >/dev/null 2>&1; then
+    return 1
+  fi
+  reviews_json="$(agent_review_agent_reviews_on_head "${snapshot}" "${head}")"
+  while IFS= read -r body || [[ -n "${body}" ]]; do
+    [[ -z "${body}" ]] && continue
+    if agent_review_profile_review_has_inline_actionable_feedback "${body}"; then
+      return 0
+    fi
+  done < <(ar_runner_jq_file "agent-review inline actionable review bodies on head" "${reviews_json}" -r \
+    '[.[] | .body // "" | select(length > 0)] | .[]')
+  return 1
+}
+
+# True when CodeRabbit head review body feedback still needs an operator PR comment.
+agent_review_coderabbit_head_feedback_needs_operator_triage() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r snapshot="$4"
+  local saved_agent
+
+  saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
+  agent_review_use_agent coderabbit
+  if declare -F agent_review_profile_head_feedback_needs_operator_triage >/dev/null 2>&1 \
+    && agent_review_profile_head_feedback_needs_operator_triage "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    agent_review_use_agent "${saved_agent}"
+    return 0
+  fi
+  agent_review_use_agent "${saved_agent}"
+  return 1
+}
+
+# True when the authenticated operator posted a PR issue comment after <iso_ts>.
+agent_review_pr_has_operator_issue_comment_after() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r iso_ts="$3"
+  local operator_login comments_json
+
+  [[ -n "${iso_ts}" ]] || return 1
+  operator_login="$(agent_review_authenticated_login)"
+  [[ -n "${operator_login}" ]] || return 1
+  comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
+  ar_runner_jq_file "agent-review operator comment after time" "${comments_json}" -rs \
+    --arg operator "${operator_login}" \
+    --arg after "${iso_ts}" \
+    -e '[ .[] | .[] | select((.user.login // "") == $operator) | select((.created_at // "") > $after) ] | length > 0' \
+    >/dev/null
 }
 
 agent_review_agent_requested_from_snapshot() {
@@ -1844,22 +1935,164 @@ agent_review_agents_with_quota_json() {
 
 # Human-readable quota summary for operator emails (copilot/bugbot/coderabbit).
 agent_review_quota_summary_for_email() {
-  local agent status parts=()
+  local agent status reason evidence_url parts=()
 
   while IFS= read -r agent || [[ -n "${agent}" ]]; do
     [[ -z "${agent}" ]] && continue
+    reason=''
+    evidence_url=''
     if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
       status='exhausted (not waiting)'
+      reason="$(agent_review_agent_quota_cache_reason_for_agent "${agent}")"
+      evidence_url="$(agent_review_agent_quota_cache_evidence_url_for_agent "${agent}")"
     elif agent_review_agent_quota_confirmed_for_agent "${agent}"; then
-      status='available'
+      status='available (reviewed today)'
+      reason="$(agent_review_agent_quota_cache_reason_for_agent "${agent}")"
+      evidence_url="$(agent_review_agent_quota_cache_evidence_url_for_agent "${agent}")"
     elif agent_review_agent_quota_probe_requested_for_agent "${agent}"; then
       status='probe requested (awaiting review)'
     else
       status='unconfirmed (not probed today)'
     fi
-    parts+=("${agent}: ${status}")
+    if [[ -n "${reason}" ]]; then
+      parts+=("${agent}: ${status} — ${reason}")
+    else
+      parts+=("${agent}: ${status}")
+    fi
+    if [[ -n "${evidence_url}" ]]; then
+      if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
+        parts+=("  evidence: ${evidence_url}")
+      elif agent_review_agent_quota_confirmed_for_agent "${agent}"; then
+        parts+=("  source: ${evidence_url}")
+      fi
+    fi
   done < <(agent_review_cycle_quota_agent_ids)
   (IFS=$'\n'; printf '%s' "${parts[*]}")
+}
+
+# Prints html_url of the latest quota-exhaustion issue comment from the active profile today.
+agent_review_quota_exhaustion_issue_comment_url_today() {
+  local -r comments_json="$1"
+  local today created_at body login url match_url=''
+
+  if [[ -z "${agent_review_profile_request_login_regex:-}" ]] \
+    || [[ -z "${comments_json}" ]]; then
+    return 1
+  fi
+  today="$(agent_review_copilot_quota_local_day)"
+  if declare -F agent_review_profile_issue_comment_is_quota_exhausted >/dev/null; then
+    while IFS=$'\t' read -r created_at body login url; do
+      [[ -n "${created_at}" ]] || continue
+      if ! agent_review_quota_timestamp_on_local_day "${created_at}" "${today}"; then
+        continue
+      fi
+      if agent_review_profile_issue_comment_is_quota_exhausted "${login}" "${body}"; then
+        match_url="${url}"
+      fi
+    done < <(ar_runner_jq_file "agent-review quota exhaustion comment url scan" "${comments_json}" -rs '
+        [ .[] | .[] | [.created_at, (.body // ""), (.user.login // ""), (.html_url // "")] ]
+        | .[]
+        | @tsv')
+  else
+    while IFS=$'\t' read -r created_at body url; do
+      [[ -n "${created_at}" ]] || continue
+      if ! agent_review_quota_timestamp_on_local_day "${created_at}" "${today}"; then
+        continue
+      fi
+      if agent_review_profile_text_is_quota_exhausted "${body}"; then
+        match_url="${url}"
+      fi
+    done < <(ar_runner_jq_file "agent-review quota exhaustion comment url scan" "${comments_json}" -rs \
+      --arg re "${agent_review_profile_request_login_regex}" '
+      [ .[] | .[] | select((.user.login // "") | test($re;"i")) ]
+      | .[]
+      | [.created_at, (.body // ""), (.html_url // "")]
+      | @tsv')
+  fi
+  if [[ -n "${match_url}" ]]; then
+    printf '%s' "${match_url}"
+    return 0
+  fi
+  return 1
+}
+
+# Prints the GraphQL review URL on <head> whose body reports quota exhaustion for the active profile.
+agent_review_quota_exhaustion_review_url_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local reviews_json body url match_url=''
+
+  reviews_json="$(agent_review_agent_reviews_on_head "${snapshot}" "${head}")"
+  while IFS=$'\t' read -r body review_url; do
+    [[ -z "${body}" ]] && continue
+    if agent_review_profile_review_is_quota_exhausted "${body}"; then
+      match_url="${review_url}"
+    fi
+  done < <(ar_runner_jq_file "agent-review quota exhaustion review url scan" "${reviews_json}" -r \
+    '[.[] | [(.body // ""), (.url // "")] | @tsv] | .[]')
+  if [[ -n "${match_url}" ]]; then
+    printf '%s' "${match_url}"
+    return 0
+  fi
+  return 1
+}
+
+# Prints the GraphQL review URL for the latest actionable agent review on <head>.
+agent_review_actionable_review_url_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local reviews_json body review_url match_url=''
+
+  if ! declare -F agent_review_profile_review_has_actionable_feedback >/dev/null 2>&1; then
+    return 1
+  fi
+  reviews_json="$(agent_review_agent_reviews_on_head "${snapshot}" "${head}")"
+  while IFS=$'\t' read -r body review_url; do
+    [[ -z "${body}" ]] && continue
+    if agent_review_profile_review_has_actionable_feedback "${body}"; then
+      match_url="${review_url}"
+    fi
+  done < <(ar_runner_jq_file "agent-review actionable review url scan" "${reviews_json}" -r \
+    '[.[] | [(.body // ""), (.url // "")] | @tsv] | .[]')
+  if [[ -n "${match_url}" ]]; then
+    printf '%s' "${match_url}"
+    return 0
+  fi
+  return 1
+}
+
+# Prints the GraphQL review URL for the latest non-empty agent review on <head>.
+agent_review_latest_agent_review_url_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local reviews_json url
+
+  reviews_json="$(agent_review_agent_reviews_on_head "${snapshot}" "${head}")"
+  url="$(ar_runner_jq_file "agent-review latest agent review url" "${reviews_json}" -r \
+    '[.[] | select((.body // "") | length > 0)]
+    | if length > 0 then (sort_by(.submittedAt) | last | .url // "") else "" end')"
+  if [[ -n "${url}" ]]; then
+    printf '%s' "${url}"
+    return 0
+  fi
+  return 1
+}
+
+# Prints html_url from a GitHub check-run JSON object (Bugbot head check).
+agent_review_head_check_evidence_url() {
+  local -r run_json="$1"
+  local url
+
+  if [[ -z "${run_json}" || "${run_json}" == 'null' ]]; then
+    return 1
+  fi
+  url="$(ar_runner_jq_file "agent-review head check evidence url" "${run_json}" -r \
+    '.html_url // .details_url // empty')"
+  if [[ -n "${url}" ]]; then
+    printf '%s' "${url}"
+    return 0
+  fi
+  return 1
 }
 
 # True when a PR issue comment from the active agent profile today reports quota exhaustion.
@@ -1934,13 +2167,32 @@ agent_review_quota_observe_agent_on_pr() {
   local -r head="$3"
   local -r snapshot="$4"
   local -r comments_json="$5"
-  local agent_id review_body run_json reason
+  local agent_id review_body run_json reason evidence_url
 
   agent_id="${agent_review_profile_id:-}"
   [[ -n "${agent_id}" ]] || return 1
 
+  if [[ "${agent_id}" == 'copilot' ]] \
+    && declare -F agent_review_copilot_success_issue_comment_for_head >/dev/null 2>&1; then
+    review_body="$(agent_review_copilot_success_issue_comment_for_head "${comments_json}" "${head}")"
+    if [[ -n "${review_body}" ]]; then
+      reason="Copilot issue comment on ${repo}#${pr} head ${head:0:7} confirms quota available."
+      evidence_url="$(agent_review_copilot_success_issue_comment_url_for_head "${comments_json}" "${head}" || true)"
+      agent_review_quota_mark_confirmed_for_agent copilot "${reason}" "${evidence_url}"
+      return 0
+    fi
+  fi
+
+  if [[ -n "${snapshot}" ]] \
+    && agent_review_head_has_actionable_agent_review_on_head "${snapshot}" "${head}"; then
+    reason="${agent_id} actionable review on ${repo}#${pr} head ${head:0:7} confirms quota available."
+    evidence_url="$(agent_review_actionable_review_url_on_head "${snapshot}" "${head}" || true)"
+    agent_review_quota_mark_confirmed_for_agent "${agent_id}" "${reason}" "${evidence_url}"
+    return 0
+  fi
+
   if [[ -n "${snapshot}" ]] && agent_review_fresh_agent_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
-    review_body="$(agent_review_latest_agent_review_body_on_head "${snapshot}" "${head}")"
+    review_body="$(agent_review_latest_nonempty_agent_review_body_on_head "${snapshot}" "${head}")"
     if [[ -z "${review_body}" ]] \
       && declare -F agent_review_profile_latest_review_body_on_head >/dev/null 2>&1; then
       review_body="$(agent_review_profile_latest_review_body_on_head \
@@ -1949,11 +2201,13 @@ agent_review_quota_observe_agent_on_pr() {
     if [[ -n "${review_body}" ]] \
       && agent_review_profile_review_is_quota_exhausted "${review_body}"; then
       reason="${agent_id} review on ${repo}#${pr} head ${head:0:7} reports quota exhaustion."
-      agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}"
+      evidence_url="$(agent_review_quota_exhaustion_review_url_on_head "${snapshot}" "${head}" || true)"
+      agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}" "${evidence_url}"
       return 0
     fi
     reason="${agent_id} review on ${repo}#${pr} head ${head:0:7} confirms quota available."
-    agent_review_quota_mark_confirmed_for_agent "${agent_id}" "${reason}"
+    evidence_url="$(agent_review_latest_agent_review_url_on_head "${snapshot}" "${head}" || true)"
+    agent_review_quota_mark_confirmed_for_agent "${agent_id}" "${reason}" "${evidence_url}"
     return 0
   fi
 
@@ -1962,7 +2216,8 @@ agent_review_quota_observe_agent_on_pr() {
     if [[ -n "${run_json}" && "${run_json}" != 'null' ]] \
       && agent_review_profile_head_check_is_quota_exhausted "${run_json}"; then
       reason="${agent_id} check on ${repo}#${pr} head ${head:0:7} reports quota or usage limit."
-      agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}"
+      evidence_url="$(agent_review_head_check_evidence_url "${run_json}" || true)"
+      agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}" "${evidence_url}"
       return 0
     fi
     if [[ -n "${run_json}" && "${run_json}" != 'null' ]] \
@@ -1970,26 +2225,16 @@ agent_review_quota_observe_agent_on_pr() {
       && agent_review_profile_head_check_is_complete "${run_json}" \
       && ! agent_review_profile_head_check_is_quota_exhausted "${run_json}"; then
       reason="${agent_id} check on ${repo}#${pr} head ${head:0:7} confirms usage available."
-      agent_review_quota_mark_confirmed_for_agent "${agent_id}" "${reason}"
+      evidence_url="$(agent_review_head_check_evidence_url "${run_json}" || true)"
+      agent_review_quota_mark_confirmed_for_agent "${agent_id}" "${reason}" "${evidence_url}"
       return 0
     fi
   fi
 
-  if [[ "${agent_id}" == 'copilot' ]] \
-    && agent_review_copilot_probe_comment_sent_for_head "${comments_json}" "${head}" \
-    && declare -F agent_review_agent_quota_probe_requested_for_agent >/dev/null 2>&1 \
-    && agent_review_agent_quota_probe_requested_for_agent copilot \
-    && ! agent_review_agent_quota_exhausted_for_agent copilot \
-    && [[ -n "${snapshot}" ]] \
-    && ! agent_review_fresh_agent_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
-    reason="Copilot probe on ${repo}#${pr} head ${head:0:7}: no review after request (likely quota)."
-    agent_review_quota_mark_exhausted_for_agent copilot "${reason}"
-    return 0
-  fi
-
   if agent_review_pr_has_quota_issue_comment_today "${repo}" "${pr}" "${comments_json}"; then
     reason="${agent_id} billing comment on ${repo}#${pr} reports quota or usage limit."
-    agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}"
+    evidence_url="$(agent_review_quota_exhaustion_issue_comment_url_today "${comments_json}" || true)"
+    agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}" "${evidence_url}"
     return 0
   fi
 
