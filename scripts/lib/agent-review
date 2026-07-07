@@ -622,7 +622,8 @@ agent_review_agent_reviews_on_head() {
   # shellcheck disable=SC2154  # agent_review_profile_request_login_regex from sourced profile
   ar_runner_jq_file "agent-review agent reviews on head" "${snapshot}" -c \
     --arg head "${head}" --arg re "${agent_review_profile_request_login_regex}" '
-    [.data.repository.pullRequest.reviews.nodes[]
+    [(.data.repository.pullRequest.reviews.nodes // [])
+      | .[]
       | select((.author.login // "") | test($re;"i"))
       | select(.state != "PENDING")
       | select(.commit.oid == $head)]'
@@ -852,6 +853,37 @@ agent_review_latest_agent_review_body_on_head() {
   reviews_json="$(agent_review_agent_reviews_on_head "${snapshot}" "${head}")"
   ar_runner_jq_file "agent-review latest agent review body" "${reviews_json}" -r \
     'sort_by(.submittedAt) | last | .body // ""'
+}
+
+# Last non-empty GraphQL review body on <head> (trailing empty reviews are common).
+agent_review_latest_nonempty_agent_review_body_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local reviews_json
+
+  reviews_json="$(agent_review_agent_reviews_on_head "${snapshot}" "${head}")"
+  ar_runner_jq_file "agent-review latest nonempty agent review body" "${reviews_json}" -r \
+    '[.[] | (.body // "") | select(length > 0)] | if length > 0 then last else "" end'
+}
+
+# True when any agent review on <head> has actionable inline feedback (CodeRabbit, etc.).
+agent_review_head_has_actionable_agent_review_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local reviews_json body
+
+  if ! declare -F agent_review_profile_review_has_actionable_feedback >/dev/null 2>&1; then
+    return 1
+  fi
+  reviews_json="$(agent_review_agent_reviews_on_head "${snapshot}" "${head}")"
+  while IFS= read -r body || [[ -n "${body}" ]]; do
+    [[ -z "${body}" ]] && continue
+    if agent_review_profile_review_has_actionable_feedback "${body}"; then
+      return 0
+    fi
+  done < <(ar_runner_jq_file "agent-review actionable review bodies on head" "${reviews_json}" -r \
+    '[.[] | .body // "" | select(length > 0)] | .[]')
+  return 1
 }
 
 agent_review_agent_requested_from_snapshot() {
@@ -1844,20 +1876,27 @@ agent_review_agents_with_quota_json() {
 
 # Human-readable quota summary for operator emails (copilot/bugbot/coderabbit).
 agent_review_quota_summary_for_email() {
-  local agent status parts=()
+  local agent status reason parts=()
 
   while IFS= read -r agent || [[ -n "${agent}" ]]; do
     [[ -z "${agent}" ]] && continue
+    reason=''
     if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
       status='exhausted (not waiting)'
+      reason="$(agent_review_agent_quota_cache_reason_for_agent "${agent}")"
     elif agent_review_agent_quota_confirmed_for_agent "${agent}"; then
-      status='available'
+      status='available (reviewed today)'
+      reason="$(agent_review_agent_quota_cache_reason_for_agent "${agent}")"
     elif agent_review_agent_quota_probe_requested_for_agent "${agent}"; then
       status='probe requested (awaiting review)'
     else
       status='unconfirmed (not probed today)'
     fi
-    parts+=("${agent}: ${status}")
+    if [[ -n "${reason}" ]]; then
+      parts+=("${agent}: ${status} — ${reason}")
+    else
+      parts+=("${agent}: ${status}")
+    fi
   done < <(agent_review_cycle_quota_agent_ids)
   (IFS=$'\n'; printf '%s' "${parts[*]}")
 }
@@ -1939,8 +1978,25 @@ agent_review_quota_observe_agent_on_pr() {
   agent_id="${agent_review_profile_id:-}"
   [[ -n "${agent_id}" ]] || return 1
 
+  if [[ "${agent_id}" == 'copilot' ]] \
+    && declare -F agent_review_copilot_success_issue_comment_for_head >/dev/null 2>&1; then
+    review_body="$(agent_review_copilot_success_issue_comment_for_head "${comments_json}" "${head}")"
+    if [[ -n "${review_body}" ]]; then
+      reason="Copilot issue comment on ${repo}#${pr} head ${head:0:7} confirms quota available."
+      agent_review_quota_mark_confirmed_for_agent copilot "${reason}"
+      return 0
+    fi
+  fi
+
+  if [[ -n "${snapshot}" ]] \
+    && agent_review_head_has_actionable_agent_review_on_head "${snapshot}" "${head}"; then
+    reason="${agent_id} actionable review on ${repo}#${pr} head ${head:0:7} confirms quota available."
+    agent_review_quota_mark_confirmed_for_agent "${agent_id}" "${reason}"
+    return 0
+  fi
+
   if [[ -n "${snapshot}" ]] && agent_review_fresh_agent_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
-    review_body="$(agent_review_latest_agent_review_body_on_head "${snapshot}" "${head}")"
+    review_body="$(agent_review_latest_nonempty_agent_review_body_on_head "${snapshot}" "${head}")"
     if [[ -z "${review_body}" ]] \
       && declare -F agent_review_profile_latest_review_body_on_head >/dev/null 2>&1; then
       review_body="$(agent_review_profile_latest_review_body_on_head \
@@ -1973,18 +2029,6 @@ agent_review_quota_observe_agent_on_pr() {
       agent_review_quota_mark_confirmed_for_agent "${agent_id}" "${reason}"
       return 0
     fi
-  fi
-
-  if [[ "${agent_id}" == 'copilot' ]] \
-    && agent_review_copilot_probe_comment_sent_for_head "${comments_json}" "${head}" \
-    && declare -F agent_review_agent_quota_probe_requested_for_agent >/dev/null 2>&1 \
-    && agent_review_agent_quota_probe_requested_for_agent copilot \
-    && ! agent_review_agent_quota_exhausted_for_agent copilot \
-    && [[ -n "${snapshot}" ]] \
-    && ! agent_review_fresh_agent_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
-    reason="Copilot probe on ${repo}#${pr} head ${head:0:7}: no review after request (likely quota)."
-    agent_review_quota_mark_exhausted_for_agent copilot "${reason}"
-    return 0
   fi
 
   if agent_review_pr_has_quota_issue_comment_today "${repo}" "${pr}" "${comments_json}"; then

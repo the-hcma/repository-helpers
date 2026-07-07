@@ -835,6 +835,20 @@ else
   fail=$(( fail + 1 ))
 fi
 
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'agent_review_latest_nonempty_agent_review_body_on_head' "$lib" \
+  && grep -qF 'agent_review_head_has_actionable_agent_review_on_head' "$lib" \
+  && grep -qF 'agent_review_copilot_success_issue_comment_for_head' \
+    "${script_dir}/../scripts/lib/agent-review-profiles/copilot" \
+  && grep -qF 'agent_review_agent_quota_cache_reason_for_agent' "$quota_lib" \
+  && ! grep -qF 'likely quota' "$lib"; then
+  printf '[PASS] quota observe: actionable review and Copilot reply helpers wired\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota observe: missing actionable review or Copilot reply helpers\n'
+  fail=$(( fail + 1 ))
+fi
+
 tmp_bugbot_observe="$(mktemp)"
 tmp_copilot_observe="$(mktemp)"
 observe_comment_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -956,6 +970,7 @@ fi
 
 tmp_copilot_inconclusive="$(mktemp)"
 tmp_copilot_inconclusive_json="$(mktemp)"
+minimal_observe_snapshot='{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[]}}}}}'
 observe_copilot_probe_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf '[{"user":{"login":"thehcma"},"created_at":"%s","body":"@copilot please review this pull request.\\n\\n<!-- wait-for-agent-review:copilot:39913c8 -->"}]' \
   "${observe_copilot_probe_ts}" >"${tmp_copilot_inconclusive_json}"
@@ -963,22 +978,81 @@ if bash -c "
   source '${lib}'
   source '${quota_lib}'
   AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_copilot_inconclusive}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_copilot_inconclusive}.cr'
+  AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${tmp_copilot_inconclusive}.bb'
   agent_review_copilot_quota_mark_probe_requested 'probe sent on PR #306'
   agent_review_use_agent copilot
   agent_review_fresh_agent_on_head() { return 1; }
   agent_review_pr_issue_comments_json() { cat '${tmp_copilot_inconclusive_json}'; }
   agent_review_head_check_run_json_for_head() { printf 'null\n'; }
   agent_review_observe_all_agent_quota_on_pr \
-    'the-hcma/mock-repo' 306 '39913c8503c7062cbc257c5a0c3f3de02fb786cb' '{}'
-  agent_review_agent_quota_exhausted_for_agent copilot
+    'the-hcma/mock-repo' 306 '39913c8503c7062cbc257c5a0c3f3de02fb786cb' \
+    '${minimal_observe_snapshot}' || true
+  ! agent_review_agent_quota_exhausted_for_agent copilot
 "; then
-  printf '[PASS] quota observe: inconclusive Copilot probe marks copilot exhausted\n'
+  printf '[PASS] quota observe: inconclusive Copilot probe does not mark copilot exhausted\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] quota observe: inconclusive Copilot probe did not mark copilot exhausted\n'
+  printf '[FAIL] quota observe: inconclusive Copilot probe falsely marked copilot exhausted\n'
   fail=$(( fail + 1 ))
 fi
 rm -f "${tmp_copilot_inconclusive}" "${tmp_copilot_inconclusive_json}"
+
+tmp_copilot_success="$(mktemp)"
+tmp_copilot_success_json="$(mktemp)"
+observe_copilot_probe_ts2="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+observe_copilot_reply_ts="$(date -u -d "${observe_copilot_probe_ts2} + 3 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '[{"user":{"login":"thehcma"},"created_at":"%s","body":"@copilot please review this pull request.\\n\\n<!-- wait-for-agent-review:copilot:39913c8 -->"},{"user":{"login":"Copilot"},"created_at":"%s","body":"> @copilot please review\\n\\nReviewed. I do not see any blocking issues in this PR."}]' \
+  "${observe_copilot_probe_ts2}" "${observe_copilot_reply_ts}" >"${tmp_copilot_success_json}"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_copilot_success}'
+  agent_review_copilot_quota_mark_probe_requested 'probe sent on PR #414'
+  agent_review_copilot_quota_write_cache 1 observed 'stale likely-quota exhaustion.'
+  agent_review_use_agent copilot
+  agent_review_fresh_agent_on_head() { return 1; }
+  agent_review_pr_issue_comments_json() { cat '${tmp_copilot_success_json}'; }
+  agent_review_head_check_run_json_for_head() { printf 'null\n'; }
+  agent_review_observe_all_agent_quota_on_pr \
+    'the-hcma/mock-repo' 414 '39913c8503c7062cbc257c5a0c3f3de02fb786cb' '{}'
+  ! agent_review_agent_quota_exhausted_for_agent copilot \
+    && agent_review_agent_quota_confirmed_for_agent copilot
+"; then
+  printf '[PASS] quota observe: Copilot issue-comment reply clears stale exhaustion\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota observe: Copilot issue-comment reply did not confirm quota\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_copilot_success}" "${tmp_copilot_success_json}"
+
+tmp_coderabbit_actionable="$(mktemp)"
+coderabbit_actionable_body='**Actionable comments posted: 4**'
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_coderabbit_actionable}'
+  agent_review_coderabbit_quota_write_cache 1 observed 'stale rate-limit exhaustion.'
+  agent_review_use_agent coderabbit
+  agent_review_fresh_agent_on_head() { return 1; }
+  agent_review_agent_reviews_on_head() {
+    printf '[{\"body\":\"${coderabbit_actionable_body}\",\"submittedAt\":\"2026-07-07T13:50:29Z\"},{\"body\":\"\",\"submittedAt\":\"2026-07-07T13:53:11Z\"}]'
+  }
+  agent_review_pr_issue_comments_json() { printf '[]\n'; }
+  agent_review_head_check_run_json_for_head() { printf 'null\n'; }
+  agent_review_observe_all_agent_quota_on_pr \
+    'the-hcma/mock-repo' 414 '39913c8503c7062cbc257c5a0c3f3de02fb786cb' '{}'
+  ! agent_review_agent_quota_exhausted_for_agent coderabbit \
+    && agent_review_agent_quota_confirmed_for_agent coderabbit
+"; then
+  printf '[PASS] quota observe: actionable GraphQL review clears CodeRabbit rate-limit cache\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota observe: actionable GraphQL review did not clear CodeRabbit exhaustion\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_coderabbit_actionable}"
 
 tmp_copilot_quota2="$(mktemp)"
 tmp_bugbot_quota2="$(mktemp)"
