@@ -14,9 +14,9 @@ development workflow support.
   (`pip`, `uv`, `poetry`, `pipenv`), Rust/Cargo, and GitHub Actions.
 - `scripts/dep-updater-batch-run` runs dependency updates across every clone under a
   scan root, streams a live log, and sends a daily email report.
-- `scripts/github-repo-lint` audits org repository settings such as Graphite merge
-  queue wiring, `protect-main`, classic branch protection, branch cleanup workflows,
-  and Dependabot auto-merge.
+- `scripts/github-repo-lint` audits org repository settings (merge queue, branch
+  protection, workflows, release-age policy, metadata, and more — see
+  [github-repo-lint checks](#github-repo-lint-checks)).
 - `scripts/github-repo-lint --enforcer` runs those practice checks daily across local
   clones and emails a compliance report.
 - `scripts/wait-for-agent-review` runs the PR agent review loop (CodeRabbit, Copilot,
@@ -117,10 +117,10 @@ for the Bash + Python extraction proposal.
 
 ## Repository Practices
 
-`scripts/github-repo-lint` audits org conventions including Graphite merge
-queue wiring, branch protection, cleanup workflows, Dependabot auto-merge,
-Release Please settings, top-level license/copyright metadata, and CODEOWNERS
-coverage for all files.
+`scripts/github-repo-lint` audits org conventions: Graphite merge queue wiring,
+`protect-main`, classic branch protection, branch cleanup workflows, release-age
+policy, license/CODEOWNERS metadata, cursor rules, and uv Python CVE checks.
+See [github-repo-lint checks](#github-repo-lint-checks) for the full list.
 
 Audit one repository:
 
@@ -147,6 +147,32 @@ target repository clone, it also prepares candidate workflow fixes in a dedicate
 Graphite stack for review. Candidate workflow templates live under
 `scripts/lib/repo-practices-workflows/` so they can be reviewed and linted directly.
 Graphite app merge queue configuration remains a manual step and is reported as such.
+
+### `github-repo-lint` checks
+
+`scripts/lib/repo-practices` implements the audit. Use `--merge-only` (via
+`scripts/check-merge-settings`) to run only the merge-queue subset.
+
+| Check | Full audit | Merge-only | What it validates |
+| --- | --- | --- | --- |
+| Release Please squash settings | yes | yes | Repos with `release-please.yml` use squash-only merges on `main` |
+| `protect-main` ruleset | yes | yes | Squash-only + Graphite App bypass on `refs/heads/main` when `merge-it` or Release Please |
+| Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts, push via Graphite only (org standard) |
+| Graphite merge queue wiring | yes | yes | `merge-it` label (strict repos), `merge-mq` when present, `merged-pr-closer.yml`, `ci.yml` `gtmq_merge_*` skip, dependabot auto-merge when `dependabot.yml` exists |
+| Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |
+| Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
+| License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
+| Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` references `wait-for-agent-review` and reply-before-resolve |
+| UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
+| `.cursor/rules` gitignore | yes | — | `.gitignore` must not block `.cursor/rules/` |
+| Dependabot release age | yes | — | `cooldown` on every `dependabot.yml` updates entry (`release-age-defaults`) |
+| pnpm release age | yes | — | `minimumReleaseAge` in `pnpm-workspace.yaml` when present |
+| `ci-secret-scan` gitleaks pin | yes* | — | Warn when `scripts/lib/ci-secret-scan` pins gitleaks behind the release-age-eligible version (*this repo only) |
+
+`--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule
+PRs via Graphite in the target repo clone.
+
+Further detail (protect-main rules, branch hygiene, CVE workflow template): [AGENTS.md](AGENTS.md#repository-practices-new-and-existing-repos).
 
 ## Systemd Service Setup
 
