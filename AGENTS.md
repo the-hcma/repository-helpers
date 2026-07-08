@@ -118,6 +118,8 @@ scripts/github-repo-lint --apply-fix --repo OWNER/NAME      # patch settings + c
 
 ### `github-repo-lint` checks
 
+Operator-oriented copy of this table also lives in [README.md](README.md#github-repo-lint-checks).
+
 `scripts/lib/repo-practices` implements the audit. Use `--merge-only` (via `scripts/check-merge-settings`) to run only the merge-queue subset.
 
 | Check | Full audit | Merge-only | What it validates |
