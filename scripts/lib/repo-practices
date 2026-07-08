@@ -849,6 +849,86 @@ rp_candidate_dependabot_auto_merge_workflow() {
   rp_candidate_workflow_template 'dependabot-auto-merge.yml'
 }
 
+rp_candidate_cve_check_workflow() {
+  rp_candidate_workflow_template 'cve-check.yml'
+}
+
+rp_repo_has_uv_python_layout() {
+  # UV Python repos are identified by uv.lock + pyproject.toml at repo root.
+  # We intentionally do not attempt to parse pyproject.toml to keep this check
+  # lightweight and robust under API/mocking.
+  local slug="$1"
+  if rp_gh_path_exists "$slug" 'uv.lock' \
+    && rp_gh_path_exists "$slug" 'pyproject.toml'; then
+    return 0
+  fi
+  return 1
+}
+
+rp_cve_check_workflow_is_canonical() {
+  local text="$1"
+
+  # Canonical template hardening requirements.
+  grep -qF 'cron: '\''0 8 * * *'\'' ' <<<"$text" || return 1
+  grep -qF 'workflow_dispatch:' <<<"$text" || return 1
+  grep -qF 'workflow_call:' <<<"$text" || return 1
+  grep -qF 'uses: nick-fields/retry@v4' <<<"$text" || return 1
+  grep -qF 'uv sync --frozen' <<<"$text" || return 1
+  grep -qF 'uv run --with pip-audit' <<<"$text" || return 1
+  grep -qF 'pip-audit --skip-editable' <<<"$text" || return 1
+
+  # Must not use pip-audit --strict with uv editable project installs.
+  if grep -qE 'pip-audit[^\\n]*--strict' <<<"$text"; then
+    return 1
+  fi
+  return 0
+}
+
+rp_check_uv_python_cve_check_workflow() {
+  local slug="$1"
+  local repo_fail=0
+  local workflow_path='.github/workflows/cve-check.yml'
+  local canonical
+  local workflow_text
+
+  if ! rp_repo_has_uv_python_layout "$slug"; then
+    return 0
+  fi
+
+  if ! rp_gh_path_exists "$slug" "$workflow_path"; then
+    repo_fail=1
+    rp_log_fail "${slug}: missing ${workflow_path} for uv Python repos"
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      canonical="$(rp_candidate_cve_check_workflow)"
+      rp_queue_candidate_file_fix "$slug" "$workflow_path" \
+        "$canonical" 'add-cve-check-workflow' \
+        'chore: add daily pip-audit CVE check workflow'
+    elif [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: add ${workflow_path} (canonical template: cve-check.yml)"
+    fi
+    return "$repo_fail"
+  fi
+
+  workflow_text="$(rp_fetch_github_text_file "$slug" "$workflow_path" || true)"
+  if [[ -z "$workflow_text" ]] || ! rp_cve_check_workflow_is_canonical "$workflow_text"; then
+    repo_fail=1
+    rp_log_fail "${slug}: ${workflow_path} must match hardened canonical config for uv Python repos"
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      canonical="$(rp_candidate_cve_check_workflow)"
+      rp_queue_candidate_file_fix "$slug" "$workflow_path" \
+        "$canonical" 'sync-cve-check-workflow' \
+        'chore: sync daily pip-audit CVE check workflow to canonical template'
+    elif [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: sync ${workflow_path} to canonical hardened config"
+    fi
+    return "$repo_fail"
+  fi
+
+  rp_log_check_ok "${slug}" 'uv Python: daily CVE check workflow (cve-check.yml)' \
+    "$(rp_github_url "$slug" "/blob/main/${workflow_path}")"
+  return 0
+}
+
 rp_candidate_secret_scan_script() {
   local -r path="${rp_lib_dir}/ci-secret-scan"
 
@@ -2940,6 +3020,7 @@ rp_print_new_repo_checklist() {
       [ ] cleanup-branch-on-merge.yml (delete branch on PR merge)
       [ ] cleanup-merged-branches.yml (daily stale-branch sweep)
       [ ] dependabot-auto-merge.yml OR auto-merge-dependabot.yml (when dependabot.yml exists)
+      [ ] cve-check.yml (daily pip-audit CVE check for uv+pyproject repos)
 
     Dependency release age (scripts/lib/release-age-defaults):
       [ ] dependabot.yml: cooldown default-days: ${release_age_dependabot_days} on every updates entry
@@ -3944,6 +4025,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_pr_ship_and_review_rule "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_uv_python_cve_check_workflow "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_cursor_rules_gitignore "$slug"; then

@@ -155,6 +155,11 @@ under `.worktrees/repo-practices-candidate-fixes-wt`.
 | `cleanup-branch-on-merge.yml` | Delete the PR head branch when a PR merges |
 | `cleanup-merged-branches.yml` | Daily sweep (+ `workflow_dispatch`) for merged and stale branches |
 
+### CVE check workflow (uv Python)
+
+Repos identified as uv Python projects (presence of `uv.lock` + `pyproject.toml` at the repo root) must include
+`.github/workflows/cve-check.yml`, a scheduled daily `pip-audit` run (via `uv run --with pip-audit pip-audit --skip-editable`).
+
 ### Merge settings and Graphite merge queue
 
 With no `--repo`, the script audits the **current git repository** when run inside a clone (from `origin`). Outside a clone, discovery includes repositories that have `release-please.yml` or a **`merge-it`** label (use `--all` to scan every org repo).
