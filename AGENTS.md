@@ -116,6 +116,28 @@ scripts/github-repo-lint --apply-fix --repo OWNER/NAME      # patch settings + c
 
 **`scripts/check-merge-settings`** is a thin wrapper (merge + Graphite only). Prefer **`github-repo-lint`** for full coverage including branch cleanup workflows.
 
+### `github-repo-lint` checks
+
+`scripts/lib/repo-practices` implements the audit. Use `--merge-only` (via `scripts/check-merge-settings`) to run only the merge-queue subset.
+
+| Check | Full audit | Merge-only | What it validates |
+| --- | --- | --- | --- |
+| Release Please squash settings | yes | yes | Repos with `release-please.yml` use squash-only merges on `main` |
+| `protect-main` ruleset | yes | yes | Squash-only + Graphite App bypass on `refs/heads/main` when `merge-it` or Release Please |
+| Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts, push via Graphite only (org standard) |
+| Graphite merge queue wiring | yes | yes | `merge-it` label (strict repos), `merge-mq` when present, `merged-pr-closer.yml`, `ci.yml` `gtmq_merge_*` skip, dependabot auto-merge when `dependabot.yml` exists |
+| Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |
+| Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
+| License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
+| Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` references `wait-for-agent-review` and reply-before-resolve |
+| UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
+| `.cursor/rules` gitignore | yes | — | `.gitignore` must not block `.cursor/rules/` |
+| Dependabot release age | yes | — | `cooldown` on every `dependabot.yml` updates entry (`release-age-defaults`) |
+| pnpm release age | yes | — | `minimumReleaseAge` in `pnpm-workspace.yaml` when present |
+| `ci-secret-scan` gitleaks pin | yes* | — | Warn when `scripts/lib/ci-secret-scan` pins gitleaks behind the release-age-eligible version (*this repo only) |
+
+`--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via Graphite in the target repo clone.
+
 See [GRAPHITE.md](./GRAPHITE.md) for stacked PRs, the merge queue, and the **`merge-it`** label.
 
 ### `protect-main` ruleset (required)
