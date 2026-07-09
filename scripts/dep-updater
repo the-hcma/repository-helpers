@@ -4,6 +4,9 @@
 # Creates one stacked PR per outdated package inside a dedicated git worktree,
 # waits for CI on each PR, then cleans up the worktree once the stack is merged.
 #
+# macOS: GNU sed is required for in-place edits (brew install gnu-sed).
+# See scripts/lib/gnu-sed and AGENTS.md.
+#
 # See scripts/dep-updater.plan.md for full design documentation.
 set -euo pipefail
 
@@ -306,6 +309,8 @@ log_prereq() {
 
 # shellcheck disable=SC1091
 source "${dep_script_dir}/lib/tooling-prereqs"
+# shellcheck disable=SC1091
+source "${dep_script_dir}/lib/gnu-sed"
 
 wait_timeout_error() {
   # Emit a single concise line suitable for batch-all postprocessing.
@@ -2641,6 +2646,13 @@ check_ecosystem_prereqs() {
   fi
 }
 
+# Prerequisite: GNU sed for in-place edits (state file, uv floors, GHA workflow patches).
+check_gnu_sed_prereqs() {
+  if ! tooling_prereq_check_gnu_sed; then
+    die "Install GNU sed and retry (see above)."
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # npm project directory helpers (root or nested, e.g. web/)
 # ---------------------------------------------------------------------------
@@ -3050,11 +3062,7 @@ state_set() {
   local -r key="$1"
   local -r value="$2"
   if rg -q "^${key}=" "$state_file" 2>/dev/null; then
-    if sed --version 2>/dev/null | grep -q GNU; then
-      sed -i "s|^${key}=.*|${key}=${value}|" "$state_file"
-    else
-      sed -i '' "s|^${key}=.*|${key}=${value}|" "$state_file"
-    fi
+    gnu_sed_inplace "$state_file" -e "s|^${key}=.*|${key}=${value}|"
   else
     printf '%s=%s\n' "$key" "$value" >> "$state_file"
   fi
@@ -4843,10 +4851,10 @@ py_uv_rewrite_version_floor() {
 
   sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
   sed_new_ver="$(printf '%s' "$new_ver" | sed 's/[\\&#]/\\&/g')"
-  sed -i -E \
+  gnu_sed_inplace -E "$path" \
     -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?)(~=|>=|==)([0-9][0-9a-zA-Z.]*)\\\"#\\1>=${sed_new_ver}\\\"#" \
     -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?\")[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*#\\1 >= ${sed_new_ver}#" \
-    "$path" 2>/dev/null || return 1
+    || return 1
   return 0
 }
 
@@ -5537,10 +5545,12 @@ gha_update_one() {
 
   # Patch all workflow files: replace `uses: action@current_ref` with
   # `uses: action@new_ref`.  The sed delimiter is | to avoid escaping /.
+  local gnu_sed_bin
+  gnu_sed_bin="$(tooling_prereq_gnu_sed_path)"
   find "${worktree_path}/.github/workflows" -maxdepth 1 \
     \( -name '*.yml' -o -name '*.yaml' \) \
-    -exec sed -i \
-      "s|uses: ${action}@${current_ref}|uses: ${action}@${new_ref}|g" \
+    -exec "$gnu_sed_bin" -i \
+      -e "s|uses: ${action}@${current_ref}|uses: ${action}@${new_ref}|g" \
       {} +
 
   run_command "git worktree" git -C "$worktree_path" add .github/workflows/
@@ -5967,13 +5977,15 @@ batch_update_all() {
   # ── GitHub Actions ───────────────────────────────────────────────────────
   local any_gha=0
   if [[ "$has_gha" == '1' && -n "$gha_lines_arg" && "$security_only" == '0' ]]; then
+    local gnu_sed_bin
+    gnu_sed_bin="$(tooling_prereq_gnu_sed_path)"
     while IFS=' ' read -r action cur_ref new_ref; do
       [[ -z "$action" ]] && continue
       log "[github-actions] Batch update: ${action} ${cur_ref} → ${new_ref}"
       find "${worktree_path}/.github/workflows" -maxdepth 1 \
         \( -name '*.yml' -o -name '*.yaml' \) \
-        -exec sed -i \
-          "s|uses: ${action}@${cur_ref}|uses: ${action}@${new_ref}|g" \
+        -exec "$gnu_sed_bin" -i \
+          -e "s|uses: ${action}@${cur_ref}|uses: ${action}@${new_ref}|g" \
           {} +
     done <<< "$gha_lines_arg"
     run_command "git worktree" git -C "$worktree_path" add .github/workflows/ 2>/dev/null || true
@@ -7904,6 +7916,7 @@ main() {
 
   if [[ "$batch_all" == '1' ]]; then
     check_core_prereqs
+    check_gnu_sed_prereqs
     batch_all_dispatch
     exit $?
   fi
@@ -7926,6 +7939,9 @@ main() {
   if [[ "$report_json" == '0' ]]; then
     detect_ecosystem
     check_ecosystem_prereqs "$has_npm" "$py_tool" "$has_rust"
+    if [[ "$dry_run" == '0' ]]; then
+      check_gnu_sed_prereqs
+    fi
   fi
   if [[ "$dry_run" == '0' ]]; then
     check_auth_prereqs
@@ -8248,7 +8264,7 @@ if [[ "$dry_run" == '1' ]]; then
           "$gha_commit" \
           ".github/workflows/" \
           "${action} ${cur_ref} ${new_ref}" \
-          "sed -i 's|uses: ${action}@${cur_ref}|uses: ${action}@${new_ref}|g' .github/workflows/*.yml"
+          "gnu_sed_inplace -e 's|uses: ${action}@${cur_ref}|uses: ${action}@${new_ref}|g' .github/workflows/*.yml"
       done <<< "$gha_lines"
     fi
   fi

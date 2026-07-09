@@ -100,6 +100,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 - **pnpm grandfathering (cutover only).** When enabling `minimumReleaseAge` on a repo with an existing lockfile, run `scripts/grandfather-pnpm-release-age` once to write `pnpm-workspace.yaml` with `minimumReleaseAgeExclude: ["*"]` so the current lockfile keeps passing CI under pnpm 11.1.3+. No registry file or prune step—**forward** bumps are gated by dep-updater (9 days) and Dependabot cooldown (10 days).
 - **GitHub Actions pins follow their own style.** `@v6` (major-only) bumps to the latest release semver when newer—patch within the same major (`v6` → `v6.0.2`) or major jump (`v7` → `v8.1.0`), matching Dependabot. `@v1.7.12` / `@0.36.0` (full semver) is bumped on any newer release. The `v`-prefix style of the existing pin is preserved. Commit-SHA pins (`@abc1234...`) and local actions (`./path`) are never touched.
 - **Wait timeouts must be machine-parseable.** Any long-running wait loop (CI gating, merge polling, PR number discovery, etc.) must, on timeout, emit **one** concise line starting with `ERROR: WAIT_TIMEOUT ...` and then fail. Avoid multi-line timeout chatter — batch runs (`--batch --all`) postprocess these lines into end-of-run actionable summaries.
+- **GNU sed on macOS.** `dep-updater` in-place edits require GNU sed (`brew install gnu-sed`; `gsed` or Homebrew `gnu-sed` gnubin on `PATH`). BSD `/usr/bin/sed` is not supported.
 
 ---
 
