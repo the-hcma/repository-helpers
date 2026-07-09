@@ -1448,6 +1448,7 @@ agent_review_status_json_from_snapshot() {
   local open_all pending_all ci_json ci_conclusion ci_ready ci_failures
   local merge_json merge_state mergeable merge_ready
   local pr_state pr_merged review_body agent_review_empty agent_quota_exhausted complete_ready agent_id
+  local pass_delivered_by_fallback
   local head_check_state head_check_clean head_check_findings head_check_error head_check_quota head_check_conclusion
   local threads_json human_open_json human_threads_json head_check_complete_json
   local request_visible wait_reason
@@ -1512,9 +1513,15 @@ agent_review_status_json_from_snapshot() {
   else
     all_quotas_exhausted=false
   fi
+  pass_delivered_by_fallback=false
+  if agent_review_delivered_recognized_pass_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    pass_delivered_by_fallback=true
+  fi
   if agent_review_profile_review_is_empty "${review_body}"; then
     agent_review_empty=true
   elif [[ "${head_check_clean}" == 'true' ]] && (( unaddressed == 0 )); then
+    agent_review_empty=true
+  elif [[ "${pass_delivered_by_fallback}" == 'true' ]]; then
     agent_review_empty=true
   else
     agent_review_empty=false
@@ -1538,6 +1545,8 @@ agent_review_status_json_from_snapshot() {
   mergeable="$(ar_runner_jq_file "agent-review status mergeable" "${merge_json}" -r '.mergeable')"
   if agent_review_merge_state_ready "${merge_state}"; then
     merge_ready=true
+  elif [[ "${merge_state}" == 'UNSTABLE' ]] && [[ "${mergeable}" == 'MERGEABLE' ]]; then
+    merge_ready=true
   else
     merge_ready=false
   fi
@@ -1550,7 +1559,7 @@ agent_review_status_json_from_snapshot() {
     wait_reason="no_fresh_agent_review_on_head"
   fi
   if [[ "${pr_merged}" == 'true' ]] \
-    || { [[ "${fresh}" == 'true' ]] \
+    || { { [[ "${fresh}" == 'true' ]] || [[ "${pass_delivered_by_fallback}" == 'true' ]]; } \
       && [[ "${ci_ready}" == 'true' ]] \
       && [[ "${pending_all}" -eq 0 ]] \
       && [[ "${open_all}" -eq 0 ]] \
@@ -1815,6 +1824,38 @@ agent_review_print_ci_failures() {
   while IFS= read -r line || [[ -n "${line}" ]]; do
     printf '  %s\n' "${line}" >&2
   done < <(ci_rollup_failed_lines "${latest}" | head -n 20)
+}
+
+# True when copilot or bugbot delivered a recognized pass (no actionable feedback) on head.
+agent_review_delivered_recognized_pass_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local -r repo="$3"
+  local -r pr="$4"
+  local saved_agent agent review_body
+
+  saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
+  for agent in copilot bugbot; do
+    agent_review_use_agent "${agent}"
+    if ! declare -F agent_review_profile_fresh_on_head >/dev/null 2>&1; then
+      continue
+    fi
+    if ! agent_review_profile_fresh_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+      continue
+    fi
+    review_body=""
+    if declare -F agent_review_profile_latest_review_body_on_head >/dev/null 2>&1; then
+      review_body="$(agent_review_profile_latest_review_body_on_head \
+        "${snapshot}" "${head}" "${repo}" "${pr}")"
+    fi
+    if [[ -n "${review_body}" ]] \
+      && agent_review_profile_review_is_empty "${review_body}"; then
+      agent_review_use_agent "${saved_agent}"
+      return 0
+    fi
+  done
+  agent_review_use_agent "${saved_agent}"
+  return 1
 }
 
 # True when the active agent's daily quota is exhausted and waiting would be futile.
