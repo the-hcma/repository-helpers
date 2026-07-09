@@ -1769,12 +1769,74 @@ printf '\n=== static: py_audit runs uv with --frozen ===\n'
 # rewrite uv.lock) in the source repository before running pip-audit.
 # Without --frozen, uv run updates uv.lock as a side effect, leaving
 # uncommitted changes behind in the source repo's working tree.
-if awk '/^py_audit\(\)/{found=1} found && /run --frozen --with pip-audit/{ok=1} found && /^}$/{found=0} END{exit !ok}' "$script"; then
+if awk '/^py_audit\(\)/{found=1} found && /run --frozen/ && /run --frozen.*--with pip-audit/{ok=1} found && /^}$/{found=0} END{exit !ok}' "$script"; then
   printf '[PASS] py_audit: uv run uses --frozen to prevent lockfile updates\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] py_audit: uv run --frozen not found — may write uv.lock in the source repo\n'
   fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: py_audit disables uv progress spinner for JSON ===\n'
+
+# uv run writes spinners to stdout before pip-audit JSON; --no-progress keeps
+# captured stdout machine-parseable (issue #345).
+if awk '/^py_audit\(\)/{found=1} found && /run --frozen --no-progress --with pip-audit/{ok=1} found && /^}$/{found=0} END{exit !ok}' "$script"; then
+  printf '[PASS] py_audit: uv run uses --no-progress for pip-audit JSON capture\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py_audit: uv run --no-progress not found — spinner may break CVE JSON parse\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== behavioural: py_audit JSON extraction tolerates uv spinner prefix ===\n'
+
+py_audit_json_fn="$(awk '/^py_audit_json_payload_from_stdout\(\)/,/^\}/' "$script")"
+if [[ -z "$py_audit_json_fn" ]]; then
+  printf '[FAIL] py_audit_json_payload_from_stdout helper is missing\n'
+  fail=$(( fail + 1 ))
+elif ! command -v jq >/dev/null 2>&1; then
+  printf '[SKIP] jq not on PATH — skipping py_audit JSON extraction test\n'
+else
+  # shellcheck disable=SC2086  # eval sourced function body from script under test
+  eval "$py_audit_json_fn"
+  audit_fixture_json='{"dependencies":[{"name":"msgpack","version":"1.2.0","vulns":[{"id":"GHSA-6v7p-g79w-8964","fix_versions":["1.2.1"]}]}]}'
+  spinner_prefixed=$'\x1b[?25l⠋ Collecting inputs\n'"${audit_fixture_json}"
+  extracted_json="$(py_audit_json_payload_from_stdout "$spinner_prefixed")"
+  if [[ "$extracted_json" != "$audit_fixture_json" ]]; then
+    printf '[FAIL] py_audit JSON extraction: spinner-prefixed stdout not normalized\n'
+    fail=$(( fail + 1 ))
+  else
+    audit_line="$(printf '%s' "$extracted_json" | jq -r '
+      .dependencies[]
+      | select(.vulns | length > 0)
+      | . as $dep
+      | .vulns
+        | map(select(.fix_versions | length > 0))
+        | select(length > 0)
+        | {
+            name: $dep.name,
+            version: $dep.version,
+            fix: (map(.fix_versions[]) | sort | last),
+            cves: (map(.id) | join(", "))
+          }
+      | "\(.name) \(.version) \(.fix) \(.cves)"
+    ')"
+    if [[ "$audit_line" == 'msgpack 1.2.0 1.2.1 GHSA-6v7p-g79w-8964' ]]; then
+      printf '[PASS] py_audit JSON extraction: CVE row parsed after uv spinner prefix\n'
+      pass=$(( pass + 1 ))
+    else
+      printf '[FAIL] py_audit JSON extraction: unexpected CVE row %s\n' "$audit_line"
+      fail=$(( fail + 1 ))
+    fi
+  fi
+  if [[ -n "$(py_audit_json_payload_from_stdout 'not json at all')" ]]; then
+    printf '[FAIL] py_audit JSON extraction: garbage input should yield empty\n'
+    fail=$(( fail + 1 ))
+  else
+    printf '[PASS] py_audit JSON extraction: non-JSON stdout yields empty\n'
+    pass=$(( pass + 1 ))
+  fi
 fi
 
 printf '\n=== static: primary clone preserve and recover ===\n'
