@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Tests for scripts/lib/gnu-userland and tooling_path_ensure_gnu_userland.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+gu_lib="${script_dir}/../scripts/lib/gnu-userland"
+path_lib="${script_dir}/../scripts/lib/tooling-path"
+readonly gu_lib path_lib
+
+pass=0
+fail=0
+
+printf '\n=== static: gnu-userland defines check helpers ===\n'
+# shellcheck disable=SC2016
+if grep -qF 'tooling_prereq_check_gnu_userland()' "$gu_lib" \
+  && grep -qF 'tooling_prereq_command_is_gnu()' "$gu_lib" \
+  && grep -qF 'brew install coreutils gnu-sed grep util-linux' "$gu_lib"; then
+  printf '[PASS] gnu-userland: check helper and brew install hint present\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] gnu-userland missing check helper or install hint\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: tooling-path ensure wires check ===\n'
+# shellcheck disable=SC2016
+if grep -qF 'tooling_path_ensure_gnu_userland()' "$path_lib" \
+  && grep -qF 'tooling_prereq_check_gnu_userland' "$path_lib" \
+  && awk '/tooling_path_bootstrap_cron_minimal/,/^}/' "$path_lib" \
+    | grep -qF 'tooling_path_ensure_gnu_userland' \
+  && awk '/tooling_path_bootstrap_node_ecosystem/,/^}/' "$path_lib" \
+    | grep -qF 'tooling_path_ensure_gnu_userland'; then
+  printf '[PASS] tooling-path: ensure used by both bootstraps\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] tooling-path must call tooling_path_ensure_gnu_userland from bootstraps\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: entrypoints fail closed on ensure ===\n'
+show_services="${script_dir}/../scripts/show-services"
+pre_pr="${script_dir}/../scripts/dev/pre-pr-checks"
+repo_lint="${script_dir}/../scripts/github-repo-lint"
+# shellcheck disable=SC2016
+if grep -qF 'tooling_path_ensure_gnu_userland' "$show_services" \
+  && grep -qF 'tooling_path_ensure_gnu_userland' "$pre_pr" \
+  && awk '/enforcer_require_libs/,/^}/' "$repo_lint" \
+    | grep -qF 'tooling_path_ensure_gnu_userland'; then
+  printf '[PASS] show-services, pre-pr-checks, and enforcer call ensure\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] entrypoints must call tooling_path_ensure_gnu_userland\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: Darwin check fails without GNU tools on PATH ===\n'
+# shellcheck disable=SC1090,SC1091
+source "$gu_lib"
+if [[ "$(uname -s)" != 'Darwin' ]]; then
+  printf '[PASS] Darwin-only failure path skipped on non-macOS\n'
+  pass=$(( pass + 1 ))
+else
+  err="$(mktemp)"
+  set +e
+  PATH='/usr/bin:/bin' tooling_prereq_check_gnu_userland >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]] \
+    && grep -qF 'brew install coreutils gnu-sed grep util-linux' "$err" \
+    && grep -qE "ERROR: '(sed|grep|date|timeout|flock)'" "$err"; then
+    printf '[PASS] check fails on BSD PATH with brew install hint\n'
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] expected non-zero check + brew hint on BSD PATH (rc=%s)\n%s\n' \
+      "$rc" "$(cat "$err")"
+    fail=$(( fail + 1 ))
+  fi
+  rm -f "$err"
+fi
+
+printf '\n=== functional: ensure succeeds when Homebrew gnubin present ===\n'
+# shellcheck disable=SC1090,SC1091
+source "$path_lib"
+if [[ "$(uname -s)" != 'Darwin' ]]; then
+  printf '[PASS] ensure success path skipped on non-macOS\n'
+  pass=$(( pass + 1 ))
+elif [[ ! -d /opt/homebrew/opt/coreutils/libexec/gnubin \
+    && ! -d /usr/local/opt/coreutils/libexec/gnubin ]]; then
+  printf '[PASS] ensure success skipped (coreutils gnubin not installed)\n'
+  pass=$(( pass + 1 ))
+else
+  err="$(mktemp)"
+  set +e
+  (
+    PATH='/usr/bin:/bin'
+    tooling_path_ensure_gnu_userland
+    printf 'grep=%s\n' "$(type -P grep)"
+    printf 'flock=%s\n' "$(type -P flock)"
+  ) >"$err.out" 2>"$err"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]] \
+    && [[ ! -s "$err" ]] \
+    && grep -qE 'grep=.*/gnubin/grep' "$err.out" \
+    && grep -qE 'flock=.*/util-linux/bin/flock' "$err.out"; then
+    printf '[PASS] ensure prepends gnubin and passes GNU check quietly\n'
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] ensure should succeed quietly with Homebrew gnubin (rc=%s)\n' "$rc"
+    printf 'stderr:\n%s\nstdout:\n%s\n' "$(cat "$err")" "$(cat "$err.out")"
+    fail=$(( fail + 1 ))
+  fi
+  rm -f "$err" "$err.out"
+fi
+
+printf '\n--- results: %d passed, %d failed ---\n' "$pass" "$fail"
+if [[ "$fail" -gt 0 ]]; then
+  exit 1
+fi
