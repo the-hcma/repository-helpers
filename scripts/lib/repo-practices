@@ -453,11 +453,12 @@ rp_log_check_fail() {
 }
 
 # Manual steps the script cannot verify (yellow + 👉 when stderr is a TTY).
+# Omitted from --compact failure reports: these are unverifiable reminders and were
+# previously recorded as "Fix:" lines even when GitHub wiring already passed.
 rp_log_manual_step() {
   local message="$1"
   local url="${2:-}"
-  if [[ "$rp_compact" -eq 1 && -n "$rp_current_slug" ]]; then
-    rp_compact_record_fix "$rp_current_slug" "$message"
+  if [[ "$rp_compact" -eq 1 ]]; then
     return 0
   fi
   printf '     ' >&2
@@ -556,34 +557,134 @@ rp_is_strict_repo() {
   [[ "$(rp_repo_short_name "$1")" != "$rp_THIS_REPO_NAME" ]] || [[ "$rp_new_repo" -eq 1 ]]
 }
 
-rp_gh_path_exists() {
-  local slug="$1"
-  local path="$2"
-  local exit_code=0
-
-  runner_exec "repo-practices gh path exists ${path}" --probe \
-    -- gh api "repos/${slug}/contents/${path}" || exit_code=$?
-  (( exit_code == 0 ))
+# rp_gh_api_detail_is_not_found <detail>
+# True when a gh api stderr summary indicates HTTP 404 / Not Found.
+rp_gh_api_detail_is_not_found() {
+  local -r detail="$1"
+  [[ "$detail" == *'404'* || "$detail" == *'Not Found'* ]]
 }
 
+# rp_gh_api_detail_is_transient <detail>
+# True for retryable GitHub API failures (gateway errors / rate limit).
+rp_gh_api_detail_is_transient() {
+  local -r detail="$1"
+  [[ "$detail" == *'502'* || "$detail" == *'503'* || "$detail" == *'504'* \
+    || "$detail" == *'429'* || "$detail" == *[Rr]'ate limit'* ]]
+}
+
+rp_gh_api_max_attempts() {
+  printf '%s' "${RP_GH_API_MAX_ATTEMPTS:-3}"
+}
+
+rp_gh_api_retry_sleep() {
+  local secs="${RP_GH_API_RETRY_SLEEP_SECS:-1}"
+  if [[ "$secs" == '0' ]]; then
+    return 0
+  fi
+  sleep "$secs"
+}
+
+# Classify a failed gh contents probe/fetch.
+# 1 = not found, 2 = API error (after optional retries for transients).
+rp_gh_api_classify_contents_failure() {
+  local detail attempt max_attempts
+  detail="$(rp_runner_last_stderr_summary || true)"
+  # Empty stderr (test mocks) or explicit 404 → missing.
+  if [[ -z "$detail" ]] || rp_gh_api_detail_is_not_found "$detail"; then
+    return 1
+  fi
+  attempt="${1:-1}"
+  max_attempts="$(rp_gh_api_max_attempts)"
+  if rp_gh_api_detail_is_transient "$detail"; then
+    if (( attempt < max_attempts )); then
+      return 3
+    fi
+    return 2
+  fi
+  # Other explicit HTTP errors from gh (401/403/500/…) → API failure.
+  if [[ "$detail" == *'HTTP '* || "$detail" == *'HTTP/'* ]]; then
+    return 2
+  fi
+  # Unrecognized stderr (e.g. test mock "unexpected gh call") → missing.
+  return 1
+}
+
+# rp_gh_path_check <slug> <path>
+# 0 = path exists, 1 = not found (404), 2 = GitHub API error after retries.
+# Never treat HTTP 502/503/504/429 as "missing" — that caused false lint failures.
+rp_gh_path_check() {
+  local -r slug="$1"
+  local -r path="$2"
+  local attempt max_attempts exit_code class_ec
+
+  max_attempts="$(rp_gh_api_max_attempts)"
+  attempt=1
+  while (( attempt <= max_attempts )); do
+    exit_code=0
+    runner_exec "repo-practices gh path exists ${path}" --probe \
+      -- gh api "repos/${slug}/contents/${path}" || exit_code=$?
+    if (( exit_code == 0 )); then
+      return 0
+    fi
+    class_ec=0
+    rp_gh_api_classify_contents_failure "$attempt" || class_ec=$?
+    if (( class_ec == 3 )); then
+      rp_gh_api_retry_sleep
+      attempt=$(( attempt + 1 ))
+      continue
+    fi
+    return "$class_ec"
+  done
+  return 2
+}
+
+# True only when the path exists. Prefer rp_gh_path_check when missing vs API
+# error must be distinguished (see call sites that fail on "missing").
+rp_gh_path_exists() {
+  local check_exit=0
+  rp_gh_path_check "$@" || check_exit=$?
+  (( check_exit == 0 ))
+}
+
+# rp_fetch_github_text_file <slug> <path>
+# Prints file text on success (exit 0). Exit 1 = not found / empty content.
+# Exit 2 = GitHub API error after retries (do not treat as missing/malformed file).
 rp_fetch_github_text_file() {
   local slug="$1"
   local path="$2"
-  local response encoded
+  local response encoded decoded
   local fetch_exit_code=0
-  set +e
-  response="$(rp_runner_exec_stdout "repo-practices gh fetch ${path}" --probe \
-    -- gh api "repos/${slug}/contents/${path}")"
-  fetch_exit_code=$?
-  set -e
-  if (( fetch_exit_code != 0 )) || [[ -z "$response" ]]; then
-    return 1
-  fi
-  encoded="$(rp_runner_jq_file "repo-practices content field" "$response" -r '.content // empty')"
-  if [[ -z "$encoded" || "$encoded" == 'null' ]]; then
-    return 1
-  fi
-  printf '%s' "$encoded" | base64 -d 2>/dev/null || return 1
+  local attempt max_attempts class_ec
+
+  max_attempts="$(rp_gh_api_max_attempts)"
+  attempt=1
+  while (( attempt <= max_attempts )); do
+    fetch_exit_code=0
+    set +e
+    response="$(rp_runner_exec_stdout "repo-practices gh fetch ${path}" --probe \
+      -- gh api "repos/${slug}/contents/${path}")"
+    fetch_exit_code=$?
+    set -e
+    if (( fetch_exit_code == 0 )) && [[ -n "$response" ]]; then
+      encoded="$(rp_runner_jq_file "repo-practices content field" "$response" \
+        -r '.content // empty')"
+      if [[ -z "$encoded" || "$encoded" == 'null' ]]; then
+        return 1
+      fi
+      decoded="$(printf '%s' "$encoded" | base64 -d 2>/dev/null)" || return 1
+      printf '%s' "$decoded"
+      return 0
+    fi
+    class_ec=0
+    rp_gh_api_classify_contents_failure "$attempt" || class_ec=$?
+    if (( class_ec == 3 )); then
+      rp_gh_api_retry_sleep
+      attempt=$(( attempt + 1 ))
+      continue
+    fi
+    return "$class_ec"
+  done
+  return 2
 }
 
 rp_text_has_copyright_notice() {
@@ -857,12 +958,23 @@ rp_repo_has_uv_python_layout() {
   # UV Python repos are identified by uv.lock + pyproject.toml at repo root.
   # We intentionally do not attempt to parse pyproject.toml to keep this check
   # lightweight and robust under API/mocking.
+  # Returns 0 when both exist, 1 when either is missing, 2 on GitHub API error.
   local slug="$1"
-  if rp_gh_path_exists "$slug" 'uv.lock' \
-    && rp_gh_path_exists "$slug" 'pyproject.toml'; then
-    return 0
+  local uv_ec=0
+  local py_ec=0
+
+  rp_gh_path_check "$slug" 'uv.lock' || uv_ec=$?
+  if (( uv_ec == 2 )); then
+    return 2
   fi
-  return 1
+  if (( uv_ec != 0 )); then
+    return 1
+  fi
+  rp_gh_path_check "$slug" 'pyproject.toml' || py_ec=$?
+  if (( py_ec == 2 )); then
+    return 2
+  fi
+  (( py_ec == 0 ))
 }
 
 rp_cve_check_workflow_is_canonical() {
@@ -909,12 +1021,25 @@ rp_check_uv_python_cve_check_workflow() {
   local workflow_path='.github/workflows/cve-check.yml'
   local canonical
   local workflow_text
+  local layout_ec=0
+  local path_ec=0
+  local fetch_ec=0
 
-  if ! rp_repo_has_uv_python_layout "$slug"; then
+  rp_repo_has_uv_python_layout "$slug" || layout_ec=$?
+  if (( layout_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not detect uv Python layout (uv.lock / pyproject.toml)'
+    return 1
+  fi
+  if (( layout_ec != 0 )); then
     return 0
   fi
 
-  if ! rp_gh_path_exists "$slug" "$workflow_path"; then
+  rp_gh_path_check "$slug" "$workflow_path" || path_ec=$?
+  if (( path_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" "could not read ${workflow_path}"
+    return 1
+  fi
+  if (( path_ec == 1 )); then
     repo_fail=1
     rp_log_fail "${slug}: missing ${workflow_path} for uv Python repos"
     if [[ "$rp_apply_fix" -eq 1 ]]; then
@@ -928,7 +1053,12 @@ rp_check_uv_python_cve_check_workflow() {
     return "$repo_fail"
   fi
 
-  workflow_text="$(rp_fetch_github_text_file "$slug" "$workflow_path" || true)"
+  fetch_ec=0
+  workflow_text="$(rp_fetch_github_text_file "$slug" "$workflow_path")" || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" "could not read ${workflow_path}"
+    return 1
+  fi
   if [[ -z "$workflow_text" ]] || ! rp_cve_check_workflow_is_canonical "$workflow_text"; then
     repo_fail=1
     rp_log_fail "${slug}: ${workflow_path} must match hardened canonical config for uv Python repos"
@@ -1642,11 +1772,18 @@ rp_ci_workflow_has_brittle_gitleaks_install() {
 
 rp_ci_secret_scan_normalize_for_compare() {
   local text="$1"
+  local normalized
   # Treat shellcheck reflows (&& vs split lines, literal \n in format strings,
   # indentation) as equivalent when no semantic script content changed.
-  printf '%s' "$text" \
-    | tr -d '\r' \
-    | sed 's/ && / /g; s/\\n/ /g; s/[[:space:]]\+/ /g; s/^ //; s/ $//'
+  # Use bash replacements + tr -s (portable); GNU sed \+ / \\n is not reliable
+  # on macOS BSD sed.
+  normalized="$(printf '%s' "$text" | tr -d '\r')"
+  normalized="${normalized// && / }"
+  normalized="${normalized//\\n/ }"
+  normalized="$(printf '%s' "$normalized" | tr -s '[:space:]' ' ')"
+  normalized="${normalized# }"
+  normalized="${normalized% }"
+  printf '%s' "$normalized"
 }
 
 rp_ci_secret_scan_script_is_canonical() {
@@ -2954,14 +3091,29 @@ rp_validate_pnpm_release_age_policy() {
   local slug="$1"
   local fail=0
   local workspace_path workspace_text saw_workspace=0
+  local path_ec=0
+  local fetch_ec=0
 
   while IFS= read -r workspace_path; do
     [[ -n "$workspace_path" ]] || continue
-    if ! rp_gh_path_exists "$slug" "$workspace_path"; then
+    path_ec=0
+    rp_gh_path_check "$slug" "$workspace_path" || path_ec=$?
+    if (( path_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" "could not read ${workspace_path}"
+      fail=1
+      continue
+    fi
+    if (( path_ec != 0 )); then
       continue
     fi
     saw_workspace=1
-    workspace_text="$(rp_fetch_github_text_file "$slug" "$workspace_path" || true)"
+    fetch_ec=0
+    workspace_text="$(rp_fetch_github_text_file "$slug" "$workspace_path")" || fetch_ec=$?
+    if (( fetch_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" "could not read ${workspace_path}"
+      fail=1
+      continue
+    fi
     if [[ -z "$workspace_text" ]]; then
       rp_log_fail "${slug}: ${workspace_path} exists but could not be read"
       fail=1
@@ -3282,8 +3434,17 @@ rp_validate_graphite_workflows() {
   local labels_json="$3"
   local fail=0
   local ci_text ci_fixed closer_text dependabot_workflow dependabot_auto_text
+  local path_ec=0
+  local fetch_ec=0
+  local secret_scan_script
+  local merge_mq_exit_code=0
 
-  if ! rp_gh_path_exists "$slug" '.github/workflows/merged-pr-closer.yml'; then
+  path_ec=0
+  rp_gh_path_check "$slug" '.github/workflows/merged-pr-closer.yml' || path_ec=$?
+  if (( path_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/workflows/merged-pr-closer.yml'
+    fail=1
+  elif (( path_ec == 1 )); then
     if [[ "$strict" == '1' ]]; then
       rp_log_fail "${slug}: missing .github/workflows/merged-pr-closer.yml"
       if [[ "$rp_apply_fix" -eq 1 ]]; then
@@ -3300,8 +3461,13 @@ rp_validate_graphite_workflows() {
       rp_log_warn "${slug}: missing merged-pr-closer.yml (optional for ${rp_THIS_REPO_NAME})"
     fi
   else
-    closer_text="$(rp_fetch_github_text_file "$slug" '.github/workflows/merged-pr-closer.yml' || true)"
-    if [[ -z "$closer_text" ]] \
+    fetch_ec=0
+    closer_text="$(rp_fetch_github_text_file "$slug" \
+      '.github/workflows/merged-pr-closer.yml')" || fetch_ec=$?
+    if (( fetch_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" 'could not read .github/workflows/merged-pr-closer.yml'
+      fail=1
+    elif [[ -z "$closer_text" ]] \
       || ! grep -qF 'graphite-app' <<<"$closer_text" \
       || ! grep -qF 'Graphite merge queue' <<<"$closer_text"; then
       rp_log_fail "${slug}: merged-pr-closer.yml must detect graphite-app Graphite merge queue comments"
@@ -3330,9 +3496,19 @@ rp_validate_graphite_workflows() {
     fi
   fi
 
-  if rp_gh_path_exists "$slug" '.github/workflows/ci.yml'; then
-    ci_text="$(rp_fetch_github_text_file "$slug" '.github/workflows/ci.yml' || true)"
-    if [[ -z "$ci_text" ]] || ! grep -qF 'gtmq_merge_' <<<"$ci_text"; then
+  path_ec=0
+  rp_gh_path_check "$slug" '.github/workflows/ci.yml' || path_ec=$?
+  if (( path_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/workflows/ci.yml'
+    fail=1
+  elif (( path_ec == 0 )); then
+    fetch_ec=0
+    ci_text="$(rp_fetch_github_text_file "$slug" '.github/workflows/ci.yml')" || fetch_ec=$?
+    if (( fetch_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" 'could not read .github/workflows/ci.yml'
+      fail=1
+      ci_text=""
+    elif [[ -z "$ci_text" ]] || ! grep -qF 'gtmq_merge_' <<<"$ci_text"; then
       if [[ "$strict" == '1' ]]; then
         rp_log_fail "${slug}: ci.yml must skip gtmq_merge_* merge-queue staging branches"
         if [[ "$rp_suggest" -eq 1 ]]; then
@@ -3344,86 +3520,98 @@ rp_validate_graphite_workflows() {
       fi
     fi
 
-    # Stacked PRs: CI must run even when the PR base is not main.
-    if rp_ci_workflow_restricts_pr_branches "$ci_text"; then
-      rp_log_fail "${slug}: ci.yml restricts pull_request branches; stacked PRs will not run CI"
-      if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_suggest "${slug}: remove pull_request.branches filters so CI runs for stacked PR base branches"
-      fi
-      if [[ "$rp_apply_fix" -eq 1 ]]; then
-        ci_fixed="$(rp_fix_ci_workflow_for_stacked_prs "$ci_text")"
-        rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
-          "$ci_fixed" \
-          'fix-ci-stacked-prs' \
-          'fix(ci): run CI for stacked PR base branches'
-        rp_compact_record_fix "$slug" "${slug}: candidate PR: fix ci.yml pull_request trigger for stacked PRs"
-      fi
-      fail=1
-    fi
-
-    if rp_ci_workflow_needs_graphite_restack_trigger_fix "$ci_text"; then
-      rp_log_fail \
-        "${slug}: ci.yml lacks full Graphite restack CI coverage (feature-branch push, guard push dedup with pull-requests read, pull_request edited type)"
-      if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_suggest \
-          "${slug}: sync ci.yml Graphite restack triggers (scripts/github-repo-lint --apply-fix)"
-      fi
-      if [[ "$rp_apply_fix" -eq 1 ]]; then
-        rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
-          "$(rp_fix_ci_workflow_hardening "$ci_text")" \
-          'sync-graphite-restack-ci-v3' \
-          'fix(ci): harden guard push-dedup gh pr list fallback'
-        rp_compact_record_fix "$slug" \
-          "${slug}: candidate PR: harden Graphite restack guard push dedup"
-      fi
-      fail=1
-    fi
-
-    if ! rp_ci_workflow_has_hardened_concurrency "$ci_text"; then
-      rp_log_fail \
-        "${slug}: ci.yml concurrency must key on head SHA (avoids zombie secret-scan checks)"
-      if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_suggest "${slug}: sync ci.yml concurrency (scripts/github-repo-lint --apply-fix)"
-      fi
-      if [[ "$rp_apply_fix" -eq 1 ]]; then
-        rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
-          "$(rp_fix_ci_workflow_hardening "$ci_text")" \
-          'sync-ci-concurrency' \
-          'fix(ci): key CI concurrency on head SHA'
-        rp_compact_record_fix "$slug" "${slug}: candidate PR: harden ci.yml concurrency and secret-scan"
-      fi
-      fail=1
-    fi
-
-    if rp_ci_workflow_has_secret_scan_coverage "$ci_text"; then
-      secret_scan_script=""
-      secret_scan_script="$(rp_fetch_github_text_file "$slug" '.github/ci/secret-scan' || true)"
-      if ! rp_ci_secret_scan_install_report_drift "$slug" "$secret_scan_script" "$ci_text"; then
+    if [[ -n "${ci_text:-}" ]]; then
+      # Stacked PRs: CI must run even when the PR base is not main.
+      if rp_ci_workflow_restricts_pr_branches "$ci_text"; then
+        rp_log_fail "${slug}: ci.yml restricts pull_request branches; stacked PRs will not run CI"
+        if [[ "$rp_suggest" -eq 1 ]]; then
+          rp_log_suggest "${slug}: remove pull_request.branches filters so CI runs for stacked PR base branches"
+        fi
         if [[ "$rp_apply_fix" -eq 1 ]]; then
-          rp_queue_ci_secret_scan_candidate_fixes "$slug" "$ci_text" 'sync'
+          ci_fixed="$(rp_fix_ci_workflow_for_stacked_prs "$ci_text")"
+          rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
+            "$ci_fixed" \
+            'fix-ci-stacked-prs' \
+            'fix(ci): run CI for stacked PR base branches'
+          rp_compact_record_fix "$slug" "${slug}: candidate PR: fix ci.yml pull_request trigger for stacked PRs"
         fi
         fail=1
       fi
-    elif [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
-      if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_warn "${slug}: ci.yml has no secret-scan job (optional for ${rp_THIS_REPO_NAME})"
+
+      if rp_ci_workflow_needs_graphite_restack_trigger_fix "$ci_text"; then
+        rp_log_fail \
+          "${slug}: ci.yml lacks full Graphite restack CI coverage (feature-branch push, guard push dedup with pull-requests read, pull_request edited type)"
+        if [[ "$rp_suggest" -eq 1 ]]; then
+          rp_log_suggest \
+            "${slug}: sync ci.yml Graphite restack triggers (scripts/github-repo-lint --apply-fix)"
+        fi
+        if [[ "$rp_apply_fix" -eq 1 ]]; then
+          rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
+            "$(rp_fix_ci_workflow_hardening "$ci_text")" \
+            'sync-graphite-restack-ci-v3' \
+            'fix(ci): harden guard push-dedup gh pr list fallback'
+          rp_compact_record_fix "$slug" \
+            "${slug}: candidate PR: harden Graphite restack guard push dedup"
+        fi
+        fail=1
       fi
-    else
-      rp_log_fail "${slug}: ci.yml must include a secret-scan job"
-      if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_suggest "${slug}: add .github/ci/secret-scan and a secret-scan job (see scripts/lib/ci-secret-scan)"
+
+      if ! rp_ci_workflow_has_hardened_concurrency "$ci_text"; then
+        rp_log_fail \
+          "${slug}: ci.yml concurrency must key on head SHA (avoids zombie secret-scan checks)"
+        if [[ "$rp_suggest" -eq 1 ]]; then
+          rp_log_suggest "${slug}: sync ci.yml concurrency (scripts/github-repo-lint --apply-fix)"
+        fi
+        if [[ "$rp_apply_fix" -eq 1 ]]; then
+          rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
+            "$(rp_fix_ci_workflow_hardening "$ci_text")" \
+            'sync-ci-concurrency' \
+            'fix(ci): key CI concurrency on head SHA'
+          rp_compact_record_fix "$slug" "${slug}: candidate PR: harden ci.yml concurrency and secret-scan"
+        fi
+        fail=1
       fi
-      if [[ "$rp_apply_fix" -eq 1 ]]; then
-        rp_queue_ci_secret_scan_candidate_fixes "$slug" "$ci_text" 'add'
+
+      if rp_ci_workflow_has_secret_scan_coverage "$ci_text"; then
+        secret_scan_script=""
+        fetch_ec=0
+        secret_scan_script="$(rp_fetch_github_text_file "$slug" '.github/ci/secret-scan')" \
+          || fetch_ec=$?
+        if (( fetch_ec == 2 )); then
+          rp_log_gh_api_fail "$slug" 'could not read .github/ci/secret-scan'
+          fail=1
+        elif ! rp_ci_secret_scan_install_report_drift "$slug" "$secret_scan_script" "$ci_text"; then
+          if [[ "$rp_apply_fix" -eq 1 ]]; then
+            rp_queue_ci_secret_scan_candidate_fixes "$slug" "$ci_text" 'sync'
+          fi
+          fail=1
+        fi
+      elif [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+        if [[ "$rp_suggest" -eq 1 ]]; then
+          rp_log_warn "${slug}: ci.yml has no secret-scan job (optional for ${rp_THIS_REPO_NAME})"
+        fi
+      else
+        rp_log_fail "${slug}: ci.yml must include a secret-scan job"
+        if [[ "$rp_suggest" -eq 1 ]]; then
+          rp_log_suggest "${slug}: add .github/ci/secret-scan and a secret-scan job (see scripts/lib/ci-secret-scan)"
+        fi
+        if [[ "$rp_apply_fix" -eq 1 ]]; then
+          rp_queue_ci_secret_scan_candidate_fixes "$slug" "$ci_text" 'add'
+        fi
+        fail=1
       fi
-      fail=1
     fi
   elif [[ "$strict" == '1' ]]; then
     rp_log_fail "${slug}: missing .github/workflows/ci.yml"
     fail=1
   fi
 
-  if rp_gh_path_exists "$slug" '.github/dependabot.yml'; then
+  path_ec=0
+  rp_gh_path_check "$slug" '.github/dependabot.yml' || path_ec=$?
+  if (( path_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/dependabot.yml'
+    fail=1
+  elif (( path_ec == 0 )); then
     dependabot_workflow="$(rp_dependabot_auto_merge_workflow_path "$slug" || true)"
     if [[ -z "$dependabot_workflow" ]]; then
       if [[ "$strict" == '1' ]]; then
@@ -3440,8 +3628,13 @@ rp_validate_graphite_workflows() {
         fail=1
       fi
     else
-      dependabot_auto_text="$(rp_fetch_github_text_file "$slug" "$dependabot_workflow" || true)"
-      if [[ -z "$dependabot_auto_text" ]] || ! grep -qF 'merge-it' <<<"$dependabot_auto_text"; then
+      fetch_ec=0
+      dependabot_auto_text="$(rp_fetch_github_text_file "$slug" "$dependabot_workflow")" \
+        || fetch_ec=$?
+      if (( fetch_ec == 2 )); then
+        rp_log_gh_api_fail "$slug" "could not read ${dependabot_workflow}"
+        fail=1
+      elif [[ -z "$dependabot_auto_text" ]] || ! grep -qF 'merge-it' <<<"$dependabot_auto_text"; then
         rp_log_fail "${slug}: ${dependabot_workflow} must add merge-it label"
         if [[ "$rp_apply_fix" -eq 1 ]]; then
           rp_queue_candidate_file_fix "$slug" "$dependabot_workflow" \
@@ -3451,10 +3644,11 @@ rp_validate_graphite_workflows() {
         fi
         fail=1
       fi
-      local merge_mq_exit_code=0
+      merge_mq_exit_code=0
       rp_runner_jq_file "repo-practices merge-mq label check" "$labels_json" \
         -e 'index("merge-mq") != null' >/dev/null || merge_mq_exit_code=$?
       if (( merge_mq_exit_code == 0 )) \
+        && [[ -n "${dependabot_auto_text:-}" ]] \
         && ! grep -qF 'merge-mq' <<<"$dependabot_auto_text"; then
         rp_log_fail "${slug}: ${dependabot_workflow} must add merge-mq when merge-mq label exists"
         if [[ "$rp_apply_fix" -eq 1 ]]; then
@@ -3476,8 +3670,15 @@ rp_validate_branch_cleanup_workflows() {
   local strict="$2"
   local fail=0
   local sweep_text
+  local path_ec=0
+  local fetch_ec=0
 
-  if ! rp_gh_path_exists "$slug" '.github/workflows/cleanup-branch-on-merge.yml'; then
+  path_ec=0
+  rp_gh_path_check "$slug" '.github/workflows/cleanup-branch-on-merge.yml' || path_ec=$?
+  if (( path_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/workflows/cleanup-branch-on-merge.yml'
+    fail=1
+  elif (( path_ec == 1 )); then
     if [[ "$strict" == '1' ]]; then
       rp_log_fail "${slug}: missing .github/workflows/cleanup-branch-on-merge.yml"
       if [[ "$rp_apply_fix" -eq 1 ]]; then
@@ -3493,7 +3694,12 @@ rp_validate_branch_cleanup_workflows() {
     fi
   fi
 
-  if ! rp_gh_path_exists "$slug" '.github/workflows/cleanup-merged-branches.yml'; then
+  path_ec=0
+  rp_gh_path_check "$slug" '.github/workflows/cleanup-merged-branches.yml' || path_ec=$?
+  if (( path_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/workflows/cleanup-merged-branches.yml'
+    fail=1
+  elif (( path_ec == 1 )); then
     if [[ "$strict" == '1' ]]; then
       rp_log_fail "${slug}: missing .github/workflows/cleanup-merged-branches.yml"
       if [[ "$rp_apply_fix" -eq 1 ]]; then
@@ -3508,8 +3714,13 @@ rp_validate_branch_cleanup_workflows() {
       fail=1
     fi
   else
-    sweep_text="$(rp_fetch_github_text_file "$slug" '.github/workflows/cleanup-merged-branches.yml' || true)"
-    if [[ -z "$sweep_text" ]] || ! grep -qF 'schedule:' <<<"$sweep_text"; then
+    fetch_ec=0
+    sweep_text="$(rp_fetch_github_text_file "$slug" \
+      '.github/workflows/cleanup-merged-branches.yml')" || fetch_ec=$?
+    if (( fetch_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" 'could not read .github/workflows/cleanup-merged-branches.yml'
+      fail=1
+    elif [[ -z "$sweep_text" ]] || ! grep -qF 'schedule:' <<<"$sweep_text"; then
       rp_log_fail "${slug}: cleanup-merged-branches.yml should include a schedule trigger"
       if [[ "$rp_apply_fix" -eq 1 ]]; then
         rp_queue_candidate_file_fix "$slug" '.github/workflows/cleanup-merged-branches.yml' \
