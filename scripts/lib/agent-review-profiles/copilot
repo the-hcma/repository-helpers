@@ -55,12 +55,21 @@ agent_review_profile_login_matches() {
 
 # agent_review_profile_text_is_quota_exhausted <text>
 # True when stderr/review body indicates Copilot review quota or billing limits.
+# Long review bodies often discuss quota heuristics in code (see PR #359) — those
+# are not exhaustion. Soft patterns apply only to short notices; longer text must
+# match unmistakable billing-block phrasing.
 agent_review_profile_text_is_quota_exhausted() {
   local -r text="${1:-}"
   local lower
+  # Soft quota notices are short; substantive reviews exceed this easily.
+  local -r max_quota_notice_len=500
 
   if [[ -z "${text}" ]]; then
     return 1
+  fi
+  if (( ${#text} > max_quota_notice_len )); then
+    agent_review_profile_text_is_copilot_billing_block "${text}"
+    return $?
   fi
   lower="${text,,}"
   if [[ "${lower}" =~ quota[_\ -]?exceeded ]]; then
@@ -301,11 +310,16 @@ agent_review_profile_latest_review_body_on_head() {
 
 # agent_review_copilot_issue_comment_is_probe <body>
 # Case-insensitive probe/request detection for Copilot issue comments.
+# Agent replies often quote the probe; real probes are short.
 agent_review_copilot_issue_comment_is_probe() {
   local -r body="${1:-}"
   local lower
+  local -r max_probe_len=300
 
   [[ -n "${body}" ]] || return 0
+  if (( ${#body} > max_probe_len )); then
+    return 1
+  fi
   lower="${body,,}"
   if [[ "${lower}" == *'wait-for-agent-review:copilot:'* ]] \
     && [[ "${lower}" =~ @copilot[[:space:]]+please[[:space:]]+review ]]; then
@@ -443,6 +457,32 @@ agent_review_copilot_issue_comment_is_ack_only() {
   return 1
 }
 
+# agent_review_copilot_probe_comment_created_at_for_head <comments_json> <head_oid>
+# Timestamp of the latest short @copilot probe for this head. Ignores agent replies
+# that quote the probe marker (those are long and would otherwise become probe_at).
+agent_review_copilot_probe_comment_created_at_for_head() {
+  local -r comments_json="$1"
+  local -r head="$2"
+  local marker
+  local -r max_probe_len=300
+
+  [[ -n "${comments_json}" && -n "${head}" ]] || return 1
+  marker="$(agent_review_copilot_request_marker "${head}")"
+  if ! declare -F ar_runner_jq_file >/dev/null 2>&1; then
+    return 1
+  fi
+  # shellcheck disable=SC2016  # jq filter uses $marker / $max_len, not shell expansion
+  ar_runner_jq_file "copilot profile probe comment time" "${comments_json}" -rs \
+    --arg marker "${marker}" \
+    --argjson max_len "${max_probe_len}" \
+    '[ .[] | .[]
+      | select((.body // "") | contains($marker))
+      | select((.body // "" | length) <= $max_len)
+      | select((.body // "" | ascii_downcase)
+          | test("@copilot[[:space:]]+please[[:space:]]+review"))
+     ] | sort_by(.created_at) | last | .created_at // ""'
+}
+
 # agent_review_copilot_success_issue_comment_for_head <comments_json> <head_oid>
 # Prints a successful Copilot issue-comment reply after the wait-for-agent-review probe.
 agent_review_copilot_success_issue_comment_for_head() {
@@ -453,15 +493,7 @@ agent_review_copilot_success_issue_comment_for_head() {
   [[ -n "${comments_json}" && -n "${head}" ]] || return 1
   marker="$(agent_review_copilot_request_marker "${head}")"
   min_len=$(( ${#marker} + 40 ))
-  if declare -F ar_runner_jq_file >/dev/null 2>&1; then
-    # shellcheck disable=SC2016  # jq filter uses $marker variable, not shell expansion
-    probe_at="$(ar_runner_jq_file "copilot profile probe comment time" "${comments_json}" -rs \
-      --arg marker "${marker}" \
-      '[ .[] | .[] | select((.body // "") | contains($marker)) ]
-      | sort_by(.created_at) | last | .created_at // ""')"
-  else
-    return 1
-  fi
+  probe_at="$(agent_review_copilot_probe_comment_created_at_for_head "${comments_json}" "${head}")"
   [[ -n "${probe_at}" ]] || return 1
   while IFS=$'\t' read -r created_at login body; do
     [[ -n "${created_at}" ]] || continue
@@ -500,15 +532,7 @@ agent_review_copilot_success_issue_comment_url_for_head() {
   [[ -n "${comments_json}" && -n "${head}" ]] || return 1
   marker="$(agent_review_copilot_request_marker "${head}")"
   min_len=$(( ${#marker} + 40 ))
-  if declare -F ar_runner_jq_file >/dev/null 2>&1; then
-    # shellcheck disable=SC2016  # jq filter uses $marker variable, not shell expansion
-    probe_at="$(ar_runner_jq_file "copilot profile probe comment time" "${comments_json}" -rs \
-      --arg marker "${marker}" \
-      '[ .[] | .[] | select((.body // "") | contains($marker)) ]
-      | sort_by(.created_at) | last | .created_at // ""')"
-  else
-    return 1
-  fi
+  probe_at="$(agent_review_copilot_probe_comment_created_at_for_head "${comments_json}" "${head}")"
   [[ -n "${probe_at}" ]] || return 1
   while IFS=$'\t' read -r created_at login body comment_url; do
     [[ -n "${created_at}" ]] || continue
