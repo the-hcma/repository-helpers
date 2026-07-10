@@ -324,8 +324,9 @@ cmd_request() {
   if agent_review_agent_quota_skip_request; then
     return 7
   fi
-  if [[ "${agent_review_profile_auto_review:-false}" == 'true' ]]; then
-    printf 'wait-for-agent-review: %s reviews run automatically — skipping manual request on PR #%s\n' \
+  if [[ "${agent_review_profile_trigger:-nudge}" == 'on_push' \
+    || "${agent_review_profile_auto_review:-false}" == 'true' ]]; then
+    printf 'wait-for-agent-review: %s is on_push — skipping nudge request on PR #%s\n' \
       "${AGENT_REVIEW_AGENT:-copilot}" "${pr}" >&2
     return 0
   fi
@@ -1252,7 +1253,8 @@ cmd_loop_nothing_outstanding() {
   return 0
 }
 
-# Sleep until CodeRabbit retry_after (if any), then post @coderabbitai review once.
+# Sleep until CodeRabbit retry_after (if any), then wait for automatic on-push review.
+# CodeRabbit is an on-push agent — never post an explicit @coderabbitai nudge (issue #347).
 # Returns 0 when this iteration should continue (rate-limit handling consumed the turn).
 cmd_loop_handle_coderabbit_rate_limit() {
   local -r repo="$1"
@@ -1278,6 +1280,14 @@ cmd_loop_handle_coderabbit_rate_limit() {
     if [[ -z "${remaining}" ]]; then
       remaining="${agent_review_default_poll_interval_s}"
     fi
+    # shellcheck disable=SC2154  # agent_review_default_coderabbit_rate_limit_wait_max_s from lib
+    if (( remaining > agent_review_default_coderabbit_rate_limit_wait_max_s )); then
+      printf 'wait-for-agent-review: CodeRabbit rate-limited until %s (%ss remaining) exceeds wait max %ss — not sleeping on PR #%s\n' \
+        "${retry_after}" "${remaining}" \
+        "${agent_review_default_coderabbit_rate_limit_wait_max_s}" "${pr}" >&2
+      agent_review_use_agent "${saved_agent}"
+      return 1
+    fi
     if (( remaining > 0 )); then
       sleep_s=$((remaining + 5))
     else
@@ -1290,23 +1300,27 @@ cmd_loop_handle_coderabbit_rate_limit() {
     sleep "${sleep_s}"
     return 0
   fi
+  # Cooldown elapsed: clear exhaustion and expect automatic CodeRabbit on-push review.
+  # Do not post @coderabbitai — on-push agents only run after pushes / their own schedule.
+  # Return 1 (do not consume the loop turn): returning 0 caused an infinite continue
+  # spin because observe rewrites the same past retry_after from today's billing comment
+  # on every iteration, re-entering this branch without ever reaching cmd_check / sleep.
   agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
-  if declare -F agent_review_profile_post_rate_limit_retry >/dev/null 2>&1; then
-    agent_review_profile_post_rate_limit_retry "${repo}" "${pr}" "${head}"
-  fi
   agent_review_loop_wait_add 'coderabbit' "${head}"
-  printf 'wait-for-agent-review: CodeRabbit rate-limit window elapsed — retry posted on PR #%s\n' \
+  printf 'wait-for-agent-review: CodeRabbit rate-limit window elapsed — waiting for automatic on-push review on PR #%s (no @coderabbitai nudge)\n' \
     "${pr}" >&2
   agent_review_use_agent "${saved_agent}"
-  return 0
+  return 1
 }
 
-# Request one probe agent on a new head (coderabbit → copilot → bugbot). Manual agents
-# get a review request unless today's quota is already cached exhausted; auto-review
-# agents rely on the PR update. Escalates to the next agent when a request is blocked.
+# Request one probe agent on a new head (coderabbit → copilot → bugbot).
+# Two trigger kinds (issue #347):
+#   on_push — wait for automatic review after push (CodeRabbit); never post a nudge.
+#   nudge   — post an explicit PR comment / request (Copilot, Bugbot).
+# Escalates to the next agent when a request is blocked or quota is exhausted.
 cmd_loop_maybe_request_agents_on_head() {
   local repo pr head last_head agent profiles_dir profile_path request_exit saved_agent
-  local current_agent
+  local current_agent owner name snapshot
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
@@ -1321,6 +1335,8 @@ cmd_loop_maybe_request_agents_on_head() {
   profiles_dir="$(cd "${script_dir}/lib/agent-review-profiles" && pwd)"
   saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
   current_agent=''
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}" 2>/dev/null || true)"
   while true; do
     if ! agent="$(agent_review_quota_probe_agent_for_today 2>/dev/null)"; then
       printf 'wait-for-agent-review: all agent quotas exhausted for today — no review requests on PR #%s\n' \
@@ -1339,11 +1355,20 @@ cmd_loop_maybe_request_agents_on_head() {
     # shellcheck disable=SC1091
     source "${profile_path}"
     agent_review_use_agent "${agent}"
-    if [[ "${agent_review_profile_auto_review:-false}" == 'true' ]]; then
-      printf 'wait-for-agent-review: %s reviews run automatically — skipping manual request; will establish quota on PR #%s\n' \
+    if [[ "${agent_review_profile_trigger:-nudge}" == 'on_push' \
+      || "${agent_review_profile_auto_review:-false}" == 'true' ]]; then
+      printf 'wait-for-agent-review: %s is on_push — skipping nudge; waiting for automatic review on PR #%s\n' \
         "${agent}" "${pr}" >&2
-      # Expect an auto-review on this head; clear once fresh/check-complete/exhausted.
+      # Expect an on-push review on this head; clear once fresh/check-complete/exhausted.
       agent_review_loop_wait_add "${agent}" "${head}"
+      break
+    fi
+    # Skip re-request when this head already has a fresh agent response (issue #347).
+    if [[ -n "${snapshot}" ]] \
+      && cmd_loop_agent_response_seen "${repo}" "${pr}" "${head}" "${agent}" "${snapshot}"; then
+      printf 'wait-for-agent-review: skip_request_reason=already_reviewed_on_head agent=%s head=%s PR #%s\n' \
+        "${agent}" "${head:0:7}" "${pr}" >&2
+      agent_review_loop_wait_remove "${agent}"
       break
     fi
     request_exit=0
@@ -1374,7 +1399,7 @@ cmd_loop_give_up_non_convergence() {
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
   pr_cap="${3:-0}"
   status="$(cmd_status "${repo}" "${pr}" 2>/dev/null || true)"
-  quota_summary="$(agent_review_quota_summary_for_email)"
+  quota_summary="$(agent_review_quota_summary_for_email "${repo}" "${pr}")"
   pending="$(wait_ar_jq_status "$status" '.pending_threads // 0' 2>/dev/null || echo 0)"
   head_sha="$(wait_ar_jq_status "$status" '.head_sha // ""' 2>/dev/null || true)"
   reason="Overall PR review exceeded AGENT_REVIEW_PR_TIMEOUT (${pr_cap}s) without reaching idle-success.
@@ -1392,7 +1417,7 @@ The PR kept receiving reviews or still has unaddressed feedback. Triage open thr
 
 cmd_complete_idle() {
   local repo pr idle_s cycle_cap status complete_ready owner name snapshot head
-  local mode approve_body
+  local mode approve_body pending_count work_checklist
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
@@ -1418,6 +1443,14 @@ cmd_complete_idle() {
       "${pr}" >&2
     return 2
   fi
+  # Re-check pending feedback immediately before approve/email (issue #347 / #352):
+  # Bugbot quota comments can land between the loop gate and this path.
+  pending_count="$(agent_review_pending_thread_count_from_snapshot "${repo}" "${pr}" "${snapshot}")"
+  if (( pending_count > 0 )); then
+    printf 'wait-for-agent-review: refusing idle complete — %s feedback item(s) still pending on PR #%s\n' \
+      "${pending_count}" "${pr}" >&2
+    return 3
+  fi
   complete_ready="$(wait_ar_jq_status "$status" '.complete_ready')"
   if [[ "${complete_ready}" == 'true' ]]; then
     cmd_complete "${repo}" "${pr}"
@@ -1427,6 +1460,15 @@ cmd_complete_idle() {
     approve_body='Agent review cycle: nothing outstanding (no pending feedback; not waiting on agents; CodeRabbit idle).'
   else
     approve_body="Agent review cycle: all feedback addressed; no new activity for ${cycle_cap}s."
+  fi
+  # Final checklist must agree with the gate (single source of truth for operator email).
+  work_checklist="$(agent_review_email_work_complete_checklist "${repo}" "${pr}")"
+  if grep -qE 'Pending feedback \(threads \+ PR comments\): [1-9]' <<<"${work_checklist}" \
+    || grep -qF 'review requested (visible on PR)' <<<"${work_checklist}" \
+    || grep -qF 'awaiting review completion' <<<"${work_checklist}"; then
+    printf 'wait-for-agent-review: refusing idle complete — work checklist still shows outstanding work on PR #%s\n' \
+      "${pr}" >&2
+    return 2
   fi
   runner_exec "wait-for-agent-review pr approve idle" -- gh pr review "${pr}" --repo "${repo}" --approve \
     --body "${approve_body}"

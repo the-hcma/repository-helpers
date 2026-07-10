@@ -10,6 +10,8 @@ agent_review_default_pr_timeout_s=43200
 agent_review_default_idle_break_s=900
 agent_review_default_transient_retries=5
 agent_review_default_transient_retry_sleep_s=30
+# Max CodeRabbit rate-limit sleep before giving up and treating as exhausted (issue #347).
+agent_review_default_coderabbit_rate_limit_wait_max_s=900
 
 _ar_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly _ar_lib_dir
@@ -278,6 +280,13 @@ agent_review_load_env() {
     fi
     agent_review_default_transient_retries="${AGENT_REVIEW_TRANSIENT_RETRIES}"
   fi
+  if [[ -n "${AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX:-}" ]]; then
+    local parsed_cr_wait
+    if ! parsed_cr_wait="$(agent_review_parse_duration_seconds "${AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX}")"; then
+      agent_review_die "invalid AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX: ${AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX@Q}"
+    fi
+    agent_review_default_coderabbit_rate_limit_wait_max_s="${parsed_cr_wait}"
+  fi
   if [[ -n "${AGENT_REVIEW_TRANSIENT_RETRY_SLEEP:-}" ]]; then
     local parsed_retry_sleep
     if ! parsed_retry_sleep="$(agent_review_parse_duration_seconds "${AGENT_REVIEW_TRANSIENT_RETRY_SLEEP}")"; then
@@ -318,16 +327,18 @@ agent_review_use_agent() {
   agent_review_load_agent_profile
 }
 
-# True when the agent profile is auto-review only (no manual request).
+# True when the agent is on_push (reviews automatically after pushes; never nudge).
+# Prefer agent_review_profile_trigger; agent_review_profile_auto_review is legacy alias.
 agent_review_agent_is_auto_review() {
   local -r agent_id="$1"
-  local saved_agent auto_review
+  local saved_agent trigger auto_review
 
   saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
   agent_review_use_agent "${agent_id}"
+  trigger="${agent_review_profile_trigger:-nudge}"
   auto_review="${agent_review_profile_auto_review:-false}"
   agent_review_use_agent "${saved_agent}"
-  [[ "${auto_review}" == 'true' ]]
+  [[ "${trigger}" == 'on_push' || "${auto_review}" == 'true' ]]
 }
 
 # Epoch seconds of the last successful agent_review_profile_request in this process.
@@ -416,7 +427,6 @@ agent_review_load_agent_profile() {
     agent_review_profile_latest_review_body_on_head \
     agent_review_profile_issue_comment_is_quota_exhausted \
     agent_review_profile_head_feedback_needs_operator_triage \
-    agent_review_profile_post_rate_limit_retry \
     agent_review_profile_text_quota_retry_after_iso \
     agent_review_profile_request_already_sent \
     agent_review_profile_review_has_actionable_feedback \
@@ -444,6 +454,8 @@ agent_review_load_agent_profile() {
   agent_review_profile_uses_head_check=false
   agent_review_profile_check_name_regex=''
   agent_review_profile_auto_review=false
+  # on_push | nudge — on_push never posts a request comment; nudge needs an explicit ask.
+  agent_review_profile_trigger='nudge'
   agent_review_profile_request_visible='true'
 
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
@@ -1994,8 +2006,17 @@ agent_review_agents_with_quota_json() {
 }
 
 # Human-readable quota summary for operator emails (copilot/bugbot/coderabbit).
+# Optional args: <repo> <pr> — when set, cross-PR evidence URLs are labeled clearly.
 agent_review_quota_summary_for_email() {
+  local repo="${1:-}"
+  local pr="${2:-}"
   local agent status reason evidence_url retry_after parts=()
+  local evidence_label current_slug
+
+  current_slug=''
+  if [[ -n "${repo}" && -n "${pr}" ]]; then
+    current_slug="${repo}#${pr}"
+  fi
 
   while IFS= read -r agent || [[ -n "${agent}" ]]; do
     [[ -z "${agent}" ]] && continue
@@ -2026,10 +2047,16 @@ agent_review_quota_summary_for_email() {
       parts+=("${agent}: ${status}")
     fi
     if [[ -n "${evidence_url}" ]]; then
+      evidence_label='source'
       if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
-        parts+=("  evidence: ${evidence_url}")
-      elif agent_review_agent_quota_confirmed_for_agent "${agent}"; then
-        parts+=("  source: ${evidence_url}")
+        evidence_label='evidence'
+      fi
+      if [[ -n "${current_slug}" ]] \
+        && [[ "${evidence_url}" != *"/pull/${pr}"* ]] \
+        && [[ "${evidence_url}" != *"/pulls/${pr}"* ]]; then
+        parts+=("  ${evidence_label} (confirmed via probe on other PR): ${evidence_url}")
+      else
+        parts+=("  ${evidence_label}: ${evidence_url}")
       fi
     fi
   done < <(agent_review_cycle_quota_agent_ids)
