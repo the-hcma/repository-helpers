@@ -174,11 +174,12 @@ fi
 
 if grep -qF 'cmd_handle_quota_exhaustion' "$wait_script" \
   && awk '/case "\$\{check_exit\}" in/,/esac/' "$wait_script" | grep -qF '5)' \
-  && awk '/case "\$\{check_exit\}" in/,/esac/' "$wait_script" | grep -qF '7)'; then
-  printf '[PASS] loop: check exit 5 polls; quota via handle_quota_exhaustion\n'
+  && awk '/case "\$\{check_exit\}" in/,/esac/' "$wait_script" | grep -qF '7)' \
+  && ! awk '/case "\$\{check_exit\}" in/,/esac/' "$wait_script" | awk '/5)/,/;;/' | grep -qF 'continue'; then
+  printf '[PASS] loop: check exit 5 falls through to early-complete; quota via handle_quota_exhaustion\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] loop: check exit 5/7 handling missing\n'
+  printf '[FAIL] loop: check exit 5/7 handling missing or exit 5 still continues past early-complete\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -1307,6 +1308,7 @@ if grep -qF 'agent_review_email_reviewers_list' "$early_email_lib" \
   && grep -qF 'Reviewers: ${reviewers}' "$early_email_lib" \
   && grep -qF 'Open feedback: none' "$early_email_lib" \
   && grep -qF 'Merge: mergeStateStatus=${merge_state}' "$early_email_lib" \
+  && ! grep -qF 'Do not add merge-it unless you intend to merge' "$early_email_lib" \
   && ! grep -qF 'CLEAN or BLOCKED' "$early_email_lib" \
   && ! grep -qF 'verify with gh pr checks' "$early_email_lib"; then
   printf '[PASS] email: complete/idle bodies list reviewers and actual mergeStateStatus\n'
@@ -1627,6 +1629,15 @@ if grep -qF 'agent_review_copilot_issue_comment_is_ack_only' "${copilot_profile}
   && ! bash -c "
   source '${copilot_profile}'
   agent_review_copilot_issue_comment_is_ack_only 'Reviewed the PR. Generated no new comments.'
+" \
+  && ! bash -c "
+  source '${copilot_profile}'
+  long_ack=\"I'll take a look at this PR. \"
+  # Pad past max_ack_len (200) so an ack opener with real review text is rejected.
+  while (( \${#long_ack} <= 200 )); do
+    long_ack+=\"This is substantive review commentary that should not count as ack-only. \"
+  done
+  agent_review_copilot_issue_comment_is_ack_only \"\${long_ack}\"
 "; then
   printf '[PASS] copilot profile: ack-only comments are not treated as review complete\n'
   pass=$(( pass + 1 ))
@@ -1636,10 +1647,14 @@ else
 fi
 
 tmp_cross_pr_quota="$(mktemp)"
+tmp_cross_pr_quota_copilot="$(mktemp)"
+tmp_cross_pr_quota_cr="$(mktemp)"
 if summary="$(bash -c "
   source '${lib}'
   source '${quota_lib}'
   AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${tmp_cross_pr_quota}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_cross_pr_quota_copilot}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_cross_pr_quota_cr}'
   agent_review_bugbot_quota_write_cache 0 observed \
     'bugbot review on mock-repo' '' '' \
     'https://github.com/the-hcma/mock-repo/pull/1#issuecomment-1'
@@ -1657,16 +1672,137 @@ else
   printf '[FAIL] quota email summary: cross-PR evidence not labeled\n%s\n' "${summary:-empty}"
   fail=$(( fail + 1 ))
 fi
-rm -f "${tmp_cross_pr_quota}"
+rm -f "${tmp_cross_pr_quota}" "${tmp_cross_pr_quota_copilot}" "${tmp_cross_pr_quota_cr}"
+
+# Same PR number on a different repo must still be labeled cross-PR (CodeRabbit on #357).
+tmp_cross_pr_same_num="$(mktemp)"
+tmp_cross_pr_same_num_copilot="$(mktemp)"
+tmp_cross_pr_same_num_cr="$(mktemp)"
+if summary="$(bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${tmp_cross_pr_same_num}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_cross_pr_same_num_copilot}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_cross_pr_same_num_cr}'
+  agent_review_bugbot_quota_write_cache 0 confirmed \
+    'bugbot review on other-repo' '' '' \
+    'https://github.com/the-hcma/other-repo/pull/352#issuecomment-99'
+  agent_review_quota_summary_for_email 'the-hcma/repository-helpers' '352'
+")" \
+  && grep -qF 'confirmed via probe on other PR' <<<"${summary}" \
+  && grep -qF 'other-repo/pull/352' <<<"${summary}"; then
+  printf '[PASS] quota email summary: same PR number different repo is cross-PR\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota email summary: same PR number different repo not labeled cross-PR\n%s\n' \
+    "${summary:-empty}"
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_cross_pr_same_num}" "${tmp_cross_pr_same_num_copilot}" "${tmp_cross_pr_same_num_cr}"
+
+# Same repo+PR evidence must not get the cross-PR label.
+tmp_same_pr_quota="$(mktemp)"
+tmp_same_pr_quota_copilot="$(mktemp)"
+tmp_same_pr_quota_cr="$(mktemp)"
+if summary="$(bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${tmp_same_pr_quota}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_same_pr_quota_copilot}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_same_pr_quota_cr}'
+  agent_review_bugbot_quota_write_cache 0 confirmed \
+    'bugbot review on current PR' '' '' \
+    'https://github.com/the-hcma/repository-helpers/pull/352#issuecomment-42'
+  agent_review_quota_summary_for_email 'the-hcma/repository-helpers' '352'
+")" \
+  && grep -qF 'repository-helpers/pull/352' <<<"${summary}" \
+  && ! grep -qF 'confirmed via probe on other PR' <<<"${summary}"; then
+  printf '[PASS] quota email summary: same repo+PR evidence is not cross-PR\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota email summary: same repo+PR incorrectly labeled cross-PR\n%s\n' \
+    "${summary:-empty}"
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_same_pr_quota}" "${tmp_same_pr_quota_copilot}" "${tmp_same_pr_quota_cr}"
 
 if ! bash -c "
   source '${copilot_profile}'
   agent_review_profile_text_is_quota_exhausted 'Using a premium request for this review.'
+" \
+  && ! bash -c "
+  source '${copilot_profile}'
+  agent_review_profile_text_is_quota_exhausted 'Out of requests for today.'
+" \
+  && bash -c "
+  source '${copilot_profile}'
+  agent_review_profile_text_is_quota_exhausted 'Out of premium requests for today.'
 "; then
-  printf '[PASS] copilot profile: bare premium-request mention is not quota exhaustion\n'
+  printf '[PASS] copilot profile: premium-request quota requires premium wording\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] copilot profile: bare premium-request still treated as exhausted\n'
+  printf '[FAIL] copilot profile: premium-request quota heuristic incorrect\n'
+  fail=$(( fail + 1 ))
+fi
+
+# Long review bodies that discuss quota heuristics must not count as exhaustion (#359).
+if bash -c "
+  source '${copilot_profile}'
+  long_review='Reviewed the PR. All tests pass. Here are my findings:\n\n'
+  long_review+=\"**Quota heuristic tightening** — The existing \\\"reached quota\\\", \"
+  long_review+='\"quota exceeded\", etc. patterns still cover the non-premium variants. '
+  while (( \${#long_review} <= 500 )); do
+    long_review+='Additional substantive review commentary about the change. '
+  done
+  long_review+='Nothing blocking — the changes are correct.'
+  ! agent_review_profile_text_is_quota_exhausted \"\${long_review}\"
+"; then
+  printf '[PASS] copilot profile: rejects quota discussion in long review text\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot profile: treated quota code discussion as billing exhaustion\n'
+  fail=$(( fail + 1 ))
+fi
+
+# Success detector must accept Copilot replies that quote the probe and mention quota (#359).
+if bash -c "
+  source '${lib}'
+  agent_review_use_agent copilot
+  head='91f486087a758ab846299e13f8df1da7034d06b4'
+  marker=\"\$(agent_review_copilot_request_marker \"\${head}\")\"
+  probe_body=\"\$(agent_review_copilot_request_comment_body \"\${head}\")\"
+  reply_body=\$'\\\\n> @copilot please review this pull request.\\\\n> \\\\n> <!-- '\${marker}' -->\\\\n\\\\n'
+  reply_body+=\"Reviewed the PR. The existing \\\"reached quota\\\", \\\"quota exceeded\\\" patterns \"
+  reply_body+='are discussed in this change. '
+  while (( \${#reply_body} <= 500 )); do
+    reply_body+='More review findings about cross-PR evidence and ack-only length. '
+  done
+  reply_body+='Nothing blocking.'
+  # Flat comment array: gh --paginate + jq -s yields .[]|.[] over comments.
+  comments_json=\$(jq -nc \\
+    --arg probe \"\${probe_body}\" \\
+    --arg reply \"\${reply_body}\" \\
+    '[
+      {
+        \"user\": {\"login\": \"operator\"},
+        \"created_at\": \"2026-07-10T18:58:55Z\",
+        \"body\": \$probe,
+        \"html_url\": \"https://example.test/probe\"
+      },
+      {
+        \"user\": {\"login\": \"Copilot\"},
+        \"created_at\": \"2026-07-10T19:02:20Z\",
+        \"body\": \$reply,
+        \"html_url\": \"https://example.test/reply\"
+      }
+    ]')
+  body=\"\$(agent_review_copilot_success_issue_comment_for_head \"\${comments_json}\" \"\${head}\")\"
+  [[ -n \"\${body}\" ]] && [[ \"\${body}\" == *'Nothing blocking'* ]]
+"; then
+  printf '[PASS] copilot profile: success comment after probe despite quoted marker + quota words\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot profile: missed success issue comment that quotes probe and discusses quota\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -1733,6 +1869,23 @@ if bash -c "source '${script_dir}/../scripts/lib/agent-review-profiles/coderabbi
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] coderabbit profile: treated quota code discussion as billing exhaustion\n'
+  fail=$(( fail + 1 ))
+fi
+
+# Copilot issue comments that discuss quota heuristics must not mark CodeRabbit exhausted (#359).
+if bash -c "
+  source '${script_dir}/../scripts/lib/agent-review-profiles/coderabbit'
+  long_body='Reviewed the PR. The existing \"reached quota\", \"quota exceeded\" patterns '
+  while (( \${#long_body} <= 500 )); do
+    long_body+='Additional Copilot review commentary. '
+  done
+  long_body+='Nothing blocking.'
+  ! agent_review_profile_issue_comment_is_quota_exhausted 'Copilot' \"\${long_body}\"
+"; then
+  printf '[PASS] coderabbit profile: ignores Copilot review that discusses quota wording\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: treated Copilot quota discussion as CodeRabbit exhaustion\n'
   fail=$(( fail + 1 ))
 fi
 
