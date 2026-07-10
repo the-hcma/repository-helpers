@@ -61,11 +61,25 @@ if grep -qF 'rp_log_manual_step' "$lib" \
   && grep -qF 'rp_repo_requires_protect_main_ruleset' "$lib" \
   && grep -qF 'rp_protect_main_create_payload' "$lib" \
   && grep -qF 'cleanup-merged-branches.yml' "$lib" \
-  && grep -qF 'rp_cleanup_merged_branches_workflow_is_canonical' "$lib"; then
+  && grep -qF 'rp_cleanup_merged_branches_workflow_is_canonical' "$lib" \
+  && grep -qF 'rp_gh_path_check' "$lib" \
+  && grep -qF 'rp_gh_api_detail_is_not_found' "$lib" \
+  && grep -qF 'rp_gh_api_detail_is_transient' "$lib"; then
   printf '[PASS] library defines branch cleanup, metadata, CODEOWNERS, and checklist helpers\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] expected branch cleanup and new-repo helpers in lib/repo-practices\n'
+  fail=$(( fail + 1 ))
+fi
+
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'rp_log_manual_step' "$lib" \
+  && grep -A20 '^rp_log_manual_step()' "$lib" | grep -qF 'rp_compact' \
+  && ! grep -A20 '^rp_log_manual_step()' "$lib" | grep -qF 'rp_compact_record_fix'; then
+  printf '[PASS] compact mode omits unverifiable manual steps from Fix lines\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rp_log_manual_step should not record compact Fix lines\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -159,14 +173,25 @@ norm_installed=""
 norm_canonical=""
 installed_scan="$(<"${rh_root}/.github/ci/secret-scan")"
 canonical_scan="$(<"${rh_root}/scripts/lib/ci-secret-scan")"
-norm_installed="$(printf '%s' "$installed_scan" | tr -d '\r' | sed 's/ && / /g; s/\\n/ /g; s/[[:space:]]\+/ /g; s/^ //; s/ $//')"
-norm_canonical="$(printf '%s' "$canonical_scan" | tr -d '\r' | sed 's/ && / /g; s/\\n/ /g; s/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+# Mirror rp_ci_secret_scan_normalize_for_compare (portable; avoid sourcing lib here).
+norm_installed="$(printf '%s' "$installed_scan" | tr -d '\r')"
+norm_installed="${norm_installed// && / }"
+norm_installed="${norm_installed//\\n/ }"
+norm_installed="$(printf '%s' "$norm_installed" | tr -s '[:space:]' ' ')"
+norm_installed="${norm_installed# }"
+norm_installed="${norm_installed% }"
+norm_canonical="$(printf '%s' "$canonical_scan" | tr -d '\r')"
+norm_canonical="${norm_canonical// && / }"
+norm_canonical="${norm_canonical//\\n/ }"
+norm_canonical="$(printf '%s' "$norm_canonical" | tr -s '[:space:]' ' ')"
+norm_canonical="${norm_canonical# }"
+norm_canonical="${norm_canonical% }"
 if [[ "$installed_scan" == "$canonical_scan" || "$norm_installed" == "$norm_canonical" ]]; then
   printf '[PASS] secret-scan: .github/ci/secret-scan is canonical (formatting drift tolerated)\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] secret-scan: .github/ci/secret-scan drift from scripts/lib/ci-secret-scan\n'
-  fail=$(( pass + 1 ))
+  fail=$(( fail + 1 ))
 fi
 
 printf '\n=== static: secret-scan drift actionable diff ===\n'
@@ -2357,6 +2382,152 @@ if [[ "$exit_code" -ne 0 ]] \
 else
   printf '[FAIL] pr-ship-rule: expected missing-breadcrumb failure (exit=%s)\n%s\n' \
     "$exit_code" "$output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
+printf '\n=== functional: HTTP 502 is API error, not missing workflow ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+mkdir -p "$mock_bin"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'auth status'* ]]; then
+  exit 0
+fi
+if [[ "$args" == *'labels'* ]]; then
+  printf '%s\n' '["merge-it"]'
+  exit 0
+fi
+if [[ "$args" == *'rulesets'* ]]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+if [[ "$args" == *'branches/main/protection'* ]]; then
+  exit 1
+fi
+if [[ "$args" == *'cleanup-merged-branches.yml'* ]]; then
+  echo 'gh: HTTP 502' >&2
+  exit 1
+fi
+if [[ "$args" == *'/contents/'* ]]; then
+  echo 'gh: Not Found (HTTP 404)' >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+set +e
+output="$(
+  RP_GH_API_MAX_ATTEMPTS=1 RP_GH_API_RETRY_SLEEP_SECS=0 \
+    PATH="${mock_bin}:${PATH}" bash "$checker" \
+    --repo the-hcma/example-repo --strict-onboarding --suggest 2>&1
+)"
+exit_code=$?
+set -e
+
+if [[ "$exit_code" -ne 0 ]] \
+  && grep -qF 'could not read .github/workflows/cleanup-merged-branches.yml (GitHub API: HTTP 502)' \
+    <<<"$output" \
+  && ! grep -qF 'missing .github/workflows/cleanup-merged-branches.yml' <<<"$output" \
+  && ! grep -qF 'should include a schedule trigger' <<<"$output"; then
+  printf '[PASS] HTTP 502 on workflow path is reported as GitHub API error\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected API error for HTTP 502, not missing/schedule (exit=%s)\n%s\n' \
+    "$exit_code" "$output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
+printf '\n=== functional: path check retries transient 502 then succeeds ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+mkdir -p "$mock_bin"
+state_file="${mock_dir}/cleanup-attempts"
+printf '0\n' >"$state_file"
+
+# shellcheck disable=SC2016  # mock embeds state file path
+cat >"${mock_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+if [[ "\$args" == *'auth status'* ]]; then
+  exit 0
+fi
+if [[ "\$args" == *'labels'* ]]; then
+  printf '%s\\n' '["merge-it"]'
+  exit 0
+fi
+if [[ "\$args" == *'rulesets'* ]]; then
+  printf '%s\\n' '[]'
+  exit 0
+fi
+if [[ "\$args" == *'branches/main/protection'* ]]; then
+  exit 1
+fi
+if [[ "\$args" == *'cleanup-merged-branches.yml'* ]]; then
+  n="\$(cat '${state_file}')"
+  n=\$(( n + 1 ))
+  printf '%s\\n' "\$n" >'${state_file}'
+  if [[ "\$n" -eq 1 ]]; then
+    echo 'gh: HTTP 502' >&2
+    exit 1
+  fi
+  # Second attempt: return a minimal workflow with schedule
+  content="\$(printf '%s' "on:\\n  schedule:\\n    - cron: '0 6 * * *'\\n" | base64)"
+  printf '{"content":"%s"}\\n' "\$content"
+  exit 0
+fi
+if [[ "\$args" == *'cleanup-branch-on-merge.yml'* ]]; then
+  echo 'gh: Not Found (HTTP 404)' >&2
+  exit 1
+fi
+if [[ "\$args" == *'/contents/'* ]]; then
+  echo 'gh: Not Found (HTTP 404)' >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+set +e
+output="$(
+  RP_GH_API_MAX_ATTEMPTS=3 RP_GH_API_RETRY_SLEEP_SECS=0 \
+    PATH="${mock_bin}:${PATH}" bash "$checker" \
+    --repo the-hcma/example-repo --strict-onboarding --suggest 2>&1
+)"
+exit_code=$?
+set -e
+attempts="$(cat "$state_file")"
+
+if [[ "$attempts" -ge 2 ]] \
+  && ! grep -qF 'could not read .github/workflows/cleanup-merged-branches.yml (GitHub API: HTTP 502)' \
+    <<<"$output" \
+  && ! grep -qF 'should include a schedule trigger' <<<"$output"; then
+  printf '[PASS] transient HTTP 502 is retried and does not false-fail schedule check\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected retry past HTTP 502 (attempts=%s exit=%s)\n%s\n' \
+    "$attempts" "$exit_code" "$output"
   fail=$(( fail + 1 ))
 fi
 rm -rf "$mock_dir"
