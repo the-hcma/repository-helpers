@@ -185,7 +185,8 @@ under `.worktrees/repo-practices-candidate-fixes-wt`.
 Repos identified as uv Python projects (presence of `uv.lock` + `pyproject.toml` at the repo root) must include
 `.github/workflows/cve-check.yml`, a scheduled daily `pip-audit` run that classifies JSON output (CVE vs transient
 failure), retries only transient tool errors, and opens or updates a `security/cve` issue when vulnerabilities are
-found (workflow job succeeds so `main` stays green for known advisories).
+found. The job succeeds when CVEs are found **and** issue notification succeeds; it fails if pip-audit reports CVEs but
+`gh issue` create/comment fails (so silent notification loss does not occur).
 
 ### Merge settings and Graphite merge queue
 
