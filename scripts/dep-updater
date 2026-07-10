@@ -5466,10 +5466,15 @@ _gha_pick_eligible_new_ref() {
 #   Commit SHA  (@abc123...)  — skipped (not managed here)
 #
 # Optional $1: repository root containing .github/workflows (defaults to $dir).
+#
+# When the same action is pinned at multiple versions (e.g. checkout@v7 and
+# checkout@v6.0.3), use the oldest pin for eligibility — not the first grep hit.
+# Otherwise a newer pin listed first hides stale pins (see #360).
 gha_outdated() {
   local -r scan_root="${1:-$dir}"
-  local -a seen_actions=()
-  local line action ref new_ref
+  local -a action_order=()
+  local -A oldest_ref_by_action=()
+  local line action ref new_ref oldest_ref sortable_ref sortable_oldest
 
   while IFS= read -r line; do
     # Extract the value after `uses:`, strip surrounding quotes/whitespace.
@@ -5486,28 +5491,35 @@ gha_outdated() {
     if [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
       continue
     fi
-    # Deduplicate: process each unique action only once.
-    local already_seen=0
-    local seen_entry
-    for seen_entry in "${seen_actions[@]}"; do
-      if [[ "$seen_entry" == "$action" ]]; then
-        already_seen=1
-        break
-      fi
-    done
-    [[ "$already_seen" == '1' ]] && continue
-    seen_actions+=("$action")
 
-    new_ref="$(_gha_pick_eligible_new_ref "$action" "$ref" 2>/dev/null || true)"
+    if [[ -z "${oldest_ref_by_action[$action]+x}" ]]; then
+      action_order+=("$action")
+      oldest_ref_by_action[$action]="$ref"
+      continue
+    fi
+
+    oldest_ref="${oldest_ref_by_action[$action]}"
+    sortable_ref="$(_gha_ref_sortable_version "$ref")"
+    sortable_oldest="$(_gha_ref_sortable_version "$oldest_ref")"
+    if [[ "$sortable_ref" != "$sortable_oldest" \
+      && "$(printf '%s\n%s\n' "$sortable_ref" "$sortable_oldest" | sort -V | head -1)" \
+        == "$sortable_ref" ]]; then
+      oldest_ref_by_action[$action]="$ref"
+    fi
+  done < <(grep -rh --include='*.yml' --include='*.yaml' \
+    'uses:' "${scan_root}/.github/workflows/" 2>/dev/null)
+
+  for action in "${action_order[@]}"; do
+    oldest_ref="${oldest_ref_by_action[$action]}"
+    new_ref="$(_gha_pick_eligible_new_ref "$action" "$oldest_ref" 2>/dev/null || true)"
     if [[ -z "$new_ref" ]]; then
       if [[ -z "$(_gha_semver_release_tags_desc "$action" | head -1 || true)" ]]; then
         log "[github-actions] No release or semver tag found for ${action} — skipping."
       fi
       continue
     fi
-    printf '%s %s %s\n' "$action" "$ref" "$new_ref"
-  done < <(grep -rh --include='*.yml' --include='*.yaml' \
-    'uses:' "${scan_root}/.github/workflows/" 2>/dev/null)
+    printf '%s %s %s\n' "$action" "$oldest_ref" "$new_ref"
+  done
 }
 
 # Update a single GitHub Actions action across all workflow files in the
