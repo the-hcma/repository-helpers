@@ -308,6 +308,7 @@ if grep -qF 'persist-credentials: false' "$cve_template" \
   && grep -qF 'security/cve' "$cve_template" \
   && grep -qF 'gh issue' "$cve_template" \
   && grep -qF 'ERROR: pip-audit found CVEs but failed to create security/cve issue' "$cve_template" \
+  && grep -qF 'ERROR: pip-audit found CVEs but failed to comment on security/cve issue' "$cve_template" \
   && ! grep -qF 'WARN: failed to create security/cve issue' "$cve_template" \
   && ! grep -qF 'WARN: failed to comment on security/cve issue' "$cve_template" \
   && ! grep -qF 'uses: nick-fields/retry@v4' "$cve_template"; then
@@ -385,6 +386,77 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$cve_fail_tmp"
+
+printf '\n=== functional: cve-check template fails when gh issue comment fails ===\n'
+cve_comment_tmp="$(mktemp -d)"
+cve_comment_funcs="${cve_comment_tmp}/cve-funcs.bash"
+awk '
+  /^[[:space:]]*run: \|[[:space:]]*$/ {
+    in_run = 1
+    next
+  }
+  in_run {
+    if ($0 ~ /^          /) {
+      sub(/^          /, "")
+      print
+      next
+    }
+    if ($0 ~ /^[[:space:]]*$/) {
+      print ""
+      next
+    }
+    in_run = 0
+  }
+' "$cve_template" | sed '/^while (( attempt/,$d' >"$cve_comment_funcs"
+cat >"${cve_comment_tmp}/audit.json" <<'AUDIT_JSON'
+{"dependencies":[{"name":"example-pkg","version":"1.0.0","vulns":[{"id":"CVE-2024-0001","fix_versions":["1.0.1"]}]}]}
+AUDIT_JSON
+mock_bin="${cve_comment_tmp}/bin"
+mkdir -p "$mock_bin"
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "label" ]]; then
+  exit 0
+fi
+if [[ "${1:-}" == "issue" && "${2:-}" == "list" ]]; then
+  printf '42\n'
+  exit 0
+fi
+if [[ "${1:-}" == "issue" && "${2:-}" == "comment" ]]; then
+  exit 1
+fi
+exit 0
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+cat >>"$cve_comment_funcs" <<'DRIVER'
+audit_json='audit.json'
+issue_title='CVE check: pip-audit findings'
+REPOSITORY='the-hcma/example-repo'
+REPOSITORY_OWNER='the-hcma'
+GITHUB_SERVER_URL='https://github.com'
+GITHUB_RUN_ID='12345'
+set +e
+file_or_update_cve_issue
+func_exit=$?
+set -e
+exit "$func_exit"
+DRIVER
+cve_comment_exit=0
+cve_comment_output=""
+cve_comment_output="$(cd "${cve_comment_tmp}" && PATH="${mock_bin}:${PATH}" bash "$cve_comment_funcs" 2>&1)" \
+  || cve_comment_exit=$?
+if [[ "$cve_comment_exit" -ne 0 ]] \
+  && grep -qF 'ERROR: pip-audit found CVEs but failed to comment on security/cve issue #42' \
+    <<<"$cve_comment_output"; then
+  printf '[PASS] cve-check template exits non-zero when gh issue comment fails\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cve-check template did not fail fast on gh issue comment (exit=%s)\n%s\n' \
+    "$cve_comment_exit" "$cve_comment_output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$cve_comment_tmp"
 
 printf '\n=== static: cleanup-merged-branches deletes Graphite MQ branches ===\n'
 gtmq_template="${templates_dir}/cleanup-merged-branches.yml"
