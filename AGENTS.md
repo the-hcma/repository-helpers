@@ -101,12 +101,13 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 - **GitHub Actions pins follow their own style.** `@v6` (major-only) bumps to the latest release semver when newer—patch within the same major (`v6` → `v6.0.2`) or major jump (`v7` → `v8.1.0`), matching Dependabot. `@v1.7.12` / `@0.36.0` (full semver) is bumped on any newer release. The `v`-prefix style of the existing pin is preserved. Commit-SHA pins (`@abc1234...`) and local actions (`./path`) are never touched.
 - **Wait timeouts must be machine-parseable.** Any long-running wait loop (CI gating, merge polling, PR number discovery, etc.) must, on timeout, emit **one** concise line starting with `ERROR: WAIT_TIMEOUT ...` and then fail. Avoid multi-line timeout chatter — batch runs (`--batch --all`) postprocess these lines into end-of-run actionable summaries.
 - **GNU userland on macOS.** Prefer Homebrew gnubin on `PATH` via
-  `tooling_path_prepend_gnu_userland` / the cron and node bootstraps
-  (`brew install coreutils gnu-sed grep`) so scripts can assume GNU
-  `sed`, `grep -P`, `date -Is`, `timeout`, etc. Do not add BSD vs GNU
-  branches at call sites. `dep-updater` in-place edits still resolve GNU
-  sed explicitly (`gsed` / `tooling_prereq_gnu_sed_path`) as a hard
-  prerequisite.
+  `tooling_path_ensure_gnu_userland` / the cron and node bootstraps
+  (`brew install coreutils gnu-sed grep util-linux`) so scripts can assume GNU
+  `sed`, `grep -P`, `date -Is`, `timeout`, and `flock`. On Darwin, missing or BSD
+  tools fail early with an install hint — do not rely on silent fallback.
+  Do not add BSD vs GNU branches at call sites. `dep-updater` in-place
+  edits still resolve GNU sed explicitly (`gsed` /
+  `tooling_prereq_gnu_sed_path`) as an additional hard prerequisite.
 
 ---
 
