@@ -144,6 +144,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | `.cursor/rules` gitignore | yes | — | `.gitignore` must not block `.cursor/rules/` |
 | Dependabot release age | yes | — | `cooldown` on every `dependabot.yml` updates entry (`release-age-defaults`) |
 | pnpm release age | yes | — | `minimumReleaseAge` in `pnpm-workspace.yaml` when present |
+| pnpm Corepack CI | yes | — | Exact `packageManager: pnpm@X.Y.Z` when lockfile exists; no `pnpm/action-setup` / `setup-node` `cache: pnpm`; use `actions/setup-pnpm-corepack` |
 | `ci-secret-scan` gitleaks pin | yes* | — | Warn when `scripts/lib/ci-secret-scan` pins gitleaks behind the release-age-eligible version (*this repo only) |
 
 `--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via Graphite in the target repo clone.
@@ -194,6 +195,31 @@ Repos identified as uv Python projects (presence of `uv.lock` + `pyproject.toml`
 failure), retries only transient tool errors, and opens or updates a `security/cve` issue when vulnerabilities are
 found. The job succeeds when CVEs are found **and** issue notification succeeds; it fails if pip-audit reports CVEs but
 `gh issue` create/comment fails (so silent notification loss does not occur).
+
+### pnpm / Corepack CI
+
+Repos with `pnpm-lock.yaml` (root or `web/`) must:
+
+1. Set an exact `"packageManager": "pnpm@X.Y.Z"` in the matching `package.json` (Corepack / CI SSOT).
+2. Install pnpm in GitHub Actions via the private composite action
+   [`actions/setup-pnpm-corepack`](actions/setup-pnpm-corepack/action.yml) **after** `actions/setup-node`
+   (pin a commit SHA or tag of this repo). Do **not** use `pnpm/action-setup` (especially not
+   `version: latest` — floating tags have broken CI; see [pnpm/action-setup#276](https://github.com/pnpm/action-setup/issues/276)).
+3. Do **not** set `cache: 'pnpm'` on `setup-node` — the composite action owns store-path discovery and
+   `actions/cache`.
+
+Canonical snippet:
+
+```yaml
+- uses: actions/checkout@v7.0.0
+- uses: actions/setup-node@v6.4.0
+  with:
+    node-version: '24'
+- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@<pinned-sha>
+  with:
+    working-directory: '.'   # or 'web'
+- run: pnpm install --frozen-lockfile
+```
 
 ### Merge settings and Graphite merge queue
 
