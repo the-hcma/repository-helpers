@@ -3173,6 +3173,255 @@ rp_check_pnpm_release_age_policy() {
   return "$repo_fail"
 }
 
+# Candidate pnpm lockfiles (root and common nested layouts).
+rp_pnpm_lock_candidate_paths() {
+  printf '%s\n' 'pnpm-lock.yaml' 'web/pnpm-lock.yaml'
+}
+
+# Map lockfile path → package.json path.
+rp_package_json_path_for_pnpm_lock() {
+  local -r lock_path="$1"
+  case "$lock_path" in
+    pnpm-lock.yaml) printf '%s\n' 'package.json' ;;
+    web/pnpm-lock.yaml) printf '%s\n' 'web/package.json' ;;
+    *) return 1 ;;
+  esac
+}
+
+# True when package.json text has exact "packageManager": "pnpm@X.Y.Z".
+rp_package_json_has_exact_pnpm_package_manager() {
+  local -r text="$1"
+  grep -Eq '"packageManager"[[:space:]]*:[[:space:]]*"pnpm@[0-9]+\.[0-9]+\.[0-9]+"' <<<"$text"
+}
+
+# True when workflow text mentions pnpm/action-setup.
+rp_workflow_uses_pnpm_action_setup() {
+  local -r text="$1"
+  grep -Eq 'pnpm/action-setup@' <<<"$text"
+}
+
+# True when workflow sets setup-node cache: pnpm (helper owns store cache instead).
+# Accept quoted or unquoted YAML (`cache: pnpm` / `cache: 'pnpm'`).
+rp_workflow_has_setup_node_pnpm_cache() {
+  local -r text="$1"
+  grep -Eq "cache:[[:space:]]*(pnpm|'pnpm'|\"pnpm\")([[:space:]]|$|#)" <<<"$text"
+}
+
+# True when workflow uses the org Corepack helper.
+rp_workflow_uses_setup_pnpm_corepack() {
+  local -r text="$1"
+  grep -Fq 'repository-helpers/actions/setup-pnpm-corepack' <<<"$text"
+}
+
+# True when a workflow appears to install or set up pnpm (needs the helper).
+rp_workflow_needs_pnpm_corepack_helper() {
+  local -r text="$1"
+  if rp_workflow_uses_pnpm_action_setup "$text"; then
+    return 0
+  fi
+  if rp_workflow_has_setup_node_pnpm_cache "$text"; then
+    return 0
+  fi
+  # Avoid a `|pnpm` substring in one ERE — runner-adoption treats that as a bare
+  # `pnpm` invocation after `|`.
+  if grep -Eq 'corepack[[:space:]]+enable[[:space:]]+pnpm' <<<"$text"; then
+    return 0
+  fi
+  if grep -Eq 'pnpm[[:space:]]+install' <<<"$text"; then
+    return 0
+  fi
+  return 1
+}
+
+# rp_repo_has_pnpm_lock <slug>
+# Exit 0 when any candidate lockfile exists; 1 when none; 2 on API error.
+rp_repo_has_pnpm_lock() {
+  local -r slug="$1"
+  local lock_path
+  local path_ec
+  local saw=0
+
+  while IFS= read -r lock_path; do
+    [[ -n "$lock_path" ]] || continue
+    path_ec=0
+    rp_gh_path_check "$slug" "$lock_path" || path_ec=$?
+    if (( path_ec == 2 )); then
+      return 2
+    fi
+    if (( path_ec == 0 )); then
+      saw=1
+    fi
+  done < <(rp_pnpm_lock_candidate_paths)
+
+  if [[ "$saw" -eq 1 ]]; then
+    return 0
+  fi
+  return 1
+}
+
+rp_validate_pnpm_package_manager_pins() {
+  local -r slug="$1"
+  local fail=0
+  local lock_path pkg_path pkg_text
+  local path_ec=0
+  local fetch_ec=0
+  local saw_lock=0
+
+  while IFS= read -r lock_path; do
+    [[ -n "$lock_path" ]] || continue
+    path_ec=0
+    rp_gh_path_check "$slug" "$lock_path" || path_ec=$?
+    if (( path_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" "could not read ${lock_path}"
+      fail=1
+      continue
+    fi
+    if (( path_ec != 0 )); then
+      continue
+    fi
+    saw_lock=1
+    pkg_path="$(rp_package_json_path_for_pnpm_lock "$lock_path")" || continue
+    fetch_ec=0
+    pkg_text="$(rp_fetch_github_text_file "$slug" "$pkg_path")" || fetch_ec=$?
+    if (( fetch_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" "could not read ${pkg_path}"
+      fail=1
+      continue
+    fi
+    if [[ -z "$pkg_text" ]]; then
+      rp_log_fail "${slug}: ${lock_path} present but ${pkg_path} missing or unreadable"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: add exact \"packageManager\": \"pnpm@X.Y.Z\" to ${pkg_path}"
+      fi
+      fail=1
+      continue
+    fi
+    if ! rp_package_json_has_exact_pnpm_package_manager "$pkg_text"; then
+      rp_log_fail \
+        "${slug}: ${pkg_path} must set exact \"packageManager\": \"pnpm@X.Y.Z\" (Corepack / CI SSOT)"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: set packageManager to an exact pnpm@X.Y.Z and use actions/setup-pnpm-corepack in CI (see repository-helpers#362)"
+      fi
+      fail=1
+    fi
+  done < <(rp_pnpm_lock_candidate_paths)
+
+  if [[ "$saw_lock" -eq 0 ]]; then
+    return 0
+  fi
+  return "$fail"
+}
+
+rp_validate_pnpm_ci_corepack() {
+  local -r slug="$1"
+  # When "1", caller already confirmed a pnpm lockfile exists — skip re-probing.
+  local -r assume_has_lock="${2:-0}"
+  local fail=0
+  local workflow_name workflow_path workflow_text
+  local fetch_ec=0
+  local has_lock_ec=0
+
+  if [[ "$assume_has_lock" != "1" ]]; then
+    has_lock_ec=0
+    rp_repo_has_pnpm_lock "$slug" || has_lock_ec=$?
+    if (( has_lock_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" 'could not probe pnpm-lock.yaml paths'
+      return 1
+    fi
+    if (( has_lock_ec != 0 )); then
+      return 0
+    fi
+  fi
+
+  while IFS= read -r workflow_name; do
+    [[ -n "$workflow_name" ]] || continue
+    workflow_path=".github/workflows/${workflow_name}"
+    fetch_ec=0
+    workflow_text="$(rp_fetch_github_text_file "$slug" "$workflow_path")" || fetch_ec=$?
+    if (( fetch_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" "could not read ${workflow_path}"
+      fail=1
+      continue
+    fi
+    if [[ -z "$workflow_text" ]]; then
+      continue
+    fi
+
+    if rp_workflow_uses_pnpm_action_setup "$workflow_text"; then
+      rp_log_fail \
+        "${slug}: ${workflow_path} must not use pnpm/action-setup (use the-hcma/repository-helpers/actions/setup-pnpm-corepack)"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: replace pnpm/action-setup with setup-node + setup-pnpm-corepack (no version: latest; see repository-helpers#362)"
+      fi
+      fail=1
+    fi
+
+    if rp_workflow_has_setup_node_pnpm_cache "$workflow_text"; then
+      rp_log_fail \
+        "${slug}: ${workflow_path} must not set setup-node cache: 'pnpm' (setup-pnpm-corepack owns the store cache)"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: drop cache: 'pnpm' from setup-node and use actions/setup-pnpm-corepack"
+      fi
+      fail=1
+    fi
+
+    if rp_workflow_needs_pnpm_corepack_helper "$workflow_text" \
+      && ! rp_workflow_uses_setup_pnpm_corepack "$workflow_text"; then
+      # action-setup / cache: pnpm already failed above; still require helper for
+      # inline corepack enable pnpm / pnpm install without the shared action.
+      if ! rp_workflow_uses_pnpm_action_setup "$workflow_text" \
+        && ! rp_workflow_has_setup_node_pnpm_cache "$workflow_text"; then
+        rp_log_fail \
+          "${slug}: ${workflow_path} sets up or installs pnpm without repository-helpers/actions/setup-pnpm-corepack"
+        if [[ "$rp_suggest" -eq 1 ]]; then
+          rp_log_suggest \
+            "${slug}: after setup-node, use the-hcma/repository-helpers/actions/setup-pnpm-corepack@<sha> (working-directory: . or web)"
+        fi
+        fail=1
+      fi
+    fi
+  done < <(rp_fetch_workflow_file_names "$slug")
+
+  return "$fail"
+}
+
+rp_check_pnpm_corepack_ci() {
+  local slug="$1"
+  local repo_fail=0
+  local has_lock_ec=0
+
+  # Probe lockfiles once; pin validation walks candidates for package.json checks,
+  # and CI validation skips a second existence probe when assume_has_lock=1.
+  has_lock_ec=0
+  rp_repo_has_pnpm_lock "$slug" || has_lock_ec=$?
+  if (( has_lock_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not probe pnpm-lock.yaml paths'
+    return 1
+  fi
+  if (( has_lock_ec != 0 )); then
+    return 0
+  fi
+
+  if ! rp_validate_pnpm_package_manager_pins "$slug"; then
+    repo_fail=1
+  fi
+  if ! rp_validate_pnpm_ci_corepack "$slug" 1; then
+    repo_fail=1
+  fi
+
+  if [[ "$repo_fail" -eq 0 ]]; then
+    rp_log_check_ok "$slug" \
+      'pnpm packageManager pin + Corepack CI helper' \
+      "$(rp_github_url "$slug" '/blob/main/package.json')"
+  fi
+
+  return "$repo_fail"
+}
+
 rp_print_new_repo_checklist() {
   local slug="$1"
   cat >&2 <<CHECKLIST
@@ -3196,6 +3445,11 @@ rp_print_new_repo_checklist() {
     Dependency release age (scripts/lib/release-age-defaults):
       [ ] dependabot.yml: cooldown default-days: ${release_age_dependabot_days} on every updates entry
       [ ] pnpm-workspace.yaml: minimumReleaseAge: ${release_age_dep_updater_minutes} when using pnpm
+
+    Corepack CI (when pnpm-lock.yaml or web/pnpm-lock.yaml exists):
+      [ ] package.json (or web/package.json) has exact "packageManager": "pnpm@X.Y.Z"
+      [ ] CI uses the-hcma/repository-helpers/actions/setup-pnpm-corepack after setup-node
+      [ ] Do not use pnpm/action-setup or setup-node cache: 'pnpm'
 
     Branch protection (required when using merge-it or Release Please):
       [ ] protect-main ruleset on refs/heads/main (squash-only + Graphite App bypass)
@@ -4267,6 +4521,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_pnpm_release_age_policy "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_pnpm_corepack_ci "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
   fi
