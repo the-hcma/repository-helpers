@@ -167,7 +167,7 @@ Graphite app merge queue configuration remains a manual step and is reported as 
 | `.cursor/rules` gitignore | yes | — | `.gitignore` must not block `.cursor/rules/` |
 | Dependabot release age | yes | — | `cooldown` on every `dependabot.yml` updates entry (`release-age-defaults`) |
 | pnpm release age | yes | — | `minimumReleaseAge` in `pnpm-workspace.yaml` when present |
-| pnpm Corepack CI | yes | — | Exact `packageManager: pnpm@X.Y.Z` when lockfile exists; no `pnpm/action-setup` / `setup-node` `cache: pnpm`; use `actions/setup-pnpm-corepack` |
+| pnpm Corepack CI | yes | — | Exact `packageManager: pnpm@X.Y.Z` when lockfile exists; no `pnpm/action-setup` / `setup-node` `cache: pnpm`; use org composite [`actions/setup-pnpm-corepack`](actions/setup-pnpm-corepack/README.md) (pin SHA on `main`) |
 | `ci-secret-scan` gitleaks pin | yes* | — | Warn when `scripts/lib/ci-secret-scan` pins gitleaks behind the release-age-eligible version (*this repo only) |
 
 `--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule
