@@ -144,7 +144,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | `.cursor/rules` gitignore | yes | — | `.gitignore` must not block `.cursor/rules/` |
 | Dependabot release age | yes | — | `cooldown` on every `dependabot.yml` updates entry (`release-age-defaults`) |
 | pnpm release age | yes | — | `minimumReleaseAge` in `pnpm-workspace.yaml` when present |
-| pnpm Corepack CI | yes | — | Exact `packageManager: pnpm@X.Y.Z` when lockfile exists; no `pnpm/action-setup` / `setup-node` `cache: pnpm`; use `actions/setup-pnpm-corepack` |
+| pnpm Corepack CI | yes | — | Exact `packageManager: pnpm@X.Y.Z` when lockfile exists; no `pnpm/action-setup` / `setup-node` `cache: pnpm`; use org composite `actions/setup-pnpm-corepack` (pin SHA on `main`; see section below) |
 | `ci-secret-scan` gitleaks pin | yes* | — | Warn when `scripts/lib/ci-secret-scan` pins gitleaks behind the release-age-eligible version (*this repo only) |
 
 `--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via Graphite in the target repo clone.
@@ -201,25 +201,61 @@ found. The job succeeds when CVEs are found **and** issue notification succeeds;
 Repos with `pnpm-lock.yaml` (root or `web/`) must:
 
 1. Set an exact `"packageManager": "pnpm@X.Y.Z"` in the matching `package.json` (Corepack / CI SSOT).
-2. Install pnpm in GitHub Actions via the private composite action
-   [`actions/setup-pnpm-corepack`](actions/setup-pnpm-corepack/action.yml) **after** `actions/setup-node`
-   (pin a commit SHA or tag of this repo). Do **not** use `pnpm/action-setup` (especially not
-   `version: latest` — floating tags have broken CI; see [pnpm/action-setup#276](https://github.com/pnpm/action-setup/issues/276)).
-3. Do **not** set `cache: 'pnpm'` on `setup-node` — the composite action owns store-path discovery and
-   `actions/cache`.
+   For nested apps (e.g. domesti-bot), put it in `web/package.json` and pass
+   `working-directory: web` to the action.
+2. Install pnpm in GitHub Actions via the org composite action
+   [`actions/setup-pnpm-corepack`](actions/setup-pnpm-corepack/README.md) **after**
+   `actions/setup-node`. Do **not** use `pnpm/action-setup` (especially not
+   `version: latest` — floating tags have broken CI; see
+   [pnpm/action-setup#276](https://github.com/pnpm/action-setup/issues/276)).
+3. Do **not** set `cache: 'pnpm'` on `setup-node` — the composite action owns store-path
+   discovery and `actions/cache`.
 
-Canonical snippet:
+**Pin policy:** pin with a **full commit SHA that is on `main`** (a merge commit of this
+repo), not a PR branch tip or other unmerged SHA. Example (current `main` tip as of the
+merge of [#363](https://github.com/the-hcma/repository-helpers/pull/363)):
+
+`cde3063aa1e030fcac59bbf215131a3bd25d7908`
+
+Pin by SHA for supply-chain integrity (repository-helpers may be public; treat this as an
+org composite action, not a “private action”). Dependabot does not always bump composite
+action SHAs automatically — plan periodic pin updates when the helper changes.
+
+**Path-filter gotcha:** CI path filters / “deps changed” gates that only watch
+`package.json` and `pnpm-lock.yaml` will **skip** pnpm install/check jobs on
+workflow-only adoption PRs (seen on [fpdf#464](https://github.com/the-hcma/fpdf/pull/464)).
+When adopting the helper, include `.github/workflows/**` (or your equivalent workflow
+paths) in those gates so the adoption PR actually runs install and check.
+
+Canonical snippets (keep `pnpm install` in the same directory as the action input):
+
+Root app:
 
 ```yaml
 - uses: actions/checkout@v7.0.0
 - uses: actions/setup-node@v6.4.0
   with:
     node-version: '24'
-- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@<pinned-sha>
-  with:
-    working-directory: '.'   # or 'web'
+- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@cde3063aa1e030fcac59bbf215131a3bd25d7908
 - run: pnpm install --frozen-lockfile
 ```
+
+Nested app (`packageManager` under `web/`):
+
+```yaml
+- uses: actions/checkout@v7.0.0
+- uses: actions/setup-node@v6.4.0
+  with:
+    node-version: '24'
+- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@cde3063aa1e030fcac59bbf215131a3bd25d7908
+  with:
+    working-directory: web
+- run: pnpm install --frozen-lockfile
+  working-directory: web
+```
+
+See [`actions/setup-pnpm-corepack/README.md`](actions/setup-pnpm-corepack/README.md) for
+inputs, caching, and consumer checklist.
 
 ### Merge settings and Graphite merge queue
 

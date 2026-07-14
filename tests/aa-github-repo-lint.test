@@ -707,8 +707,37 @@ rp_workflow_uses_pnpm_action_setup() {
 rp_workflow_has_setup_node_pnpm_cache() {
   grep -Eq "cache:[[:space:]]*(pnpm|'pnpm'|\"pnpm\")([[:space:]]|$|#)" <<<"$1"
 }
+rp_workflow_setup_pnpm_corepack_pins() {
+  local -r text="$1"
+  local line trimmed uses_ref pin
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+    if [[ "$trimmed" =~ ^-?[[:space:]]*uses:[[:space:]]*([^[:space:]#]+) ]]; then
+      uses_ref="${BASH_REMATCH[1]}"
+      if [[ "$uses_ref" == \"*\" ]]; then
+        uses_ref="${uses_ref:1:${#uses_ref}-2}"
+      elif [[ "$uses_ref" == \'*\' ]]; then
+        uses_ref="${uses_ref:1:${#uses_ref}-2}"
+      fi
+      if [[ "$uses_ref" == *'/repository-helpers/actions/setup-pnpm-corepack@'* ]] \
+        || [[ "$uses_ref" == 'repository-helpers/actions/setup-pnpm-corepack@'* ]]; then
+        pin="${uses_ref##*@}"
+        printf '%s\n' "$pin"
+      fi
+    fi
+  done <<<"$text"
+}
 rp_workflow_uses_setup_pnpm_corepack() {
-  grep -Fq 'repository-helpers/actions/setup-pnpm-corepack' <<<"$1"
+  local -r text="$1"
+  local pin
+  while IFS= read -r pin || [[ -n "$pin" ]]; do
+    [[ -z "$pin" ]] && continue
+    if [[ "$pin" =~ ^[0-9a-fA-F]{40}$ ]]; then
+      return 0
+    fi
+  done < <(rp_workflow_setup_pnpm_corepack_pins "$text")
+  return 1
 }
 rp_workflow_needs_pnpm_corepack_helper() {
   if grep -Eq 'corepack[[:space:]]+enable[[:space:]]+pnpm' <<<"$1"; then return 0; fi
@@ -723,7 +752,18 @@ rp_workflow_has_setup_node_pnpm_cache "cache: pnpm"
 rp_workflow_has_setup_node_pnpm_cache "cache: 'pnpm'"
 rp_workflow_has_setup_node_pnpm_cache 'cache: "pnpm"'
 ! rp_workflow_has_setup_node_pnpm_cache 'cache: pnpmfoo'
+full_sha='cde3063aa1e030fcac59bbf215131a3bd25d7908'
 rp_workflow_uses_setup_pnpm_corepack \
+  $'uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@'"${full_sha}"$'\n'
+rp_workflow_uses_setup_pnpm_corepack \
+  "uses: \"the-hcma/repository-helpers/actions/setup-pnpm-corepack@${full_sha}\""$'\n'
+rp_workflow_uses_setup_pnpm_corepack \
+  "uses: 'the-hcma/repository-helpers/actions/setup-pnpm-corepack@${full_sha}'"$'\n'
+! rp_workflow_uses_setup_pnpm_corepack \
+  $'uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@main\n'
+! rp_workflow_uses_setup_pnpm_corepack \
+  $'# uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@'"${full_sha}"$'\n'
+! rp_workflow_uses_setup_pnpm_corepack \
   $'uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@abc123\n'
 rp_workflow_needs_pnpm_corepack_helper $'run: pnpm install --frozen-lockfile\n'
 PRED
@@ -735,6 +775,80 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -f "$pred_script"
+
+printf '\n=== unit: helpers sha-on-main cache skips transient failures ===\n'
+sha_cache_script="$(mktemp)"
+cat >"$sha_cache_script" <<'SHA_CACHE'
+#!/usr/bin/env bash
+set -euo pipefail
+declare -gA rp_helpers_sha_on_main_cache=()
+rp_DEFAULT_ORG='the-hcma'
+rp_THIS_REPO_NAME='repository-helpers'
+# Counter must survive command-substitution subshells used by the production helper.
+rp_mock_compare_file="$(mktemp)"
+printf '0\n' >"$rp_mock_compare_file"
+rp_runner_gh_api_stream() {
+  local n
+  n="$(<"$rp_mock_compare_file")"
+  n=$((n + 1))
+  printf '%s\n' "$n" >"$rp_mock_compare_file"
+  if (( n == 1 )); then
+    return 1
+  fi
+  printf '%s\n' 'identical'
+  return 0
+}
+rp_helpers_commit_reachable_from_main() {
+  local -r sha="$1"
+  local -r helpers_slug="${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}"
+  local status
+  local api_ec=0
+
+  if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    return 1
+  fi
+
+  if [[ -n "${rp_helpers_sha_on_main_cache[$sha]+x}" ]]; then
+    case "${rp_helpers_sha_on_main_cache[$sha]}" in
+      1) return 0 ;;
+      0) return 1 ;;
+    esac
+  fi
+
+  status=''
+  api_ec=0
+  status="$(rp_runner_gh_api_stream "repo-practices helpers sha on main" \
+    "repos/${helpers_slug}/compare/main...${sha}" --jq '.status // empty')" || api_ec=$?
+  if (( api_ec != 0 )) || [[ -z "$status" ]]; then
+    return 2
+  fi
+  if [[ "$status" == 'behind' || "$status" == 'identical' ]]; then
+    rp_helpers_sha_on_main_cache[$sha]='1'
+    return 0
+  fi
+  rp_helpers_sha_on_main_cache[$sha]='0'
+  return 1
+}
+full_sha='cde3063aa1e030fcac59bbf215131a3bd25d7908'
+reach_ec=0
+rp_helpers_commit_reachable_from_main "$full_sha" || reach_ec=$?
+[[ "$reach_ec" -eq 2 ]]
+[[ -z "${rp_helpers_sha_on_main_cache[$full_sha]+x}" ]]
+reach_ec=0
+rp_helpers_commit_reachable_from_main "$full_sha" || reach_ec=$?
+[[ "$reach_ec" -eq 0 ]]
+[[ "${rp_helpers_sha_on_main_cache[$full_sha]}" == '1' ]]
+[[ "$(<"$rp_mock_compare_file")" -eq 2 ]]
+rm -f "$rp_mock_compare_file"
+SHA_CACHE
+if bash "$sha_cache_script"; then
+  printf '[PASS] helpers sha-on-main cache retries after transient API failure\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] helpers sha-on-main cache should not store transient failures\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "$sha_cache_script"
 
 printf '\n=== functional: dependabot cooldown enforced ===\n'
 mock_dir="$(mktemp -d)"

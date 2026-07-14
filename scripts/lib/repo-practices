@@ -3207,10 +3207,89 @@ rp_workflow_has_setup_node_pnpm_cache() {
   grep -Eq "cache:[[:space:]]*(pnpm|'pnpm'|\"pnpm\")([[:space:]]|$|#)" <<<"$text"
 }
 
-# True when workflow uses the org Corepack helper.
+# Cache: pin SHA -> 1 (on main) / 0 (definitively not on main). Transient API
+# failures are not cached so later callers retry.
+if ! declare -p rp_helpers_sha_on_main_cache >/dev/null 2>&1; then
+  declare -gA rp_helpers_sha_on_main_cache=()
+fi
+
+# Print each pin (ref after @) from active uses: lines for setup-pnpm-corepack.
+# Ignores full-line YAML comments; does not accept @main/tags/PR tips as "found".
+rp_workflow_setup_pnpm_corepack_pins() {
+  local -r text="$1"
+  local line trimmed uses_ref pin
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+    # Match optional list dash, then uses: <action>@<ref>
+    if [[ "$trimmed" =~ ^-?[[:space:]]*uses:[[:space:]]*([^[:space:]#]+) ]]; then
+      uses_ref="${BASH_REMATCH[1]}"
+      # YAML may quote the action ref; strip matching surrounding quotes.
+      if [[ "$uses_ref" == \"*\" ]]; then
+        uses_ref="${uses_ref:1:${#uses_ref}-2}"
+      elif [[ "$uses_ref" == \'*\' ]]; then
+        uses_ref="${uses_ref:1:${#uses_ref}-2}"
+      fi
+      if [[ "$uses_ref" == *'/repository-helpers/actions/setup-pnpm-corepack@'* ]] \
+        || [[ "$uses_ref" == 'repository-helpers/actions/setup-pnpm-corepack@'* ]]; then
+        pin="${uses_ref##*@}"
+        printf '%s\n' "$pin"
+      fi
+    fi
+  done <<<"$text"
+}
+
+# True when workflow has an active uses: pin of the helper to a full 40-char SHA.
+# Comments, @main, tags, and short SHAs do not count.
 rp_workflow_uses_setup_pnpm_corepack() {
   local -r text="$1"
-  grep -Fq 'repository-helpers/actions/setup-pnpm-corepack' <<<"$text"
+  local pin
+
+  while IFS= read -r pin || [[ -n "$pin" ]]; do
+    [[ -z "$pin" ]] && continue
+    if [[ "$pin" =~ ^[0-9a-fA-F]{40}$ ]]; then
+      return 0
+    fi
+  done < <(rp_workflow_setup_pnpm_corepack_pins "$text")
+  return 1
+}
+
+# rp_helpers_commit_reachable_from_main <40-char-sha>
+# Exit 0 when the commit is an ancestor of (or equal to) repository-helpers main.
+# Exit 1 when not on main. Exit 2 on GitHub API failure.
+rp_helpers_commit_reachable_from_main() {
+  local -r sha="$1"
+  local -r helpers_slug="${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}"
+  local status
+  local api_ec=0
+
+  if [[ ! "$sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    return 1
+  fi
+
+  if [[ -n "${rp_helpers_sha_on_main_cache[$sha]+x}" ]]; then
+    case "${rp_helpers_sha_on_main_cache[$sha]}" in
+      1) return 0 ;;
+      0) return 1 ;;
+      # Stale transient markers (if any) fall through so the compare is retried.
+    esac
+  fi
+
+  # compare/main...sha: behind|identical => sha is on main history; ahead|diverged => not.
+  status=''
+  api_ec=0
+  status="$(rp_runner_gh_api_stream "repo-practices helpers sha on main" \
+    "repos/${helpers_slug}/compare/main...${sha}" --jq '.status // empty')" || api_ec=$?
+  if (( api_ec != 0 )) || [[ -z "$status" ]]; then
+    return 2
+  fi
+  if [[ "$status" == 'behind' || "$status" == 'identical' ]]; then
+    rp_helpers_sha_on_main_cache[$sha]='1'
+    return 0
+  fi
+  rp_helpers_sha_on_main_cache[$sha]='0'
+  return 1
 }
 
 # True when a workflow appears to install or set up pnpm (needs the helper).
@@ -3322,6 +3401,8 @@ rp_validate_pnpm_ci_corepack() {
   local workflow_name workflow_path workflow_text
   local fetch_ec=0
   local has_lock_ec=0
+  local pin saw_any_pin=0
+  local reach_ec=0
 
   if [[ "$assume_has_lock" != "1" ]]; then
     has_lock_ec=0
@@ -3375,14 +3456,50 @@ rp_validate_pnpm_ci_corepack() {
       # inline corepack enable pnpm / pnpm install without the shared action.
       if ! rp_workflow_uses_pnpm_action_setup "$workflow_text" \
         && ! rp_workflow_has_setup_node_pnpm_cache "$workflow_text"; then
-        rp_log_fail \
-          "${slug}: ${workflow_path} sets up or installs pnpm without repository-helpers/actions/setup-pnpm-corepack"
-        if [[ "$rp_suggest" -eq 1 ]]; then
-          rp_log_suggest \
-            "${slug}: after setup-node, use the-hcma/repository-helpers/actions/setup-pnpm-corepack@<sha> (working-directory: . or web)"
+        # Distinguish missing helper vs present but not pinned to a full SHA.
+        saw_any_pin=0
+        while IFS= read -r pin || [[ -n "$pin" ]]; do
+          [[ -z "$pin" ]] && continue
+          saw_any_pin=1
+          rp_log_fail \
+            "${slug}: ${workflow_path} setup-pnpm-corepack must pin a full 40-char SHA on main (got @${pin})"
+          if [[ "$rp_suggest" -eq 1 ]]; then
+            rp_log_suggest \
+              "${slug}: use the-hcma/repository-helpers/actions/setup-pnpm-corepack@<full-sha-on-main> (not @main/tags/PR tips)"
+          fi
+          fail=1
+        done < <(rp_workflow_setup_pnpm_corepack_pins "$workflow_text")
+        if [[ "$saw_any_pin" -eq 0 ]]; then
+          rp_log_fail \
+            "${slug}: ${workflow_path} sets up or installs pnpm without repository-helpers/actions/setup-pnpm-corepack"
+          if [[ "$rp_suggest" -eq 1 ]]; then
+            rp_log_suggest \
+              "${slug}: after setup-node, pin the-hcma/repository-helpers/actions/setup-pnpm-corepack@<full-sha-on-main> (working-directory: . or web; see actions/setup-pnpm-corepack/README.md)"
+          fi
+          fail=1
         fi
-        fail=1
       fi
+    elif rp_workflow_uses_setup_pnpm_corepack "$workflow_text"; then
+      # Enforce SHA-on-main for every active full-SHA pin (mutable refs already failed above).
+      while IFS= read -r pin || [[ -n "$pin" ]]; do
+        [[ -z "$pin" ]] && continue
+        [[ "$pin" =~ ^[0-9a-fA-F]{40}$ ]] || continue
+        reach_ec=0
+        rp_helpers_commit_reachable_from_main "$pin" || reach_ec=$?
+        if (( reach_ec == 2 )); then
+          rp_log_gh_api_fail "$slug" \
+            "could not verify setup-pnpm-corepack@${pin} is on ${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME} main"
+          fail=1
+        elif (( reach_ec != 0 )); then
+          rp_log_fail \
+            "${slug}: ${workflow_path} setup-pnpm-corepack@${pin} is not reachable on ${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME} main"
+          if [[ "$rp_suggest" -eq 1 ]]; then
+            rp_log_suggest \
+              "${slug}: retarget the pin to a merge commit SHA that is on ${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME} main"
+          fi
+          fail=1
+        fi
+      done < <(rp_workflow_setup_pnpm_corepack_pins "$workflow_text")
     fi
   done < <(rp_fetch_workflow_file_names "$slug")
 
@@ -3449,7 +3566,9 @@ rp_print_new_repo_checklist() {
     Corepack CI (when pnpm-lock.yaml or web/pnpm-lock.yaml exists):
       [ ] package.json (or web/package.json) has exact "packageManager": "pnpm@X.Y.Z"
       [ ] CI uses the-hcma/repository-helpers/actions/setup-pnpm-corepack after setup-node
+          (pin full SHA on main; working-directory: . or web — see actions/setup-pnpm-corepack/README.md)
       [ ] Do not use pnpm/action-setup or setup-node cache: 'pnpm'
+      [ ] Path filters / deps-changed gates include .github/workflows/** so adoption PRs run install
 
     Branch protection (required when using merge-it or Release Please):
       [ ] protect-main ruleset on refs/heads/main (squash-only + Graphite App bypass)
