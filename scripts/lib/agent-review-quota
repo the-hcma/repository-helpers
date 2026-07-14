@@ -244,6 +244,20 @@ agent_review_copilot_quota_mark_probe_requested() {
     "${agent_review_copilot_quota_confirmed_today:-0}" 1
 }
 
+# Record a same-day Copilot timeline probe with no exhaustion signal (negative cache).
+# Does not mark confirmed or exhausted — only prevents re-fetching the PR timeline today.
+agent_review_copilot_quota_mark_timeline_probed() {
+  local -r reason="${1:-Copilot PR timeline probed; no same-day quota failure.}"
+
+  agent_review_copilot_quota_write_cache 0 timeline_probed "${reason}" 0
+}
+
+# True when today's Copilot cache already records a negative timeline probe.
+agent_review_copilot_timeline_probed_today() {
+  agent_review_copilot_quota_refresh_for_today || return 1
+  [[ "${agent_review_copilot_quota_cache_source:-}" == 'timeline_probed' ]]
+}
+
 # Probe open PRs for Copilot reviews and issue comments without requesting a new review.
 # Exit 0 when quota exhausted today, 1 when not exhausted (may still be unconfirmed).
 agent_review_copilot_quota_probe_recent_reviews() {
@@ -980,12 +994,15 @@ agent_review_coderabbit_quota_clear_observed_cache() {
 
 # Probe open PR issue comments for CodeRabbit quota signals without requesting a review.
 # Exit 0 when usage limit exhausted today, 1 when not exhausted (may still be unconfirmed).
+# Prefer comment updatedAt (fall back to createdAt) for day filter and retry_after (issue #366).
 agent_review_coderabbit_quota_probe_recent_comments() {
-  local probe_json today repo pr at body reason
+  local probe_json today repo pr at body reason retry_after profiles_dir coderabbit_profile
 
   agent_review_require_cmd gh
   agent_review_require_cmd jq
   today="$(agent_review_copilot_quota_local_day)"
+  profiles_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/agent-review-profiles" && pwd)"
+  coderabbit_profile="${profiles_dir}/coderabbit"
   probe_json="$(ar_runner_gh_api_stream "agent-review quota coderabbit probe graphql" graphql -f query='
 query {
   viewer {
@@ -994,7 +1011,7 @@ query {
         number
         repository { nameWithOwner }
         comments(last: 30) {
-          nodes { author { login } body createdAt }
+          nodes { author { login } body createdAt updatedAt }
         }
       }
     }
@@ -1007,7 +1024,18 @@ query {
     fi
     if agent_review_coderabbit_quota_issue_comment_is_exhausted "${login}" "${body}"; then
       reason="CodeRabbit comment on ${repo}#${pr} at ${at} reports usage limit reached."
-      agent_review_coderabbit_quota_write_cache 1 probe_recent_comments "${reason}"
+      retry_after=''
+      if [[ -f "${coderabbit_profile}" ]]; then
+        retry_after="$(
+          CODERABBIT_QUOTA_PROBE_BODY="${body}" CODERABBIT_QUOTA_PROBE_AT="${at}" \
+            runner_sh_stdout "agent-review quota coderabbit retry_after" -- \
+            "source '${coderabbit_profile}';
+             agent_review_profile_text_quota_retry_after_iso \
+               \"\${CODERABBIT_QUOTA_PROBE_BODY}\" \"\${CODERABBIT_QUOTA_PROBE_AT}\"" \
+            2>/dev/null || true
+        )"
+      fi
+      agent_review_coderabbit_quota_write_cache 1 probe_recent_comments "${reason}" '' '' '' "${retry_after}"
       return 0
     fi
   done < <(
@@ -1020,7 +1048,7 @@ query {
             repo: $pr.repository.nameWithOwner,
             pr: ($pr.number | tostring),
             body: .body,
-            at: .createdAt,
+            at: (.updatedAt // .createdAt),
             login: (.author.login // "")
           }
       ]

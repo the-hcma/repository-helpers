@@ -10,8 +10,8 @@ agent_review_default_pr_timeout_s=43200
 agent_review_default_idle_break_s=900
 agent_review_default_transient_retries=5
 agent_review_default_transient_retry_sleep_s=30
-# Max CodeRabbit rate-limit sleep before giving up and treating as exhausted (issue #347).
-agent_review_default_coderabbit_rate_limit_wait_max_s=900
+# Max CodeRabbit rate-limit sleep chunk (default 60m). Longer cooldowns are slept in chunks (issue #366).
+agent_review_default_coderabbit_rate_limit_wait_max_s=3600
 
 _ar_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly _ar_lib_dir
@@ -1464,6 +1464,7 @@ agent_review_status_json_from_snapshot() {
   local head_check_state head_check_clean head_check_findings head_check_error head_check_quota head_check_conclusion
   local threads_json human_open_json human_threads_json head_check_complete_json
   local request_visible wait_reason
+  local coderabbit_rate_limited coderabbit_retry_after
 
   agent_review_assert_reviews_complete "${snapshot}"
   head="$(ar_runner_jq_file "agent-review status head sha" "${snapshot}" -r '.data.repository.pullRequest.headRefOid')"
@@ -1525,6 +1526,12 @@ agent_review_status_json_from_snapshot() {
   else
     all_quotas_exhausted=false
   fi
+  coderabbit_rate_limited=false
+  coderabbit_retry_after=''
+  if agent_review_agent_quota_rate_limited_for_agent 'coderabbit'; then
+    coderabbit_rate_limited=true
+    coderabbit_retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent 'coderabbit')"
+  fi
   pass_delivered_by_fallback=false
   if agent_review_delivered_recognized_pass_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
     pass_delivered_by_fallback=true
@@ -1565,6 +1572,8 @@ agent_review_status_json_from_snapshot() {
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
   if [[ "${pr_merged}" == 'true' ]] || [[ "${fresh}" == 'true' ]]; then
     wait_reason=""
+  elif [[ "${coderabbit_rate_limited}" == 'true' ]] && [[ -n "${coderabbit_retry_after}" ]]; then
+    wait_reason="coderabbit_rate_limited_until=${coderabbit_retry_after}"
   elif ! agent_review_profile_request_is_visible; then
     wait_reason="polling_for_review_on_head (agent requests may not appear as pending reviewers on GitHub)"
   else
@@ -1591,6 +1600,7 @@ agent_review_status_json_from_snapshot() {
     --arg mergeable "${mergeable}" \
     --arg agent_id "${agent_id}" \
     --arg wait_reason "${wait_reason}" \
+    --arg coderabbit_retry_after "${coderabbit_retry_after}" \
     --argjson merge_ready "${merge_ready}" \
     --argjson pr_merged "${pr_merged}" \
     --argjson requested "${requested}" \
@@ -1617,6 +1627,7 @@ agent_review_status_json_from_snapshot() {
     --argjson head_check_quota "${head_check_quota}" \
     --arg head_check_conclusion "${head_check_conclusion}" \
     --argjson head_check "${head_check_complete_json}" \
+    --argjson coderabbit_rate_limited "${coderabbit_rate_limited}" \
     '{
       pr: ($pr | tonumber),
       repo: $repo,
@@ -1651,6 +1662,8 @@ agent_review_status_json_from_snapshot() {
       head_check_findings: $head_check_findings,
       head_check_error: $head_check_error,
       head_check_quota: $head_check_quota,
+      coderabbit_rate_limited: $coderabbit_rate_limited,
+      coderabbit_retry_after: (if $coderabbit_retry_after == "" then null else $coderabbit_retry_after end),
       wait_reason: (if $wait_reason == "" then null else $wait_reason end),
       pending: (($pr_merged | not) and ($fresh_review_on_head | not))
     }'
@@ -2066,9 +2079,11 @@ agent_review_quota_summary_for_email() {
 
 # Prints html_url and optional retry-after (tab-separated) for the latest quota-exhaustion
 # issue comment from the active profile today.
+# Prefer comment updated_at (fall back to created_at) for the local-day filter and retry_after
+# anchor so edited rate-limit comments recompute from the latest timestamp (issue #366).
 agent_review_quota_exhaustion_issue_comment_signal_today() {
   local -r comments_json="$1"
-  local today created_at body login url match_url match_retry retry_after
+  local today anchor_at body login url match_url match_retry retry_after
 
   if [[ -z "${agent_review_profile_request_login_regex:-}" ]] \
     || [[ -z "${comments_json}" ]]; then
@@ -2078,34 +2093,35 @@ agent_review_quota_exhaustion_issue_comment_signal_today() {
   match_url=''
   match_retry=''
   if declare -F agent_review_profile_issue_comment_is_quota_exhausted >/dev/null; then
-    while IFS=$'\t' read -r created_at body login url; do
-      [[ -n "${created_at}" ]] || continue
-      if ! agent_review_quota_timestamp_on_local_day "${created_at}" "${today}"; then
+    while IFS=$'\t' read -r anchor_at body login url; do
+      [[ -n "${anchor_at}" ]] || continue
+      if ! agent_review_quota_timestamp_on_local_day "${anchor_at}" "${today}"; then
         continue
       fi
       if agent_review_profile_issue_comment_is_quota_exhausted "${login}" "${body}"; then
         match_url="${url}"
         retry_after=''
         if declare -F agent_review_profile_text_quota_retry_after_iso >/dev/null; then
-          retry_after="$(agent_review_profile_text_quota_retry_after_iso "${body}" "${created_at}" || true)"
+          retry_after="$(agent_review_profile_text_quota_retry_after_iso "${body}" "${anchor_at}" || true)"
         fi
         match_retry="${retry_after}"
       fi
     done < <(ar_runner_jq_file "agent-review quota exhaustion comment signal scan" "${comments_json}" -rs '
-        [ .[] | .[] | [.created_at, (.body // ""), (.user.login // ""), (.html_url // "")] ]
+        [ .[] | .[]
+          | [(.updated_at // .created_at), (.body // ""), (.user.login // ""), (.html_url // "")] ]
         | .[]
         | @tsv')
   else
-    while IFS=$'\t' read -r created_at body url; do
-      [[ -n "${created_at}" ]] || continue
-      if ! agent_review_quota_timestamp_on_local_day "${created_at}" "${today}"; then
+    while IFS=$'\t' read -r anchor_at body url; do
+      [[ -n "${anchor_at}" ]] || continue
+      if ! agent_review_quota_timestamp_on_local_day "${anchor_at}" "${today}"; then
         continue
       fi
       if agent_review_profile_text_is_quota_exhausted "${body}"; then
         match_url="${url}"
         retry_after=''
         if declare -F agent_review_profile_text_quota_retry_after_iso >/dev/null; then
-          retry_after="$(agent_review_profile_text_quota_retry_after_iso "${body}" "${created_at}" || true)"
+          retry_after="$(agent_review_profile_text_quota_retry_after_iso "${body}" "${anchor_at}" || true)"
         fi
         match_retry="${retry_after}"
       fi
@@ -2113,7 +2129,7 @@ agent_review_quota_exhaustion_issue_comment_signal_today() {
       --arg re "${agent_review_profile_request_login_regex}" '
       [ .[] | .[] | select((.user.login // "") | test($re;"i")) ]
       | .[]
-      | [.created_at, (.body // ""), (.html_url // "")]
+      | [(.updated_at // .created_at), (.body // ""), (.html_url // "")]
       | @tsv')
   fi
   if [[ -n "${match_url}" ]]; then
@@ -2296,6 +2312,68 @@ agent_review_pr_issue_comments_json() {
   printf '%s' "${api_json}"
 }
 
+# Fetch PR timeline events (REST paginate). Copilot credit exhaustion may appear only as
+# timeline event copilot_work_finished_failure (no issue comment / review body).
+# On API failure returns [].
+agent_review_pr_timeline_json() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local owner name exit_code api_json
+
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  exit_code=0
+  api_json="$(ar_runner_gh_api_stream "agent-review pr timeline" \
+    -H 'Accept: application/vnd.github.mockingbird-preview+json' \
+    "repos/${owner}/${name}/issues/${pr}/timeline" --paginate)" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "${api_json}" ]]; then
+    printf '[]\n'
+    return 0
+  fi
+  printf '%s' "${api_json}"
+}
+
+# True when PR timeline has a copilot_work_finished_failure today from a Copilot GitHub App.
+# Prints evidence URL (event fragment when id is present). Non-quota failures of this event
+# type also mark exhausted for the local day — acceptable for agent-review skip caches.
+agent_review_copilot_timeline_quota_failure_today() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r timeline_json="${3:-}"
+  local today event_id created_at last_id last_at
+
+  [[ -n "${repo}" && -n "${pr}" && -n "${timeline_json}" ]] || return 1
+  today="$(agent_review_copilot_quota_local_day)"
+  last_id=''
+  last_at=''
+  while IFS=$'\t' read -r event_id created_at; do
+    [[ -n "${created_at}" ]] || continue
+    if ! agent_review_quota_timestamp_on_local_day "${created_at}" "${today}"; then
+      continue
+    fi
+    last_id="${event_id}"
+    last_at="${created_at}"
+  done < <(ar_runner_jq_file "agent-review copilot timeline quota failure" "${timeline_json}" -rs '
+    [
+      .[]
+      | .[]
+      | select(.event == "copilot_work_finished_failure")
+      | select((.performed_via_github_app.slug // "") | test("copilot"; "i"))
+    ]
+    | sort_by(.created_at // "")
+    | .[]
+    | [(.id | tostring), (.created_at // "")]
+    | @tsv')
+  [[ -n "${last_at}" ]] || return 1
+  if [[ -n "${last_id}" && "${last_id}" != 'null' ]]; then
+    printf 'https://github.com/%s/pull/%s#event-%s\n' "${repo}" "${pr}" "${last_id}"
+  else
+    printf 'https://github.com/%s/pull/%s\n' "${repo}" "${pr}"
+  fi
+  return 0
+}
+
 # Observe quota for one agent on the current PR head. Head reviews/checks run first so a
 # successful review on this PR clears stale exhaustion cached from other PRs. Returns 0 when
 # the daily cache was updated.
@@ -2306,6 +2384,7 @@ agent_review_quota_observe_agent_on_pr() {
   local -r snapshot="$4"
   local -r comments_json="$5"
   local agent_id review_body run_json reason evidence_url retry_after submitted_at signal
+  local timeline_json
 
   agent_id="${agent_review_profile_id:-}"
   [[ -n "${agent_id}" ]] || return 1
@@ -2399,6 +2478,28 @@ agent_review_quota_observe_agent_on_pr() {
     fi
     agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}" "${evidence_url}" "${retry_after}"
     return 0
+  fi
+
+  # Copilot may exhaust credits with only a timeline event (no comment/review body).
+  # Non-quota copilot_work_finished_failure events also mark exhausted for today.
+  # Gate the paginated timeline fetch behind the day-scoped quota cache so we probe at
+  # most once per local day (positive exhaustion or negative timeline_probed).
+  if [[ "${agent_id}" == 'copilot' ]]; then
+    if agent_review_agent_quota_exhausted_for_agent copilot \
+      || agent_review_agent_quota_confirmed_for_agent copilot \
+      || agent_review_copilot_timeline_probed_today; then
+      return 1
+    fi
+    timeline_json="$(agent_review_pr_timeline_json "${repo}" "${pr}")"
+    evidence_url=''
+    if evidence_url="$(agent_review_copilot_timeline_quota_failure_today \
+      "${repo}" "${pr}" "${timeline_json}")"; then
+      reason="Copilot timeline event copilot_work_finished_failure on ${repo}#${pr} (credits or work failure; treated as quota exhausted for today)."
+      agent_review_quota_mark_exhausted_for_agent copilot "${reason}" "${evidence_url}"
+      return 0
+    fi
+    agent_review_copilot_quota_mark_timeline_probed \
+      "Copilot timeline on ${repo}#${pr} had no same-day copilot_work_finished_failure."
   fi
 
   return 1

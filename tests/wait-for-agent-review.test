@@ -929,6 +929,76 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== static: Copilot timeline quota failure ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'copilot_work_finished_failure' "$lib" \
+  && grep -qF 'agent_review_pr_timeline_json' "$lib" \
+  && grep -qF 'agent_review_copilot_timeline_quota_failure_today' "$lib" \
+  && grep -qF 'agent_review_copilot_timeline_probed_today' "$lib" \
+  && grep -qF 'agent_review_copilot_quota_mark_timeline_probed' "$quota_lib" \
+  && awk '
+    /agent_review_quota_observe_agent_on_pr\(\)/ { in_fn=1 }
+    in_fn && /agent_review_copilot_timeline_quota_failure_today/ { found=1 }
+    in_fn && /agent_review_copilot_timeline_probed_today/ { gated=1 }
+    in_fn && /^}/ { if (found && gated) exit 0; exit 1 }
+    END { exit((found && gated) ? 0 : 1) }
+  ' "$lib" \
+  && grep -qF 'copilot_work_finished_failure' "$agents_md"; then
+  printf '[PASS] copilot timeline: quota failure detection wired into observe + AGENTS.md\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot timeline: missing timeline quota helpers or observe wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+timeline_today_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+timeline_yesterday_ts="$(date -u -d 'yesterday' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+  || date -u -v-1d +%Y-%m-%dT%H:%M:%SZ)"
+timeline_ok_json="$(printf \
+  '[{"id":424242,"event":"copilot_work_finished_failure","created_at":"%s","performed_via_github_app":{"slug":"copilot-swe-agent"}}]' \
+  "${timeline_today_ts}")"
+timeline_wrong_app_json="$(printf \
+  '[{"id":1,"event":"copilot_work_finished_failure","created_at":"%s","performed_via_github_app":{"slug":"other-bot"}}]' \
+  "${timeline_today_ts}")"
+timeline_yesterday_json="$(printf \
+  '[{"id":2,"event":"copilot_work_finished_failure","created_at":"%s","performed_via_github_app":{"slug":"copilot-swe-agent"}}]' \
+  "${timeline_yesterday_ts}")"
+# shellcheck disable=SC2016  # bash -c asserts timeline helper against fixture JSON
+if evidence="$(bash -c "
+  source '${lib}'
+  agent_review_copilot_timeline_quota_failure_today \
+    'the-hcma/mock-repo' 367 '${timeline_ok_json}'
+")" \
+  && [[ "${evidence}" == 'https://github.com/the-hcma/mock-repo/pull/367#event-424242' ]]; then
+  printf '[PASS] copilot timeline: today failure with copilot app returns evidence URL\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot timeline: expected event evidence URL (got %s)\n' "${evidence:-<empty>}"
+  fail=$(( fail + 1 ))
+fi
+if bash -c "
+  source '${lib}'
+  ! agent_review_copilot_timeline_quota_failure_today \
+    'the-hcma/mock-repo' 367 '${timeline_wrong_app_json}'
+"; then
+  printf '[PASS] copilot timeline: non-copilot app slug is ignored\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot timeline: non-copilot app should return 1\n'
+  fail=$(( fail + 1 ))
+fi
+if bash -c "
+  source '${lib}'
+  ! agent_review_copilot_timeline_quota_failure_today \
+    'the-hcma/mock-repo' 367 '${timeline_yesterday_json}'
+"; then
+  printf '[PASS] copilot timeline: yesterday failure is ignored for local day\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot timeline: yesterday event should return 1\n'
+  fail=$(( fail + 1 ))
+fi
+
 # shellcheck disable=SC2016  # static assert matches literal source text
 if grep -qF 'agent_review_latest_nonempty_agent_review_body_on_head' "$lib" \
   && grep -qF 'agent_review_head_has_actionable_agent_review_on_head' "$lib" \
@@ -1394,6 +1464,52 @@ else
   fail=$(( fail + 1 ))
 fi
 
+# Prefer updated_at over created_at as the retry_after anchor (issue #366).
+if retry_iso="$(bash -c "
+  source '${coderabbit_profile}'
+  agent_review_profile_text_quota_retry_after_iso \
+    'Next review available in: **59 minutes**' \
+    '2026-07-14T12:30:00Z'
+")" && [[ "${retry_iso}" == '2026-07-14T13:29:00Z' ]]; then
+  printf '[PASS] coderabbit profile: updated_at anchor later than created_at drives retry_after\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: updated_at-anchored retry_after failed (got %s)\n' \
+    "${retry_iso:-empty}"
+  fail=$(( fail + 1 ))
+fi
+
+# Signal-today prefers updated_at // created_at for day filter + retry_after (issue #366).
+tmp_signal_updated="$(mktemp)"
+# Single page array (gh --paginate + jq -s shape). created_at early, updated_at later.
+cat >"${tmp_signal_updated}" <<'EOF'
+[
+  {
+    "user": {"login": "coderabbitai"},
+    "created_at": "2026-07-14T10:00:00Z",
+    "updated_at": "2026-07-14T12:30:00Z",
+    "body": "Review limit reached. Next review available in: **59 minutes**",
+    "html_url": "https://example.test/cr-updated"
+  }
+]
+EOF
+if signal_out="$(bash -c "
+  source '${lib}'
+  source '${coderabbit_profile}'
+  agent_review_use_agent coderabbit
+  # Pin local day to the fixture date so the day filter is deterministic.
+  agent_review_copilot_quota_local_day() { printf '2026-07-14'; }
+  agent_review_quota_exhaustion_issue_comment_signal_today \"\$(cat '${tmp_signal_updated}')\"
+")" \
+  && [[ "${signal_out}" == *$'\t2026-07-14T13:29:00Z' ]]; then
+  printf '[PASS] quota signal: retry_after uses updated_at when later than created_at\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota signal: updated_at retry_after failed (got %s)\n' "${signal_out:-empty}"
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_signal_updated}"
+
 # PR #346 wording: "Next review available in: 28 seconds" (issue #347).
 if retry_iso="$(bash -c "
   source '${coderabbit_profile}'
@@ -1591,11 +1707,33 @@ if grep -qF 'cmd_loop_handle_coderabbit_rate_limit' "$wait_script" \
   && grep -qF 'skipping CodeRabbit rate-limit sleep' "$wait_script" \
   && grep -qF 'agent_review_default_coderabbit_rate_limit_wait_max_s' "$lib" \
   && grep -qF 'AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX' "$lib" \
-  && grep -qF 'exceeds wait max' "$wait_script"; then
-  printf '[PASS] loop: CodeRabbit rate-limit wait then on-push wait (no @coderabbitai nudge)\n'
+  && grep -qF 'agent_review_default_coderabbit_rate_limit_wait_max_s=3600' "$lib" \
+  && ! grep -qF 'exceeds wait max' "$wait_script" \
+  && grep -qF 'sleeping chunk' "$wait_script" \
+  && grep -qF 'updatedAt' "${quota_lib}" \
+  && grep -qF 'updated_at // .created_at' "$lib" \
+  && grep -qF 'coderabbit_rate_limited' "$lib"; then
+  printf '[PASS] loop: CodeRabbit chunked rate-limit wait then on-push wait (no @coderabbitai nudge)\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] loop: missing CodeRabbit on-push rate-limit wiring\n'
+  printf '[FAIL] loop: missing CodeRabbit chunked on-push rate-limit wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+# Docs: on_push / no @coderabbitai review policy (issue #364).
+if grep -qF '@coderabbitai review' "$agents_md" \
+  && grep -qF 'on_push' "$agents_md" \
+  && grep -qF 'chunked sleep' "$agents_md" \
+  && grep -qF '@coderabbitai review' "$rule" \
+  && grep -qF 'on_push' "$rule" \
+  && grep -qF 'chunked sleep' "$rule" \
+  && grep -qF '@coderabbitai review' "${script_dir}/../scripts/lib/repo-practices-cursor/pr-ship-and-review.mdc" \
+  && ! grep -qiF 'treated as exhausted' "${script_dir}/../etc/agent-review.env.example" \
+  && grep -qF 'sleep chunk' "${script_dir}/../etc/agent-review.env.example"; then
+  printf '[PASS] docs: CodeRabbit on_push / no @coderabbitai review + chunked sleep (#364/#366)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] docs: missing CodeRabbit on_push / chunked-sleep policy wording\n'
   fail=$(( fail + 1 ))
 fi
 

@@ -441,6 +441,19 @@ When CI is green, run the **agent review loop** documented in **`.cursor/rules/p
 3. **`./scripts/wait-for-agent-review complete --pr <n>`** when `check` reports `complete_ready`, or let **`loop`** exit **0** when nothing is outstanding (no pending feedback, no in-flight agent wait, CodeRabbit idle).
 4. Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`.
 
+#### CodeRabbit on_push policy (no `@coderabbitai review`)
+
+CodeRabbit reviews run **automatically on push**. Under normal circumstances **do not** post
+`@coderabbitai review` — `loop` / `request` refuse that nudge. Exceptions:
+
+- After an explicit CodeRabbit **pause** / **resume** (operator-driven).
+- Last-resort **`@coderabbitai full review`** only after the loop has waited out a documented
+  quota / “Next review available in” window and automatic on-push review still never fires.
+
+The loop honors CodeRabbit “Next review available in …” via **chunked sleep**
+(`AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX`, default 60m chunks; issue #366). It does **not**
+auto-nudge `@coderabbitai` after the wait — it clears observed exhaustion and waits for on_push.
+
 #### Early-complete loop and per-agent quota skip
 
 - **Nothing outstanding:** after all threads are addressed, CI is green, and the PR is merge-ready,
@@ -453,6 +466,11 @@ When CI is green, run the **agent review loop** documented in **`.cursor/rules/p
 Per-agent daily quota caches skip review requests for exhausted agents (CodeRabbit, Copilot, Bugbot)
 and probe the next agent in `AGENT_REVIEW_QUOTA_FALLBACK_CHAIN` (see
 `.cursor/rules/pr-ship-and-review.mdc`).
+
+**Copilot timeline failures:** credit exhaustion sometimes appears only as a PR timeline event
+`copilot_work_finished_failure` (GitHub App `copilot-swe-agent`) with no issue comment or review
+body. Quota observe scans that timeline event for the local calendar day. Non-quota work failures
+of the same event type also mark Copilot exhausted for the day (acceptable for skip caches).
 
 Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`. Set `AGENT_REVIEW_AGENT=copilot` or another supported profile under `scripts/lib/agent-review-profiles/`.
 
