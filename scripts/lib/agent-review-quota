@@ -238,17 +238,20 @@ agent_review_copilot_quota_mark_probe_requested() {
   local -r reason="${1:-Copilot review requested to probe quota.}"
 
   agent_review_copilot_quota_read_cache || true
+  # Clear confirmed: a new ask can still hit credit exhaustion (timeline failure).
   agent_review_copilot_quota_write_cache \
     "${agent_review_copilot_quota_exhausted_today:-0}" \
     probe_requested "${reason}" \
-    "${agent_review_copilot_quota_confirmed_today:-0}" 1
+    0 1
 }
 
 # Record a same-day Copilot timeline probe with no exhaustion signal (negative cache).
-# Does not mark confirmed or exhausted — only prevents re-fetching the PR timeline today.
+# Does not mark confirmed or exhausted — only prevents re-fetching the PR timeline today
+# when no @copilot ask is outstanding (probe_requested is preserved from the prior write).
 agent_review_copilot_quota_mark_timeline_probed() {
   local -r reason="${1:-Copilot PR timeline probed; no same-day quota failure.}"
 
+  agent_review_copilot_quota_read_cache || true
   agent_review_copilot_quota_write_cache 0 timeline_probed "${reason}" 0
 }
 
@@ -949,9 +952,42 @@ EOF
 agent_review_coderabbit_quota_mark_exhausted() {
   local -r reason="${1:-CodeRabbit usage limit reached.}"
   local -r evidence_url="${2:-}"
-  local -r retry_after="${3:-}"
+  local retry_after="${3:-}"
+  local existing_retry now evidence_keep now_epoch existing_epoch new_epoch
 
-  agent_review_coderabbit_quota_write_cache 1 observed "${reason}" '' '' "${evidence_url}" "${retry_after}"
+  # Prefer the later still-future retry_after so a stale probe on another PR
+  # (expired "Next review available…") cannot clobber a newer cooldown window.
+  # Compare via UTC epochs — not locale-sensitive [[ string < string ]] (CR on #368).
+  agent_review_coderabbit_quota_read_cache || true
+  existing_retry="${agent_review_coderabbit_quota_cache_retry_after:-}"
+  now="$(runner_exec_stdout "coderabbit quota mark_exhausted now" -- date -u +%Y-%m-%dT%H:%M:%SZ)"
+  now_epoch="$(runner_exec_stdout "coderabbit quota mark_exhausted now epoch" -- \
+    date -u -d "${now}" +%s)"
+  evidence_keep="${evidence_url}"
+  if [[ -n "${existing_retry}" ]]; then
+    existing_epoch="$(runner_exec_stdout "coderabbit quota mark_exhausted existing epoch" -- \
+      date -u -d "${existing_retry}" +%s 2>/dev/null || true)"
+    if [[ -n "${existing_epoch}" ]] && (( now_epoch < existing_epoch )); then
+      if [[ -z "${retry_after}" ]]; then
+        retry_after="${existing_retry}"
+        if [[ -z "${evidence_keep}" ]]; then
+          evidence_keep="${agent_review_coderabbit_quota_cache_evidence_url:-}"
+        fi
+      else
+        new_epoch="$(runner_exec_stdout "coderabbit quota mark_exhausted new epoch" -- \
+          date -u -d "${retry_after}" +%s 2>/dev/null || true)"
+        if [[ -z "${new_epoch}" ]] || (( new_epoch < existing_epoch )); then
+          retry_after="${existing_retry}"
+          if [[ -z "${evidence_keep}" ]]; then
+            evidence_keep="${agent_review_coderabbit_quota_cache_evidence_url:-}"
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  agent_review_coderabbit_quota_write_cache 1 observed "${reason}" '' '' \
+    "${evidence_keep}" "${retry_after}"
 }
 
 agent_review_coderabbit_quota_mark_confirmed() {
@@ -1318,7 +1354,7 @@ agent_review_agent_quota_cache_retry_after_for_agent() {
 # True when <agent_id> daily quota cache reports exhaustion (no log output).
 agent_review_agent_quota_exhausted_for_agent() {
   local -r agent_id="$1"
-  local exhausted retry_after now
+  local exhausted retry_after now now_epoch retry_epoch
 
   case "${agent_id}" in
     copilot)
@@ -1342,8 +1378,11 @@ agent_review_agent_quota_exhausted_for_agent() {
     return 1
   fi
   if [[ -n "${retry_after}" ]]; then
-    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    if [[ "${now}" > "${retry_after}" ]]; then
+    now="$(runner_exec_stdout "agent-review quota now iso" -- date -u +%Y-%m-%dT%H:%M:%SZ)"
+    now_epoch="$(runner_exec_stdout "agent-review quota now epoch" -- date -u -d "${now}" +%s)"
+    retry_epoch="$(runner_exec_stdout "agent-review quota retry epoch" -- \
+      date -u -d "${retry_after}" +%s 2>/dev/null || true)"
+    if [[ -n "${retry_epoch}" ]] && (( now_epoch > retry_epoch )); then
       return 1
     fi
   fi

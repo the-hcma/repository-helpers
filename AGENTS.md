@@ -441,18 +441,21 @@ When CI is green, run the **agent review loop** documented in **`.cursor/rules/p
 3. **`./scripts/wait-for-agent-review complete --pr <n>`** when `check` reports `complete_ready`, or let **`loop`** exit **0** when nothing is outstanding (no pending feedback, no in-flight agent wait, CodeRabbit idle).
 4. Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`.
 
-#### CodeRabbit on_push policy (no `@coderabbitai review`)
+#### CodeRabbit on_push policy (gated full review only)
 
-CodeRabbit reviews run **automatically on push**. Under normal circumstances **do not** post
-`@coderabbitai review` — `loop` / `request` refuse that nudge. Exceptions:
+A **new push** triggers CodeRabbit automatically (`on_push`). Do **not** post
+`@coderabbitai review` (or any ordinary review prompt) — `loop` / `request` refuse them.
 
-- After an explicit CodeRabbit **pause** / **resume** (operator-driven).
-- Last-resort **`@coderabbitai full review`** only after the loop has waited out a documented
-  quota / “Next review available in” window and automatic on-push review still never fires.
+If CodeRabbit is out of quota, it reports a **cooldown** (“Next review available in …” /
+“More reviews will be available in …” / rate-limit notice). Then:
 
-The loop honors CodeRabbit “Next review available in …” via **chunked sleep**
-(`AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX`, default 60m chunks; issue #366). It does **not**
-auto-nudge `@coderabbitai` after the wait — it clears observed exhaustion and waits for on_push.
+1. Wait out that cooldown (chunked sleep via `AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX`).
+2. Wait an extra **grace** (`AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE`, default **60s**).
+3. Only if there is still **no real review** on the current head, the loop posts a one-shot
+   **`@coderabbitai full review`** (idempotent per head). Rate-limit stubs that merely mention
+   the head SHA are **not** a review.
+
+Operators/agents must follow the same gate — never full-review early, never plain `review`.
 
 #### Early-complete loop and per-agent quota skip
 

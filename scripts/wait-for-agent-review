@@ -1254,7 +1254,9 @@ cmd_loop_nothing_outstanding() {
 }
 
 # Sleep until CodeRabbit retry_after (if any), then wait for automatic on-push review.
-# CodeRabbit is an on-push agent — never post an explicit @coderabbitai nudge (issue #347).
+# Ordinary "@coderabbitai review" is never posted. After cooldown +
+# AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE (default 60s), if still no review on head,
+# post a one-shot "@coderabbitai full review" (issue #347 / operator policy).
 # Long cooldowns sleep in WAIT_MAX chunks rather than abandoning the wait (issue #366).
 # Returns 0 when this iteration should continue (rate-limit handling consumed the turn).
 cmd_loop_handle_coderabbit_rate_limit() {
@@ -1262,12 +1264,25 @@ cmd_loop_handle_coderabbit_rate_limit() {
   local -r pr="$2"
   local -r head="$3"
   local -r snapshot="${4:-}"
-  local saved_agent retry_after remaining sleep_s
+  local saved_agent retry_after remaining sleep_s retry_epoch now_epoch grace_s grace_remaining
+  local profiles_dir coderabbit_profile _owner _name sent_rc
 
   if [[ -n "${snapshot}" ]] \
     && agent_review_delivered_recognized_pass_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
     printf 'wait-for-agent-review: skipping CodeRabbit rate-limit sleep — another agent delivered a recognized pass on head %s (PR #%s)\n' \
       "${head:0:7}" "${pr}" >&2
+    return 1
+  fi
+  # Commit status "CodeRabbit: Review completed" means on-push finished for this head —
+  # do not keep sleeping on a stale cooldown comment (often from an edited summarize body).
+  if agent_review_named_pr_check_succeeded "${repo}" "${pr}" 'CodeRabbit'; then
+    agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
+    agent_review_quota_mark_confirmed_for_agent 'coderabbit' \
+      "CodeRabbit commit status Review completed on ${repo}#${pr}." \
+      || true
+    printf 'wait-for-agent-review: CodeRabbit status succeeded on PR #%s — clearing rate-limit wait\n' \
+      "${pr}" >&2
+    agent_review_loop_wait_remove 'coderabbit' || true
     return 1
   fi
   retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent 'coderabbit')"
@@ -1307,16 +1322,106 @@ cmd_loop_handle_coderabbit_rate_limit() {
     sleep "${sleep_s}"
     return 0
   fi
-  # Cooldown elapsed: clear exhaustion and expect automatic CodeRabbit on-push review.
-  # Do not post @coderabbitai — on-push agents only run after pushes / their own schedule.
-  # Return 1 (do not consume the loop turn): returning 0 caused an infinite continue
-  # spin because observe rewrites the same past retry_after from today's billing comment
-  # on every iteration, re-entering this branch without ever reaching cmd_check / sleep.
-  agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
+
+  # Cooldown elapsed: wait POST_COOLDOWN_GRACE for on-push, then last-resort full review
+  # once if still missing. Keep observed cache (with past retry_after) until we finish so
+  # the next poll still sees retry_after after grace sleep.
   agent_review_loop_wait_add 'coderabbit' "${head}"
-  printf 'wait-for-agent-review: CodeRabbit rate-limit window elapsed — waiting for automatic on-push review on PR #%s (no @coderabbitai nudge)\n' \
-    "${pr}" >&2
+
+  if [[ -n "${snapshot}" ]] \
+    && cmd_loop_agent_response_seen "${repo}" "${pr}" "${head}" 'coderabbit' "${snapshot}"; then
+    agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
+    printf 'wait-for-agent-review: CodeRabbit rate-limit window elapsed — review already present on head %s (PR #%s)\n' \
+      "${head:0:7}" "${pr}" >&2
+    agent_review_loop_wait_remove 'coderabbit'
+    agent_review_use_agent "${saved_agent}"
+    return 1
+  fi
+
+  profiles_dir="$(cd "${script_dir}/lib/agent-review-profiles" && pwd)"
+  coderabbit_profile="${profiles_dir}/coderabbit"
+  # shellcheck disable=SC1090,SC1091  # profile loaded at runtime for last-resort helpers
+  source "${coderabbit_profile}"
+
+  sent_rc=0
+  agent_review_coderabbit_full_review_already_sent "${repo}" "${pr}" "${head}" || sent_rc=$?
+  if (( sent_rc == 0 )); then
+    agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
+    printf 'wait-for-agent-review: CodeRabbit full review already requested for head %s — waiting on PR #%s\n' \
+      "${head:0:7}" "${pr}" >&2
+    agent_review_use_agent "${saved_agent}"
+    return 1
+  fi
+  if (( sent_rc == 2 )); then
+    printf 'wait-for-agent-review: CodeRabbit full-review marker lookup failed for PR #%s — will retry\n' \
+      "${pr}" >&2
+    agent_review_use_agent "${saved_agent}"
+    return 0
+  fi
+
+  retry_epoch="$(runner_exec_stdout "coderabbit cooldown retry_after epoch" -- \
+    date -u -d "${retry_after}" +%s 2>/dev/null || true)"
+  now_epoch="$(runner_exec_stdout "coderabbit cooldown now epoch" -- date -u +%s)"
+  # shellcheck disable=SC2154  # agent_review_default_coderabbit_post_cooldown_grace_s from lib
+  grace_s="${agent_review_default_coderabbit_post_cooldown_grace_s}"
+  if [[ -z "${retry_epoch}" ]]; then
+    grace_remaining="${grace_s}"
+  else
+    grace_remaining=$((retry_epoch + grace_s - now_epoch))
+  fi
+  if (( grace_remaining > 0 )); then
+    sleep_s="${grace_remaining}"
+    if (( sleep_s > agent_review_default_coderabbit_rate_limit_wait_max_s )); then
+      sleep_s="${agent_review_default_coderabbit_rate_limit_wait_max_s}"
+    fi
+    if (( sleep_s < 5 )); then
+      sleep_s=5
+    fi
+    printf 'wait-for-agent-review: CodeRabbit cooldown elapsed at %s — waiting %ss grace (of %ss) for on-push review before full review on PR #%s\n' \
+      "${retry_after}" "${sleep_s}" "${grace_s}" "${pr}" >&2
+    agent_review_use_agent "${saved_agent}"
+    run_command "coderabbit post-cooldown grace sleep" sleep "${sleep_s}"
+    return 0
+  fi
+
+  # Re-check after grace (parameter snapshot may be stale).
+  local fresh_snapshot
+  read -r _owner _name < <(agent_review_repo_parts "${repo}")
+  fresh_snapshot="$(agent_review_graphql_pr_snapshot "${_owner}" "${_name}" "${pr}" 2>/dev/null || true)"
+  if [[ -n "${fresh_snapshot}" ]] \
+    && cmd_loop_agent_response_seen "${repo}" "${pr}" "${head}" 'coderabbit' "${fresh_snapshot}"; then
+    agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
+    printf 'wait-for-agent-review: CodeRabbit on-push review arrived during grace on head %s (PR #%s) — skipping full review\n' \
+      "${head:0:7}" "${pr}" >&2
+    agent_review_loop_wait_remove 'coderabbit'
+    agent_review_use_agent "${saved_agent}"
+    return 1
+  fi
+  if agent_review_named_pr_check_succeeded "${repo}" "${pr}" 'CodeRabbit'; then
+    agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
+    printf 'wait-for-agent-review: CodeRabbit status succeeded after grace on PR #%s — skipping full review\n' \
+      "${pr}" >&2
+    agent_review_loop_wait_remove 'coderabbit'
+    agent_review_use_agent "${saved_agent}"
+    return 1
+  fi
+  if agent_review_named_pr_check_is_pending "${repo}" "${pr}" 'CodeRabbit'; then
+    printf 'wait-for-agent-review: CodeRabbit workflow still in progress on PR #%s — deferring last-resort full review\n' \
+      "${pr}" >&2
+    agent_review_use_agent "${saved_agent}"
+    return 0
+  fi
+
+  printf 'wait-for-agent-review: CodeRabbit still missing after cooldown+%ss — posting last-resort full review on PR #%s head %s\n' \
+    "${grace_s}" "${pr}" "${head:0:7}" >&2
+  if ! agent_review_profile_request_last_resort_full_review "${repo}" "${pr}" "${head}"; then
+    printf 'wait-for-agent-review: failed to request CodeRabbit full review; retrying\n' >&2
+    agent_review_use_agent "${saved_agent}"
+    return 0
+  fi
+  agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
   agent_review_use_agent "${saved_agent}"
+  # Return 1 so observe-rewritten past retry_after does not spin forever after the nudge.
   return 1
 }
 
@@ -1573,6 +1678,15 @@ cmd_loop() {
     fi
     cmd_loop_observe_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}"
     agent_review_sync_active_probe_agent || true
+    # Wait for an in-flight CodeRabbit on-push check before last-resort full review.
+    # handle_coderabbit_rate_limit used to run first and could post @coderabbitai full review
+    # while the push-triggered workflow was still pending (repository-helpers#368).
+    if ! agent_review_agent_quota_exhausted_for_agent 'coderabbit' \
+      && agent_review_named_pr_check_is_pending "${repo}" "${pr}" 'CodeRabbit'; then
+      printf 'wait-for-agent-review loop: CodeRabbit workflow in progress on PR #%s…\n' "${pr}" >&2
+      sleep "${agent_review_default_poll_interval_s}"
+      continue
+    fi
     if cmd_loop_handle_coderabbit_rate_limit "${repo}" "${pr}" "${head}" "${snapshot}"; then
       continue
     fi
@@ -1582,13 +1696,6 @@ cmd_loop() {
     elif [[ "${head}" != "${last_head}" ]]; then
       cmd_loop_maybe_request_agents_on_head "${repo}" "${pr}" "${head}" "${last_head}"
       last_head="${head}"
-    fi
-
-    if ! agent_review_agent_quota_exhausted_for_agent 'coderabbit' \
-      && agent_review_named_pr_check_is_pending "${repo}" "${pr}" 'CodeRabbit'; then
-      printf 'wait-for-agent-review loop: CodeRabbit workflow in progress on PR #%s…\n' "${pr}" >&2
-      sleep "${agent_review_default_poll_interval_s}"
-      continue
     fi
 
     check_exit=0
