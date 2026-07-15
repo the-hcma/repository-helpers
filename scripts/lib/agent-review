@@ -10,8 +10,11 @@ agent_review_default_pr_timeout_s=43200
 agent_review_default_idle_break_s=900
 agent_review_default_transient_retries=5
 agent_review_default_transient_retry_sleep_s=30
-# Max CodeRabbit rate-limit sleep chunk (default 60m). Longer cooldowns are slept in chunks (issue #366).
+# Max CodeRabbit rate-limit sleep chunk (default 60m). Safety ceiling for a single sleep (issue #366).
 agent_review_default_coderabbit_rate_limit_wait_max_s=3600
+# Feedback-poll interval while waiting on CodeRabbit retry_after (default 60s; issue #369).
+# Between chunks the loop re-checks pending threads / issue comments and can exit 3 early.
+agent_review_default_coderabbit_rate_limit_poll_s=60
 # After CodeRabbit retry_after, wait this grace before a last-resort @coderabbitai full review (default 60s).
 agent_review_default_coderabbit_post_cooldown_grace_s=60
 
@@ -288,6 +291,13 @@ agent_review_load_env() {
       agent_review_die "invalid AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX: ${AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX@Q}"
     fi
     agent_review_default_coderabbit_rate_limit_wait_max_s="${parsed_cr_wait}"
+  fi
+  if [[ -n "${AGENT_REVIEW_CODERABBIT_RATE_LIMIT_POLL:-}" ]]; then
+    local parsed_cr_poll
+    if ! parsed_cr_poll="$(agent_review_parse_duration_seconds "${AGENT_REVIEW_CODERABBIT_RATE_LIMIT_POLL}")"; then
+      agent_review_die "invalid AGENT_REVIEW_CODERABBIT_RATE_LIMIT_POLL: ${AGENT_REVIEW_CODERABBIT_RATE_LIMIT_POLL@Q}"
+    fi
+    agent_review_default_coderabbit_rate_limit_poll_s="${parsed_cr_poll}"
   fi
   if [[ -n "${AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE:-}" ]]; then
     local parsed_cr_grace
@@ -1526,13 +1536,8 @@ agent_review_status_json_from_snapshot() {
   needs_resolve_human="$(ar_runner_jq_file "agent-review status human needs resolve count" "${needs_resolve_human_json}" 'length')"
   open_all="$(agent_review_open_thread_count_from_snapshot "${snapshot}")"
   pending_all="$(agent_review_pending_thread_count_from_snapshot "${repo}" "${pr}" "${snapshot}")"
-  # CodeRabbit posts a commit status ("Review completed") even when there is no issue-comment
-  # body mentioning the head SHA. Treat that as fresh for status/complete when threads are clear.
-  if [[ "${fresh}" != 'true' ]] \
-    && agent_review_named_pr_check_succeeded "${repo}" "${pr}" 'CodeRabbit' \
-    && (( pending_all == 0 )); then
-    fresh=true
-  fi
+  # Do not treat CodeRabbit commit status alone as fresh — complete requires a real
+  # agent sign-off on this head (review body / Bugbot clean check).
   ci_json="$(agent_review_ci_status_json_for_pr "${repo}" "${pr}")"
   ci_conclusion="$(ar_runner_jq_file "agent-review status ci conclusion" "${ci_json}" -r '.ci_conclusion')"
   ci_ready="$(ar_runner_jq_file "agent-review status ci ready" "${ci_json}" -r '.ci_ready')"
@@ -1557,11 +1562,6 @@ agent_review_status_json_from_snapshot() {
   elif [[ "${head_check_clean}" == 'true' ]] && (( unaddressed == 0 )); then
     agent_review_empty=true
   elif [[ "${pass_delivered_by_fallback}" == 'true' ]]; then
-    agent_review_empty=true
-  elif [[ "${fresh}" == 'true' ]] \
-    && agent_review_named_pr_check_succeeded "${repo}" "${pr}" 'CodeRabbit' \
-    && (( pending_all == 0 )) \
-    && (( unaddressed == 0 )); then
     agent_review_empty=true
   else
     agent_review_empty=false
@@ -1601,12 +1601,11 @@ agent_review_status_json_from_snapshot() {
     wait_reason="no_fresh_agent_review_on_head"
   fi
   if [[ "${pr_merged}" == 'true' ]] \
-    || { { [[ "${fresh}" == 'true' ]] || [[ "${pass_delivered_by_fallback}" == 'true' ]]; } \
+    || { agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}" \
       && [[ "${ci_ready}" == 'true' ]] \
       && [[ "${pending_all}" -eq 0 ]] \
       && [[ "${open_all}" -eq 0 ]] \
-      && [[ "${merge_ready}" == 'true' ]] \
-      && [[ "${agent_review_empty}" == 'true' ]]; }; then
+      && [[ "${merge_ready}" == 'true' ]]; }; then
     complete_ready=true
   else
     complete_ready=false
@@ -1866,17 +1865,30 @@ agent_review_print_ci_failures() {
   done < <(ci_rollup_failed_lines "${latest}" | head -n 20)
 }
 
-# True when copilot or bugbot delivered a recognized pass (no actionable feedback) on head.
+# True when copilot, bugbot, or coderabbit delivered a recognized pass (no actionable
+# feedback) on head — a real agent sign-off, not a rate-limit stub or bare commit status.
 agent_review_delivered_recognized_pass_on_head() {
   local -r snapshot="$1"
   local -r head="$2"
   local -r repo="$3"
   local -r pr="$4"
-  local saved_agent agent review_body
+  local saved_agent agent review_body check_state_json clean
 
   saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
-  for agent in copilot bugbot; do
+  for agent in copilot bugbot coderabbit; do
     agent_review_use_agent "${agent}"
+    if [[ "${agent_review_profile_uses_head_check:-false}" == 'true' ]]; then
+      if agent_review_head_check_complete_on_head "${repo}" "${head}"; then
+        check_state_json="$(agent_review_head_check_state_json "${repo}" "${head}")"
+        clean="$(ar_runner_jq_file "agent-review signed-off head check clean" \
+          "${check_state_json}" -r '.clean')"
+        if [[ "${clean}" == 'true' ]]; then
+          agent_review_use_agent "${saved_agent}"
+          return 0
+        fi
+      fi
+      continue
+    fi
     if ! declare -F agent_review_profile_fresh_on_head >/dev/null 2>&1; then
       continue
     fi
@@ -1896,6 +1908,11 @@ agent_review_delivered_recognized_pass_on_head() {
   done
   agent_review_use_agent "${saved_agent}"
   return 1
+}
+
+# Alias: at least one agent signed off on this head (same as recognized pass).
+agent_review_agent_signed_off_on_head() {
+  agent_review_delivered_recognized_pass_on_head "$@"
 }
 
 # True when the active agent's daily quota is exhausted and waiting would be futile.

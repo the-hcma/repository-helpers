@@ -18,7 +18,7 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | pnpm cutover | `scripts/grandfather-pnpm-release-age` | One-time `minimumReleaseAgeExclude` for existing lockfiles. |
 | Systemd | `scripts/setup-service`, `scripts/setup-github-repo-lint`, `scripts/show-services` | Install timers/units; status summary. |
 | Deploy hook | `scripts/on-deploy` | Example hook; consumer repos implement their own. |
-| Agent review | `scripts/wait-for-agent-review`, `scripts/trigger-agent-review` | PR review loop, triage, approve, operator email. |
+| Agent review | `scripts/wait-for-agent-review`, `scripts/trigger-agent-review` | PR review loop, triage, operator email (no self-approve). |
 | Dev workflow | `scripts/dev/start-development` | Worktree + Graphite sync entry point. |
 | Dev workflow | `scripts/dev/pre-pr-checks` | Local CI mirror (`bash -n`, `shellcheck`, all tests). |
 | Dev workflow | `scripts/dev/submit-stack` | `pre-pr-checks` → `gt submit` → `post-pr-submission-checks`. |
@@ -438,7 +438,11 @@ When CI is green, run the **agent review loop** documented in **`.cursor/rules/p
 
 1. Prefer **`./scripts/wait-for-agent-review loop --pr <n>`** (or `scripts/dev/ship-and-review` from submit).
 2. On exit **3**, triage each feedback item (inline thread or top-level issue comment): fix → **`reply-thread`** / **`reply-comment`** → **`resolve-thread`** / **`resolve-comment`** — never resolve without replying first. Use **`list-feedback`** to see pending items.
-3. **`./scripts/wait-for-agent-review complete --pr <n>`** when `check` reports `complete_ready`, or let **`loop`** exit **0** when nothing is outstanding (no pending feedback, no in-flight agent wait, CodeRabbit idle).
+3. When `check` reports `complete_ready: true`, run
+   `./scripts/wait-for-agent-review complete --pr <n>` (or let `loop` exit **0**).
+   `complete_ready` requires at least one **agent sign-off** on the current head
+   (Copilot/Bugbot empty pass, or a real CodeRabbit review body — not a rate-limit
+   stub and not a bare “CodeRabbit: Review completed” commit status alone).
 4. Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`.
 
 #### CodeRabbit on_push policy (gated full review only)
@@ -449,7 +453,10 @@ A **new push** triggers CodeRabbit automatically (`on_push`). Do **not** post
 If CodeRabbit is out of quota, it reports a **cooldown** (“Next review available in …” /
 “More reviews will be available in …” / rate-limit notice). Then:
 
-1. Wait out that cooldown (chunked sleep via `AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX`).
+1. Wait out that cooldown with **poll-while-rate-limited** sleeps
+   (`AGENT_REVIEW_CODERABBIT_RATE_LIMIT_POLL`, default **60s**; ceiling
+   `AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX`). Between poll chunks the loop re-checks
+   pending feedback and exits **3** immediately if human/agent triage is needed (issue #369).
 2. Wait an extra **grace** (`AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE`, default **60s**).
 3. Only if there is still **no real review** on the current head, the loop posts a one-shot
    **`@coderabbitai full review`** (idempotent per head). Rate-limit stubs that merely mention
@@ -461,8 +468,8 @@ Operators/agents must follow the same gate — never full-review early, never pl
 
 - **Nothing outstanding:** after all threads are addressed, CI is green, and the PR is merge-ready,
   `loop` completes as soon as it is not waiting on a requested Copilot/Bugbot review and CodeRabbit
-  is idle. `cmd_complete_idle` (early) approves and emails — **without** requiring Copilot
-  **“generated no new comments”**. `AGENT_REVIEW_CYCLE_TIMEOUT` is retained for compatibility only.
+  is idle. `cmd_complete_idle` (early) emails the operator — **without** requiring Copilot
+  **“generated no new comments”**, and **without** a `gh` self-approve. `AGENT_REVIEW_CYCLE_TIMEOUT` is retained for compatibility only.
 - **`AGENT_REVIEW_PR_TIMEOUT`** (default **12h**): non-convergence cap when review cycles keep
   iterating without reaching early-complete; exit **6** triggers give-up.
 

@@ -11,7 +11,7 @@
 #   reply-comment       Post a top-level PR comment in reply to agent feedback
 #   resolve-comment     Mark an issue comment addressed (requires operator reply)
 #   check               Exit 0 when complete_ready or PR merged
-#   complete            Approve PR + email operator (only when agent review is empty)
+#   complete            Email operator when agent review is complete (no PR self-approve)
 #   restack             Sync and restack when mergeStateStatus is BEHIND
 #   resolve-thread      Resolve one thread by GraphQL node id (requires human reply)
 #   reply-thread          Post an on-thread human reply (GraphQL)
@@ -654,45 +654,30 @@ cmd_check() {
 }
 
 cmd_complete() {
-  local repo pr status complete_ready gh_user existing pr_merged reviews_json
+  local repo pr status complete_ready pr_merged
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
   agent_review_require_cmd gh
   agent_review_require_cmd jq
   if agent_review_pr_is_merged "${repo}" "${pr}"; then
-    printf 'PR #%s is already merged — skipping approve/email\n' "${pr}" >&2
+    printf 'PR #%s is already merged — skipping complete email\n' "${pr}" >&2
     return 0
   fi
   status="$(cmd_status "${repo}" "${pr}")"
   pr_merged="$(wait_ar_jq_status "$status" '.pr_merged')"
   if [[ "${pr_merged}" == 'true' ]]; then
-    printf 'PR #%s is already merged — skipping approve/email\n' "${pr}" >&2
+    printf 'PR #%s is already merged — skipping complete email\n' "${pr}" >&2
     return 0
   fi
   complete_ready="$(wait_ar_jq_status "$status" '.complete_ready')"
   if [[ "${complete_ready}" != 'true' ]]; then
     agent_review_die 'complete requires agent and human review empty on current head with no unaddressed threads'
   fi
-  gh_user="$(ar_runner_gh_api_stream "gh api user login" user --jq '.login')"
-  reviews_json="$(ar_runner_gh_pr_jq "wait-for-agent-review pr reviews" "${repo}" "${pr}" reviews)"
-  existing="$(ar_runner_jq_file "wait-for-agent-review last user review state" "${reviews_json}" \
-    -r --arg user "${gh_user}" '
-      [.reviews[]
-        | select(.author.login == $user)
-        | select(.state != "PENDING")
-        | {state, submittedAt}]
-      | sort_by(.submittedAt)
-      | last
-      | .state // empty')"
-  if [[ "${existing}" != 'APPROVED' ]]; then
-    runner_exec "wait-for-agent-review pr approve" -- gh pr review "${pr}" --repo "${repo}" --approve \
-      --body "Agent review (${AGENT_REVIEW_AGENT:-copilot}): no new comments on current head."
-    printf 'Approved PR #%s as %s\n' "${pr}" "${gh_user}" >&2
-  else
-    printf 'PR #%s already approved by %s — skipping approve\n' "${pr}" "${gh_user}" >&2
-  fi
+  # Do not gh-approve: the authenticated operator often authors the PR, and GitHub
+  # rejects self-approvals. Merge remains an explicit operator step (merge-it).
   agent_review_email_complete "${repo}" "${pr}"
+  printf 'Agent review complete on PR #%s — emailed operator (no self-approve)\n' "${pr}" >&2
 }
 
 cmd_resolve_thread() {
@@ -1221,6 +1206,10 @@ cmd_loop_nothing_outstanding() {
     "${repo}" "${pr}" "${head}" "${snapshot}"; then
     return 1
   fi
+  # Head must have at least one agent sign-off (real pass) — not a bare CR status.
+  if ! agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    return 1
+  fi
   # Also block while a CodeRabbit workflow is actively running (even if wait list
   # was cleared by a stale prior-head signal).
   if ! agent_review_agent_quota_exhausted_for_agent 'coderabbit' \
@@ -1228,7 +1217,7 @@ cmd_loop_nothing_outstanding() {
     return 1
   fi
   if agent_review_agent_quota_rate_limited_for_agent 'coderabbit' \
-    && ! agent_review_delivered_recognized_pass_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    && ! agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
     return 1
   fi
   saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
@@ -1257,34 +1246,26 @@ cmd_loop_nothing_outstanding() {
 # Ordinary "@coderabbitai review" is never posted. After cooldown +
 # AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE (default 60s), if still no review on head,
 # post a one-shot "@coderabbitai full review" (issue #347 / operator policy).
-# Long cooldowns sleep in WAIT_MAX chunks rather than abandoning the wait (issue #366).
+# Long cooldowns wait until retry_after with short feedback-poll chunks (issues #366 / #369).
 # Returns 0 when this iteration should continue (rate-limit handling consumed the turn).
+# Returns 3 when pending human/agent feedback appears mid-wait (triage immediately).
 cmd_loop_handle_coderabbit_rate_limit() {
   local -r repo="$1"
   local -r pr="$2"
   local -r head="$3"
-  local -r snapshot="${4:-}"
+  local snapshot="${4:-}"
   local saved_agent retry_after remaining sleep_s retry_epoch now_epoch grace_s grace_remaining
   local profiles_dir coderabbit_profile _owner _name sent_rc
+  local poll_s pending_exit
 
   if [[ -n "${snapshot}" ]] \
-    && agent_review_delivered_recognized_pass_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
-    printf 'wait-for-agent-review: skipping CodeRabbit rate-limit sleep — another agent delivered a recognized pass on head %s (PR #%s)\n' \
+    && agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    printf 'wait-for-agent-review: skipping CodeRabbit rate-limit sleep — an agent signed off on head %s (PR #%s)\n' \
       "${head:0:7}" "${pr}" >&2
     return 1
   fi
-  # Commit status "CodeRabbit: Review completed" means on-push finished for this head —
-  # do not keep sleeping on a stale cooldown comment (often from an edited summarize body).
-  if agent_review_named_pr_check_succeeded "${repo}" "${pr}" 'CodeRabbit'; then
-    agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
-    agent_review_quota_mark_confirmed_for_agent 'coderabbit' \
-      "CodeRabbit commit status Review completed on ${repo}#${pr}." \
-      || true
-    printf 'wait-for-agent-review: CodeRabbit status succeeded on PR #%s — clearing rate-limit wait\n' \
-      "${pr}" >&2
-    agent_review_loop_wait_remove 'coderabbit' || true
-    return 1
-  fi
+  # Do not treat bare "CodeRabbit: Review completed" commit status as a sign-off.
+  # A rate-limit/summarize stub can still flip that status while no real review exists.
   retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent 'coderabbit')"
   if [[ -z "${retry_after}" ]]; then
     return 1
@@ -1292,34 +1273,79 @@ cmd_loop_handle_coderabbit_rate_limit() {
   saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
   agent_review_use_agent 'coderabbit'
   if agent_review_agent_quota_rate_limited_for_agent 'coderabbit'; then
-    remaining="$(agent_review_agent_quota_seconds_until_retry_for_agent 'coderabbit' || true)"
-    if [[ -z "${remaining}" ]]; then
-      remaining="${agent_review_default_poll_interval_s}"
-    fi
-    if (( remaining > 0 )); then
-      sleep_s=$((remaining + 5))
-    else
-      sleep_s=5
-    fi
-    # shellcheck disable=SC2154  # agent_review_default_coderabbit_rate_limit_wait_max_s from lib
-    if (( sleep_s > agent_review_default_coderabbit_rate_limit_wait_max_s )); then
-      sleep_s="${agent_review_default_coderabbit_rate_limit_wait_max_s}"
-    fi
-    if (( sleep_s < 5 )); then
-      sleep_s=5
-    fi
     agent_review_loop_wait_add 'coderabbit' "${head}"
-    # shellcheck disable=SC2154  # agent_review_default_coderabbit_rate_limit_wait_max_s from lib
-    if (( remaining > agent_review_default_coderabbit_rate_limit_wait_max_s )); then
-      printf 'wait-for-agent-review: CodeRabbit rate-limited until %s (%ss remaining) — sleeping chunk %ss of max %ss on PR #%s\n' \
-        "${retry_after}" "${remaining}" "${sleep_s}" \
-        "${agent_review_default_coderabbit_rate_limit_wait_max_s}" "${pr}" >&2
-    else
-      printf 'wait-for-agent-review: CodeRabbit rate-limited until %s — sleeping %ss on PR #%s\n' \
-        "${retry_after}" "${sleep_s}" "${pr}" >&2
-    fi
     agent_review_use_agent "${saved_agent}"
-    sleep "${sleep_s}"
+    # shellcheck disable=SC2154  # rate-limit poll/wait defaults assigned in scripts/lib/agent-review
+    poll_s="${agent_review_default_coderabbit_rate_limit_poll_s}"
+    if (( poll_s < 1 )); then
+      poll_s=1
+    fi
+    if (( poll_s < 5 )); then
+      poll_s=5
+    fi
+    # shellcheck disable=SC2154  # agent_review_default_coderabbit_rate_limit_wait_max_s from lib
+    # Clamp to WAIT_MAX last so the documented max is authoritative (even if < 5s).
+    if (( poll_s > agent_review_default_coderabbit_rate_limit_wait_max_s )); then
+      poll_s="${agent_review_default_coderabbit_rate_limit_wait_max_s}"
+    fi
+    if (( poll_s < 1 )); then
+      poll_s=1
+    fi
+    # Poll pending feedback between short sleeps so human/agent triage is not deferred
+    # for the full CodeRabbit cooldown (issue #369).
+    while agent_review_agent_quota_rate_limited_for_agent 'coderabbit'; do
+      # Refresh snapshot each chunk — a mid-wait Copilot/Bugbot/CR sign-off must be visible.
+      read -r _owner _name < <(agent_review_repo_parts "${repo}")
+      snapshot="$(agent_review_graphql_pr_snapshot "${_owner}" "${_name}" "${pr}" 2>/dev/null || true)"
+      if [[ -n "${snapshot}" ]] \
+        && agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+        agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
+        printf 'wait-for-agent-review: agent signed off during CodeRabbit rate-limit wait on PR #%s — clearing wait\n' \
+          "${pr}" >&2
+        agent_review_loop_wait_remove 'coderabbit' || true
+        return 1
+      fi
+      pending_exit=0
+      agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
+      if (( pending_exit == 3 )); then
+        agent_review_loop_set_stop 'THREADS_PENDING' \
+          'Feedback items still need a reply or resolve (threads and issue comments).'
+        printf 'wait-for-agent-review: pending feedback during CodeRabbit rate-limit wait on PR #%s — surfacing triage (exit 3)\n' \
+          "${pr}" >&2
+        return 3
+      fi
+      remaining="$(agent_review_agent_quota_seconds_until_retry_for_agent 'coderabbit' || true)"
+      if [[ -z "${remaining}" ]]; then
+        remaining="${poll_s}"
+      fi
+      if (( remaining <= 0 )); then
+        break
+      fi
+      if (( remaining > poll_s )); then
+        sleep_s="${poll_s}"
+      else
+        # Final chunk: pad slightly past retry_after so the next iteration sees elapsed.
+        sleep_s=$((remaining + 5))
+      fi
+      if (( sleep_s < 1 )); then
+        sleep_s=1
+      fi
+      if (( sleep_s < 5 )); then
+        sleep_s=5
+      fi
+      # shellcheck disable=SC2154  # agent_review_default_coderabbit_rate_limit_wait_max_s from lib
+      # WAIT_MAX last — must remain the hard ceiling even when configured below 5s.
+      if (( sleep_s > agent_review_default_coderabbit_rate_limit_wait_max_s )); then
+        sleep_s="${agent_review_default_coderabbit_rate_limit_wait_max_s}"
+      fi
+      if (( sleep_s < 1 )); then
+        sleep_s=1
+      fi
+      printf 'wait-for-agent-review: CodeRabbit rate-limited until %s (%ss remaining) — sleeping poll chunk %ss (poll=%ss, max=%ss) on PR #%s\n' \
+        "${retry_after}" "${remaining}" "${sleep_s}" "${poll_s}" \
+        "${agent_review_default_coderabbit_rate_limit_wait_max_s}" "${pr}" >&2
+      run_command "coderabbit rate-limit poll sleep" sleep "${sleep_s}"
+    done
     return 0
   fi
 
@@ -1371,11 +1397,18 @@ cmd_loop_handle_coderabbit_rate_limit() {
   fi
   if (( grace_remaining > 0 )); then
     sleep_s="${grace_remaining}"
-    if (( sleep_s > agent_review_default_coderabbit_rate_limit_wait_max_s )); then
-      sleep_s="${agent_review_default_coderabbit_rate_limit_wait_max_s}"
+    if (( sleep_s < 1 )); then
+      sleep_s=1
     fi
     if (( sleep_s < 5 )); then
       sleep_s=5
+    fi
+    # WAIT_MAX last so the documented ceiling stays authoritative.
+    if (( sleep_s > agent_review_default_coderabbit_rate_limit_wait_max_s )); then
+      sleep_s="${agent_review_default_coderabbit_rate_limit_wait_max_s}"
+    fi
+    if (( sleep_s < 1 )); then
+      sleep_s=1
     fi
     printf 'wait-for-agent-review: CodeRabbit cooldown elapsed at %s — waiting %ss grace (of %ss) for on-push review before full review on PR #%s\n' \
       "${retry_after}" "${sleep_s}" "${grace_s}" "${pr}" >&2
@@ -1389,6 +1422,15 @@ cmd_loop_handle_coderabbit_rate_limit() {
   read -r _owner _name < <(agent_review_repo_parts "${repo}")
   fresh_snapshot="$(agent_review_graphql_pr_snapshot "${_owner}" "${_name}" "${pr}" 2>/dev/null || true)"
   if [[ -n "${fresh_snapshot}" ]] \
+    && agent_review_agent_signed_off_on_head "${fresh_snapshot}" "${head}" "${repo}" "${pr}"; then
+    agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
+    printf 'wait-for-agent-review: agent signed off during grace on head %s (PR #%s) — skipping full review\n' \
+      "${head:0:7}" "${pr}" >&2
+    agent_review_loop_wait_remove 'coderabbit'
+    agent_review_use_agent "${saved_agent}"
+    return 1
+  fi
+  if [[ -n "${fresh_snapshot}" ]] \
     && cmd_loop_agent_response_seen "${repo}" "${pr}" "${head}" 'coderabbit' "${fresh_snapshot}"; then
     agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
     printf 'wait-for-agent-review: CodeRabbit on-push review arrived during grace on head %s (PR #%s) — skipping full review\n' \
@@ -1397,14 +1439,7 @@ cmd_loop_handle_coderabbit_rate_limit() {
     agent_review_use_agent "${saved_agent}"
     return 1
   fi
-  if agent_review_named_pr_check_succeeded "${repo}" "${pr}" 'CodeRabbit'; then
-    agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
-    printf 'wait-for-agent-review: CodeRabbit status succeeded after grace on PR #%s — skipping full review\n' \
-      "${pr}" >&2
-    agent_review_loop_wait_remove 'coderabbit'
-    agent_review_use_agent "${saved_agent}"
-    return 1
-  fi
+  # Bare "Review completed" commit status is not a sign-off — still may post full review.
   if agent_review_named_pr_check_is_pending "${repo}" "${pr}" 'CodeRabbit'; then
     printf 'wait-for-agent-review: CodeRabbit workflow still in progress on PR #%s — deferring last-resort full review\n' \
       "${pr}" >&2
@@ -1529,7 +1564,7 @@ The PR kept receiving reviews or still has unaddressed feedback. Triage open thr
 
 cmd_complete_idle() {
   local repo pr idle_s cycle_cap status complete_ready owner name snapshot head
-  local mode approve_body pending_count work_checklist
+  local mode pending_count work_checklist
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
@@ -1555,7 +1590,7 @@ cmd_complete_idle() {
       "${pr}" >&2
     return 2
   fi
-  # Re-check pending feedback immediately before approve/email (issue #347 / #352):
+  # Re-check pending feedback immediately before complete email (issue #347 / #352):
   # Bugbot quota comments can land between the loop gate and this path.
   pending_count="$(agent_review_pending_thread_count_from_snapshot "${repo}" "${pr}" "${snapshot}")"
   if (( pending_count > 0 )); then
@@ -1568,11 +1603,6 @@ cmd_complete_idle() {
     cmd_complete "${repo}" "${pr}"
     return $?
   fi
-  if [[ "${mode}" == 'early' ]]; then
-    approve_body='Agent review cycle: nothing outstanding (no pending feedback; not waiting on agents; CodeRabbit idle).'
-  else
-    approve_body="Agent review cycle: all feedback addressed; no new activity for ${cycle_cap}s."
-  fi
   # Final checklist must agree with the gate (single source of truth for operator email).
   work_checklist="$(agent_review_email_work_complete_checklist "${repo}" "${pr}")"
   if grep -qE 'Pending feedback \(threads \+ PR comments\): [1-9]' <<<"${work_checklist}" \
@@ -1582,20 +1612,27 @@ cmd_complete_idle() {
       "${pr}" >&2
     return 2
   fi
-  runner_exec "wait-for-agent-review pr approve idle" -- gh pr review "${pr}" --repo "${repo}" --approve \
-    --body "${approve_body}"
+  # Do not email "complete" without an agent sign-off on this head (bare CR status is not enough).
+  if ! agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    printf 'wait-for-agent-review: refusing idle complete — no agent sign-off on head %s (PR #%s)\n' \
+      "${head:0:7}" "${pr}" >&2
+    return 2
+  fi
+  # No gh self-approve — email only; merge stays an explicit operator step.
   agent_review_email_idle_complete "${repo}" "${pr}" "${idle_s}" "${mode}"
   if [[ "${mode}" == 'early' ]]; then
-    printf 'PR #%s review cycle complete (nothing outstanding)\n' "${pr}" >&2
+    printf 'PR #%s review cycle complete (nothing outstanding; emailed operator, no self-approve)\n' \
+      "${pr}" >&2
   else
-    printf 'PR #%s review cycle complete (idle %ss)\n' "${pr}" "${idle_s}" >&2
+    printf 'PR #%s review cycle complete (idle %ss; emailed operator, no self-approve)\n' \
+      "${pr}" "${idle_s}" >&2
   fi
   return 0
 }
 
 cmd_loop() {
   local repo pr pr_started last_head head now
-  local pr_cap cycle_cap check_exit ci_exit pending_exit status
+  local pr_cap cycle_cap check_exit ci_exit pending_exit rate_exit status
   local owner name snapshot complete_exit
   local transient_retries transient_max transient_sleep restack_exit
 
@@ -1687,7 +1724,12 @@ cmd_loop() {
       sleep "${agent_review_default_poll_interval_s}"
       continue
     fi
-    if cmd_loop_handle_coderabbit_rate_limit "${repo}" "${pr}" "${head}" "${snapshot}"; then
+    rate_exit=0
+    cmd_loop_handle_coderabbit_rate_limit "${repo}" "${pr}" "${head}" "${snapshot}" || rate_exit=$?
+    if (( rate_exit == 3 )); then
+      return 3
+    fi
+    if (( rate_exit == 0 )); then
       continue
     fi
     if [[ -z "${last_head}" ]]; then
@@ -1957,4 +1999,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
