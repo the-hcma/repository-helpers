@@ -432,12 +432,24 @@ if grep -qF "agent_review_profile_trigger='on_push'" "${script_dir}/../scripts/l
   && grep -qF 'agent_review_profile_trigger' "$wait_script" \
   && grep -qF 'is on_push — skipping nudge' "$wait_script" \
   && ! grep -qF 'agent_review_profile_post_rate_limit_retry' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
-  && ! grep -qE '@coderabbitai[[:space:]]+review' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
-  && ! awk '/gh pr comment/ && !/runner_exec/' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" | grep -q .; then
-  printf '[PASS] coderabbit profile: on_push only — never posts @coderabbitai nudge\n'
+  && ! grep -qE '@coderabbitai[[:space:]]+review([^a-z]|$)' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
+  && grep -qF 'agent_review_profile_request_last_resort_full_review' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
+  && grep -qF 'runner_exec "coderabbit profile last-resort full review"' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
+  && grep -qF 'return 2' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
+  && grep -qF 'failed to request CodeRabbit full review; retrying' "${wait_script}" \
+  && grep -qF 'run_command "coderabbit post-cooldown grace sleep"' "${wait_script}" \
+  && grep -qF 'deferring last-resort full review' "${wait_script}" \
+  && awk '
+    /cmd_loop\(\)/ { in_loop=1 }
+    in_loop && /named_pr_check_is_pending/ { pending=1 }
+    in_loop && /cmd_loop_handle_coderabbit_rate_limit/ { rate=1; if (pending) ok=1 }
+    in_loop && /^}/ { exit }
+    END { exit(ok ? 0 : 1) }
+  ' "${wait_script}"; then
+  printf '[PASS] coderabbit profile: on_push + gated last-resort full review helper\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] coderabbit profile: missing on_push wiring or still posts @coderabbitai\n'
+  printf '[FAIL] coderabbit profile: missing on_push / full-review gate wiring\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -999,6 +1011,35 @@ else
   fail=$(( fail + 1 ))
 fi
 
+# Confirmed + probe_requested must not suppress timeline exhaustion (repository-helpers#368).
+tmp_copilot_timeline_obs="$(mktemp)"
+tmp_copilot_timeline_json="$(mktemp)"
+printf '%s\n' "${timeline_ok_json}" >"${tmp_copilot_timeline_json}"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_copilot_timeline_obs}'
+  agent_review_copilot_quota_write_cache 0 confirmed \
+    'stale confirmed before new ask' 1 1
+  agent_review_copilot_quota_mark_probe_requested 'new @copilot ask'
+  agent_review_use_agent copilot
+  agent_review_fresh_agent_on_head() { return 1; }
+  agent_review_pr_issue_comments_json() { printf '[]\n'; }
+  agent_review_head_check_run_json_for_head() { printf 'null\n'; }
+  agent_review_pr_timeline_json() { cat '${tmp_copilot_timeline_json}'; }
+  agent_review_quota_observe_agent_on_pr \
+    'the-hcma/mock-repo' 368 'ce53596000000000000000000000000000000000' '{}' '[]' \
+    || true
+  agent_review_agent_quota_exhausted_for_agent copilot
+"; then
+  printf '[PASS] quota observe: Copilot timeline failure after confirmed+probe marks exhausted\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota observe: Copilot timeline failure missed when confirmed+probe\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_copilot_timeline_obs}" "${tmp_copilot_timeline_json}"
+
 # shellcheck disable=SC2016  # static assert matches literal source text
 if grep -qF 'agent_review_latest_nonempty_agent_review_body_on_head' "$lib" \
   && grep -qF 'agent_review_head_has_actionable_agent_review_on_head' "$lib" \
@@ -1130,6 +1171,28 @@ if RATE_LIMIT_BODY="${rate_limit_body}" bash -c "
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] coderabbit profile: rate-limited summarize comment not detected as quota\n'
+  fail=$(( fail + 1 ))
+fi
+
+# Rate-limit stubs that mention a head SHA must not count as a fresh review (#368).
+rate_limit_with_sha_body="${rate_limit_body}
+
+<details>
+<summary>📥 Commits</summary>
+
+Reviewing files that changed from the base of the PR and between aa7bd88849c377d833d77318936cd2af66e00960 and 6753f0158d8a0cd2d35b028377beb1e6456862ba.
+</details>"
+if RATE_LIMIT_BODY="${rate_limit_with_sha_body}" bash -c "
+  source '${lib}'
+  source '${coderabbit_profile}'
+  agent_review_latest_issue_comment_body_for_profile() { printf '%s' \"\${RATE_LIMIT_BODY}\"; }
+  ! agent_review_profile_fresh_on_head '{}' \
+    '6753f0158d8a0cd2d35b028377beb1e6456862ba' 'the-hcma/mock-repo' 1
+"; then
+  printf '[PASS] coderabbit profile: rate-limit stub with head SHA is not fresh_on_head\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: rate-limit stub with head SHA wrongly counted as fresh\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -1402,6 +1465,7 @@ fi
 
 if grep -qF 'agent_review_default_cycle_timeout_s=900' "$lib" \
   && grep -qF 'agent_review_named_pr_check_is_pending' "$lib" \
+  && grep -qF 'agent_review_named_pr_check_succeeded' "$lib" \
   && grep -qF 'agent_review_quota_summary_for_email' "$lib"; then
   printf '[PASS] lib: 15m cycle default and per-agent quota helpers\n'
   pass=$(( pass + 1 ))
@@ -1476,6 +1540,35 @@ if retry_iso="$(bash -c "
 else
   printf '[FAIL] coderabbit profile: updated_at-anchored retry_after failed (got %s)\n' \
     "${retry_iso:-empty}"
+  fail=$(( fail + 1 ))
+fi
+
+# Full-review cooldown wording (repository-helpers#368): "More reviews will be available in N minutes."
+if retry_iso="$(bash -c "
+  source '${coderabbit_profile}'
+  agent_review_profile_text_quota_retry_after_iso \
+    'Your plan includes PR reviews subject to rate limits. More reviews will be available in 44 minutes.' \
+    '2026-07-15T15:32:32Z'
+")" && [[ "${retry_iso}" == '2026-07-15T16:16:32Z' ]]; then
+  printf '[PASS] coderabbit profile: parses more-reviews-will-be-available minutes\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: more-reviews-will-be-available parse failed (got %s)\n' \
+    "${retry_iso:-empty}"
+  fail=$(( fail + 1 ))
+fi
+
+if bash -c "
+  source '${coderabbit_profile}'
+  agent_review_profile_text_is_quota_exhausted \
+    'Full review finished. More reviews will be available in 44 minutes.'
+  ! agent_review_profile_text_is_coderabbit_billing_block \
+    'Bugbot overview: wait for More reviews will be available in 44 minutes cooldown wording.'
+"; then
+  printf '[PASS] coderabbit profile: more-reviews-will-be-available counts as quota (CR author path)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: more-reviews-will-be-available should count as quota block\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -1602,6 +1695,30 @@ else
 fi
 rm -f "${tmp_quota_expired}"
 
+tmp_quota_keep_later="$(mktemp)"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_quota_keep_later}'
+  agent_review_coderabbit_quota_write_cache 1 observed \
+    'newer PR cooldown' '' '' \
+    'https://github.com/the-hcma/mock-repo/pull/368#issuecomment-new' \
+    '2099-06-01T12:00:00Z'
+  agent_review_coderabbit_quota_mark_exhausted \
+    'stale PR with past retry' \
+    'https://github.com/the-hcma/mock-repo/pull/1#issuecomment-old' \
+    '2000-01-01T00:00:00Z'
+  agent_review_coderabbit_quota_read_cache
+  [[ \"\${agent_review_coderabbit_quota_cache_retry_after}\" == '2099-06-01T12:00:00Z' ]]
+"; then
+  printf '[PASS] quota cache: mark_exhausted keeps later future retry_after\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota cache: mark_exhausted clobbered later retry_after\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_quota_keep_later}"
+
 # shellcheck disable=SC2016  # static assert matches literal source text
 if grep -qF 'agent_review_profile_review_outstanding' "${script_dir}/../scripts/lib/agent-review-profiles/copilot" \
   && grep -qF 'cmd_loop_track_outstanding_agent_reviews' "$wait_script" \
@@ -1697,10 +1814,16 @@ fi
 
 if grep -qF 'cmd_loop_handle_coderabbit_rate_limit' "$wait_script" \
   && grep -qF 'agent_review_agent_quota_rate_limited_for_agent' "${quota_lib}" \
-  && grep -qF 'waiting for automatic on-push review' "$wait_script" \
-  && grep -qF 'do not consume the loop turn' "$wait_script" \
   && ! grep -qF 'agent_review_profile_post_rate_limit_retry' "${coderabbit_profile}" \
-  && ! grep -qE '@coderabbitai[[:space:]]+review' "${coderabbit_profile}" \
+  && ! grep -qE '@coderabbitai[[:space:]]+review([^a-z]|$)' "${coderabbit_profile}" \
+  && grep -qF 'agent_review_profile_request_last_resort_full_review' "${coderabbit_profile}" \
+  && grep -qF 'agent_review_default_coderabbit_post_cooldown_grace_s' "$lib" \
+  && grep -qF 'AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE' "$lib" \
+  && grep -qF 'agent_review_default_coderabbit_post_cooldown_grace_s=60' "$lib" \
+  && grep -qF 'waiting %ss grace' "$wait_script" \
+  && grep -qF 'Return 1 so observe-rewritten' "$wait_script" \
+  && grep -qF 'fresh_snapshot' "$wait_script" \
+  && ! awk '/^cmd_loop_handle_coderabbit_rate_limit\(/,/^}/ { if ($0 ~ /^[[:space:]]*snapshot=/) exit 0 } END { exit 1 }' "$wait_script" \
   && grep -qF 'agent_review_coderabbit_quota_clear_observed_cache' "${quota_lib}" \
   && grep -qF 'agent_review_coderabbit_quota_cache_retry_after' "${quota_lib}" \
   && grep -qF 'agent_review_delivered_recognized_pass_on_head' "$lib" \
@@ -1713,27 +1836,35 @@ if grep -qF 'cmd_loop_handle_coderabbit_rate_limit' "$wait_script" \
   && grep -qF 'updatedAt' "${quota_lib}" \
   && grep -qF 'updated_at // .created_at' "$lib" \
   && grep -qF 'coderabbit_rate_limited' "$lib"; then
-  printf '[PASS] loop: CodeRabbit chunked rate-limit wait then on-push wait (no @coderabbitai nudge)\n'
+  printf '[PASS] loop: CodeRabbit chunked rate-limit wait + post-cooldown full-review gate\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] loop: missing CodeRabbit chunked on-push rate-limit wiring\n'
+  printf '[FAIL] loop: missing CodeRabbit chunked/on-push/full-review gate wiring\n'
   fail=$(( fail + 1 ))
 fi
 
-# Docs: on_push / no @coderabbitai review policy (issue #364).
+# Docs: on_push; ban plain @coderabbitai review; gated full review after cooldown+grace (#364).
+consumer_rule="${script_dir}/../scripts/lib/repo-practices-cursor/pr-ship-and-review.mdc"
 if grep -qF '@coderabbitai review' "$agents_md" \
   && grep -qF 'on_push' "$agents_md" \
   && grep -qF 'chunked sleep' "$agents_md" \
+  && grep -qF 'AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE' "$agents_md" \
+  && grep -qF '60s' "$agents_md" \
+  && grep -qF 'full review' "$agents_md" \
+  && ! grep -qiE 'under normal circumstances' "$agents_md" \
   && grep -qF '@coderabbitai review' "$rule" \
   && grep -qF 'on_push' "$rule" \
-  && grep -qF 'chunked sleep' "$rule" \
-  && grep -qF '@coderabbitai review' "${script_dir}/../scripts/lib/repo-practices-cursor/pr-ship-and-review.mdc" \
+  && grep -qF 'full review' "$rule" \
+  && grep -qF '60s' "$rule" \
+  && grep -qF '@coderabbitai review' "$consumer_rule" \
+  && grep -qF 'full review' "$consumer_rule" \
   && ! grep -qiF 'treated as exhausted' "${script_dir}/../etc/agent-review.env.example" \
-  && grep -qF 'sleep chunk' "${script_dir}/../etc/agent-review.env.example"; then
-  printf '[PASS] docs: CodeRabbit on_push / no @coderabbitai review + chunked sleep (#364/#366)\n'
+  && grep -qF 'sleep chunk' "${script_dir}/../etc/agent-review.env.example" \
+  && grep -qF 'POST_COOLDOWN_GRACE' "${script_dir}/../etc/agent-review.env.example"; then
+  printf '[PASS] docs: CodeRabbit on_push + cooldown+grace full-review gate (#364/#366)\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] docs: missing CodeRabbit on_push / chunked-sleep policy wording\n'
+  printf '[FAIL] docs: missing CodeRabbit gated full-review / chunked-sleep policy wording\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -2305,7 +2436,9 @@ else
 fi
 
 if grep -qF 'agent_review_ci_rollup_for_gating' "$lib" \
-  && grep -qF 'CodeRabbit|Cursor Bugbot' "$lib"; then
+  && grep -qF 'ci_rollup_without_agent_product_checks' "$lib" \
+  && grep -qF 'ci_rollup_without_agent_product_checks' \
+    "${script_dir}/../scripts/lib/ci-check-rollup"; then
   printf '[PASS] loop: required CI gate excludes agent-product checks\n'
   pass=$(( pass + 1 ))
 else
