@@ -1831,23 +1831,37 @@ if grep -qF 'cmd_loop_handle_coderabbit_rate_limit' "$wait_script" \
   && grep -qF 'agent_review_default_coderabbit_rate_limit_wait_max_s' "$lib" \
   && grep -qF 'AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX' "$lib" \
   && grep -qF 'agent_review_default_coderabbit_rate_limit_wait_max_s=3600' "$lib" \
+  && grep -qF 'agent_review_default_coderabbit_rate_limit_poll_s' "$lib" \
+  && grep -qF 'AGENT_REVIEW_CODERABBIT_RATE_LIMIT_POLL' "$lib" \
+  && grep -qF 'agent_review_default_coderabbit_rate_limit_poll_s=60' "$lib" \
   && ! grep -qF 'exceeds wait max' "$wait_script" \
-  && grep -qF 'sleeping chunk' "$wait_script" \
+  && grep -qF 'sleeping poll chunk' "$wait_script" \
+  && grep -qF 'coderabbit rate-limit poll sleep' "$wait_script" \
+  && grep -qF 'pending feedback during CodeRabbit rate-limit wait' "$wait_script" \
+  && awk '
+    /^cmd_loop_handle_coderabbit_rate_limit\(/ { in_fn=1 }
+    in_fn && /agent_review_abort_if_pending_threads/ { abort=1 }
+    in_fn && /coderabbit rate-limit poll sleep/ { if (abort) order_ok=1 }
+    in_fn && /^}/ { exit }
+    END { exit(order_ok ? 0 : 1) }
+  ' "$wait_script" \
+  && grep -qF 'rate_exit == 3' "$wait_script" \
   && grep -qF 'updatedAt' "${quota_lib}" \
   && grep -qF 'updated_at // .created_at' "$lib" \
   && grep -qF 'coderabbit_rate_limited' "$lib"; then
-  printf '[PASS] loop: CodeRabbit chunked rate-limit wait + post-cooldown full-review gate\n'
+  printf '[PASS] loop: CodeRabbit poll-while-rate-limited wait + post-cooldown full-review gate\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] loop: missing CodeRabbit chunked/on-push/full-review gate wiring\n'
+  printf '[FAIL] loop: missing CodeRabbit poll-while-rate-limited / full-review gate wiring\n'
   fail=$(( fail + 1 ))
 fi
 
-# Docs: on_push; ban plain @coderabbitai review; gated full review after cooldown+grace (#364).
+# Docs: on_push; ban plain @coderabbitai review; gated full review after cooldown+grace (#364/#369).
 consumer_rule="${script_dir}/../scripts/lib/repo-practices-cursor/pr-ship-and-review.mdc"
 if grep -qF '@coderabbitai review' "$agents_md" \
   && grep -qF 'on_push' "$agents_md" \
-  && grep -qF 'chunked sleep' "$agents_md" \
+  && grep -qF 'poll-while-rate-limited' "$agents_md" \
+  && grep -qF 'AGENT_REVIEW_CODERABBIT_RATE_LIMIT_POLL' "$agents_md" \
   && grep -qF 'AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE' "$agents_md" \
   && grep -qF '60s' "$agents_md" \
   && grep -qF 'full review' "$agents_md" \
@@ -1855,16 +1869,18 @@ if grep -qF '@coderabbitai review' "$agents_md" \
   && grep -qF '@coderabbitai review' "$rule" \
   && grep -qF 'on_push' "$rule" \
   && grep -qF 'full review' "$rule" \
+  && grep -qF 'RATE_LIMIT_POLL' "$rule" \
   && grep -qF '60s' "$rule" \
   && grep -qF '@coderabbitai review' "$consumer_rule" \
   && grep -qF 'full review' "$consumer_rule" \
+  && grep -qF 'feedback polls' "$consumer_rule" \
   && ! grep -qiF 'treated as exhausted' "${script_dir}/../etc/agent-review.env.example" \
-  && grep -qF 'sleep chunk' "${script_dir}/../etc/agent-review.env.example" \
+  && grep -qF 'RATE_LIMIT_POLL' "${script_dir}/../etc/agent-review.env.example" \
   && grep -qF 'POST_COOLDOWN_GRACE' "${script_dir}/../etc/agent-review.env.example"; then
-  printf '[PASS] docs: CodeRabbit on_push + cooldown+grace full-review gate (#364/#366)\n'
+  printf '[PASS] docs: CodeRabbit on_push + poll-while-rate-limited + cooldown+grace (#364/#366/#369)\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] docs: missing CodeRabbit gated full-review / chunked-sleep policy wording\n'
+  printf '[FAIL] docs: missing CodeRabbit gated full-review / poll-while-rate-limited wording\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -2091,6 +2107,90 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -f "${tmp_rate_limit_wait}"
+
+# Hermetic: mid-cooldown pending feedback wakes the rate-limit wait (issue #369).
+tmp_rate_limit_poll="$(mktemp)"
+tmp_sleep_log="$(mktemp)"
+if bash -c "
+  set -euo pipefail
+  # Source wait-for-agent-review without running main (BASH_SOURCE != \$0).
+  # Do not pre-source agent-review: _ar_lib_dir is readonly.
+  source '${wait_script}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_rate_limit_poll}'
+  agent_review_coderabbit_quota_write_cache 1 observed \
+    'rate limited' '' '' '' '2099-06-01T12:00:00Z'
+  agent_review_named_pr_check_succeeded() { return 1; }
+  agent_review_loop_wait_add() { return 0; }
+  agent_review_loop_wait_remove() { return 0; }
+  agent_review_loop_set_stop() { return 0; }
+  agent_review_use_agent() { return 0; }
+  agent_review_abort_if_pending_threads() { return 3; }
+  run_command() {
+    printf '%s\n' \"\$*\" >>'${tmp_sleep_log}'
+    return 0
+  }
+  set +e
+  cmd_loop_handle_coderabbit_rate_limit 'o/r' '1' 'abc1234deadbeef'
+  rc=\$?
+  set -e
+  (( rc == 3 ))
+  # Must not have slept: pending feedback surfaces immediately.
+  ! grep -q . '${tmp_sleep_log}'
+"; then
+  printf '[PASS] hermetic: pending feedback during CodeRabbit rate-limit wait returns 3 without sleep\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] hermetic: mid-cooldown pending feedback did not wake rate-limit wait\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_rate_limit_poll}" "${tmp_sleep_log}"
+
+# Hermetic: clean PR sleeps a poll chunk then resumes when retry_after clears.
+tmp_rate_limit_poll2="$(mktemp)"
+tmp_sleep_log2="$(mktemp)"
+if bash -c "
+  set -euo pipefail
+  source '${wait_script}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_rate_limit_poll2}'
+  agent_review_default_coderabbit_rate_limit_poll_s=7
+  agent_review_coderabbit_quota_write_cache 1 observed \
+    'rate limited' '' '' '' '2099-06-01T12:00:00Z'
+  agent_review_named_pr_check_succeeded() { return 1; }
+  agent_review_loop_wait_add() { return 0; }
+  agent_review_loop_wait_remove() { return 0; }
+  agent_review_loop_set_stop() { return 0; }
+  agent_review_use_agent() { return 0; }
+  agent_review_abort_if_pending_threads() { return 0; }
+  agent_review_agent_quota_seconds_until_retry_for_agent() { printf '120\n'; }
+  polls=0
+  agent_review_agent_quota_rate_limited_for_agent() {
+    polls=\$((polls + 1))
+    # Enter branch + first while check = limited; after one sleep, clear.
+    if (( polls <= 2 )); then
+      return 0
+    fi
+    return 1
+  }
+  run_command() {
+    local label=\"\$1\"
+    shift
+    printf '%s %s\n' \"\${label}\" \"\$*\" >>'${tmp_sleep_log2}'
+    return 0
+  }
+  set +e
+  cmd_loop_handle_coderabbit_rate_limit 'o/r' '1' 'abc1234deadbeef'
+  rc=\$?
+  set -e
+  (( rc == 0 ))
+  grep -qF 'coderabbit rate-limit poll sleep sleep 7' '${tmp_sleep_log2}'
+"; then
+  printf '[PASS] hermetic: clean rate-limit wait sleeps poll chunk then returns 0\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] hermetic: clean rate-limit poll chunk path broken\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_rate_limit_poll2}" "${tmp_sleep_log2}"
 
 # shellcheck disable=SC2016  # static assert matches literal source text
 if grep -qF 'agent_review_agent_quota_rate_limited_for_agent "${agent}"' "$wait_script"; then

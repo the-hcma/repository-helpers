@@ -449,7 +449,10 @@ A **new push** triggers CodeRabbit automatically (`on_push`). Do **not** post
 If CodeRabbit is out of quota, it reports a **cooldown** (“Next review available in …” /
 “More reviews will be available in …” / rate-limit notice). Then:
 
-1. Wait out that cooldown (chunked sleep via `AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX`).
+1. Wait out that cooldown with **poll-while-rate-limited** sleeps
+   (`AGENT_REVIEW_CODERABBIT_RATE_LIMIT_POLL`, default **60s**; ceiling
+   `AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX`). Between poll chunks the loop re-checks
+   pending feedback and exits **3** immediately if human/agent triage is needed (issue #369).
 2. Wait an extra **grace** (`AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE`, default **60s**).
 3. Only if there is still **no real review** on the current head, the loop posts a one-shot
    **`@coderabbitai full review`** (idempotent per head). Rate-limit stubs that merely mention
