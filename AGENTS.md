@@ -438,7 +438,11 @@ When CI is green, run the **agent review loop** documented in **`.cursor/rules/p
 
 1. Prefer **`./scripts/wait-for-agent-review loop --pr <n>`** (or `scripts/dev/ship-and-review` from submit).
 2. On exit **3**, triage each feedback item (inline thread or top-level issue comment): fix → **`reply-thread`** / **`reply-comment`** → **`resolve-thread`** / **`resolve-comment`** — never resolve without replying first. Use **`list-feedback`** to see pending items.
-3. **`./scripts/wait-for-agent-review complete --pr <n>`** when `check` reports `complete_ready`, or let **`loop`** exit **0** when nothing is outstanding (no pending feedback, no in-flight agent wait, CodeRabbit idle).
+3. When `check` reports `complete_ready: true`, run
+   `./scripts/wait-for-agent-review complete --pr <n>` (or let `loop` exit **0**).
+   `complete_ready` requires at least one **agent sign-off** on the current head
+   (Copilot/Bugbot empty pass, or a real CodeRabbit review body — not a rate-limit
+   stub and not a bare “CodeRabbit: Review completed” commit status alone).
 4. Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`.
 
 #### CodeRabbit on_push policy (gated full review only)
