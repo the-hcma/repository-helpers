@@ -11,7 +11,7 @@
 #   reply-comment       Post a top-level PR comment in reply to agent feedback
 #   resolve-comment     Mark an issue comment addressed (requires operator reply)
 #   check               Exit 0 when complete_ready or PR merged
-#   complete            Approve PR + email operator (only when agent review is empty)
+#   complete            Email operator when agent review is complete (no PR self-approve)
 #   restack             Sync and restack when mergeStateStatus is BEHIND
 #   resolve-thread      Resolve one thread by GraphQL node id (requires human reply)
 #   reply-thread          Post an on-thread human reply (GraphQL)
@@ -654,45 +654,30 @@ cmd_check() {
 }
 
 cmd_complete() {
-  local repo pr status complete_ready gh_user existing pr_merged reviews_json
+  local repo pr status complete_ready pr_merged
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
   agent_review_require_cmd gh
   agent_review_require_cmd jq
   if agent_review_pr_is_merged "${repo}" "${pr}"; then
-    printf 'PR #%s is already merged — skipping approve/email\n' "${pr}" >&2
+    printf 'PR #%s is already merged — skipping complete email\n' "${pr}" >&2
     return 0
   fi
   status="$(cmd_status "${repo}" "${pr}")"
   pr_merged="$(wait_ar_jq_status "$status" '.pr_merged')"
   if [[ "${pr_merged}" == 'true' ]]; then
-    printf 'PR #%s is already merged — skipping approve/email\n' "${pr}" >&2
+    printf 'PR #%s is already merged — skipping complete email\n' "${pr}" >&2
     return 0
   fi
   complete_ready="$(wait_ar_jq_status "$status" '.complete_ready')"
   if [[ "${complete_ready}" != 'true' ]]; then
     agent_review_die 'complete requires agent and human review empty on current head with no unaddressed threads'
   fi
-  gh_user="$(ar_runner_gh_api_stream "gh api user login" user --jq '.login')"
-  reviews_json="$(ar_runner_gh_pr_jq "wait-for-agent-review pr reviews" "${repo}" "${pr}" reviews)"
-  existing="$(ar_runner_jq_file "wait-for-agent-review last user review state" "${reviews_json}" \
-    -r --arg user "${gh_user}" '
-      [.reviews[]
-        | select(.author.login == $user)
-        | select(.state != "PENDING")
-        | {state, submittedAt}]
-      | sort_by(.submittedAt)
-      | last
-      | .state // empty')"
-  if [[ "${existing}" != 'APPROVED' ]]; then
-    runner_exec "wait-for-agent-review pr approve" -- gh pr review "${pr}" --repo "${repo}" --approve \
-      --body "Agent review (${AGENT_REVIEW_AGENT:-copilot}): no new comments on current head."
-    printf 'Approved PR #%s as %s\n' "${pr}" "${gh_user}" >&2
-  else
-    printf 'PR #%s already approved by %s — skipping approve\n' "${pr}" "${gh_user}" >&2
-  fi
+  # Do not gh-approve: the authenticated operator often authors the PR, and GitHub
+  # rejects self-approvals. Merge remains an explicit operator step (merge-it).
   agent_review_email_complete "${repo}" "${pr}"
+  printf 'Agent review complete on PR #%s — emailed operator (no self-approve)\n' "${pr}" >&2
 }
 
 cmd_resolve_thread() {
@@ -1561,7 +1546,7 @@ The PR kept receiving reviews or still has unaddressed feedback. Triage open thr
 
 cmd_complete_idle() {
   local repo pr idle_s cycle_cap status complete_ready owner name snapshot head
-  local mode approve_body pending_count work_checklist
+  local mode pending_count work_checklist
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
@@ -1587,7 +1572,7 @@ cmd_complete_idle() {
       "${pr}" >&2
     return 2
   fi
-  # Re-check pending feedback immediately before approve/email (issue #347 / #352):
+  # Re-check pending feedback immediately before complete email (issue #347 / #352):
   # Bugbot quota comments can land between the loop gate and this path.
   pending_count="$(agent_review_pending_thread_count_from_snapshot "${repo}" "${pr}" "${snapshot}")"
   if (( pending_count > 0 )); then
@@ -1600,11 +1585,6 @@ cmd_complete_idle() {
     cmd_complete "${repo}" "${pr}"
     return $?
   fi
-  if [[ "${mode}" == 'early' ]]; then
-    approve_body='Agent review cycle: nothing outstanding (no pending feedback; not waiting on agents; CodeRabbit idle).'
-  else
-    approve_body="Agent review cycle: all feedback addressed; no new activity for ${cycle_cap}s."
-  fi
   # Final checklist must agree with the gate (single source of truth for operator email).
   work_checklist="$(agent_review_email_work_complete_checklist "${repo}" "${pr}")"
   if grep -qE 'Pending feedback \(threads \+ PR comments\): [1-9]' <<<"${work_checklist}" \
@@ -1614,13 +1594,14 @@ cmd_complete_idle() {
       "${pr}" >&2
     return 2
   fi
-  runner_exec "wait-for-agent-review pr approve idle" -- gh pr review "${pr}" --repo "${repo}" --approve \
-    --body "${approve_body}"
+  # No gh self-approve — email only; merge stays an explicit operator step.
   agent_review_email_idle_complete "${repo}" "${pr}" "${idle_s}" "${mode}"
   if [[ "${mode}" == 'early' ]]; then
-    printf 'PR #%s review cycle complete (nothing outstanding)\n' "${pr}" >&2
+    printf 'PR #%s review cycle complete (nothing outstanding; emailed operator, no self-approve)\n' \
+      "${pr}" >&2
   else
-    printf 'PR #%s review cycle complete (idle %ss)\n' "${pr}" "${idle_s}" >&2
+    printf 'PR #%s review cycle complete (idle %ss; emailed operator, no self-approve)\n' \
+      "${pr}" "${idle_s}" >&2
   fi
   return 0
 }

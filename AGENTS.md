@@ -18,7 +18,7 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | pnpm cutover | `scripts/grandfather-pnpm-release-age` | One-time `minimumReleaseAgeExclude` for existing lockfiles. |
 | Systemd | `scripts/setup-service`, `scripts/setup-github-repo-lint`, `scripts/show-services` | Install timers/units; status summary. |
 | Deploy hook | `scripts/on-deploy` | Example hook; consumer repos implement their own. |
-| Agent review | `scripts/wait-for-agent-review`, `scripts/trigger-agent-review` | PR review loop, triage, approve, operator email. |
+| Agent review | `scripts/wait-for-agent-review`, `scripts/trigger-agent-review` | PR review loop, triage, operator email (no self-approve). |
 | Dev workflow | `scripts/dev/start-development` | Worktree + Graphite sync entry point. |
 | Dev workflow | `scripts/dev/pre-pr-checks` | Local CI mirror (`bash -n`, `shellcheck`, all tests). |
 | Dev workflow | `scripts/dev/submit-stack` | `pre-pr-checks` → `gt submit` → `post-pr-submission-checks`. |
@@ -464,8 +464,8 @@ Operators/agents must follow the same gate — never full-review early, never pl
 
 - **Nothing outstanding:** after all threads are addressed, CI is green, and the PR is merge-ready,
   `loop` completes as soon as it is not waiting on a requested Copilot/Bugbot review and CodeRabbit
-  is idle. `cmd_complete_idle` (early) approves and emails — **without** requiring Copilot
-  **“generated no new comments”**. `AGENT_REVIEW_CYCLE_TIMEOUT` is retained for compatibility only.
+  is idle. `cmd_complete_idle` (early) emails the operator — **without** requiring Copilot
+  **“generated no new comments”**, and **without** a `gh` self-approve. `AGENT_REVIEW_CYCLE_TIMEOUT` is retained for compatibility only.
 - **`AGENT_REVIEW_PR_TIMEOUT`** (default **12h**): non-convergence cap when review cycles keep
   iterating without reaching early-complete; exit **6** triggers give-up.
 
