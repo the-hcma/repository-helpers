@@ -7,9 +7,9 @@
 #   wait                Block until the agent posts a review for the current head
 #   list-threads        Print agent threads still needing a human reply (JSON)
 #   list-human-threads  Print human reviewer threads still needing a reply (JSON)
-#   list-feedback       Print all pending feedback (threads + issue comments, JSON)
+#   list-feedback       Print all pending feedback (threads + issue comments + review bodies, JSON)
 #   reply-comment       Post a top-level PR comment in reply to agent feedback
-#   resolve-comment     Mark an issue comment addressed (requires operator reply)
+#   resolve-comment     Mark an issue comment or review body addressed (requires operator reply)
 #   check               Exit 0 when complete_ready or PR merged
 #   complete            Email operator when agent review is complete (no PR self-approve)
 #   restack             Sync and restack when mergeStateStatus is BEHIND
@@ -82,8 +82,8 @@ Commands:
   restack [--pr N] [--repo OWNER/NAME]
   resolve-thread --thread-id ID [--force]
   reply-thread --thread-id ID --body TEXT
-  reply-comment --comment-id ID --body TEXT [--pr N] [--repo OWNER/NAME]
-  resolve-comment --comment-id ID [--pr N] [--repo OWNER/NAME] [--force]
+  reply-comment (--comment-id ID | --review-id ID) --body TEXT [--pr N] [--repo OWNER/NAME]
+  resolve-comment (--comment-id ID | --review-id ID) [--pr N] [--repo OWNER/NAME] [--force]
   resolve-addressed [--pr N] [--repo OWNER/NAME]
   resolve-human-addressed [--pr N] [--repo OWNER/NAME]
   email-failure [--pr N] [--repo OWNER/NAME] [--reason TEXT]
@@ -209,7 +209,7 @@ agent_review_loop_default_stop_for_exit() {
       ;;
     3)
       agent_review_loop_set_stop 'THREADS_PENDING' \
-        'Feedback items still need a reply or resolve (threads and issue comments).'
+        'Feedback items still need a reply or resolve (threads, issue comments, review bodies).'
       ;;
     4)
       agent_review_loop_set_stop 'RESTACK_FAILED' \
@@ -521,7 +521,7 @@ cmd_list_feedback() {
 
 cmd_check() {
   local repo pr owner name snapshot status complete_ready fresh merge_state pr_merged agent_empty agent_quota
-  local head_check_error head_check_findings head review_body all_quotas_exhausted pending_count
+  local head_check_error head_check_findings head all_quotas_exhausted pending_count
   local ci_conclusion merge_class
 
   # Drop stale diagnostics from prior polls so stop emails stay actionable.
@@ -633,17 +633,6 @@ cmd_check() {
       ;;
   esac
   if [[ "${agent_empty}" != 'true' ]]; then
-    if [[ "${AGENT_REVIEW_AGENT:-copilot}" == 'coderabbit' ]] \
-      && [[ "$(wait_ar_jq_status "$status" '.pending_threads // 0')" == '0' ]]; then
-      head="$(wait_ar_jq_status "$status" '.head_sha')"
-      review_body="$(agent_review_latest_agent_review_body_on_head "${snapshot}" "${head}")"
-      if agent_review_profile_review_has_body_feedback "${review_body}"; then
-        printf '%s\n' "${status}" >&2
-        printf 'wait-for-agent-review: CodeRabbit review on head %s has actionable summary feedback — triage required\n' \
-          "${head:0:7}" >&2
-        return 3
-      fi
-    fi
     printf '%s\n' "${status}"
     printf 'wait-for-agent-review: %s reviewed head but did not report "no new comments" yet\n' \
       "${AGENT_REVIEW_AGENT:-copilot}" >&2
@@ -705,34 +694,57 @@ cmd_reply_thread() {
 }
 
 cmd_reply_comment() {
-  local repo pr comment_id body
+  local repo pr comment_id review_id body owner name snapshot
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
   comment_id="${3:-}"
-  body="${4:-}"
-  if [[ -z "${comment_id}" ]]; then
-    agent_review_die 'reply-comment requires --comment-id'
+  review_id="${4:-}"
+  body="${5:-}"
+  if [[ -n "${comment_id}" && -n "${review_id}" ]]; then
+    agent_review_die 'reply-comment accepts only one of --comment-id or --review-id'
+  fi
+  if [[ -z "${comment_id}" && -z "${review_id}" ]]; then
+    agent_review_die 'reply-comment requires --comment-id or --review-id'
   fi
   agent_review_require_cmd gh
+  if [[ -n "${review_id}" ]]; then
+    read -r owner name < <(agent_review_repo_parts "${repo}")
+    snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
+    agent_review_assert_snapshot_complete "${snapshot}"
+    agent_review_reply_pull_request_review "${repo}" "${pr}" "${snapshot}" "${review_id}" "${body}"
+    return 0
+  fi
   agent_review_reply_issue_comment "${repo}" "${pr}" "${comment_id}" "${body}"
 }
 
 cmd_resolve_comment() {
-  local repo pr comment_id force
+  local repo pr comment_id review_id force owner name snapshot
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
   comment_id="${3:-}"
-  force="${4:-0}"
-  if [[ -z "${comment_id}" ]]; then
-    agent_review_die 'resolve-comment requires --comment-id'
+  review_id="${4:-}"
+  force="${5:-0}"
+  if [[ -n "${comment_id}" && -n "${review_id}" ]]; then
+    agent_review_die 'resolve-comment accepts only one of --comment-id or --review-id'
+  fi
+  if [[ -z "${comment_id}" && -z "${review_id}" ]]; then
+    agent_review_die 'resolve-comment requires --comment-id or --review-id'
+  fi
+  if [[ -n "${review_id}" ]]; then
+    read -r owner name < <(agent_review_repo_parts "${repo}")
+    snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
+    agent_review_assert_snapshot_complete "${snapshot}"
+    agent_review_resolve_pull_request_review "${repo}" "${pr}" "${snapshot}" "${review_id}" "${force}"
+    return 0
   fi
   agent_review_resolve_issue_comment "${repo}" "${pr}" "${comment_id}" "${force}"
 }
 
 cmd_resolve_addressed() {
   local repo pr owner name snapshot ids id needs_resolve_json comment_ids cid issue_json
+  local review_ids rid reviews_json
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   read -r owner name < <(agent_review_repo_parts "${repo}")
@@ -759,15 +771,20 @@ cmd_resolve_addressed() {
     ar_runner_jq_file "wait-for-agent-review addressed issue comment ids" "${issue_json}" \
       -r 'map(select(.state == "needs_resolve")) | .[].comment_id'
   )
-  if ((${#comment_ids[@]} == 0)); then
-    if ((${#ids[@]} == 0)); then
-      printf 'No addressed feedback to resolve on PR #%s\n' "${pr}" >&2
-    fi
-    return 0
-  fi
   for cid in "${comment_ids[@]}"; do
     agent_review_resolve_issue_comment "${repo}" "${pr}" "${cid}"
   done
+  reviews_json="$(agent_review_feedback_reviews_pending_json "${repo}" "${pr}" "${snapshot}")"
+  mapfile -t review_ids < <(
+    ar_runner_jq_file "wait-for-agent-review addressed review ids" "${reviews_json}" \
+      -r 'map(select(.state == "needs_resolve")) | .[].review_id'
+  )
+  for rid in "${review_ids[@]}"; do
+    agent_review_resolve_pull_request_review "${repo}" "${pr}" "${snapshot}" "${rid}"
+  done
+  if ((${#ids[@]} == 0)) && ((${#comment_ids[@]} == 0)) && ((${#review_ids[@]} == 0)); then
+    printf 'No addressed feedback to resolve on PR #%s\n' "${pr}" >&2
+  fi
 }
 
 cmd_resolve_human_addressed() {
@@ -993,7 +1010,7 @@ cmd_give_up() {
   agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
   if (( pending_exit == 3 )); then
     agent_review_loop_set_stop 'THREADS_PENDING' \
-      'Feedback items still need a reply or resolve (threads and issue comments).'
+      'Feedback items still need a reply or resolve (threads, issue comments, review bodies).'
     return 3
   fi
   agent_review_require_cmd gh
@@ -1202,10 +1219,6 @@ cmd_loop_nothing_outstanding() {
   if ! cmd_loop_ready_for_idle_wait "${status}"; then
     return 1
   fi
-  if agent_review_coderabbit_head_feedback_needs_operator_triage \
-    "${repo}" "${pr}" "${head}" "${snapshot}"; then
-    return 1
-  fi
   # Head must have at least one agent sign-off (real pass) — not a bare CR status.
   if ! agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
     return 1
@@ -1309,7 +1322,7 @@ cmd_loop_handle_coderabbit_rate_limit() {
       agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
       if (( pending_exit == 3 )); then
         agent_review_loop_set_stop 'THREADS_PENDING' \
-          'Feedback items still need a reply or resolve (threads and issue comments).'
+          'Feedback items still need a reply or resolve (threads, issue comments, review bodies).'
         printf 'wait-for-agent-review: pending feedback during CodeRabbit rate-limit wait on PR #%s — surfacing triage (exit 3)\n' \
           "${pr}" >&2
         return 3
@@ -1697,7 +1710,7 @@ cmd_loop() {
     agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
     if (( pending_exit == 3 )); then
       agent_review_loop_set_stop 'THREADS_PENDING' \
-        'Feedback items still need a reply or resolve (threads and issue comments).'
+        'Feedback items still need a reply or resolve (threads, issue comments, review bodies).'
       return 3
     fi
 
@@ -1705,14 +1718,6 @@ cmd_loop() {
     snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
     agent_review_assert_snapshot_complete "${snapshot}"
     head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
-    if agent_review_coderabbit_head_feedback_needs_operator_triage \
-      "${repo}" "${pr}" "${head}" "${snapshot}"; then
-      agent_review_loop_set_stop 'THREADS_PENDING' \
-        'CodeRabbit review body feedback needs an operator PR comment (reply or skip rationale).'
-      printf 'wait-for-agent-review: CodeRabbit head review on PR #%s has unaddressed body feedback — post a PR comment to triage.\n' \
-        "${pr}" >&2
-      return 3
-    fi
     cmd_loop_observe_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}"
     agent_review_sync_active_probe_agent || true
     # Wait for an in-flight CodeRabbit on-push check before last-resort full review.
@@ -1749,7 +1754,7 @@ cmd_loop() {
         ;;
       3)
         agent_review_loop_set_stop 'THREADS_PENDING' \
-          'Feedback items still need a reply or resolve (threads and issue comments).'
+          'Feedback items still need a reply or resolve (threads, issue comments, review bodies).'
         return 3
         ;;
       4)
@@ -1858,7 +1863,7 @@ cmd_loop() {
 main() {
   local cmd="${1:-}"
   shift || true
-  local repo_arg='' pr_arg='' timeout_arg='' interval_arg='' thread_id='' comment_id='' reason='' body='' force_resolve=0
+  local repo_arg='' pr_arg='' timeout_arg='' interval_arg='' thread_id='' comment_id='' review_id='' reason='' body='' force_resolve=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1884,6 +1889,10 @@ main() {
         ;;
       --comment-id)
         comment_id="$(agent_review_require_option_value --comment-id "${2:-}")"
+        shift 2
+        ;;
+      --review-id)
+        review_id="$(agent_review_require_option_value --review-id "${2:-}")"
         shift 2
         ;;
       --body)
@@ -1959,10 +1968,10 @@ main() {
       cmd_reply_thread "${thread_id}" "${body}"
       ;;
     reply-comment)
-      cmd_reply_comment "${repo_arg}" "${pr_arg}" "${comment_id}" "${body}"
+      cmd_reply_comment "${repo_arg}" "${pr_arg}" "${comment_id}" "${review_id}" "${body}"
       ;;
     resolve-comment)
-      cmd_resolve_comment "${repo_arg}" "${pr_arg}" "${comment_id}" "${force_resolve}"
+      cmd_resolve_comment "${repo_arg}" "${pr_arg}" "${comment_id}" "${review_id}" "${force_resolve}"
       ;;
     resolve-addressed)
       cmd_resolve_addressed "${repo_arg}" "${pr_arg}"
