@@ -139,7 +139,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |
 | Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
 | License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
-| Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` references `wait-for-agent-review` and reply-before-resolve |
+| Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` + `.cursor/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve |
 | UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
 | `.cursor/rules` gitignore | yes | — | `.gitignore` must not block `.cursor/rules/` |
 | Dependabot release age | yes | — | `cooldown` on every `dependabot.yml` updates entry (`release-age-defaults`) |
@@ -432,57 +432,21 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 
 ### Agent review after submit
 
-After every push, **`scripts/dev/post-pr-submission-checks --pr <n>`** must pass (CI green on the PR head). It waits for GitHub Actions and, on failure, prints **`==> CI failure details for coding agent`** with filtered job log excerpts so the agent can fix and re-push. `scripts/dev/submit-stack` invokes this by default; do not skip CI monitoring unless the user opts out (`--no-wait-ci`).
+After every push, **`scripts/dev/post-pr-submission-checks --pr <n>`** must pass (CI green on the PR head). `scripts/dev/submit-stack` and `scripts/dev/ship-and-review` invoke this by default.
 
-When CI is green, run the **agent review loop** documented in **`.cursor/rules/pr-ship-and-review.mdc`**:
+When CI is green, follow **`.cursor/skills/ship-and-review/SKILL.md`** (deep playbook) and the thin contract **`.cursor/rules/pr-ship-and-review.mdc`**:
 
 1. Prefer **`./scripts/wait-for-agent-review loop --pr <n>`** (or `scripts/dev/ship-and-review` from submit).
-2. On exit **3**, triage each feedback item (inline thread or top-level issue comment): fix → **`reply-thread`** / **`reply-comment`** → **`resolve-thread`** / **`resolve-comment`** — never resolve without replying first. Use **`list-feedback`** to see pending items.
-3. When `check` reports `complete_ready: true`, run
-   `./scripts/wait-for-agent-review complete --pr <n>` (or let `loop` exit **0**).
-   `complete_ready` requires at least one **agent sign-off** on the current head
-   (Copilot/Bugbot empty pass, or a real CodeRabbit review body — not a rate-limit
-   stub and not a bare “CodeRabbit: Review completed” commit status alone).
+2. On exit **3**, triage feedback: fix → **`reply-thread`** / **`reply-comment`** → **`resolve-thread`** / **`resolve-comment`** — never resolve without replying first.
+3. When `check` reports `complete_ready: true`, run **`./scripts/wait-for-agent-review complete --pr <n>`** (requires **agent sign-off** on the current head).
 4. Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`.
 
-#### CodeRabbit on_push policy (gated full review only)
-
-A **new push** triggers CodeRabbit automatically (`on_push`). Do **not** post
-`@coderabbitai review` (or any ordinary review prompt) — `loop` / `request` refuse them.
-
-If CodeRabbit is out of quota, it reports a **cooldown** (“Next review available in …” /
-“More reviews will be available in …” / rate-limit notice). Then:
-
-1. Wait out that cooldown with **poll-while-rate-limited** sleeps
-   (`AGENT_REVIEW_CODERABBIT_RATE_LIMIT_POLL`, default **60s**; ceiling
-   `AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX`). Between poll chunks the loop re-checks
-   pending feedback and exits **3** immediately if human/agent triage is needed (issue #369).
-2. Wait an extra **grace** (`AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE`, default **60s**).
-3. Only if there is still **no real review** on the current head, the loop posts a one-shot
-   **`@coderabbitai full review`** (idempotent per head). Rate-limit stubs that merely mention
-   the head SHA are **not** a review.
-
-Operators/agents must follow the same gate — never full-review early, never plain `review`.
-
-#### Early-complete loop and per-agent quota skip
-
-- **Nothing outstanding:** after all threads are addressed, CI is green, and the PR is merge-ready,
-  `loop` completes as soon as it is not waiting on a requested Copilot/Bugbot review and CodeRabbit
-  is idle. `cmd_complete_idle` (early) emails the operator — **without** requiring Copilot
-  **“generated no new comments”**, and **without** a `gh` self-approve. `AGENT_REVIEW_CYCLE_TIMEOUT` is retained for compatibility only.
-- **`AGENT_REVIEW_PR_TIMEOUT`** (default **12h**): non-convergence cap when review cycles keep
-  iterating without reaching early-complete; exit **6** triggers give-up.
-
-Per-agent daily quota caches skip review requests for exhausted agents (CodeRabbit, Copilot, Bugbot)
-and probe the next agent in `AGENT_REVIEW_QUOTA_FALLBACK_CHAIN` (see
-`.cursor/rules/pr-ship-and-review.mdc`).
+See the Skill for CodeRabbit on_push policy, early-complete loop semantics, per-agent quota fallback, and exit codes (**`scripts/wait-for-agent-review --help`** is the SSOT).
 
 **Copilot timeline failures:** credit exhaustion sometimes appears only as a PR timeline event
 `copilot_work_finished_failure` (GitHub App `copilot-swe-agent`) with no issue comment or review
 body. Quota observe scans that timeline event for the local calendar day. Non-quota work failures
 of the same event type also mark Copilot exhausted for the day (acceptable for skip caches).
-
-Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`. Set `AGENT_REVIEW_AGENT=copilot` or another supported profile under `scripts/lib/agent-review-profiles/`.
 
 ---
 

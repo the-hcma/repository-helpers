@@ -162,7 +162,7 @@ Graphite app merge queue configuration remains a manual step and is reported as 
 | Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |
 | Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
 | License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
-| Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` references `wait-for-agent-review` and reply-before-resolve |
+| Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` + `.cursor/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve |
 | UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
 | `.cursor/rules` gitignore | yes | — | `.gitignore` must not block `.cursor/rules/` |
 | Dependabot release age | yes | — | `cooldown` on every `dependabot.yml` updates entry (`release-age-defaults`) |
@@ -233,8 +233,7 @@ scripts/wait-for-agent-review loop --pr <n>
 ```
 
 Configure `~/.config/agent-review.env` from `etc/agent-review.env.example` (SMTP,
-`AGENT_REVIEW_REPORT_TO`, dual-timeout defaults: **15m** idle-success,
-**12h** PR non-convergence cap).
+`AGENT_REVIEW_REPORT_TO`, early-complete when nothing outstanding, **12h** PR non-convergence cap).
 
 See [AGENTS.md](AGENTS.md) for coding conventions, utility index, and agent-review
 details; [GRAPHITE.md](GRAPHITE.md) for branch stacking and the merge queue.
