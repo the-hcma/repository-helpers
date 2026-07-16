@@ -907,6 +907,10 @@ cmd_restack() {
   fi
   attempt=0
   while (( attempt < 12 )); do
+    if agent_review_pr_is_merged "${repo}" "${pr}"; then
+      printf 'PR #%s merged during restack poll — stopping\n' "${pr}" >&2
+      return 0
+    fi
     pr_fields_json="$(ar_runner_gh_pr_jq "wait-for-agent-review pr merge state poll" "${repo}" "${pr}" \
       mergeStateStatus)"
     merge_state="$(ar_runner_jq_file "wait-for-agent-review mergeStateStatus poll" "${pr_fields_json}" \
@@ -1260,7 +1264,8 @@ cmd_loop_nothing_outstanding() {
 # AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE (default 60s), if still no review on head,
 # post a one-shot "@coderabbitai full review" (issue #347 / operator policy).
 # Long cooldowns wait until retry_after with short feedback-poll chunks (issues #366 / #369).
-# Returns 0 when this iteration should continue (rate-limit handling consumed the turn).
+# Returns 0 when this iteration should continue (rate-limit handling consumed the turn),
+# including when the PR merges mid-wait (outer loop then exits 0).
 # Returns 3 when pending human/agent feedback appears mid-wait (triage immediately).
 cmd_loop_handle_coderabbit_rate_limit() {
   local -r repo="$1"
@@ -1304,9 +1309,15 @@ cmd_loop_handle_coderabbit_rate_limit() {
     if (( poll_s < 1 )); then
       poll_s=1
     fi
-    # Poll pending feedback between short sleeps so human/agent triage is not deferred
-    # for the full CodeRabbit cooldown (issue #369).
+    # Poll pending feedback / merge between short sleeps so triage and early
+    # exit are not deferred for the full CodeRabbit cooldown (issues #369 / merge wake).
     while agent_review_agent_quota_rate_limited_for_agent 'coderabbit'; do
+      if agent_review_pr_is_merged "${repo}" "${pr}"; then
+        printf 'wait-for-agent-review: PR #%s merged during CodeRabbit rate-limit wait — stopping\n' \
+          "${pr}" >&2
+        agent_review_loop_wait_remove 'coderabbit' || true
+        return 0
+      fi
       # Refresh snapshot each chunk — a mid-wait Copilot/Bugbot/CR sign-off must be visible.
       read -r _owner _name < <(agent_review_repo_parts "${repo}")
       snapshot="$(agent_review_graphql_pr_snapshot "${_owner}" "${_name}" "${pr}" 2>/dev/null || true)"
@@ -1409,6 +1420,13 @@ cmd_loop_handle_coderabbit_rate_limit() {
     grace_remaining=$((retry_epoch + grace_s - now_epoch))
   fi
   if (( grace_remaining > 0 )); then
+    if agent_review_pr_is_merged "${repo}" "${pr}"; then
+      printf 'wait-for-agent-review: PR #%s merged before CodeRabbit post-cooldown grace — stopping\n' \
+        "${pr}" >&2
+      agent_review_loop_wait_remove 'coderabbit' || true
+      agent_review_use_agent "${saved_agent}"
+      return 0
+    fi
     sleep_s="${grace_remaining}"
     if (( sleep_s < 1 )); then
       sleep_s=1
