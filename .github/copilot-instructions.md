@@ -2,7 +2,8 @@
 
 > Full coding standards, conventions, and CI requirements are in [AGENTS.md](../AGENTS.md).
 > Graphite workflow reference is in [GRAPHITE.md](../GRAPHITE.md).
-> PR ship and agent review loop: [`.cursor/rules/pr-ship-and-review.mdc`](../.cursor/rules/pr-ship-and-review.mdc).
+> PR ship and agent review loop: [`.cursor/skills/ship-and-review/SKILL.md`](../.cursor/skills/ship-and-review/SKILL.md)
+> (thin contract: [`.cursor/rules/pr-ship-and-review.mdc`](../.cursor/rules/pr-ship-and-review.mdc)).
 
 ## Starting New Work
 
@@ -31,13 +32,22 @@ or implement on the primary clone (`main` worktree).
 
 ## Submit and ship
 
+Prefer the all-in-one:
+
 ```bash
-scripts/dev/pre-pr-checks
-scripts/dev/submit-stack                    # or scripts/dev/ship-and-review
-scripts/dev/post-pr-submission-checks --pr <n>   # after each push if not using submit-stack
-scripts/wait-for-agent-review loop --pr <n>      # when CI is green
+scripts/dev/ship-and-review
 ```
 
-The agent review loop uses **dual timeouts**: **15m** idle-success after all feedback
-is addressed (any party), **12h** cap when review cycles never converge. Reply on-thread
-before resolving agent threads (exit **3** if missing). See `etc/agent-review.env.example`.
+Or the manual phases (do not also run `ship-and-review`):
+
+```bash
+scripts/dev/pre-pr-checks
+scripts/dev/submit-stack                       # includes post-pr-submission-checks
+scripts/wait-for-agent-review loop --pr <n>    # when CI is green
+```
+
+After every later push, re-run `scripts/dev/post-pr-submission-checks --pr <n>` before agent review.
+
+Read **`.cursor/skills/ship-and-review/SKILL.md`** before the agent review loop. The loop uses
+**early-complete** when nothing is outstanding and a **12h** PR non-convergence cap. Reply
+on-thread before resolving agent threads (exit **3** if missing). See `etc/agent-review.env.example`.
