@@ -654,6 +654,116 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== quota: once-per-day memory is cross-repo (issue #379) ===\n'
+# Copilot/Bugbot quota is tied to the developer's GitHub identity, not a repo/PR: a
+# usage-limit signal observed on one org PR must be remembered for every other repo the
+# same local day, without re-probing GitHub. A poisoned `gh` on PATH makes any network
+# probe fail loudly and recorded, so honoring the cache means the log stays empty.
+quota_fake_bin="$(mktemp -d)"
+cat >"${quota_fake_bin}/gh" <<'FAKE_GH'
+#!/usr/bin/env bash
+echo "gh $*" >>"${QUOTA_TEST_GH_LOG}"
+exit 42
+FAKE_GH
+chmod +x "${quota_fake_bin}/gh"
+quota_gh_log="$(mktemp)"
+quota_bug_state="$(mktemp -u)"
+quota_sticky_state="$(mktemp -u)"
+quota_stale_state="$(mktemp -u)"
+quota_cop_state="$(mktemp -u)"
+
+# 1) Bugbot exhaustion observed on the-hcma/domesti-bot#494 is honored on another repo.
+: >"${quota_gh_log}"
+quota_skip_rc=0
+QUOTA_TEST_GH_LOG="${quota_gh_log}" PATH="${quota_fake_bin}:${PATH}" bash -c "
+  source '${lib}'; source '${quota_lib}'
+  export AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${quota_bug_state}'
+  export AGENT_REVIEW_AGENT=bugbot
+  agent_review_bugbot_quota_mark_exhausted \
+    'Bugbot comment on the-hcma/domesti-bot#494 reports usage limit reached.' \
+    'https://github.com/the-hcma/domesti-bot/pull/494#issuecomment-4995360683'
+  agent_review_bugbot_quota_skip_request
+" || quota_skip_rc=$?
+if (( quota_skip_rc == 0 )) && [[ ! -s "${quota_gh_log}" ]]; then
+  printf '[PASS] bugbot quota: exhaustion on one repo skips other repos without re-probing gh\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot quota: cross-repo skip failed (rc=%s) or re-probed gh (%s)\n' \
+    "${quota_skip_rc}" "$(tr '\n' ';' <"${quota_gh_log}")"
+  fail=$(( fail + 1 ))
+fi
+
+# 2) A genuine usage-limit observation must survive clear_observed_cache (remember thereafter).
+# Isolated state file (not shared with test #1) so survival is unambiguous if clear deletes it.
+: >"${quota_gh_log}"
+quota_skip_rc=0
+QUOTA_TEST_GH_LOG="${quota_gh_log}" PATH="${quota_fake_bin}:${PATH}" bash -c "
+  source '${lib}'; source '${quota_lib}'
+  export AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${quota_sticky_state}'
+  export AGENT_REVIEW_AGENT=bugbot
+  agent_review_bugbot_quota_mark_exhausted \
+    'Bugbot comment on the-hcma/domesti-bot#494 reports usage limit reached.' \
+    'https://github.com/the-hcma/domesti-bot/pull/494#issuecomment-4995360683'
+  [[ -f '${quota_sticky_state}' ]] || exit 3
+  agent_review_bugbot_quota_clear_observed_cache
+  [[ -f '${quota_sticky_state}' ]] || exit 4
+  agent_review_bugbot_quota_skip_request
+" || quota_skip_rc=$?
+if (( quota_skip_rc == 0 )) && [[ -f "${quota_sticky_state}" ]] && [[ ! -s "${quota_gh_log}" ]]; then
+  printf '[PASS] bugbot quota: genuine usage-limit exhaustion is sticky across clear_observed_cache\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot quota: usage-limit memory lost after clear (rc=%s, cache=%s, gh=%s)\n' \
+    "${quota_skip_rc}" \
+    "$([[ -f "${quota_sticky_state}" ]] && echo present || echo gone)" \
+    "$(tr '\n' ';' <"${quota_gh_log}")"
+  fail=$(( fail + 1 ))
+fi
+
+# 3) A stale non-usage-limit observed entry stays clearable so a fresh run can proceed.
+quota_cleared=no
+if bash -c "
+  source '${lib}'; source '${quota_lib}'
+  export AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${quota_stale_state}'
+  agent_review_bugbot_quota_write_cache 1 observed 'Bugbot review appeared stuck; retrying.'
+  agent_review_bugbot_quota_clear_observed_cache
+  [[ ! -f '${quota_stale_state}' ]]
+"; then
+  quota_cleared=yes
+fi
+if [[ "${quota_cleared}" == 'yes' ]]; then
+  printf '[PASS] bugbot quota: non-usage-limit observed entry still clears for a fresh run\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] bugbot quota: non-usage-limit observed entry was not cleared\n'
+  fail=$(( fail + 1 ))
+fi
+
+# 4) Copilot: identity-scoped exhaustion is likewise honored on another repo without re-probing.
+: >"${quota_gh_log}"
+quota_skip_rc=0
+QUOTA_TEST_GH_LOG="${quota_gh_log}" PATH="${quota_fake_bin}:${PATH}" bash -c "
+  source '${lib}'; source '${quota_lib}'
+  export AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${quota_cop_state}'
+  export AGENT_REVIEW_AGENT=copilot
+  agent_review_copilot_quota_mark_exhausted \
+    'Copilot out of included AI credits (observed on the-hcma/domesti-bot#454).' \
+    'https://github.com/the-hcma/domesti-bot/pull/454#event-1'
+  agent_review_copilot_quota_skip_request
+" || quota_skip_rc=$?
+if (( quota_skip_rc == 0 )) && [[ ! -s "${quota_gh_log}" ]]; then
+  printf '[PASS] copilot quota: exhaustion is remembered across repos without re-probing gh\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot quota: cross-repo skip failed (rc=%s) or re-probed gh (%s)\n' \
+    "${quota_skip_rc}" "$(tr '\n' ';' <"${quota_gh_log}")"
+  fail=$(( fail + 1 ))
+fi
+
+rm -rf "${quota_fake_bin}"
+rm -f "${quota_gh_log}" "${quota_bug_state}" "${quota_sticky_state}" \
+  "${quota_stale_state}" "${quota_cop_state}"
+
 printf '\n=== static: bugbot GitHub check wait ===\n'
 if grep -qF 'agent_review_profile_uses_head_check=true' "$bugbot_profile" \
   && grep -qF 'agent_review_profile_head_check_is_clean' "$bugbot_profile" \
