@@ -53,6 +53,22 @@ sd_runner_git_c() {
   return "$exit_code"
 }
 
+# sd_runner_readlink_f <label> <path>
+# Best-effort readlink -f via runner (empty string on failure).
+sd_runner_readlink_f() {
+  local -r label="$1"
+  local -r path="$2"
+  runner_exec_stdout "$label" -- sh -c 'readlink -f "$1" 2>/dev/null || true' _ "$path"
+}
+
+# sd_runner_readlink <label> <path>
+# Best-effort readlink via runner (empty string on failure).
+sd_runner_readlink() {
+  local -r label="$1"
+  local -r path="$2"
+  runner_exec_stdout "$label" -- sh -c 'readlink "$1" 2>/dev/null || true' _ "$path"
+}
+
 # Use the caller's git root to identify the repo, not the script's own location —
 # so the script works correctly when called from any repo or subdirectory.
 this_worktree="$(sd_runner_git_c_stdout "$PWD" "start-development git toplevel" -- rev-parse --show-toplevel)"
@@ -245,6 +261,164 @@ branch_patch_already_on_main() {
   return 0
 }
 
+# sd_absolutize_path <path>
+# Prints an absolute, symlink-resolved path when possible (readlink -f preferred).
+sd_absolutize_path() {
+  local path="$1"
+  local abs
+  local parent
+
+  [[ -n "$path" ]] || return 1
+  if command -v readlink >/dev/null 2>&1; then
+    abs="$(sd_runner_readlink_f "start-development readlink -f path" "$path")"
+    if [[ -n "$abs" ]]; then
+      printf '%s' "$abs"
+      return 0
+    fi
+  fi
+  if [[ -d "$path" ]]; then
+    abs="$(cd "$path" && pwd -P)" || abs=""
+    if [[ -n "$abs" ]]; then
+      printf '%s' "$abs"
+      return 0
+    fi
+  fi
+  parent="$(dirname "$path")"
+  if [[ -e "$parent" || -d "$parent" ]]; then
+    abs="$(cd "$parent" && pwd -P)" || abs=""
+    if [[ -n "$abs" ]]; then
+      abs="${abs}/$(basename "$path")"
+      printf '%s' "$abs"
+      return 0
+    fi
+  fi
+  printf '%s' "$path"
+  return 0
+}
+
+# sd_path_is_under_prefix <candidate> <prefix>
+# Exit 0 when candidate equals prefix or is a child path under prefix/.
+sd_path_is_under_prefix() {
+  local candidate="$1"
+  local prefix="$2"
+  local prefix_slash
+
+  [[ -n "$candidate" && -n "$prefix" ]] || return 1
+  if [[ "$candidate" == "$prefix" ]]; then
+    return 0
+  fi
+  prefix_slash="${prefix%/}/"
+  [[ "$candidate" == "${prefix_slash}"* ]]
+}
+
+# sd_free_worktree_path_holders <abs_path>
+# Best-effort: terminate processes whose cwd or open fds are under abs_path (Linux /proc).
+# May kill unrelated shells that still have cwd under the worktree; skips only $$ and $PPID.
+sd_free_worktree_path_holders() {
+  local abs_path="$1"
+  local my_pid my_ppid proc_dir pid cwd_link cwd_resolved fd_dir fd_link fd_target fd_resolved
+  local -a pids=()
+  local -a unique_pids=()
+  local holder_pid
+
+  [[ -n "$abs_path" ]] || return 0
+  my_pid=$$
+  my_ppid=$PPID
+
+  for proc_dir in /proc/[0-9]*; do
+    [[ -d "$proc_dir" ]] || continue
+    pid="${proc_dir##*/}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    if (( pid == my_pid || pid == my_ppid )); then
+      continue
+    fi
+
+    cwd_link="$proc_dir/cwd"
+    if [[ -L "$cwd_link" ]]; then
+      cwd_resolved="$(sd_runner_readlink_f "start-development readlink -f cwd" "$cwd_link")"
+      if [[ -z "$cwd_resolved" ]]; then
+        cwd_resolved="$(sd_runner_readlink "start-development readlink cwd" "$cwd_link")"
+      fi
+      if [[ -n "$cwd_resolved" ]] && sd_path_is_under_prefix "$cwd_resolved" "$abs_path"; then
+        pids+=("$pid")
+        continue
+      fi
+    fi
+
+    fd_dir="$proc_dir/fd"
+    if [[ -d "$fd_dir" ]]; then
+      for fd_link in "$fd_dir"/*; do
+        [[ -L "$fd_link" ]] || continue
+        fd_target="$(sd_runner_readlink "start-development readlink fd" "$fd_link")"
+        [[ "$fd_target" == /* ]] || continue
+        fd_resolved="$(sd_runner_readlink_f "start-development readlink -f fd" "$fd_target")"
+        if [[ -z "$fd_resolved" ]]; then
+          fd_resolved="$fd_target"
+        fi
+        if sd_path_is_under_prefix "$fd_resolved" "$abs_path"; then
+          pids+=("$pid")
+          break
+        fi
+      done
+    fi
+  done
+
+  if ((${#pids[@]} == 0)); then
+    return 0
+  fi
+
+  mapfile -t unique_pids < <(printf '%s\n' "${pids[@]}" | sort -u -n)
+  printf '   [~] Releasing %d process(es) holding %s (SIGTERM)…\n' \
+    "${#unique_pids[@]}" "$abs_path"
+  for holder_pid in "${unique_pids[@]}"; do
+    kill -TERM "$holder_pid" 2>/dev/null || true
+  done
+  sleep 1 2>/dev/null || true
+  for holder_pid in "${unique_pids[@]}"; do
+    if kill -0 "$holder_pid" 2>/dev/null; then
+      printf '   [~] Process %s still holding %s; sending SIGKILL…\n' "$holder_pid" "$abs_path"
+      kill -KILL "$holder_pid" 2>/dev/null || true
+    fi
+  done
+}
+
+# force_remove_directory <path>
+# Remove a directory tree with chmod/retry and /proc holder release. Exit 0 when gone.
+force_remove_directory() {
+  local path="$1"
+  local abs_path
+  local attempt
+  local max_attempts=5
+
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    return 0
+  fi
+
+  # sd_absolutize_path always prints a best-effort path for non-empty input (exit 0).
+  abs_path="$(sd_absolutize_path "$path")"
+
+  for attempt in 1 2 3 4 5; do
+    chmod -R u+w "$abs_path" 2>/dev/null || true
+    rm -rf -- "$abs_path" 2>/dev/null || true
+    if [[ "$path" != "$abs_path" ]]; then
+      rm -f -- "$path" 2>/dev/null || true
+    fi
+    if [[ ! -e "$path" && ! -L "$path" ]] \
+      && [[ ! -e "$abs_path" && ! -L "$abs_path" ]]; then
+      return 0
+    fi
+    sd_free_worktree_path_holders "$abs_path"
+    if (( attempt < max_attempts )); then
+      sleep 1 2>/dev/null || true
+    fi
+  done
+
+  if [[ -e "$path" || -L "$path" || -e "$abs_path" || -L "$abs_path" ]]; then
+    return 1
+  fi
+  return 0
+}
+
 # remove_secondary_worktree <main_repo> <path> <branch> <human_reason_one_line>
 remove_secondary_worktree() {
   local -r repo="$1"
@@ -253,8 +427,9 @@ remove_secondary_worktree() {
   local -r reason="$4"
   printf '   [!] %s\n' "$reason"
   sd_runner_git_c "$repo" "start-development worktree remove" -- worktree remove --force "$path" || true
-  rm -rf "$path" 2>/dev/null \
-    || echo "   [~] Could not fully remove '$path' (files may be busy); continuing."
+  if ! force_remove_directory "$path"; then
+    printf '   [~] Could not fully remove %s (files may still be busy); continuing.\n' "$path"
+  fi
   sd_runner_git_c "$repo" "start-development worktree prune" -- worktree prune
   sd_runner_git_c "$repo" "start-development branch delete" -- branch -D "$branch" || true
 }
