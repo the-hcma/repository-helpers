@@ -1,0 +1,240 @@
+# shellcheck shell=bash
+#
+# Shared stacking-tool preference (Graphite vs GitHub Stacked PRs).
+# Marker file: .github/stacking-tool — single line, graphite|gh-stack.
+#
+# Scripts that create/submit/restack stacks must read the marker via this lib
+# rather than hardcoding gt. See issue #387.
+
+if declare -F stacking_tool_read >/dev/null 2>&1; then
+  return 0
+fi
+
+_stacking_tool_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _stacking_tool_lib_dir
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_stacking_tool_lib_dir}/runner-ensure"
+
+# Relative path of the preference file inside a repository clone.
+# shellcheck disable=SC2034  # sourced by scripts/tests/lint
+stacking_tool_MARKER_RELPATH='.github/stacking-tool'
+# shellcheck disable=SC2034
+readonly stacking_tool_MARKER_RELPATH
+
+stacking_tool_VALUE_GRAPHITE='graphite'
+# shellcheck disable=SC2034
+readonly stacking_tool_VALUE_GRAPHITE
+
+stacking_tool_VALUE_GH_STACK='gh-stack'
+# shellcheck disable=SC2034
+readonly stacking_tool_VALUE_GH_STACK
+
+# Default written by github-repo-lint --apply-fix for consumer repos that still
+# use Graphite. This repo (repository-helpers) may opt into gh-stack as a trial.
+stacking_tool_ORG_DEFAULT="${stacking_tool_VALUE_GRAPHITE}"
+# shellcheck disable=SC2034
+readonly stacking_tool_ORG_DEFAULT
+
+stacking_tool_die() {
+  printf 'ERROR: stacking-tool: %s\n' "$*" >&2
+  exit 1
+}
+
+# stacking_tool_is_valid <value>
+# Returns 0 when value is graphite or gh-stack.
+stacking_tool_is_valid() {
+  local -r value="${1:-}"
+  [[ "$value" == "$stacking_tool_VALUE_GRAPHITE" || "$value" == "$stacking_tool_VALUE_GH_STACK" ]]
+}
+
+# stacking_tool_normalize <raw>
+# Trims whitespace/newlines; prints the normalized token (may be empty/invalid).
+stacking_tool_normalize() {
+  local raw="${1:-}"
+  # Strip CR, leading/trailing whitespace, and keep only the first line.
+  raw="${raw%%$'\n'*}"
+  raw="${raw%%$'\r'*}"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  printf '%s' "$raw"
+}
+
+# stacking_tool_marker_path <repo_dir>
+stacking_tool_marker_path() {
+  local -r repo_dir="$1"
+  printf '%s/%s' "$repo_dir" "$stacking_tool_MARKER_RELPATH"
+}
+
+# stacking_tool_resolve_repo_dir [repo_dir]
+# Prints an absolute git toplevel. Uses repo_dir when set; otherwise cwd.
+stacking_tool_resolve_repo_dir() {
+  local repo_dir="${1:-}"
+  local resolved
+
+  if [[ -n "$repo_dir" ]]; then
+    if [[ ! -d "$repo_dir" ]]; then
+      stacking_tool_die "repo dir is not a directory: ${repo_dir}"
+    fi
+    resolved="$(
+      runner_exec_stdout "stacking-tool git rev-parse toplevel" -- \
+        git -C "$repo_dir" rev-parse --show-toplevel
+    )" || stacking_tool_die "not a git repository: ${repo_dir}"
+  else
+    resolved="$(
+      runner_exec_stdout "stacking-tool git rev-parse toplevel (cwd)" -- \
+        git rev-parse --show-toplevel
+    )" || stacking_tool_die 'not inside a git repository'
+  fi
+  printf '%s' "$resolved"
+}
+
+# stacking_tool_read <repo_dir>
+# Prints graphite|gh-stack. Dies when the marker is missing or invalid.
+stacking_tool_read() {
+  local repo_dir marker_path raw value
+
+  repo_dir="$(stacking_tool_resolve_repo_dir "${1:-}")"
+  marker_path="$(stacking_tool_marker_path "$repo_dir")"
+
+  if [[ ! -f "$marker_path" ]]; then
+    stacking_tool_die \
+      "missing ${stacking_tool_MARKER_RELPATH} in ${repo_dir} (expected '${stacking_tool_VALUE_GRAPHITE}' or '${stacking_tool_VALUE_GH_STACK}')"
+  fi
+
+  raw="$(
+    runner_exec_stdout "stacking-tool read marker" -- cat "$marker_path"
+  )" || stacking_tool_die "failed to read ${marker_path}"
+  value="$(stacking_tool_normalize "$raw")"
+
+  if [[ -z "$value" ]]; then
+    stacking_tool_die \
+      "${stacking_tool_MARKER_RELPATH} is empty (expected '${stacking_tool_VALUE_GRAPHITE}' or '${stacking_tool_VALUE_GH_STACK}')"
+  fi
+  if ! stacking_tool_is_valid "$value"; then
+    stacking_tool_die \
+      "invalid ${stacking_tool_MARKER_RELPATH} value '${value}' (expected '${stacking_tool_VALUE_GRAPHITE}' or '${stacking_tool_VALUE_GH_STACK}')"
+  fi
+  printf '%s' "$value"
+}
+
+# stacking_tool_require_cli <tool>
+# Ensures the CLI for the selected stacking backend is available.
+stacking_tool_require_cli() {
+  local -r tool="$1"
+
+  case "$tool" in
+    "$stacking_tool_VALUE_GRAPHITE")
+      command -v gt >/dev/null 2>&1 \
+        || stacking_tool_die "gt (Graphite CLI) not found on PATH (marker is ${stacking_tool_VALUE_GRAPHITE})"
+      ;;
+    "$stacking_tool_VALUE_GH_STACK")
+      command -v gh >/dev/null 2>&1 \
+        || stacking_tool_die "gh (GitHub CLI) not found on PATH (marker is ${stacking_tool_VALUE_GH_STACK})"
+      if ! runner_exec "stacking-tool probe gh stack" -- \
+        gh stack --help >/dev/null 2>&1; then
+        stacking_tool_die \
+          "gh stack extension not available (install: gh extension install github/gh-stack)"
+      fi
+      ;;
+    *)
+      stacking_tool_die "unknown stacking tool '${tool}'"
+      ;;
+  esac
+}
+
+# stacking_tool_submit <repo_dir> [extra args…]
+# Submits the current stack using the marker-selected backend.
+# Graphite: gt submit --publish --no-interactive [extras]
+# gh-stack: gh stack submit --auto --open --remote origin (extras ignored for now)
+stacking_tool_submit() {
+  local repo_dir tool quoted_repo arg quoted_extras
+  local -a extras=()
+
+  repo_dir="$(stacking_tool_resolve_repo_dir "${1:-}")"
+  if [[ $# -ge 1 ]]; then
+    shift
+  fi
+  extras=("$@")
+  tool="$(stacking_tool_read "$repo_dir")"
+  stacking_tool_require_cli "$tool"
+  quoted_repo="$(printf '%q' "$repo_dir")"
+
+  case "$tool" in
+    "$stacking_tool_VALUE_GRAPHITE")
+      quoted_extras=''
+      for arg in "${extras[@]}"; do
+        quoted_extras+=" $(printf '%q' "$arg")"
+      done
+      runner_sh "stacking-tool gt submit" \
+        "cd ${quoted_repo} && gt submit --publish --no-interactive${quoted_extras}"
+      ;;
+    "$stacking_tool_VALUE_GH_STACK")
+      if [[ ${#extras[@]} -gt 0 ]]; then
+        printf 'stacking-tool: warning: ignoring extra submit args for gh-stack: %s\n' \
+          "${extras[*]}" >&2
+      fi
+      runner_sh "stacking-tool gh stack submit" \
+        "cd ${quoted_repo} && gh stack submit --auto --open --remote origin"
+      ;;
+  esac
+}
+
+# stacking_tool_restack <repo_dir>
+# Rebases the current stack onto an updated base and re-pushes.
+# Graphite: gt sync && gt restack && gt submit --no-interactive --publish
+# gh-stack: gh stack sync --remote origin (fetch/rebase/push); falls back to
+#           gh stack rebase + gh stack submit --auto --open on sync failure.
+stacking_tool_restack() {
+  local repo_dir tool quoted_repo
+
+  repo_dir="$(stacking_tool_resolve_repo_dir "${1:-}")"
+  tool="$(stacking_tool_read "$repo_dir")"
+  stacking_tool_require_cli "$tool"
+  quoted_repo="$(printf '%q' "$repo_dir")"
+
+  case "$tool" in
+    "$stacking_tool_VALUE_GRAPHITE")
+      runner_sh "stacking-tool gt sync" "cd ${quoted_repo} && gt sync" \
+        || stacking_tool_die 'gt sync failed during restack'
+      runner_sh "stacking-tool gt restack" "cd ${quoted_repo} && gt restack" \
+        || stacking_tool_die 'gt restack failed'
+      runner_sh "stacking-tool gt submit after restack" \
+        "cd ${quoted_repo} && gt submit --no-interactive --publish" \
+        || stacking_tool_die 'gt submit failed after restack'
+      ;;
+    "$stacking_tool_VALUE_GH_STACK")
+      if ! runner_sh "stacking-tool gh stack sync" \
+        "cd ${quoted_repo} && gh stack sync --remote origin"; then
+        runner_sh "stacking-tool gh stack rebase" \
+          "cd ${quoted_repo} && gh stack rebase --remote origin" \
+          || stacking_tool_die 'gh stack rebase failed during restack'
+        runner_sh "stacking-tool gh stack submit after rebase" \
+          "cd ${quoted_repo} && gh stack submit --auto --open --remote origin" \
+          || stacking_tool_die 'gh stack submit failed after rebase'
+      fi
+      ;;
+  esac
+}
+
+# stacking_tool_session_sync <repo_dir>
+# Session bootstrap sync (start-development). Graphite: gt sync --quiet --force.
+# gh-stack: git fetch --prune origin (no Graphite).
+stacking_tool_session_sync() {
+  local repo_dir tool quoted_repo
+
+  repo_dir="$(stacking_tool_resolve_repo_dir "${1:-}")"
+  tool="$(stacking_tool_read "$repo_dir")"
+  stacking_tool_require_cli "$tool"
+  quoted_repo="$(printf '%q' "$repo_dir")"
+
+  case "$tool" in
+    "$stacking_tool_VALUE_GRAPHITE")
+      runner_sh "stacking-tool session gt sync" \
+        "cd ${quoted_repo} && gt sync --quiet --force"
+      ;;
+    "$stacking_tool_VALUE_GH_STACK")
+      runner_sh "stacking-tool session git fetch" \
+        "cd ${quoted_repo} && git fetch --prune origin"
+      ;;
+  esac
+}
