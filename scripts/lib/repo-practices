@@ -1092,6 +1092,270 @@ rp_check_uv_python_cve_check_workflow() {
   return 0
 }
 
+# Canonical job name for the combined Python lint/format/typecheck CI job.
+readonly rp_PYTHON_STATIC_JOB_NAME='Python lint & format checks'
+# Canonical CI wrapper script that runs ruff + typechecker in one uv sync.
+readonly rp_PYTHON_STATIC_SCRIPT_PATH='.github/ci/python-static'
+
+# True when a .github/ci/python-static script runs ruff check + format + a typechecker.
+rp_python_static_wrapper_is_canonical() {
+  local text="$1"
+  grep -qE 'ruff[[:space:]]+check' <<<"$text" || return 1
+  grep -qE 'ruff[[:space:]]+format[[:space:]]+--check' <<<"$text" || return 1
+  grep -qE '(pyright|mypy)' <<<"$text" || return 1
+  return 0
+}
+
+# Split / cutover-alias job display names (exact `name:` lines; optional quotes).
+readonly rp_PYTHON_STATIC_SPLIT_JOB_NAME_RE='^[[:space:]]*name:[[:space:]]*["'\'']?(Ruff|Pyright|Mypy|Backend Lint)["'\'']?[[:space:]]*$'
+
+# True when ci.yml has a standalone Ruff/Pyright/Mypy/Backend Lint job (the split
+# anti-pattern or leftover cutover aliases). Matches exact job display names.
+rp_ci_workflow_has_split_python_static_jobs() {
+  local text="$1"
+  grep -qE "$rp_PYTHON_STATIC_SPLIT_JOB_NAME_RE" <<<"$text"
+}
+
+# Cutover alias stubs that `needs: python-static` but only gate on guard will
+# still *run and succeed* when python-static fails (GitHub Actions re-evaluates
+# a custom `if:` instead of the default success()). Required checks named
+# Ruff/Pyright/… then go green while lint/typecheck failed.
+#
+# True when any split-named job's block lacks the python-static success gate
+# (scoped per job under `jobs:` — a gate on an unrelated job must not mask an
+# unsafe alias). Flags accumulate per job block and are evaluated at the block
+# boundary, so YAML key ordering (`if:` before `name:`) and multi-line `if:`
+# scalars (`if: >` continuation lines) are both handled. The job-key indent is
+# learned from the first key under `jobs:` so 2-space and 4-space YAML both
+# parse; deeper keys (steps, permissions) are ignored.
+rp_ci_workflow_has_unsafe_python_static_cutover_aliases() {
+  local text="$1"
+  rp_ci_workflow_has_split_python_static_jobs "$text" || return 1
+  awk '
+    BEGIN { unsafe = 0; in_jobs = 0; is_alias = 0; has_gate = 0; job_indent = 0 }
+    /^jobs:[[:space:]]*$/ { in_jobs = 1; job_indent = 0; next }
+    in_jobs && /^[^[:space:]]/ { in_jobs = 0 }
+    !in_jobs { next }
+    # Job key under jobs: (indent level learned from the first key seen).
+    /^ +[A-Za-z0-9_.-]+:[[:space:]]*$/ {
+      indent = match($0, /[^ ]/) - 1
+      if (job_indent == 0) { job_indent = indent }
+      if (indent == job_indent) {
+        if (is_alias && !has_gate) { unsafe = 1 }
+        is_alias = 0
+        has_gate = 0
+        next
+      }
+    }
+    $0 ~ /^[[:space:]]*name:[[:space:]]*["'\'']?(Ruff|Pyright|Mypy|Backend Lint)["'\'']?[[:space:]]*$/ {
+      is_alias = 1
+      next
+    }
+    $0 ~ /needs\.python-static\.result[[:space:]]*==[[:space:]]*['\''"]?success['\''"]?/ {
+      has_gate = 1
+    }
+    END {
+      if (is_alias && !has_gate) { unsafe = 1 }
+      exit(unsafe ? 0 : 1)
+    }
+  ' <<<"$text"
+}
+
+# True when ci.yml has one job that both uses the canonical display name and
+# runs the wrapper (scoped to the same job block under `jobs:`). Name and
+# wrapper flags accumulate per job block and are evaluated at the block
+# boundary, so YAML key ordering (`steps:` before `name:`) is handled.
+rp_ci_workflow_has_combined_python_static_job() {
+  local text="$1"
+  local -r job_name="$rp_PYTHON_STATIC_JOB_NAME"
+  local -r wrapper="bash ${rp_PYTHON_STATIC_SCRIPT_PATH}"
+  awk -v job_name="$job_name" -v wrapper="$wrapper" '
+    BEGIN { found = 0; in_jobs = 0; has_name = 0; has_wrapper = 0; job_indent = 0 }
+    /^jobs:[[:space:]]*$/ { in_jobs = 1; job_indent = 0; next }
+    in_jobs && /^[^[:space:]]/ { in_jobs = 0 }
+    !in_jobs { next }
+    /^ +[A-Za-z0-9_.-]+:[[:space:]]*$/ {
+      indent = match($0, /[^ ]/) - 1
+      if (job_indent == 0) { job_indent = indent }
+      if (indent == job_indent) {
+        if (has_name && has_wrapper) { found = 1 }
+        has_name = 0
+        has_wrapper = 0
+        next
+      }
+    }
+    {
+      name_re = "^[[:space:]]*name:[[:space:]]*[\"'\'']?" job_name "[\"'\'']?[[:space:]]*$"
+      if ($0 ~ name_re) {
+        has_name = 1
+        next
+      }
+      # Exact wrapper invocation: reject suffixed paths like python-static-v2.
+      pos = index($0, wrapper)
+      if (pos > 0) {
+        tail = substr($0, pos + length(wrapper), 1)
+        if (tail == "" || tail == " " || tail == "\t" || tail == "\"" || tail == "'\''") {
+          has_wrapper = 1
+        }
+      }
+    }
+    END {
+      if (has_name && has_wrapper) { found = 1 }
+      exit(found ? 0 : 1)
+    }
+  ' <<<"$text"
+}
+
+# Classify whether the repo lints Python with ruff in CI.
+# Exit 0 = uses ruff (policy applies). Exit 1 = no ruff. Exit 2 = GitHub API error.
+# Only ci.yml content or the canonical python-static wrapper count — a stale
+# `.github/ci/ruff` path alone must not force the policy on.
+rp_repo_uses_ruff_ci() {
+  local slug="$1"
+  local ci_text="$2"
+  local path_ec=0
+
+  if grep -qiF 'ruff' <<<"$ci_text"; then
+    return 0
+  fi
+
+  rp_gh_path_check "$slug" "$rp_PYTHON_STATIC_SCRIPT_PATH" || path_ec=$?
+  if (( path_ec == 2 )); then
+    return 2
+  fi
+  if (( path_ec == 0 )); then
+    return 0
+  fi
+  return 1
+}
+
+# Best practice: Python repos run ruff (check + format) and their typechecker
+# (pyright/mypy) in ONE CI job (`Python lint & format checks`) driven by a shared
+# `.github/ci/python-static` wrapper — not split across per-tool jobs. Splitting
+# burns an extra runner + uv sync and adds a branch-protection context per tool
+# (the source of the domesti-bot "missing Ruff" drift). Cutover aliases that omit
+# `needs.python-static.result == 'success'` falsely green required checks when
+# the combined job fails. See the Python static CI cursor rule and AGENTS.md.
+rp_check_python_static_ci_job() {
+  local slug="$1"
+  local repo_fail=0
+  local py_ec=0
+  local ruff_ec=0
+  local path_ec=0
+  local ci_text
+  local wrapper_text
+  local wrapper_ec=0
+
+  # Gate: only Python repos (pyproject.toml at root).
+  rp_gh_path_check "$slug" 'pyproject.toml' || py_ec=$?
+  if (( py_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not detect pyproject.toml for Python static CI check'
+    return 1
+  fi
+  if (( py_ec != 0 )); then
+    return 0
+  fi
+
+  # Distinguish missing ci.yml from GitHub API failures (do not treat empty
+  # decode from a transient 502 as "no workflow").
+  path_ec=0
+  rp_gh_path_check "$slug" '.github/workflows/ci.yml' || path_ec=$?
+  if (( path_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/workflows/ci.yml for Python static CI check'
+    return 1
+  fi
+  if (( path_ec != 0 )); then
+    return 0
+  fi
+
+  wrapper_ec=0
+  ci_text="$(rp_fetch_github_text_file "$slug" '.github/workflows/ci.yml')" || wrapper_ec=$?
+  if (( wrapper_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/workflows/ci.yml for Python static CI check'
+    return 1
+  fi
+  if (( wrapper_ec != 0 )) || [[ -z "$ci_text" ]]; then
+    # Path existed but content empty/unreadable — treat as missing workflow, skip.
+    return 0
+  fi
+
+  # Gate: only repos that lint Python with ruff in CI.
+  rp_repo_uses_ruff_ci "$slug" "$ci_text" || ruff_ec=$?
+  if (( ruff_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not detect ruff CI usage for Python static check'
+    return 1
+  fi
+  if (( ruff_ec != 0 )); then
+    return 0
+  fi
+
+  if rp_ci_workflow_has_unsafe_python_static_cutover_aliases "$ci_text"; then
+    repo_fail=1
+    rp_log_fail \
+      "${slug}: cutover alias jobs (Ruff/Pyright/Mypy/Backend Lint) omit needs.python-static.result == 'success' (false-green when combined job fails)"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: alias if: must include needs.python-static.result == 'success' (or remove aliases after github-repo-lint --apply-fix)"
+    fi
+  elif rp_ci_workflow_has_split_python_static_jobs "$ci_text"; then
+    repo_fail=1
+    rp_log_fail \
+      "${slug}: ci.yml still has split/cutover Python static jobs (Ruff/Pyright/Mypy/Backend Lint); remove after protection retarget"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: remove alias jobs; keep only '${rp_PYTHON_STATIC_JOB_NAME}' via ${rp_PYTHON_STATIC_SCRIPT_PATH}"
+    fi
+  fi
+
+  if ! rp_ci_workflow_has_combined_python_static_job "$ci_text"; then
+    repo_fail=1
+    rp_log_fail \
+      "${slug}: ci.yml missing combined '${rp_PYTHON_STATIC_JOB_NAME}' job running ${rp_PYTHON_STATIC_SCRIPT_PATH}"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add a '${rp_PYTHON_STATIC_JOB_NAME}' job that runs 'bash ${rp_PYTHON_STATIC_SCRIPT_PATH}'"
+    fi
+  fi
+
+  path_ec=0
+  rp_gh_path_check "$slug" "$rp_PYTHON_STATIC_SCRIPT_PATH" || path_ec=$?
+  if (( path_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" "could not read ${rp_PYTHON_STATIC_SCRIPT_PATH}"
+    return 1
+  fi
+  if (( path_ec != 0 )); then
+    repo_fail=1
+    rp_log_fail "${slug}: missing ${rp_PYTHON_STATIC_SCRIPT_PATH} wrapper (ruff check + format + typecheck)"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add ${rp_PYTHON_STATIC_SCRIPT_PATH} running ruff check, ruff format --check, and pyright/mypy after one uv sync"
+    fi
+  else
+    wrapper_ec=0
+    wrapper_text="$(rp_fetch_github_text_file "$slug" "$rp_PYTHON_STATIC_SCRIPT_PATH")" || wrapper_ec=$?
+    if (( wrapper_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" "could not read ${rp_PYTHON_STATIC_SCRIPT_PATH}"
+      return 1
+    fi
+    if [[ -z "$wrapper_text" ]] || ! rp_python_static_wrapper_is_canonical "$wrapper_text"; then
+      repo_fail=1
+      rp_log_fail \
+        "${slug}: ${rp_PYTHON_STATIC_SCRIPT_PATH} must run ruff check, ruff format --check, and a typechecker"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: ${rp_PYTHON_STATIC_SCRIPT_PATH} should run ruff check, ruff format --check, and pyright/mypy"
+      fi
+    fi
+  fi
+
+  if [[ "$repo_fail" -eq 0 ]]; then
+    rp_log_check_ok "${slug}" 'Python static checks combined in one CI job' \
+      "$(rp_github_url "$slug" "/blob/main/${rp_PYTHON_STATIC_SCRIPT_PATH}")"
+  fi
+
+  return "$repo_fail"
+}
+
 rp_candidate_secret_scan_script() {
   local -r path="${rp_lib_dir}/ci-secret-scan"
 
@@ -4645,6 +4909,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_uv_python_cve_check_workflow "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_python_static_ci_job "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_cursor_rules_gitignore "$slug"; then
