@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Tests for scripts/lib/stacking-tool and .github/stacking-tool.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+rh_root="${script_dir}/.."
+readonly rh_root
+
+lib="${rh_root}/scripts/lib/stacking-tool"
+marker="${rh_root}/.github/stacking-tool"
+readonly lib marker
+
+# shellcheck source=tests/lib/test-assert
+source "${script_dir}/lib/test-assert"
+pass=0
+fail=0
+test_init
+
+printf '\n=== static: library and marker exist ===\n'
+if [[ -f "$lib" ]]; then
+  pass_case 'scripts/lib/stacking-tool exists'
+else
+  fail_case 'scripts/lib/stacking-tool exists'
+fi
+if [[ -f "$marker" ]]; then
+  pass_case '.github/stacking-tool exists'
+else
+  fail_case '.github/stacking-tool exists'
+fi
+
+printf '\n=== static: marker value for this repo ===\n'
+marker_value="$(tr -d '[:space:]' <"$marker" || true)"
+if [[ "$marker_value" == 'gh-stack' ]]; then
+  pass_case 'repository-helpers marker is gh-stack (trial)'
+else
+  fail_case "repository-helpers marker is gh-stack (got '${marker_value}')"
+fi
+
+printf '\n=== static: library API surface ===\n'
+if grep -qF "stacking_tool_MARKER_RELPATH='.github/stacking-tool'" "$lib" \
+  && grep -qF "stacking_tool_VALUE_GRAPHITE='graphite'" "$lib" \
+  && grep -qF "stacking_tool_VALUE_GH_STACK='gh-stack'" "$lib" \
+  && grep -qF 'stacking_tool_ORG_DEFAULT=' "$lib" \
+  && grep -qF 'stacking_tool_read' "$lib" \
+  && grep -qF 'stacking_tool_is_valid' "$lib" \
+  && grep -qF 'stacking_tool_require_cli' "$lib" \
+  && grep -qF 'stacking_tool_submit' "$lib" \
+  && grep -qF 'stacking_tool_restack' "$lib" \
+  && grep -qF 'stacking_tool_session_sync' "$lib"; then
+  pass_case 'stacking-tool defines marker constants and operation helpers'
+else
+  fail_case 'stacking-tool defines marker constants and operation helpers'
+fi
+
+printf '\n=== static: backends use runner helpers ===\n'
+# shellcheck disable=SC2016  # intentional literal match for source path in library
+if grep -qF 'source "${_stacking_tool_lib_dir}/runner-ensure"' "$lib" \
+  && grep -qF 'runner_sh "stacking-tool gt submit"' "$lib" \
+  && grep -qF 'runner_sh "stacking-tool gh stack submit"' "$lib" \
+  && grep -qF 'gh stack submit --auto --open' "$lib" \
+  && grep -qF 'gt submit --publish --no-interactive' "$lib"; then
+  pass_case 'stacking-tool dispatches via runner_sh for both backends'
+else
+  fail_case 'stacking-tool dispatches via runner_sh for both backends'
+fi
+
+# shellcheck disable=SC1090,SC1091
+source "$lib"
+
+printf '\n=== functional: stacking_tool_is_valid ===\n'
+if stacking_tool_is_valid 'graphite' && stacking_tool_is_valid 'gh-stack'; then
+  pass_case 'stacking_tool_is_valid accepts graphite and gh-stack'
+else
+  fail_case 'stacking_tool_is_valid accepts graphite and gh-stack'
+fi
+if ! stacking_tool_is_valid 'graphite-cli' && ! stacking_tool_is_valid '' && ! stacking_tool_is_valid 'GT'; then
+  pass_case 'stacking_tool_is_valid rejects invalid values'
+else
+  fail_case 'stacking_tool_is_valid rejects invalid values'
+fi
+
+printf '\n=== functional: stacking_tool_normalize ===\n'
+norm_out="$(stacking_tool_normalize $'  gh-stack\n')"
+assert_contains 'normalize trims whitespace' "$norm_out" 'gh-stack'
+if [[ "$norm_out" == 'gh-stack' ]]; then
+  pass_case 'normalize returns exact gh-stack token'
+else
+  fail_case "normalize returns exact gh-stack token (got '${norm_out}')"
+fi
+
+printf '\n=== functional: stacking_tool_read this repo ===\n'
+read_out="$(stacking_tool_read "$rh_root")"
+assert_contains 'read returns gh-stack for this worktree' "$read_out" 'gh-stack'
+if [[ "$read_out" == 'gh-stack' ]]; then
+  pass_case 'read value equals gh-stack exactly'
+else
+  fail_case "read value equals gh-stack exactly (got '${read_out}')"
+fi
+
+printf '\n=== functional: stacking_tool_read missing/invalid ===\n'
+tmp_repo="$(mktemp -d)"
+git -C "$tmp_repo" -c user.name=test -c user.email=test@example.com init -q
+git -C "$tmp_repo" -c user.name=test -c user.email=test@example.com \
+  commit --allow-empty -q -m 'init'
+
+missing_exit=0
+missing_out="$(stacking_tool_read "$tmp_repo" 2>&1)" || missing_exit=$?
+if [[ "$missing_exit" -ne 0 ]] && printf '%s' "$missing_out" | grep -qF 'missing .github/stacking-tool'; then
+  pass_case 'read dies when marker is missing'
+else
+  fail_case "read dies when marker is missing (exit=${missing_exit})"
+fi
+
+mkdir -p "${tmp_repo}/.github"
+printf 'not-a-tool\n' >"${tmp_repo}/.github/stacking-tool"
+invalid_exit=0
+invalid_out="$(stacking_tool_read "$tmp_repo" 2>&1)" || invalid_exit=$?
+if [[ "$invalid_exit" -ne 0 ]] && printf '%s' "$invalid_out" | grep -qF 'invalid'; then
+  pass_case 'read dies when marker is invalid'
+else
+  fail_case "read dies when marker is invalid (exit=${invalid_exit})"
+fi
+
+printf 'graphite\n' >"${tmp_repo}/.github/stacking-tool"
+graphite_out="$(stacking_tool_read "$tmp_repo")"
+assert_contains 'read accepts graphite in temp repo' "$graphite_out" 'graphite'
+
+rm -rf "$tmp_repo"
+
+printf '\n=== functional: stacking_tool_require_cli ===\n'
+if stacking_tool_require_cli 'gh-stack'; then
+  pass_case 'require_cli accepts available gh-stack extension'
+else
+  fail_case 'require_cli accepts available gh-stack extension'
+fi
+
+fake_bin="$(mktemp -d)"
+# No gt on PATH → graphite prereq should fail. Run in a subshell: require_cli dies via exit.
+require_exit=0
+( PATH="${fake_bin}:/usr/bin:/bin" stacking_tool_require_cli 'graphite' ) 2>/dev/null || require_exit=$?
+if [[ "$require_exit" -ne 0 ]]; then
+  pass_case 'require_cli fails when gt is missing for graphite'
+else
+  fail_case 'require_cli fails when gt is missing for graphite'
+fi
+rm -rf "$fake_bin"
+
+printf '\n=== summary ===\n'
+printf 'pass=%s fail=%s\n' "$pass" "$fail"
+if [[ "$fail" -ne 0 ]]; then
+  exit 1
+fi
+exit 0
