@@ -29,7 +29,9 @@ the primary clone (`main` worktree).
 - Declare `local` / `readonly` separately from command substitutions (SC2155).
 - Never declare `local -r` inside a loop body.
 - Every behaviour change or bug fix must have a test in `tests/`.
-- Never push directly to `main`. Use `gt create` → `scripts/dev/submit-stack`.
+- Never push directly to `main`. Create a stack layer per `.github/stacking-tool`
+  (`gt create` when `graphite`, `gh stack init` / `gh stack add` when `gh-stack`),
+  then `scripts/dev/submit-stack`.
 - To merge a PR: `gh pr edit <number> --add-label merge-it`. Never `gh pr merge`.
 
 ## Submit and ship
