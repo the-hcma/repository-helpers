@@ -11,6 +11,8 @@ rp_GRAPHITE_APP_SLUG='graphite-app'
 rp_DEPENDABOT_APP_SLUG='dependabot'
 rp_ORG_OWNER_BYPASS_USER='thehcma'
 rp_THIS_REPO_NAME='repository-helpers'
+# GitHub merge-queue rule must squash (matches org Release Please / Graphite policy).
+rp_GITHUB_MQ_MERGE_METHOD='SQUASH'
 
 rp_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly rp_lib_dir
@@ -2788,6 +2790,34 @@ rp_fetch_repo_labels_json() {
   return 0
 }
 
+# rp_ruleset_has_github_merge_queue <ruleset_json>
+# True when protect-main includes a merge_queue rule (native GitHub MQ).
+rp_ruleset_has_github_merge_queue() {
+  local -r ruleset_json="${1:-}"
+  [[ -n "$ruleset_json" ]] || return 1
+  local jq_exit_code=0
+  rp_runner_jq_file "repo-practices ruleset has merge_queue" "$ruleset_json" \
+    -e '[.rules[]? | select(.type == "merge_queue")] | length > 0' >/dev/null \
+    || jq_exit_code=$?
+  (( jq_exit_code == 0 ))
+}
+
+# rp_repo_uses_github_merge_queue <slug>
+# True when the repo's protect-main ruleset requires GitHub's merge queue.
+rp_repo_uses_github_merge_queue() {
+  local -r slug="$1"
+  local ruleset_json
+  local fetch_exit=0
+  set +e
+  ruleset_json="$(rp_fetch_protect_main_ruleset "$slug")"
+  fetch_exit=$?
+  set -e
+  if (( fetch_exit == 2 )); then
+    return 1
+  fi
+  rp_ruleset_has_github_merge_queue "$ruleset_json"
+}
+
 rp_repo_requires_protect_main_ruleset() {
   local slug="$1"
   if [[ "$rp_merge_only" -eq 0 ]] && rp_is_strict_repo "$slug"; then
@@ -2797,6 +2827,9 @@ rp_repo_requires_protect_main_ruleset() {
     return 0
   fi
   if rp_repo_has_merge_it_label "$slug"; then
+    return 0
+  fi
+  if rp_repo_uses_github_merge_queue "$slug"; then
     return 0
   fi
   return 1
@@ -3015,6 +3048,11 @@ rp_validate_classic_main_protection_json() {
   local expected
   local -a expected_contexts=()
   local ctx
+  local github_mq=0
+
+  if rp_repo_uses_github_merge_queue "$slug"; then
+    github_mq=1
+  fi
 
   local jq_exit_code=0
   rp_runner_jq_file "repo-practices allow force pushes" "$protection_json" \
@@ -3044,14 +3082,16 @@ rp_validate_classic_main_protection_json() {
     rp_log_fail "${slug}: classic main protection must require CODEOWNERS review"
     fail=1
   fi
-  jq_exit_code=0
-  rp_runner_jq_file "repo-practices graphite review bypass" "$protection_json" \
-    --arg slug "${rp_GRAPHITE_APP_SLUG}" \
-    -e '[.required_pull_request_reviews.bypass_pull_request_allowances.apps[]?.slug] | index($slug) != null' \
-    >/dev/null || jq_exit_code=$?
-  if (( jq_exit_code != 0 )); then
-    rp_log_fail "${slug}: classic main protection must bypass ${rp_GRAPHITE_APP_SLUG} for reviews"
-    fail=1
+  if [[ "$github_mq" -eq 0 ]]; then
+    jq_exit_code=0
+    rp_runner_jq_file "repo-practices graphite review bypass" "$protection_json" \
+      --arg slug "${rp_GRAPHITE_APP_SLUG}" \
+      -e '[.required_pull_request_reviews.bypass_pull_request_allowances.apps[]?.slug] | index($slug) != null' \
+      >/dev/null || jq_exit_code=$?
+    if (( jq_exit_code != 0 )); then
+      rp_log_fail "${slug}: classic main protection must bypass ${rp_GRAPHITE_APP_SLUG} for reviews"
+      fail=1
+    fi
   fi
   if rp_repo_has_dependabot "$slug"; then
     jq_exit_code=0
@@ -3064,14 +3104,31 @@ rp_validate_classic_main_protection_json() {
       fail=1
     fi
   fi
-  jq_exit_code=0
-  rp_runner_jq_file "repo-practices graphite push restriction" "$protection_json" \
-    --arg slug "${rp_GRAPHITE_APP_SLUG}" \
-    -e '[.restrictions.apps[]?.slug] | index($slug) != null' \
-    >/dev/null || jq_exit_code=$?
-  if (( jq_exit_code != 0 )); then
-    rp_log_fail "${slug}: classic main protection must restrict pushes on main to ${rp_GRAPHITE_APP_SLUG}"
-    fail=1
+  if [[ "$github_mq" -eq 1 ]]; then
+    jq_exit_code=0
+    # GitHub merge queue must be able to land on main; Graphite-only push
+    # restrictions block the native queue.
+    rp_runner_jq_file "repo-practices no graphite-only push restriction" "$protection_json" \
+      -e '(.restrictions == null) or ((.restrictions.apps // []) | length == 0)' \
+      >/dev/null || jq_exit_code=$?
+    if (( jq_exit_code != 0 )); then
+      rp_log_fail \
+        "${slug}: classic main protection must not restrict pushes when GitHub merge queue is enabled"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: clear classic push restrictions on main (GitHub MQ lands merges)"
+      fi
+      fail=1
+    fi
+  else
+    jq_exit_code=0
+    rp_runner_jq_file "repo-practices graphite push restriction" "$protection_json" \
+      --arg slug "${rp_GRAPHITE_APP_SLUG}" \
+      -e '[.restrictions.apps[]?.slug] | index($slug) != null' \
+      >/dev/null || jq_exit_code=$?
+    if (( jq_exit_code != 0 )); then
+      rp_log_fail "${slug}: classic main protection must restrict pushes on main to ${rp_GRAPHITE_APP_SLUG}"
+      fail=1
+    fi
   fi
   jq_exit_code=0
   rp_runner_jq_file "repo-practices strict status checks" "$protection_json" \
@@ -3123,6 +3180,8 @@ rp_apply_classic_main_protection() {
   local -a contexts=()
   local ctx
   local bypass_apps_json payload
+  local github_mq=0
+  local restrictions_json
 
   while IFS= read -r ctx; do
     [[ -n "$ctx" ]] || continue
@@ -3130,11 +3189,18 @@ rp_apply_classic_main_protection() {
   done < <(rp_discover_ci_status_contexts "$slug")
 
   bypass_apps_json="$(rp_classic_protection_bypass_apps_json "$slug")"
+  if rp_repo_uses_github_merge_queue "$slug"; then
+    github_mq=1
+    restrictions_json='null'
+  else
+    restrictions_json='{"users":[],"teams":[],"apps":["graphite-app"]}'
+  fi
 
   if [[ "${#contexts[@]}" -eq 0 ]]; then
     payload="$(rp_runner_jq_n "repo-practices classic protection payload empty contexts" \
       --arg owner "${rp_ORG_OWNER_BYPASS_USER}" \
       --argjson bypass_apps "$bypass_apps_json" \
+      --argjson restrictions "$restrictions_json" \
       '{
         required_status_checks: null,
         enforce_admins: false,
@@ -3148,11 +3214,7 @@ rp_apply_classic_main_protection() {
             apps: $bypass_apps
           }
         },
-        restrictions: {
-          users: [],
-          teams: [],
-          apps: ["graphite-app"]
-        },
+        restrictions: $restrictions,
         allow_force_pushes: false,
         allow_deletions: false
       }')"
@@ -3162,6 +3224,7 @@ rp_apply_classic_main_protection() {
     payload="$(rp_runner_jq_n "repo-practices classic protection payload" \
       --arg owner "${rp_ORG_OWNER_BYPASS_USER}" \
       --argjson bypass_apps "$bypass_apps_json" \
+      --argjson restrictions "$restrictions_json" \
       --argjson contexts "$(rp_runner_jq_file "repo-practices protection contexts slurp" "$contexts_lines" -R -s 'split("\n") | map(select(length > 0))')" \
       '{
         required_status_checks: {
@@ -3179,17 +3242,17 @@ rp_apply_classic_main_protection() {
             apps: $bypass_apps
           }
         },
-        restrictions: {
-          users: [],
-          teams: [],
-          apps: ["graphite-app"]
-        },
+        restrictions: $restrictions,
         allow_force_pushes: false,
         allow_deletions: false
       }')"
   fi
 
-  rp_log_warn "${slug}: applying classic main branch protection (org standard)"
+  if [[ "$github_mq" -eq 1 ]]; then
+    rp_log_warn "${slug}: applying classic main branch protection (GitHub merge queue; no push restrictions)"
+  else
+    rp_log_warn "${slug}: applying classic main branch protection (org standard)"
+  fi
   printf '%s' "$payload" | runner_exec "repo-practices gh put classic protection" \
     -- gh api -X PUT "repos/${slug}/branches/main/protection" --input -
 }
@@ -4043,6 +4106,11 @@ rp_validate_graphite_bypass_json() {
     return 1
   fi
 
+  # Native GitHub merge queue replaces Graphite App bypass on protect-main.
+  if rp_ruleset_has_github_merge_queue "$ruleset_json"; then
+    return 0
+  fi
+
   local bypass_exit_code=0
   rp_runner_jq_file "repo-practices graphite ruleset bypass" "$ruleset_json" \
     --argjson id "$rp_GRAPHITE_APP_ACTOR_ID" \
@@ -4053,6 +4121,30 @@ rp_validate_graphite_bypass_json() {
   fi
 
   rp_log_fail "${slug}: protect-main must bypass Graphite App (Integration actor_id ${rp_GRAPHITE_APP_ACTOR_ID})"
+  return 1
+}
+
+# rp_validate_github_merge_queue_ruleset <slug> <ruleset_json>
+# When merge_queue is present, require squash merge method on the queue rule.
+rp_validate_github_merge_queue_ruleset() {
+  local slug="$1"
+  local ruleset_json="$2"
+  local method
+
+  if ! rp_ruleset_has_github_merge_queue "$ruleset_json"; then
+    return 0
+  fi
+
+  method="$(rp_runner_jq_file "repo-practices merge_queue merge_method" "$ruleset_json" \
+    -r '[.rules[]? | select(.type == "merge_queue") | .parameters.merge_method // empty] | first // empty')"
+  if [[ "$method" == "$rp_GITHUB_MQ_MERGE_METHOD" ]]; then
+    return 0
+  fi
+
+  rp_log_fail "${slug}: protect-main merge_queue merge_method must be ${rp_GITHUB_MQ_MERGE_METHOD} (got: ${method:-missing})"
+  if [[ "$rp_suggest" -eq 1 ]]; then
+    rp_log_suggest "${slug}: set protect-main merge_queue parameters.merge_method to ${rp_GITHUB_MQ_MERGE_METHOD}"
+  fi
   return 1
 }
 
@@ -4573,13 +4665,21 @@ rp_check_protect_main_ruleset() {
   if ! rp_validate_ruleset_methods_json "$slug" "$methods_json"; then
     repo_fail=1
   fi
+  if ! rp_validate_github_merge_queue_ruleset "$slug" "$ruleset_json"; then
+    repo_fail=1
+  fi
   if ! rp_validate_graphite_bypass_json "$slug" "$ruleset_json"; then
     repo_fail=1
   fi
 
   if [[ "$repo_fail" -eq 0 ]]; then
-    rp_log_check_ok "$slug" 'protect-main ruleset (squash-only + Graphite bypass)' \
-      "$(rp_github_url "$slug" '/settings/rules')"
+    if rp_ruleset_has_github_merge_queue "$ruleset_json"; then
+      rp_log_check_ok "$slug" 'protect-main ruleset (squash-only + GitHub merge queue)' \
+        "$(rp_github_url "$slug" '/settings/rules')"
+    else
+      rp_log_check_ok "$slug" 'protect-main ruleset (squash-only + Graphite bypass)' \
+        "$(rp_github_url "$slug" '/settings/rules')"
+    fi
   else
     rp_log_check_fail "$slug" 'protect-main ruleset (see AGENTS.md; fix with --apply-fix)' \
       "$(rp_github_url "$slug" '/settings/rules')"
@@ -4660,6 +4760,50 @@ rp_check_classic_main_protection() {
   return "$repo_fail"
 }
 
+rp_check_github_merge_queue() {
+  local slug="$1"
+  local repo_fail=0
+  local ci_text
+  local fetch_ec=0
+  local path_ec=0
+
+  path_ec=0
+  rp_gh_path_check "$slug" '.github/workflows/ci.yml' || path_ec=$?
+  if (( path_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/workflows/ci.yml'
+    repo_fail=1
+  elif (( path_ec == 1 )); then
+    rp_log_fail "${slug}: missing .github/workflows/ci.yml (required for GitHub merge queue checks)"
+    repo_fail=1
+  else
+    fetch_ec=0
+    ci_text="$(rp_fetch_github_text_file "$slug" '.github/workflows/ci.yml')" || fetch_ec=$?
+    if (( fetch_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" 'could not read .github/workflows/ci.yml'
+      repo_fail=1
+    elif [[ -z "$ci_text" ]] || ! grep -qE '^[[:space:]]*merge_group:[[:space:]]*$' <<<"$ci_text"; then
+      rp_log_fail "${slug}: ci.yml must trigger on merge_group for GitHub merge queue"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: add merge_group: under on: in .github/workflows/ci.yml"
+      fi
+      repo_fail=1
+    fi
+  fi
+
+  if [[ "$repo_fail" -eq 0 ]]; then
+    rp_log_check_ok "$slug" 'GitHub merge queue wiring' \
+      "$(rp_github_url "$slug" '/settings/rules')"
+    rp_log_manual_step \
+      'You: merge via Enable auto-merge / Merge when ready (GitHub merge queue)' \
+      "$(rp_github_url "$slug" '/queue/main')"
+  else
+    rp_log_check_fail "$slug" 'GitHub merge queue setup (see AGENTS.md)' \
+      "$(rp_github_url "$slug" '/settings/rules')"
+  fi
+
+  return "$repo_fail"
+}
+
 rp_check_graphite_merge_queue() {
   local slug="$1"
   local repo_fail=0
@@ -4667,6 +4811,11 @@ rp_check_graphite_merge_queue() {
   local labels_json
   local labels_fetch_exit=0
   local merge_it_exit=0
+
+  if rp_repo_uses_github_merge_queue "$slug"; then
+    rp_check_github_merge_queue "$slug"
+    return $?
+  fi
 
   set +e
   labels_json="$(rp_fetch_repo_labels_json "$slug")"

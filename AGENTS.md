@@ -154,26 +154,27 @@ See [GRAPHITE.md](./GRAPHITE.md) for stacked PRs, the merge queue, and the **`me
 
 ### `protect-main` ruleset (required)
 
-Any repo with **`merge-it`** (Graphite merge queue) or **`release-please.yml`** must use the ruleset **`protect-main`** on `refs/heads/main`. Classic branch protection alone is **not** sufficient — the checker requires the ruleset.
+Any repo with **`merge-it`** (Graphite merge queue), **GitHub merge queue** (`merge_queue` rule), or **`release-please.yml`** must use the ruleset **`protect-main`** on `refs/heads/main`. Classic branch protection alone is **not** sufficient — the checker requires the ruleset.
 
 | Ruleset rule | Purpose |
 | --- | --- |
 | `deletion` | Block branch deletion |
 | `non_fast_forward` | Block force-push |
-| `pull_request` with `allowed_merge_methods: ["squash"]` | Squash-only merges (Release Please + Graphite MQ) |
-| `bypass_actors`: Graphite App (`actor_id` **158384**, Integration, `always`) | Merge queue can land on `main` |
+| `pull_request` with `allowed_merge_methods: ["squash"]` | Squash-only merges (Release Please + merge queues) |
+| `bypass_actors`: Graphite App (`actor_id` **158384**, Integration, `always`) | Graphite MQ can land on `main` (Graphite MQ repos) |
+| `merge_queue` with `merge_method: SQUASH` | Native GitHub merge queue (this repo) |
 
-Classic branch protection on **`main`** is also required (org standard). It complements the ruleset — reviews, CI, and push restrictions — while **`protect-main`** enforces squash-only merges and ruleset-level Graphite bypass.
+Classic branch protection on **`main`** is also required (org standard). It complements the ruleset — reviews, CI, and push restrictions — while **`protect-main`** enforces squash-only merges and either Graphite bypass or GitHub `merge_queue`.
 
-| Classic setting | Value |
-| --- | --- |
-| Required reviews | CODEOWNERS (`require_code_owner_reviews`), dismiss stale; **0** GitHub approvals (Graphite owns review flow) |
-| Bypass (reviews) | **graphite-app**; **dependabot** when `dependabot.yml` exists; org owner login (emergency bypass) |
-| Push restrictions | **graphite-app** only (merge queue lands on `main`) |
-| Required status checks | All `ci.yml` job contexts except `guard`, `changed-files`, `secret-scan`, `workflow-lint` |
-| Strict | `true` (branch must be up to date) |
-| Force-push / delete | disabled |
-| `enforce_admins` | `false` (warn if enabled) |
+| Classic setting | Graphite MQ repos | GitHub MQ (this repo) |
+| --- | --- | --- |
+| Required reviews | CODEOWNERS, dismiss stale; **0** approvals | same |
+| Bypass (reviews) | **graphite-app**; **dependabot** when present; org owner | org owner (+ dependabot when present) |
+| Push restrictions | **graphite-app** only | **none** (GitHub MQ lands merges) |
+| Required status checks | All `ci.yml` job contexts except `guard`, `changed-files`, `secret-scan`, `workflow-lint` | same |
+| Strict | `true` | same |
+| Force-push / delete | disabled | same |
+| `enforce_admins` | `false` (warn if enabled) | same |
 
 Create or repair ruleset + classic settings with
 `scripts/github-repo-lint --repo OWNER/NAME --apply-fix`. Run it from the target
@@ -181,6 +182,17 @@ repository clone when you want candidate workflow fixes emitted as a Graphite st
 under `.worktrees/repo-practices-candidate-fixes-wt`.
 
 **`merge-mq`** is not the default enqueue label. Use it only when Graphite MQ for that repo is wired to **`merge-mq`**; otherwise use **`merge-it`** only.
+
+### This repo: GitHub merge queue
+
+**`repository-helpers`** uses **GitHub’s native merge queue** (not Graphite MQ):
+
+- `protect-main` includes a `merge_queue` rule (`SQUASH`)
+- `ci.yml` triggers on `merge_group` (and ignores `gh-readonly-queue/**` pushes)
+- Merge with **Enable auto-merge** / **Merge when ready** (or `gh pr merge --auto --squash`)
+- Do **not** use the `merge-it` label here — that enqueues Graphite MQ on other org repos
+
+Disable this repo in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue) so Graphite does not also try to land PRs.
 
 ### Branch hygiene
 
@@ -283,19 +295,20 @@ Repositories with `/.github/workflows/release-please.yml` must use **squash merg
 
 ### Graphite merge queue
 
-The script verifies GitHub-side wiring (not Graphite app UI settings) when a **`merge-it`** label exists:
+The script verifies GitHub-side wiring (not Graphite app UI settings) when a **`merge-it`** label exists **and** the repo is not on GitHub’s native merge queue (`protect-main` `merge_queue` rule). When GitHub MQ is enabled, the checker validates `ci.yml` `merge_group` instead.
 
 | Check | Other audited repos | This repo (`repository-helpers`) |
 | --- | --- | --- |
-| Label `merge-it` | required | required |
+| Label `merge-it` | required | not used (GitHub MQ) |
 | Label `merge-mq` | required only when that label exists on the repo (MQ wired to `merge-mq`) | — |
 | `merged-pr-closer.yml` detects `graphite-app` / merge queue | required | warn if missing |
-| `ci.yml` skips `gtmq_merge_*` | required | warn if missing |
+| `ci.yml` skips `gtmq_merge_*` | required | n/a (GitHub MQ) |
+| `ci.yml` `merge_group` trigger | required when GitHub MQ | required |
 | `dependabot-auto-merge.yml` with `merge-it` when `dependabot.yml` exists | required | warn |
-| `protect-main` bypass for Graphite App (`actor_id` **158384**) | required when `merge-it` or Release Please | warn |
-| Classic `main` protection (org standard) | required when `merge-it` or Release Please | warn |
+| `protect-main` bypass for Graphite App (`actor_id` **158384**) | required when Graphite MQ | n/a (use `merge_queue`) |
+| Classic `main` protection (org standard) | required when `merge-it` or Release Please | required (no Graphite-only push restrictions) |
 
-**Manual (not checked via `gh`):** enable the repo in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue), set merge strategy to **squash**, and wire enqueue labels (`merge-it`, or `merge-mq` when that repo uses it).
+**Manual (Graphite MQ repos, not checked via `gh`):** enable the repo in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue), set merge strategy to **squash**, and wire enqueue labels (`merge-it`, or `merge-mq` when that repo uses it).
 
 ---
 
@@ -423,7 +436,7 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 - `pre-pr-checks` mirrors CI: `bash -n`, `shellcheck -S info` (all `scripts/*`, `scripts/dev/*`, `scripts/lib/*`, `tests/*`, `tests/lib/*`), and **every** `tests/*.test` must pass. It also verifies the **primary worktree** is unchanged when checks finish (auto-stash/restore any pre-existing local changes on main).
 - Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).
 - PRs must be **published (not draft)** so reviewers see them normally. Prefer `scripts/dev/submit-stack` for non-interactive submit (implies `--publish`).
-- To merge a PR, add the `merge-it` label: `gh pr edit <number> --add-label merge-it`. Do not use `gh pr merge` manually. **Exception:** `dep-updater` batch runs (`--batch`, including daily `--batch --all`) may use `gh pr merge --auto --squash` after CI passes (`--merge-via gh`, the batch default); `--auto` lets GitHub wait for required branch checks instead of merging immediately.
+- To merge a PR in **this** repo: enable auto-merge / Merge when ready so GitHub’s merge queue lands it (`gh pr merge --auto --squash`). Do **not** use `merge-it` here. **Other org repos** still use `gh pr edit <number> --add-label merge-it` for Graphite MQ. **Exception:** `dep-updater` batch runs (`--batch`, including daily `--batch --all`) may use `gh pr merge --auto --squash` after CI passes (`--merge-via gh`, the batch default); `--auto` lets GitHub wait for required checks / the merge queue.
 - Follow **Conventional Commits**: `feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`.
 - Each commit must pass all CI checks (see below) before being pushed.
 - Never merge a PR until **all checks have run and are green** (no skipped required checks).
