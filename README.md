@@ -237,7 +237,8 @@ Configure `~/.config/agent-review.env` from `etc/agent-review.env.example` (SMTP
 `AGENT_REVIEW_REPORT_TO`, early-complete when nothing outstanding, **12h** PR non-convergence cap).
 
 See [AGENTS.md](AGENTS.md) for coding conventions, utility index, and agent-review
-details; [GRAPHITE.md](GRAPHITE.md) for branch stacking and the merge queue.
+details; [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc) for
+Graphite vs gh-stack selection; skills under `.cursor/skills/{graphite,gh-stack}/`.
 
 ## Scripts reference
 

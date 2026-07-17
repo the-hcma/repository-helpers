@@ -150,7 +150,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 
 `--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via Graphite in the target repo clone.
 
-See [GRAPHITE.md](./GRAPHITE.md) for stacked PRs, the merge queue, and the **`merge-it`** label.
+See [`.cursor/skills/graphite/SKILL.md`](.cursor/skills/graphite/SKILL.md) for Graphite stacked PRs when `.github/stacking-tool` is `graphite`, and the **`merge-it`** label. This repo trials **`gh-stack`** — see [`.cursor/skills/gh-stack/SKILL.md`](.cursor/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc).
 
 ### `protect-main` ruleset (required)
 
@@ -424,15 +424,13 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 
 ## Commits, Stacking & Pull Requests
 
-> See [GRAPHITE.md](./GRAPHITE.md) for the full Graphite workflow reference (branch naming, stack creation, navigation, submission, troubleshooting, and advanced rebasing).
+> See [`.cursor/skills/graphite/SKILL.md`](.cursor/skills/graphite/SKILL.md) for the full Graphite workflow reference when `.github/stacking-tool` is `graphite` (branch naming, stack creation, navigation, submission, troubleshooting, and advanced rebasing). For this repo (`gh-stack`), see [`.cursor/skills/gh-stack/SKILL.md`](.cursor/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc).
 
-- This project uses **Graphite** (`gt`) for branch stacking.
-- All work is done in stacked branches via `gt create`, `gt modify`, and `gt submit`.
-- Never work directly on `main`. Always create a stack branch: `gt create -m "feat: description"`.
+- Stacking backend is selected by `.github/stacking-tool` (`graphite` or `gh-stack`). Prefer **`scripts/dev/submit-stack`** (dispatches via `scripts/lib/stacking-tool`).
+- Never work directly on `main`. Create stack layers with `gh stack init` / `gh stack add` when the marker is `gh-stack`, or `gt create` when it is `graphite`.
 - Keep each branch in the stack focused on exactly one logical change. Stacks should map 1-to-1 with milestones or sub-tasks from [dep-updater.plan.md](./dep-updater.plan.md).
-- Sync regularly: `gt sync` before starting new work; `gt restack` after upstream changes land.
-- Submit stacks with `gt submit` — do not open PRs manually via the GitHub UI.
-- **Before opening/submitting a PR**, run **`scripts/dev/pre-pr-checks`** from your feature worktree (or use **`scripts/dev/submit-stack`**, which runs checks then `gt submit --publish --no-interactive`). Do not run bare `gt submit` without passing pre-pr-checks first.
+- Sync via `scripts/dev/start-development` (marker-aware). For `gh-stack`, use `gh stack sync` / `gh stack rebase` as needed; for Graphite, `gt sync` / `gt restack`.
+- **Before opening/submitting a PR**, run **`scripts/dev/pre-pr-checks`** from your feature worktree (or use **`scripts/dev/submit-stack`**). Do not submit without passing pre-pr-checks first.
 - `pre-pr-checks` mirrors CI: `bash -n`, `shellcheck -S info` (all `scripts/*`, `scripts/dev/*`, `scripts/lib/*`, `tests/*`, `tests/lib/*`), and **every** `tests/*.test` must pass. It also verifies the **primary worktree** is unchanged when checks finish (auto-stash/restore any pre-existing local changes on main).
 - Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).
 - PRs must be **published (not draft)** so reviewers see them normally. Prefer `scripts/dev/submit-stack` for non-interactive submit (implies `--publish`).

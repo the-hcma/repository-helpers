@@ -1,3 +1,13 @@
+---
+name: graphite
+description: >-
+  Work with Graphite (gt) for stacked PRs — creating, navigating, and managing
+  PR stacks. Use when .github/stacking-tool is graphite, or the user mentions gt,
+  Graphite, stacked PRs with Graphite, gt create/submit/restack.
+---
+
+Use this skill only when `.github/stacking-tool` is `graphite` (see `.cursor/rules/stacking-tool.mdc`).
+
 # Graphite Workflow
 
 Reference guide for working with Graphite (`gt`) for creating, navigating, and managing stacked pull requests.

@@ -1,7 +1,9 @@
 # Copilot Instructions
 
 > Full coding standards, conventions, and CI requirements are in [AGENTS.md](../AGENTS.md).
-> Graphite workflow reference is in [GRAPHITE.md](../GRAPHITE.md).
+> Stacking tool: [`.cursor/rules/stacking-tool.mdc`](../.cursor/rules/stacking-tool.mdc) (read `.github/stacking-tool`).
+> Graphite skill: [`.cursor/skills/graphite/SKILL.md`](../.cursor/skills/graphite/SKILL.md).
+> gh-stack skill: [`.cursor/skills/gh-stack/SKILL.md`](../.cursor/skills/gh-stack/SKILL.md).
 > PR ship and agent review loop: [`.cursor/skills/ship-and-review/SKILL.md`](../.cursor/skills/ship-and-review/SKILL.md)
 > (thin contract: [`.cursor/rules/pr-ship-and-review.mdc`](../.cursor/rules/pr-ship-and-review.mdc)).
 
@@ -14,9 +16,9 @@ scripts/dev/start-development --worktree <stack-name> --no-interactive
 cd .worktrees/<stack-name>-wt
 ```
 
-This is the single entry point for new work. It prunes stale worktrees, syncs Graphite,
-and creates or resumes a stack worktree. Do not manually run `gt sync`, create worktrees,
-or implement on the primary clone (`main` worktree).
+This is the single entry point for new work. It prunes stale worktrees, syncs per
+`.github/stacking-tool`, and creates or resumes a stack worktree. Do not implement on
+the primary clone (`main` worktree).
 
 ## Key Rules (Quick Reference)
 
