@@ -7,6 +7,11 @@ _sd_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly _sd_script_dir
 # shellcheck disable=SC1091  # runner-bootstrap begins session for runner_exec calls
 source "${_sd_script_dir}/../lib/runner-bootstrap"
+# shellcheck disable=SC1091  # stacking-tool selects session sync backend when marker exists
+source "${_sd_script_dir}/../lib/stacking-tool"
+# Referenced below; assigned readonly in scripts/lib/stacking-tool.
+# shellcheck disable=SC2154
+: "${stacking_tool_MARKER_RELPATH}" "${stacking_tool_VALUE_GH_STACK}"
 
 sd_runner_last_stdout() {
   local uuid
@@ -650,10 +655,14 @@ while IFS= read -r line; do
     fi
 done <<< "$wt_info"
 
-# 3. Synchronize Graphite and prune merged branches
-echo "Synchronizing Graphite (gt sync --force --quiet)..."
+# 3. Synchronize stacking tool (Graphite or git fetch per .github/stacking-tool)
+if [[ -f "${main_repo}/${stacking_tool_MARKER_RELPATH}" ]]; then
+  echo "Synchronizing via stacking-tool ($(stacking_tool_read "$main_repo"))..."
+else
+  echo "Synchronizing Graphite (gt sync --force --quiet; no ${stacking_tool_MARKER_RELPATH} yet)..."
+fi
 
-# Stash tracked changes before gt sync, but leave lockfiles at HEAD so stash pop does
+# Stash tracked changes before sync, but leave lockfiles at HEAD so stash pop does
 # not leave modified uv.lock / pnpm-lock.yaml behind (common when sync updates pins).
 stash_paths=()
 while IFS= read -r line; do
@@ -672,14 +681,19 @@ if [[ ${#stash_paths[@]} -gt 0 ]]; then
 fi
 
 set +e
-runner_sh "start-development gt sync" "cd \"${main_repo}\" && gt sync --quiet --force"
-gt_sync_exit=$?
+if [[ -f "${main_repo}/${stacking_tool_MARKER_RELPATH}" ]]; then
+  stacking_tool_session_sync "$main_repo"
+  gt_sync_exit=$?
+else
+  runner_sh "start-development gt sync" "cd \"${main_repo}\" && gt sync --quiet --force"
+  gt_sync_exit=$?
+fi
 set -e
 if [[ "$gt_sync_exit" -ne 0 ]]; then
-  printf '   [~] gt sync exited with code %s (often: Graphite deletes a branch that git already removed). Continuing with post-sync cleanup.\n' \
+  printf '   [~] session sync exited with code %s (often: tool deletes a branch that git already removed). Continuing with post-sync cleanup.\n' \
     "$gt_sync_exit" >&2
 fi
-echo "Graphite sync complete."
+echo "Session sync complete."
 
 if [[ "$stashed" == "true" ]]; then
     echo "Restoring local changes in main repo..."
@@ -928,18 +942,40 @@ if [[ -z "$selected_path" ]]; then
         exit 2
     fi
     sd_runner_git_c "$main_repo" "start-development worktree add" -- worktree add -b "$branch_name" "$selected_path" main
-    runner_sh "start-development gt track" "cd \"${selected_path}\" && gt track --parent main"
+    if [[ -f "${main_repo}/${stacking_tool_MARKER_RELPATH}" ]] \
+      && [[ "$(stacking_tool_read "$main_repo")" == "$stacking_tool_VALUE_GH_STACK" ]]; then
+      :
+    else
+      runner_sh "start-development gt track" "cd \"${selected_path}\" && gt track --parent main"
+    fi
 
     echo ""
-    echo "Start your first branch with:"
-    echo "  gt create $stack_name/<description> -m 'feat: ...'"
-    echo "  gt track --parent main   # reparent directly to main (required for gt submit)"
+    if [[ -f "${selected_path}/${stacking_tool_MARKER_RELPATH}" ]] \
+      && [[ "$(stacking_tool_read "$selected_path")" == "$stacking_tool_VALUE_GH_STACK" ]]; then
+      echo "Start your first stack with:"
+      echo "  gh stack init ${stack_name}/<description>"
+      echo "  # commit, then: gh stack add <next-layer>   # or gh stack submit --auto --open"
+    elif [[ -f "${main_repo}/${stacking_tool_MARKER_RELPATH}" ]] \
+      && [[ "$(stacking_tool_read "$main_repo")" == "$stacking_tool_VALUE_GH_STACK" ]]; then
+      echo "Start your first stack with:"
+      echo "  gh stack init ${stack_name}/<description>"
+      echo "  # commit, then: gh stack add <next-layer>   # or gh stack submit --auto --open"
+    else
+      echo "Start your first branch with:"
+      echo "  gt create $stack_name/<description> -m 'feat: ...'"
+      echo "  gt track --parent main   # reparent directly to main (required for gt submit)"
+    fi
 fi
 
 echo ""
 echo "To work on this stack, run:"
 echo "  cd $selected_path"
 echo "=========================================="
-echo "Tip: Use 'gt state' to debug Graphite metadata issues."
+if [[ -f "${main_repo}/${stacking_tool_MARKER_RELPATH}" ]] \
+  && [[ "$(stacking_tool_read "$main_repo")" == "$stacking_tool_VALUE_GH_STACK" ]]; then
+  echo "Tip: Use 'gh stack view --json' to inspect GitHub Stacked PRs state."
+else
+  echo "Tip: Use 'gt state' to debug Graphite metadata issues."
+fi
 echo "    Initialization Complete               "
 echo "=========================================="
