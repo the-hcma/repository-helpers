@@ -4,9 +4,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Bash 5.x](https://img.shields.io/badge/bash-5.x-4EAA25?logo=gnu-bash&logoColor=white)
 
-Pure Bash helpers for keeping repositories maintained: dependency update PRs, repository
-practice audits, agent review automation, systemd user services, and Graphite-based
-development workflow support.
+Pure Bash helpers for keeping repositories maintained: dependency update PRs,
+repository practice audits, agent review automation, systemd user services, and
+stacked PR workflow support (`gh-stack` or Graphite, selected per repo).
 
 ## Highlights
 
@@ -20,12 +20,13 @@ development workflow support.
 - `scripts/github-repo-lint --enforcer` runs those practice checks daily across local
   clones and emails a compliance report.
 - `scripts/wait-for-agent-review` runs the PR agent review loop (CodeRabbit, Copilot,
-  Bugbot, humans): CI gating, thread triage, dual-timeout idle-success, quota skip,
-  approve, and operator email.
-- `scripts/dev/ship-and-review` submits a Graphite stack, waits for CI, then runs the
-  agent review loop end-to-end.
+  Bugbot, humans): CI gating, reply-before-resolve triage, early-complete when
+  nothing is outstanding, quota fallback, and operator email (no self-approve).
+- `scripts/dev/ship-and-review` submits the stack (`gh stack` or `gt`), waits for CI,
+  then runs the agent review loop end-to-end.
 - `scripts/setup-service` installs worktree-aware systemd user services from templates.
-- `scripts/dev/start-development` creates and resumes Graphite worktrees safely.
+- `scripts/dev/start-development` creates and resumes stack worktrees safely
+  (marker-aware sync via `.github/stacking-tool`).
 
 ## Daily Services
 
@@ -117,10 +118,11 @@ for the Bash + Python extraction proposal.
 
 ## Repository Practices
 
-`scripts/github-repo-lint` audits org conventions: Graphite merge queue wiring,
-`protect-main`, classic branch protection, branch cleanup workflows, release-age
-policy, license/CODEOWNERS metadata, cursor rules, and uv Python CVE checks.
-See [github-repo-lint checks](#github-repo-lint-checks) for the full list.
+`scripts/github-repo-lint` audits org conventions: merge queue wiring (Graphite MQ
+or GitHub’s native merge queue), `protect-main`, classic branch protection, branch
+cleanup workflows, release-age policy, license/CODEOWNERS metadata, cursor rules,
+and uv Python CVE checks. See [github-repo-lint checks](#github-repo-lint-checks)
+for the full list.
 
 Audit one repository:
 
@@ -140,13 +142,14 @@ Apply supported GitHub-side fixes:
 scripts/github-repo-lint --repo OWNER/NAME --apply-fix
 ```
 
-`--apply-fix` can repair supported GitHub settings such as Release Please squash settings,
-the `protect-main` ruleset, and classic `main` branch protection. When run from the
-target repository clone, it also prepares candidate workflow fixes in a dedicated
-`.worktrees/repo-practices-candidate-fixes-wt` worktree and submits them as a
-Graphite stack for review. Candidate workflow templates live under
-`scripts/lib/repo-practices-workflows/` so they can be reviewed and linted directly.
-Graphite app merge queue configuration remains a manual step and is reported as such.
+`--apply-fix` can repair supported GitHub settings such as Release Please squash
+settings, the `protect-main` ruleset, and classic `main` branch protection. When
+run from the target repository clone, it also prepares candidate workflow fixes in
+a dedicated `.worktrees/repo-practices-candidate-fixes-wt` worktree and submits
+them as a stacked PR for review. Candidate workflow templates live under
+`scripts/lib/repo-practices-workflows/` so they can be reviewed and linted
+directly. Graphite app merge queue configuration (for Graphite MQ repos) remains a
+manual step and is reported as such.
 
 ### `github-repo-lint` checks
 
@@ -156,25 +159,26 @@ Graphite app merge queue configuration remains a manual step and is reported as 
 | Check | Full audit | Merge-only | What it validates |
 | --- | --- | --- | --- |
 | Release Please squash settings | yes | yes | Repos with `release-please.yml` use squash-only merges on `main` |
-| `protect-main` ruleset | yes | yes | Squash-only + Graphite App bypass on `refs/heads/main` when `merge-it` or Release Please |
-| Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts, push via Graphite only (org standard) |
-| Graphite merge queue wiring | yes | yes | `merge-it` label (strict repos), `merge-mq` when present, `merged-pr-closer.yml`, `ci.yml` `gtmq_merge_*` skip, dependabot auto-merge when `dependabot.yml` exists |
+| `protect-main` ruleset | yes | yes | Squash-only + Graphite App bypass **or** GitHub `merge_queue` on `refs/heads/main` when `merge-it`, GitHub MQ, or Release Please |
+| Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts; Graphite-only push on Graphite MQ repos (org standard) |
+| Graphite / GitHub merge queue | yes | yes | Graphite: `merge-it` (strict), `merge-mq` when present, `merged-pr-closer.yml`, `ci.yml` `gtmq_merge_*` skip, dependabot auto-merge when `dependabot.yml` exists. GitHub MQ: `ci.yml` `merge_group` |
 | Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |
 | Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
 | License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
 | Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` + `.cursor/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve |
 | UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
-| Python static CI job | yes | — | Python (`pyproject.toml` + ruff) repos run ruff check/format + typecheck in one `Python lint & format checks` job via `.github/ci/python-static`; no split `Ruff`/`Pyright`/`Mypy`/`Backend Lint` jobs; cutover aliases must gate on `needs.python-static.result == 'success'` |
+| Python static CI job | yes | — | Python (`pyproject.toml` + ruff) repos run ruff check/format + typecheck in one `Python lint & format checks` job via `.github/ci/python-static`; no split `Ruff`/`Pyright`/`Mypy`/`Backend Lint` publishers in **any** workflow; cutover must share the combined job/step conclusion |
 | `.cursor/rules` gitignore | yes | — | `.gitignore` must not block `.cursor/rules/` |
 | Dependabot release age | yes | — | `cooldown` on every `dependabot.yml` updates entry (`release-age-defaults`) |
 | pnpm release age | yes | — | `minimumReleaseAge` in `pnpm-workspace.yaml` when present |
 | pnpm Corepack CI | yes | — | Exact `packageManager: pnpm@X.Y.Z` when lockfile exists; no `pnpm/action-setup` / `setup-node` `cache: pnpm`; use org composite [`actions/setup-pnpm-corepack`](actions/setup-pnpm-corepack/README.md) (pin SHA on `main`) |
 | `ci-secret-scan` gitleaks pin | yes* | — | Warn when `scripts/lib/ci-secret-scan` pins gitleaks behind the release-age-eligible version (*this repo only) |
 
-`--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule
-PRs via Graphite in the target repo clone.
+`--suggest` prints remediation lines; `--apply-fix` queues candidate
+workflow/cursor-rule PRs via the repo’s stacking tool in the target clone.
 
-Further detail (protect-main rules, branch hygiene, CVE workflow template): [AGENTS.md](AGENTS.md#repository-practices-new-and-existing-repos).
+Further detail (protect-main rules, branch hygiene, CVE workflow template):
+[AGENTS.md](AGENTS.md#repository-practices-new-and-existing-repos).
 
 ## Systemd Service Setup
 
@@ -198,19 +202,28 @@ staleness checks. See [AGENTS.md](AGENTS.md#on-deploy-hooks) and
 
 ## Development
 
-Start work in a Graphite worktree (never edit the primary clone directly):
+Stacking backend is selected by `.github/stacking-tool` (`gh-stack` or `graphite`).
+**This repo trials `gh-stack`.** Never edit the primary clone directly — work in a
+stack worktree.
 
 ```bash
 scripts/dev/start-development --worktree my-change --no-interactive
 cd .worktrees/my-change-wt
-gt create my-change/topic -m 'feat: …'
+
+# gh-stack (this repo):
+gh stack init my-change/topic
+# … commit …
+# gh stack add my-change/next-layer   # optional extra layer
+
+# graphite (when .github/stacking-tool is graphite):
+# gt create my-change/topic -m 'feat: …'
 ```
 
-Local quality gates and submit:
+Local quality gates and submit (prefer these over bare `gh stack submit` / `gt submit`):
 
 ```bash
 scripts/dev/pre-pr-checks          # bash -n, shellcheck, all tests/*.test
-scripts/dev/submit-stack           # pre-pr-checks + gt submit + CI wait
+scripts/dev/submit-stack           # pre-pr-checks + stack submit + CI wait
 ```
 
 End-to-end ship (submit + CI + agent review loop):
@@ -227,35 +240,48 @@ After every push, wait for CI on the PR head (included in `submit-stack` by defa
 scripts/dev/post-pr-submission-checks --pr <n>
 ```
 
-When CI is green, run the agent review loop (reply on-thread before resolving threads):
+When CI is green, run the agent review loop. **Reply on-thread before resolving**
+(exit code 3 means feedback still needs a human reply):
 
 ```bash
 scripts/wait-for-agent-review loop --pr <n>
 ```
 
+When `check` reports `complete_ready: true` (agent sign-off on the current head):
+
+```bash
+scripts/wait-for-agent-review complete --pr <n>   # emails the operator; does not self-approve
+```
+
+**Merging this repo:** use GitHub’s merge queue (`gh pr merge --auto --squash` /
+Enable auto-merge). Do **not** use the `merge-it` label here — that enqueues
+Graphite MQ on other org repos.
+
 Configure `~/.config/agent-review.env` from `etc/agent-review.env.example` (SMTP,
-`AGENT_REVIEW_REPORT_TO`, early-complete when nothing outstanding, **12h** PR non-convergence cap).
+`AGENT_REVIEW_REPORT_TO`, early-complete when nothing outstanding, **12h** PR
+non-convergence cap).
 
 See [AGENTS.md](AGENTS.md) for coding conventions, utility index, and agent-review
 details; [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc) for
-Graphite vs gh-stack selection; skills under `.cursor/skills/{graphite,gh-stack}/`.
+backend selection; [`.cursor/skills/ship-and-review/SKILL.md`](.cursor/skills/ship-and-review/SKILL.md)
+for the full review playbook; skills under `.cursor/skills/{graphite,gh-stack}/`.
 
 ## Scripts reference
 
 | Script | Purpose |
 | --- | --- |
-| `scripts/dep-updater` | Dependency bumps → Graphite PR(s) for one repo. |
+| `scripts/dep-updater` | Dependency bumps → stacked PR(s) for one repo. |
 | `scripts/dep-updater-batch-run` | Daily batch across a scan root; email report. |
 | `scripts/github-repo-lint` | Org repo practices audit / `--apply-fix`. |
-| `scripts/check-merge-settings` | Merge + Graphite settings only. |
+| `scripts/check-merge-settings` | Merge + Graphite MQ settings only. |
 | `scripts/check-lockfile-drift` | Lockfile vs manifest drift check. |
 | `scripts/grandfather-pnpm-release-age` | One-time pnpm release-age cutover helper. |
-| `scripts/wait-for-agent-review` | Agent review loop, triage, approve, email. |
+| `scripts/wait-for-agent-review` | Agent review loop, triage, operator email (no self-approve). |
 | `scripts/trigger-agent-review` | Request a review from the configured agent profile. |
 | `scripts/setup-service` | Install worktree-aware systemd user unit. |
 | `scripts/setup-github-repo-lint` | Install repo-lint timer/service. |
 | `scripts/show-services` | Status of all service templates in this repo. |
-| `scripts/dev/start-development` | Worktree + Graphite sync entry point. |
+| `scripts/dev/start-development` | Worktree + marker-aware stack sync. |
 | `scripts/dev/pre-pr-checks` | Full local CI mirror. |
 | `scripts/dev/submit-stack` | Checks, submit, CI wait. |
 | `scripts/dev/post-pr-submission-checks` | PR CI poll + agent-friendly failure logs. |

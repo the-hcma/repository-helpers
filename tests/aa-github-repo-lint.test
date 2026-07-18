@@ -2807,6 +2807,10 @@ if grep -qF 'rp_check_python_static_ci_job' "$lib" \
   && grep -qF 'rp_ci_workflow_has_combined_python_static_job' "$lib" \
   && grep -qF 'rp_ci_workflow_has_split_python_static_jobs' "$lib" \
   && grep -qF 'rp_ci_workflow_has_unsafe_python_static_cutover_aliases' "$lib" \
+  && grep -qF 'rp_workflow_has_unsafe_noop_legacy_python_static' "$lib" \
+  && grep -qF 'rp_workflow_has_unsafe_checks_action_python_static' "$lib" \
+  && grep -qF 'rp_workflow_has_unsafe_python_static_publishers' "$lib" \
+  && grep -qF 'rp_fetch_workflow_file_names' "$lib" \
   && grep -qF 'Backend Lint' "$lib" \
   && grep -qF 'rp_repo_uses_ruff_ci' "$lib" \
   && grep -qF 'rp_check_python_static_ci_job() {' "$lib" \
@@ -2972,6 +2976,49 @@ multiline_if_safe_ci='jobs:
       needs.python-static.result == '\''success'\''
     steps:
       - run: echo covered'
+# Matrix primary rows named Ruff/Mypy with cutover-ok are unsafe false-greens (#390).
+# shellcheck disable=SC2016  # fixture YAML contains literal ${{ }} expressions
+unsafe_matrix_noop='jobs:
+  release-pr-checks:
+    name: ${{ matrix.check.name }}
+    strategy:
+      matrix:
+        check:
+          - name: Python lint & format checks
+            script: .github/ci/python-static
+          - name: Ruff
+            script: .github/ci/cutover-ok
+          - name: Mypy
+            script: .github/ci/cutover-ok'
+# Safe cutover: aliases share the real job conclusion (still leftover end-state).
+safe_matrix_aliases='jobs:
+  release-pr-checks:
+    strategy:
+      matrix:
+        check:
+          - name: Python lint & format checks
+            script: .github/ci/python-static
+            aliases: Ruff Mypy'
+# checks-action with hardcoded success is unsafe; outcome-tied is not.
+unsafe_checks_action='jobs:
+  publish:
+    steps:
+      - id: run
+        run: bash .github/ci/python-static
+      - uses: LouisBrunner/checks-action@v3.1.0
+        with:
+          name: Ruff
+          conclusion: success'
+# shellcheck disable=SC2016  # fixture YAML contains literal ${{ }} expressions
+safe_checks_action='jobs:
+  publish:
+    steps:
+      - id: run
+        run: bash .github/ci/python-static
+      - uses: LouisBrunner/checks-action@v3.1.0
+        with:
+          name: Ruff
+          conclusion: ${{ steps.run.outcome == '\''success'\'' && '\''success'\'' || '\''failure'\'' }}'
 if bash -c "source '${lib}'; rp_ci_workflow_has_combined_python_static_job \"\$1\"" _ "$combined_ci" \
   && bash -c "source '${lib}'; rp_ci_workflow_has_combined_python_static_job \"\$1\"" _ "$combined_with_preamble_ci" \
   && ! bash -c "source '${lib}'; rp_ci_workflow_has_combined_python_static_job \"\$1\"" _ "$split_markers_ci" \
@@ -2989,7 +3036,14 @@ if bash -c "source '${lib}'; rp_ci_workflow_has_combined_python_static_job \"\$1
   && ! bash -c "source '${lib}'; rp_ci_workflow_has_combined_python_static_job \"\$1\"" _ "$suffixed_wrapper_ci" \
   && bash -c "source '${lib}'; rp_ci_workflow_has_combined_python_static_job \"\$1\"" _ "$combined_reordered_ci" \
   && ! bash -c "source '${lib}'; rp_ci_workflow_has_unsafe_python_static_cutover_aliases \"\$1\"" _ "$reordered_safe_alias_ci" \
-  && ! bash -c "source '${lib}'; rp_ci_workflow_has_unsafe_python_static_cutover_aliases \"\$1\"" _ "$multiline_if_safe_ci"; then
+  && ! bash -c "source '${lib}'; rp_ci_workflow_has_unsafe_python_static_cutover_aliases \"\$1\"" _ "$multiline_if_safe_ci" \
+  && bash -c "source '${lib}'; rp_workflow_has_unsafe_noop_legacy_python_static \"\$1\"" _ "$unsafe_matrix_noop" \
+  && bash -c "source '${lib}'; rp_workflow_has_unsafe_python_static_publishers \"\$1\"" _ "$unsafe_matrix_noop" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_split_python_static_jobs \"\$1\"" _ "$safe_matrix_aliases" \
+  && ! bash -c "source '${lib}'; rp_workflow_has_unsafe_noop_legacy_python_static \"\$1\"" _ "$safe_matrix_aliases" \
+  && bash -c "source '${lib}'; rp_workflow_has_unsafe_checks_action_python_static \"\$1\"" _ "$unsafe_checks_action" \
+  && ! bash -c "source '${lib}'; rp_workflow_has_unsafe_checks_action_python_static \"\$1\"" _ "$safe_checks_action" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_split_python_static_jobs \"\$1\"" _ "$safe_checks_action"; then
   printf '[PASS] python-static: detects combined/split jobs and unsafe vs safe cutover aliases\n'
   pass=$(( pass + 1 ))
 else
@@ -3047,13 +3101,95 @@ exit_code=$?
 set -e
 
 if [[ "$exit_code" -ne 0 ]] \
-  && grep -qF "omit needs.python-static.result == 'success'" <<<"$output" \
+  && grep -qF 'not gated on the combined job/step succeeding' <<<"$output" \
   && grep -qF "missing combined 'Python lint & format checks' job" <<<"$output" \
   && grep -qF 'missing .github/ci/python-static wrapper' <<<"$output"; then
   printf '[PASS] python-static: unsafe split/alias jobs fail audit with suggestions\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] python-static: expected split-job failure (exit=%s)\n%s\n' \
+    "$exit_code" "$output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
+printf '\n=== functional: python-static non-ci.yml matrix no-op fails audit ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+mkdir -p "$mock_bin"
+good_ci_b64="$(printf '%s' 'name: CI
+jobs:
+  python-static:
+    name: Python lint & format checks
+    steps:
+      - run: bash .github/ci/python-static' | base64 -w0)"
+# shellcheck disable=SC2016  # fixture YAML contains literal ${{ }} expressions
+bad_rp_b64="$(printf '%s' 'name: Release Please
+jobs:
+  release-pr-checks:
+    name: ${{ matrix.check.name }}
+    strategy:
+      matrix:
+        check:
+          - name: Python lint & format checks
+            script: .github/ci/python-static
+          - name: Ruff
+            script: .github/ci/cutover-ok
+          - name: Mypy
+            script: .github/ci/cutover-ok' | base64 -w0)"
+wrapper_b64="$(printf '%s' '#!/usr/bin/env bash
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy .' | base64 -w0)"
+
+cat >"${mock_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+if [[ "\$args" == *'auth status'* ]]; then exit 0; fi
+if [[ "\$args" == *'/labels'* ]]; then printf '%s\n' '[]'; exit 0; fi
+if [[ "\$args" == *'contents/.github/workflows/ci.yml'* ]]; then
+  printf '%s\n' '{"content":"${good_ci_b64}"}'
+  exit 0
+fi
+if [[ "\$args" == *'contents/.github/workflows/release-please.yml'* ]]; then
+  printf '%s\n' '{"content":"${bad_rp_b64}"}'
+  exit 0
+fi
+if [[ "\$args" == *'contents/.github/workflows' ]]; then
+  printf '%s\n' '[{"name":"ci.yml","type":"file"},{"name":"release-please.yml","type":"file"}]'
+  exit 0
+fi
+if [[ "\$args" == *'contents/pyproject.toml'* ]]; then printf '%s\n' '{}'; exit 0; fi
+if [[ "\$args" == *'contents/.github/ci/python-static'* ]]; then
+  printf '%s\n' '{"content":"${wrapper_b64}"}'
+  exit 0
+fi
+if [[ "\$args" == *'/contents/'* ]]; then exit 1; fi
+printf 'unexpected gh call: %s\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+set +e
+output="$(PATH="${mock_bin}:${PATH}" bash "$checker" \
+  --repo the-hcma/matrix-noop-python --suggest 2>&1)"
+exit_code=$?
+set -e
+
+if [[ "$exit_code" -ne 0 ]] \
+  && grep -qF 'release-please.yml' <<<"$output" \
+  && grep -qF 'not gated on the combined job/step succeeding' <<<"$output" \
+  && grep -qF 'false-green' <<<"$output"; then
+  printf '[PASS] python-static: release-please matrix cutover-ok no-ops fail audit\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] python-static: expected non-ci.yml matrix failure (exit=%s)\n%s\n' \
     "$exit_code" "$output"
   fail=$(( fail + 1 ))
 fi
