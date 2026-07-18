@@ -1083,14 +1083,18 @@ printf '\n=== static: Copilot timeline quota failure ===\n'
 if grep -qF 'copilot_work_finished_failure' "$lib" \
   && grep -qF 'agent_review_pr_timeline_json' "$lib" \
   && grep -qF 'agent_review_copilot_timeline_quota_failure_today' "$lib" \
-  && grep -qF 'agent_review_copilot_timeline_probed_today' "$lib" \
+  && grep -qF 'agent_review_copilot_timeline_probed_for_pr_today' "$quota_lib" \
   && grep -qF 'agent_review_copilot_quota_mark_timeline_probed' "$quota_lib" \
+  && grep -qF 'agent_review_copilot_quota_expire_stale_probe_requested' "$quota_lib" \
+  && grep -qF 'AGENT_REVIEW_PROBE_REQUESTED_TTL' "$wait_script" \
+  && grep -qF 'agent_review_default_probe_requested_ttl_s' "$quota_lib" \
   && awk '
     /agent_review_quota_observe_agent_on_pr\(\)/ { in_fn=1 }
     in_fn && /agent_review_copilot_timeline_quota_failure_today/ { found=1 }
-    in_fn && /agent_review_copilot_timeline_probed_today/ { gated=1 }
-    in_fn && /^}/ { if (found && gated) exit 0; exit 1 }
-    END { exit((found && gated) ? 0 : 1) }
+    in_fn && /agent_review_copilot_timeline_probed_for_pr_today/ { gated=1 }
+    in_fn && /agent_review_copilot_quota_expire_stale_probe_requested/ { expired=1 }
+    in_fn && /^}/ { if (found && gated && expired) exit 0; exit 1 }
+    END { exit((found && gated && expired) ? 0 : 1) }
   ' "$lib" \
   && grep -qF 'copilot_work_finished_failure' "$agents_md"; then
   printf '[PASS] copilot timeline: quota failure detection wired into observe + AGENTS.md\n'
@@ -1177,11 +1181,89 @@ else
 fi
 rm -f "${tmp_copilot_timeline_obs}" "${tmp_copilot_timeline_json}"
 
+# repository-helpers#408: stale probe_requested expires; timeline failure on current PR is seen
+# even when another PR's timeline_probed poisoned the daily cache.
+tmp_copilot_ttl="$(mktemp)"
+tmp_copilot_ttl_timeline="$(mktemp)"
+printf '%s\n' "${timeline_ok_json}" >"${tmp_copilot_ttl_timeline}"
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_copilot_ttl}'
+  agent_review_default_probe_requested_ttl_s=1
+  today=\$(agent_review_copilot_quota_local_day)
+  stale=\$(( \$(date +%s) - 120 ))
+  cat >'${tmp_copilot_ttl}' <<CACHE
+valid_date=\${today}
+exhausted=0
+confirmed=0
+probe_requested=1
+probe_attempted=1
+probe_requested_at=\${stale}
+source=probe_requested
+checked_at=2026-07-18T00:00:00Z
+reason=stale\ probe
+CACHE
+  agent_review_copilot_quota_expire_stale_probe_requested
+  [[ \"\${agent_review_copilot_quota_cache_source}\" == 'probe_expired' ]]
+  ! agent_review_agent_quota_probe_requested_for_agent copilot
+  agent_review_agent_quota_probe_attempted_for_agent copilot
+  agent_review_agent_quota_probe_expired_for_agent copilot
+"; then
+  printf '[PASS] quota probe TTL: stale probe_requested expires and blocks re-request\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota probe TTL: expire did not clear active probe_requested\n'
+  fail=$(( fail + 1 ))
+fi
+if bash -c "
+  source '${lib}'
+  source '${quota_lib}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_copilot_ttl}'
+  # Poison: negative probe for a different PR (tests must use temp quota files — #408).
+  agent_review_copilot_quota_mark_timeline_probed \
+    'Copilot timeline on the-hcma/mock-repo#414 had no same-day copilot_work_finished_failure.' \
+    'the-hcma/mock-repo#414'
+  agent_review_use_agent copilot
+  agent_review_fresh_agent_on_head() { return 1; }
+  agent_review_pr_issue_comments_json() { printf '[]\n'; }
+  agent_review_head_check_run_json_for_head() { printf 'null\n'; }
+  agent_review_pr_timeline_json() { cat '${tmp_copilot_ttl_timeline}'; }
+  agent_review_quota_observe_agent_on_pr \
+    'the-hcma/mock-repo' 402 'abd63a023cec6d4ade0f466c2d5def727697399e' '{}' '[]' \
+    || true
+  agent_review_agent_quota_exhausted_for_agent copilot
+"; then
+  printf '[PASS] quota observe: other-PR timeline_probed does not skip current PR timeline\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota observe: cross-PR timeline_probed blocked current PR scan\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_copilot_ttl}" "${tmp_copilot_ttl_timeline}"
+
 # shellcheck disable=SC2016  # static assert matches literal source text
-if grep -qF 'agent_review_latest_nonempty_agent_review_body_on_head' "$lib" \
+if grep -qF 'cmd_loop_observe_quota_on_pr' "$wait_script" \
+  && awk '
+    /sleep \"\$\{agent_review_default_poll_interval_s\}\"/ { sleep_line=NR }
+    /cmd_loop_observe_quota_on_pr/ { obs[NR]=1 }
+    END {
+      for (n in obs) if (n < sleep_line && sleep_line - n < 30) found=1
+      exit(found ? 0 : 1)
+    }
+  ' "$wait_script"; then
+  printf '[PASS] loop: re-observes quota/timeline before poll sleep (#408)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] loop: missing pre-sleep quota observe for timeline wake (#408)\n'
+  fail=$(( fail + 1 ))
+fi
+
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'agent_review_copilot_success_issue_comment_for_head' \
+  "${script_dir}/../scripts/lib/agent-review-profiles/copilot" \
+  && grep -qF 'agent_review_latest_nonempty_agent_review_body_on_head' "$lib" \
   && grep -qF 'agent_review_head_has_actionable_agent_review_on_head' "$lib" \
-  && grep -qF 'agent_review_copilot_success_issue_comment_for_head' \
-    "${script_dir}/../scripts/lib/agent-review-profiles/copilot" \
   && grep -qF 'agent_review_agent_quota_cache_reason_for_agent' "$quota_lib" \
   && ! grep -qF 'likely quota' "$lib"; then
   printf '[PASS] quota observe: actionable review and Copilot reply helpers wired\n'

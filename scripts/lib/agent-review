@@ -17,6 +17,8 @@ agent_review_default_coderabbit_rate_limit_wait_max_s=3600
 agent_review_default_coderabbit_rate_limit_poll_s=60
 # After CodeRabbit retry_after, wait this grace before a last-resort @coderabbitai full review (default 60s).
 agent_review_default_coderabbit_post_cooldown_grace_s=60
+# Outstanding Copilot/Bugbot probe_requested wait TTL (default 15m; issue #408).
+agent_review_default_probe_requested_ttl_s=900
 
 _ar_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly _ar_lib_dir
@@ -312,6 +314,13 @@ agent_review_load_env() {
       agent_review_die "invalid AGENT_REVIEW_TRANSIENT_RETRY_SLEEP: ${AGENT_REVIEW_TRANSIENT_RETRY_SLEEP@Q}"
     fi
     agent_review_default_transient_retry_sleep_s="${parsed_retry_sleep}"
+  fi
+  if [[ -n "${AGENT_REVIEW_PROBE_REQUESTED_TTL:-}" ]]; then
+    local parsed_probe_ttl
+    if ! parsed_probe_ttl="$(agent_review_parse_duration_seconds "${AGENT_REVIEW_PROBE_REQUESTED_TTL}")"; then
+      agent_review_die "invalid AGENT_REVIEW_PROBE_REQUESTED_TTL: ${AGENT_REVIEW_PROBE_REQUESTED_TTL@Q}"
+    fi
+    agent_review_default_probe_requested_ttl_s="${parsed_probe_ttl}"
   fi
 }
 
@@ -2112,6 +2121,9 @@ agent_review_quota_summary_for_email() {
       evidence_url="$(agent_review_agent_quota_cache_evidence_url_for_agent "${agent}")"
     elif agent_review_agent_quota_probe_requested_for_agent "${agent}"; then
       status='probe requested (awaiting review)'
+    elif agent_review_agent_quota_probe_expired_for_agent "${agent}"; then
+      status='probe expired (no review within TTL)'
+      reason="$(agent_review_agent_quota_cache_reason_for_agent "${agent}")"
     else
       status='unconfirmed (not probed today)'
     fi
@@ -2547,12 +2559,15 @@ agent_review_quota_observe_agent_on_pr() {
   # with copilot_work_finished_failure (repository-helpers#368).
   # While probe_requested is set, keep re-scanning: failure can land after an earlier
   # empty timeline probe overwrote the ask with source=timeline_probed.
+  # Negative timeline_probed is scoped to OWNER/NAME#N so another PR cannot skip this
+  # one; stale probe_requested expires after AGENT_REVIEW_PROBE_REQUESTED_TTL (#408).
   if [[ "${agent_id}" == 'copilot' ]]; then
     if agent_review_agent_quota_exhausted_for_agent copilot; then
       return 1
     fi
     agent_review_copilot_quota_refresh_for_today || true
-    if agent_review_copilot_timeline_probed_today \
+    agent_review_copilot_quota_expire_stale_probe_requested || true
+    if agent_review_copilot_timeline_probed_for_pr_today "${repo}#${pr}" \
       && [[ "${agent_review_copilot_quota_probe_requested_today:-0}" != '1' ]]; then
       return 1
     fi
@@ -2567,7 +2582,8 @@ agent_review_quota_observe_agent_on_pr() {
     # Negative probe only when no ask is outstanding (otherwise recheck next loop).
     if [[ "${agent_review_copilot_quota_probe_requested_today:-0}" != '1' ]]; then
       agent_review_copilot_quota_mark_timeline_probed \
-        "Copilot timeline on ${repo}#${pr} had no same-day copilot_work_finished_failure."
+        "Copilot timeline on ${repo}#${pr} had no same-day copilot_work_finished_failure." \
+        "${repo}#${pr}"
     fi
   fi
 
