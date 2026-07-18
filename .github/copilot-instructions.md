@@ -1,7 +1,9 @@
 # Copilot Instructions
 
 > Full coding standards, conventions, and CI requirements are in [AGENTS.md](../AGENTS.md).
-> Graphite workflow reference is in [GRAPHITE.md](../GRAPHITE.md).
+> Stacking tool: [`.cursor/rules/stacking-tool.mdc`](../.cursor/rules/stacking-tool.mdc) (read `.github/stacking-tool`).
+> Graphite skill: [`.cursor/skills/graphite/SKILL.md`](../.cursor/skills/graphite/SKILL.md).
+> gh-stack skill: [`.cursor/skills/gh-stack/SKILL.md`](../.cursor/skills/gh-stack/SKILL.md).
 > PR ship and agent review loop: [`.cursor/skills/ship-and-review/SKILL.md`](../.cursor/skills/ship-and-review/SKILL.md)
 > (thin contract: [`.cursor/rules/pr-ship-and-review.mdc`](../.cursor/rules/pr-ship-and-review.mdc)).
 
@@ -14,9 +16,9 @@ scripts/dev/start-development --worktree <stack-name> --no-interactive
 cd .worktrees/<stack-name>-wt
 ```
 
-This is the single entry point for new work. It prunes stale worktrees, syncs Graphite,
-and creates or resumes a stack worktree. Do not manually run `gt sync`, create worktrees,
-or implement on the primary clone (`main` worktree).
+This is the single entry point for new work. It prunes stale worktrees, syncs per
+`.github/stacking-tool`, and creates or resumes a stack worktree. Do not implement on
+the primary clone (`main` worktree).
 
 ## Key Rules (Quick Reference)
 
@@ -27,7 +29,9 @@ or implement on the primary clone (`main` worktree).
 - Declare `local` / `readonly` separately from command substitutions (SC2155).
 - Never declare `local -r` inside a loop body.
 - Every behaviour change or bug fix must have a test in `tests/`.
-- Never push directly to `main`. Use `gt create` → `scripts/dev/submit-stack`.
+- Never push directly to `main`. Create a stack layer per `.github/stacking-tool`
+  (`gt create` when `graphite`, `gh stack init` / `gh stack add` when `gh-stack`),
+  then `scripts/dev/submit-stack`.
 - To merge a PR: `gh pr edit <number> --add-label merge-it`. Never `gh pr merge`.
 
 ## Submit and ship
