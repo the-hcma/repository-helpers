@@ -146,7 +146,8 @@ scripts/github-repo-lint --repo OWNER/NAME --apply-fix
 settings, the `protect-main` ruleset, and classic `main` branch protection. When
 run from the target repository clone, it also prepares candidate workflow fixes in
 a dedicated `.worktrees/repo-practices-candidate-fixes-wt` worktree and submits
-them as a stacked PR for review. Candidate workflow templates live under
+them as a Graphite stack for review (`gt track` / `gt submit`; not yet
+marker-aware for `gh-stack`). Candidate workflow templates live under
 `scripts/lib/repo-practices-workflows/` so they can be reviewed and linted
 directly. Graphite app merge queue configuration (for Graphite MQ repos) remains a
 manual step and is reported as such.
@@ -175,7 +176,8 @@ manual step and is reported as such.
 | `ci-secret-scan` gitleaks pin | yes* | — | Warn when `scripts/lib/ci-secret-scan` pins gitleaks behind the release-age-eligible version (*this repo only) |
 
 `--suggest` prints remediation lines; `--apply-fix` queues candidate
-workflow/cursor-rule PRs via the repo’s stacking tool in the target clone.
+workflow/cursor-rule PRs via **Graphite** (`gt track` / `gt submit`) in the
+target clone (not yet marker-aware for `gh-stack`).
 
 Further detail (protect-main rules, branch hygiene, CVE workflow template):
 [AGENTS.md](AGENTS.md#repository-practices-new-and-existing-repos).
