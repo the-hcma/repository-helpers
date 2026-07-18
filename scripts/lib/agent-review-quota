@@ -10,10 +10,26 @@
 #   ~/scratch/repository-helpers/copilot-review-quota.env
 #   ~/scratch/repository-helpers/bugbot-review-quota.env
 #   ~/scratch/repository-helpers/coderabbit-review-quota.env
-# Fields: valid_date, exhausted, confirmed, probe_requested, source, reason, evidence_url.
+# Fields: valid_date, exhausted, confirmed, probe_requested, probe_requested_at,
+# probe_attempted, timeline_probed_slug, source, reason, evidence_url.
 # Passive scans may record exhaustion from prior signals; availability is confirmed only
 # after a successful review or GitHub check on the PR under review (not from stale probes).
+#
+# probe_requested_at — unix epoch when probe_requested was set. After
+# AGENT_REVIEW_PROBE_REQUESTED_TTL (default 15m) with no review, expire the wait
+# (source=probe_expired), re-scan the current PR timeline, and allow quota fallback
+# without hanging forever (repository-helpers#408).
+# timeline_probed_slug — OWNER/NAME#N of the PR whose timeline was negatively probed;
+# a blank/other slug must not skip scanning a different PR.
 # shellcheck disable=SC2016  # GraphQL and jq filter strings use single quotes
+
+# Default TTL for an outstanding probe_requested wait (seconds). Overridden by
+# AGENT_REVIEW_PROBE_REQUESTED_TTL via agent_review_load_env.
+agent_review_default_probe_requested_ttl_s=900
+
+agent_review_probe_requested_ttl_s() {
+  printf '%s\n' "${agent_review_default_probe_requested_ttl_s:-900}"
+}
 
 agent_review_copilot_quota_state_file() {
   printf '%s\n' \
@@ -50,6 +66,9 @@ agent_review_quota_cache_read_fields() {
   agent_review_quota_cache_exhausted=''
   agent_review_quota_cache_confirmed=''
   agent_review_quota_cache_probe_requested=''
+  agent_review_quota_cache_probe_requested_at=''
+  agent_review_quota_cache_probe_attempted=''
+  agent_review_quota_cache_timeline_probed_slug=''
   [[ -f "${state_file}" ]] || return 1
   while IFS= read -r line || [[ -n "${line}" ]]; do
     case "${line}" in
@@ -57,6 +76,9 @@ agent_review_quota_cache_read_fields() {
       exhausted=*) agent_review_quota_cache_exhausted="${line#exhausted=}" ;;
       confirmed=*) agent_review_quota_cache_confirmed="${line#confirmed=}" ;;
       probe_requested=*) agent_review_quota_cache_probe_requested="${line#probe_requested=}" ;;
+      probe_requested_at=*) agent_review_quota_cache_probe_requested_at="${line#probe_requested_at=}" ;;
+      probe_attempted=*) agent_review_quota_cache_probe_attempted="${line#probe_attempted=}" ;;
+      timeline_probed_slug=*) agent_review_quota_cache_timeline_probed_slug="${line#timeline_probed_slug=}" ;;
     esac
   done <"${state_file}"
   [[ -n "${agent_review_quota_cache_valid_date}" ]]
@@ -105,11 +127,14 @@ agent_review_copilot_quota_read_cache() {
   # evidence_url/retry_after/checked_at must be local: sourcing the cache would otherwise
   # collide with caller `local -r evidence_url` (e.g. mark_exhausted) and abort under set -e.
   local state_file today valid_date exhausted confirmed probe_requested source reason
-  local evidence_url retry_after checked_at
+  local evidence_url retry_after checked_at probe_requested_at probe_attempted timeline_probed_slug
 
   agent_review_copilot_quota_exhausted_today=0
   agent_review_copilot_quota_confirmed_today=0
   agent_review_copilot_quota_probe_requested_today=0
+  agent_review_copilot_quota_probe_requested_at=0
+  agent_review_copilot_quota_probe_attempted_today=0
+  agent_review_copilot_quota_timeline_probed_slug=''
   agent_review_copilot_quota_cache_source=''
   agent_review_copilot_quota_cache_reason=''
   agent_review_copilot_quota_cache_evidence_url=''
@@ -125,6 +150,9 @@ agent_review_copilot_quota_read_cache() {
   exhausted="${exhausted:-0}"
   confirmed="${confirmed:-0}"
   probe_requested="${probe_requested:-0}"
+  probe_requested_at="${probe_requested_at:-0}"
+  probe_attempted="${probe_attempted:-0}"
+  timeline_probed_slug="${timeline_probed_slug:-}"
   source="${source:-cache}"
   reason="${reason:-}"
   if [[ "${valid_date}" != "${today}" ]]; then
@@ -134,6 +162,8 @@ agent_review_copilot_quota_read_cache() {
   agent_review_copilot_quota_cache_reason="${reason}"
   agent_review_copilot_quota_cache_evidence_url="${evidence_url:-}"
   agent_review_copilot_quota_cache_retry_after="${retry_after:-}"
+  agent_review_copilot_quota_probe_requested_at="${probe_requested_at}"
+  agent_review_copilot_quota_timeline_probed_slug="${timeline_probed_slug}"
   if [[ "${exhausted}" == '1' ]]; then
     agent_review_copilot_quota_exhausted_today=1
   else
@@ -149,6 +179,12 @@ agent_review_copilot_quota_read_cache() {
   else
     agent_review_copilot_quota_probe_requested_today=0
   fi
+  if [[ "${probe_attempted}" == '1' || "${probe_requested}" == '1' \
+    || "${source}" == 'probe_expired' || "${source}" == 'probe_requested' ]]; then
+    agent_review_copilot_quota_probe_attempted_today=1
+  else
+    agent_review_copilot_quota_probe_attempted_today=0
+  fi
   return 0
 }
 
@@ -160,7 +196,9 @@ agent_review_copilot_quota_write_cache() {
   local probe_requested_flag="${5:-}"
   local evidence_url="${6:-}"
   local retry_after="${7:-}"
+  local timeline_slug_arg="${8:-}"
   local state_file today checked_at reason_quoted evidence_quoted retry_quoted
+  local probe_at='' probe_attempted_flag=0 timeline_slug='' slug_quoted
 
   if [[ -z "${confirmed_flag}" ]]; then
     if [[ "${exhausted_flag}" == '1' ]]; then
@@ -178,6 +216,13 @@ agent_review_copilot_quota_write_cache() {
     if [[ -z "${probe_requested_flag}" ]]; then
       probe_requested_flag="${agent_review_quota_cache_probe_requested:-0}"
     fi
+    probe_at="${agent_review_quota_cache_probe_requested_at:-}"
+    probe_attempted_flag="${agent_review_quota_cache_probe_attempted:-0}"
+    timeline_slug="${agent_review_quota_cache_timeline_probed_slug:-}"
+  fi
+  # Prefer last sourced slug (unquoted) over raw line-parse of %q-encoded cache values.
+  if [[ -n "${agent_review_copilot_quota_timeline_probed_slug:-}" ]]; then
+    timeline_slug="${agent_review_copilot_quota_timeline_probed_slug}"
   fi
   probe_requested_flag="${probe_requested_flag:-0}"
   if [[ "${exhausted_flag}" == '0' && "${confirmed_flag}" != '1' ]] \
@@ -186,6 +231,24 @@ agent_review_copilot_quota_write_cache() {
       && "${agent_review_quota_cache_exhausted}" == '1' \
       && "${agent_review_quota_cache_confirmed:-0}" != '1' ]]; then
     return 0
+  fi
+  if [[ "${source_tag}" == 'probe_requested' && "${probe_requested_flag}" == '1' ]]; then
+    probe_at="$(date +%s)"
+    probe_attempted_flag=1
+  elif [[ "${probe_requested_flag}" == '1' ]]; then
+    if [[ -z "${probe_at}" || ! "${probe_at}" =~ ^[0-9]+$ ]]; then
+      probe_at="$(date +%s)"
+    fi
+    probe_attempted_flag=1
+  elif [[ "${source_tag}" == 'probe_expired' ]]; then
+    probe_at=''
+    probe_attempted_flag=1
+  fi
+  if [[ -n "${timeline_slug_arg}" ]]; then
+    timeline_slug="${timeline_slug_arg}"
+  fi
+  if [[ "${source_tag}" == 'timeline_probed' && -z "${timeline_slug}" ]]; then
+    timeline_slug="${agent_review_copilot_quota_timeline_probed_slug:-}"
   fi
   agent_review_copilot_quota_ensure_state_dir
   checked_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -196,10 +259,19 @@ valid_date=${today}
 exhausted=${exhausted_flag}
 confirmed=${confirmed_flag}
 probe_requested=${probe_requested_flag}
+probe_attempted=${probe_attempted_flag}
 source=${source_tag}
 checked_at=${checked_at}
 reason=${reason_quoted}
 EOF
+    # Numeric epoch — write raw so `source` and line parsers agree (no %q).
+    if [[ -n "${probe_at}" && "${probe_at}" =~ ^[0-9]+$ ]]; then
+      printf 'probe_requested_at=%s\n' "${probe_at}"
+    fi
+    if [[ -n "${timeline_slug}" ]]; then
+      slug_quoted="$(agent_review_quota_quote_env_value "${timeline_slug}")"
+      printf 'timeline_probed_slug=%s\n' "${slug_quoted}"
+    fi
     if [[ -n "${evidence_url}" ]]; then
       evidence_quoted="$(agent_review_quota_quote_env_value "${evidence_url}")"
       printf 'evidence_url=%s\n' "${evidence_quoted}"
@@ -220,6 +292,9 @@ EOF
   else
     agent_review_copilot_quota_probe_requested_today=0
   fi
+  agent_review_copilot_quota_probe_attempted_today="${probe_attempted_flag}"
+  agent_review_copilot_quota_probe_requested_at="${probe_at:-0}"
+  agent_review_copilot_quota_timeline_probed_slug="${timeline_slug}"
   # shellcheck disable=SC2034  # cache metadata read by wait-for-agent-review logging
   agent_review_copilot_quota_cache_source="${source_tag}"
   # shellcheck disable=SC2034  # cache metadata read by wait-for-agent-review logging
@@ -256,17 +331,63 @@ agent_review_copilot_quota_mark_probe_requested() {
     0 1
 }
 
+# Expire an outstanding probe_requested wait after AGENT_REVIEW_PROBE_REQUESTED_TTL.
+# Returns 0 when the probe was expired (caller should re-scan the PR timeline).
+# Returns 1 when there is no active probe or the TTL has not elapsed.
+agent_review_copilot_quota_expire_stale_probe_requested() {
+  local now ttl at age reason
+
+  agent_review_copilot_quota_read_cache || return 1
+  [[ "${agent_review_copilot_quota_probe_requested_today:-0}" == '1' ]] || return 1
+  at="${agent_review_copilot_quota_probe_requested_at:-0}"
+  ttl="$(agent_review_probe_requested_ttl_s)"
+  now="$(date +%s)"
+  if [[ ! "${at}" =~ ^[0-9]+$ ]] || (( at <= 0 )); then
+    # Legacy caches without a timestamp: treat as already stale.
+    age="${ttl}"
+  else
+    age=$(( now - at ))
+  fi
+  if (( age < ttl )); then
+    return 1
+  fi
+  reason="Copilot probe_requested expired after ${ttl}s without a review (repository-helpers#408)."
+  # Pass the sourced slug explicitly — raw line-parse of %q-encoded values is unreliable.
+  agent_review_copilot_quota_write_cache 0 probe_expired "${reason}" 0 0 '' '' \
+    "${agent_review_copilot_quota_timeline_probed_slug:-}"
+  printf 'wait-for-agent-review: %s\n' "${reason}" >&2
+  return 0
+}
+
 # Record a same-day Copilot timeline probe with no exhaustion signal (negative cache).
-# Does not mark confirmed or exhausted — only prevents re-fetching the PR timeline today
+# Scoped to OWNER/NAME#N so another PR's probe cannot skip this PR's timeline (#408).
+# Does not mark confirmed or exhausted — only prevents re-fetching the same PR timeline
 # when no @copilot ask is outstanding (probe_requested is preserved from the prior write).
 agent_review_copilot_quota_mark_timeline_probed() {
   local -r reason="${1:-Copilot PR timeline probed; no same-day quota failure.}"
+  local -r slug="${2:-}"
 
   agent_review_copilot_quota_read_cache || true
-  agent_review_copilot_quota_write_cache 0 timeline_probed "${reason}" 0
+  # Preserve probe_expired so quota fallback still treats this agent as attempted.
+  if [[ "${agent_review_copilot_quota_cache_source:-}" == 'probe_expired' ]]; then
+    agent_review_copilot_quota_write_cache 0 probe_expired "${reason}" 0 0 '' '' "${slug}"
+    return 0
+  fi
+  agent_review_copilot_quota_write_cache 0 timeline_probed "${reason}" 0 '' '' '' "${slug}"
 }
 
-# True when today's Copilot cache already records a negative timeline probe.
+# True when today's Copilot cache already records a negative timeline probe for this PR.
+agent_review_copilot_timeline_probed_for_pr_today() {
+  local -r slug="$1"
+
+  agent_review_copilot_quota_refresh_for_today || return 1
+  [[ "${agent_review_copilot_quota_cache_source:-}" == 'timeline_probed' ]] || return 1
+  [[ -n "${slug}" ]] || return 1
+  [[ "${agent_review_copilot_quota_timeline_probed_slug:-}" == "${slug}" ]]
+}
+
+# Backward-compatible alias: any same-day timeline_probed (not PR-scoped). Prefer
+# agent_review_copilot_timeline_probed_for_pr_today for observe gates.
 agent_review_copilot_timeline_probed_today() {
   agent_review_copilot_quota_refresh_for_today || return 1
   [[ "${agent_review_copilot_quota_cache_source:-}" == 'timeline_probed' ]]
@@ -437,11 +558,13 @@ agent_review_bugbot_quota_read_cache() {
   # evidence_url/retry_after/checked_at must be local: sourcing the cache would otherwise
   # collide with caller `local -r evidence_url` (e.g. mark_exhausted) and abort under set -e.
   local state_file today valid_date exhausted confirmed probe_requested source reason
-  local evidence_url retry_after checked_at
+  local evidence_url retry_after checked_at probe_requested_at probe_attempted
 
   agent_review_bugbot_quota_exhausted_today=0
   agent_review_bugbot_quota_confirmed_today=0
   agent_review_bugbot_quota_probe_requested_today=0
+  agent_review_bugbot_quota_probe_requested_at=0
+  agent_review_bugbot_quota_probe_attempted_today=0
   agent_review_bugbot_quota_cache_source=''
   agent_review_bugbot_quota_cache_reason=''
   agent_review_bugbot_quota_cache_evidence_url=''
@@ -457,6 +580,8 @@ agent_review_bugbot_quota_read_cache() {
   exhausted="${exhausted:-0}"
   confirmed="${confirmed:-0}"
   probe_requested="${probe_requested:-0}"
+  probe_requested_at="${probe_requested_at:-0}"
+  probe_attempted="${probe_attempted:-0}"
   source="${source:-cache}"
   reason="${reason:-}"
   if [[ "${valid_date}" != "${today}" ]]; then
@@ -466,6 +591,7 @@ agent_review_bugbot_quota_read_cache() {
   agent_review_bugbot_quota_cache_reason="${reason}"
   agent_review_bugbot_quota_cache_evidence_url="${evidence_url:-}"
   agent_review_bugbot_quota_cache_retry_after="${retry_after:-}"
+  agent_review_bugbot_quota_probe_requested_at="${probe_requested_at}"
   if [[ "${exhausted}" == '1' ]]; then
     agent_review_bugbot_quota_exhausted_today=1
   else
@@ -481,6 +607,12 @@ agent_review_bugbot_quota_read_cache() {
   else
     agent_review_bugbot_quota_probe_requested_today=0
   fi
+  if [[ "${probe_attempted}" == '1' || "${probe_requested}" == '1' \
+    || "${source}" == 'probe_expired' || "${source}" == 'probe_requested' ]]; then
+    agent_review_bugbot_quota_probe_attempted_today=1
+  else
+    agent_review_bugbot_quota_probe_attempted_today=0
+  fi
   return 0
 }
 
@@ -493,6 +625,7 @@ agent_review_bugbot_quota_write_cache() {
   local evidence_url="${6:-}"
   local retry_after="${7:-}"
   local state_file today checked_at reason_quoted evidence_quoted retry_quoted
+  local probe_at='' probe_attempted_flag=0
 
   if [[ -z "${confirmed_flag}" ]]; then
     if [[ "${exhausted_flag}" == '1' ]]; then
@@ -510,6 +643,8 @@ agent_review_bugbot_quota_write_cache() {
     if [[ -z "${probe_requested_flag}" ]]; then
       probe_requested_flag="${agent_review_quota_cache_probe_requested:-0}"
     fi
+    probe_at="${agent_review_quota_cache_probe_requested_at:-}"
+    probe_attempted_flag="${agent_review_quota_cache_probe_attempted:-0}"
   fi
   probe_requested_flag="${probe_requested_flag:-0}"
   if [[ "${exhausted_flag}" == '0' && "${confirmed_flag}" != '1' ]] \
@@ -518,6 +653,18 @@ agent_review_bugbot_quota_write_cache() {
       && "${agent_review_quota_cache_exhausted}" == '1' \
       && "${agent_review_quota_cache_confirmed:-0}" != '1' ]]; then
     return 0
+  fi
+  if [[ "${source_tag}" == 'probe_requested' && "${probe_requested_flag}" == '1' ]]; then
+    probe_at="$(date +%s)"
+    probe_attempted_flag=1
+  elif [[ "${probe_requested_flag}" == '1' ]]; then
+    if [[ -z "${probe_at}" || ! "${probe_at}" =~ ^[0-9]+$ ]]; then
+      probe_at="$(date +%s)"
+    fi
+    probe_attempted_flag=1
+  elif [[ "${source_tag}" == 'probe_expired' ]]; then
+    probe_at=''
+    probe_attempted_flag=1
   fi
   agent_review_bugbot_quota_ensure_state_dir
   checked_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -528,10 +675,14 @@ valid_date=${today}
 exhausted=${exhausted_flag}
 confirmed=${confirmed_flag}
 probe_requested=${probe_requested_flag}
+probe_attempted=${probe_attempted_flag}
 source=${source_tag}
 checked_at=${checked_at}
 reason=${reason_quoted}
 EOF
+    if [[ -n "${probe_at}" && "${probe_at}" =~ ^[0-9]+$ ]]; then
+      printf 'probe_requested_at=%s\n' "${probe_at}"
+    fi
     if [[ -n "${evidence_url}" ]]; then
       evidence_quoted="$(agent_review_quota_quote_env_value "${evidence_url}")"
       printf 'evidence_url=%s\n' "${evidence_quoted}"
@@ -552,6 +703,8 @@ EOF
   else
     agent_review_bugbot_quota_probe_requested_today=0
   fi
+  agent_review_bugbot_quota_probe_attempted_today="${probe_attempted_flag}"
+  agent_review_bugbot_quota_probe_requested_at="${probe_at:-0}"
   # shellcheck disable=SC2034  # cache metadata read by wait-for-agent-review logging
   agent_review_bugbot_quota_cache_source="${source_tag}"
   # shellcheck disable=SC2034  # cache metadata read by wait-for-agent-review logging
@@ -617,7 +770,31 @@ agent_review_bugbot_quota_mark_probe_requested() {
   agent_review_bugbot_quota_write_cache \
     "${agent_review_bugbot_quota_exhausted_today:-0}" \
     probe_requested "${reason}" \
-    "${agent_review_bugbot_quota_confirmed_today:-0}" 1
+    0 1
+}
+
+# Expire an outstanding Bugbot probe_requested wait after AGENT_REVIEW_PROBE_REQUESTED_TTL.
+# Returns 0 when expired; 1 when still active or not set.
+agent_review_bugbot_quota_expire_stale_probe_requested() {
+  local now ttl at age reason
+
+  agent_review_bugbot_quota_read_cache || return 1
+  [[ "${agent_review_bugbot_quota_probe_requested_today:-0}" == '1' ]] || return 1
+  at="${agent_review_bugbot_quota_probe_requested_at:-0}"
+  ttl="$(agent_review_probe_requested_ttl_s)"
+  now="$(date +%s)"
+  if [[ ! "${at}" =~ ^[0-9]+$ ]] || (( at <= 0 )); then
+    age="${ttl}"
+  else
+    age=$(( now - at ))
+  fi
+  if (( age < ttl )); then
+    return 1
+  fi
+  reason="Bugbot probe_requested expired after ${ttl}s without a review (repository-helpers#408)."
+  agent_review_bugbot_quota_write_cache 0 probe_expired "${reason}" 0 0
+  printf 'wait-for-agent-review: %s\n' "${reason}" >&2
+  return 0
 }
 
 # Probe open PRs for Bugbot PR comments, reviews, and head checks without requesting a new review.
@@ -1194,7 +1371,7 @@ agent_review_quota_probe_agent_for_today() {
     if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
       continue
     fi
-    if agent_review_agent_quota_probe_requested_for_agent "${agent}" \
+    if agent_review_agent_quota_probe_attempted_for_agent "${agent}" \
       && ! agent_review_agent_is_auto_review "${agent}"; then
       continue
     fi
@@ -1233,7 +1410,8 @@ agent_review_cycle_quota_agent_ids() {
   agent_review_quota_escalation_agent_ids
 }
 
-# Human-readable quota status for one agent (no side effects beyond cache refresh).
+# Human-readable quota status for one agent. May expire a stale probe_requested
+# wait (writes source=probe_expired) via probe_requested_for_agent / TTL checks.
 agent_review_agent_quota_status_label() {
   local -r agent_id="$1"
 
@@ -1254,7 +1432,11 @@ agent_review_agent_quota_status_label() {
     return 0
   fi
   if agent_review_agent_quota_probe_requested_for_agent "${agent_id}"; then
-    printf 'probe requested (awaiting review)\n'
+    printf 'probe requested (awaiting review; TTL %ss)\n' "$(agent_review_probe_requested_ttl_s)"
+    return 0
+  fi
+  if agent_review_agent_quota_probe_expired_for_agent "${agent_id}"; then
+    printf 'probe expired (no review within TTL; will not re-request today)\n'
     return 0
   fi
   printf 'unconfirmed (will request to probe)\n'
@@ -1273,22 +1455,70 @@ agent_review_log_cycle_quota_preamble() {
   done < <(agent_review_cycle_quota_agent_ids)
 }
 
-# True when <agent_id> daily quota cache reports a manual probe request was sent today.
+# True when <agent_id> daily quota cache reports a manual probe request was sent today
+# and the wait has not yet expired (AGENT_REVIEW_PROBE_REQUESTED_TTL).
 agent_review_agent_quota_probe_requested_for_agent() {
   local -r agent_id="$1"
 
   case "${agent_id}" in
     copilot)
       agent_review_copilot_quota_refresh_for_today
+      agent_review_copilot_quota_expire_stale_probe_requested || true
       [[ "${agent_review_copilot_quota_probe_requested_today:-0}" == '1' ]]
       ;;
     bugbot)
       agent_review_bugbot_quota_refresh_for_today
+      agent_review_bugbot_quota_expire_stale_probe_requested || true
       [[ "${agent_review_bugbot_quota_probe_requested_today:-0}" == '1' ]]
       ;;
     coderabbit)
       agent_review_coderabbit_quota_refresh_for_today
       [[ "${agent_review_coderabbit_quota_probe_requested_today:-0}" == '1' ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# True when a nudge/probe was attempted today (active wait, expired wait, or probe_attempted).
+# Used so quota fallback does not re-request the same agent after TTL expiry (#408).
+# This is a per-day host-wide signal (same as other quota caches): a probe on PR A
+# blocks re-probing that agent on PR B until the local calendar day rolls.
+agent_review_agent_quota_probe_attempted_for_agent() {
+  local -r agent_id="$1"
+
+  if agent_review_agent_quota_probe_requested_for_agent "${agent_id}"; then
+    return 0
+  fi
+  case "${agent_id}" in
+    copilot)
+      agent_review_copilot_quota_refresh_for_today
+      [[ "${agent_review_copilot_quota_probe_attempted_today:-0}" == '1' \
+        || "${agent_review_copilot_quota_cache_source:-}" == 'probe_expired' ]]
+      ;;
+    bugbot)
+      agent_review_bugbot_quota_refresh_for_today
+      [[ "${agent_review_bugbot_quota_probe_attempted_today:-0}" == '1' \
+        || "${agent_review_bugbot_quota_cache_source:-}" == 'probe_expired' ]]
+      ;;
+    coderabbit)
+      agent_review_agent_quota_probe_requested_for_agent coderabbit
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# True when today's probe_requested wait expired without a review (source=probe_expired).
+agent_review_agent_quota_probe_expired_for_agent() {
+  local -r agent_id="$1"
+
+  case "${agent_id}" in
+    copilot)
+      agent_review_copilot_quota_refresh_for_today
+      [[ "${agent_review_copilot_quota_cache_source:-}" == 'probe_expired' ]]
+      ;;
+    bugbot)
+      agent_review_bugbot_quota_refresh_for_today
+      [[ "${agent_review_bugbot_quota_cache_source:-}" == 'probe_expired' ]]
       ;;
     *) return 1 ;;
   esac

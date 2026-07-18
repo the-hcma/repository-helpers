@@ -460,6 +460,10 @@ See the Skill for CodeRabbit on_push policy, early-complete loop semantics, per-
 `copilot_work_finished_failure` (GitHub App `copilot-swe-agent`) with no issue comment or review
 body. Quota observe scans that timeline event for the local calendar day. Non-quota work failures
 of the same event type also mark Copilot exhausted for the day (acceptable for skip caches).
+Outstanding `@copilot` / Bugbot `probe_requested` waits expire after
+`AGENT_REVIEW_PROBE_REQUESTED_TTL` (default **15m**): the loop re-scans the current PR timeline
+and advances the quota fallback chain instead of hanging (`repository-helpers#408`). Negative
+`timeline_probed` cache entries are scoped to `OWNER/NAME#N` so another PR cannot skip the scan.
 
 ---
 

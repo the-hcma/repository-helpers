@@ -109,6 +109,7 @@ Environment:
   AGENT_REVIEW_REPORT_FROM      Email sender (required for complete/email-failure)
   AGENT_REVIEW_CYCLE_TIMEOUT    Legacy idle dwell (default: 15m); loop completes early when nothing is outstanding
   AGENT_REVIEW_PR_TIMEOUT       Non-convergence cap while review cycles keep iterating (default: 12h)
+  AGENT_REVIEW_PROBE_REQUESTED_TTL  Expire outstanding Copilot/Bugbot probe waits (default: 15m)
   AGENT_REVIEW_TRANSIENT_RETRIES  Retries for transient merge/restack failures (default: 5)
   AGENT_REVIEW_TRANSIENT_RETRY_SLEEP  Sleep between transient retries (default: 30s)
   AGENT_REVIEW_IDLE_BREAK_TIMEOUT  Deprecated; use AGENT_REVIEW_CYCLE_TIMEOUT idle-success semantics
@@ -402,6 +403,9 @@ cmd_wait() {
     snapshot="$(agent_review_graphql_wait_snapshot "${owner}" "${name}" "${pr}")"
     head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
     agent_review_observe_all_agent_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}" || true
+    # Expire stale probe_requested waits so timeline re-scan / fallback can proceed (#408).
+    agent_review_copilot_quota_expire_stale_probe_requested || true
+    agent_review_bugbot_quota_expire_stale_probe_requested || true
     now_epoch="$(agent_review_last_activity_epoch_from_snapshot "${snapshot}")"
     if (( now_epoch > last_activity )); then
       last_activity="${now_epoch}"
@@ -1125,6 +1129,10 @@ cmd_loop_agent_response_seen() {
     if agent_review_agent_quota_rate_limited_for_agent "${agent}"; then
       return 1
     fi
+    return 0
+  fi
+  # Stale probe_requested TTL: stop waiting so the loop can fall through the chain (#408).
+  if agent_review_agent_quota_probe_expired_for_agent "${agent}"; then
     return 0
   fi
   saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
@@ -1871,6 +1879,13 @@ cmd_loop() {
         "${pr}" >&2
     fi
 
+    # Re-check PR timeline / quota signals before sleeping so Copilot
+    # copilot_work_finished_failure (or probe TTL expiry) wakes the loop (#408).
+    cmd_loop_observe_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}"
+    cmd_loop_refresh_waiting_agents "${repo}" "${pr}" "${head}" "${snapshot}"
+    if cmd_loop_nothing_outstanding "${repo}" "${pr}" "${status}" "${snapshot}" "${head}"; then
+      continue
+    fi
     sleep "${agent_review_default_poll_interval_s}"
   done
 }
