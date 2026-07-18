@@ -1187,6 +1187,7 @@ rp_workflow_has_unsafe_noop_legacy_python_static() {
     }
     /^[[:space:]]*-[[:space:]]/ {
       cur = match($0, /[^ ]/) - 1
+      # Next/sibling list item at this indent closes the current matrix row.
       if (in_item && cur <= item_indent) {
         finish_item()
       }
@@ -1197,13 +1198,11 @@ rp_workflow_has_unsafe_noop_legacy_python_static() {
         item_indent = cur
         next
       }
-      if (in_item && cur <= item_indent) {
-        next
-      }
     }
     in_item {
       cur = match($0, /[^ ]/) - 1
-      if (cur >= 0 && cur <= item_indent && $0 !~ /^[[:space:]]*$/) {
+      # Only a shallower indent leaves the matrix row (same-indent keys are fields).
+      if (cur >= 0 && cur < item_indent && $0 !~ /^[[:space:]]*$/) {
         finish_item()
         next
       }
@@ -1211,6 +1210,8 @@ rp_workflow_has_unsafe_noop_legacy_python_static() {
       if ($0 ~ /script:[[:space:]]*.*cutover-ok/) { is_noop = 1 }
       if ($0 ~ /run:[[:space:]]*echo[[:space:]]/) { is_noop = 1 }
       if ($0 ~ /run:[[:space:]]*bash[[:space:]]+\.github\/ci\/cutover-ok/) { is_noop = 1 }
+      if ($0 ~ /run:[[:space:]]*exit[[:space:]]+0[[:space:]]*$/) { is_noop = 1 }
+      if ($0 ~ /run:[[:space:]]*["'\'']?true["'\'']?[[:space:]]*$/) { is_noop = 1 }
     }
     END {
       finish_item()
@@ -1232,6 +1233,7 @@ rp_workflow_has_unsafe_checks_action_python_static() {
       is_checks = 0
       has_legacy = 0
       has_outcome_gate = 0
+      pending_conclusion = 0
       step_indent = -1
     }
     function finish_step() {
@@ -1240,6 +1242,7 @@ rp_workflow_has_unsafe_checks_action_python_static() {
       is_checks = 0
       has_legacy = 0
       has_outcome_gate = 0
+      pending_conclusion = 0
       step_indent = -1
     }
     /^[[:space:]]*-[[:space:]]/ {
@@ -1247,19 +1250,22 @@ rp_workflow_has_unsafe_checks_action_python_static() {
       if (in_step && cur <= step_indent) {
         finish_step()
       }
-      if ($0 ~ /checks-action/) {
+      # Require uses: …checks-action on the step opener (ignore run:/echo mentions).
+      if ($0 ~ /^[[:space:]]*-[[:space:]]*uses:[[:space:]]*.*checks-action/) {
         in_step = 1
         is_checks = 1
         has_legacy = 0
         has_outcome_gate = 0
+        pending_conclusion = 0
         step_indent = cur
         next
       }
       if ($0 ~ /^[[:space:]]*-[[:space:]]*uses:[[:space:]]*/) {
         in_step = 1
-        is_checks = ($0 ~ /checks-action/)
+        is_checks = 0
         has_legacy = 0
         has_outcome_gate = 0
+        pending_conclusion = 0
         step_indent = cur
         next
       }
@@ -1270,12 +1276,19 @@ rp_workflow_has_unsafe_checks_action_python_static() {
         finish_step()
         next
       }
-      if ($0 ~ /checks-action/) { is_checks = 1 }
       if ($0 ~ /^[[:space:]]*name:[[:space:]]*["'\'']?(Ruff|Pyright|Mypy|Backend Lint)["'\'']?[[:space:]]*$/) {
         has_legacy = 1
       }
-      if ($0 ~ /conclusion:[[:space:]]*/ && $0 ~ /steps\.[A-Za-z0-9_-]+\.outcome/) {
+      if ($0 ~ /conclusion:[[:space:]]*/) {
+        if ($0 ~ /steps\.[A-Za-z0-9_-]+\.outcome/) {
+          has_outcome_gate = 1
+          pending_conclusion = 0
+        } else {
+          pending_conclusion = 1
+        }
+      } else if (pending_conclusion && $0 ~ /steps\.[A-Za-z0-9_-]+\.outcome/) {
         has_outcome_gate = 1
+        pending_conclusion = 0
       }
     }
     END {
@@ -1384,8 +1397,8 @@ rp_check_python_static_ci_job() {
   local workflow_path
   local workflow_text
   local fetch_ec=0
-  local saw_unsafe=0
-  local saw_split=0
+  local workflow_count=0
+  local saw_ci_workflow=0
 
   # Gate: only Python repos (pyproject.toml at root).
   rp_gh_path_check "$slug" 'pyproject.toml' || py_ec=$?
@@ -1435,6 +1448,10 @@ rp_check_python_static_ci_job() {
   while IFS= read -r workflow_name; do
     [[ -n "$workflow_name" ]] || continue
     [[ "$workflow_name" == *.yml ]] || continue
+    workflow_count=$((workflow_count + 1))
+    if [[ "$workflow_name" == 'ci.yml' ]]; then
+      saw_ci_workflow=1
+    fi
     workflow_path=".github/workflows/${workflow_name}"
     fetch_ec=0
     workflow_text="$(rp_fetch_github_text_file "$slug" "$workflow_path")" || fetch_ec=$?
@@ -1447,7 +1464,6 @@ rp_check_python_static_ci_job() {
     fi
 
     if rp_workflow_has_unsafe_python_static_publishers "$workflow_text"; then
-      saw_unsafe=1
       repo_fail=1
       rp_log_fail \
         "${slug}: ${workflow_path}: legacy Python static check publishers (Ruff/Pyright/Mypy/Backend Lint) are not gated on the combined job/step succeeding (false-green risk)"
@@ -1456,7 +1472,6 @@ rp_check_python_static_ci_job() {
           "${slug}: ${workflow_path}: gate aliases with needs.python-static.result == 'success', share conclusion via aliases:/steps.*.outcome, or remove no-op publishers"
       fi
     elif rp_ci_workflow_has_split_python_static_jobs "$workflow_text"; then
-      saw_split=1
       repo_fail=1
       rp_log_fail \
         "${slug}: ${workflow_path}: still publishes split/cutover Python static contexts (Ruff/Pyright/Mypy/Backend Lint); remove after protection retarget"
@@ -1467,9 +1482,16 @@ rp_check_python_static_ci_job() {
     fi
   done < <(rp_fetch_workflow_file_names "$slug")
 
-  # If the workflows listing failed open (empty), still audit ci.yml content we
-  # already fetched so a listing outage cannot skip false-green detection.
-  if [[ "$saw_unsafe" -eq 0 && "$saw_split" -eq 0 ]]; then
+  # Empty listing while ci.yml exists means the directory list call failed open —
+  # do not pass the audit (that would skip release-please.yml and friends).
+  if (( workflow_count == 0 )); then
+    rp_log_gh_api_fail "$slug" \
+      'could not list .github/workflows for Python static CI check (refusing to skip non-ci.yml publishers)'
+    return 1
+  fi
+
+  # Listing succeeded but omitted ci.yml — still audit the content we already fetched.
+  if (( saw_ci_workflow == 0 )); then
     if rp_workflow_has_unsafe_python_static_publishers "$ci_text"; then
       repo_fail=1
       rp_log_fail \
