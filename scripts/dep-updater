@@ -981,6 +981,41 @@ _npm_version_is_stable_release() {
   [[ "$version" != *-* ]]
 }
 
+# npm_semver_major <version>
+# Prints the leading major integer from a semver-ish string (strips a leading v).
+# Non-numeric majors print empty so callers fall through instead of skipping.
+npm_semver_major() {
+  local ver="$1"
+  ver="${ver#v}"
+  ver="${ver%%-*}"
+  ver="${ver%%+*}"
+  ver="${ver%%.*}"
+  if [[ "$ver" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$ver"
+  else
+    printf ''
+  fi
+}
+
+# npm_should_skip_typescript_major <current> <candidate>
+# Returns 0 when candidate is a TypeScript major bump that should not be proposed.
+# typescript-eslint (and similar tooling) does not support TypeScript 7+ programmatic
+# APIs yet; auto-bumping the major breaks ESLint CI (#401). CVE-driven majors still land.
+npm_should_skip_typescript_major() {
+  local -r current="$1"
+  local -r candidate="$2"
+  local cur_maj cand_maj
+
+  cur_maj="$(npm_semver_major "$current")"
+  cand_maj="$(npm_semver_major "$candidate")"
+  [[ -n "$cur_maj" && -n "$cand_maj" ]] || return 1
+  [[ "$cur_maj" != "$cand_maj" ]] || return 1
+  if npm_pkg_has_cve_fix_in_audit 'typescript'; then
+    return 1
+  fi
+  return 0
+}
+
 # _npm_registry_stable_versions_desc <pkg>
 # Prints stable published versions newest-first from the npm packument.
 _npm_registry_stable_versions_desc() {
@@ -1015,7 +1050,9 @@ npm_pick_eligible_new_version() {
   local -r pkg="$1"
   local -r current="$2"
   local -r scan_root="${3:-$dir}"
-  local ver latest_tag picked
+  local ver latest_tag picked skipped_ts_major
+
+  skipped_ts_major=0
 
   # Integration tests stub pnpm only (DEP_UPDATER_SKIP_NPM_REGISTRY=1): walk the
   # registry packument is unavailable, so use pnpm view like the pre-walk path.
@@ -1025,6 +1062,10 @@ npm_pick_eligible_new_version() {
       return 1
     fi
     if [[ "$(printf '%s\n%s\n' "$current" "$latest_tag" | sort -V | tail -1)" != "$latest_tag" ]]; then
+      return 1
+    fi
+    if [[ "$pkg" == 'typescript' ]] && npm_should_skip_typescript_major "$current" "$latest_tag"; then
+      log "[pnpm] typescript: holding at major $(npm_semver_major "$current") (skipping ${latest_tag}; typescript-eslint lacks TS major support)."
       return 1
     fi
     if npm_version_meets_minimum_release_age "$pkg" "$latest_tag" "$scan_root" \
@@ -1043,6 +1084,13 @@ npm_pick_eligible_new_version() {
       continue
     fi
     if [[ "$(printf '%s\n%s\n' "$current" "$ver" | sort -V | tail -1)" != "$ver" ]]; then
+      continue
+    fi
+    if [[ "$pkg" == 'typescript' ]] && npm_should_skip_typescript_major "$current" "$ver"; then
+      if (( skipped_ts_major == 0 )); then
+        log "[pnpm] typescript: holding at major $(npm_semver_major "$current") (skipping ${ver}; typescript-eslint lacks TS major support)."
+        skipped_ts_major=1
+      fi
       continue
     fi
     # Age-gate the candidate and confirm the top-level tarball exists. Exact-semver
@@ -3717,6 +3765,12 @@ npm_outdated() {
     while IFS= read -r _npkg _ncur _nnew; do
       [[ -z "$_npkg" ]] && continue
       if [[ "$semver_only" == '1' ]]; then
+        # Only gate here when we take `_nnew` as-is. The --latest path below
+        # calls npm_pick_eligible_new_version, which walks same-major candidates.
+        if [[ "$_npkg" == 'typescript' ]] && npm_should_skip_typescript_major "$_ncur" "$_nnew"; then
+          log "[pnpm] typescript: holding at major $(npm_semver_major "$_ncur") (skipping ${_nnew}; typescript-eslint lacks TS major support)."
+          continue
+        fi
         if [[ "$tool" == 'pnpm' ]]; then
           if npm_version_meets_minimum_release_age "$_npkg" "$_nnew" "$scan_root" \
             && npm_version_prefetch_closure "$_npkg" "$_nnew" "$scan_root"; then
