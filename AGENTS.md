@@ -133,7 +133,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Check | Full audit | Merge-only | What it validates |
 | --- | --- | --- | --- |
 | Release Please squash settings | yes | yes | Repos with `release-please.yml` use squash-only merges on `main` |
-| `protect-main` ruleset | yes | yes | Squash-only + Graphite App bypass on `refs/heads/main` when `merge-it` or Release Please |
+| `protect-main` ruleset | yes | yes | Squash-only + Graphite App bypass or GitHub `merge_queue` on `refs/heads/main` when `merge-it`, GitHub MQ, or Release Please |
 | Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts, push via Graphite only (org standard) |
 | Graphite merge queue wiring | yes | yes | `merge-it` label (strict repos), `merge-mq` when present, `merged-pr-closer.yml`, `ci.yml` `gtmq_merge_*` skip, dependabot auto-merge when `dependabot.yml` exists |
 | Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |

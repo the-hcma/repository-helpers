@@ -2803,7 +2803,8 @@ rp_ruleset_has_github_merge_queue() {
 }
 
 # rp_repo_uses_github_merge_queue <slug>
-# True when the repo's protect-main ruleset requires GitHub's merge queue.
+# Exit 0 when protect-main requires GitHub's merge queue, 1 when it does not,
+# 2 when the GitHub API call fails (do not treat as "not GitHub MQ").
 rp_repo_uses_github_merge_queue() {
   local -r slug="$1"
   local ruleset_json
@@ -2813,13 +2814,19 @@ rp_repo_uses_github_merge_queue() {
   fetch_exit=$?
   set -e
   if (( fetch_exit == 2 )); then
+    return 2
+  fi
+  if (( fetch_exit != 0 )); then
     return 1
   fi
   rp_ruleset_has_github_merge_queue "$ruleset_json"
 }
 
+# Exit 0 when protect-main is required, 1 when not, 2 on GitHub API failure
+# (do not treat API errors as "not required").
 rp_repo_requires_protect_main_ruleset() {
   local slug="$1"
+  local mq_exit=0
   if [[ "$rp_merge_only" -eq 0 ]] && rp_is_strict_repo "$slug"; then
     return 0
   fi
@@ -2829,8 +2836,12 @@ rp_repo_requires_protect_main_ruleset() {
   if rp_repo_has_merge_it_label "$slug"; then
     return 0
   fi
-  if rp_repo_uses_github_merge_queue "$slug"; then
+  rp_repo_uses_github_merge_queue "$slug" || mq_exit=$?
+  if (( mq_exit == 0 )); then
     return 0
+  fi
+  if (( mq_exit == 2 )); then
+    return 2
   fi
   return 1
 }
@@ -3049,8 +3060,14 @@ rp_validate_classic_main_protection_json() {
   local -a expected_contexts=()
   local ctx
   local github_mq=0
+  local mq_exit=0
 
-  if rp_repo_uses_github_merge_queue "$slug"; then
+  rp_repo_uses_github_merge_queue "$slug" || mq_exit=$?
+  if (( mq_exit == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read protect-main ruleset'
+    return 1
+  fi
+  if (( mq_exit == 0 )); then
     github_mq=1
   fi
 
@@ -3182,6 +3199,7 @@ rp_apply_classic_main_protection() {
   local bypass_apps_json payload
   local github_mq=0
   local restrictions_json
+  local mq_exit=0
 
   while IFS= read -r ctx; do
     [[ -n "$ctx" ]] || continue
@@ -3189,7 +3207,13 @@ rp_apply_classic_main_protection() {
   done < <(rp_discover_ci_status_contexts "$slug")
 
   bypass_apps_json="$(rp_classic_protection_bypass_apps_json "$slug")"
-  if rp_repo_uses_github_merge_queue "$slug"; then
+  mq_exit=0
+  rp_repo_uses_github_merge_queue "$slug" || mq_exit=$?
+  if (( mq_exit == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read protect-main ruleset'
+    return 1
+  fi
+  if (( mq_exit == 0 )); then
     github_mq=1
     restrictions_json='null'
   else
@@ -4072,10 +4096,16 @@ rp_validate_ruleset_methods_json() {
   local slug="$1"
   local methods_json="$2"
   local count methods_line
+  local require_exit=0
 
   count="$(rp_runner_jq_file "repo-practices methods length" "$methods_json" 'length')"
   if [[ "$count" -eq 0 ]]; then
-    if rp_repo_requires_protect_main_ruleset "$slug"; then
+    rp_repo_requires_protect_main_ruleset "$slug" || require_exit=$?
+    if (( require_exit == 2 )); then
+      rp_log_gh_api_fail "$slug" 'could not determine whether protect-main is required'
+      return 1
+    fi
+    if (( require_exit == 0 )); then
       rp_log_fail "${slug}: missing protect-main ruleset (squash-only merges on main)"
       if [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest "${slug}: add protect-main ruleset (see AGENTS.md) or run --apply-fix"
@@ -4614,8 +4644,16 @@ rp_check_protect_main_ruleset() {
   local repo_fail=0
   local ruleset_json methods_json
   local fetch_exit=0
+  local require_exit=0
 
-  if ! rp_repo_requires_protect_main_ruleset "$slug"; then
+  rp_repo_requires_protect_main_ruleset "$slug" || require_exit=$?
+  if (( require_exit == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not determine whether protect-main is required'
+    rp_log_check_fail "$slug" 'protect-main ruleset (GitHub API error; retry)' \
+      "$(rp_github_url "$slug" '/settings/rules')"
+    return 1
+  fi
+  if (( require_exit != 0 )); then
     return 0
   fi
 
@@ -4696,8 +4734,16 @@ rp_check_classic_main_protection() {
   local repo_fail=0
   local protection_json
   local fetch_exit=0
+  local require_exit=0
 
-  if ! rp_repo_requires_protect_main_ruleset "$slug"; then
+  rp_repo_requires_protect_main_ruleset "$slug" || require_exit=$?
+  if (( require_exit == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not determine whether protect-main is required'
+    rp_log_check_fail "$slug" 'classic main branch protection (GitHub API error; retry)' \
+      "$(rp_github_url "$slug" '/settings/branches')"
+    return 1
+  fi
+  if (( require_exit != 0 )); then
     return 0
   fi
 
@@ -4784,7 +4830,7 @@ rp_check_github_merge_queue() {
     if (( fetch_ec == 2 )); then
       rp_log_gh_api_fail "$slug" 'could not read .github/workflows/ci.yml'
       repo_fail=1
-    elif [[ -z "$ci_text" ]] || ! grep -qE '^[[:space:]]*merge_group:[[:space:]]*$' <<<"$ci_text"; then
+    elif [[ -z "$ci_text" ]] || ! grep -qE '^[[:space:]]*merge_group:' <<<"$ci_text"; then
       rp_log_fail "${slug}: ci.yml must trigger on merge_group for GitHub merge queue"
       if [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest "${slug}: add merge_group: under on: in .github/workflows/ci.yml"
@@ -4814,8 +4860,13 @@ rp_check_graphite_merge_queue() {
   local labels_json
   local labels_fetch_exit=0
   local merge_it_exit=0
+  local mq_exit=0
 
-  if rp_repo_uses_github_merge_queue "$slug"; then
+  # Only take the GitHub MQ path on a positive detection. API errors (exit 2)
+  # fall through to the Graphite label/workflow checks — protect-main already
+  # reports ruleset fetch failures, and strict-onboarding still needs merge-it.
+  rp_repo_uses_github_merge_queue "$slug" || mq_exit=$?
+  if (( mq_exit == 0 )); then
     rp_check_github_merge_queue "$slug"
     return $?
   fi
