@@ -110,8 +110,19 @@ agent_review_feedback_issue_comment_is_probe() {
   if [[ "${lower}" =~ ^@copilot[[:space:]]+please[[:space:]]+review ]]; then
     return 0
   fi
+  # Bugbot explicit trigger (agent_review_profile_trigger_comment).
+  if [[ "${lower}" =~ ^bugbot[[:space:]]+run[[:space:]]*$ ]]; then
+    return 0
+  fi
   if [[ "${lower}" == *'summarize by coderabbit.ai'* ]] \
-    || [[ "${lower}" == *'walkthrough_start'* ]]; then
+    || [[ "${lower}" == *'walkthrough_start'* ]] \
+    || [[ "${lower}" == *'cursor_summary'* ]]; then
+    return 0
+  fi
+  # Bugbot quota / run-failed notices — observed for quota, not product triage.
+  if [[ "${lower}" == *'bugbot'* ]] \
+    && { [[ "${lower}" == *'usage limit'* ]] || [[ "${lower}" == *"couldn't run"* ]] \
+      || [[ "${lower}" == *'could not run'* ]]; }; then
     return 0
   fi
   # Repository overview / architecture blurb (e.g. Vortex) — not actionable findings.
@@ -259,17 +270,28 @@ agent_review_feedback_issue_comments_pending_json() {
   operator_login="$(agent_review_authenticated_login)"
   comments_json="$(agent_review_feedback_issue_comments_array_json "${repo}" "${pr}")"
   resolved_csv="$(agent_review_feedback_resolved_ids_for_pr "${repo}" "${pr}")"
+  # Include operator-authored conversation comments (product notes) as pending
+  # feedback. Probe/bot boilerplate and triage replies ("In reply to …") stay
+  # excluded. "Addressed" requires a later operator comment that cites this
+  # comment's html_url — not merely any later operator comment (issue #385).
   ar_runner_jq_file "agent-review feedback pending issue comments" "${comments_json}" \
     --arg operator "${operator_login}" \
     --arg resolved_csv "${resolved_csv}" '
       def is_probe($body):
         ($body // "") | test("wait-for-agent-review:";"i")
         or test("^@copilot[[:space:]]+please[[:space:]]+review";"i")
+        or test("^bugbot[[:space:]]+run[[:space:]]*$";"i")
         or test("summarize by coderabbit\\.ai";"i")
         or test("walkthrough_start";"i")
+        or test("cursor_summary";"i")
+        or (test("bugbot";"i") and (test("usage limit";"i")
+             or test("couldn\u0027t run";"i") or test("could not run";"i")))
         or test("code-review-agent:overview";"i")
         or (test("action performed";"i") and (test("review triggered";"i") or test("review finished";"i")))
         or (test("auto-generated reply by coderabbit";"i") and test("action performed";"i"));
+      def is_triage_reply($body):
+        # reply-comment / reply-review append: "(In reply to <url>)" near the end.
+        (($body // "") | test("[(]In reply to https?://[^)]+[)][[:space:]]*$"));
       def resolved_set:
         if ($resolved_csv | length) == 0 then []
         else ($resolved_csv | split(","))
@@ -278,8 +300,9 @@ agent_review_feedback_issue_comments_pending_json() {
       | [ range(0; ($all | length)) as $i
         | $all[$i] as $c
         | select(is_probe($c.body) | not)
-        | select($c.login != $operator)
+        | select(is_triage_reply($c.body) | not)
         | select((resolved_set | index($c.id)) | not)
+        | ($c.html_url // "") as $url
         | {
             kind: "issue_comment",
             feedback_id: ("IC_" + $c.id),
@@ -288,8 +311,12 @@ agent_review_feedback_issue_comments_pending_json() {
             comment_url: $c.html_url,
             body: $c.body,
             state: (
-              if [ range($i + 1; ($all | length))
-                   | $all[.] | select(.login == $operator) ] | length > 0
+              if ($url | length) == 0 then "unaddressed"
+              elif ([ range($i + 1; ($all | length))
+                      | $all[.]
+                      | select(.login == $operator)
+                      | select((.body // "") | index("(In reply to " + $url + ")") != null)
+                    ] | length > 0)
               then "needs_resolve"
               else "unaddressed"
               end
@@ -402,8 +429,8 @@ agent_review_feedback_reviews_pending_json() {
               | select(.login == $operator)
               | select((.created_at // "") > $after)
               | select(
-                  (($url | length) > 0 and ((.body // "") | index($url) != null))
-                  or ((.body // "") | index($anchor) != null)
+                  (($url | length) > 0 and ((.body // "") | index("(In reply to " + $url + ")") != null))
+                  or ((.body // "") | index($anchor + ")") != null)
                 )
             ] | length > 0
           end;
@@ -489,15 +516,22 @@ agent_review_feedback_posted_count() {
       def is_probe($body):
         ($body // "") | test("wait-for-agent-review:";"i")
         or test("^@copilot[[:space:]]+please[[:space:]]+review";"i")
+        or test("^bugbot[[:space:]]+run[[:space:]]*$";"i")
         or test("summarize by coderabbit\\.ai";"i")
         or test("walkthrough_start";"i")
+        or test("cursor_summary";"i")
+        or (test("bugbot";"i") and (test("usage limit";"i")
+             or test("couldn\u0027t run";"i") or test("could not run";"i")))
         or test("code-review-agent:overview";"i")
         or (test("action performed";"i") and (test("review triggered";"i") or test("review finished";"i")))
         or (test("auto-generated reply by coderabbit";"i") and test("action performed";"i"));
+      def is_triage_reply($body):
+        (($body // "") | test("[(]In reply to https?://[^)]+[)][[:space:]]*$"));
+      # Match pending triage: bot + operator product notes; exclude probes/replies.
       [ .[]
         | select(is_probe(.body) | not)
-        | select(.login != $operator)
-        | select(is_bot_login(.login))
+        | select(is_triage_reply(.body) | not)
+        | select(is_bot_login(.login) or .login == $operator)
       ] | length')"
   # Pending reviews are a lower bound on posted body-feedback items (resolved ones
   # drop out of pending; still fine for email stats).
@@ -551,6 +585,8 @@ agent_review_feedback_issue_comment_has_operator_reply() {
 
   operator_login="$(agent_review_authenticated_login)"
   comments_json="$(agent_review_feedback_issue_comments_array_json "${repo}" "${pr}")"
+  # Require an explicit citation of the target comment URL (reply-comment appends
+  # "(In reply to <url>)"). A later unrelated operator note must not count.
   ar_runner_jq_file "agent-review feedback issue comment has reply" "${comments_json}" \
     --arg id "${comment_id}" \
     --arg operator "${operator_login}" \
@@ -558,7 +594,16 @@ agent_review_feedback_issue_comment_has_operator_reply() {
       . as $all
       | (first(range(0; length) | select($all[.] | .id == $id)) // null) as $idx
       | if $idx == null then false
-        else [ range($idx + 1; length) | $all[.] | select(.login == $operator) ] | length > 0
+        else
+          ($all[$idx].html_url // "") as $url
+          | if ($url | length) == 0 then false
+            else
+              [ range($idx + 1; length)
+                | $all[.]
+                | select(.login == $operator)
+                | select((.body // "") | index("(In reply to " + $url + ")") != null)
+              ] | length > 0
+            end
         end'
 }
 
@@ -593,8 +638,8 @@ agent_review_feedback_review_has_operator_reply() {
         | select(.login == $operator)
         | select((.created_at // "") > $after)
         | select(
-            (($url | length) > 0 and ((.body // "") | index($url) != null))
-            or ((.body // "") | index($anchor) != null)
+            (($url | length) > 0 and ((.body // "") | index("(In reply to " + $url + ")") != null))
+            or ((.body // "") | index($anchor + ")") != null)
           )
       ] | length > 0' >/dev/null
 }
