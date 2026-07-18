@@ -111,8 +111,11 @@ Manual iteration (when `loop` exits **3** for triage):
 
 ### Triage unaddressed feedback (exit 3)
 
-Feedback may arrive as **inline review threads** or **top-level PR issue comments** (e.g. Copilot
-replying via `gh pr comment`). Use the same workflow for both: address → respond → resolve.
+Feedback may arrive as **inline review threads**, **top-level PR issue comments** (agent or
+**operator-authored** product notes), or **pull-request review bodies**. Use the same workflow:
+address → respond → resolve. Probe/bot boilerplate stays excluded; triage replies that contain
+`(In reply to <url>)` are not new pending items. A later unrelated operator comment does **not**
+clear prior feedback — the reply must cite the target comment/review URL.
 
 List pending items:
 
