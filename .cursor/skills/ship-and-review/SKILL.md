@@ -212,7 +212,10 @@ If quota-limited, wait the cooldown with **poll-while-rate-limited** feedback po
 `AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX`, default 60m; issues #366 / #369), then
 `AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE` (default **60s**); only then, if still no real
 review on head, the loop may post a one-shot `@coderabbitai full review` (idempotent per head).
-Rate-limit stubs are not reviews. Mid-cooldown human/agent feedback wakes the loop (exit **3**).
+**When CodeRabbit says wait** (“More reviews will be available in N minutes”), do **not**
+re-ask — keep waiting until `retry_after`; the full-review helper hard-refuses while
+rate-limited. Rate-limit stubs are not reviews. Mid-cooldown human/agent feedback wakes
+the loop (exit **3**).
 
 CodeRabbit runs via its GitHub App / Actions after pushes. Copilot and Bugbot are probed with
 explicit review requests on new PR heads when quota is unknown.
