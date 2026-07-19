@@ -1108,14 +1108,26 @@ rp_python_static_wrapper_is_canonical() {
   return 0
 }
 
-# Split / cutover-alias job display names (exact `name:` lines; optional quotes).
-readonly rp_PYTHON_STATIC_SPLIT_JOB_NAME_RE='^[[:space:]]*name:[[:space:]]*["'\'']?(Ruff|Pyright|Mypy|Backend Lint)["'\'']?[[:space:]]*$'
+# Job / step / matrix `name:` lines that publish a legacy context (optional list
+# dash; optional trailing YAML `#` comment).
+readonly rp_PYTHON_STATIC_SPLIT_JOB_NAME_RE='^[[:space:]]*(-[[:space:]]*)?name:[[:space:]]*["'\'']?(Ruff|Pyright|Mypy|Backend Lint)["'\'']?[[:space:]]*(#.*)?$'
 
-# True when ci.yml has a standalone Ruff/Pyright/Mypy/Backend Lint job (the split
-# anti-pattern or leftover cutover aliases). Matches exact job display names.
+# Matrix/check `aliases:` that still publish leftover legacy contexts (end-state).
+# Whole tokens only (space-separated) — not substrings like mypy-check / FooMypy.
+readonly rp_PYTHON_STATIC_ALIASES_FIELD_RE='^[[:space:]]*aliases:[[:space:]]*(([^#[:space:]]+[[:space:]]+)*)(Ruff|Pyright|Mypy|Backend Lint)([[:space:]]|#|$)'
+
+# Job display-name line (no list dash) with optional trailing comment.
+readonly rp_PYTHON_STATIC_JOB_NAME_LINE_RE='^[[:space:]]*name:[[:space:]]*["'\'']?(Ruff|Pyright|Mypy|Backend Lint)["'\'']?[[:space:]]*(#.*)?$'
+
+# Matrix list item name line with optional trailing comment.
+readonly rp_PYTHON_STATIC_MATRIX_NAME_LINE_RE='^[[:space:]]*-[[:space:]]*name:[[:space:]]*["'\'']?(Ruff|Pyright|Mypy|Backend Lint)["'\'']?[[:space:]]*(#.*)?$'
+
+# True when a workflow publishes standalone Ruff/Pyright/Mypy/Backend Lint contexts
+# (split jobs, matrix primary names, checks-action names, or leftover aliases: fields).
 rp_ci_workflow_has_split_python_static_jobs() {
   local text="$1"
-  grep -qE "$rp_PYTHON_STATIC_SPLIT_JOB_NAME_RE" <<<"$text"
+  grep -qE "$rp_PYTHON_STATIC_SPLIT_JOB_NAME_RE" <<<"$text" \
+    || grep -qE "$rp_PYTHON_STATIC_ALIASES_FIELD_RE" <<<"$text"
 }
 
 # Cutover alias stubs that `needs: python-static` but only gate on guard will
@@ -1123,18 +1135,30 @@ rp_ci_workflow_has_split_python_static_jobs() {
 # a custom `if:` instead of the default success()). Required checks named
 # Ruff/Pyright/… then go green while lint/typecheck failed.
 #
-# True when any split-named job's block lacks the python-static success gate
+# True when any split-named *job* block lacks the python-static success gate
 # (scoped per job under `jobs:` — a gate on an unrelated job must not mask an
-# unsafe alias). Flags accumulate per job block and are evaluated at the block
-# boundary, so YAML key ordering (`if:` before `name:`) and multi-line `if:`
-# scalars (`if: >` continuation lines) are both handled. The job-key indent is
-# learned from the first key under `jobs:` so 2-space and 4-space YAML both
-# parse; deeper keys (steps, permissions) are ignored.
+# unsafe alias). Matrix list items (`- name: Ruff`) are ignored here — see
+# rp_workflow_has_unsafe_noop_legacy_python_static. Flags accumulate per job
+# block and are evaluated at the block boundary, so YAML key ordering
+# (`if:` before `name:`) and multi-line `if:` scalars are both handled. The
+# job-key indent is learned from the first key under `jobs:` so 2-space and
+# 4-space YAML both parse; deeper keys (steps, permissions) are ignored.
 rp_ci_workflow_has_unsafe_python_static_cutover_aliases() {
   local text="$1"
-  rp_ci_workflow_has_split_python_static_jobs "$text" || return 1
-  awk '
-    BEGIN { unsafe = 0; in_jobs = 0; is_alias = 0; has_gate = 0; job_indent = 0 }
+  # Job display names only (no list dash) — matrix rows are handled separately.
+  # Match only at job-property indent (learned from the first key under the job)
+  # so step-level `name: Ruff` under `steps:` is not a false-positive cutover alias.
+  grep -qE "$rp_PYTHON_STATIC_JOB_NAME_LINE_RE" <<<"$text" || return 1
+  awk -v name_re="$rp_PYTHON_STATIC_JOB_NAME_LINE_RE" '
+    BEGIN {
+      unsafe = 0
+      in_jobs = 0
+      is_alias = 0
+      has_gate = 0
+      job_indent = 0
+      prop_indent = -1
+      in_steps = 0
+    }
     /^jobs:[[:space:]]*$/ { in_jobs = 1; job_indent = 0; next }
     in_jobs && /^[^[:space:]]/ { in_jobs = 0 }
     !in_jobs { next }
@@ -1146,21 +1170,208 @@ rp_ci_workflow_has_unsafe_python_static_cutover_aliases() {
         if (is_alias && !has_gate) { unsafe = 1 }
         is_alias = 0
         has_gate = 0
+        prop_indent = -1
+        in_steps = 0
         next
       }
     }
-    $0 ~ /^[[:space:]]*name:[[:space:]]*["'\'']?(Ruff|Pyright|Mypy|Backend Lint)["'\'']?[[:space:]]*$/ {
-      is_alias = 1
-      next
-    }
-    $0 ~ /needs\.python-static\.result[[:space:]]*==[[:space:]]*['\''"]?success['\''"]?/ {
-      has_gate = 1
+    {
+      indent = match($0, /[^ ]/) - 1
+      if (prop_indent < 0 && indent > job_indent && $0 ~ /^ +[A-Za-z0-9_.-]+:/) {
+        prop_indent = indent
+      }
+      if (prop_indent >= 0 && indent == prop_indent && $0 ~ /^ +steps:/) {
+        in_steps = 1
+      }
+      if (prop_indent >= 0 && indent == prop_indent && $0 ~ name_re) {
+        is_alias = 1
+        next
+      }
+      # Job-level if: (including multi-line if: > continuations) — not step if:.
+      if (!in_steps && prop_indent >= 0 && indent >= prop_indent \
+          && $0 ~ /needs\.python-static\.result[[:space:]]*==[[:space:]]*['\''"]?success['\''"]?/) {
+        has_gate = 1
+      }
     }
     END {
       if (is_alias && !has_gate) { unsafe = 1 }
       exit(unsafe ? 0 : 1)
     }
   ' <<<"$text"
+}
+
+# Matrix rows that publish a legacy check name via a no-op / cutover-ok stub in
+# parallel with the real static job — those checks go green even when lint fails.
+# Safe cutover publishes aliases from the real job/script with the same conclusion
+# (e.g. aliases: Ruff Mypy on the python-static matrix row), not a separate no-op.
+rp_workflow_has_unsafe_noop_legacy_python_static() {
+  local text="$1"
+  awk -v name_re="$rp_PYTHON_STATIC_MATRIX_NAME_LINE_RE" '
+    BEGIN {
+      unsafe = 0
+      in_item = 0
+      is_legacy = 0
+      is_noop = 0
+      saw_true_run = 0
+      saw_real_action = 0
+      item_indent = -1
+    }
+    function finish_item() {
+      # run: true is a cutover stub only when the row has no other real action.
+      if (saw_true_run && !saw_real_action) { is_noop = 1 }
+      if (in_item && is_legacy && is_noop) { unsafe = 1 }
+      in_item = 0
+      is_legacy = 0
+      is_noop = 0
+      saw_true_run = 0
+      saw_real_action = 0
+      item_indent = -1
+    }
+    /^[[:space:]]*-[[:space:]]/ {
+      cur = match($0, /[^ ]/) - 1
+      # Next/sibling list item at this indent closes the current matrix row.
+      if (in_item && cur <= item_indent) {
+        finish_item()
+      }
+      if ($0 ~ name_re) {
+        in_item = 1
+        is_legacy = 1
+        is_noop = 0
+        saw_true_run = 0
+        saw_real_action = 0
+        item_indent = cur
+        next
+      }
+    }
+    in_item {
+      cur = match($0, /[^ ]/) - 1
+      # Only a shallower indent leaves the matrix row (same-indent keys are fields).
+      if (cur >= 0 && cur < item_indent && $0 !~ /^[[:space:]]*$/) {
+        finish_item()
+        next
+      }
+      # Basename cutover-ok (optional dir prefix) — avoid validate-cutover-ok-setup FPs.
+      if ($0 ~ /script:[[:space:]]*(.*\/)?cutover-ok([^A-Za-z0-9_-]|$)/) { is_noop = 1 }
+      # Cutover stubs only — quoted or unquoted Covered-by echo.
+      if ($0 ~ /run:[[:space:]]*echo[[:space:]]+["'\'']?Covered by(["'\''[:space:]]|$)/) { is_noop = 1 }
+      if ($0 ~ /run:[[:space:]]*bash[[:space:]]+(.*\/)?cutover-ok([^A-Za-z0-9_-]|$)/) { is_noop = 1 }
+      if ($0 ~ /run:[[:space:]]*exit[[:space:]]+0[[:space:]]*$/) { is_noop = 1 }
+      if ($0 ~ /run:[[:space:]]*["'\'']?true["'\'']?[[:space:]]*$/) { saw_true_run = 1 }
+      # Real matrix actions (not cutover stubs) suppress a lone run: true noop.
+      if ($0 ~ /script:[[:space:]]/ \
+          && $0 !~ /script:[[:space:]]*(.*\/)?cutover-ok([^A-Za-z0-9_-]|$)/) {
+        saw_real_action = 1
+      }
+      if ($0 ~ /run:[[:space:]]/ \
+          && $0 !~ /run:[[:space:]]*["'\'']?true["'\'']?[[:space:]]*$/ \
+          && $0 !~ /run:[[:space:]]*echo[[:space:]]+["'\'']?Covered by(["'\''[:space:]]|$)/ \
+          && $0 !~ /run:[[:space:]]*bash[[:space:]]+(.*\/)?cutover-ok([^A-Za-z0-9_-]|$)/ \
+          && $0 !~ /run:[[:space:]]*exit[[:space:]]+0[[:space:]]*$/) {
+        saw_real_action = 1
+      }
+    }
+    END {
+      finish_item()
+      exit(unsafe ? 0 : 1)
+    }
+  ' <<<"$text"
+}
+
+# checks-action (or similar) that publishes a legacy name with a conclusion that
+# is not derived from steps.*.outcome — success is then independent of the real
+# static-check step (false-green). Outcome-tied conclusions are allowed for
+# cutover but still fail end-state via rp_ci_workflow_has_split_python_static_jobs.
+rp_workflow_has_unsafe_checks_action_python_static() {
+  local text="$1"
+  awk '
+    BEGIN {
+      unsafe = 0
+      in_step = 0
+      is_checks = 0
+      has_legacy = 0
+      has_outcome_gate = 0
+      pending_conclusion = 0
+      conclusion_indent = -1
+      step_indent = -1
+    }
+    function finish_step() {
+      if (in_step && is_checks && has_legacy && !has_outcome_gate) { unsafe = 1 }
+      in_step = 0
+      is_checks = 0
+      has_legacy = 0
+      has_outcome_gate = 0
+      pending_conclusion = 0
+      conclusion_indent = -1
+      step_indent = -1
+    }
+    /^[[:space:]]*-[[:space:]]/ {
+      cur = match($0, /[^ ]/) - 1
+      if (in_step && cur <= step_indent) {
+        finish_step()
+      }
+      # Any list step may later reveal uses: checks-action (name: may come first).
+      in_step = 1
+      # Action path segment …/checks-action@… — not arbitrary substring matches.
+      is_checks = ($0 ~ /uses:[[:space:]]*[^[:space:]]*\/checks-action(@|[[:space:]]|$)/)
+      has_legacy = ($0 ~ /^[[:space:]]*-[[:space:]]*name:[[:space:]]*["'\'']?(Ruff|Pyright|Mypy|Backend Lint)["'\'']?[[:space:]]*(#.*)?$/)
+      has_outcome_gate = 0
+      pending_conclusion = 0
+      conclusion_indent = -1
+      step_indent = cur
+      next
+    }
+    in_step {
+      cur = match($0, /[^ ]/) - 1
+      if (cur >= 0 && cur <= step_indent && $0 !~ /^[[:space:]]*$/) {
+        finish_step()
+        next
+      }
+      if ($0 ~ /^[[:space:]]*uses:[[:space:]]*[^[:space:]]*\/checks-action(@|[[:space:]]|$)/) {
+        is_checks = 1
+      }
+      if ($0 ~ /^[[:space:]]*name:[[:space:]]*["'\'']?(Ruff|Pyright|Mypy|Backend Lint)["'\'']?[[:space:]]*(#.*)?$/) {
+        has_legacy = 1
+      }
+      if ($0 ~ /conclusion:[[:space:]]*/) {
+        conclusion_indent = cur
+        line_nocomment = $0
+        sub(/#.*/, "", line_nocomment)
+        if (line_nocomment ~ /steps\.[A-Za-z0-9_-]+\.outcome/) {
+          has_outcome_gate = 1
+          pending_conclusion = 0
+        } else if (line_nocomment ~ /conclusion:[[:space:]]*[>|][-+]?/) {
+          # Folded/literal scalar (incl. >- / |+) — only deeper continuation lines count.
+          pending_conclusion = 1
+        } else {
+          # Inline value without outcome (e.g. conclusion: success) — not gated.
+          pending_conclusion = 0
+        }
+      } else if (pending_conclusion) {
+        line_nocomment = $0
+        sub(/#.*/, "", line_nocomment)
+        # Sibling with: keys end the scalar; other lines (any indent) may carry the value.
+        if (cur <= conclusion_indent && line_nocomment ~ /^[[:space:]]*[A-Za-z0-9_.-]+:/) {
+          pending_conclusion = 0
+        } else if (line_nocomment ~ /steps\.[A-Za-z0-9_-]+\.outcome/) {
+          has_outcome_gate = 1
+          pending_conclusion = 0
+        }
+      }
+    }
+    END {
+      finish_step()
+      exit(unsafe ? 0 : 1)
+    }
+  ' <<<"$text"
+}
+
+# True when any workflow-level false-green publisher is present (unsafe job
+# aliases, matrix no-op legacy rows, or ungated checks-action conclusions).
+rp_workflow_has_unsafe_python_static_publishers() {
+  local text="$1"
+  rp_ci_workflow_has_unsafe_python_static_cutover_aliases "$text" \
+    || rp_workflow_has_unsafe_noop_legacy_python_static "$text" \
+    || rp_workflow_has_unsafe_checks_action_python_static "$text"
 }
 
 # True when ci.yml has one job that both uses the canonical display name and
@@ -1236,8 +1447,10 @@ rp_repo_uses_ruff_ci() {
 # `.github/ci/python-static` wrapper — not split across per-tool jobs. Splitting
 # burns an extra runner + uv sync and adds a branch-protection context per tool
 # (the source of the domesti-bot "missing Ruff" drift). Cutover aliases that omit
-# `needs.python-static.result == 'success'` falsely green required checks when
-# the combined job fails. See the Python static CI cursor rule and AGENTS.md.
+# `needs.python-static.result == 'success'` (or publish legacy names via a
+# separate no-op / ungated checks-action from *any* workflow) falsely green
+# required checks when the combined job fails. See the Python static CI cursor
+# rule and AGENTS.md.
 rp_check_python_static_ci_job() {
   local slug="$1"
   local repo_fail=0
@@ -1247,6 +1460,12 @@ rp_check_python_static_ci_job() {
   local ci_text
   local wrapper_text
   local wrapper_ec=0
+  local workflow_name
+  local workflow_path
+  local workflow_text
+  local fetch_ec=0
+  local workflow_count=0
+  local saw_ci_workflow=0
 
   # Gate: only Python repos (pyproject.toml at root).
   rp_gh_path_check "$slug" 'pyproject.toml' || py_ec=$?
@@ -1291,21 +1510,81 @@ rp_check_python_static_ci_job() {
     return 0
   fi
 
-  if rp_ci_workflow_has_unsafe_python_static_cutover_aliases "$ci_text"; then
-    repo_fail=1
-    rp_log_fail \
-      "${slug}: cutover alias jobs (Ruff/Pyright/Mypy/Backend Lint) omit needs.python-static.result == 'success' (false-green when combined job fails)"
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: alias if: must include needs.python-static.result == 'success' (or remove aliases after github-repo-lint --apply-fix)"
+  # Scan every workflow — false-green publishers often live outside ci.yml
+  # (release-please matrix no-ops, reusable checks-action stubs). Issue #390.
+  while IFS= read -r workflow_name; do
+    [[ -n "$workflow_name" ]] || continue
+    [[ "$workflow_name" == *.yml ]] || continue
+    workflow_count=$((workflow_count + 1))
+    if [[ "$workflow_name" == 'ci.yml' ]]; then
+      saw_ci_workflow=1
     fi
-  elif rp_ci_workflow_has_split_python_static_jobs "$ci_text"; then
-    repo_fail=1
-    rp_log_fail \
-      "${slug}: ci.yml still has split/cutover Python static jobs (Ruff/Pyright/Mypy/Backend Lint); remove after protection retarget"
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: remove alias jobs; keep only '${rp_PYTHON_STATIC_JOB_NAME}' via ${rp_PYTHON_STATIC_SCRIPT_PATH}"
+    workflow_path=".github/workflows/${workflow_name}"
+    if [[ "$workflow_name" == 'ci.yml' ]]; then
+      # Reuse the earlier successful fetch — a transient re-fetch miss must not
+      # skip auditing ci.yml while saw_ci_workflow is already set.
+      workflow_text="$ci_text"
+    else
+      fetch_ec=0
+      workflow_text="$(rp_fetch_github_text_file "$slug" "$workflow_path")" || fetch_ec=$?
+      if (( fetch_ec == 2 )); then
+        rp_log_gh_api_fail "$slug" "could not read ${workflow_path} for Python static CI check"
+        return 1
+      fi
+      # Listed workflows must be readable — empty/decode failure must not skip
+      # non-ci.yml false-green publishers (unlike a truly missing path).
+      if (( fetch_ec != 0 )) || [[ -z "$workflow_text" ]]; then
+        rp_log_gh_api_fail "$slug" \
+          "could not read ${workflow_path} for Python static CI check (listed but empty/unreadable)"
+        return 1
+      fi
+    fi
+
+    if rp_workflow_has_unsafe_python_static_publishers "$workflow_text"; then
+      repo_fail=1
+      rp_log_fail \
+        "${slug}: ${workflow_path}: legacy Python static check publishers (Ruff/Pyright/Mypy/Backend Lint) are not gated on the combined job/step succeeding (false-green risk)"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: ${workflow_path}: gate aliases with needs.python-static.result == 'success', share conclusion via aliases:/steps.*.outcome, or remove no-op publishers"
+      fi
+    elif rp_ci_workflow_has_split_python_static_jobs "$workflow_text"; then
+      repo_fail=1
+      rp_log_fail \
+        "${slug}: ${workflow_path}: still publishes split/cutover Python static contexts (Ruff/Pyright/Mypy/Backend Lint); remove after protection retarget"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: ${workflow_path}: remove alias jobs/matrix rows/aliases: fields; keep only '${rp_PYTHON_STATIC_JOB_NAME}' via ${rp_PYTHON_STATIC_SCRIPT_PATH}"
+      fi
+    fi
+  done < <(rp_fetch_workflow_file_names "$slug")
+
+  # Empty listing while ci.yml exists means the directory list call failed open —
+  # do not pass the audit (that would skip release-please.yml and friends).
+  if (( workflow_count == 0 )); then
+    rp_log_gh_api_fail "$slug" \
+      'could not list .github/workflows for Python static CI check (refusing to skip non-ci.yml publishers)'
+    return 1
+  fi
+
+  # Listing succeeded but omitted ci.yml — still audit the content we already fetched.
+  if (( saw_ci_workflow == 0 )); then
+    if rp_workflow_has_unsafe_python_static_publishers "$ci_text"; then
+      repo_fail=1
+      rp_log_fail \
+        "${slug}: .github/workflows/ci.yml: legacy Python static check publishers (Ruff/Pyright/Mypy/Backend Lint) are not gated on the combined job/step succeeding (false-green risk)"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: .github/workflows/ci.yml: alias if: must include needs.python-static.result == 'success' (or remove aliases after github-repo-lint --apply-fix)"
+      fi
+    elif rp_ci_workflow_has_split_python_static_jobs "$ci_text"; then
+      repo_fail=1
+      rp_log_fail \
+        "${slug}: .github/workflows/ci.yml: still publishes split/cutover Python static contexts (Ruff/Pyright/Mypy/Backend Lint); remove after protection retarget"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: .github/workflows/ci.yml: remove alias jobs; keep only '${rp_PYTHON_STATIC_JOB_NAME}' via ${rp_PYTHON_STATIC_SCRIPT_PATH}"
+      fi
     fi
   fi
 
