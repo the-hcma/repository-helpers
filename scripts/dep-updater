@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# dep-updater — discover and bump outdated dependencies via a Graphite PR stack.
+# dep-updater — discover and bump outdated dependencies via a stacked PR workflow
+# (Graphite or gh-stack, selected by .github/stacking-tool).
 #
 # Creates one stacked PR per outdated package inside a dedicated git worktree,
 # waits for CI on each PR, then cleans up the worktree once the stack is merged.
@@ -40,6 +41,11 @@ source "${dep_script_dir}/lib/time-log"
 source "${dep_script_dir}/lib/runner"
 # shellcheck source=scripts/lib/github-repo-slug
 source "${dep_script_dir}/lib/github-repo-slug"
+# shellcheck disable=SC1091  # stacking-tool selects gt vs gh stack for submit/restack
+source "${dep_script_dir}/lib/stacking-tool"
+# Referenced below; assigned readonly in scripts/lib/stacking-tool.
+# shellcheck disable=SC2154
+: "${stacking_tool_MARKER_RELPATH}" "${stacking_tool_VALUE_GRAPHITE}" "${stacking_tool_VALUE_GH_STACK}"
 
 dep_updater_minimum_release_age_minutes="$release_age_dep_updater_minutes"
 readonly dep_updater_minimum_release_age_minutes
@@ -119,6 +125,9 @@ log_reset=""
 
 repo_owner=""
 repo_name=""
+dep_stacking_tool=""
+_dep_repo_label_names=""
+_dep_repo_label_names_fetched=0
 
 pnpm_ignored_build_pkgs=""
 
@@ -231,8 +240,22 @@ stack_needs_rebase() {
 
 log_stack_rebase_context() {
   local branches_csv current_branch gt_state_json needs_restack_lines
+
   branches_csv="$(state_get "branches")"
   current_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current 2>/dev/null || true)"
+
+  if dep_stacking_is_gh_stack; then
+    log "Stack may be behind origin/main."
+    log "  worktree: $worktree_path"
+    if [[ -n "$current_branch" ]]; then
+      log "  current branch: $current_branch"
+    fi
+    if [[ -n "$branches_csv" ]]; then
+      log "  tracked stack branches: $branches_csv"
+    fi
+    return 0
+  fi
+
   gt_state_json="$(run_in_worktree gt state 2>/dev/null || true)"
 
   if [[ -z "$gt_state_json" ]]; then
@@ -391,6 +414,145 @@ _on_signal() {
   fi
   # Re-raise with the conventional signal exit code so the caller's $? is right.
   kill -s "$sig" "$$"
+}
+
+# ---------------------------------------------------------------------------
+# Stacking-tool dispatch (Graphite vs gh-stack)
+# ---------------------------------------------------------------------------
+
+dep_init_stacking_tool() {
+  local marker_path raw value
+
+  marker_path="${dir}/${stacking_tool_MARKER_RELPATH}"
+  if [[ ! -f "$marker_path" ]]; then
+    log "WARNING: missing ${stacking_tool_MARKER_RELPATH}; defaulting to ${stacking_tool_VALUE_GRAPHITE} (create the marker to select gh-stack)"
+    dep_stacking_tool="$stacking_tool_VALUE_GRAPHITE"
+    return 0
+  fi
+
+  raw="$(cat "$marker_path")"
+  value="$(stacking_tool_normalize "$raw")"
+  if stacking_tool_is_valid "$value"; then
+    dep_stacking_tool="$value"
+    return 0
+  fi
+
+  die "invalid ${stacking_tool_MARKER_RELPATH} value '${value}' (expected '${stacking_tool_VALUE_GRAPHITE}' or '${stacking_tool_VALUE_GH_STACK}')"
+}
+
+dep_stacking_is_graphite() {
+  [[ "$dep_stacking_tool" == "$stacking_tool_VALUE_GRAPHITE" ]]
+}
+
+dep_stacking_is_gh_stack() {
+  [[ "$dep_stacking_tool" == "$stacking_tool_VALUE_GH_STACK" ]]
+}
+
+dep_fetch_repo_label_names() {
+  local labels_out labels_exit=0
+
+  if [[ "$_dep_repo_label_names_fetched" == '1' ]]; then
+    return 0
+  fi
+
+  labels_out="$(dep_runner_gh_stdout "dep-updater repo labels" -- api \
+    "repos/${repo_owner}/${repo_name}/labels" --paginate --jq '.[].name' 2>/dev/null)" \
+    || labels_exit=$?
+  if (( labels_exit != 0 )); then
+    die "Could not list labels for ${repo_owner}/${repo_name} (needed to decide merge-mq / merge-it enqueue)."
+  fi
+  _dep_repo_label_names="$labels_out"
+  _dep_repo_label_names_fetched=1
+}
+
+dep_repo_has_label() {
+  local -r label="$1"
+  dep_fetch_repo_label_names
+  grep -qxF "$label" <<<"$_dep_repo_label_names"
+}
+
+dep_uses_graphite_merge_queue_labels() {
+  dep_repo_has_label 'merge-it'
+}
+
+dep_stack_register_branch() {
+  local -r parent_branch="$1"
+
+  dep_stacking_is_graphite || return 0
+  if [[ "$parent_branch" == "$wt_base_branch" ]]; then
+    run_in_worktree gt track -p main
+  else
+    run_in_worktree gt track -p "$parent_branch"
+  fi
+}
+
+dep_stack_register_branch_optional() {
+  dep_stacking_is_graphite || return 0
+  run_in_worktree gt track -p main 2>/dev/null || true
+}
+
+dep_stack_submit_current() {
+  if dep_stacking_is_gh_stack; then
+    run_in_worktree gh stack submit --auto --open --remote origin
+  else
+    run_in_worktree gt submit --no-interactive --publish --no-stack
+  fi
+}
+
+dep_stack_track_force() {
+  dep_stacking_is_graphite || return 0
+  run_in_worktree gt track --force \
+    || log "Warning: could not track branch with Graphite."
+}
+
+dep_stack_ensure_tracked() {
+  dep_stacking_is_graphite || return 0
+  ensure_gt_tracked
+}
+
+dep_stack_branch_info_ok() {
+  if dep_stacking_is_gh_stack; then
+    run_in_worktree gh stack view --json >/dev/null 2>&1
+    return $?
+  fi
+  run_in_worktree gt branch info &>/dev/null 2>&1
+}
+
+dep_stack_needs_rebase() {
+  local branches_csv first_branch main_sha base_sha
+
+  if dep_stacking_is_graphite; then
+    stack_needs_rebase
+    return $?
+  fi
+
+  branches_csv="$(state_get "branches")"
+  [[ -z "$branches_csv" ]] && return 1
+
+  first_branch="$(cut -d',' -f1 <<<"$branches_csv")"
+  [[ -z "$first_branch" ]] && return 1
+
+  if ! run_command "git worktree" git -C "$worktree_path" fetch origin main >/dev/null 2>&1; then
+    log "WARNING: could not fetch origin/main while checking rebase need; treating stack as not needing rebase"
+    return 1
+  fi
+  if ! run_command "git worktree" git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${first_branch}"; then
+    return 1
+  fi
+
+  main_sha="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-parse origin/main 2>/dev/null || true)"
+  base_sha="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- merge-base origin/main "$first_branch" 2>/dev/null || true)"
+  [[ -n "$main_sha" && -n "$base_sha" && "$main_sha" != "$base_sha" ]]
+}
+
+dep_rebase_stack_on_main() {
+  if dep_stacking_is_gh_stack; then
+    stacking_tool_restack "$worktree_path" \
+      || die "Rebase failed. Resolve conflicts manually and re-run."
+    log "Rebase complete."
+    return 0
+  fi
+  rebase_stack_on_main
 }
 
 init_repo_api_context() {
@@ -556,18 +718,52 @@ gh_pr_merged_for_number() {
   printf '%s' "${raw:-}"
 }
 
-add_merge_it_label() {
+dep_enqueue_pr_for_merge_queue() {
   local -r pr_number="$1"
+  local merge_out merge_exit=0
+
+  if dep_stacking_is_gh_stack || ! dep_uses_graphite_merge_queue_labels; then
+    merge_out="$(dep_runner_gh_stdout "dep-updater gh pr merge auto" -- pr merge "$pr_number" \
+      --repo "${repo_owner}/${repo_name}" \
+      --auto --squash 2>&1)" || merge_exit=$?
+    if (( merge_exit != 0 )); then
+      die "Could not enable auto-merge on PR #${pr_number}: ${merge_out}"
+    fi
+    if [[ -n "$merge_out" ]]; then
+      log "$merge_out"
+    fi
+    return 0
+  fi
+
   dep_runner_gh "gh api merge-it label" -- api "repos/${repo_owner}/${repo_name}/issues/${pr_number}/labels" \
     --method POST \
-    -f labels[]=merge-it >/dev/null
-  # my-tracks uses Graphite's multi-partition merge queue, which requires the
-  # 'merge-mq' label (in addition to 'merge-it') to enqueue a PR.
-  if [[ "$repo_name" == 'my-tracks' ]]; then
+    -f labels[]=merge-it >/dev/null \
+    || die "Could not add merge-it label to PR #${pr_number}"
+  if dep_repo_has_label 'merge-mq'; then
     dep_runner_gh "gh api merge-mq label" -- api "repos/${repo_owner}/${repo_name}/issues/${pr_number}/labels" \
       --method POST \
-      -f labels[]=merge-mq >/dev/null 2>/dev/null || true
+      -f labels[]=merge-mq >/dev/null \
+      || die "Could not add merge-mq label to PR #${pr_number} (repo has merge-mq label)"
   fi
+}
+
+# Prints exactly one of: true, false, unknown (never guess on API failure).
+pr_has_merge_enqueue_pending() {
+  local -r pr_number="$1"
+  local raw
+
+  if dep_stacking_is_gh_stack || ! dep_uses_graphite_merge_queue_labels; then
+    raw="$(dep_runner_gh_stdout "dep-updater gh pr autoMergeRequest" -- pr view "$pr_number" \
+      --repo "${repo_owner}/${repo_name}" \
+      --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null || true)"
+    case "$raw" in
+      true|false) printf '%s' "$raw" ;;
+      *) printf 'unknown' ;;
+    esac
+    return 0
+  fi
+
+  pr_has_merge_it_label "$pr_number"
 }
 
 # Prints exactly one of: true, false, unknown (never guess on API failure).
@@ -631,7 +827,7 @@ Options:
   -h, --help        Print this help and exit
 
 Primary clone (--dir):
-  Stack work (gt sync, gt checkout, gt submit) runs only in the dep-updater worktree
+  Stack work (stacking-tool sync/submit) runs only in the dep-updater worktree
   under --tmpdir — not from the primary clone. Uncommitted primary-clone changes are
   stashed at the start of a run and restored when the run finishes (including on error).
   The primary checkout branch and refs are not modified.
@@ -838,7 +1034,24 @@ parse_args() {
 check_core_prereqs() {
   local missing=0
 
-  tooling_prereq_check_tools "[tooling]" git gt gh jq rg || missing=$?
+  tooling_prereq_check_tools "[tooling]" git gh jq rg || missing=$?
+
+  # --batch --all parent only orchestrates child --dir runs; each child resolves
+  # its own .github/stacking-tool. Do not infer Graphite from an empty $dir.
+  if [[ "$batch_all" == '1' ]]; then
+    if (( missing > 0 )); then
+      die "Install the missing tool(s) above and retry."
+    fi
+    return 0
+  fi
+
+  dep_init_stacking_tool
+  if dep_stacking_is_graphite; then
+    tooling_prereq_check_tools "[tooling]" gt || missing=$?
+  elif ! dep_runner_sh "dep-updater probe gh stack" "gh stack --help >/dev/null 2>&1"; then
+    log "ERROR: gh stack extension not available (install: gh extension install github/gh-stack)"
+    missing=1
+  fi
 
   if (( missing > 0 )); then
     die "Install the missing tool(s) above and retry."
@@ -3046,7 +3259,7 @@ primary_repo_warn_if_not_main() {
 
   log "[worktree] Warning: primary clone is checked out on '${branch}', not main."
   log "[worktree] dep-updater runs stacks in a separate worktree under --tmpdir."
-  log "[worktree] Do not run 'gt sync', 'gt checkout', or 'gt submit' from the primary clone."
+  log "[worktree] Do not run stacking sync/submit from the primary clone."
   log "[worktree] The primary checkout branch is not changed by dep-updater."
 }
 
@@ -3519,16 +3732,11 @@ prepare_worktree() {
         run_command "git worktree" git -C "$worktree_path" checkout -b "$wt_base_branch"
         state_set "wt_branch" "$wt_base_branch"
         log "Attached detached HEAD to new branch: $wt_base_branch"
-        # Register the new branch with Graphite so gt create can stack on top of it.
-        # Use --force so Graphite auto-detects the trunk parent without us hardcoding 'main'.
-        run_in_worktree gt track --force \
-          || log "Warning: could not track '${wt_base_branch}' with Graphite."
+        dep_stack_track_force
       fi
 
-      # Sanity check: verify Graphite can operate on the current branch.
-      # If not (e.g. gt track failed or state is corrupted), offer to delete
-      # this worktree and start fresh.
-      if ! run_in_worktree gt branch info &>/dev/null 2>&1; then
+      # Sanity check: verify the stacking backend can operate on the current branch.
+      if ! dep_stack_branch_info_ok; then
         offer_worktree_reset
         # offer_worktree_reset either dies or recreates the worktree via
         # create_worktree, which marks worktree_path readonly.
@@ -3541,12 +3749,12 @@ prepare_worktree() {
       run_command "git worktree" git -C "$worktree_path" fetch origin main >/dev/null 2>&1 \
         || log "Note: could not fetch latest main; stack may be behind."
       
-      # Check if stack needs rebase using Graphite's status
-      if stack_needs_rebase; then
+      # Check if stack needs rebase.
+      if dep_stack_needs_rebase; then
         log_stack_rebase_context
         if prompt_yes_no "Rebase stack on main now?" "y"; then
           log "Rebasing stack..."
-          rebase_stack_on_main
+          dep_rebase_stack_on_main
         else
           log "Skipped rebase. Stack will use current base."
         fi
@@ -3910,8 +4118,8 @@ npm_update_group() {
     if [[ -z "$existing_pr" ]]; then
       log "Branch ${branch} has no PR — submitting now."
       run_command "git worktree" git -C "$worktree_path" checkout "$branch"
-      run_in_worktree gt track -p main 2>/dev/null || true
-      run_in_worktree gt submit --no-interactive --publish --no-stack
+  dep_stack_register_branch_optional
+      dep_stack_submit_current
       existing_pr="$(gh_pr_number_for_branch "$branch")"
       if [[ -n "$existing_pr" ]]; then
         state_append_pr "$existing_pr"
@@ -4135,13 +4343,9 @@ npm_update_group() {
   run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
   # Tell Graphite about the branch parentage.
-  if [[ "$parent_branch" == "$wt_base_branch" ]]; then
-    run_in_worktree gt track -p main
-  else
-    run_in_worktree gt track -p "$parent_branch"
-  fi
+  dep_stack_register_branch "$parent_branch"
   log "[gate] Submitting PR for '${branch}'…"
-  run_in_worktree gt submit --no-interactive --publish --no-stack
+  dep_stack_submit_current
 
   # Stay on $branch — the next dep-updater branch will stack on top of it.
 
@@ -4160,11 +4364,6 @@ npm_update_group() {
     --body-file "$npm_body_file" \
     --add-label "dep-updater" || true
   rm -f "$npm_body_file"
-  # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
-  if [[ "$repo_name" == 'my-tracks' ]]; then
-    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
-  fi
-
   state_append "branches" "$branch"
   state_append_pr "$pr_num"
   add_summary_line "npm" "$group_key" "$first_old" "$first_new" "$branch" "$pr_num" "no" "-"
@@ -4409,8 +4608,8 @@ npm_security_update() {
     if [[ -z "$existing_pr" ]]; then
       log "Branch ${branch} has no PR — submitting now."
       run_command "git worktree" git -C "$worktree_path" checkout "$branch"
-      run_in_worktree gt track -p main 2>/dev/null || true
-      run_in_worktree gt submit --no-interactive --publish --no-stack
+  dep_stack_register_branch_optional
+      dep_stack_submit_current
       existing_pr="$(gh_pr_number_for_branch "$branch")"
       if [[ -n "$existing_pr" ]]; then state_append_pr "$existing_pr"; fi
     fi
@@ -4472,13 +4671,9 @@ npm_security_update() {
   run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
 
-  if [[ "$parent_branch" == "$wt_base_branch" ]]; then
-    run_in_worktree gt track -p main
-  else
-    run_in_worktree gt track -p "$parent_branch"
-  fi
+  dep_stack_register_branch "$parent_branch"
   log "[gate] Submitting security PR for '${branch}'…"
-  run_in_worktree gt submit --no-interactive --publish --no-stack
+  dep_stack_submit_current
 
   local submitted_head
   submitted_head="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-parse "$branch")"
@@ -4495,11 +4690,6 @@ npm_security_update() {
     --add-label "dep-updater" \
     --add-label "security" || true
   rm -f "$body_file"
-  # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
-  if [[ "$repo_name" == 'my-tracks' ]]; then
-    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
-  fi
-
   state_append "branches" "$branch"
   state_append_pr "$pr_num"
   add_summary_line "npm" "npm-security" "-" "-" "$branch" "$pr_num" "yes" "multiple"
@@ -4535,8 +4725,8 @@ py_security_update() {
     if [[ -z "$existing_pr" ]]; then
       log "Branch ${branch} has no PR — submitting now."
       run_command "git worktree" git -C "$worktree_path" checkout "$branch"
-      run_in_worktree gt track -p main 2>/dev/null || true
-      run_in_worktree gt submit --no-interactive --publish --no-stack
+  dep_stack_register_branch_optional
+      dep_stack_submit_current
       existing_pr="$(gh_pr_number_for_branch "$branch")"
       if [[ -n "$existing_pr" ]]; then state_append_pr "$existing_pr"; fi
     fi
@@ -4593,13 +4783,9 @@ py_security_update() {
   run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
 
-  if [[ "$parent_branch" == "$wt_base_branch" ]]; then
-    run_in_worktree gt track -p main
-  else
-    run_in_worktree gt track -p "$parent_branch"
-  fi
+  dep_stack_register_branch "$parent_branch"
   log "[gate] Submitting Python security PR for '${branch}'…"
-  run_in_worktree gt submit --no-interactive --publish --no-stack
+  dep_stack_submit_current
 
   local submitted_head
   submitted_head="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-parse "$branch")"
@@ -4616,11 +4802,6 @@ py_security_update() {
     --add-label "dep-updater" \
     --add-label "security" || true
   rm -f "$body_file"
-  # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
-  if [[ "$repo_name" == 'my-tracks' ]]; then
-    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
-  fi
-
   state_append "branches" "$branch"
   state_append_pr "$pr_num"
   add_summary_line "python" "py-security" "-" "-" "$branch" "$pr_num" "yes" "multiple"
@@ -5143,8 +5324,8 @@ py_update_one() {
     if [[ -z "$existing_pr" ]]; then
       log "Branch ${branch} has no PR — submitting now."
       run_command "git worktree" git -C "$worktree_path" checkout "$branch"
-      run_in_worktree gt track -p main 2>/dev/null || true
-      run_in_worktree gt submit --no-interactive --publish --no-stack
+  dep_stack_register_branch_optional
+      dep_stack_submit_current
       existing_pr="$(gh_pr_number_for_branch "$branch")"
       if [[ -n "$existing_pr" ]]; then
         state_append_pr "$existing_pr"
@@ -5233,13 +5414,9 @@ py_update_one() {
   run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
   # Tell Graphite about the branch parentage.
-  if [[ "$parent_branch" == "$wt_base_branch" ]]; then
-    run_in_worktree gt track -p main
-  else
-    run_in_worktree gt track -p "$parent_branch"
-  fi
+  dep_stack_register_branch "$parent_branch"
   log "[gate] Submitting PR for '${branch}'…"
-  run_in_worktree gt submit --no-interactive --publish --no-stack
+  dep_stack_submit_current
 
   # Stay on $branch — the next dep-updater branch will stack on top of it.
 
@@ -5261,11 +5438,6 @@ py_update_one() {
     --body-file "$py_body_file" \
     --add-label "dep-updater" || true
   rm -f "$py_body_file"
-  # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
-  if [[ "$repo_name" == 'my-tracks' ]]; then
-    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
-  fi
-
   state_append "branches" "$branch"
   state_append_pr "$pr_num"
   add_summary_line "python/${tool}" "$pkg" "$old_ver" "$new_ver" "$branch" "$pr_num" "no" "-"
@@ -5375,8 +5547,8 @@ rust_update_one() {
     if [[ -z "$existing_pr" ]]; then
       log "Branch ${branch} has no PR — submitting now."
       run_command "git worktree" git -C "$worktree_path" checkout "$branch"
-      run_in_worktree gt track -p main 2>/dev/null || true
-      run_in_worktree gt submit --no-interactive --publish --no-stack
+  dep_stack_register_branch_optional
+      dep_stack_submit_current
       existing_pr="$(gh_pr_number_for_branch "$branch")"
       if [[ -n "$existing_pr" ]]; then
         state_append_pr "$existing_pr"
@@ -5417,13 +5589,9 @@ rust_update_one() {
 
   run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
-  if [[ "$parent_branch" == "$wt_base_branch" ]]; then
-    run_in_worktree gt track -p main
-  else
-    run_in_worktree gt track -p "$parent_branch"
-  fi
+  dep_stack_register_branch "$parent_branch"
   log "[gate] Submitting PR for '${branch}'…"
-  run_in_worktree gt submit --no-interactive --publish --no-stack
+  dep_stack_submit_current
 
   local pr_num
   pr_num="$(wait_for_pr_number_for_new_branch "$branch" || true)"
@@ -5438,10 +5606,6 @@ rust_update_one() {
     --body-file "$rust_body_file" \
     --add-label "dep-updater" || true
   rm -f "$rust_body_file"
-  if [[ "$repo_name" == 'my-tracks' ]]; then
-    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
-  fi
-
   state_append "branches" "$branch"
   state_append_pr "$pr_num"
   add_summary_line "rust/cargo" "$pkg" "$old_ver" "$new_ver" "$branch" "$pr_num" "no" "-"
@@ -5596,8 +5760,8 @@ gha_update_one() {
     if [[ -z "$existing_pr" ]]; then
       log "Branch ${branch} has no PR — submitting now."
       run_command "git worktree" git -C "$worktree_path" checkout "$branch"
-      run_in_worktree gt track -p main 2>/dev/null || true
-      run_in_worktree gt submit --no-interactive --publish --no-stack
+  dep_stack_register_branch_optional
+      dep_stack_submit_current
       existing_pr="$(gh_pr_number_for_branch "$branch")"
       if [[ -n "$existing_pr" ]]; then
         state_append_pr "$existing_pr"
@@ -5631,13 +5795,9 @@ gha_update_one() {
 
   run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
-  if [[ "$parent_branch" == "$wt_base_branch" ]]; then
-    run_in_worktree gt track -p main
-  else
-    run_in_worktree gt track -p "$parent_branch"
-  fi
+  dep_stack_register_branch "$parent_branch"
   log "[gate] Submitting PR for '${branch}'…"
-  run_in_worktree gt submit --no-interactive --publish --no-stack
+  dep_stack_submit_current
 
   local pr_num
   pr_num="$(wait_for_pr_number_for_new_branch "$branch" || true)"
@@ -5653,10 +5813,6 @@ gha_update_one() {
     --body-file "$gha_body_file" \
     --add-label "dep-updater" || true
   rm -f "$gha_body_file"
-  if [[ "$repo_name" == 'my-tracks' ]]; then
-    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
-  fi
-
   state_append "branches" "$branch"
   state_append_pr "$pr_num"
   add_summary_line "github-actions" "$action" "$current_ref" "$new_ref" "$branch" "$pr_num" "no" "-"
@@ -6097,9 +6253,9 @@ batch_update_all() {
 
   run_command "git worktree" git -C "$worktree_path" checkout -b "$branch"
   _worktree_commit "$commit_msg"
-  run_in_worktree gt track -p main
+  dep_stack_register_branch_optional
   log "[gate] Submitting batch PR for '${branch}'…"
-  run_in_worktree gt submit --no-interactive --publish --no-stack
+  dep_stack_submit_current
 
   local pr_num
   pr_num="$(wait_for_pr_number_for_new_branch "$branch" || true)"
@@ -6248,11 +6404,6 @@ batch_update_all() {
       --add-label "dep-updater" || true
   fi
   rm -f "$body_file"
-  # my-tracks uses Graphite's multi-partition merge queue: merge-mq enqueues the PR.
-  if [[ "$repo_name" == 'my-tracks' ]]; then
-    dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" --repo "${repo_owner}/${repo_name}" --add-label "merge-mq" 2>/dev/null || true
-  fi
-
   state_append "branches" "$branch"
   state_append_pr "$pr_num"
   while IFS=' ' read -r pkg old_ver new_ver; do
@@ -6843,19 +6994,21 @@ maybe_label_top_pr_for_merge() {
   esac
 
   local has_label
-  has_label="$(pr_has_merge_it_label "$top_pr")"
+  has_label="$(pr_has_merge_enqueue_pending "$top_pr")"
   if [[ "$has_label" == 'true' ]]; then
     return 0
   fi
   if [[ "$has_label" == 'unknown' ]]; then
-    log "Could not verify merge-it label on top PR #${top_pr}; skipping apply this cycle."
+    log "Could not verify merge enqueue state on top PR #${top_pr}; skipping apply this cycle."
     return 0
   fi
 
   # has_label is definitively false — safe to apply.
-  add_merge_it_label "$top_pr"
+  dep_enqueue_pr_for_merge_queue "$top_pr"
   if [[ "$_merge_it_poll_pr" == "$top_pr" && "$_merge_it_poll_had_label" == 'true' ]]; then
-    log "Re-applying merge-it label to top PR #${top_pr} (label was present last poll, now absent)."
+    log "Re-applying merge enqueue on top PR #${top_pr} (was present last poll, now absent)."
+  elif dep_stacking_is_gh_stack || ! dep_uses_graphite_merge_queue_labels; then
+    log "Enabled auto-merge on top PR #${top_pr}."
   else
     log "Added merge-it label to top PR #${top_pr}."
   fi
@@ -7016,7 +7169,9 @@ print_stack_urls() {
 
   log ""
   log "Stack URLs:"
-  log "  Graphite: https://app.graphite.com/github/pr/${repo_owner}/${repo_name}/${first_pr}"
+  if dep_stacking_is_graphite; then
+    log "  Graphite: https://app.graphite.com/github/pr/${repo_owner}/${repo_name}/${first_pr}"
+  fi
   local remaining="$prs_csv"
   local pr
   while [[ -n "$remaining" ]]; do
@@ -7244,7 +7399,7 @@ poll_until_merged() {
   local branches_csv top_branch top_pr top_has_label top_ci_status top_head wait_context
   while true; do
     # If we're waiting for merges, CI may finish after initial submission; ensure
-    # the top PR gets merge-it (and my-tracks merge-mq) as soon as it becomes
+    # the top PR is enqueued for merge as soon as it becomes merge-ready,
     # merge-ready, even if it was pending on the first check.
     maybe_label_top_pr_for_merge
 
@@ -7316,7 +7471,7 @@ poll_until_merged() {
     if [[ -n "$top_branch" ]]; then
       top_pr="$(gh_pr_number_for_branch "$top_branch" 2>/dev/null || true)"
       if [[ -n "$top_pr" ]] && is_valid_pr_number "$top_pr"; then
-        top_has_label="$(pr_has_merge_it_label "$top_pr")"
+        top_has_label="$(pr_has_merge_enqueue_pending "$top_pr")"
         top_ci_status="unknown"
         if git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${top_branch}"; then
           top_head="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-parse "$top_branch" 2>/dev/null || true)"
@@ -7324,7 +7479,7 @@ poll_until_merged() {
             top_ci_status="$(ci_conclusion_for_head "$top_branch" "$top_head" 2>/dev/null || echo 'unknown')"
           fi
         fi
-        wait_context="(top=#${top_pr} merge-it=${top_has_label} ci=${top_ci_status})"
+        wait_context="(top=#${top_pr} enqueue=${top_has_label} ci=${top_ci_status})"
         _merge_it_poll_pr="$top_pr"
         _merge_it_poll_had_label="$top_has_label"
       fi
@@ -7482,7 +7637,7 @@ rebase_stack_on_main() {
     || run_in_worktree gt restack \
     || die "Rebase failed. Resolve conflicts manually and re-run."
 
-  run_in_worktree gt submit --no-interactive --publish --no-stack \
+  dep_stack_submit_current \
     || log "Note: gt submit after restack returned non-zero (may be a no-op)."
 
   log "Rebase complete."
@@ -8048,7 +8203,7 @@ main() {
     readonly worktree_path
     wt_base_branch="$(state_get "wt_branch")"
     log "Rebasing stack in worktree: ${worktree_path}"
-    rebase_stack_on_main
+    dep_rebase_stack_on_main
     exit 0
   fi
 
@@ -8357,7 +8512,7 @@ existing_branches="$(state_get "branches")"
 existing_prs="$(state_get "prs")"
 
 prepare_worktree
-ensure_gt_tracked
+dep_stack_ensure_tracked
 
 # Worktree is live — any unexpected exit from here should trigger cleanup.
 dep_updater_ensure_eco_fail_file
