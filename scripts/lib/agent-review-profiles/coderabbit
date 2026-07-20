@@ -415,17 +415,36 @@ agent_review_coderabbit_full_review_already_sent() {
   local -r repo="$1"
   local -r pr="$2"
   local -r head="$3"
-  local marker comments_json
+  local marker comments_json exit_code
 
   marker="$(agent_review_coderabbit_full_review_marker "${head}")"
   if ! comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"; then
     return 2
   fi
+  if [[ -z "${comments_json}" || "${comments_json}" == 'null' ]]; then
+    return 2
+  fi
+  # Paginated gh --paginate pages (slurp) then flat single-page fallback — same
+  # pattern as Copilot marker scans. A failed fetch that yields [] looks like
+  # "absent"; callers treat exit 2 as inconclusive and must not re-post.
+  exit_code=0
   # shellcheck disable=SC2016  # jq filter uses $marker
-  ar_runner_jq_file "coderabbit full-review marker" "${comments_json}" -res \
+  ar_runner_jq_file "coderabbit full-review marker" "${comments_json}" \
+    --raw-output --exit-status --slurp \
     --arg marker "${marker}" \
     '[ .[] | .[] | .body // "" | select(contains($marker)) ] | length > 0' \
-    >/dev/null 2>&1
+    >/dev/null 2>&1 || exit_code=$?
+  if (( exit_code == 0 )); then
+    return 0
+  fi
+  exit_code=0
+  # shellcheck disable=SC2016  # jq filter uses $marker
+  ar_runner_jq_file "coderabbit full-review marker flat" "${comments_json}" \
+    --raw-output --exit-status \
+    --arg marker "${marker}" \
+    '[ .[] | .body // "" | select(contains($marker)) ] | length > 0' \
+    >/dev/null 2>&1 || exit_code=$?
+  (( exit_code == 0 ))
 }
 
 # agent_review_profile_request <repo> <pr>
@@ -441,14 +460,24 @@ agent_review_profile_request() {
 
 # agent_review_profile_request_last_resort_full_review <repo> <pr> <head>
 # Posts "@coderabbitai full review" once per head after cooldown + grace (loop-gated).
+# Hard-refuses while CodeRabbit's retry_after window is still in the future — when CR
+# says wait, we must wait (no re-ask storms).
 agent_review_profile_request_last_resort_full_review() {
   local -r repo="$1"
   local -r pr="$2"
   local -r head="$3"
-  local body sent_rc=0
+  local body sent_rc=0 retry_after
 
   if [[ -z "${head}" ]]; then
     return 1
+  fi
+  # Quota helpers are always loaded with agent-review; call directly so a missing
+  # function fails loudly instead of silently posting while rate-limited.
+  if agent_review_agent_quota_rate_limited_for_agent 'coderabbit'; then
+    retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent 'coderabbit' || true)"
+    printf 'wait-for-agent-review: refusing CodeRabbit full review on PR #%s — rate-limited until %s (wait, do not re-ask)\n' \
+      "${pr}" "${retry_after:-unknown}" >&2
+    return 0
   fi
   agent_review_coderabbit_full_review_already_sent "${repo}" "${pr}" "${head}" || sent_rc=$?
   if (( sent_rc == 0 )); then

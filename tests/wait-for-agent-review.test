@@ -452,8 +452,18 @@ if grep -qF "agent_review_profile_trigger='on_push'" "${script_dir}/../scripts/l
   && ! grep -qE '@coderabbitai[[:space:]]+review([^a-z]|$)' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
   && grep -qF 'agent_review_profile_request_last_resort_full_review' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
   && grep -qF 'runner_exec "coderabbit profile last-resort full review"' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
+  && grep -qF 'refusing CodeRabbit full review' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
+  && grep -qF 'rate-limited until' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
   && grep -qF 'return 2' "${script_dir}/../scripts/lib/agent-review-profiles/coderabbit" \
   && grep -qF 'failed to request CodeRabbit full review; retrying' "${wait_script}" \
+  && grep -qF 'became rate-limited before full review' "${wait_script}" \
+  && grep -qF 'holding asks until response or grace' "${wait_script}" \
+  && awk '
+    /posting last-resort full review/ { post=1 }
+    post && /agent_review_coderabbit_quota_mark_exhausted/ { mark=1 }
+    post && /agent_review_agent_quota_clear_observed_for_agent .coderabbit./ { clear_after=1 }
+    END { exit((mark && !clear_after) ? 0 : 1) }
+  ' "${wait_script}" \
   && grep -qF 'run_command "coderabbit post-cooldown grace sleep"' "${wait_script}" \
   && grep -qF 'deferring last-resort full review' "${wait_script}" \
   && awk '
@@ -2413,6 +2423,59 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -f "${tmp_rate_limit_wait}"
+
+# Hermetic: last-resort full review must refuse while rate-limited (do not re-ask).
+tmp_refuse_while_waiting="$(mktemp)"
+tmp_refuse_gh_log="$(mktemp)"
+if out="$(bash -c "
+  set -euo pipefail
+  source '${lib}'
+  source '${quota_lib}'
+  source '${coderabbit_profile}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_refuse_while_waiting}'
+  agent_review_coderabbit_quota_write_cache 1 observed \
+    'rate limited' '' '' '' '2099-06-01T12:00:00Z'
+  runner_exec() {
+    printf '%s\n' \"\$*\" >>'${tmp_refuse_gh_log}'
+    # Quota helpers call runner_exec for date(1); only block gh pr comment.
+    if [[ \"\$*\" == *'gh pr comment'* ]]; then
+      return 0
+    fi
+    shift || true
+    command \"\$@\"
+  }
+  agent_review_coderabbit_full_review_already_sent() { return 1; }
+  set +e
+  agent_review_profile_request_last_resort_full_review 'o/r' '1' 'abc1234deadbeef' 2>&1
+  rc=\$?
+  set -e
+  (( rc == 0 ))
+  ! grep -qF 'gh pr comment' '${tmp_refuse_gh_log}'
+")" && grep -qF 'refusing CodeRabbit full review' <<<"${out}" \
+  && grep -qF 'rate-limited until 2099-06-01T12:00:00Z' <<<"${out}"; then
+  printf '[PASS] hermetic: CodeRabbit full review refused while rate-limited (no re-ask)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] hermetic: CodeRabbit full review was not refused while rate-limited\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_refuse_while_waiting}" "${tmp_refuse_gh_log}"
+
+# Hermetic: flat comment page still detects full-review marker (one-shot-per-head).
+if bash -c "
+  set -euo pipefail
+  source '${lib}'
+  source '${coderabbit_profile}'
+  flat='[{\"body\":\"@coderabbitai full review\\n\\n<!-- wait-for-agent-review:coderabbit-full:deadbeef -->\"}]'
+  agent_review_pr_issue_comments_json() { printf '%s' \"\${flat}\"; }
+  agent_review_coderabbit_full_review_already_sent 'o/r' '1' 'deadbeef'
+"; then
+  printf '[PASS] hermetic: CodeRabbit full-review marker detected on flat comments JSON\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] hermetic: CodeRabbit full-review marker missed on flat comments JSON\n'
+  fail=$(( fail + 1 ))
+fi
 
 # Hermetic: read_cache must isolate evidence_url so mark_exhausted's local -r does not abort.
 tmp_readonly_collide="$(mktemp)"

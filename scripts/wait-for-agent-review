@@ -1279,7 +1279,7 @@ cmd_loop_handle_coderabbit_rate_limit() {
   local snapshot="${4:-}"
   local saved_agent retry_after remaining sleep_s retry_epoch now_epoch grace_s grace_remaining
   local profiles_dir coderabbit_profile _owner _name sent_rc
-  local poll_s pending_exit
+  local poll_s pending_exit provisional_retry
 
   if [[ -n "${snapshot}" ]] \
     && agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
@@ -1485,12 +1485,45 @@ cmd_loop_handle_coderabbit_rate_limit() {
 
   printf 'wait-for-agent-review: CodeRabbit still missing after cooldown+%ss — posting last-resort full review on PR #%s head %s\n' \
     "${grace_s}" "${pr}" "${head:0:7}" >&2
+  # Re-check rate-limit immediately before posting — a mid-grace CR "wait N minutes"
+  # reply must block the ask (when told to wait, wait; do not re-ask).
+  if agent_review_agent_quota_rate_limited_for_agent 'coderabbit'; then
+    printf 'wait-for-agent-review: CodeRabbit became rate-limited before full review on PR #%s — waiting instead of asking\n' \
+      "${pr}" >&2
+    agent_review_use_agent "${saved_agent}"
+    return 0
+  fi
   if ! agent_review_profile_request_last_resort_full_review "${repo}" "${pr}" "${head}"; then
     printf 'wait-for-agent-review: failed to request CodeRabbit full review; retrying\n' >&2
     agent_review_use_agent "${saved_agent}"
     return 0
   fi
-  agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
+  # Keep the wait gate closed until CR replies (observe extends retry_after) or grace
+  # elapses. Clearing observed here used to allow another full-review ask while CR's
+  # "More reviews will be available in N minutes" reply was still in flight.
+  if ! [[ "${grace_s}" =~ ^[0-9]+$ ]] || (( grace_s < 1 )); then
+    grace_s="${agent_review_default_coderabbit_post_cooldown_grace_s:-60}"
+  fi
+  if ! [[ "${grace_s}" =~ ^[0-9]+$ ]] || (( grace_s < 1 )); then
+    grace_s=60
+  fi
+  provisional_retry=''
+  provisional_retry="$(runner_exec_stdout "coderabbit post-full-review provisional retry_after" -- \
+    date --utc --date="now + ${grace_s} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+  if [[ -z "${provisional_retry}" ]]; then
+    printf 'wait-for-agent-review: warning: could not compute provisional retry_after (grace_s=%s) on PR #%s — using +60s fallback\n' \
+      "${grace_s}" "${pr}" >&2
+    provisional_retry="$(runner_exec_stdout "coderabbit post-full-review provisional retry_after fallback" -- \
+      date --utc --date='now + 60 seconds' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+  fi
+  if [[ -n "${provisional_retry}" ]]; then
+    agent_review_coderabbit_quota_mark_exhausted \
+      "CodeRabbit full review requested on ${repo}#${pr}; holding asks until response or grace." \
+      "" "${provisional_retry}" || true
+  else
+    printf 'wait-for-agent-review: error: provisional retry_after unavailable after full review on PR #%s — refusing to clear wait gate\n' \
+      "${pr}" >&2
+  fi
   agent_review_use_agent "${saved_agent}"
   # Return 1 so observe-rewritten past retry_after does not spin forever after the nudge.
   return 1
