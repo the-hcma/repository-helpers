@@ -90,6 +90,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 
 ## dep-updater Behavioral Invariants
 
+- **Stacking backend follows `.github/stacking-tool`.** Consumer repos declare `graphite` or `gh-stack` in `.github/stacking-tool`. dep-updater uses `gt track` / `gt submit` for Graphite and `gh stack submit` for gh-stack. Merge enqueue uses Graphite MQ labels (`merge-it`, plus `merge-mq` when that label exists on the repo) or `gh pr merge --auto --squash` for gh-stack / GitHub merge queue repos.
 - **Never introduce `==` pins (Python).** dep-updater always writes `>=` floor constraints when bumping a Python dependency. It must never lock a package to an exact version.
 - **Respect existing pins for pip / pipenv / poetry.** For these ecosystems, `==` signals a deliberate user decision to lock a specific version. dep-updater skips those packages entirely (`py_is_pinned`).
 - **uv `==` pins are not treated as intentional freezes.** dep-updater updates them and promotes the constraint to `>=` on bump. The transitive constraint check (`uv pip install --dry-run`) still gates upgrades that would violate real transitive constraints.
