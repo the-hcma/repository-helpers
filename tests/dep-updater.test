@@ -3050,12 +3050,38 @@ fi
 
 printf '\n=== static: dep-updater sources tooling-path for PATH bootstrap ===\n'
 # shellcheck disable=SC2016  # single-quoted pattern is intentional: grep for literal ${dep_script_dir} in script source
+main_body="$(awk '/^main\(\) \{/{found=1; next} found && /^\}$/{exit} found' "$script")"
+# shellcheck disable=SC2016  # grep for literal ${dep_script_dir} in dep-updater source
 if grep -qF 'source "${dep_script_dir}/lib/tooling-path"' "$script" \
-  && grep -qF 'tooling_path_bootstrap_node_ecosystem' "$script"; then
-  printf '[PASS] tooling-path: dep-updater sources lib/tooling-path and bootstraps PATH\n'
+  && grep -qF 'dep_updater_bootstrap_path()' "$script" \
+  && grep -qF 'tooling_path_bootstrap_node_ecosystem' "$script" \
+  && printf '%s\n' "$main_body" | grep -qF 'dep_updater_bootstrap_path'; then
+  printf '[PASS] tooling-path: dep-updater sources lib/tooling-path and bootstraps PATH from main\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] tooling-path: dep-updater must source lib/tooling-path and call bootstrap_node_ecosystem\n'
+  printf '[FAIL] tooling-path: dep-updater must source lib/tooling-path and bootstrap from main\n'
+  fail=$(( fail + 1 ))
+fi
+
+if ! grep -qE '^tooling_path_bootstrap_node_ecosystem$' "$script"; then
+  printf '[PASS] tooling-path: bootstrap is not invoked at top level (set -e silent exit)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] tooling-path: must not call bootstrap at top level before runner init\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: early runner init before PATH bootstrap (issue #411) ===\n'
+if grep -qF 'dep_updater_early_init()' "$script" \
+  && printf '%s\n' "$main_body" | grep -qF 'dep_updater_early_init' \
+  && [[ "$(printf '%s\n' "$main_body" | grep -n 'dep_updater_early_init' | head -1 | cut -d: -f1)" \
+       -lt "$(printf '%s\n' "$main_body" | grep -n 'dep_updater_bootstrap_path' | head -1 | cut -d: -f1)" ]] \
+  && [[ "$(printf '%s\n' "$main_body" | grep -n 'dep_updater_bootstrap_path' | head -1 | cut -d: -f1)" \
+       -lt "$(printf '%s\n' "$main_body" | grep -n 'parse_args' | head -1 | cut -d: -f1)" ]]; then
+  printf '[PASS] early-init: main initializes runner session before bootstrap and parse_args\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] early-init: expected dep_updater_early_init → bootstrap → parse_args in main\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -3345,11 +3371,78 @@ if awk '/^dep_runner_jq_with_args\(\) \{/,/^\}$/ { print }' "$script" \
   && awk '/^dep_runner_uv_dir\(\) \{/,/^\}$/ { print }' "$script" \
     | grep -qF "if [[ \"\${1:-}\" == '--probe' ]]; then" \
   && awk '/^dep_runner_gh\(\) \{/,/^\}$/ { print }' "$script" \
+    | grep -qF "if [[ \"\${1:-}\" == '--probe' ]]; then" \
+  && awk '/^dep_runner_rg\(\) \{/,/^\}$/ { print }' "$script" \
     | grep -qF "if [[ \"\${1:-}\" == '--probe' ]]; then"; then
   printf '[PASS] probe helpers: parse leading --probe before label\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] probe helpers: expected leading --probe parse before label assignment\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: ignored-builds probe uses runner --probe (issue #411) ===\n'
+ignored_builds_body="$(awk '/^pnpm_output_has_ignored_builds\(\) \{/,/^\}$/' "$script")"
+if printf '%s\n' "$ignored_builds_body" | grep -qF -- 'dep_runner_rg --probe "pnpm ignored builds marker"'; then
+  printf '[PASS] ignored-builds: pnpm_output_has_ignored_builds uses dep_runner_rg --probe\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] ignored-builds: expected dep_runner_rg --probe for absent-marker checks\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: ignored-builds absent marker emits no runner [FAIL] (issue #411) ===\n'
+probe_tmp="$(mktemp -d)"
+probe_scan="${probe_tmp}/scan"
+probe_log="${probe_tmp}/child.log"
+probe_repo="${probe_scan}/repo"
+probe_bin="${probe_tmp}/bin"
+mkdir -p "$probe_bin" "$probe_repo"
+printf 'dep-updater failed for unrelated reason\n' >"$probe_log"
+
+git -C "$probe_repo" -c user.name=test -c user.email=test@example.com init -q
+git -C "$probe_repo" -c user.name=test -c user.email=test@example.com checkout -b main 2>/dev/null \
+  || git -C "$probe_repo" -c user.name=test -c user.email=test@example.com checkout -q -b main
+printf 'x\n' >"$probe_repo/README.md"
+git -C "$probe_repo" -c user.name=test -c user.email=test@example.com add README.md
+git -C "$probe_repo" -c user.name=test -c user.email=test@example.com commit -q -m init
+
+cat >"${probe_bin}/git" <<'MOCK_GIT_PROBE'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-C" ]]; then
+  cdir="$2"
+  shift 2
+  if [[ "${1:-}" == "worktree" && "${2:-}" == "add" ]]; then
+    printf 'fatal: mock worktree add denied\n' >&2
+    exit 128
+  fi
+  exec /usr/bin/git -C "$cdir" "$@"
+fi
+exec /usr/bin/git "$@"
+MOCK_GIT_PROBE
+chmod +x "${probe_bin}/git"
+
+probe_parent_stderr="${probe_tmp}/parent.stderr"
+probe_parent_exit=0
+PATH="${probe_bin}:${PATH}" \
+  "$script" --batch --all --dry-run --scan-root "$probe_scan" \
+  >"${probe_tmp}/parent.stdout" 2>"$probe_parent_stderr" || probe_parent_exit=$?
+
+probe_fail_line=""
+if [[ -f "$probe_parent_stderr" ]]; then
+  probe_fail_line="$(grep -F '[FAIL] pnpm ignored builds marker' "$probe_parent_stderr" || true)"
+fi
+rm -rf "$probe_tmp"
+
+if [[ "$probe_parent_exit" -ne 0 ]] && [[ -z "$probe_fail_line" ]]; then
+  printf '[PASS] ignored-builds probe: absent marker does not emit runner [FAIL] in batch-all parent\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] ignored-builds probe: expected batch-all failure without [FAIL] pnpm ignored builds marker (exit=%s)\n' \
+    "$probe_parent_exit"
+  if [[ -n "$probe_fail_line" ]]; then
+    printf '%s\n' "$probe_fail_line"
+  fi
   fail=$(( fail + 1 ))
 fi
 
@@ -3387,8 +3480,10 @@ PATH="${capture_bin}:${PATH}" DEP_UPDATER_RUN_REPORT="$capture_report" \
   "$script" --batch --dry-run --dir "$capture_repo" 2>/dev/null || capture_exit=$?
 
 capture_stderr=""
+capture_primary=""
 if [[ -f "$capture_report" ]]; then
   capture_stderr="$(jq -r '.capture_stderr // empty' "$capture_report" 2>/dev/null || true)"
+  capture_primary="$(jq -r '.primary // empty' "$capture_report" 2>/dev/null || true)"
 fi
 rm -rf "$capture_tmp"
 
@@ -3399,6 +3494,17 @@ if [[ -n "$capture_stderr" ]] \
 else
   printf '[FAIL] batch child report missing capture_stderr from runner (exit=%s stderr=%s)\n' \
     "$capture_exit" "${capture_stderr:-empty}"
+  fail=$(( fail + 1 ))
+fi
+
+if [[ -n "$capture_primary" ]] \
+  && [[ "$capture_primary" != "dep-updater exited with code 1" ]] \
+  && [[ "$capture_primary" != "dep-updater exited with code ${capture_exit}" ]]; then
+  printf '[PASS] batch child report primary is actionable on runner failure (issue #411)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] batch child report primary is generic (exit=%s primary=%s)\n' \
+    "$capture_exit" "${capture_primary:-empty}"
   fail=$(( fail + 1 ))
 fi
 

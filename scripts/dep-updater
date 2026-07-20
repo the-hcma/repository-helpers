@@ -47,7 +47,6 @@ readonly dep_updater_minimum_release_age_minutes
 source "${dep_script_dir}/lib/ci-check-rollup"
 # shellcheck disable=SC1091
 source "${dep_script_dir}/lib/tooling-path"
-tooling_path_bootstrap_node_ecosystem
 
 # ---------------------------------------------------------------------------
 # Script-level constants
@@ -297,6 +296,27 @@ die() {
   record_first_failure "$*"
   printf 'ERROR: %s\n' "$*" >&2
   exit 1
+}
+
+# dep_updater_early_init
+# Runner session + first-failure file before PATH bootstrap or parse_args so
+# batch-all children can emit DEP_UPDATER_RUN_REPORT when startup fails early.
+dep_updater_early_init() {
+  RUNNER_FIRST_FAILURE_FILE="$(mktemp)"
+  export RUNNER_FIRST_FAILURE_FILE
+  # Each dep-updater process owns its own runner session. Parent wrappers
+  # (batch-run, batch-all) export RUNNER_SESSION_DIR; sharing would aggregate
+  # expected probe failures from every repo into one email dump.
+  unset RUNNER_SESSION_DIR
+  runner_session_begin
+}
+
+# dep_updater_bootstrap_path
+# Interactive / cron PATH: local bin, GNU userland, pnpm, fnm, Node alignment.
+dep_updater_bootstrap_path() {
+  if ! tooling_path_bootstrap_node_ecosystem; then
+    die "PATH bootstrap failed: install GNU userland and Node/pnpm tooling, then retry."
+  fi
 }
 
 # Tooling / prerequisite lines must reach stderr even when TIME_LOG_ENABLED=0
@@ -853,7 +873,7 @@ pnpm_output_has_ignored_builds() {
   p_approve='approve-builds'
   ignored_builds_pat="ERR_PNPM_IGNORED_BUILDS|${p_pm_tool} ${p_approve}|${p_approve}"
   [[ -f "$output_file" ]] || return 1
-  dep_runner_rg "pnpm ignored builds marker" -- --quiet \
+  dep_runner_rg --probe "pnpm ignored builds marker" -- --quiet \
     "$ignored_builds_pat" "$output_file"
 }
 
@@ -2027,16 +2047,30 @@ dep_runner_git_stdout() {
   return "$exit_code"
 }
 
-# dep_runner_rg <label> -- <rg-args…>
+# dep_runner_rg <label> [--probe] -- <rg-args…>
+# Also accepts --probe before <label> (audit call sites).
 dep_runner_rg() {
-  local -r label="$1"
+  local probe=0 label exit_code
+
+  if [[ "${1:-}" == '--probe' ]]; then
+    probe=1
+    shift
+  fi
+  label="$1"
   shift
+  if [[ "${1:-}" == '--probe' ]]; then
+    probe=1
+    shift
+  fi
+  [[ -n "$label" ]] || return 2
   [[ "${1:-}" == '--' ]] || return 2
   shift
-  local exit_code
-
   exit_code=0
-  runner_exec "$label" -- rg "$@" || exit_code=$?
+  if (( probe )); then
+    runner_exec "$label" --probe -- rg "$@" || exit_code=$?
+  else
+    runner_exec "$label" -- rg "$@" || exit_code=$?
+  fi
   return "$exit_code"
 }
 
@@ -7966,19 +8000,10 @@ batch_all_dispatch() {
 # ---------------------------------------------------------------------------
 
 main() {
+  dep_updater_early_init
+  dep_updater_bootstrap_path
   parse_args "$@"
   init_prompt_style
-
-  # Set up exit-failure tracking so _on_exit can emit the real reason
-  # rather than "script exited unexpectedly". The file is overwritten on each
-  # record_first_failure() call so the last failure before exit wins.
-  RUNNER_FIRST_FAILURE_FILE="$(mktemp)"
-  export RUNNER_FIRST_FAILURE_FILE
-  # Each dep-updater process owns its own runner session. Parent wrappers
-  # (batch-run, batch-all) export RUNNER_SESSION_DIR; sharing would aggregate
-  # expected probe failures from every repo into one email dump.
-  unset RUNNER_SESSION_DIR
-  runner_session_begin
 
   if [[ "$batch_all" == '1' ]]; then
     check_core_prereqs
