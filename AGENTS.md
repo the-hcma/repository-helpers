@@ -142,6 +142,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
 | License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
 | Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` + `.cursor/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve |
+| Stacking-tool marker + rule | yes | — | `.github/stacking-tool` (`graphite`\|`gh-stack`) and thin `.cursor/rules/stacking-tool.mdc` (skill breadcrumbs; no copied skill bodies) |
 | UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
 | Python static CI job | yes | — | Python (`pyproject.toml` + ruff) repos run ruff check/format + typecheck in one `Python lint & format checks` job via `.github/ci/python-static`; no split `Ruff`/`Pyright`/`Mypy`/`Backend Lint` jobs in **any** `.github/workflows/*`; cutover aliases must gate on `needs.python-static.result == 'success'` (or share conclusion via `aliases:` / `steps.*.outcome`) — see `.cursor/rules/python-static-ci-job.mdc` |
 | `.cursor/rules` gitignore | yes | — | `.gitignore` must not block `.cursor/rules/` |
@@ -150,7 +151,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | pnpm Corepack CI | yes | — | Exact `packageManager: pnpm@X.Y.Z` when lockfile exists; no `pnpm/action-setup` / `setup-node` `cache: pnpm`; use org composite `actions/setup-pnpm-corepack` (pin SHA on `main`; see section below) |
 | `ci-secret-scan` gitleaks pin | yes* | — | Warn when `scripts/lib/ci-secret-scan` pins gitleaks behind the release-age-eligible version (*this repo only) |
 
-`--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via Graphite in the target repo clone.
+`--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via the stacking backend selected by `.github/stacking-tool` (`graphite` or `gh-stack`; org default `graphite` when the marker is missing) in the target repo clone.
 
 See [`.cursor/skills/graphite/SKILL.md`](.cursor/skills/graphite/SKILL.md) for Graphite stacked PRs when `.github/stacking-tool` is `graphite`, and the **`merge-it`** label. This repo trials **`gh-stack`** — see [`.cursor/skills/gh-stack/SKILL.md`](.cursor/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc).
 
