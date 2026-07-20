@@ -830,7 +830,11 @@ query {
       continue
     fi
     if agent_review_bugbot_quota_text_is_exhausted "${body}"; then
-      reason="Bugbot comment on ${repo}#${pr} at ${at} reports usage limit reached."
+      if [[ "${body,,}" == *"disabled"* || "${body,,}" == *"not enabled"* ]]; then
+        reason="Bugbot comment on ${repo}#${pr} at ${at} reports disabled for your account."
+      else
+        reason="Bugbot comment on ${repo}#${pr} at ${at} reports usage limit reached."
+      fi
       agent_review_bugbot_quota_write_cache 1 probe_recent_comments "${reason}"
       return 0
     fi
@@ -1694,4 +1698,95 @@ agent_review_all_quotas_exhausted() {
   [[ "${agent_review_copilot_quota_exhausted_today:-0}" == '1' \
     && "${agent_review_bugbot_quota_exhausted_today:-0}" == '1' \
     && "${agent_review_coderabbit_quota_exhausted_today:-0}" == '1' ]]
+}
+
+# agent_review_agent_unavailable_reason_for_agent <agent_id>
+# Compact machine token for check JSON / wait_reason (empty when agent is available).
+agent_review_agent_unavailable_reason_for_agent() {
+  local -r agent_id="$1"
+  local reason retry_after lower
+
+  if agent_review_agent_quota_rate_limited_for_agent "${agent_id}"; then
+    retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent "${agent_id}")"
+    if [[ -n "${retry_after}" ]]; then
+      printf 'rate_limited_until=%s' "${retry_after}"
+      return 0
+    fi
+    printf 'rate_limited'
+    return 0
+  fi
+  if ! agent_review_agent_quota_exhausted_for_agent "${agent_id}"; then
+    return 1
+  fi
+  reason="$(agent_review_agent_quota_cache_reason_for_agent "${agent_id}")"
+  lower="${reason,,}"
+  if [[ "${lower}" == *"disabled"* ]]; then
+    printf 'disabled_for_account'
+    return 0
+  fi
+  if [[ "${lower}" == *"copilot_work_finished_failure"* ]]; then
+    printf 'copilot_work_finished_failure'
+    return 0
+  fi
+  if [[ "${lower}" == *"usage limit"* || "${lower}" == *"spend limit"* \
+    || "${lower}" == *"billing"* || "${lower}" == *"quota"* ]]; then
+    printf 'quota_exhausted'
+    return 0
+  fi
+  if [[ -n "${reason}" ]]; then
+    printf 'unavailable'
+    return 0
+  fi
+  printf 'exhausted'
+}
+
+# agent_review_agents_availability_json
+# Per-cycle-agent availability for check JSON (repository-helpers#415).
+agent_review_agents_availability_json() {
+  local agent available reason out
+
+  out='{}'
+  while IFS= read -r agent || [[ -n "${agent}" ]]; do
+    [[ -z "${agent}" ]] && continue
+    available=true
+    reason=''
+    if reason="$(agent_review_agent_unavailable_reason_for_agent "${agent}")"; then
+      available=false
+    else
+      reason=''
+    fi
+    out="$(ar_runner_jq_file "agent-review agents availability merge" "${out}" \
+      --arg id "${agent}" \
+      --argjson available "${available}" \
+      --arg reason "${reason}" \
+      '. * {($id): {available: $available, reason: (if $reason == "" then null else $reason end)}}')"
+  done < <(agent_review_cycle_quota_agent_ids)
+  printf '%s\n' "${out}"
+}
+
+# agent_review_wait_reason_from_agent_availability
+# Prefer explicit per-agent unavailability over a CodeRabbit-only cooldown string.
+agent_review_wait_reason_from_agent_availability() {
+  local agent reason pieces cr_retry
+
+  pieces=()
+  while IFS= read -r agent || [[ -n "${agent}" ]]; do
+    [[ -z "${agent}" ]] && continue
+    if reason="$(agent_review_agent_unavailable_reason_for_agent "${agent}")"; then
+      pieces+=("${agent}=${reason}")
+    fi
+  done < <(agent_review_cycle_quota_agent_ids)
+  if (( ${#pieces[@]} > 0 )); then
+    local IFS=','
+    printf '%s' "${pieces[*]}"
+    return 0
+  fi
+  if agent_review_agent_quota_rate_limited_for_agent 'coderabbit'; then
+    cr_retry="$(agent_review_agent_quota_cache_retry_after_for_agent 'coderabbit')"
+    if [[ -n "${cr_retry}" ]]; then
+      printf 'coderabbit_rate_limited_until=%s' "${cr_retry}"
+      return 0
+    fi
+  fi
+  return 1
 }

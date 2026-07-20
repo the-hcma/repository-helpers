@@ -1493,7 +1493,7 @@ agent_review_status_json_from_snapshot() {
   local pass_delivered_by_fallback
   local head_check_state head_check_clean head_check_findings head_check_error head_check_quota head_check_conclusion
   local threads_json human_open_json human_threads_json head_check_complete_json
-  local request_visible wait_reason
+  local request_visible wait_reason agents_json
   local coderabbit_rate_limited coderabbit_retry_after
 
   agent_review_assert_reviews_complete "${snapshot}"
@@ -1558,6 +1558,7 @@ agent_review_status_json_from_snapshot() {
   else
     all_quotas_exhausted=false
   fi
+  agents_json="$(agent_review_agents_availability_json)"
   coderabbit_rate_limited=false
   coderabbit_retry_after=''
   if agent_review_agent_quota_rate_limited_for_agent 'coderabbit'; then
@@ -1604,8 +1605,8 @@ agent_review_status_json_from_snapshot() {
   agent_id="${AGENT_REVIEW_AGENT:-copilot}"
   if [[ "${pr_merged}" == 'true' ]] || [[ "${fresh}" == 'true' ]]; then
     wait_reason=""
-  elif [[ "${coderabbit_rate_limited}" == 'true' ]] && [[ -n "${coderabbit_retry_after}" ]]; then
-    wait_reason="coderabbit_rate_limited_until=${coderabbit_retry_after}"
+  elif wait_reason="$(agent_review_wait_reason_from_agent_availability)"; then
+    :
   elif ! agent_review_profile_request_is_visible; then
     wait_reason="polling_for_review_on_head (agent requests may not appear as pending reviewers on GitHub)"
   else
@@ -1632,6 +1633,7 @@ agent_review_status_json_from_snapshot() {
     --arg agent_id "${agent_id}" \
     --arg wait_reason "${wait_reason}" \
     --arg coderabbit_retry_after "${coderabbit_retry_after}" \
+    --argjson agents "${agents_json}" \
     --argjson merge_ready "${merge_ready}" \
     --argjson pr_merged "${pr_merged}" \
     --argjson requested "${requested}" \
@@ -1686,6 +1688,7 @@ agent_review_status_json_from_snapshot() {
       ci_ready: $ci_ready,
       ci_failures: $ci_failures,
       all_quotas_exhausted: $all_quotas_exhausted,
+      agents: $agents,
       complete_ready: $complete_ready,
       head_check_complete: $head_check,
       head_check_conclusion: $head_check_conclusion,
@@ -2385,6 +2388,29 @@ agent_review_pr_issue_comments_json() {
   printf '%s' "${api_json}"
 }
 
+# True when comments_json has a same-day "@copilot please review" ask (any author).
+# Used so a negative timeline_probed cache does not skip post-ask failure detection (#415).
+agent_review_copilot_pr_has_review_ask_today() {
+  local -r comments_json="${1:-}"
+  local today created_at
+
+  [[ -n "${comments_json}" && "${comments_json}" != '[]' && "${comments_json}" != 'null' ]] || return 1
+  today="$(agent_review_copilot_quota_local_day)"
+  while IFS= read -r created_at; do
+    [[ -n "${created_at}" ]] || continue
+    if agent_review_quota_timestamp_on_local_day "${created_at}" "${today}"; then
+      return 0
+    fi
+  done < <(ar_runner_jq_file "agent-review copilot ask scan" "${comments_json}" -rs '
+    [ .[]
+      | .[]
+      | select((.body // "") | test("@copilot[[:space:]]+please[[:space:]]+review"; "i"))
+      | .created_at
+    ]
+    | .[]')
+  return 1
+}
+
 # Fetch PR timeline events (REST paginate). Copilot credit exhaustion may appear only as
 # timeline event copilot_work_finished_failure (no issue comment / review body).
 # On API failure returns [].
@@ -2457,10 +2483,12 @@ agent_review_quota_observe_agent_on_pr() {
   local -r snapshot="$4"
   local -r comments_json="$5"
   local agent_id review_body run_json reason evidence_url retry_after submitted_at signal
-  local timeline_json
+  local timeline_json copilot_ask_outstanding comment_body_probe
 
   agent_id="${agent_review_profile_id:-}"
   [[ -n "${agent_id}" ]] || return 1
+  copilot_ask_outstanding=0
+  comment_body_probe=''
 
   if [[ "${agent_id}" == 'copilot' ]] \
     && declare -F agent_review_copilot_success_issue_comment_for_head >/dev/null 2>&1; then
@@ -2549,6 +2577,16 @@ agent_review_quota_observe_agent_on_pr() {
     if [[ "${retry_after}" == "${signal}" ]]; then
       retry_after=''
     fi
+    if [[ "${agent_id}" == 'bugbot' ]]; then
+      comment_body_probe="$(ar_runner_jq_file "agent-review bugbot disabled body" "${comments_json}" -rs '
+        [ .[] | .[] | select((.user.login // "") | test("cursor";"i")) | .body // "" ]
+        | map(select(length > 0))
+        | .[-1] // empty' 2>/dev/null || true)"
+      if [[ "${comment_body_probe,,}" == *"disabled"* ]] \
+        || [[ "${comment_body_probe,,}" == *"not enabled"* ]]; then
+        reason="Bugbot comment on ${repo}#${pr} reports disabled for your account."
+      fi
+    fi
     agent_review_quota_mark_exhausted_for_agent "${agent_id}" "${reason}" "${evidence_url}" "${retry_after}"
     return 0
   fi
@@ -2557,18 +2595,24 @@ agent_review_quota_observe_agent_on_pr() {
   # Non-quota copilot_work_finished_failure events also mark exhausted for today.
   # Do not skip on "confirmed" — a later @copilot ask the same day can still fail
   # with copilot_work_finished_failure (repository-helpers#368).
-  # While probe_requested is set, keep re-scanning: failure can land after an earlier
-  # empty timeline probe overwrote the ask with source=timeline_probed.
-  # Negative timeline_probed is scoped to OWNER/NAME#N so another PR cannot skip this
-  # one; stale probe_requested expires after AGENT_REVIEW_PROBE_REQUESTED_TTL (#408).
+  # While probe_requested is set, or an @copilot ask / agent_requested is visible on
+  # this PR, keep re-scanning: failure can land after an earlier empty timeline probe
+  # (repository-helpers#415). Negative timeline_probed is scoped to OWNER/NAME#N;
+  # stale probe_requested expires after AGENT_REVIEW_PROBE_REQUESTED_TTL (#408).
   if [[ "${agent_id}" == 'copilot' ]]; then
     if agent_review_agent_quota_exhausted_for_agent copilot; then
       return 1
     fi
     agent_review_copilot_quota_refresh_for_today || true
     agent_review_copilot_quota_expire_stale_probe_requested || true
+    if [[ "${agent_review_copilot_quota_probe_requested_today:-0}" == '1' ]] \
+      || agent_review_copilot_pr_has_review_ask_today "${comments_json}" \
+      || { [[ -n "${snapshot}" ]] \
+        && agent_review_agent_requested_from_snapshot "${snapshot}"; }; then
+      copilot_ask_outstanding=1
+    fi
     if agent_review_copilot_timeline_probed_for_pr_today "${repo}#${pr}" \
-      && [[ "${agent_review_copilot_quota_probe_requested_today:-0}" != '1' ]]; then
+      && [[ "${copilot_ask_outstanding}" != '1' ]]; then
       return 1
     fi
     timeline_json="$(agent_review_pr_timeline_json "${repo}" "${pr}")"
@@ -2580,7 +2624,7 @@ agent_review_quota_observe_agent_on_pr() {
       return 0
     fi
     # Negative probe only when no ask is outstanding (otherwise recheck next loop).
-    if [[ "${agent_review_copilot_quota_probe_requested_today:-0}" != '1' ]]; then
+    if [[ "${copilot_ask_outstanding}" != '1' ]]; then
       agent_review_copilot_quota_mark_timeline_probed \
         "Copilot timeline on ${repo}#${pr} had no same-day copilot_work_finished_failure." \
         "${repo}#${pr}"
