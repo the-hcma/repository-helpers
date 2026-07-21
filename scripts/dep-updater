@@ -495,8 +495,68 @@ dep_uses_graphite_merge_queue_labels() {
   dep_repo_has_label 'merge-it'
 }
 
+# Rebuild local gh-stack tracking for prior state branches + the current branch
+# (created via git checkout -b). Uses ``unstack --local`` so already-submitted
+# GitHub stacks are not torn down. Trunk is ``main`` (same as Graphite
+# ``gt track -p main`` when the parent is the throwaway wt base branch).
+dep_stack_gh_stack_adopt_current() {
+  local current_branch branches_csv quoted_wt quoted_branches bottom_branch
+  local view_ok=0
+  local -a ordered=()
+  local branch
+
+  current_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" \
+    -- branch --show-current)"
+  if [[ -z "$current_branch" ]]; then
+    die "gh-stack adopt: could not determine current branch in ${worktree_path}"
+  fi
+
+  branches_csv="$(state_get "branches")"
+  if [[ -n "$branches_csv" ]]; then
+    IFS=',' read -r -a ordered <<< "$branches_csv"
+  fi
+  if ! csv_contains "${branches_csv:-}" "$current_branch"; then
+    ordered+=("$current_branch")
+  fi
+  if (( ${#ordered[@]} == 0 )); then
+    die "gh-stack adopt: no branches to register"
+  fi
+
+  bottom_branch="${ordered[0]}"
+  quoted_wt="$(printf '%q' "$worktree_path")"
+  quoted_branches=''
+  for branch in "${ordered[@]}"; do
+    quoted_branches+=" $(printf '%q' "$branch")"
+  done
+
+  # Clear local tracking only when a stack already exists (multi-layer rebuild).
+  # Keep runner_sh label+script on one line for the runner-adoption ratchet.
+  if run_command "git worktree" git -C "$worktree_path" show-ref --verify --quiet \
+    "refs/heads/${bottom_branch}"; then
+    view_ok=0
+    if runner_sh "dep-updater probe gh stack view" --probe -- "cd ${quoted_wt} && git checkout $(printf '%q' "$bottom_branch") >/dev/null && gh stack view --json >/dev/null 2>&1"; then
+      view_ok=1
+    fi
+    if (( view_ok == 1 )); then
+      dep_runner_sh "dep-updater gh stack unstack local" -- "cd ${quoted_wt} && git checkout $(printf '%q' "$bottom_branch") >/dev/null && gh stack unstack --local" \
+        || die "gh-stack: could not clear local stack tracking before re-init"
+    fi
+  fi
+
+  dep_runner_sh "dep-updater gh stack init" -- "cd ${quoted_wt} && gh stack init --base main${quoted_branches}" \
+    || die "gh-stack: failed to init/adopt stack for:${quoted_branches}"
+
+  # init checks out the top (last) branch; ensure we stay on the new layer.
+  run_command "git worktree" git -C "$worktree_path" checkout "$current_branch"
+}
+
 dep_stack_register_branch() {
   local -r parent_branch="$1"
+
+  if dep_stacking_is_gh_stack; then
+    dep_stack_gh_stack_adopt_current
+    return
+  fi
 
   dep_stacking_is_graphite || return 0
   if [[ "$parent_branch" == "$wt_base_branch" ]]; then
@@ -507,6 +567,13 @@ dep_stack_register_branch() {
 }
 
 dep_stack_register_branch_optional() {
+  if dep_stacking_is_gh_stack; then
+    if ! dep_stack_branch_info_ok; then
+      log "Warning: current branch is not in a gh-stack; adopting before submit."
+      dep_stack_gh_stack_adopt_current
+    fi
+    return
+  fi
   dep_stacking_is_graphite || return 0
   run_in_worktree gt track -p main 2>/dev/null || true
 }
@@ -1068,7 +1135,8 @@ check_core_prereqs() {
   dep_init_stacking_tool
   if dep_stacking_is_graphite; then
     tooling_prereq_check_tools "[tooling]" gt || missing=$?
-  elif ! dep_runner_sh "dep-updater probe gh stack" "gh stack --help >/dev/null 2>&1"; then
+  elif ! dep_runner_sh "dep-updater probe gh stack" -- \
+    "gh stack --help >/dev/null 2>&1"; then
     log "ERROR: gh stack extension not available (install: gh extension install github/gh-stack)"
     missing=1
   fi
