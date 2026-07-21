@@ -29,6 +29,9 @@ source "${rp_lib_dir}/github-repo-slug"
 # shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
 source "${rp_lib_dir}/runner-ensure"
 
+# shellcheck source=scripts/lib/stacking-tool
+source "${rp_lib_dir}/stacking-tool"
+
 rp_runner_last_stdout() {
   local uuid
 
@@ -907,6 +910,192 @@ rp_check_pr_ship_and_review_rule() {
   else
     rp_log_check_ok "$slug" 'pr-ship-and-review cursor rule' \
       "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_rule_path}")"
+  fi
+
+  return "$repo_fail"
+}
+
+readonly rp_stacking_tool_rule_path='.cursor/rules/stacking-tool.mdc'
+readonly rp_stacking_tool_graphite_skill_path='.cursor/skills/graphite/SKILL.md'
+readonly rp_stacking_tool_gh_stack_skill_path='.cursor/skills/gh-stack/SKILL.md'
+
+rp_stacking_tool_graphite_skill_url() {
+  rp_github_url "${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}" \
+    "/blob/main/${rp_stacking_tool_graphite_skill_path}"
+}
+
+rp_stacking_tool_gh_stack_skill_url() {
+  rp_github_url "${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}" \
+    "/blob/main/${rp_stacking_tool_gh_stack_skill_path}"
+}
+
+rp_stacking_tool_rule_template() {
+  local path graphite_url gh_stack_url
+
+  path="${rp_lib_dir}/repo-practices-cursor/stacking-tool.mdc"
+  graphite_url="$(rp_stacking_tool_graphite_skill_url)"
+  gh_stack_url="$(rp_stacking_tool_gh_stack_skill_url)"
+
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing cursor rule template: ${path}"
+  fi
+  sed -e "s|@@STACKING_TOOL_GRAPHITE_SKILL_URL@@|${graphite_url}|g" \
+    -e "s|@@STACKING_TOOL_GH_STACK_SKILL_URL@@|${gh_stack_url}|g" "$path"
+}
+
+rp_stacking_tool_rule_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_stacking_tool_rule_path}"
+      if [[ -f "$local_path" ]]; then
+        cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_stacking_tool_rule_template
+}
+
+# Prefer an existing valid local marker (so a clone can seed gh-stack before
+# apply-fix), then this-repo trial default, else org Graphite default.
+rp_stacking_tool_marker_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_value
+
+  repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+  if [[ -n "$repo_dir" ]]; then
+    local_value="$(stacking_tool_read_optional "$repo_dir" || true)"
+    if [[ -n "$local_value" ]]; then
+      printf '%s' "$local_value"
+      return 0
+    fi
+  fi
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    printf '%s' "$stacking_tool_VALUE_GH_STACK"
+    return 0
+  fi
+  printf '%s' "$stacking_tool_ORG_DEFAULT"
+}
+
+# True when the stacking-tool cursor rule references the marker and both
+# backends. This repo may cite local skill paths; consumers need breadcrumb
+# comments or github blob URLs to the canonical skills.
+rp_stacking_tool_rule_is_valid() {
+  local -r text="$1"
+  local -r slug="$2"
+
+  if ! grep -qF '.github/stacking-tool' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qF 'graphite' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qF 'gh-stack' <<<"$text"; then
+    return 1
+  fi
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    grep -qF "$rp_stacking_tool_graphite_skill_path" <<<"$text" \
+      && grep -qF "$rp_stacking_tool_gh_stack_skill_path" <<<"$text"
+    return $?
+  fi
+  if ! grep -qE \
+    'stacking-tool-canonical-graphite-skill:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.cursor/skills/graphite/SKILL\.md' \
+    <<<"$text"; then
+    return 1
+  fi
+  grep -qE \
+    'stacking-tool-canonical-gh-stack-skill:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.cursor/skills/gh-stack/SKILL\.md' \
+    <<<"$text"
+}
+
+rp_check_stacking_tool() {
+  local slug="$1"
+  local repo_fail=0
+  local marker_text rule_text marker_value
+
+  marker_text="$(rp_fetch_github_text_file "$slug" "$stacking_tool_MARKER_RELPATH" || true)"
+  if [[ -z "$marker_text" ]]; then
+    repo_fail=1
+    rp_log_check_fail "$slug" \
+      "stacking-tool marker (${stacking_tool_MARKER_RELPATH})" \
+      "$(rp_github_url "$slug" "/new/main/${stacking_tool_MARKER_RELPATH}")"
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$stacking_tool_MARKER_RELPATH" \
+        "$(rp_stacking_tool_marker_content_for_apply_fix "$slug")" \
+        'add-stacking-tool-marker' \
+        'chore: add stacking-tool marker'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add ${stacking_tool_MARKER_RELPATH} with '${stacking_tool_VALUE_GRAPHITE}' or '${stacking_tool_VALUE_GH_STACK}' (org default: ${stacking_tool_ORG_DEFAULT})"
+    fi
+  else
+    marker_value="$(stacking_tool_normalize "$marker_text")"
+    if ! stacking_tool_is_valid "$marker_value"; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        "stacking-tool marker must be '${stacking_tool_VALUE_GRAPHITE}' or '${stacking_tool_VALUE_GH_STACK}'" \
+        "$(rp_github_url "$slug" "/blob/main/${stacking_tool_MARKER_RELPATH}")"
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
+        rp_queue_candidate_file_fix "$slug" "$stacking_tool_MARKER_RELPATH" \
+          "$(rp_stacking_tool_marker_content_for_apply_fix "$slug")" \
+          'sync-stacking-tool-marker' \
+          'chore: sync stacking-tool marker'
+      fi
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: set ${stacking_tool_MARKER_RELPATH} to '${stacking_tool_VALUE_GRAPHITE}' or '${stacking_tool_VALUE_GH_STACK}'"
+      fi
+    else
+      rp_log_check_ok "$slug" 'stacking-tool marker' \
+        "$(rp_github_url "$slug" "/blob/main/${stacking_tool_MARKER_RELPATH}")"
+    fi
+  fi
+
+  rule_text="$(rp_fetch_github_text_file "$slug" "$rp_stacking_tool_rule_path" || true)"
+  if [[ -z "$rule_text" ]]; then
+    repo_fail=1
+    rp_log_check_fail "$slug" \
+      'stacking-tool cursor rule (.cursor/rules/stacking-tool.mdc)' \
+      "$(rp_github_url "$slug" '/new/main/.cursor/rules/stacking-tool.mdc')"
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_stacking_tool_rule_path" \
+        "$(rp_stacking_tool_rule_content_for_apply_fix "$slug")" \
+        'add-stacking-tool-rule' \
+        'chore: add stacking-tool cursor rule'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add .cursor/rules/stacking-tool.mdc (template: scripts/lib/repo-practices-cursor/)"
+    fi
+  elif ! rp_stacking_tool_rule_is_valid "$rule_text" "$slug"; then
+    repo_fail=1
+    if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+      rp_log_check_fail "$slug" \
+        'stacking-tool rule must reference marker and local graphite/gh-stack skills' \
+        "$(rp_github_url "$slug" "/blob/main/${rp_stacking_tool_rule_path}")"
+    else
+      rp_log_check_fail "$slug" \
+        'stacking-tool rule must link to canonical graphite/gh-stack skills (breadcrumb URLs)' \
+        "$(rp_stacking_tool_graphite_skill_url)"
+    fi
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_stacking_tool_rule_path" \
+        "$(rp_stacking_tool_rule_content_for_apply_fix "$slug")" \
+        'sync-stacking-tool-rule' \
+        'chore: sync stacking-tool cursor rule'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: sync .cursor/rules/stacking-tool.mdc to the marker-aware stacking-tool template (include skill breadcrumbs)"
+    fi
+  else
+    rp_log_check_ok "$slug" 'stacking-tool cursor rule' \
+      "$(rp_github_url "$slug" "/blob/main/${rp_stacking_tool_rule_path}")"
   fi
 
   return "$repo_fail"
@@ -2745,6 +2934,8 @@ rp_apply_candidate_fix_stack() {
   local slug="$1"
   local repo_dir default_branch worktree_path key key_slug path content branch_suffix message
   local branch parent_branch parent_ref created_any has_candidate path_dir status
+  local stacking_tool show_ref_exit_code diff_exit_code quoted_wt quoted_branches
+  local -a created_branches=()
 
   if [[ "$rp_apply_fix" -ne 1 ]]; then
     return 0
@@ -2768,6 +2959,11 @@ rp_apply_candidate_fix_stack() {
     return 0
   fi
 
+  stacking_tool="$(stacking_tool_read_optional "$repo_dir" || true)"
+  if [[ -z "$stacking_tool" ]]; then
+    stacking_tool="$stacking_tool_ORG_DEFAULT"
+  fi
+
   default_branch="$(rp_runner_gh_api_stream "repo-practices default branch" "repos/${slug}" --jq '.default_branch // "main"')"
   worktree_path="$(rp_prepare_candidate_worktree "$repo_dir" "$default_branch")"
   parent_branch="$default_branch"
@@ -2782,7 +2978,7 @@ rp_apply_candidate_fix_stack() {
     message="${rp_candidate_fix_messages[$key]}"
     branch="repo-practices/${branch_suffix}"
 
-    local show_ref_exit_code=0
+    show_ref_exit_code=0
     runner_exec "repo-practices git show-ref branch" \
       -- git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${branch}" \
       || show_ref_exit_code=$?
@@ -2805,7 +3001,7 @@ rp_apply_candidate_fix_stack() {
     printf '%s\n' "$content" >"${worktree_path}/${path}"
     runner_exec "repo-practices git add candidate path" \
       -- git -C "$worktree_path" add "$path"
-    local diff_exit_code=0
+    diff_exit_code=0
     runner_exec "repo-practices git diff cached quiet" \
       -- git -C "$worktree_path" diff --cached --quiet || diff_exit_code=$?
     if (( diff_exit_code == 0 )); then
@@ -2814,9 +3010,11 @@ rp_apply_candidate_fix_stack() {
     fi
     runner_exec "repo-practices git commit candidate fix" \
       -- git -C "$worktree_path" commit -m "$message"
-    local gt_cli='gt'
-    runner_sh "repo-practices gt track" \
-      "cd \"${worktree_path}\" && ${gt_cli} track --parent \"${parent_branch}\""
+    if [[ "$stacking_tool" == "$stacking_tool_VALUE_GRAPHITE" ]]; then
+      # Keep runner_sh label+script on one line for the runner-adoption ratchet.
+      runner_sh "repo-practices gt track" "cd \"${worktree_path}\" && gt track --parent \"${parent_branch}\""
+    fi
+    created_branches+=("$branch")
     rp_log_warn "${slug}: created candidate branch ${branch} for ${path}"
     parent_branch="$branch"
     parent_ref="$branch"
@@ -2827,9 +3025,18 @@ rp_apply_candidate_fix_stack() {
     return 0
   fi
 
-  local gt_cli='gt'
-  runner_sh "repo-practices gt submit" \
-    "cd \"${worktree_path}\" && ${gt_cli} submit --publish --no-interactive"
+  if [[ "$stacking_tool" == "$stacking_tool_VALUE_GRAPHITE" ]]; then
+    stacking_tool_submit_as "$stacking_tool_VALUE_GRAPHITE" "$worktree_path"
+  else
+    quoted_wt="$(printf '%q' "$worktree_path")"
+    quoted_branches=''
+    for branch in "${created_branches[@]}"; do
+      quoted_branches+=" $(printf '%q' "$branch")"
+    done
+    # Keep runner_sh label+script on one line for the runner-adoption ratchet.
+    runner_sh "repo-practices gh stack init" "cd ${quoted_wt} && gh stack init --base $(printf '%q' "$default_branch")${quoted_branches}"
+    stacking_tool_submit_as "$stacking_tool_VALUE_GH_STACK" "$worktree_path"
+  fi
   status=""
   set +e
   status="$(rp_runner_exec_stdout "repo-practices git status after submit" \
@@ -4229,9 +4436,8 @@ rp_print_new_repo_checklist() {
       [ ] CODEOWNERS with * @OWNER so all code requires CODEOWNER review
       [ ] .cursor/rules/pr-ship-and-review.mdc (agent review loop; template in ${rp_THIS_REPO_NAME})
       [ ] .gitignore must not ignore .cursor/rules/ (un-ignore if ignoring other .cursor content)
-      [ ] .cursor/skills/graphite/SKILL.md (Graphite stacked PRs when marker is graphite)
-      [ ] .cursor/skills/gh-stack/SKILL.md (when marker is gh-stack; optional until trial)
       [ ] .github/stacking-tool (graphite|gh-stack)
+      [ ] .cursor/rules/stacking-tool.mdc (thin marker rule; template in ${rp_THIS_REPO_NAME})
       [ ] merge-it / Graphite merge queue flow (AGENTS.md)
       [ ] RELEASING.md when using Release Please
 
@@ -5388,6 +5594,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_pr_ship_and_review_rule "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_stacking_tool "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_uv_python_cve_check_workflow "$slug"; then
