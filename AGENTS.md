@@ -435,9 +435,11 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 - Sync via `scripts/dev/start-development` (marker-aware). For `gh-stack`, use `gh stack sync` / `gh stack rebase` as needed; for Graphite, `gt sync` / `gt restack`.
 - **Before opening/submitting a PR**, run **`scripts/dev/pre-pr-checks`** from your feature worktree (or use **`scripts/dev/submit-stack`**). Do not submit without passing pre-pr-checks first.
 - `pre-pr-checks` **detects the project type first** (filesystem markers only), then requires tools and runs **only planned jobs** in parallel:
-  - **Shell / workflows / bash tests** when present: shebang-filtered `bash -n` + `shellcheck -S info` under `scripts/`, `.github/ci/`, `tests/`; `actionlint` on workflows; `tests/*.test` when present
+  - **Shell**: helpers-style (`scripts/dev/pre-pr-checks`) → CI globs + `bash -n` / `shellcheck -S info`; or consumer `.github/ci/shellcheck` wrapper when present. Not every repo with a `scripts/` tree.
+  - **Workflows**: `actionlint` when helpers-style or when workflows already invoke actionlint
+  - **Bash tests**: `tests/*.test` when present (sequential, isolated TMPDIR)
   - **Python** (`pyproject.toml`): prefer `.github/ci/python-static`; else `uv run` ruff check/format + pyright
-  - **TypeScript**: `web/package.json` → pnpm install + typecheck/build; else root pnpm → `pnpm run check` (or typecheck/lint)
+  - **TypeScript**: `web/package.json` → pnpm install + typecheck/build; else root pnpm (only when no `web/`) → `pnpm run check` (or typecheck/lint). Both layouts: web wins; root is not also planned.
   - **Rust** (`Cargo.toml`): `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`
   - Escape hatch: `PRE_PR_CHECKS_SKIP=job1,job2` (documented; no silent skip). Do **not** bypass a failing run with ad-hoc substitutes.
   - Also verifies the **primary worktree** is unchanged when checks finish.
