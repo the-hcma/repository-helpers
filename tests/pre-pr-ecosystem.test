@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# Hermetic tests for scripts/lib/pre-pr-ecosystem (detection + shebang filter).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+# shellcheck disable=SC1091
+source "${script_dir}/../scripts/lib/runner-bootstrap"
+# shellcheck disable=SC1091
+source "${script_dir}/../scripts/lib/pre-pr-ecosystem"
+
+pre_pr_checks="${script_dir}/../scripts/dev/pre-pr-checks"
+ecosystem_lib="${script_dir}/../scripts/lib/pre-pr-ecosystem"
+readonly pre_pr_checks ecosystem_lib
+
+pass=0
+fail=0
+
+make_git_fixture() {
+  local -r dir="$1"
+  mkdir -p "$dir"
+  (
+    cd "$dir"
+    git init -q
+    git config user.email 'test@example.com'
+    git config user.name 'Test'
+  )
+}
+
+commit_all() {
+  local -r dir="$1"
+  (
+    cd "$dir"
+    git add -A
+    git commit -q -m 'fixture' --allow-empty
+  )
+}
+
+printf '\n=== static: pre-pr-ecosystem conventions ===\n'
+if head -1 "$ecosystem_lib" | grep -qF '# shellcheck shell=bash'; then
+  pass_case 'ecosystem lib: shellcheck shell=bash'
+else
+  fail_case 'ecosystem lib: shellcheck shell=bash'
+fi
+if grep -qF 'runner-ensure' "$ecosystem_lib" \
+  && grep -qF 'prec_detect_profile' "$ecosystem_lib" \
+  && grep -qF 'prec_require_tools_for_planned' "$ecosystem_lib" \
+  && grep -qF 'PRE_PR_CHECKS_SKIP' "$ecosystem_lib"; then
+  pass_case 'ecosystem lib: detect + require + skip env'
+else
+  fail_case 'ecosystem lib: detect + require + skip env'
+fi
+# shellcheck disable=SC2016  # assert literal source text
+if grep -qF 'prec_shell_file_eligible' "$ecosystem_lib" \
+  && grep -qF "*bash*" "$ecosystem_lib" \
+  && grep -qF 'runner_exec_stdout "prec git ls-files .github/ci"' "$ecosystem_lib"; then
+  pass_case 'ecosystem lib: shebang-aware shell collect via runner'
+else
+  fail_case 'ecosystem lib: shebang-aware shell collect via runner'
+fi
+
+# shellcheck disable=SC2016  # static: no run_command followed by return 0 in runners
+if awk '
+  /run_command/ { prev=1; next }
+  prev && /^[[:space:]]*return 0/ { exit 0 }
+  { prev=0 }
+  END { exit 1 }
+' "$ecosystem_lib"; then
+  fail_case 'job runners do not mask run_command failures with return 0'
+else
+  pass_case 'job runners do not mask run_command failures with return 0'
+fi
+
+printf '\n=== static: pre-pr-checks detect-first wiring ===\n'
+if grep -qF 'pre-pr-ecosystem' "$pre_pr_checks" \
+  && grep -qF 'prec_detect_profile' "$pre_pr_checks" \
+  && grep -qF 'prec_require_tools_for_planned' "$pre_pr_checks" \
+  && grep -qF 'start_planned_parallel_checks' "$pre_pr_checks"; then
+  pass_case 'pre-pr-checks sources ecosystem and detect-first'
+else
+  fail_case 'pre-pr-checks sources ecosystem and detect-first'
+fi
+# Detect before require: line order in main().
+detect_line=0
+require_line=0
+detect_line="$(grep -n 'prec_detect_profile' "$pre_pr_checks" | head -1 | cut -d: -f1)"
+require_line="$(grep -n 'prec_require_tools_for_planned' "$pre_pr_checks" | head -1 | cut -d: -f1)"
+if [[ -n "$detect_line" && -n "$require_line" && "$detect_line" -lt "$require_line" ]]; then
+  pass_case 'pre-pr-checks calls detect before require_tools'
+else
+  fail_case 'pre-pr-checks calls detect before require_tools'
+fi
+# Must not unconditionally require shellcheck at top-level require_tools.
+if ! grep -qE '^require_tools\(\)' "$pre_pr_checks" \
+  && ! grep -qF 'command -v shellcheck' "$pre_pr_checks"; then
+  pass_case 'pre-pr-checks does not always require shellcheck'
+else
+  fail_case 'pre-pr-checks does not always require shellcheck'
+fi
+
+printf '\n=== prec_shell_file_eligible ===\n'
+elig_tmp="$(mktemp -d)"
+printf '#!/usr/bin/env bash\necho hi\n' >"${elig_tmp}/ok-script"
+printf '#!/usr/bin/env python3\nprint(1)\n' >"${elig_tmp}/py-script"
+printf 'x = 1\n' >"${elig_tmp}/plain.py"
+if prec_shell_file_eligible "${elig_tmp}/ok-script"; then
+  pass_case 'eligible: bash shebang script'
+else
+  fail_case 'eligible: bash shebang script'
+fi
+if ! prec_shell_file_eligible "${elig_tmp}/py-script"; then
+  pass_case 'ineligible: python shebang (no extension)'
+else
+  fail_case 'ineligible: python shebang (no extension)'
+fi
+if ! prec_shell_file_eligible "${elig_tmp}/plain.py"; then
+  pass_case 'ineligible: .py extension'
+else
+  fail_case 'ineligible: .py extension'
+fi
+printf '#!/usr/bin/env perl\nprint 1;\n' >"${elig_tmp}/perl-script"
+printf '# shellcheck shell=bash\ntrue\n' >"${elig_tmp}/sourced-lib"
+if ! prec_shell_file_eligible "${elig_tmp}/perl-script"; then
+  pass_case 'ineligible: perl shebang'
+else
+  fail_case 'ineligible: perl shebang'
+fi
+if prec_shell_file_eligible "${elig_tmp}/sourced-lib"; then
+  pass_case 'eligible: sourced lib without shebang'
+else
+  fail_case 'eligible: sourced lib without shebang'
+fi
+rm -rf "$elig_tmp"
+
+printf '\n=== detect: python-only fixture (no cargo/pnpm jobs) ===\n'
+py_fix="$(mktemp -d)"
+make_git_fixture "$py_fix"
+printf '[project]\nname = "x"\n' >"${py_fix}/pyproject.toml"
+mkdir -p "${py_fix}/scripts"
+printf '#!/usr/bin/env bash\ntrue\n' >"${py_fix}/scripts/hello"
+commit_all "$py_fix"
+unset PRE_PR_CHECKS_SKIP
+prec_detect_profile "$py_fix"
+detected="$(prec_format_detected)"
+planned="$(prec_format_planned_jobs)"
+if [[ "$detected" == *python* && "$detected" != *rust* && "$detected" != *ts-* ]]; then
+  pass_case 'python-only: detected python (no foreign ecosystems)'
+else
+  fail_case "python-only: detected python (got ${detected})"
+fi
+if [[ "$planned" == *python-static* && "$planned" != *cargo* && "$planned" != *ts-* \
+  && "$planned" != *shellcheck* ]]; then
+  pass_case 'python-only: planned python-static; no shellcheck without helpers/wrapper'
+else
+  fail_case "python-only: planned jobs (got ${planned})"
+fi
+# Require tools must not demand cargo/pnpm for this profile.
+need_cargo=0
+need_pnpm=0
+prec_job_is_planned 'cargo-fmt' && need_cargo=1
+prec_job_is_planned 'ts-web' && need_pnpm=1
+prec_job_is_planned 'ts-root' && need_pnpm=1
+if [[ "$need_cargo" -eq 0 && "$need_pnpm" -eq 0 ]]; then
+  pass_case 'python-only: no cargo/pnpm in planned tools'
+else
+  fail_case 'python-only: no cargo/pnpm in planned tools'
+fi
+rm -rf "$py_fix"
+
+printf '\n=== detect: helpers-style plans shellcheck ===\n'
+hs_fix="$(mktemp -d)"
+make_git_fixture "$hs_fix"
+mkdir -p "${hs_fix}/scripts/dev" "${hs_fix}/scripts/lib"
+printf '#!/usr/bin/env bash\ntrue\n' >"${hs_fix}/scripts/dev/pre-pr-checks"
+printf '#!/usr/bin/env bash\ntrue\n' >"${hs_fix}/scripts/lib/helper"
+commit_all "$hs_fix"
+prec_detect_profile "$hs_fix"
+planned="$(prec_format_planned_jobs)"
+if [[ "$planned" == *shellcheck* && "$planned" == *bash-n* ]]; then
+  pass_case 'helpers-style: plans bash-n and shellcheck'
+else
+  fail_case "helpers-style: plans shell jobs (got ${planned})"
+fi
+rm -rf "$hs_fix"
+
+printf '\n=== detect: shellcheck wrapper plans shellcheck ===\n'
+wrap_fix="$(mktemp -d)"
+make_git_fixture "$wrap_fix"
+mkdir -p "${wrap_fix}/.github/ci" "${wrap_fix}/scripts"
+printf '#!/usr/bin/env bash\ntrue\n' >"${wrap_fix}/.github/ci/shellcheck"
+printf '#!/usr/bin/env bash\ntrue\n' >"${wrap_fix}/scripts/ok"
+commit_all "$wrap_fix"
+prec_detect_profile "$wrap_fix"
+planned="$(prec_format_planned_jobs)"
+if [[ "$planned" == *shellcheck* ]]; then
+  pass_case 'wrapper: plans shellcheck'
+else
+  fail_case "wrapper: plans shellcheck (got ${planned})"
+fi
+rm -rf "$wrap_fix"
+
+printf '\n=== detect: rust-only fixture ===\n'
+rs_fix="$(mktemp -d)"
+make_git_fixture "$rs_fix"
+printf '[package]\nname = "x"\nversion = "0.1.0"\nedition = "2021"\n' >"${rs_fix}/Cargo.toml"
+commit_all "$rs_fix"
+prec_detect_profile "$rs_fix"
+detected="$(prec_format_detected)"
+planned="$(prec_format_planned_jobs)"
+if [[ "$detected" == *rust* && "$detected" != *python* && "$detected" != *ts-* ]]; then
+  pass_case 'rust-only: detected rust'
+else
+  fail_case "rust-only: detected rust (got ${detected})"
+fi
+if [[ "$planned" == *cargo-fmt* && "$planned" == *cargo-clippy* \
+  && "$planned" != *python* && "$planned" != *ts-* ]]; then
+  pass_case 'rust-only: planned cargo jobs only (ecosystem)'
+else
+  fail_case "rust-only: planned cargo (got ${planned})"
+fi
+rm -rf "$rs_fix"
+
+printf '\n=== detect: web-ts fixture ===\n'
+web_fix="$(mktemp -d)"
+make_git_fixture "$web_fix"
+mkdir -p "${web_fix}/web"
+printf '{"name":"w","packageManager":"pnpm@9.0.0","scripts":{"typecheck":"tsc"}}\n' \
+  >"${web_fix}/web/package.json"
+printf 'lock\n' >"${web_fix}/web/pnpm-lock.yaml"
+commit_all "$web_fix"
+prec_detect_profile "$web_fix"
+detected="$(prec_format_detected)"
+planned="$(prec_format_planned_jobs)"
+if [[ "$detected" == *ts-web* && "$planned" == *ts-web* && "$planned" != *ts-root* ]]; then
+  pass_case 'web-ts: detected ts-web job'
+else
+  fail_case "web-ts: detected ts-web (detected=${detected} planned=${planned})"
+fi
+rm -rf "$web_fix"
+
+printf '\n=== detect: root pnpm (no web/) ===\n'
+root_ts="$(mktemp -d)"
+make_git_fixture "$root_ts"
+printf '{"name":"r","packageManager":"pnpm@9.0.0","scripts":{"check":"tsc"}}\n' \
+  >"${root_ts}/package.json"
+printf 'lock\n' >"${root_ts}/pnpm-lock.yaml"
+commit_all "$root_ts"
+prec_detect_profile "$root_ts"
+detected="$(prec_format_detected)"
+planned="$(prec_format_planned_jobs)"
+if [[ "$detected" == *ts-root* && "$planned" == *ts-root* && "$planned" != *ts-web* ]]; then
+  pass_case 'root-ts: detected ts-root job'
+else
+  fail_case "root-ts: detected ts-root (detected=${detected} planned=${planned})"
+fi
+rm -rf "$root_ts"
+
+printf '\n=== PRE_PR_CHECKS_SKIP ===\n'
+skip_fix="$(mktemp -d)"
+make_git_fixture "$skip_fix"
+printf '[project]\nname = "x"\n' >"${skip_fix}/pyproject.toml"
+commit_all "$skip_fix"
+export PRE_PR_CHECKS_SKIP='python-static,shellcheck'
+prec_detect_profile "$skip_fix"
+planned="$(prec_format_planned_jobs)"
+if [[ "$planned" != *python-static* ]]; then
+  pass_case 'SKIP removes python-static from planned'
+else
+  fail_case "SKIP removes python-static (got ${planned})"
+fi
+unset PRE_PR_CHECKS_SKIP
+rm -rf "$skip_fix"
+
+printf '\n=== help mentions detect-first / SKIP ===\n'
+help_output=""
+help_exit=0
+help_output="$(bash "$pre_pr_checks" --help 2>&1)" || help_exit=$?
+assert_exit_0 "ecosystem --help" "$help_output" "$help_exit"
+assert_contains "ecosystem --help detect" "$help_output" "Detect-first"
+assert_contains "ecosystem --help SKIP" "$help_output" "PRE_PR_CHECKS_SKIP"
+
+printf '\n=== summary ===\n'
+printf 'passed: %d  failed: %d\n' "$pass" "$fail"
+# assert_* helpers use the same pass/fail counters (test_init / pass_case / fail_case).
+if (( fail > 0 )); then
+  exit 1
+fi

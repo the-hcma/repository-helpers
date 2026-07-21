@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # scripts/dev/pre-pr-checks — Run local CI checks before opening/submitting a PR.
 #
-# Mirrors .github/workflows/ci.yml (bash -n, shellcheck, actionlint, tests/*.test).
-# Requires a stack worktree (not the primary clone) and a clean primary worktree.
+# Detects project ecosystems first (filesystem only), then requires tools and
+# runs only the planned jobs in parallel. Prefer repo CI wrappers / package
+# scripts when present (see scripts/lib/pre-pr-ecosystem, issue #423).
 #
-# Independent checks run in parallel to minimize wall-clock time.
+# Requires a stack worktree (not the primary clone) and a clean primary worktree.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,6 +28,12 @@ tooling_path_ensure_gnu_userland \
 # shellcheck disable=SC1091  # dev-worktree-guard is a sibling lib, not a package
 source "${script_dir}/../lib/dev-worktree-guard"
 
+# shellcheck disable=SC1091
+source "${script_dir}/../lib/pre-pr-ecosystem"
+
+# Assigned by prec_detect_profile; initialize so shellcheck sees the assignment (SC2154).
+prec_planned_jobs=()
+
 main_repo=""
 check_root=""
 restore_done=0
@@ -42,15 +49,25 @@ Usage:
 Run from a stack worktree (.worktrees/<stack>-wt) of the repository you are about
 to submit. Exits non-zero if any check fails.
 
-Checks (same as CI, run in parallel where independent):
+Detect-first: inspects the check-root for Python (pyproject.toml), TypeScript
+(web/ or root pnpm), Rust (Cargo.toml), shell targets, workflows, and
+tests/*.test — then requires tools and starts jobs only for detected ecosystems.
+
+Jobs (parallel where independent; skip with PRE_PR_CHECKS_SKIP=job1,job2):
+  - bash-n / shellcheck -S info — helpers-style (scripts/dev/pre-pr-checks) CI globs;
+    or consumer `.github/ci/shellcheck` wrapper when present
+  - actionlint — helpers-style, or when workflows already invoke actionlint
+  - tests — bash tests/*.test when present (sequential, isolated TMPDIR)
+  - python-static — .github/ci/python-static or uv ruff/pyright fallback
+  - ts-web / ts-root — pnpm install + typecheck/build or check
+  - cargo-fmt / cargo-clippy — rustfmt + clippy (-D warnings)
+
+Also enforces:
   - Stack worktree (not the primary clone)
   - Primary worktree clean (empty git status --porcelain)
-  - bash -n on scripts/*, scripts/dev/*, scripts/lib/*, tests/*, tests/lib/*
-  - shellcheck -S info on the same paths
-  - actionlint on GitHub workflows and repository-practices workflow templates
-  - bash tests/*.test sequentially (CI parity), each in an isolated TMPDIR
 
 Before submit-stack / ship-and-review, run this script (or use scripts/dev/submit-stack).
+Do not bypass a failing run unless using an explicit PRE_PR_CHECKS_SKIP escape hatch.
 USAGE
 }
 
@@ -65,40 +82,6 @@ resolve_repo_roots() {
   [[ -n "$check_root" ]] || die "Not inside a git repository (cwd: ${start_dir})"
   main_repo="$(dev_worktree_primary_path "$check_root")"
   [[ -n "$main_repo" ]] || die "Could not resolve primary worktree path"
-}
-
-collect_check_files() {
-  local repo_root="$1"
-  local -n _out=$2
-  local f
-  _out=()
-  for f in \
-    "${repo_root}"/scripts/* \
-    "${repo_root}"/scripts/dev/* \
-    "${repo_root}"/scripts/lib/* \
-    "${repo_root}"/tests/* \
-    "${repo_root}"/tests/lib/*; do
-    [[ -f "$f" ]] || continue
-    _out+=("$f")
-  done
-  if [[ "${#_out[@]}" -eq 0 ]]; then
-    die "No shell scripts found under ${repo_root}/scripts or tests"
-  fi
-}
-
-collect_actionlint_files() {
-  local repo_root="$1"
-  local -n out_ref="$2"
-  local f
-  out_ref=()
-  shopt -s nullglob
-  for f in \
-    "${repo_root}"/.github/workflows/*.yml \
-    "${repo_root}"/scripts/lib/repo-practices-workflows/*.yml; do
-    [[ -f "$f" ]] || continue
-    out_ref+=("$f")
-  done
-  shopt -u nullglob
 }
 
 on_exit() {
@@ -141,13 +124,6 @@ assert_worktree_guards() {
   log_step 'Primary worktree is clean'
 }
 
-require_tools() {
-  command -v shellcheck >/dev/null 2>&1 || die "shellcheck not found on PATH"
-  command -v actionlint >/dev/null 2>&1 || die "actionlint not found on PATH"
-  command -v bash >/dev/null 2>&1 || die "bash not found on PATH"
-  command -v rg >/dev/null 2>&1 || die "rg (ripgrep) not found on PATH (required by tests; see CI workflow)"
-}
-
 init_parallel_jobs() {
   prec_pr_jobs_dir="$(mktemp -d "${TMPDIR:-/tmp}/pre-pr-checks-jobs.XXXXXX")"
   prec_pr_test_isolate_dir="${prec_pr_jobs_dir}/test-isolate"
@@ -170,20 +146,32 @@ start_parallel_job() {
 
 job_bash_n() {
   local -a files=()
-  collect_check_files "$check_root" files
+  prec_collect_shell_files "$check_root" files
+  [[ "${#files[@]}" -gt 0 ]] || return 0
   bash -n "${files[@]}"
 }
 
 job_shellcheck() {
   local -a files=()
-  collect_check_files "$check_root" files
-  # Match .github/workflows/ci.yml exactly (no suppressions).
+  local rc
+  if [[ -f "${check_root}/.github/ci/shellcheck" ]]; then
+    rc=0
+    (
+      set -euo pipefail
+      cd "$check_root"
+      run_command "pre-pr shellcheck wrapper" bash .github/ci/shellcheck
+    ) || rc=$?
+    return "$rc"
+  fi
+  prec_collect_shell_files "$check_root" files
+  [[ "${#files[@]}" -gt 0 ]] || return 0
+  # Match .github/workflows/ci.yml severity (no suppressions) for helpers-style.
   shellcheck -S info "${files[@]}"
 }
 
 job_actionlint() {
   local -a files=()
-  collect_actionlint_files "$check_root" files
+  prec_collect_actionlint_files "$check_root" files
   if [[ "${#files[@]}" -eq 0 ]]; then
     return 0
   fi
@@ -212,7 +200,7 @@ job_all_tests() {
   local -a tests=( "${check_root}"/tests/*.test )
   shopt -u nullglob
   if [[ "${#tests[@]}" -eq 0 ]]; then
-    die "No tests/*.test files found under ${check_root}"
+    return 0
   fi
   for t in "${tests[@]}"; do
     base="$(basename "$t" .test)"
@@ -226,18 +214,40 @@ job_all_tests() {
   return 0
 }
 
-start_parallel_checks() {
+start_planned_parallel_checks() {
+  local job
   init_parallel_jobs
-  start_parallel_job 'bash-n' job_bash_n
-  start_parallel_job 'shellcheck' job_shellcheck
-  start_parallel_job 'actionlint' job_actionlint
-  start_parallel_job 'tests' job_all_tests
 
+  for job in "${prec_planned_jobs[@]+"${prec_planned_jobs[@]}"}"; do
+    case "$job" in
+      bash-n) start_parallel_job 'bash-n' job_bash_n ;;
+      shellcheck) start_parallel_job 'shellcheck' job_shellcheck ;;
+      actionlint) start_parallel_job 'actionlint' job_actionlint ;;
+      tests) start_parallel_job 'tests' job_all_tests ;;
+      python-static) start_parallel_job 'python-static' prec_run_python_static "$check_root" ;;
+      ts-web) start_parallel_job 'ts-web' prec_run_ts_web "$check_root" ;;
+      ts-root) start_parallel_job 'ts-root' prec_run_ts_root "$check_root" ;;
+      cargo-fmt) start_parallel_job 'cargo-fmt' prec_run_cargo_fmt "$check_root" ;;
+      cargo-clippy) start_parallel_job 'cargo-clippy' prec_run_cargo_clippy "$check_root" ;;
+      *)
+        die "Unknown planned job: ${job}"
+        ;;
+    esac
+  done
+
+  if [[ "$prec_pr_job_count" -eq 0 ]]; then
+    log_step 'No planned jobs (nothing to run)'
+    return 0
+  fi
   log_step "Running ${prec_pr_job_count} checks in parallel (tests sequential, isolated TMPDIR)…"
 }
 
 wait_parallel_checks() {
   local rc_file job_name rc failed=0 fail_count=0
+
+  if [[ "$prec_pr_job_count" -eq 0 ]]; then
+    return 0
+  fi
 
   set +e
   wait
@@ -281,10 +291,14 @@ main() {
   parse_args "$@"
   trap on_exit EXIT
 
-  require_tools
   resolve_repo_roots "$PWD"
   assert_worktree_guards
-  start_parallel_checks
+
+  prec_detect_profile "$check_root"
+  log_step "detected: $(prec_format_detected) ; jobs: $(prec_format_planned_jobs)"
+
+  prec_require_tools_for_planned
+  start_planned_parallel_checks
   wait_parallel_checks
 
   log_step "pre-pr-checks passed"

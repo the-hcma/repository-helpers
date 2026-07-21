@@ -20,7 +20,7 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | Deploy hook | `scripts/on-deploy` | Example hook; consumer repos implement their own. |
 | Agent review | `scripts/wait-for-agent-review`, `scripts/trigger-agent-review` | PR review loop, triage, operator email (no self-approve). |
 | Dev workflow | `scripts/dev/start-development` | Worktree + Graphite sync entry point. |
-| Dev workflow | `scripts/dev/pre-pr-checks` | Local CI mirror (`bash -n`, `shellcheck`, all tests). |
+| Dev workflow | `scripts/dev/pre-pr-checks` | Detect-first local CI gates (bash + Python/TS/Rust when present). |
 | Dev workflow | `scripts/dev/submit-stack` | `pre-pr-checks` → `gt submit` → `post-pr-submission-checks`. |
 | Dev workflow | `scripts/dev/post-pr-submission-checks` | Wait for PR CI; print agent-friendly failure excerpts. |
 | Dev workflow | `scripts/dev/ship-and-review` | Submit + CI wait + `wait-for-agent-review loop`. |
@@ -434,7 +434,15 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 - Keep each branch in the stack focused on exactly one logical change. Stacks should map 1-to-1 with milestones or sub-tasks from [dep-updater.plan.md](./dep-updater.plan.md).
 - Sync via `scripts/dev/start-development` (marker-aware). For `gh-stack`, use `gh stack sync` / `gh stack rebase` as needed; for Graphite, `gt sync` / `gt restack`.
 - **Before opening/submitting a PR**, run **`scripts/dev/pre-pr-checks`** from your feature worktree (or use **`scripts/dev/submit-stack`**). Do not submit without passing pre-pr-checks first.
-- `pre-pr-checks` mirrors CI: `bash -n`, `shellcheck -S info` (all `scripts/*`, `scripts/dev/*`, `scripts/lib/*`, `tests/*`, `tests/lib/*`), and **every** `tests/*.test` must pass. It also verifies the **primary worktree** is unchanged when checks finish (auto-stash/restore any pre-existing local changes on main).
+- `pre-pr-checks` **detects the project type first** (filesystem markers only), then requires tools and runs **only planned jobs** in parallel:
+  - **Shell**: helpers-style (`scripts/dev/pre-pr-checks`) → CI globs + `bash -n` / `shellcheck -S info`; or consumer `.github/ci/shellcheck` wrapper when present. Not every repo with a `scripts/` tree.
+  - **Workflows**: `actionlint` when helpers-style or when workflows already invoke actionlint
+  - **Bash tests**: `tests/*.test` when present (sequential, isolated TMPDIR)
+  - **Python** (`pyproject.toml`): prefer `.github/ci/python-static`; else `uv run` ruff check/format + pyright
+  - **TypeScript**: `web/package.json` → pnpm install + typecheck/build; else root pnpm (only when no `web/`) → `pnpm run check` (or typecheck/lint). Both layouts: web wins; root is not also planned.
+  - **Rust** (`Cargo.toml`): `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`
+  - Escape hatch: `PRE_PR_CHECKS_SKIP=job1,job2` (documented; no silent skip). Do **not** bypass a failing run with ad-hoc substitutes.
+  - Also verifies the **primary worktree** is unchanged when checks finish.
 - Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).
 - PRs must be **published (not draft)** so reviewers see them normally. Prefer `scripts/dev/submit-stack` for non-interactive submit (implies `--publish`).
 - To merge a PR in **this** repo: enable auto-merge / Merge when ready so GitHub’s merge queue lands it (`gh pr merge --auto --squash`). Do **not** use `merge-it` here. **Other org repos** still use `gh pr edit <number> --add-label merge-it` for Graphite MQ. **Exception:** `dep-updater` batch runs (`--batch`, including daily `--batch --all`) may use `gh pr merge --auto --squash` after CI passes (`--merge-via gh`, the batch default); `--auto` lets GitHub wait for required checks / the merge queue.
@@ -508,15 +516,12 @@ and advances the quota fallback chain instead of hanging (`repository-helpers#40
 
 ## CI Checks (all must pass)
 
-Run locally via **`scripts/dev/pre-pr-checks`** before every PR (same commands as CI):
+Run locally via **`scripts/dev/pre-pr-checks`** before every PR (detect-first ecosystem jobs + main worktree guard):
 
 ```
-scripts/dev/pre-pr-checks            # preferred: all checks + main worktree guard
-# or manually:
-bash -n scripts/* scripts/dev/* scripts/lib/* tests/* tests/lib/*
-shellcheck -S info scripts/* scripts/dev/* scripts/lib/* tests/* tests/lib/*
-actionlint .github/workflows/*.yml scripts/lib/repo-practices-workflows/*.yml
-bash tests/*.test                    # every test harness
+scripts/dev/pre-pr-checks            # preferred: planned jobs + main worktree guard
+# bash-only subset when that is all that is detected:
+bash -n … && shellcheck -S info … && actionlint … && bash tests/*.test
 ```
 
 No PR may be merged with a failing CI check. No exceptions.
