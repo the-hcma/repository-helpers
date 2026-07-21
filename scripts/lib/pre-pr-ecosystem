@@ -1,0 +1,434 @@
+# shellcheck shell=bash
+# scripts/lib/pre-pr-ecosystem — detect project type and run ecosystem pre-PR jobs.
+#
+# Detect filesystem markers first; require/invoke tools only for planned jobs.
+# See repository-helpers#423.
+
+if declare -F prec_detect_profile >/dev/null 2>&1; then
+  return 0
+fi
+
+_prec_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _prec_lib_dir
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_prec_lib_dir}/runner-ensure"
+
+# Populated by prec_detect_profile / prec_load_skip_env (lowercase; not exported).
+prec_detected=()
+prec_planned_jobs=()
+prec_skip_jobs=()
+
+prec_die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+# prec_load_skip_env — parse PRE_PR_CHECKS_SKIP=job1,job2 into prec_skip_jobs.
+prec_load_skip_env() {
+  local raw="${PRE_PR_CHECKS_SKIP:-}"
+  prec_skip_jobs=()
+  raw="${raw//[[:space:]]/}"
+  [[ -n "$raw" ]] || return 0
+  IFS=',' read -r -a prec_skip_jobs <<<"$raw"
+}
+
+# prec_job_is_skipped <job_name>
+prec_job_is_skipped() {
+  local -r name="$1"
+  local s
+  for s in "${prec_skip_jobs[@]+"${prec_skip_jobs[@]}"}"; do
+    [[ "$s" == "$name" ]] && return 0
+  done
+  return 1
+}
+
+# prec_pkg_has_script <package.json> <script_name>
+prec_pkg_has_script() {
+  local -r pkg="$1"
+  local -r script="$2"
+  [[ -f "$pkg" ]] || return 1
+  grep -Eq "\"${script}\"[[:space:]]*:" "$pkg"
+}
+
+# prec_pkg_is_pnpm <package.json-dir-or-file>
+# True when package.json has packageManager pnpm@… or sibling pnpm-lock.yaml exists.
+prec_pkg_is_pnpm() {
+  local root_or_pkg="$1"
+  local pkg dir
+  if [[ -f "$root_or_pkg" ]]; then
+    pkg="$root_or_pkg"
+    dir="$(dirname "$pkg")"
+  else
+    dir="$root_or_pkg"
+    pkg="${dir}/package.json"
+  fi
+  [[ -f "$pkg" ]] || return 1
+  if [[ -f "${dir}/pnpm-lock.yaml" ]]; then
+    return 0
+  fi
+  grep -Eq '"packageManager"[[:space:]]*:[[:space:]]*"pnpm@' "$pkg"
+}
+
+prec_has_python() {
+  local -r root="$1"
+  [[ -f "${root}/pyproject.toml" ]]
+}
+
+prec_has_web_ts() {
+  local -r root="$1"
+  [[ -f "${root}/web/package.json" ]]
+}
+
+prec_has_root_ts() {
+  local -r root="$1"
+  [[ -f "${root}/package.json" ]] || return 1
+  [[ -f "${root}/web/package.json" ]] && return 1
+  prec_pkg_is_pnpm "$root"
+}
+
+prec_has_rust() {
+  local -r root="$1"
+  [[ -f "${root}/Cargo.toml" ]]
+}
+
+prec_has_workflows() {
+  local -r root="$1"
+  local f
+  shopt -s nullglob
+  local -a files=(
+    "${root}"/.github/workflows/*.yml
+    "${root}"/scripts/lib/repo-practices-workflows/*.yml
+  )
+  shopt -u nullglob
+  for f in "${files[@]+"${files[@]}"}"; do
+    [[ -f "$f" ]] && return 0
+  done
+  return 1
+}
+
+# actionlint when helpers-style (CI runs it) or consumer workflows already invoke actionlint.
+prec_should_run_actionlint() {
+  local -r root="$1"
+  local f
+  prec_is_helpers_style "$root" && return 0
+  shopt -s nullglob
+  local -a wfs=( "${root}"/.github/workflows/*.yml )
+  shopt -u nullglob
+  for f in "${wfs[@]+"${wfs[@]}"}"; do
+    [[ -f "$f" ]] || continue
+    if grep -qF 'actionlint' "$f"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+prec_has_bash_tests() {
+  local -r root="$1"
+  local f
+  shopt -s nullglob
+  local -a tests=( "${root}"/tests/*.test )
+  shopt -u nullglob
+  for f in "${tests[@]+"${tests[@]}"}"; do
+    [[ -f "$f" ]] && return 0
+  done
+  return 1
+}
+
+# Helpers-style repos (this project): scripts/dev/pre-pr-checks + CI-shaped shell globs.
+prec_is_helpers_style() {
+  local -r root="$1"
+  [[ -f "${root}/scripts/dev/pre-pr-checks" ]]
+}
+
+# Prefer consumer wrapper when present (domesti-bot .github/ci/shellcheck).
+prec_has_shellcheck_wrapper() {
+  local -r root="$1"
+  [[ -f "${root}/.github/ci/shellcheck" ]]
+}
+
+# Plan bash-n/shellcheck only for helpers-style or repos with an explicit shellcheck wrapper.
+# Avoid -S info on consumer release scripts that their CI does not shellcheck.
+prec_should_run_shell_jobs() {
+  local -r root="$1"
+  prec_is_helpers_style "$root" || prec_has_shellcheck_wrapper "$root"
+}
+
+# prec_shell_file_eligible <abs-or-rel-path>
+# Skip non-shell extensions and python shebangs (domesti-bot .github/ci/shellcheck).
+prec_shell_file_eligible() {
+  local -r path="$1"
+  local base first_line
+  [[ -f "$path" ]] || return 1
+  base="$(basename "$path")"
+  case "$base" in
+    *.py|*.md|*.mdc|*.snippet|*.txt|*.yml|*.yaml|*.json|*.toml|*.rs|*.ts|*.tsx|*.js|*.jsx|*.css|*.html|*.svg)
+      return 1
+      ;;
+  esac
+  first_line=''
+  IFS= read -r first_line <"$path" || true
+  if [[ "$first_line" == *python* ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# prec_collect_shell_files <repo_root> <nameref_array>
+# Prefer CI-shaped globs (scripts/*, scripts/dev/*, scripts/lib/*, tests/*, tests/lib/*)
+# plus shebang-filtered .github/ci/ (consumer pattern). Skip python shebangs / non-shell.
+prec_collect_shell_files() {
+  local -r repo_root="$1"
+  local -n _prec_out=$2
+  local f line rel abs
+  local -a listed=()
+  local -a ci_paths=()
+
+  _prec_out=()
+  shopt -s nullglob
+  for f in \
+    "${repo_root}"/scripts/* \
+    "${repo_root}"/scripts/dev/* \
+    "${repo_root}"/scripts/lib/* \
+    "${repo_root}"/tests/* \
+    "${repo_root}"/tests/lib/*; do
+    [[ -f "$f" ]] || continue
+    if prec_shell_file_eligible "$f"; then
+      _prec_out+=("$f")
+    fi
+  done
+  shopt -u nullglob
+
+  if [[ -d "${repo_root}/.github/ci" ]]; then
+    ci_paths=('.github/ci')
+    # Single-line runner_exec so adoption ratchet sees the wrapper (not a bare git line).
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      listed+=("$line")
+    done < <(runner_exec_stdout "prec git ls-files .github/ci" -- git -C "$repo_root" ls-files -c -o --exclude-standard -- "${ci_paths[@]}") || true
+    for rel in "${listed[@]+"${listed[@]}"}"; do
+      abs="${repo_root}/${rel}"
+      if prec_shell_file_eligible "$abs"; then
+        _prec_out+=("$abs")
+      fi
+    done
+  fi
+}
+
+prec_has_shell_targets() {
+  local -r root="$1"
+  local -a files=()
+  prec_collect_shell_files "$root" files
+  [[ "${#files[@]}" -gt 0 ]]
+}
+
+# prec_plan_add_job <job_name> — append to prec_planned_jobs unless skipped.
+prec_plan_add_job() {
+  local -r name="$1"
+  if prec_job_is_skipped "$name"; then
+    printf '==> skip job (PRE_PR_CHECKS_SKIP): %s\n' "$name" >&2
+    return 0
+  fi
+  prec_planned_jobs+=("$name")
+}
+
+# prec_detect_profile <repo_root>
+# Sets prec_detected and prec_planned_jobs. Filesystem + cheap git ls-files only.
+prec_detect_profile() {
+  local -r root="$1"
+  local -a files=()
+
+  prec_load_skip_env
+  prec_detected=()
+  prec_planned_jobs=()
+
+  if prec_has_python "$root"; then
+    prec_detected+=('python')
+    prec_plan_add_job 'python-static'
+  fi
+  if prec_has_web_ts "$root"; then
+    prec_detected+=('ts-web')
+    prec_plan_add_job 'ts-web'
+  elif prec_has_root_ts "$root"; then
+    prec_detected+=('ts-root')
+    prec_plan_add_job 'ts-root'
+  fi
+  if prec_has_rust "$root"; then
+    prec_detected+=('rust')
+    prec_plan_add_job 'cargo-fmt'
+    prec_plan_add_job 'cargo-clippy'
+  fi
+
+  prec_collect_shell_files "$root" files
+  if prec_should_run_shell_jobs "$root" && [[ "${#files[@]}" -gt 0 || -f "${root}/.github/ci/shellcheck" ]]; then
+    prec_detected+=('shell')
+    if prec_is_helpers_style "$root" || [[ "${#files[@]}" -gt 0 ]]; then
+      prec_plan_add_job 'bash-n'
+    fi
+    prec_plan_add_job 'shellcheck'
+  fi
+  if prec_should_run_actionlint "$root"; then
+    prec_detected+=('workflows')
+    prec_plan_add_job 'actionlint'
+  fi
+  if prec_has_bash_tests "$root"; then
+    prec_detected+=('bash-tests')
+    prec_plan_add_job 'tests'
+  fi
+}
+
+# prec_format_detected — print comma-separated detected ecosystems (or "none").
+prec_format_detected() {
+  if [[ "${#prec_detected[@]}" -eq 0 ]]; then
+    printf 'none'
+    return 0
+  fi
+  local IFS=','
+  printf '%s' "${prec_detected[*]}"
+}
+
+# prec_format_planned_jobs — print comma-separated planned jobs (or "none").
+prec_format_planned_jobs() {
+  if [[ "${#prec_planned_jobs[@]}" -eq 0 ]]; then
+    printf 'none'
+    return 0
+  fi
+  local IFS=','
+  printf '%s' "${prec_planned_jobs[*]}"
+}
+
+# prec_job_is_planned <job_name>
+prec_job_is_planned() {
+  local -r name="$1"
+  local j
+  for j in "${prec_planned_jobs[@]+"${prec_planned_jobs[@]}"}"; do
+    [[ "$j" == "$name" ]] && return 0
+  done
+  return 1
+}
+
+# prec_require_tools_for_planned — die if a tool needed by a planned job is missing.
+prec_require_tools_for_planned() {
+  local need_shellcheck=0 need_actionlint=0 need_rg=0 need_uv=0 need_pnpm=0 need_cargo=0
+
+  prec_job_is_planned 'shellcheck' && need_shellcheck=1
+  prec_job_is_planned 'actionlint' && need_actionlint=1
+  prec_job_is_planned 'tests' && need_rg=1
+  prec_job_is_planned 'python-static' && need_uv=1
+  prec_job_is_planned 'ts-web' && need_pnpm=1
+  prec_job_is_planned 'ts-root' && need_pnpm=1
+  prec_job_is_planned 'cargo-fmt' && need_cargo=1
+  prec_job_is_planned 'cargo-clippy' && need_cargo=1
+
+  command -v bash >/dev/null 2>&1 || prec_die "bash not found on PATH"
+
+  if [[ "$need_shellcheck" -eq 1 ]]; then
+    command -v shellcheck >/dev/null 2>&1 \
+      || prec_die "shellcheck not found on PATH (required for planned shellcheck job)"
+  fi
+  if [[ "$need_actionlint" -eq 1 ]]; then
+    command -v actionlint >/dev/null 2>&1 \
+      || prec_die "actionlint not found on PATH (required for planned actionlint job)"
+  fi
+  if [[ "$need_rg" -eq 1 ]]; then
+    command -v rg >/dev/null 2>&1 \
+      || prec_die "rg (ripgrep) not found on PATH (required by tests; see CI workflow)"
+  fi
+  if [[ "$need_uv" -eq 1 ]]; then
+    command -v uv >/dev/null 2>&1 \
+      || prec_die "uv not found on PATH. Install: https://docs.astral.sh/uv/"
+  fi
+  if [[ "$need_pnpm" -eq 1 ]]; then
+    command -v pnpm >/dev/null 2>&1 \
+      || prec_die "pnpm not found on PATH (required for TypeScript jobs). Install: npm install -g pnpm"
+  fi
+  if [[ "$need_cargo" -eq 1 ]]; then
+    command -v cargo >/dev/null 2>&1 \
+      || prec_die "cargo not found on PATH. Install: https://www.rust-lang.org/tools/install"
+  fi
+}
+
+# --- Job runners (cwd: caller should pass repo_root; runners cd themselves) ---
+
+prec_run_python_static() {
+  local -r root="$1"
+  (
+    cd "$root" || exit 1
+    if [[ -f .github/ci/python-static ]]; then
+      run_command "pre-pr python-static wrapper" bash .github/ci/python-static
+      return 0
+    fi
+    if [[ -f .github/ci/setup-python ]]; then
+      run_command "pre-pr setup-python" bash .github/ci/setup-python
+    fi
+    run_command "pre-pr ruff check" uv run ruff check .
+    run_command "pre-pr ruff format --check" uv run ruff format --check .
+    run_command "pre-pr pyright" uv run pyright
+  )
+}
+
+prec_run_ts_web() {
+  local -r root="$1"
+  local -r web="${root}/web"
+  local pkg="${web}/package.json"
+  (
+    cd "$web" || exit 1
+    run_command "pre-pr pnpm install (web)" pnpm install --frozen-lockfile
+    if prec_pkg_has_script "$pkg" typecheck; then
+      run_command "pre-pr pnpm typecheck (web)" pnpm run typecheck
+    fi
+    if prec_pkg_has_script "$pkg" build; then
+      run_command "pre-pr pnpm build (web)" pnpm run build
+    fi
+  )
+}
+
+prec_run_ts_root() {
+  local -r root="$1"
+  local pkg="${root}/package.json"
+  (
+    cd "$root" || exit 1
+    run_command "pre-pr pnpm install (root)" pnpm install --frozen-lockfile
+    if prec_pkg_has_script "$pkg" check; then
+      run_command "pre-pr pnpm check (root)" pnpm run check
+      return 0
+    fi
+    if prec_pkg_has_script "$pkg" typecheck; then
+      run_command "pre-pr pnpm typecheck (root)" pnpm run typecheck
+    fi
+    if prec_pkg_has_script "$pkg" lint; then
+      run_command "pre-pr pnpm lint (root)" pnpm run lint
+    fi
+  )
+}
+
+prec_run_cargo_fmt() {
+  local -r root="$1"
+  (
+    cd "$root" || exit 1
+    run_command "pre-pr cargo fmt" cargo fmt --all -- --check
+  )
+}
+
+prec_run_cargo_clippy() {
+  local -r root="$1"
+  (
+    cd "$root" || exit 1
+    run_command "pre-pr cargo clippy" cargo clippy --all-targets -- -D warnings
+  )
+}
+
+prec_collect_actionlint_files() {
+  local -r repo_root="$1"
+  local -n _al_out=$2
+  local f
+  _al_out=()
+  shopt -s nullglob
+  for f in \
+    "${repo_root}"/.github/workflows/*.yml \
+    "${repo_root}"/scripts/lib/repo-practices-workflows/*.yml; do
+    [[ -f "$f" ]] || continue
+    _al_out+=("$f")
+  done
+  shopt -u nullglob
+}

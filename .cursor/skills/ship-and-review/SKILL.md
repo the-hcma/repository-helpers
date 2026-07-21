@@ -30,7 +30,7 @@ From the stack worktree:
 scripts/dev/pre-pr-checks
 ```
 
-Fix failures before committing. Do not skip hooks or push with failing gates.
+`pre-pr-checks` detects ecosystems first and runs only planned jobs (bash/shellcheck/actionlint/tests, plus Python/TS/Rust when markers are present). Fix failures before committing. **Do not bypass a failing run** with ad-hoc substitutes; use documented `PRE_PR_CHECKS_SKIP=job1,job2` only as an explicit escape hatch. Do not skip hooks or push with failing gates.
 
 ## 2. Commit, submit, and monitor CI (required after every push)
 
