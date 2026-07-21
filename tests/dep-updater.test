@@ -3010,6 +3010,242 @@ else
   pass=$(( pass + 1 ))
 fi
 
+# shellcheck disable=SC2016  # grep -qF needles are literal source tokens
+if grep -qF 'dep_stack_gh_stack_adopt_current()' "$script" \
+  && grep -qF 'gh stack init --base main' "$script" \
+  && grep -qF 'gh stack unstack --local' "$script" \
+  && grep -qF 'dep_stack_gh_stack_adopt_current' "$script" \
+  && grep -qF 'dep_runner_sh "dep-updater probe gh stack" --' "$script"; then
+  printf '[PASS] stacking-tool: gh-stack adopt/init/unstack-local before submit; prereq probe uses --\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] stacking-tool: missing gh-stack adopt helpers or broken prereq probe\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: gh-stack register adopts via init before submit ===\n'
+gh_stack_adopt_dir="$(mktemp -d)"
+gh_stack_fake_bin="${gh_stack_adopt_dir}/bin"
+gh_stack_log="${gh_stack_adopt_dir}/gh.log"
+gh_stack_state="${gh_stack_adopt_dir}/state"
+gh_stack_wt="${gh_stack_adopt_dir}/wt"
+mkdir -p "$gh_stack_fake_bin" "$gh_stack_wt"
+: >"$gh_stack_log"
+: >"$gh_stack_state"
+
+git -C "$gh_stack_wt" init --initial-branch=main -q
+git -C "$gh_stack_wt" config user.name dep-updater-test
+git -C "$gh_stack_wt" config user.email dep-updater-test@example.com
+git -C "$gh_stack_wt" commit --allow-empty -q -m 'chore: init'
+git -C "$gh_stack_wt" checkout -q -b dep-updates/npm-first
+git -C "$gh_stack_wt" commit --allow-empty -q -m 'chore(deps): first'
+
+cat >"${gh_stack_fake_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${GH_STACK_LOG:?}"
+if [[ "$*" == 'stack --help' || "$*" == *'stack --help'* ]]; then
+  exit 0
+fi
+if [[ "$*" == *'stack view --json'* ]]; then
+  # No local stack until init; match real gh-stack exit for unstacked branch.
+  exit 2
+fi
+if [[ "$*" == *'stack unstack --local'* ]]; then
+  exit 0
+fi
+if [[ "$*" == *'stack init --base main'* ]]; then
+  exit 0
+fi
+if [[ "$*" == *'stack submit'* ]]; then
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 1
+MOCK_GH
+chmod +x "${gh_stack_fake_bin}/gh"
+
+gh_stack_helpers="$(awk '
+  /^dep_stack_gh_stack_adopt_current\(\)/ {p=1}
+  /^dep_stack_register_branch\(\)/ {p=1}
+  /^dep_stack_submit_current\(\)/ {p=1}
+  p {print}
+  p && /^}/ {p=0}
+' "$script")"
+
+set +e
+gh_stack_probe_out="$(
+  PATH="${gh_stack_fake_bin}:${PATH}" \
+  GH_STACK_LOG="$gh_stack_log" \
+  bash -c '
+    set -euo pipefail
+    worktree_path="$1"
+    state_file="$2"
+    dep_stacking_tool="gh-stack"
+    wt_base_branch="dep-updater-wt-base"
+    die() { printf "DIE: %s\n" "$*" >&2; exit 1; }
+    log() { :; }
+    state_get() {
+      local -r key="$1"
+      rg -m1 "^${key}=" "$state_file" 2>/dev/null | cut -d= -f2- || true
+    }
+    csv_contains() {
+      local -r csv="$1"
+      local -r needle="$2"
+      [[ -n "$csv" ]] || return 1
+      [[ ",${csv}," == *",${needle},"* ]]
+    }
+    run_command() { shift; "$@"; }
+    run_in_worktree() { (cd "$worktree_path" && "$@"); }
+    runner_sh() {
+      local label="$1"; shift
+      local probe=0
+      [[ "${1:-}" == "--probe" ]] && { probe=1; shift; }
+      [[ "${1:-}" == "--" ]] && shift
+      local -r script="$1"
+      bash -c "$script"
+    }
+    dep_runner_sh() {
+      local -r label="$1"; shift
+      [[ "${1:-}" == "--" ]] || return 2
+      shift
+      bash -c "$*"
+    }
+    dep_runner_git_c_stdout() {
+      shift
+      local -r repo="$1"; shift
+      [[ "${1:-}" == "--" ]] && shift
+      git -C "$repo" "$@"
+    }
+    dep_stacking_is_gh_stack() { [[ "$dep_stacking_tool" == "gh-stack" ]]; }
+    dep_stacking_is_graphite() { [[ "$dep_stacking_tool" == "graphite" ]]; }
+    dep_stack_branch_info_ok() {
+      run_in_worktree gh stack view --json >/dev/null 2>&1
+    }
+    eval "$3"
+    dep_stack_register_branch "$wt_base_branch"
+    dep_stack_submit_current
+  ' _ "$gh_stack_wt" "$gh_stack_state" "$gh_stack_helpers" 2>&1
+)"
+gh_stack_probe_exit=$?
+set -e
+
+if [[ "$gh_stack_probe_exit" -eq 0 ]] \
+  && grep -qF 'stack init --base main dep-updates/npm-first' "$gh_stack_log" \
+  && grep -qF 'stack submit --auto --open --remote origin' "$gh_stack_log" \
+  && awk '
+      /stack init --base main/ { init=1 }
+      /stack submit/ { submit=1; if (!init) exit 1 }
+      END { exit (init && submit) ? 0 : 1 }
+    ' "$gh_stack_log"; then
+  printf '[PASS] gh-stack register: init adopts branch before submit\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] gh-stack register: expected init-before-submit (exit=%s)\n%s\ngh_log:\n%s\n' \
+    "$gh_stack_probe_exit" "$gh_stack_probe_out" "$(cat "$gh_stack_log" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+
+# Layer 2: prior branch in state + existing local stack → unstack --local then re-init.
+printf 'branches=dep-updates/npm-first\n' >"$gh_stack_state"
+: >"$gh_stack_log"
+git -C "$gh_stack_wt" checkout -q -b dep-updates/npm-second
+git -C "$gh_stack_wt" commit --allow-empty -q -m 'chore(deps): second'
+
+cat >"${gh_stack_fake_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${GH_STACK_LOG:?}"
+# Pretend bottom branch is already stacked so adopt clears local tracking.
+if [[ "$*" == *'stack view --json'* ]]; then
+  printf '%s\n' '{"trunk":"main","branches":[{"name":"dep-updates/npm-first"}]}'
+  exit 0
+fi
+if [[ "$*" == *'stack unstack --local'* ]]; then
+  exit 0
+fi
+if [[ "$*" == *'stack init --base main'* ]]; then
+  exit 0
+fi
+if [[ "$*" == *'stack submit'* ]]; then
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 1
+MOCK_GH
+chmod +x "${gh_stack_fake_bin}/gh"
+
+set +e
+gh_stack_probe2_out="$(
+  PATH="${gh_stack_fake_bin}:${PATH}" \
+  GH_STACK_LOG="$gh_stack_log" \
+  bash -c '
+    set -euo pipefail
+    worktree_path="$1"
+    state_file="$2"
+    dep_stacking_tool="gh-stack"
+    wt_base_branch="dep-updater-wt-base"
+    die() { printf "DIE: %s\n" "$*" >&2; exit 1; }
+    log() { :; }
+    state_get() {
+      local -r key="$1"
+      rg -m1 "^${key}=" "$state_file" 2>/dev/null | cut -d= -f2- || true
+    }
+    csv_contains() {
+      local -r csv="$1"
+      local -r needle="$2"
+      [[ -n "$csv" ]] || return 1
+      [[ ",${csv}," == *",${needle},"* ]]
+    }
+    run_command() { shift; "$@"; }
+    run_in_worktree() { (cd "$worktree_path" && "$@"); }
+    runner_sh() {
+      local label="$1"; shift
+      [[ "${1:-}" == "--probe" ]] && shift
+      [[ "${1:-}" == "--" ]] && shift
+      bash -c "$1"
+    }
+    dep_runner_sh() {
+      local -r label="$1"; shift
+      [[ "${1:-}" == "--" ]] || return 2
+      shift
+      bash -c "$*"
+    }
+    dep_runner_git_c_stdout() {
+      shift
+      local -r repo="$1"; shift
+      [[ "${1:-}" == "--" ]] && shift
+      git -C "$repo" "$@"
+    }
+    dep_stacking_is_gh_stack() { [[ "$dep_stacking_tool" == "gh-stack" ]]; }
+    dep_stacking_is_graphite() { [[ "$dep_stacking_tool" == "graphite" ]]; }
+    eval "$3"
+    dep_stack_register_branch "dep-updates/npm-first"
+    dep_stack_submit_current
+  ' _ "$gh_stack_wt" "$gh_stack_state" "$gh_stack_helpers" 2>&1
+)"
+gh_stack_probe2_exit=$?
+set -e
+
+if [[ "$gh_stack_probe2_exit" -eq 0 ]] \
+  && grep -qF 'stack unstack --local' "$gh_stack_log" \
+  && grep -qF 'stack init --base main dep-updates/npm-first dep-updates/npm-second' \
+    "$gh_stack_log" \
+  && awk '
+      /stack unstack --local/ { u=1 }
+      /stack init --base main/ { if (!u) exit 1; i=1 }
+      /stack submit/ { if (!i) exit 1 }
+      END { exit (u && i) ? 0 : 1 }
+    ' "$gh_stack_log"; then
+  printf '[PASS] gh-stack register: second layer unstack --local then re-init before submit\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] gh-stack register: expected unstack+re-init for layer 2 (exit=%s)\n%s\ngh_log:\n%s\n' \
+    "$gh_stack_probe2_exit" "$gh_stack_probe2_out" "$(cat "$gh_stack_log" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$gh_stack_adopt_dir"
+
 printf '\n=== static: die records first failure ===\n'
 die_body="$(awk '/^die\(\) \{/{found=1; next} found && /^\}$/{exit} found' "$script")"
 if printf '%s\n' "$die_body" | grep -qF 'record_first_failure'; then
