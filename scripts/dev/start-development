@@ -11,7 +11,18 @@ source "${_sd_script_dir}/../lib/runner-bootstrap"
 source "${_sd_script_dir}/../lib/stacking-tool"
 # Referenced below; assigned readonly in scripts/lib/stacking-tool.
 # shellcheck disable=SC2154
-: "${stacking_tool_MARKER_RELPATH}" "${stacking_tool_VALUE_GH_STACK}"
+: "${stacking_tool_marker_relpath}" "${stacking_tool_value_graphite}" \
+  "${stacking_tool_value_gh_stack}" "${stacking_tool_org_default}"
+
+# Resolved once per session (missing marker → org default + log; invalid → die).
+start_dev_stacking_tool=''
+
+start_dev_stacking_tool_value() {
+  if [[ -z "$start_dev_stacking_tool" ]]; then
+    start_dev_stacking_tool="$(stacking_tool_read_or_org_default "$main_repo" "start-development")"
+  fi
+  printf '%s' "$start_dev_stacking_tool"
+}
 
 sd_runner_last_stdout() {
   local uuid
@@ -132,8 +143,9 @@ gh_pr_info() {
 
 # start_dev_consult_graphite_for_pr_state
 # Exit 0 when gt info should be consulted for merge/close detection.
-# Skip Graphite when START_DEV_SKIP_GRAPHITE=1, gt is missing, or the repo marker
-# is gh-stack (gh-stack branches are not Graphite-tracked and gt info fails loudly).
+# Skip Graphite when START_DEV_SKIP_GRAPHITE=1, gt is missing, or the resolved
+# stacking tool is gh-stack (gh-stack branches are not Graphite-tracked).
+# Missing marker → org default (logged once); invalid marker → dies.
 start_dev_consult_graphite_for_pr_state() {
   local tool
 
@@ -143,22 +155,20 @@ start_dev_consult_graphite_for_pr_state() {
   if ! command -v gt >/dev/null 2>&1; then
     return 1
   fi
-  if [[ -f "${main_repo}/${stacking_tool_MARKER_RELPATH}" ]]; then
-    # Invalid/empty marker: fall back to Graphite (org default), do not abort prune.
-    tool="$(stacking_tool_read "$main_repo" 2>/dev/null)" || return 0
-    if [[ "$tool" == "$stacking_tool_VALUE_GH_STACK" ]]; then
-      return 1
-    fi
+  tool="$(start_dev_stacking_tool_value)"
+  if [[ "$tool" == "$stacking_tool_value_gh_stack" ]]; then
+    return 1
   fi
   return 0
 }
 
 # resolve_pr_state_for_branch <branch>
 # Prints the same format as gh_pr_info: NOT_FOUND | <STATE> <NUMBER>.
-# For graphite (or no marker yet): Graphite is authoritative for merge/close —
-# gt info --branch reflects merged stacks immediately, while GitHub's REST view
-# can still list the PR as OPEN until caches catch up.
+# For graphite (or org default when marker missing): Graphite is authoritative for
+# merge/close — gt info --branch reflects merged stacks immediately, while GitHub's
+# REST view can still list the PR as OPEN until caches catch up.
 # For gh-stack: use GitHub only (never call gt info).
+# Invalid marker aborts session setup (stacking_tool_read_or_org_default).
 resolve_pr_state_for_branch() {
   local -r branch="$1"
   local gt_out first_line pr_from_gt gh_line gh_num
@@ -682,11 +692,8 @@ while IFS= read -r line; do
 done <<< "$wt_info"
 
 # 3. Synchronize stacking tool (Graphite or git fetch per .github/stacking-tool)
-if [[ -f "${main_repo}/${stacking_tool_MARKER_RELPATH}" ]]; then
-  echo "Synchronizing via stacking-tool ($(stacking_tool_read "$main_repo"))..."
-else
-  echo "Synchronizing Graphite (gt sync --force --quiet; no ${stacking_tool_MARKER_RELPATH} yet)..."
-fi
+start_dev_tool="$(start_dev_stacking_tool_value)"
+echo "Synchronizing via stacking-tool (${start_dev_tool})..."
 
 # Stash tracked changes before sync, but leave lockfiles at HEAD so stash pop does
 # not leave modified uv.lock / pnpm-lock.yaml behind (common when sync updates pins).
@@ -707,13 +714,8 @@ if [[ ${#stash_paths[@]} -gt 0 ]]; then
 fi
 
 set +e
-if [[ -f "${main_repo}/${stacking_tool_MARKER_RELPATH}" ]]; then
-  stacking_tool_session_sync "$main_repo"
-  gt_sync_exit=$?
-else
-  runner_sh "start-development gt sync" "cd \"${main_repo}\" && gt sync --quiet --force"
-  gt_sync_exit=$?
-fi
+stacking_tool_session_sync_as "$start_dev_tool" "$main_repo"
+gt_sync_exit=$?
 set -e
 if [[ "$gt_sync_exit" -ne 0 ]]; then
   printf '   [~] session sync exited with code %s (often: tool deletes a branch that git already removed). Continuing with post-sync cleanup.\n' \
@@ -968,21 +970,14 @@ if [[ -z "$selected_path" ]]; then
         exit 2
     fi
     sd_runner_git_c "$main_repo" "start-development worktree add" -- worktree add -b "$branch_name" "$selected_path" main
-    if [[ -f "${main_repo}/${stacking_tool_MARKER_RELPATH}" ]] \
-      && [[ "$(stacking_tool_read "$main_repo")" == "$stacking_tool_VALUE_GH_STACK" ]]; then
+    if [[ "$(start_dev_stacking_tool_value)" == "$stacking_tool_value_gh_stack" ]]; then
       :
     else
       runner_sh "start-development gt track" "cd \"${selected_path}\" && gt track --parent main"
     fi
 
     echo ""
-    if [[ -f "${selected_path}/${stacking_tool_MARKER_RELPATH}" ]] \
-      && [[ "$(stacking_tool_read "$selected_path")" == "$stacking_tool_VALUE_GH_STACK" ]]; then
-      echo "Start your first stack with:"
-      echo "  gh stack init ${stack_name}/<description>"
-      echo "  # commit, then: gh stack add <next-layer>   # or gh stack submit --auto --open"
-    elif [[ -f "${main_repo}/${stacking_tool_MARKER_RELPATH}" ]] \
-      && [[ "$(stacking_tool_read "$main_repo")" == "$stacking_tool_VALUE_GH_STACK" ]]; then
+    if [[ "$(start_dev_stacking_tool_value)" == "$stacking_tool_value_gh_stack" ]]; then
       echo "Start your first stack with:"
       echo "  gh stack init ${stack_name}/<description>"
       echo "  # commit, then: gh stack add <next-layer>   # or gh stack submit --auto --open"
@@ -997,8 +992,7 @@ echo ""
 echo "To work on this stack, run:"
 echo "  cd $selected_path"
 echo "=========================================="
-if [[ -f "${main_repo}/${stacking_tool_MARKER_RELPATH}" ]] \
-  && [[ "$(stacking_tool_read "$main_repo")" == "$stacking_tool_VALUE_GH_STACK" ]]; then
+if [[ "$(start_dev_stacking_tool_value)" == "$stacking_tool_value_gh_stack" ]]; then
   echo "Tip: Use 'gh stack view --json' to inspect GitHub Stacked PRs state."
 else
   echo "Tip: Use 'gt state' to debug Graphite metadata issues."
