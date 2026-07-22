@@ -331,21 +331,58 @@ agent_review_profile_review_is_empty() {
   return 1
 }
 
-# agent_review_profile_fresh_on_head <snapshot> <head> <repo> <pr>
-# CodeRabbit posts walkthrough summaries as issue comments, not GraphQL reviews.
-# Rate-limit / billing stubs often mention the head SHA in "Reviewing files…" metadata —
-# those are not completed reviews and must not count as fresh (repository-helpers#368).
-# Commit status "Review completed" alone is also not enough — complete requires a real
-# sign-off body/check from an agent on this head (issue #369 follow-up).
-agent_review_profile_fresh_on_head() {
-  local -r snapshot="$1"
-  local -r head="$2"
-  local -r repo="$3"
-  local -r pr="$4"
-  local body short_head lower
+# agent_review_profile_comment_is_command_ack <body>
+# True for ephemeral "@coderabbitai …" command replies ("Action performed" /
+# "Full review finished") that must not mask a prior walkthrough sign-off.
+agent_review_profile_comment_is_command_ack() {
+  local -r body="${1:-}"
+  local lower
 
-  body="$(agent_review_latest_issue_comment_body_for_profile "${repo}" "${pr}")"
   if [[ -z "${body}" ]]; then
+    return 1
+  fi
+  lower="${body,,}"
+  # Real review bodies embed walkthrough / summarize markers or comment tallies.
+  if [[ "${lower}" == *"walkthrough_start"* ]] \
+    || [[ "${lower}" == *"summarize by coderabbit"* ]] \
+    || [[ "${lower}" == *"review_stack_entry"* ]] \
+    || [[ "${lower}" =~ actionable[[:space:]]+comments[[:space:]]+(posted|were[[:space:]]+generated) ]]; then
+    return 1
+  fi
+  if [[ "${lower}" == *"action performed"* ]] \
+    || [[ "${lower}" == *"full review finished"* ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# agent_review_profile_comment_body_matches_head <body> <head>
+agent_review_profile_comment_body_matches_head() {
+  local -r body="${1:-}"
+  local -r head="${2:-}"
+  local short_head
+
+  if [[ -z "${body}" || -z "${head}" ]]; then
+    return 1
+  fi
+  if [[ "${body}" == *"${head}"* ]]; then
+    return 0
+  fi
+  short_head="${head:0:7}"
+  [[ -n "${short_head}" && "${body}" == *"${short_head}"* ]]
+}
+
+# agent_review_profile_comment_is_usable_head_review <body> <head>
+# True when body is a completed CodeRabbit review for <head> (not ack/rate-limit).
+agent_review_profile_comment_is_usable_head_review() {
+  local -r body="${1:-}"
+  local -r head="${2:-}"
+  local lower
+
+  if [[ -z "${body}" ]] || ! agent_review_profile_comment_body_matches_head "${body}" "${head}"; then
+    return 1
+  fi
+  if agent_review_profile_comment_is_command_ack "${body}"; then
     return 1
   fi
   lower="${body,,}"
@@ -356,16 +393,95 @@ agent_review_profile_fresh_on_head() {
     || agent_review_profile_text_is_coderabbit_billing_block "${body}"; then
     return 1
   fi
-  if [[ "${body}" == *"${head}"* ]]; then
-    return 0
-  fi
-  # Intentional: CodeRabbit often embeds the abbreviated SHA. Rate-limit/quota stubs
-  # are rejected above before we reach SHA matching.
+  return 0
+}
+
+# agent_review_profile_select_review_body_on_head <repo> <pr> <head>
+# Prefer the newest CodeRabbit issue comment that mentions <head> and is not an
+# ack/rate-limit stub. Falling back to "latest profile comment" alone is wrong
+# when a later "Full review finished" ack follows a walkthrough that has the SHA.
+agent_review_profile_select_review_body_on_head() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local comments_json body short_head
+
   short_head="${head:0:7}"
-  if [[ -n "${short_head}" ]] && [[ "${body}" == *"${short_head}"* ]]; then
+  comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
+  if [[ -n "${comments_json}" && "${comments_json}" != '[]' && "${comments_json}" != 'null' ]]; then
+    # shellcheck disable=SC2016  # jq uses $re / $head / $short from --arg
+    body="$(ar_runner_jq_file "coderabbit profile select head review body" "${comments_json}" -rs \
+      --arg re "${agent_review_profile_request_login_regex}" \
+      --arg head "${head}" \
+      --arg short "${short_head}" '
+      def lower: ascii_downcase;
+      def matches_head:
+        (. as $b
+         | ($head != "" and ($b | contains($head)))
+           or ($short != "" and ($b | contains($short))));
+      def is_real_review_marker:
+        ((. | lower) as $l
+         | ($l | contains("walkthrough_start"))
+           or ($l | contains("summarize by coderabbit"))
+           or ($l | contains("review_stack_entry"))
+           or ($l | test("actionable[[:space:]]+comments[[:space:]]+(posted|were[[:space:]]+generated)")));
+      def is_command_ack:
+        ((. | lower) as $l
+         | (($l | contains("action performed")) or ($l | contains("full review finished"))))
+        and ((. | is_real_review_marker) | not);
+      def is_rate_or_quota:
+        ((. | lower) as $l
+         | ($l | contains("rate limited by coderabbit"))
+           or ($l | contains("rate limited by coderabbit.ai"))
+           or ($l | test("review[[:space:]]+limit[[:space:]]+reached"))
+           or ($l | test("usage[[:space:]]+limit[[:space:]]+reached"))
+           or ($l | test("next[[:space:]]+review[[:space:]]+available[[:space:]]+in"))
+           or ($l | test("more[[:space:]]+reviews?[[:space:]]+(will[[:space:]]+be[[:space:]]+)?available[[:space:]]+in"))
+           or ($l | test("quota[_[:space:]-]?exceeded"))
+           or ($l | test("billing[[:space:]]+(limit|quota|issue)"))
+           or ($l | test("subscription[[:space:]]+(limit|expired)")));
+      [ .[]
+        | .[]
+        | select((.user.login // "") | test($re; "i"))
+        | select((.body // "" | length) > 0)
+        | select((.body // "") | matches_head)
+        | select((.body // "") | is_command_ack | not)
+        | select((.body // "") | is_rate_or_quota | not)
+      ]
+      | sort_by(.created_at)
+      | if length == 0 then "" else (last | .body // "") end
+    ' 2>/dev/null || true)"
+    if [[ -n "${body}" ]]; then
+      printf '%s' "${body}"
+      return 0
+    fi
+  fi
+
+  # Fallback for unit tests that stub only the latest-comment helper.
+  body="$(agent_review_latest_issue_comment_body_for_profile "${repo}" "${pr}")"
+  if agent_review_profile_comment_is_usable_head_review "${body}" "${head}"; then
+    printf '%s' "${body}"
     return 0
   fi
-  return 1
+  printf '\n'
+}
+
+# agent_review_profile_fresh_on_head <snapshot> <head> <repo> <pr>
+# CodeRabbit posts walkthrough summaries as issue comments, not GraphQL reviews.
+# Rate-limit / billing stubs often mention the head SHA in "Reviewing files…" metadata —
+# those are not completed reviews and must not count as fresh (repository-helpers#368).
+# Commit status "Review completed" alone is also not enough — complete requires a real
+# sign-off body/check from an agent on this head (issue #369 follow-up).
+# Later "Action performed / Full review finished" acks must not hide an earlier
+# walkthrough that already signed off on this head.
+agent_review_profile_fresh_on_head() {
+  local -r head="$2"
+  local -r repo="$3"
+  local -r pr="$4"
+  local body
+
+  body="$(agent_review_profile_select_review_body_on_head "${repo}" "${pr}" "${head}")"
+  [[ -n "${body}" ]]
 }
 
 # agent_review_profile_latest_review_body_on_head <snapshot> <head> <repo> <pr>
@@ -373,23 +489,8 @@ agent_review_profile_latest_review_body_on_head() {
   local -r head="$2"
   local -r repo="$3"
   local -r pr="$4"
-  local body short_head
 
-  body="$(agent_review_latest_issue_comment_body_for_profile "${repo}" "${pr}")"
-  if [[ -z "${body}" ]]; then
-    printf '\n'
-    return 0
-  fi
-  if [[ "${body}" == *"${head}"* ]]; then
-    printf '%s' "${body}"
-    return 0
-  fi
-  short_head="${head:0:7}"
-  if [[ -n "${short_head}" ]] && [[ "${body}" == *"${short_head}"* ]]; then
-    printf '%s' "${body}"
-    return 0
-  fi
-  printf '\n'
+  agent_review_profile_select_review_body_on_head "${repo}" "${pr}" "${head}"
 }
 
 # agent_review_coderabbit_full_review_marker <head_sha>
