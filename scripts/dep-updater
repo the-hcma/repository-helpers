@@ -5614,11 +5614,35 @@ rust_outdated() {
       done
 }
 
+# rust_revert_post_bump_workdir <worktree_dir>
+# Drop Cargo.toml / Cargo.lock / *.rs changes from a failed bump+clippy attempt
+# so other ecosystems (or later crates) can continue. Leaves package.json etc.
+rust_revert_post_bump_workdir() {
+  local -r cargo_dir="$1"
+  local f
+
+  run_command "git worktree" git -C "$cargo_dir" restore --source=HEAD --staged --worktree -- \
+    Cargo.toml Cargo.lock 2>/dev/null || true
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    case "$f" in
+      *.rs) ;;
+      *) continue ;;
+    esac
+    run_command "git worktree" git -C "$cargo_dir" restore --source=HEAD --staged --worktree -- "$f" \
+      2>/dev/null || true
+  done < <({
+    dep_runner_git_c_stdout "git worktree" "$cargo_dir" -- diff --name-only HEAD 2>/dev/null || true
+    dep_runner_git_c_stdout "git worktree" "$cargo_dir" -- diff --cached --name-only 2>/dev/null || true
+  } | sort -u)
+}
+
 # rust_recover_post_bump_clippy <worktree_dir>
 # After cargo add bumps, run the same clippy bar as consumer CI (-D warnings).
 # On failure, apply mechanical suggestions via `cargo clippy --fix`, then
 # re-check. Returns 0 when clean or recovered; 1 when still failing (caller
-# should abort with ERROR: RUST_CLIPPY_RECOVER_FAILED — issue #433).
+# should skip/revert the Rust bump — issue #433). Logs
+# ERROR: RUST_CLIPPY_RECOVER_FAILED on unrecovered failure.
 rust_recover_post_bump_clippy() {
   local -r cargo_dir="$1"
   local clippy_out clippy_rc fix_out fix_rc
@@ -5723,9 +5747,16 @@ rust_update_one() {
   fi
 
   if ! rust_recover_post_bump_clippy "$worktree_path"; then
-    die "RUST_CLIPPY_RECOVER_FAILED after bumping ${pkg} ${old_ver}→${new_ver}"
+    log "[rust] Skipping ${pkg} ${old_ver}→${new_ver}: unrecovered clippy after bump."
+    rust_revert_post_bump_workdir "$worktree_path"
+    return 0
   fi
   run_command "git worktree" git -C "$worktree_path" add -u
+
+  if git -C "$worktree_path" diff --cached --quiet; then
+    log "[rust] ${pkg}: no file changes after clippy recover — skipping PR."
+    return 0
+  fi
 
   local parent_branch
   parent_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current)"
@@ -6337,9 +6368,12 @@ batch_update_all() {
     if ! git -C "$worktree_path" diff --cached --quiet; then
       any_rust=1
       if ! rust_recover_post_bump_clippy "$worktree_path"; then
-        die "RUST_CLIPPY_RECOVER_FAILED after Rust batch dependency bumps"
+        log "[rust] Reverting Rust batch bumps after unrecovered clippy; continuing other ecosystems."
+        rust_revert_post_bump_workdir "$worktree_path"
+        any_rust=0
+      else
+        run_command "git worktree" git -C "$worktree_path" add -u
       fi
-      run_command "git worktree" git -C "$worktree_path" add -u
     fi
   fi
 
