@@ -5614,6 +5614,77 @@ rust_outdated() {
       done
 }
 
+# rust_revert_post_bump_workdir <worktree_dir>
+# Drop Cargo.toml / Cargo.lock / *.rs changes from a failed bump+clippy attempt
+# so other ecosystems (or later crates) can continue. Leaves package.json etc.
+rust_revert_post_bump_workdir() {
+  local -r cargo_dir="$1"
+  local f
+
+  run_command "git worktree" git -C "$cargo_dir" restore --source=HEAD --staged --worktree -- \
+    Cargo.toml Cargo.lock 2>/dev/null || true
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    case "$f" in
+      *.rs) ;;
+      *) continue ;;
+    esac
+    run_command "git worktree" git -C "$cargo_dir" restore --source=HEAD --staged --worktree -- "$f" \
+      2>/dev/null || true
+  done < <({
+    dep_runner_git_c_stdout "git worktree" "$cargo_dir" -- diff --name-only HEAD 2>/dev/null || true
+    dep_runner_git_c_stdout "git worktree" "$cargo_dir" -- diff --cached --name-only 2>/dev/null || true
+  } | sort -u)
+}
+
+# rust_recover_post_bump_clippy <worktree_dir>
+# After cargo add bumps, run the same clippy bar as consumer CI (-D warnings).
+# On failure, apply mechanical suggestions via `cargo clippy --fix`, then
+# re-check. Returns 0 when clean or recovered; 1 when still failing (caller
+# should skip/revert the Rust bump — issue #433). Logs
+# ERROR: RUST_CLIPPY_RECOVER_FAILED on unrecovered failure.
+rust_recover_post_bump_clippy() {
+  local -r cargo_dir="$1"
+  local clippy_out clippy_rc fix_out fix_rc
+  local -r clippy_tail_lines=40
+
+  log "[rust] Running post-bump clippy (--all-targets -D warnings)…"
+  clippy_rc=0
+  clippy_out="$(dep_runner_cargo_dir_capture "cargo clippy post-bump" "$cargo_dir" -- \
+    clippy --all-targets -- -D warnings)" || clippy_rc=$?
+  if (( clippy_rc == 0 )); then
+    log "[rust] Post-bump clippy clean."
+    return 0
+  fi
+
+  log "[rust] Post-bump clippy failed (exit ${clippy_rc}); attempting cargo clippy --fix…"
+  fix_rc=0
+  fix_out="$(dep_runner_cargo_dir_capture "cargo clippy --fix" "$cargo_dir" -- \
+    clippy --fix --allow-dirty --allow-staged)" || fix_rc=$?
+  if (( fix_rc != 0 )); then
+    log "[rust] cargo clippy --fix exited ${fix_rc} (continuing to re-check)."
+    if [[ -n "$fix_out" ]]; then
+      log "$(printf '%s\n' "$fix_out" | tail -n "$clippy_tail_lines")"
+    fi
+  fi
+
+  clippy_rc=0
+  clippy_out="$(dep_runner_cargo_dir_capture "cargo clippy post-fix" "$cargo_dir" -- \
+    clippy --all-targets -- -D warnings)" || clippy_rc=$?
+  if (( clippy_rc == 0 )); then
+    log "[rust] Post-bump clippy recovered after --fix."
+    return 0
+  fi
+
+  log "ERROR: RUST_CLIPPY_RECOVER_FAILED dir=${cargo_dir} exit=${clippy_rc}"
+  if [[ -n "$clippy_out" ]]; then
+    log "$(printf '%s\n' "$clippy_out" | tail -n "$clippy_tail_lines")"
+  fi
+  dep_updater_append_ecosystem_failure \
+    "rust|post-bump clippy still failing after --fix (exit ${clippy_rc})"
+  return 1
+}
+
 # Bump one direct dependency and open a stacked PR.
 # Args: $1=crate, $2=current version, $3=target version, $4=dependency kind, $5=workspace package
 rust_update_one() {
@@ -5672,6 +5743,18 @@ rust_update_one() {
 
   if git -C "$worktree_path" diff --cached --quiet; then
     log "[rust] ${pkg}: no file changes after update — already at latest. Skipping PR."
+    return 0
+  fi
+
+  if ! rust_recover_post_bump_clippy "$worktree_path"; then
+    log "[rust] Skipping ${pkg} ${old_ver}→${new_ver}: unrecovered clippy after bump."
+    rust_revert_post_bump_workdir "$worktree_path"
+    return 0
+  fi
+  run_command "git worktree" git -C "$worktree_path" add -u
+
+  if git -C "$worktree_path" diff --cached --quiet; then
+    log "[rust] ${pkg}: no file changes after clippy recover — skipping PR."
     return 0
   fi
 
@@ -6284,6 +6367,13 @@ batch_update_all() {
     run_command "git worktree" git -C "$worktree_path" add -u
     if ! git -C "$worktree_path" diff --cached --quiet; then
       any_rust=1
+      if ! rust_recover_post_bump_clippy "$worktree_path"; then
+        log "[rust] Reverting Rust batch bumps after unrecovered clippy; continuing other ecosystems."
+        rust_revert_post_bump_workdir "$worktree_path"
+        any_rust=0
+      else
+        run_command "git worktree" git -C "$worktree_path" add -u
+      fi
     fi
   fi
 
