@@ -204,8 +204,9 @@ Preview a report email without running the batch (uses the same env file):
 ```
 
 **Separate tool:** `scripts/dep-updater-notifier` emails when scans find *available*
-updates (dry-run). The timer batch job applies updates and emails *run results*
-(success/failure per repo).
+updates (dry-run). It loads the same `~/.config/dep-updater.env` for
+`DEP_UPDATER_REPORT_TO` / `DEP_UPDATER_REPORT_FROM`. The timer batch job applies
+updates and emails *run results* (success/failure per repo).
 
 ### Install
 
