@@ -1603,6 +1603,71 @@ else
   fail=$(( fail + 1 ))
 fi
 
+# PEP 735 [dependency-groups] (bunnify pyright/ruff) must be treated as direct —
+# otherwise stale floors are never proposed and Dependabot wins the race.
+# shellcheck disable=SC2016  # assert literal awk patterns in source
+if awk '/^py_constraint_op\(\)/,/^\}/' "$script" | grep -qF 'dependency-groups' \
+  && awk '/^py_outdated\(\)/,/^\}/' "$script" | grep -qF 'dependency-groups'; then
+  printf '[PASS] pyproject scanners: include PEP 735 dependency-groups as direct deps\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] pyproject scanners: dependency-groups must be in py_constraint_op and py_outdated\n'
+  fail=$(( fail + 1 ))
+fi
+
+# Behavioural: floor extractor must emit dependency-groups >= specs (and still
+# skip tool.uv constraint-dependencies). Keep this awk in lockstep with
+# py_outdated's inline scanner (asserted above to include dependency-groups).
+synth_pyproject="$(mktemp "${TMPDIR:-/tmp}/dep-updater-depgroups.XXXXXX")"
+cat >"$synth_pyproject" <<'EOF'
+[project]
+dependencies = [
+    "click>=8.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.410",
+    "ruff>=0.15.17",
+]
+
+[tool.uv]
+constraint-dependencies = [
+    "urllib3>=2.0.0",
+]
+EOF
+floor_out="$(awk '
+  BEGIN { in_direct = 0 }
+  /^\[[[:space:]]*(project|project\.[^]]*|dependency-groups)[[:space:]]*\]/ {
+    in_direct = 1
+    next
+  }
+  /^\[/ { in_direct = 0; next }
+  !in_direct { next }
+  /constraint-dependencies/ { next }
+  {
+    s = $0
+    while (1) {
+      if (match(s, /"[A-Za-z0-9][A-Za-z0-9._-]*[^"=<>!~,]*>=[^"]*"/)) {
+        print substr(s, RSTART+1, RLENGTH-2)
+        s = substr(s, RSTART+RLENGTH)
+      } else break
+    }
+  }
+' "$synth_pyproject")"
+rm -f "$synth_pyproject"
+if printf '%s\n' "$floor_out" | grep -qxF 'pyright>=1.1.410' \
+  && printf '%s\n' "$floor_out" | grep -qxF 'ruff>=0.15.17' \
+  && printf '%s\n' "$floor_out" | grep -qxF 'click>=8.0.0' \
+  && ! printf '%s\n' "$floor_out" | grep -qF 'urllib3'; then
+  printf '[PASS] py_outdated floor awk: emits dependency-groups floors; skips constraint-dependencies\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py_outdated floor awk: unexpected floors\n'
+  printf '       got:\n%s\n' "$floor_out"
+  fail=$(( fail + 1 ))
+fi
+
 # ---------------------------------------------------------------------------
 # Behavioural: uv transitive-constraint probe
 # ---------------------------------------------------------------------------
@@ -2297,6 +2362,74 @@ if awk '/^rust_outdated\(\)/{found=1} found && /--root-deps-only/{ok=1} found &&
 else
   printf '[FAIL] rust_outdated: --root-deps-only not found\n'
   fail=$(( fail + 1 ))
+fi
+
+# cargo-outdated uses "---" (not null) when no in-range upgrade exists. jq's //
+# does not treat "---" as missing, so rust_outdated must explicitly fall through
+# to .latest (rusty-jack tungstenite 0.29→0.30).
+# shellcheck disable=SC2016  # assert literal jq in source
+if awk '/^rust_outdated\(\)/,/^\}/' "$script" | grep -qF '$d.compat != "---"' \
+  && awk '/^rust_outdated\(\)/,/^\}/' "$script" | grep -qF 'else $d.latest'; then
+  printf '[PASS] rust_outdated: falls through to latest when compat is ---\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rust_outdated: must use latest when compat sentinel is ---\n'
+  fail=$(( fail + 1 ))
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  printf '[SKIP] jq not on PATH — skipping rust_outdated jq fallback test\n'
+else
+  # Mirror the rust_outdated jq filter against a tungstenite-shaped payload.
+  rust_jq_out="$(printf '%s' '{
+    "crate_name": "rusty-jack",
+    "dependencies": [
+      {
+        "name": "tungstenite",
+        "project": "0.29.0",
+        "compat": "---",
+        "latest": "0.30.0",
+        "kind": "Normal"
+      },
+      {
+        "name": "clap",
+        "project": "4.6.3",
+        "compat": "4.6.4",
+        "latest": "4.7.0",
+        "kind": "Normal"
+      },
+      {
+        "name": "already-latest",
+        "project": "1.0.0",
+        "compat": "---",
+        "latest": "1.0.0",
+        "kind": "Normal"
+      }
+    ]
+  }' | jq -r '
+    (if type == "array" then .[] else . end)
+    | .crate_name as $crate
+    | .dependencies[]?
+    | select(.name != null and .project != null)
+    | select(.latest != null and .latest != "---")
+    | . as $d
+    | (if ($d.compat != null and $d.compat != "---")
+       then $d.compat
+       else $d.latest
+       end) as $target
+    | select($target != "---" and $d.project != $target)
+    | "\($d.name | split(" -> ") | last) \($d.project) \($target) \($d.kind // "Normal") \($crate // "-")"
+  ')"
+  if printf '%s\n' "$rust_jq_out" | grep -qxF 'tungstenite 0.29.0 0.30.0 Normal rusty-jack' \
+    && printf '%s\n' "$rust_jq_out" | grep -qxF 'clap 4.6.3 4.6.4 Normal rusty-jack' \
+    && ! printf '%s\n' "$rust_jq_out" | grep -qF 'already-latest'; then
+    printf '[PASS] rust_outdated jq: proposes latest when compat is ---; prefers compat when set\n'
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] rust_outdated jq: unexpected rows\n'
+    printf '       got:\n%s\n' "$rust_jq_out"
+    fail=$(( fail + 1 ))
+  fi
 fi
 
 if awk '/^rust_is_pinned\(\)/{found=1} found && /dep_table/{ok=1} found && /^}/{found=0} END{exit !ok}' "$script"; then
