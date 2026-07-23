@@ -6658,43 +6658,6 @@ ci_run_exists_for_head() {
   return "$jq_exit"
 }
 
-ci_conclusion_for_head() {
-  local -r branch="$1"
-  local -r target_sha="$2"
-  local exit_code uuid json jq_filter
-
-  # shellcheck disable=SC2016  # jq filter uses $sha/$names variables, not shell expansion
-  jq_filter='map(select(
-          .headSha == $sha and
-          ($names == "" or (.name as $n | $names | split("\n") | index($n) != null))
-        ))
-        | . as $runs
-        | if length == 0 then "missing"
-          elif any(.[]; .conclusion == "failure" or .conclusion == "cancelled"
-                       or .conclusion == "timed_out" or .conclusion == "startup_failure") then "failure"
-          elif ($names != "" and ([$names | split("\n") | .[]] | length) > ($runs | length)) then "pending"
-          elif all(.[]; .conclusion != null) then "success"
-          else "pending"
-          end'
-
-  exit_code=0
-  runner_exec "gh run list for ci conclusion" -- gh run list \
-    --repo "${repo_owner}/${repo_name}" --branch "$branch" --limit 30 \
-    --json name,headSha,status,conclusion,createdAt \
-    || exit_code=$?
-  uuid="$(runner_last_id)"
-  json="$(runner_read "$uuid" stdout 2>/dev/null || true)"
-  if [[ -z "$json" ]]; then
-    printf 'missing\n'
-    return 0
-  fi
-  tmp_json="$(mktemp)"
-  printf '%s' "$json" >"$tmp_json"
-  runner_exec "jq ci conclusion for head" --stream-stdout -- jq -r --arg sha "$target_sha" \
-    --arg names "$ci_workflow_names" "$jq_filter" "$tmp_json"
-  rm -f "$tmp_json"
-}
-
 ci_conclusion_for_pr() {
   local -r pr_num="$1"
 
@@ -6854,8 +6817,10 @@ require_resume_ci_gate() {
   fi
 
   # Check current CI conclusion before deciding what to do.
+  # Use PR statusCheckRollup (ci_conclusion_for_pr), not gh run list: SKIPPED-only
+  # push runs must not count as passed (issue #430 / resume path).
   local ci_status
-  ci_status="$(ci_conclusion_for_head "$last_branch" "$current_head")"
+  ci_status="$(ci_conclusion_for_pr "$last_pr")"
 
   case "$ci_status" in
     failure)
@@ -6865,7 +6830,7 @@ require_resume_ci_gate() {
       _cleanup_trap_active=0
       dep_updater_handle_ci_failure "$last_pr" "$last_branch"
       ;;
-    success|skipped|neutral)
+    success)
       # CI already passed — nothing to wait for.
       log "Resuming after existing PR #${last_pr} (${last_branch}); CI already passed."
       return 0
@@ -7084,9 +7049,11 @@ maybe_label_top_pr_for_merge() {
   top_head="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-parse "$top_branch" 2>/dev/null || true)"
   [[ -z "$top_head" ]] && return 0
 
-  ci_status="$(ci_conclusion_for_head "$top_branch" "$top_head")"
+  # Use PR statusCheckRollup gating (not gh run list): SKIPPED-only push runs
+  # must not look merge-ready (issue #430).
+  ci_status="$(ci_conclusion_for_pr "$top_pr")"
   case "$ci_status" in
-    success|skipped|neutral)
+    success)
       ;;
     *)
       log "Top PR #${top_pr} (${top_branch}) is not merge-ready yet (CI status: ${ci_status})."
@@ -7316,24 +7283,51 @@ print_summary() {
 
 cleanup_on_error() {
   local -r reason="$1"
+  local leave_prs_open=0
+  local saved_prs="" saved_p saved_merged saved_state comment
+
   log "Cleaning up after error: ${reason}"
   primary_repo_recover || true
-  # Close any open PRs created in this session so a subsequent run starts fresh.
+
+  # Leave PRs open when the failure is merge/auto-merge config or CI-not-ready —
+  # closing them drops a recoverable PR (issue #430 / tsp-maximizer#128).
+  case "$reason" in
+    *'gh merge failed'*|*'Auto merge is not allowed'*|*'enablePullRequestAutoMerge'*|\
+    *'CI not ready'*|*'refusing gh merge'*|*'is not CI-green'*|WAIT_TIMEOUT*|*'WAIT_TIMEOUT '*)
+      leave_prs_open=1
+      ;;
+  esac
+
+  # Close any open PRs created in this session so a subsequent run starts fresh
+  # (unless leave_prs_open — then comment and keep the PR for retry).
   if [[ -n "$state_file" && -f "$state_file" ]]; then
-    local saved_prs=""
     saved_prs="$(state_get "prs" 2>/dev/null || true)"
     if [[ -n "$saved_prs" ]]; then
       log "Run created PR(s): $(csv_pretty "$saved_prs")"
-      log "Closing any still-open PRs created by this run."
-      local saved_p saved_merged saved_state
+      if [[ "$leave_prs_open" == '1' ]]; then
+        log "Leaving PRs open for retry (merge/CI gate failure)."
+      else
+        log "Closing any still-open PRs created by this run."
+      fi
       IFS=',' read -ra saved_prs_list <<< "$saved_prs"
       for saved_p in "${saved_prs_list[@]}"; do
         [[ -z "$saved_p" ]] && continue
         saved_merged="$(gh_pr_merged_for_number "$saved_p" 2>/dev/null || true)"
         saved_state="$(gh_pr_state_for_number "$saved_p" 2>/dev/null || true)"
         if [[ "$saved_merged" != 'true' && "$saved_state" == 'open' ]]; then
-          log "Closing PR #${saved_p} (cleanup on error — re-run to submit a fresh PR)."
-          dep_runner_gh_stdout "gh pr" -- pr close "$saved_p" --repo "${repo_owner}/${repo_name}" 2>/dev/null || true
+          if [[ "$leave_prs_open" == '1' ]]; then
+            comment="dep-updater hit an error and left this PR open for retry: ${reason}"
+            dep_runner_gh_stdout "gh pr" -- pr comment "$saved_p" \
+              --repo "${repo_owner}/${repo_name}" \
+              --body "$comment" 2>/dev/null || true
+            log "Left PR #${saved_p} open (commented)."
+          else
+            comment="Closed by dep-updater after error: ${reason}. Re-run to create a fresh update."
+            log "Closing PR #${saved_p} (cleanup on error — re-run to submit a fresh PR)."
+            dep_runner_gh_stdout "gh pr" -- pr close "$saved_p" \
+              --repo "${repo_owner}/${repo_name}" \
+              --comment "$comment" 2>/dev/null || true
+          fi
         fi
       done
     fi
@@ -7406,18 +7400,36 @@ merge_pr_via_gh_single() {
   # Head-branch cleanup is handled by the repo delete_branch_on_merge setting /
   # cleanup workflows. Keep in sync with dep_enqueue_pr_for_merge_queue
   # (--auto --squash only).
-  log "Enabling auto-merge for PR #${pr_num} via gh (squash)…"
-  merge_out=""
-  merge_exit=0
-  merge_out="$(dep_runner_gh_stdout "gh pr" -- pr merge "$pr_num" \
-    --repo "${repo_owner}/${repo_name}" \
-    --auto --squash 2>&1)" || merge_exit=$?
-  if (( merge_exit != 0 )); then
-    record_first_failure "gh merge failed: pr=#${pr_num}: ${merge_out}"
-    die "gh merge failed: pr=#${pr_num}: ${merge_out}"
-  fi
-  if [[ -n "$merge_out" ]]; then
-    log "$merge_out"
+  #
+  # Graphite MQ repos (merge-it label, allow_auto_merge often false): enqueue via
+  # labels instead of gh --auto (issue #430 / tsp-maximizer#128).
+  if dep_uses_graphite_merge_queue_labels && ! dep_stacking_is_gh_stack; then
+    log "Repo uses Graphite merge queue; enqueuing PR #${pr_num} via merge-it (not gh --auto)…"
+    dep_enqueue_pr_for_merge_queue "$pr_num"
+  else
+    log "Enabling auto-merge for PR #${pr_num} via gh (squash)…"
+    merge_out=""
+    merge_exit=0
+    merge_out="$(dep_runner_gh_stdout "gh pr" -- pr merge "$pr_num" \
+      --repo "${repo_owner}/${repo_name}" \
+      --auto --squash 2>&1)" || merge_exit=$?
+    if (( merge_exit != 0 )); then
+      if printf '%s' "$merge_out" \
+        | grep -qiE 'enablePullRequestAutoMerge|Auto merge is not allowed'; then
+        if dep_repo_has_label 'merge-it'; then
+          log "gh --auto unavailable; falling back to merge-it labels for PR #${pr_num}…"
+          dep_enqueue_pr_for_merge_queue "$pr_num"
+        else
+          record_first_failure "gh merge failed: pr=#${pr_num}: ${merge_out}"
+          die "gh merge failed: pr=#${pr_num}: ${merge_out}"
+        fi
+      else
+        record_first_failure "gh merge failed: pr=#${pr_num}: ${merge_out}"
+        die "gh merge failed: pr=#${pr_num}: ${merge_out}"
+      fi
+    elif [[ -n "$merge_out" ]]; then
+      log "$merge_out"
+    fi
   fi
 
   elapsed=0
@@ -7502,7 +7514,7 @@ poll_until_merged() {
   _merge_it_poll_had_label=""
 
   local all_merged p merged pending_list check_rollup failed_check failed_branch
-  local branches_csv top_branch top_pr top_has_label top_ci_status top_head wait_context
+  local branches_csv top_branch top_pr top_has_label top_ci_status wait_context
   while true; do
     # If we're waiting for merges, CI may finish after initial submission; ensure
     # the top PR is enqueued for merge as soon as it becomes merge-ready,
@@ -7579,12 +7591,8 @@ poll_until_merged() {
       if [[ -n "$top_pr" ]] && is_valid_pr_number "$top_pr"; then
         top_has_label="$(pr_has_merge_enqueue_pending "$top_pr")"
         top_ci_status="unknown"
-        if git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${top_branch}"; then
-          top_head="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- rev-parse "$top_branch" 2>/dev/null || true)"
-          if [[ -n "$top_head" ]]; then
-            top_ci_status="$(ci_conclusion_for_head "$top_branch" "$top_head" 2>/dev/null || echo 'unknown')"
-          fi
-        fi
+        # Match merge gating: PR statusCheckRollup, not gh run list (issue #430).
+        top_ci_status="$(ci_conclusion_for_pr "$top_pr" 2>/dev/null || echo 'unknown')"
         wait_context="(top=#${top_pr} enqueue=${top_has_label} ci=${top_ci_status})"
         _merge_it_poll_pr="$top_pr"
         _merge_it_poll_had_label="$top_has_label"
