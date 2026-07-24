@@ -29,6 +29,7 @@ stage_notifier_bundle() {
   cp scripts/lib/runner "$tmp/bin/lib/runner"
   cp scripts/lib/runner-ensure "$tmp/bin/lib/runner-ensure"
   cp scripts/lib/runner-bootstrap "$tmp/bin/lib/runner-bootstrap"
+  cp scripts/lib/github-repo-slug "$tmp/bin/lib/github-repo-slug"
 }
 
 # Keep mocks first, then the bash that runs this suite (shebang via env), then
@@ -88,6 +89,11 @@ EOF
   assert_contains 'email subject mentions updates' "$out" \
     "Subject: [dep-updater-notifier] dependency updates needed"
   assert_contains 'email body includes discovered repo section' "$out" "=== bunnify ==="
+  # Sole-update rows used to vanish: $(jq) strips the trailing newline and
+  # `while read` drops the only line → header-only "Outdated packages" tables.
+  assert_contains 'email body lists the sole outdated package' "$out" "astral-sh/setup-uv"
+  assert_contains 'email body lists the from version' "$out" "v7"
+  assert_contains 'email body lists the to version' "$out" "v8"
 }
 
 run_short_flags() {
@@ -380,6 +386,67 @@ EOF
     "command: $tmp/bin/dep-updater --report-json --dir $tmp/work/ai/bunnify"
 }
 
+run_skips_archived_repos() {
+  local tmp out err
+  tmp="$(make_tmpdir)"
+  readonly tmp
+  trap 'rm -rf "$tmp"' RETURN
+
+  local -r sendmail_breadcrumb="${tmp}/sendmail.invoked"
+  mkdir -p "$tmp/work/ai/active" "$tmp/work/ai/archived"
+  stage_notifier_bundle "$tmp"
+
+  # Minimal remotes so gh_slug_from_repo_dir resolves OWNER/NAME.
+  git -C "$tmp/work/ai/active" init --quiet
+  git -C "$tmp/work/ai/active" remote add origin "https://github.com/the-hcma/example-active.git"
+  git -C "$tmp/work/ai/archived" init --quiet
+  git -C "$tmp/work/ai/archived" remote add origin "https://github.com/the-hcma/example-archived.git"
+
+  cat >"$tmp/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# github-repo-slug calls: gh api repos/OWNER/NAME --jq .archived
+if [[ "${1:-}" == 'api' && "${2:-}" == repos/* ]]; then
+  case "$2" in
+    repos/the-hcma/example-archived) printf 'true\n'; exit 0 ;;
+    repos/the-hcma/example-active) printf 'false\n'; exit 0 ;;
+    *) printf 'false\n'; exit 0 ;;
+  esac
+fi
+printf 'unexpected gh invocation: %s\n' "$*" >&2
+exit 1
+EOF
+
+  cat >"$tmp/bin/dep-updater" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+dir=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dir) dir="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+repo="$(basename "$dir")"
+if [[ "$repo" == 'archived' ]]; then
+  printf '%s\n' 'ERROR: dep-updater should not scan archived repos' >&2
+  exit 1
+fi
+printf '%s' '{"has_updates":true,"has_cves":false,"updates":[{"ecosystem":"gha","package":"actions/checkout","from":"v4","to":"v5"}],"cves":[]}'
+EOF
+  chmod +x "$tmp/bin/gh" "$tmp/bin/dep-updater" "$tmp/bin/dep-updater-notifier"
+
+  out="$(env -u DEP_UPDATER_ENV_FILE HOME="$tmp" PATH="$(notifier_test_path "$tmp")" \
+    REPO_HELPERS_TEST_MODE=1 REPO_HELPERS_SENDMAIL_BREADCRUMB="$sendmail_breadcrumb" \
+    "$tmp/bin/dep-updater-notifier" --print 2>"$tmp/stderr")"
+  err="$(cat "$tmp/stderr")"
+
+  assert_contains 'email includes active repo' "$out" "=== active ==="
+  assert_contains 'email lists active package' "$out" "actions/checkout"
+  assert_not_contains 'email omits archived repo section' "$out" "=== archived ==="
+  assert_not_contains 'stderr has no archived scan failure' "$err" "archived:"
+}
+
 printf '\n=== static: empty arrays safe under set -u ===\n'
 notifier_script="scripts/dep-updater-notifier"
 if grep -qF "(( \${#notice_lines[@]} > 0 ))" "$notifier_script" \
@@ -400,6 +467,17 @@ if grep -qF 'lib/runner-bootstrap' "$notifier_script" \
   pass_case 'dep-updater-notifier: jq and utilities via dun_runner helpers; dep-updater via run_command'
 else
   fail_case 'dep-updater-notifier: missing runner adoption wiring'
+fi
+
+printf '\n=== static: dep-updater-notifier restores jq stream newlines ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'dun_runner_print_captured' "$notifier_script" \
+  && grep -qF 'dun_skip_archived_repo' "$notifier_script" \
+  && grep -qF 'github-repo-slug' "$notifier_script" \
+  && grep -qF '.updates|length' "$notifier_script"; then
+  pass_case 'dep-updater-notifier: newline restore, archived skip, updates|length gate'
+else
+  fail_case 'dep-updater-notifier: missing empty-table / archived-skip wiring'
 fi
 
 printf '\n=== static: dep-updater-notifier loads dep-updater.env ===\n'
@@ -442,6 +520,9 @@ run_failure_email_header_uses_first_nonblank_stderr_line
 
 echo "=== failure: cron stderr includes invalid-json reason ==="
 run_failure_stderr_includes_invalid_json_reason
+
+echo "=== discovery: skips archived GitHub repositories ==="
+run_skips_archived_repos
 
 echo "=== done ==="
 test_summary

@@ -119,6 +119,22 @@ trap cleanup_tmpfiles EXIT INT TERM
 # shellcheck disable=SC1091  # shared helper sourced at runtime; CI shellcheck doesn't use -x
 source "${script_dir}/lib/runner-bootstrap"
 
+# shellcheck disable=SC1091  # shared helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/github-repo-slug"
+
+# dun_runner_print_captured <text>
+# Re-emit runner/jq stdout after $(…) capture. Command substitution strips all
+# trailing newlines; without restoring one, `while read` drops a sole/last row
+# (empty "Outdated packages" tables when a repo has exactly one update).
+dun_runner_print_captured() {
+  local -r out="$1"
+
+  printf '%s' "$out"
+  if [[ -n "$out" ]]; then
+    printf '\n'
+  fi
+}
+
 # dun_runner_jq_file <label> <file> [jq-args…]
 dun_runner_jq_file() {
   local -r label="$1"
@@ -129,7 +145,7 @@ dun_runner_jq_file() {
 
   exit_code=0
   out="$(runner_exec_stdout "$label" -- jq "$@" "$file")" || exit_code=$?
-  printf '%s' "$out"
+  dun_runner_print_captured "$out"
   return "$exit_code"
 }
 
@@ -145,7 +161,7 @@ dun_runner_jq_r() {
   # shellcheck disable=SC2016  # jq filter passed as bash -c positional arg
   out="$(runner_exec_stdout "$label" -- bash -c 'printf "%s" "$2" | jq --raw-output "$1"' bash "$filter" "$json")" \
     || exit_code=$?
-  printf '%s' "$out"
+  dun_runner_print_captured "$out"
   return "$exit_code"
 }
 
@@ -159,7 +175,7 @@ dun_runner_exec_stdout() {
 
   exit_code=0
   out="$(runner_exec_stdout "$label" -- "$@")" || exit_code=$?
-  printf '%s' "$out"
+  dun_runner_print_captured "$out"
   return "$exit_code"
 }
 
@@ -277,6 +293,36 @@ discover_repos() {
       printf '%s\n' "$child"
     done
   done < <(tr ':' '\n' <<<"$roots_csv" | sed '/^$/d')
+}
+
+# dun_skip_archived_repo <repo_dir>
+# Exit 0 when the clone should be skipped (archived, or archived status unknown).
+# Exit 1 when the clone should be scanned (not archived, or no resolvable slug).
+dun_skip_archived_repo() {
+  local -r repo="$1"
+  local slug
+  local archived_status
+
+  slug=""
+  slug="$(gh_slug_from_repo_dir "$repo" 2>/dev/null || true)"
+  if [[ -z "$slug" ]]; then
+    return 1
+  fi
+
+  archived_status=0
+  gh_repo_is_archived "$slug" || archived_status=$?
+  case "$archived_status" in
+    0)
+      return 0
+      ;;
+    2)
+      warn "Could not determine archived status for ${slug}; skipping."
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 check_notifier_prereqs() {
@@ -407,6 +453,11 @@ for repo in "${repos[@]}"; do
     continue
   fi
 
+  if dun_skip_archived_repo "$repo"; then
+    log "Skipping ${repo_name}: archived GitHub repository."
+    continue
+  fi
+
   log "Checking ${repo_name}…"
   log "  cmd: ${dep_updater} --report-json --dir ${repo}"
 
@@ -475,14 +526,31 @@ for repo in "${repos[@]}"; do
     continue
   fi
 
-  has_updates="$(dun_runner_jq_file "dep-updater-notifier has_updates" "$dep_out_file" --raw-output '.has_updates' \
-    2>/dev/null || echo "")"
-  has_cves="$(dun_runner_jq_file "dep-updater-notifier has_cves" "$dep_out_file" --raw-output '.has_cves' \
-    2>/dev/null || echo "")"
+  update_count="$(dun_runner_jq_file "dep-updater-notifier updates count" "$dep_out_file" --raw-output '.updates|length' \
+    2>/dev/null || echo "0")"
+  cve_count="$(dun_runner_jq_file "dep-updater-notifier cves count" "$dep_out_file" --raw-output '.cves|length' \
+    2>/dev/null || echo "0")"
 
-  if [[ "$has_updates" != 'true' && "$has_cves" != 'true' ]]; then
+  # Prefer concrete array lengths over has_* flags so empty tables are never mailed.
+  if [[ ! "$update_count" =~ ^[0-9]+$ ]]; then
+    update_count=0
+  fi
+  if [[ ! "$cve_count" =~ ^[0-9]+$ ]]; then
+    cve_count=0
+  fi
+  if (( update_count == 0 && cve_count == 0 )); then
     log "${repo_name}: up to date."
     continue
+  fi
+  if (( update_count > 0 )); then
+    has_updates='true'
+  else
+    has_updates='false'
+  fi
+  if (( cve_count > 0 )); then
+    has_cves='true'
+  else
+    has_cves='false'
   fi
 
   found_any=1
@@ -498,7 +566,8 @@ for repo in "${repos[@]}"; do
   if [[ "$has_cves" == 'true' ]]; then
     report_lines+=("Security vulnerabilities with available fixes:")
     report_lines+=("  $(printf '%-24s  %-10s  %-10s  %s' 'PACKAGE' 'CURRENT' 'FIX' 'CVEs')")
-    while IFS= read -r row; do
+    while IFS= read -r row || [[ -n "$row" ]]; do
+      [[ -n "$row" ]] || continue
       pkg="$(dun_runner_jq_r "dep-updater-notifier cve package" "$row" '.package')"
       current="$(dun_runner_jq_r "dep-updater-notifier cve current" "$row" '.current')"
       fix="$(dun_runner_jq_r "dep-updater-notifier cve fix" "$row" '.fix')"
@@ -522,7 +591,8 @@ for repo in "${repos[@]}"; do
     local_notice="${repo_name}${cve_flag}:"
     local_count=0
     local_pairs=""
-    while IFS= read -r row; do
+    while IFS= read -r row || [[ -n "$row" ]]; do
+      [[ -n "$row" ]] || continue
       ecosystem="$(dun_runner_jq_r "dep-updater-notifier update ecosystem" "$row" '.ecosystem')"
       pkg="$(dun_runner_jq_r "dep-updater-notifier update package" "$row" '.package')"
       from="$(dun_runner_jq_r "dep-updater-notifier update from" "$row" '.from')"
