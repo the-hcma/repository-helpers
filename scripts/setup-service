@@ -368,18 +368,28 @@ host_runs_units() {
     host_machine_id_matches && host_name_matches_service_host
 }
 
-# timer_standby_disable
-# Standby hosts (shared NFS home): never ``systemctl disable`` timers. That removes
-# shared ``timers.target.wants/`` symlinks and stops schedules on the service host.
-# ``ConditionHost`` already prevents timers from firing here. Stop a locally active
-# timer only (enable links stay intact for the service host).
+# timer_standby_disable <timer_filename>
+# Standby hosts (shared NFS home): never ``systemctl disable`` this repo's timer.
+# That removes shared ``timers.target.wants/`` and stops schedules on the service
+# host. ``ConditionHost`` already prevents the timer from firing here. Called only
+# for the specific ``*.timer`` being installed in this setup-service run; stop that
+# timer locally if active (enable links stay intact for the service host).
 timer_standby_disable() {
     local -r timer_filename="$1"
     local is_active_exit=0
     local stop_exit=0
 
+    if host_runs_units; then
+        return 0
+    fi
+    if [[ "$timer_filename" != *.timer ]]; then
+        echo "⏭️  ${timer_filename}: timer_standby_disable expects a *.timer unit; skipping"
+        return 0
+    fi
+
     # Exit 0 = active; 3 = inactive (systemd); other = probe failure.
-    runner_exec "systemctl is-active --quiet ${timer_filename}" -- \
+    # --probe: inactive (3) is the common standby case after the first stop.
+    runner_exec "systemctl is-active --quiet ${timer_filename}" --probe -- \
       systemctl --user is-active --quiet "$timer_filename" || is_active_exit=$?
     if (( is_active_exit == 0 )); then
         stop_exit=0
@@ -644,14 +654,19 @@ unit_timer_activation_service_basename() {
 }
 
 # remove_stale_unit_file <unit_filename>
-# Service host only: disable + delete. On standby hosts, skip — ``disable`` and
-# deleting under the shared NFS ``~/.config/systemd/user/`` would disarm the
-# service host the same way ``timer_standby_disable`` used to.
+# On the service host: disable + delete. On standby hosts, only skip NFS-destructive
+# cleanup for ``*.timer`` units (shared ``timers.target.wants/``). Other stale units
+# still must not be ``disable``d on standby (shared wants if present); skip those
+# too when off the service host so the shared user unit dir is not mutated there.
 remove_stale_unit_file() {
     local -r unit="$1"
 
     if ! host_runs_units; then
-        echo "⏭️  ${unit}: skip stale remove on $(current_hostname_short) (shared NFS — run setup-service on ${condition_host_value})."
+        if [[ "$unit" == *.timer ]]; then
+            echo "⏭️  ${unit}: skip stale timer remove on $(current_hostname_short) (shared NFS wants — run setup-service on ${condition_host_value})."
+            return 0
+        fi
+        echo "⏭️  ${unit}: skip stale remove on $(current_hostname_short) (shared user unit dir — run setup-service on ${condition_host_value})."
         return 0
     fi
 
@@ -1033,10 +1048,10 @@ OPTIONS:
 
     --condition-host NAME
         Short hostname label for the machine where systemd should run these units
-        (e.g. meerkat). Saved to ~/.config/user-services-host.
+        (e.g. svc-host). Saved to ~/.config/user-services-host.
 
     --condition-host-fqdn NAME
-        Fully qualified hostname for the service host (e.g. meerkat.house.hcma).
+        Fully qualified hostname for the service host (e.g. svc-host.example).
         Saved to ~/.config/user-services-host-fqdn. When omitted, setup-service
         captures hostname -f on the first run on the service host.
 

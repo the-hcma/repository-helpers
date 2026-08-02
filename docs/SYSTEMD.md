@@ -54,9 +54,9 @@ Units are pinned with **two** `ConditionHost=` lines after `[Unit]`:
 | `ConditionHost=\|<short-hostname>` | Hostname OR-fallback — active guard on **older systemd**; also matches on 259+. |
 
 ```ini
-# Service host: meerkat (meerkat.house.hcma; machine-id 7aeaef81…)
+# Service host: svc-host (svc-host.example; machine-id 7aeaef81…)
 ConditionHost=|7aeaef81ca2647d09d2c2ef67e36bc84
-ConditionHost=|meerkat
+ConditionHost=|svc-host
 ```
 
 Both lines use the `|` (**triggering**) prefix, giving **OR** semantics: the unit
@@ -72,8 +72,8 @@ matches (all systemd versions). See
 
 | File | Purpose |
 | --- | --- |
-| `~/.config/user-services-host` | Short hostname label (e.g. `meerkat`) — prompts, status, and hostname `ConditionHost` |
-| `~/.config/user-services-host-fqdn` | FQDN from `hostname` on the service host (e.g. `meerkat.house.hcma`) |
+| `~/.config/user-services-host` | Short hostname label (e.g. `svc-host`) — prompts, status, and hostname `ConditionHost` |
+| `~/.config/user-services-host-fqdn` | FQDN from `hostname` on the service host (e.g. `svc-host.example`) |
 | `~/.config/user-services-machine-id` | 32-char hex ID from `/etc/machine-id` on the service host |
 
 On the **first** `setup-service` run on the configured service host, the script
@@ -87,20 +87,20 @@ matches `~/.config/user-services-machine-id` **and** the hostname matches
 arming schedules via `timer_standby_disable` (stop-only; see below).
 
 **systemd ≥ 259** is required for machine-id `ConditionHost` to be reliable in
-units. On older systemd (e.g. meerkat today), the hostname `ConditionHost` line
+units. On older systemd (hostname-only guard), the hostname `ConditionHost` line
 is the active guard; upgrade systemd when possible so both guards apply.
 
 `setup-service --status` reports whether this machine matches the configured
 service host and notes when systemd is below 259.
 
-**Standby hosts** (same NFS home, e.g. keylime): `setup-service` must **not**
-`systemctl --user disable` timer units or delete shared unit files under
-`~/.config/systemd/user/`. Disable/remove on standby removes shared
-`timers.target.wants/` (and unit files) and stops schedules on the service host.
-`ConditionHost` already prevents timers from firing on standby. On standby,
-`timer_standby_disable` only stops a locally active timer, and stale-unit
-cleanup is skipped. Re-run `setup-service` on **meerkat** if wants links were
-ever removed and need re-enabling.
+**Standby hosts** (same NFS home, e.g. a laptop sharing `~`): `setup-service`
+must **not** `systemctl --user disable` **timer** units for this repo (or delete
+those timer unit files under `~/.config/systemd/user/`). Disable/remove on
+standby removes shared `timers.target.wants/` symlinks and stops schedules on
+the service host. `ConditionHost` already prevents those timers from firing on
+standby. On standby, `timer_standby_disable` only stops the specific timer being
+installed, and stale **timer** cleanup is skipped. Re-run `setup-service` on the
+**configured service host** if wants links were ever removed and need re-enabling.
 
 Use `scripts/show-services` for a read-only overview of every service template in
 this repo:
