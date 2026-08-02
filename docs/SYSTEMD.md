@@ -98,13 +98,8 @@ service host and notes when systemd is below 259.
 `timers.target.wants/` symlinks and stops schedules on the service host.
 `ConditionHost` already prevents timers from firing on standby. On standby,
 `timer_standby_disable` only stops a locally active timer and leaves enable
-links intact.
-
-**Heal on the service host:** `ensure-user-service-timers.service`
-(`WantedBy=default.target`) re-runs `systemctl --user enable --now` for every
-`etc/systemd/*.timer` when the lingering user manager starts (boot / login).
-That recovers missing wants links without waiting for an interactive
-`setup-service` / `start-development --refresh`.
+links intact. Re-run `setup-service` on **meerkat** if wants links were ever
+removed and need re-enabling.
 
 Use `scripts/show-services` for a read-only overview of every service template in
 this repo:
