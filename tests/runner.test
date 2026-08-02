@@ -39,7 +39,7 @@ assert_lib_grep "artifact stderr file"           "_runner_artifact_stderr"
 assert_lib_grep "artifact exit_status file"      "_runner_artifact_exit_status"
 assert_lib_grep "artifact cmdline file"        "_runner_artifact_cmdline"
 # shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars
-assert_lib_grep "delegates to runner_exec"     'runner_exec "$label" --stream-stdout'
+assert_lib_grep "delegates to runner_exec"     'runner_exec "$label" "${exec_opts[@]}" --'
 assert_not_contains "run_command does not call exit" \
   "$(awk '/^run_command\(\) \{/{found=1; next} found && /^\}$/{exit} found' "$lib" \
       | grep -E '^\s+exit\b' || true)" \
@@ -49,6 +49,15 @@ assert_lib_grep "declares runner_last_failure_capture_stderr" "runner_last_failu
 assert_lib_grep "declares runner_failures_to_json" "runner_failures_to_json()"
 assert_lib_grep "declares runner_report_append_command_failures" "runner_report_append_command_failures()"
 assert_lib_grep "declares runner probe artifact" "_runner_artifact_probe='probe'"
+assert_lib_grep "declares runner_timeout_bin" "runner_timeout_bin()"
+assert_lib_grep "declares runner_validate_timeout_sec" "runner_validate_timeout_sec()"
+assert_lib_grep "supports --timeout" "--timeout requires SECONDS"
+assert_lib_grep "uses GNU timeout --kill-after" "--kill-after="
+assert_lib_grep "emits WAIT_TIMEOUT on expiry" "ERROR: WAIT_TIMEOUT"
+assert_lib_grep "INT trap prints active command" "[INT] Interrupted:"
+assert_lib_grep "installs INT trap" "_runner_install_int_trap"
+assert_lib_grep "restores INT trap after command" "_runner_restore_int_trap"
+assert_lib_grep "INT trap uses nesting depth" "_runner_int_trap_depth"
 
 # runner_exec must report unexpected failures (run_command delegates to runner_exec).
 assert_lib_grep "declares runner_report_command_failure" "runner_report_command_failure()"
@@ -394,6 +403,177 @@ assert_contains "email section points at log file" "$report_text" '/tmp/checker.
 
 runner_session_end
 unset RUNNER_SESSION_KEEP RUNNER_SESSION_DIR
+
+# ---------------------------------------------------------------------------
+# --timeout and Ctrl-C (SIGINT)
+# ---------------------------------------------------------------------------
+
+printf '\n=== runner_exec: --timeout expires ===\n'
+
+if ! runner_timeout_bin >/dev/null 2>&1; then
+  pass_case "runner_exec --timeout skipped (no timeout/gtimeout on PATH)"
+  pass_case "timeout emits ERROR: WAIT_TIMEOUT (skipped)"
+  pass_case "timeout announces wait budget (skipped)"
+  pass_case "timeout failure still prints [FAIL] (skipped)"
+  pass_case "timeout cmdline records timeout(1) (skipped)"
+  pass_case "runner_sh --timeout skipped (no timeout/gtimeout on PATH)"
+  pass_case "runner_sh timeout WAIT_TIMEOUT (skipped)"
+else
+runner_session_begin
+rc=0
+timeout_err="$(
+  runner_exec "timeout sleep" --timeout 1 -- sleep 30 2>&1 >/dev/null
+)" || rc=$?
+if [[ "$rc" -eq 124 ]]; then
+  pass_case "runner_exec --timeout returns 124"
+else
+  printf '[FAIL] runner_exec --timeout: expected exit 124, got %d\n' "$rc"
+  fail=$(( fail + 1 ))
+fi
+assert_contains "timeout emits ERROR: WAIT_TIMEOUT" "$timeout_err" \
+  "ERROR: WAIT_TIMEOUT timeout sleep timeout=1s"
+assert_contains "timeout announces wait budget" "$timeout_err" \
+  "waiting up to 1s: timeout sleep"
+assert_contains "timeout failure still prints [FAIL]" "$timeout_err" \
+  "[FAIL] timeout sleep"
+timeout_id="$(runner_last_id)"
+assert_contains "timeout cmdline records timeout(1)" \
+  "$(runner_read "$timeout_id" cmdline)" "timeout"
+
+printf '\n=== runner_sh: --timeout expires ===\n'
+
+rc=0
+sh_timeout_err="$(
+  runner_sh "sh timeout" --timeout 1 -- 'sleep 30' 2>&1 >/dev/null
+)" || rc=$?
+if [[ "$rc" -eq 124 ]]; then
+  pass_case "runner_sh --timeout returns 124"
+else
+  printf '[FAIL] runner_sh --timeout: expected exit 124, got %d\n' "$rc"
+  fail=$(( fail + 1 ))
+fi
+assert_contains "runner_sh timeout WAIT_TIMEOUT" "$sh_timeout_err" \
+  "ERROR: WAIT_TIMEOUT sh timeout timeout=1s"
+fi
+
+printf '\n=== runner_sh: invalid --timeout rejected ===\n'
+
+rc=0
+bad_timeout_err="$(
+  runner_sh "bad timeout" --timeout abc -- 'true' 2>&1 >/dev/null
+)" || rc=$?
+if [[ "$rc" -eq 2 ]]; then
+  pass_case "runner_sh rejects non-numeric --timeout with exit 2"
+else
+  printf '[FAIL] runner_sh invalid --timeout: expected exit 2, got %d\n' "$rc"
+  fail=$(( fail + 1 ))
+fi
+assert_contains "invalid timeout message" "$bad_timeout_err" \
+  "must be a non-negative integer"
+
+printf '\n=== runner_exec: Ctrl-C prints active command ===\n'
+
+# Unit: INT handler prints banner and marks interrupted (finalize is in runner_exec).
+int_direct_out="$(
+  (
+    _runner_active_label='direct int'
+    _runner_active_cmdline='printf direct'
+    _runner_active_pid=0
+    _runner_interrupted=0
+    _runner_on_int
+    printf 'interrupted=%s\n' "$_runner_interrupted"
+  ) 2>&1
+)"
+assert_contains "INT handler prints label" "$int_direct_out" "[INT] Interrupted: direct int"
+assert_contains "INT handler prints cmdline" "$int_direct_out" "command: printf direct"
+assert_contains "INT handler sets interrupted flag" "$int_direct_out" "interrupted=1"
+
+printf '\n=== runner_exec: restores caller INT trap ===\n'
+int_probe_rc=0
+( trap 'exit 42' INT; kill -INT "$BASHPID"; exit 0 ) || int_probe_rc=$?
+if [[ "$int_probe_rc" -ne 42 ]]; then
+  pass_case "caller INT trap restore skipped (SIGINT ignored in this process tree)"
+else
+  # shellcheck disable=SC2329  # invoked via INT trap in this probe
+  caller_int_handler() { :; }
+  trap 'caller_int_handler' INT
+  runner_session_end 2>/dev/null || true
+  unset RUNNER_SESSION_DIR
+  runner_session_begin
+  runner_exec "restore trap probe" -- true >/dev/null
+  after_trap="$(trap -p INT 2>/dev/null || true)"
+  if grep -qF 'caller_int_handler' <<<"$after_trap"; then
+    pass_case "runner_exec restores caller INT trap after command"
+  else
+    printf '[FAIL] caller INT trap not restored: %s\n' "$after_trap"
+    fail=$(( fail + 1 ))
+  fi
+  # Nested install must not re-capture `_runner_on_int` as the saved caller trap.
+  _runner_int_trap_depth=0
+  _runner_saved_int_trap=''
+  trap 'caller_int_handler' INT
+  _runner_install_int_trap
+  _runner_install_int_trap
+  _runner_restore_int_trap
+  mid_trap="$(trap -p INT 2>/dev/null || true)"
+  _runner_restore_int_trap
+  after_nested="$(trap -p INT 2>/dev/null || true)"
+  if grep -qF '_runner_on_int' <<<"$mid_trap" \
+    && grep -qF 'caller_int_handler' <<<"$after_nested" \
+    && ! grep -qF '_runner_on_int' <<<"$after_nested"; then
+    pass_case "nested runner_exec restores original caller INT trap"
+  else
+    printf '[FAIL] nested INT trap restore mid=%s after=%s\n' "$mid_trap" "$after_nested"
+    fail=$(( fail + 1 ))
+  fi
+  trap - INT
+fi
+
+# Integration: SIGINT while runner_exec waits. Skipped when this process tree started
+# with SIGINT ignored (e.g. pre-pr-checks parallel background job — POSIX).
+int_probe_rc=0
+( trap 'exit 42' INT; kill -INT "$BASHPID"; exit 0 ) || int_probe_rc=$?
+if [[ "$int_probe_rc" -ne 42 ]]; then
+  pass_case "Ctrl-C integration skipped (SIGINT ignored in this process tree)"
+  pass_case "Ctrl-C prints label (skipped)"
+  pass_case "Ctrl-C prints cmdline (skipped)"
+else
+  int_log="$(mktemp)"
+  int_sub_rc=0
+  # shellcheck disable=SC2016  # bash -c body is single-quoted so $1/$BASHPID expand in the child
+  env PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+    bash -c '
+      set -euo pipefail
+      # shellcheck disable=SC1090
+      source "$1"
+      runner_session_begin
+      int_target="$BASHPID"
+      (
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+          if [[ -f "${RUNNER_SESSION_DIR}/.active_pid" ]]; then
+            break
+          fi
+          sleep 0.05
+        done
+        sleep 0.05
+        kill -INT "$int_target"
+      ) &
+      runner_exec "int sleep" -- bash -c "sleep 30" >/dev/null
+    ' bash "$lib" >"$int_log" 2>&1 || int_sub_rc=$?
+  int_out="$(cat "$int_log" 2>/dev/null || true)"
+  if [[ "$int_sub_rc" -eq 130 ]] \
+    || grep -qF '[INT] Interrupted: int sleep' <<<"$int_out"; then
+    pass_case "Ctrl-C interrupts runner_exec (exit 130 or INT banner)"
+  else
+    printf '[FAIL] Ctrl-C: expected INT banner or exit 130; rc=%s out=%s\n' \
+      "$int_sub_rc" "$int_out"
+    fail=$(( fail + 1 ))
+  fi
+  assert_contains "Ctrl-C prints label" "$int_out" "[INT] Interrupted: int sleep"
+  assert_contains "Ctrl-C prints cmdline" "$int_out" "command:"
+  rm -f "$int_log"
+fi
+
 
 # ---------------------------------------------------------------------------
 # Summary

@@ -18,12 +18,18 @@
 # Inspect failures with runner_session_failed_ids, runner_read, and
 # runner_format_failure.
 #
-#   run_command <label> <cmd> [args…]
+#   run_command <label> [--timeout SECONDS] <cmd> [args…]
 #     Runs <cmd> [args…]. Stdout is passed through (tee) so callers can redirect.
 #     On failure: prints a structured diagnostic to stderr and returns the exit code.
 #
-#   run_command_or_die <label> <cmd> [args…]
+#   run_command_or_die <label> [--timeout SECONDS] <cmd> [args…]
 #     Delegates to run_command; exits with the same code on failure.
+#
+#   runner_exec / runner_sh accept --timeout SECONDS (GNU timeout(1) / gtimeout).
+#   On expiry: exit 124 and one ERROR: WAIT_TIMEOUT line on stderr.
+#
+#   Ctrl-C (SIGINT): prints the active label + cmdline, then interrupts the child
+#   and exits 130.
 #
 #   record_first_failure <message>
 #     Saves the latest failure reason to $RUNNER_FIRST_FAILURE_FILE (if set).
@@ -39,6 +45,22 @@ readonly _runner_artifact_exit_status='exit_status'
 readonly _runner_artifact_cmdline='cmdline'
 readonly _runner_artifact_label='label'
 readonly _runner_artifact_probe='probe'
+
+# Seconds after SIGTERM before SIGKILL when --timeout fires (GNU timeout --kill-after).
+_runner_timeout_kill_after_sec="${RUNNER_TIMEOUT_KILL_AFTER_SEC:-5}"
+readonly _runner_timeout_kill_after_sec
+
+# Active command (for Ctrl-C diagnostics). Cleared when the command finishes.
+_runner_active_label=''
+_runner_active_cmdline=''
+_runner_active_pid=0
+_runner_active_uuid=''
+_runner_interrupted=0
+# Nesting depth for runner_exec INT handling. Save/restore the caller's trap only
+# at depth 0↔1 so nested runner_exec (e.g. run_command → helper → runner_exec)
+# does not re-capture `_runner_on_int` and clobber the original caller trap.
+_runner_int_trap_depth=0
+_runner_saved_int_trap=''
 
 # runner_session_default_root
 # Prints the directory that holds per-invocation session directories.
@@ -131,32 +153,188 @@ runner_new_uuid() {
   printf '%s-%s-%s\n' "$(date +%s%N)" "$$" "$RANDOM"
 }
 
-# runner_exec <label> [--probe] [--stream-stdout] -- <cmd> [args…]
+# runner_timeout_bin
+# Prints path to GNU timeout(1) or gtimeout(1). Returns 1 when neither is on PATH.
+runner_timeout_bin() {
+  if command -v timeout >/dev/null 2>&1; then
+    command -v timeout
+    return 0
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    command -v gtimeout
+    return 0
+  fi
+  return 1
+}
+
+# runner_validate_timeout_sec <helper> <label> <timeout_sec>
+# Rejects non-integer --timeout values before any arithmetic coercion.
+runner_validate_timeout_sec() {
+  local -r helper="$1"
+  local -r label="$2"
+  local -r timeout_sec="$3"
+
+  if [[ ! "$timeout_sec" =~ ^[0-9]+$ ]]; then
+    printf '%s: --timeout must be a non-negative integer (label=%s)\n' \
+      "$helper" "$label" >&2
+    return 2
+  fi
+  return 0
+}
+
+_runner_on_int() {
+  local label cmdline pid
+
+  label="${_runner_active_label:-}"
+  cmdline="${_runner_active_cmdline:-}"
+  pid="${_runner_active_pid:-0}"
+
+  # Prefer in-memory state; fall back to session files (subshell / inheritance).
+  if [[ -z "$label" && -n "${RUNNER_SESSION_DIR:-}" && -f "${RUNNER_SESSION_DIR}/.active_label" ]]; then
+    label="$(tr -d '\n' <"${RUNNER_SESSION_DIR}/.active_label" 2>/dev/null || true)"
+    cmdline="$(tr -d '\n' <"${RUNNER_SESSION_DIR}/.active_cmdline" 2>/dev/null || true)"
+    pid="$(tr -d '\n' <"${RUNNER_SESSION_DIR}/.active_pid" 2>/dev/null || true)"
+  fi
+
+  runner_print_int_banner "$label" "$cmdline"
+  _runner_interrupted=1
+
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    kill -INT "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
+
+  # Do not exit here: let wait(1) return so runner_exec can record exit_status,
+  # .order, and runner_report_command_failure (same path as a normal failure).
+  # Prior INT traps are not chained — callers should use EXIT for cleanup
+  # (runner-bootstrap already chains EXIT).
+}
+
+# runner_print_int_banner <label> <cmdline>
+runner_print_int_banner() {
+  local -r label="${1:-}"
+  local -r cmdline="${2:-}"
+
+  if [[ -z "$label" && -z "$cmdline" ]]; then
+    return 0
+  fi
+  printf '\n[INT] Interrupted: %s\n' "${label:-command}" >&2
+  printf '  command: %s\n' "${cmdline:-?}" >&2
+}
+
+# runner_exit_code_is_signal_int <exit_code>
+# True for 130 (SIGINT) or 143 (SIGTERM) — common interrupt statuses from wait(1).
+runner_exit_code_is_signal_int() {
+  local -r exit_code="$1"
+  [[ "$exit_code" == "130" || "$exit_code" == "143" ]]
+}
+
+_runner_install_int_trap() {
+  # Depth 0→1: snapshot the caller's INT trap (full `trap -p` line) and install
+  # ours. Deeper nests only bump depth — do not re-capture `_runner_on_int`.
+  if (( _runner_int_trap_depth == 0 )); then
+    _runner_saved_int_trap="$(trap -p INT 2>/dev/null || true)"
+    trap '_runner_on_int' INT
+  fi
+  _runner_int_trap_depth=$((_runner_int_trap_depth + 1))
+}
+
+_runner_restore_int_trap() {
+  if (( _runner_int_trap_depth > 0 )); then
+    _runner_int_trap_depth=$((_runner_int_trap_depth - 1))
+  fi
+  if (( _runner_int_trap_depth > 0 )); then
+    return 0
+  fi
+  if [[ -n "${_runner_saved_int_trap}" ]]; then
+    # Same round-trip as runner-bootstrap EXIT chaining: eval the exact trap -p
+    # line. Exotic handler bodies with embedded quotes can break; callers should
+    # prefer EXIT for cleanup (bootstrap already chains EXIT).
+    eval "${_runner_saved_int_trap}"
+  else
+    trap - INT
+  fi
+  _runner_saved_int_trap=''
+}
+
+# runner_set_active_command <label> <cmdline_quoted> <pid> [uuid]
+runner_set_active_command() {
+  _runner_active_label="$1"
+  _runner_active_cmdline="$2"
+  _runner_active_pid="$3"
+  _runner_active_uuid="${4:-}"
+  _runner_interrupted=0
+  if [[ -n "${RUNNER_SESSION_DIR:-}" ]]; then
+    printf '%s\n' "$1" >"${RUNNER_SESSION_DIR}/.active_label"
+    printf '%s\n' "$2" >"${RUNNER_SESSION_DIR}/.active_cmdline"
+    printf '%s\n' "$3" >"${RUNNER_SESSION_DIR}/.active_pid"
+  fi
+}
+
+# runner_clear_active_command
+runner_clear_active_command() {
+  _runner_active_label=''
+  _runner_active_cmdline=''
+  _runner_active_pid=0
+  _runner_active_uuid=''
+  if [[ -n "${RUNNER_SESSION_DIR:-}" ]]; then
+    rm -f "${RUNNER_SESSION_DIR}/.active_label" \
+      "${RUNNER_SESSION_DIR}/.active_cmdline" \
+      "${RUNNER_SESSION_DIR}/.active_pid"
+  fi
+}
+
+# runner_exec <label> [--probe] [--stream-stdout] [--timeout SECONDS] -- <cmd> [args…]
 # Captures stdout/stderr/exit in a UUID directory. Returns the command exit code.
 # With --probe, non-zero exits are omitted from failure reports (expected checks).
 # With --stream-stdout, copies stdout to file descriptor 1 after completion.
+# With --timeout SECONDS, wraps the command in GNU timeout(1) (--kill-after),
+# prints "waiting up to Ns: <label>" on stderr, and on expiry exits 124 with
+# ERROR: WAIT_TIMEOUT <label> timeout=<Ns>.
 runner_exec() {
-  local label stream_stdout=0 probe=0
+  local label stream_stdout=0 probe=0 timeout_sec=0
+  local -a runner_cmd=()
+  local uuid run_dir exit_code cmdline_quoted timeout_bin int_pid
   label="${1:?}"
   shift
 
-  if [[ "${1:-}" == '--probe' ]]; then
-    probe=1
-    shift
-  fi
-  if [[ "${1:-}" == '--stream-stdout' ]]; then
-    stream_stdout=1
-    shift
-  fi
-  [[ "${1:-}" == '--' ]] || {
-    printf 'runner_exec: expected -- before command (label=%s)\n' "$label" >&2
-    return 2
-  }
-  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --probe)
+        probe=1
+        shift
+        ;;
+      --stream-stdout)
+        stream_stdout=1
+        shift
+        ;;
+      --timeout)
+        [[ $# -ge 2 ]] || {
+          printf 'runner_exec: --timeout requires SECONDS (label=%s)\n' "$label" >&2
+          return 2
+        }
+        timeout_sec="$2"
+        shift 2
+        ;;
+      --timeout=*)
+        timeout_sec="${1#--timeout=}"
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        printf 'runner_exec: expected -- before command (label=%s)\n' "$label" >&2
+        return 2
+        ;;
+    esac
+  done
+
+  runner_validate_timeout_sec "runner_exec" "$label" "$timeout_sec" || return $?
 
   runner_session_ensure
 
-  local uuid run_dir exit_code cmdline_quoted
   uuid="$(runner_new_uuid)"
   run_dir="${RUNNER_SESSION_DIR}/${uuid}"
   mkdir -p "$run_dir"
@@ -165,11 +343,69 @@ runner_exec() {
   if (( probe )); then
     printf '1\n' >"${run_dir}/${_runner_artifact_probe}"
   fi
-  cmdline_quoted="$(runner_quote_cmdline "$@")"
+
+  runner_cmd=("$@")
+  if (( timeout_sec > 0 )); then
+    timeout_bin="$(runner_timeout_bin)" || {
+      printf 'runner_exec: --timeout requires timeout(1) or gtimeout(1) on PATH (label=%s)\n' \
+        "$label" >&2
+      return 2
+    }
+    runner_cmd=(
+      "$timeout_bin"
+      --foreground
+      --kill-after="${_runner_timeout_kill_after_sec}"
+      "${timeout_sec}"
+      "$@"
+    )
+  fi
+
+  # Install INT trap only after early-return setup succeeds so the stack stays balanced.
+  _runner_install_int_trap
+
+  cmdline_quoted="$(runner_quote_cmdline "${runner_cmd[@]}")"
   printf '%s' "$cmdline_quoted" >"${run_dir}/${_runner_artifact_cmdline}"
 
+  if (( timeout_sec > 0 )); then
+    printf 'waiting up to %ss: %s\n' "$timeout_sec" "$label" >&2
+  fi
+
+  # Background + wait so the INT trap can print the cmdline, then kill the child
+  # (bash defers INT traps while a foreground external command is running).
   exit_code=0
-  "$@" >"${run_dir}/${_runner_artifact_stdout}" 2>"${run_dir}/${_runner_artifact_stderr}" || exit_code=$?
+  _runner_interrupted=0
+  "${runner_cmd[@]}" \
+    >"${run_dir}/${_runner_artifact_stdout}" \
+    2>"${run_dir}/${_runner_artifact_stderr}" &
+  runner_set_active_command "$label" "$cmdline_quoted" "$!" "$uuid"
+  wait "$_runner_active_pid" || exit_code=$?
+  # When wait is interrupted by SIGINT, bash may return 130 here; the INT trap
+  # sets _runner_interrupted and kills the child. Fall through to the normal
+  # artifact + failure-report + stream-stdout path.
+  if (( _runner_interrupted )) || runner_exit_code_is_signal_int "$exit_code"; then
+    int_pid="${_runner_active_pid:-0}"
+    if [[ "$int_pid" =~ ^[1-9][0-9]*$ ]]; then
+      kill -INT "$int_pid" 2>/dev/null || true
+      kill -TERM "$int_pid" 2>/dev/null || true
+      wait "$int_pid" 2>/dev/null || true
+    fi
+    if (( ! _runner_interrupted )); then
+      runner_print_int_banner "$_runner_active_label" "$_runner_active_cmdline"
+    fi
+    # Preserve SIGTERM (143) when that is what wait reported; default Ctrl-C to 130.
+    if ! runner_exit_code_is_signal_int "$exit_code"; then
+      exit_code=130
+    fi
+  fi
+  runner_clear_active_command
+
+  if (( timeout_sec > 0 && exit_code == 124 )); then
+    {
+      printf 'ERROR: WAIT_TIMEOUT %s timeout=%ss\n' "$label" "$timeout_sec"
+    } >>"${run_dir}/${_runner_artifact_stderr}"
+    printf 'ERROR: WAIT_TIMEOUT %s timeout=%ss\n' "$label" "$timeout_sec" >&2
+  fi
+
   printf '%s\n' "$exit_code" >"${run_dir}/${_runner_artifact_exit_status}"
   printf '%s\n' "$uuid" >>"${RUNNER_SESSION_DIR}/.order"
 
@@ -181,38 +417,60 @@ runner_exec() {
     runner_report_command_failure "$label" "$exit_code" "$uuid"
   fi
 
+  _runner_restore_int_trap
   return "$exit_code"
 }
 
-# runner_sh <label> [--probe] [--stream-stdout] [--] <script>
+# runner_sh <label> [--probe] [--stream-stdout] [--timeout SECONDS] [--] <script>
 # Runs bash -c with capture (pipelines and compound commands).
 runner_sh() {
-  local label probe=0 stream_stdout=0 script
+  local label probe=0 stream_stdout=0 timeout_sec=0 script
+  local -a exec_opts=()
   label="${1:?}"
   shift
-  if [[ "${1:-}" == '--probe' ]]; then
-    probe=1
-    shift
-  fi
-  if [[ "${1:-}" == '--stream-stdout' ]]; then
-    stream_stdout=1
-    shift
-  fi
-  if [[ "${1:-}" == '--' ]]; then
-    shift
-  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --probe)
+        probe=1
+        shift
+        ;;
+      --stream-stdout)
+        stream_stdout=1
+        shift
+        ;;
+      --timeout)
+        [[ $# -ge 2 ]] || {
+          printf 'runner_sh: --timeout requires SECONDS (label=%s)\n' "$label" >&2
+          return 2
+        }
+        timeout_sec="$2"
+        shift 2
+        ;;
+      --timeout=*)
+        timeout_sec="${1#--timeout=}"
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
   script="${1:?}"
+  runner_validate_timeout_sec "runner_sh" "$label" "$timeout_sec" || return $?
   if (( probe )); then
-    if (( stream_stdout )); then
-      runner_exec "$label" --probe --stream-stdout -- bash -c "$script"
-    else
-      runner_exec "$label" --probe -- bash -c "$script"
-    fi
-  elif (( stream_stdout )); then
-    runner_exec "$label" --stream-stdout -- bash -c "$script"
-  else
-    runner_exec "$label" -- bash -c "$script"
+    exec_opts+=(--probe)
   fi
+  if (( stream_stdout )); then
+    exec_opts+=(--stream-stdout)
+  fi
+  if (( timeout_sec > 0 )); then
+    exec_opts+=(--timeout "$timeout_sec")
+  fi
+  runner_exec "$label" "${exec_opts[@]}" -- bash -c "$script"
 }
 
 # runner_read <uuid> <artifact>
@@ -241,28 +499,51 @@ runner_last_id() {
   tail -n 1 "${RUNNER_SESSION_DIR}/.order"
 }
 
-# runner_exec_stdout <label> [--probe] -- <cmd> [args…]
+# runner_exec_stdout <label> [--probe] [--timeout SECONDS] -- <cmd> [args…]
 # Runs command; prints captured stdout on success or failure. Returns exit code.
 runner_exec_stdout() {
-  local label probe=0
+  local label probe=0 timeout_sec=0
+  local -a exec_opts=()
   label="$1"
   shift
-  if [[ "${1:-}" == '--probe' ]]; then
-    probe=1
-    shift
-  fi
-  [[ "${1:-}" == '--' ]] || {
-    printf 'runner_exec_stdout: expected -- before command (label=%s)\n' "$label" >&2
-    return 2
-  }
-  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --probe)
+        probe=1
+        shift
+        ;;
+      --timeout)
+        [[ $# -ge 2 ]] || {
+          printf 'runner_exec_stdout: --timeout requires SECONDS (label=%s)\n' "$label" >&2
+          return 2
+        }
+        timeout_sec="$2"
+        shift 2
+        ;;
+      --timeout=*)
+        timeout_sec="${1#--timeout=}"
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        printf 'runner_exec_stdout: expected -- before command (label=%s)\n' "$label" >&2
+        return 2
+        ;;
+    esac
+  done
   local uuid exit_code
-  exit_code=0
+  runner_validate_timeout_sec "runner_exec_stdout" "$label" "$timeout_sec" || return $?
   if (( probe )); then
-    runner_exec "$label" --probe -- "$@" || exit_code=$?
-  else
-    runner_exec "$label" -- "$@" || exit_code=$?
+    exec_opts+=(--probe)
   fi
+  if (( timeout_sec > 0 )); then
+    exec_opts+=(--timeout "$timeout_sec")
+  fi
+  exit_code=0
+  runner_exec "$label" "${exec_opts[@]}" -- "$@" || exit_code=$?
   uuid="$(runner_last_id)"
   if [[ -n "$uuid" ]]; then
     runner_read "$uuid" "$_runner_artifact_stdout" || true
@@ -270,17 +551,42 @@ runner_exec_stdout() {
   return "$exit_code"
 }
 
-# runner_sh_stdout <label> [--] <script>
+# runner_sh_stdout <label> [--timeout SECONDS] [--] <script>
 runner_sh_stdout() {
-  local label script exit_code uuid
+  local label timeout_sec=0 script exit_code uuid
+  local -a sh_opts=()
   label="${1:?}"
   shift
-  if [[ "${1:-}" == '--' ]]; then
-    shift
-  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout)
+        [[ $# -ge 2 ]] || {
+          printf 'runner_sh_stdout: --timeout requires SECONDS (label=%s)\n' "$label" >&2
+          return 2
+        }
+        timeout_sec="$2"
+        shift 2
+        ;;
+      --timeout=*)
+        timeout_sec="${1#--timeout=}"
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
   script="${1:?}"
+  runner_validate_timeout_sec "runner_sh_stdout" "$label" "$timeout_sec" || return $?
+  if (( timeout_sec > 0 )); then
+    sh_opts+=(--timeout "$timeout_sec")
+  fi
   exit_code=0
-  runner_sh "$label" -- "$script" || exit_code=$?
+  runner_sh "$label" "${sh_opts[@]}" -- "$script" || exit_code=$?
   uuid="$(runner_last_id)"
   if [[ -n "$uuid" ]]; then
     runner_read "$uuid" "$_runner_artifact_stdout" || true
@@ -583,9 +889,42 @@ run_command() {
   local -r label="$1"
   shift
 
+  local timeout_sec=0
+  local -a exec_opts=(--stream-stdout)
   local exit_code
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout)
+        [[ $# -ge 2 ]] || {
+          printf 'run_command: --timeout requires SECONDS (label=%s)\n' "$label" >&2
+          return 2
+        }
+        timeout_sec="$2"
+        shift 2
+        ;;
+      --timeout=*)
+        timeout_sec="${1#--timeout=}"
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  runner_validate_timeout_sec "run_command" "$label" "$timeout_sec" || return $?
+
+  if (( timeout_sec > 0 )); then
+    exec_opts+=(--timeout "$timeout_sec")
+  fi
+
   exit_code=0
-  runner_exec "$label" --stream-stdout -- "$@" || exit_code=$?
+  runner_exec "$label" "${exec_opts[@]}" -- "$@" || exit_code=$?
 
   return "$exit_code"
 }
