@@ -73,7 +73,7 @@ matches (all systemd versions). See
 | File | Purpose |
 | --- | --- |
 | `~/.config/user-services-host` | Short hostname label (e.g. `svc-host`) — prompts, status, and hostname `ConditionHost` |
-| `~/.config/user-services-host-fqdn` | FQDN from `hostname` on the service host (e.g. `svc-host.example`) |
+| `~/.config/user-services-host-fqdn` | FQDN from `hostname -f` on the service host (e.g. `svc-host.example`) |
 | `~/.config/user-services-machine-id` | 32-char hex ID from `/etc/machine-id` on the service host |
 
 On the **first** `setup-service` run on the configured service host, the script
