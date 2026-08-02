@@ -94,12 +94,13 @@ is the active guard; upgrade systemd when possible so both guards apply.
 service host and notes when systemd is below 259.
 
 **Standby hosts** (same NFS home, e.g. keylime): `setup-service` must **not**
-`systemctl --user disable` timer units. Disable removes shared
-`timers.target.wants/` symlinks and stops schedules on the service host.
+`systemctl --user disable` timer units or delete shared unit files under
+`~/.config/systemd/user/`. Disable/remove on standby removes shared
+`timers.target.wants/` (and unit files) and stops schedules on the service host.
 `ConditionHost` already prevents timers from firing on standby. On standby,
-`timer_standby_disable` only stops a locally active timer and leaves enable
-links intact. Re-run `setup-service` on **meerkat** if wants links were ever
-removed and need re-enabling.
+`timer_standby_disable` only stops a locally active timer, and stale-unit
+cleanup is skipped. Re-run `setup-service` on **meerkat** if wants links were
+ever removed and need re-enabling.
 
 Use `scripts/show-services` for a read-only overview of every service template in
 this repo:
