@@ -122,11 +122,13 @@ source "${script_dir}/lib/runner-bootstrap"
 # shellcheck disable=SC1091  # shared helper sourced at runtime; CI shellcheck doesn't use -x
 source "${script_dir}/lib/github-repo-slug"
 
-# dun_runner_print_captured <text>
-# Re-emit runner/jq stdout after $(…) capture. Command substitution strips all
-# trailing newlines; without restoring one, `while read` drops a sole/last row
-# (empty "Outdated packages" tables when a repo has exactly one update).
-dun_runner_print_captured() {
+# dun_runner_print_stream <text>
+# Re-emit jq stream stdout after $(…) capture inside the helper. Command
+# substitution strips trailing newlines; without restoring one, `while read`
+# drops a sole/last row. Only for process-substitution streams — scalar
+# captures (hostname, counts, MIME boundary) must use printf '%s' so outer
+# $(…) / string embeds are not polluted if a caller forgets to strip.
+dun_runner_print_stream() {
   local -r out="$1"
 
   printf '%s' "$out"
@@ -136,6 +138,7 @@ dun_runner_print_captured() {
 }
 
 # dun_runner_jq_file <label> <file> [jq-args…]
+# Scalar / validation jq (counts, flags, pretty). Does not restore newlines.
 dun_runner_jq_file() {
   local -r label="$1"
   local -r file="$2"
@@ -145,7 +148,22 @@ dun_runner_jq_file() {
 
   exit_code=0
   out="$(runner_exec_stdout "$label" -- jq "$@" "$file")" || exit_code=$?
-  dun_runner_print_captured "$out"
+  printf '%s' "$out"
+  return "$exit_code"
+}
+
+# dun_runner_jq_stream <label> <file> [jq-args…]
+# NDJSON / row streams for `while read` (e.g. .updates[], .cves[]).
+dun_runner_jq_stream() {
+  local -r label="$1"
+  local -r file="$2"
+  shift 2
+  local exit_code
+  local out
+
+  exit_code=0
+  out="$(runner_exec_stdout "$label" -- jq "$@" "$file")" || exit_code=$?
+  dun_runner_print_stream "$out"
   return "$exit_code"
 }
 
@@ -161,7 +179,7 @@ dun_runner_jq_r() {
   # shellcheck disable=SC2016  # jq filter passed as bash -c positional arg
   out="$(runner_exec_stdout "$label" -- bash -c 'printf "%s" "$2" | jq --raw-output "$1"' bash "$filter" "$json")" \
     || exit_code=$?
-  dun_runner_print_captured "$out"
+  printf '%s' "$out"
   return "$exit_code"
 }
 
@@ -175,7 +193,7 @@ dun_runner_exec_stdout() {
 
   exit_code=0
   out="$(runner_exec_stdout "$label" -- "$@")" || exit_code=$?
-  dun_runner_print_captured "$out"
+  printf '%s' "$out"
   return "$exit_code"
 }
 
@@ -573,7 +591,7 @@ for repo in "${repos[@]}"; do
       fix="$(dun_runner_jq_r "dep-updater-notifier cve fix" "$row" '.fix')"
       cves="$(dun_runner_jq_r "dep-updater-notifier cve ids" "$row" '.cves')"
       report_lines+=("  $(printf '%-24s  %-10s  %-10s  %s' "$pkg" "$current" "$fix" "$cves")")
-    done < <(dun_runner_jq_file "dep-updater-notifier cves stream" "$dep_out_file" --compact-output '.cves[]')
+    done < <(dun_runner_jq_stream "dep-updater-notifier cves stream" "$dep_out_file" --compact-output '.cves[]')
     report_lines+=("")
   fi
 
@@ -607,7 +625,7 @@ for repo in "${repos[@]}"; do
       if (( local_count <= 3 )); then
         local_pairs="${local_pairs:+${local_pairs}, }${pkg} ${from}→${to}"
       fi
-    done < <(dun_runner_jq_file "dep-updater-notifier updates stream" "$dep_out_file" --compact-output '.updates[]')
+    done < <(dun_runner_jq_stream "dep-updater-notifier updates stream" "$dep_out_file" --compact-output '.updates[]')
 
     # Compute widths (cap PACKAGE to avoid huge lines in mail clients).
     for i in "${!ecosystems[@]}"; do
