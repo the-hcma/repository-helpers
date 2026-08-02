@@ -53,6 +53,8 @@ readonly _runner_timeout_kill_after_sec="${RUNNER_TIMEOUT_KILL_AFTER_SEC:-5}"
 _runner_active_label=''
 _runner_active_cmdline=''
 _runner_active_pid=0
+_runner_active_uuid=''
+_runner_interrupted=0
 _runner_prior_int=''
 _runner_int_trap_installed=0
 
@@ -215,19 +217,18 @@ _runner_on_int() {
   fi
 
   runner_print_int_banner "$label" "$cmdline"
+  _runner_interrupted=1
 
   if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
     kill -INT "$pid" 2>/dev/null || true
     kill -TERM "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
   fi
 
-  runner_clear_active_command
-
+  # Do not exit here: let wait(1) return so runner_exec can record exit_status,
+  # .order, and runner_report_command_failure (same path as a normal failure).
   if [[ -n "${_runner_prior_int:-}" ]]; then
     eval "${_runner_prior_int}"
   fi
-  exit 130
 }
 
 # runner_print_int_banner <label> <cmdline>
@@ -257,11 +258,13 @@ _runner_install_int_trap() {
   _runner_int_trap_installed=1
 }
 
-# runner_set_active_command <label> <cmdline_quoted> <pid>
+# runner_set_active_command <label> <cmdline_quoted> <pid> [uuid]
 runner_set_active_command() {
   _runner_active_label="$1"
   _runner_active_cmdline="$2"
   _runner_active_pid="$3"
+  _runner_active_uuid="${4:-}"
+  _runner_interrupted=0
   if [[ -n "${RUNNER_SESSION_DIR:-}" ]]; then
     printf '%s\n' "$1" >"${RUNNER_SESSION_DIR}/.active_label"
     printf '%s\n' "$2" >"${RUNNER_SESSION_DIR}/.active_cmdline"
@@ -274,6 +277,7 @@ runner_clear_active_command() {
   _runner_active_label=''
   _runner_active_cmdline=''
   _runner_active_pid=0
+  _runner_active_uuid=''
   if [[ -n "${RUNNER_SESSION_DIR:-}" ]]; then
     rm -f "${RUNNER_SESSION_DIR}/.active_label" \
       "${RUNNER_SESSION_DIR}/.active_cmdline" \
@@ -363,25 +367,33 @@ runner_exec() {
   # Background + wait so the INT trap can print the cmdline, then kill the child
   # (bash defers INT traps while a foreground external command is running).
   exit_code=0
+  _runner_interrupted=0
   "${runner_cmd[@]}" \
     >"${run_dir}/${_runner_artifact_stdout}" \
     2>"${run_dir}/${_runner_artifact_stderr}" &
-  runner_set_active_command "$label" "$cmdline_quoted" "$!"
+  runner_set_active_command "$label" "$cmdline_quoted" "$!" "$uuid"
   wait "$_runner_active_pid" || exit_code=$?
-  # When wait is interrupted by SIGINT, bash may return 130 here without running
-  # the INT trap first — print the banner, kill the child, then abort.
-  if runner_exit_code_is_signal_int "$exit_code"; then
+  # When wait is interrupted by SIGINT, bash may return 130 here; the INT trap
+  # sets _runner_interrupted and kills the child. Finalize via the normal
+  # artifact + failure-report path (do not exit early from the trap).
+  if (( _runner_interrupted )) || runner_exit_code_is_signal_int "$exit_code"; then
     int_pid="${_runner_active_pid:-0}"
-    runner_print_int_banner "$_runner_active_label" "$_runner_active_cmdline"
     if [[ "$int_pid" =~ ^[1-9][0-9]*$ ]]; then
       kill -INT "$int_pid" 2>/dev/null || true
       kill -TERM "$int_pid" 2>/dev/null || true
       wait "$int_pid" 2>/dev/null || true
     fi
+    if (( ! _runner_interrupted )); then
+      runner_print_int_banner "$_runner_active_label" "$_runner_active_cmdline"
+    fi
     runner_clear_active_command
+    exit_code=130
     printf '%s\n' "$exit_code" >"${run_dir}/${_runner_artifact_exit_status}"
     printf '%s\n' "$uuid" >>"${RUNNER_SESSION_DIR}/.order"
-    exit 130
+    if ! (( probe )); then
+      runner_report_command_failure "$label" "$exit_code" "$uuid"
+    fi
+    return 130
   fi
   runner_clear_active_command
 
