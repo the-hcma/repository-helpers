@@ -393,6 +393,7 @@ run_skips_archived_repos() {
   trap 'rm -rf "$tmp"' RETURN
 
   local -r sendmail_breadcrumb="${tmp}/sendmail.invoked"
+  local -r archived_scan_breadcrumb="${tmp}/archived-scan.invoked"
   # tooling_path_bootstrap_cron_minimal puts $HOME/.local/bin ahead of /usr/bin.
   # Install the gh mock there so CI's real /usr/bin/gh cannot shadow it (404 →
   # archived-unknown → both repos skipped → empty email). Same pattern as
@@ -434,7 +435,8 @@ while [[ $# -gt 0 ]]; do
 done
 repo="$(basename "$dir")"
 if [[ "$repo" == 'archived' ]]; then
-  printf '%s\n' 'ERROR: dep-updater should not scan archived repos' >&2
+  : >"${DEP_UPDATER_ARCHIVED_SCAN_BREADCRUMB:?}"
+  printf '%s\n' 'ERROR: archived: dep-updater should not scan archived repos' >&2
   exit 1
 fi
 printf '%s' '{"has_updates":true,"has_cves":false,"updates":[{"ecosystem":"gha","package":"actions/checkout","from":"v4","to":"v5"}],"cves":[]}'
@@ -442,6 +444,7 @@ EOF
   chmod +x "$tmp/bin/gh" "$tmp/.local/bin/gh" "$tmp/bin/dep-updater" "$tmp/bin/dep-updater-notifier"
 
   out="$(env -u DEP_UPDATER_ENV_FILE HOME="$tmp" PATH="$(notifier_test_path "$tmp")" \
+    DEP_UPDATER_ARCHIVED_SCAN_BREADCRUMB="$archived_scan_breadcrumb" \
     REPO_HELPERS_TEST_MODE=1 REPO_HELPERS_SENDMAIL_BREADCRUMB="$sendmail_breadcrumb" \
     "$tmp/bin/dep-updater-notifier" --print 2>"$tmp/stderr")"
   err="$(cat "$tmp/stderr")"
@@ -450,6 +453,44 @@ EOF
   assert_contains 'email lists active package' "$out" "actions/checkout"
   assert_not_contains 'email omits archived repo section' "$out" "=== archived ==="
   assert_not_contains 'stderr has no archived scan failure' "$err" "archived:"
+  if [[ ! -e "$archived_scan_breadcrumb" ]]; then
+    pass_case 'archived repository is not scanned'
+  else
+    fail_case 'archived repository is not scanned'
+  fi
+}
+
+# Missing origin must not pollute runner_last_failure_* used for dep-updater emails.
+run_no_origin_failure_reports_dep_updater() {
+  local tmp out err
+  tmp="$(make_tmpdir)"
+  readonly tmp
+  trap 'rm -rf "$tmp"' RETURN
+
+  local -r sendmail_breadcrumb="${tmp}/sendmail.invoked"
+  mkdir -p "$tmp/work/ai/orphan" "$tmp/.local/bin"
+  stage_notifier_bundle "$tmp"
+
+  git -C "$tmp/work/ai/orphan" init --quiet
+  # No origin remote — archived probe's git remote get-url fails (must be --probe).
+
+  cat >"$tmp/bin/dep-updater" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' 'ERROR: simulated scan boom' >&2
+exit 2
+EOF
+  chmod +x "$tmp/bin/dep-updater" "$tmp/bin/dep-updater-notifier"
+
+  out="$(env -u DEP_UPDATER_ENV_FILE HOME="$tmp" PATH="$(notifier_test_path "$tmp")" \
+    REPO_HELPERS_TEST_MODE=1 REPO_HELPERS_SENDMAIL_BREADCRUMB="$sendmail_breadcrumb" \
+    "$tmp/bin/dep-updater-notifier" --print 2>"$tmp/stderr" || true)"
+  err="$(cat "$tmp/stderr")"
+
+  assert_contains 'email reports dep-updater failure reason' "$out" 'simulated scan boom'
+  assert_contains 'email command is dep-updater scan' "$out" 'dep-updater --report-json'
+  assert_not_contains 'email does not blame missing origin remote' "$out" 'git remote get-url'
+  assert_not_contains 'stderr does not blame missing origin remote' "$err" 'git remote get-url'
 }
 
 printf '\n=== static: empty arrays safe under set -u ===\n'
@@ -474,15 +515,17 @@ else
   fail_case 'dep-updater-notifier: missing runner adoption wiring'
 fi
 
-printf '\n=== static: dep-updater-notifier restores jq stream newlines ===\n'
+printf '\n=== static: dep-updater-notifier stream newline restore ===\n'
 # shellcheck disable=SC2016  # static assert matches literal source text
-if grep -qF 'dun_runner_print_captured' "$notifier_script" \
+if grep -qF 'dun_runner_print_stream' "$notifier_script" \
+  && grep -qF 'dun_runner_jq_stream' "$notifier_script" \
   && grep -qF 'dun_skip_archived_repo' "$notifier_script" \
   && grep -qF 'github-repo-slug' "$notifier_script" \
-  && grep -qF '.updates|length' "$notifier_script"; then
-  pass_case 'dep-updater-notifier: newline restore, archived skip, updates|length gate'
+  && grep -qF '.updates|length' "$notifier_script" \
+  && ! grep -qF 'dun_runner_print_captured' "$notifier_script"; then
+  pass_case 'dep-updater-notifier: stream-only newline restore, archived skip, updates|length gate'
 else
-  fail_case 'dep-updater-notifier: missing empty-table / archived-skip wiring'
+  fail_case 'dep-updater-notifier: missing stream/archived-skip wiring (or scalar print_captured)'
 fi
 
 printf '\n=== static: dep-updater-notifier loads dep-updater.env ===\n'
@@ -528,6 +571,9 @@ run_failure_stderr_includes_invalid_json_reason
 
 echo "=== discovery: skips archived GitHub repositories ==="
 run_skips_archived_repos
+
+echo "=== failure: missing origin does not pollute dep-updater failure report ==="
+run_no_origin_failure_reports_dep_updater
 
 echo "=== done ==="
 test_summary
