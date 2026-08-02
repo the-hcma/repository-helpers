@@ -369,18 +369,19 @@ host_runs_units() {
 }
 
 # timer_standby_disable
-# On NFS-shared homes, disable timer symlinks on hosts that must not run scheduled jobs.
+# Standby hosts (shared NFS home): never ``systemctl disable`` timers. That removes
+# shared ``timers.target.wants/`` symlinks and stops schedules on the service host.
+# ``ConditionHost`` already prevents timers from firing here. Stop a locally active
+# timer only (enable links stay intact for the service host).
 timer_standby_disable() {
     local -r timer_filename="$1"
-    local enabled_state
 
-    enabled_state="$(systemctl --user is-enabled "$timer_filename" 2>/dev/null || true)"
-    case "$enabled_state" in
-        enabled|linked|linked-runtime)
-            systemctl --user disable --now "$timer_filename" 2>/dev/null || true
-            echo "⏭️  ${timer_filename}: disabled on $(current_hostname_short) (shared NFS — timers run only on ${condition_host_value})."
-            ;;
-    esac
+    if systemctl --user is-active --quiet "$timer_filename" 2>/dev/null; then
+        systemctl --user stop "$timer_filename" 2>/dev/null || true
+        echo "⏭️  ${timer_filename}: stopped on $(current_hostname_short) (ConditionHost skips schedule; NFS wants left intact for ${condition_host_value})."
+        return 0
+    fi
+    echo "⏭️  ${timer_filename}: skipped on $(current_hostname_short) (ConditionHost; not disabling shared NFS wants — timers run on ${condition_host_value})."
 }
 
 # warn_host_skips_service
@@ -572,6 +573,13 @@ generate_timer_unit() {
 service_unit_is_oneshot() {
     local -r unit_path="$1"
     [[ -f "$unit_path" ]] && grep -qE '^Type=oneshot([[:space:]]|$)' "$unit_path"
+}
+
+# service_unit_wanted_by_default_target [unit_file]
+# True when [Install] WantedBy includes default.target (boot/login heal oneshots).
+service_unit_wanted_by_default_target() {
+    local -r unit_path="$1"
+    [[ -f "$unit_path" ]] && grep -qE '^WantedBy=([^[:space:]]*[[:space:]]+)*default\.target([[:space:]]|$)' "$unit_path"
 }
 
 # timer_only_drop_stale_default_target_link <service_filename>
@@ -1627,7 +1635,12 @@ while IFS= read -r unit_basename; do
 
     if [[ "$is_oneshot" == "true" ]]; then
         if host_runs_units; then
-            echo "⏭️  ${service_filename}: oneshot — no timer; start manually with systemctl --user start ${service_filename}"
+            if service_unit_wanted_by_default_target "$local_target_service"; then
+                echo "🚀 Enabling and starting ${service_filename} (default.target oneshot)..."
+                systemctl --user enable --now "$service_filename"
+            else
+                echo "⏭️  ${service_filename}: oneshot — no timer; start manually with systemctl --user start ${service_filename}"
+            fi
         else
             echo "⏭️  ${service_filename}: oneshot — skipped on $(current_hostname_short) (service host ${condition_host_value} / ${condition_host_machine_id})."
         fi

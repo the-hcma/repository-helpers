@@ -83,8 +83,8 @@ jobs must not run there.
 
 `host_runs_units` (used by `setup-service`) is true when local `/etc/machine-id`
 matches `~/.config/user-services-machine-id` **and** the hostname matches
-`~/.config/user-services-host`. Timers enable on that host only; standbys get
-`timer_standby_disable`.
+`~/.config/user-services-host`. Timers enable on that host only; standbys skip
+arming schedules via `timer_standby_disable` (stop-only; see below).
 
 **systemd ≥ 259** is required for machine-id `ConditionHost` to be reliable in
 units. On older systemd (e.g. meerkat today), the hostname `ConditionHost` line
@@ -93,10 +93,18 @@ is the active guard; upgrade systemd when possible so both guards apply.
 `setup-service --status` reports whether this machine matches the configured
 service host and notes when systemd is below 259.
 
-**Standby hosts** (same NFS home, e.g. keylime): `setup-service` **disables**
-timer units (`systemctl --user disable --now …`) so shared
-`timers.target.wants/` symlinks do not arm the wrong machine. Re-run
-`setup-service` on **meerkat** after changes to re-enable timers there.
+**Standby hosts** (same NFS home, e.g. keylime): `setup-service` must **not**
+`systemctl --user disable` timer units. Disable removes shared
+`timers.target.wants/` symlinks and stops schedules on the service host.
+`ConditionHost` already prevents timers from firing on standby. On standby,
+`timer_standby_disable` only stops a locally active timer and leaves enable
+links intact.
+
+**Heal on the service host:** `ensure-user-service-timers.service`
+(`WantedBy=default.target`) re-runs `systemctl --user enable --now` for every
+`etc/systemd/*.timer` when the lingering user manager starts (boot / login).
+That recovers missing wants links without waiting for an interactive
+`setup-service` / `start-development --refresh`.
 
 Use `scripts/show-services` for a read-only overview of every service template in
 this repo:
