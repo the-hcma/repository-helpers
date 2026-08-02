@@ -563,12 +563,66 @@ dep_stack_register_branch_optional() {
   run_in_worktree gt track -p main 2>/dev/null || true
 }
 
+# dep_stack_submit_gh_pr_fallback
+# Used when the repo marker is gh-stack but GitHub Stacked PRs are not enabled
+# for the repository yet (public preview rollout). Push HEAD and open a normal PR.
+dep_stack_submit_gh_pr_fallback() {
+  local branch title body_file quoted_wt
+
+  branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current)"
+  [[ -n "$branch" ]] || die "gh pr fallback: could not determine current branch"
+  title="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- log -1 --format=%s)"
+  [[ -n "$title" ]] || title="chore(deps): dependency updates"
+  quoted_wt="$(printf '%q' "$worktree_path")"
+
+  dep_runner_sh "dep-updater git push fallback" -- "cd ${quoted_wt} && git push --set-upstream origin HEAD" \
+    || die "gh pr fallback: failed to push ${branch}"
+
+  body_file="$(mktemp)"
+  cat >"$body_file" <<'EOF'
+Automated dependency update via dep-updater.
+
+Opened with gh pr create because Stacked PRs are not enabled for this repository.
+EOF
+  dep_runner_gh "dep-updater gh pr create fallback" -- pr create \
+    --repo "${repo_owner}/${repo_name}" \
+    --base main \
+    --head "$branch" \
+    --title "$title" \
+    --body-file "$body_file" \
+    --label "dep-updater" \
+    || {
+      rm -f "$body_file"
+      die "gh pr fallback: failed to create PR for ${branch}"
+    }
+  rm -f "$body_file"
+}
+
 dep_stack_submit_current() {
+  local submit_out submit_rc=0
+  local quoted_wt
+
   if dep_stacking_is_gh_stack; then
-    run_in_worktree gh stack submit --auto --open --remote origin
-  else
-    run_in_worktree gt submit --no-interactive --publish --no-stack
+    quoted_wt="$(printf '%q' "$worktree_path")"
+    # Keep runner helper on the same line as the shell script so the
+    # runner-adoption ratchet does not treat the inner `gh` as bare.
+    submit_out="$(dep_runner_sh_stdout "dep-updater gh stack submit" -- "cd ${quoted_wt} && gh stack submit --auto --open --remote origin 2>&1")" \
+      && submit_rc=0 || submit_rc=$?
+    if (( submit_rc == 0 )); then
+      [[ -n "$submit_out" ]] && printf '%s\n' "$submit_out"
+      return 0
+    fi
+    if grep -qiF 'Stacked PRs are not enabled for this repository' <<<"$submit_out"; then
+      log "Warning: Stacked PRs are not enabled for ${repo_owner}/${repo_name}; falling back to gh pr create."
+      [[ -n "$submit_out" ]] && log "$submit_out"
+      dep_stack_submit_gh_pr_fallback
+      return 0
+    fi
+    [[ -n "$submit_out" ]] && log "$submit_out"
+    die "gh stack submit failed (exit ${submit_rc})"
   fi
+
+  run_in_worktree gt submit --no-interactive --publish --no-stack
 }
 
 dep_stack_track_force() {
@@ -5130,6 +5184,9 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
     fi
   done
 
+  # Dry-run probe is current-platform only; packages that pass can still fail
+  # multi-environment `uv lock` (darwin/win32/PyPy markers). Always batch-filter
+  # the surviving direct set with py_uv_filter_outdated_lines before emitting.
   for line in "${direct_candidates[@]}"; do
     read -r pkg cur new <<<"$line"
     if py_uv_probe_transitive_upgrade "$target_dir" "$installed_json" "$pkg" "$cur" "$new"; then
@@ -5139,9 +5196,12 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
     fi
   done
 
-  for line in "${direct_passing[@]}"; do
-    printf '%s\n' "$line"
-  done
+  if [[ ${#direct_passing[@]} -gt 0 ]]; then
+    mapfile -t filtered_direct < <(py_uv_filter_outdated_lines "$target_dir" "${direct_passing[@]}")
+    for line in "${filtered_direct[@]}"; do
+      [[ -n "$line" ]] && printf '%s\n' "$line"
+    done
+  fi
 
   if [[ ${#direct_failing[@]} -gt 0 ]]; then
     mapfile -t filtered_direct < <(py_uv_filter_outdated_lines "$target_dir" "${direct_failing[@]}")
@@ -5660,12 +5720,28 @@ _rust_log_output_tail() {
   done
 }
 
+# rust_clippy_failure_is_host_incompatible <clippy_output>
+# True when clippy/build failed because a dependency requires another OS
+# (e.g. coreaudio-sys on Linux for a macOS-only crate). Local clippy cannot
+# validate those bumps; allow them and rely on target-platform CI.
+rust_clippy_failure_is_host_incompatible() {
+  local -r text="$1"
+  [[ -z "$text" ]] && return 1
+  if grep -qiE \
+    'requires macos or ios|only (available|supported) on (macos|ios|windows|android)|target.?os.*(macos|ios|windows).*required|cannot find .* for .*apple-darwin|linker .* not found' \
+    <<<"$text"
+  then
+    return 0
+  fi
+  return 1
+}
+
 # rust_recover_post_bump_clippy <worktree_dir>
 # After cargo add bumps, run the same clippy bar as consumer CI (-D warnings).
 # On failure, apply mechanical suggestions via `cargo clippy --fix`, then
-# re-check. Returns 0 when clean or recovered; 1 when still failing (caller
-# should skip/revert the Rust bump — issue #433). Logs
-# ERROR: RUST_CLIPPY_RECOVER_FAILED on unrecovered failure.
+# re-check. Returns 0 when clean, recovered, or skipped as host-incompatible;
+# 1 when still failing (caller should skip/revert the Rust bump — issue #433).
+# Logs ERROR: RUST_CLIPPY_RECOVER_FAILED on unrecovered failure.
 rust_recover_post_bump_clippy() {
   local -r cargo_dir="$1"
   local clippy_out clippy_rc fix_out fix_rc
@@ -5677,6 +5753,12 @@ rust_recover_post_bump_clippy() {
     clippy --all-targets -- -D warnings)" || clippy_rc=$?
   if (( clippy_rc == 0 )); then
     log "[rust] Post-bump clippy clean."
+    return 0
+  fi
+
+  if rust_clippy_failure_is_host_incompatible "$clippy_out"; then
+    log "[rust] Post-bump clippy skipped: host cannot build this crate (platform-specific deps); relying on target CI."
+    _rust_log_output_tail "$clippy_out" "$clippy_tail_lines"
     return 0
   fi
 
@@ -5694,6 +5776,12 @@ rust_recover_post_bump_clippy() {
     clippy --all-targets -- -D warnings)" || clippy_rc=$?
   if (( clippy_rc == 0 )); then
     log "[rust] Post-bump clippy recovered after --fix."
+    return 0
+  fi
+
+  if rust_clippy_failure_is_host_incompatible "$clippy_out"; then
+    log "[rust] Post-bump clippy skipped after --fix: host cannot build this crate; relying on target CI."
+    _rust_log_output_tail "$clippy_out" "$clippy_tail_lines"
     return 0
   fi
 
@@ -6267,7 +6355,8 @@ batch_update_all() {
             run_command "git worktree" git -C "$worktree_path" clean --force -- uv.lock 2>/dev/null || true
             log "[python/uv] Skipping python batch floor bumps: dependency resolution failed."
             log "$py_out"
-            dep_updater_append_ecosystem_failure "python|batch uv lock failed (exit ${py_exit})"
+            # Handled skip (same as poetry resolution failures) — do not mark the
+            # run as an ecosystem failure when floors were reverted.
             uv_floor_batch=0
           fi
         fi
