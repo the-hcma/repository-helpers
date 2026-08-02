@@ -55,7 +55,6 @@ _runner_active_cmdline=''
 _runner_active_pid=0
 _runner_active_uuid=''
 _runner_interrupted=0
-_runner_prior_int=''
 _runner_int_trap_installed=0
 
 # runner_session_default_root
@@ -178,30 +177,6 @@ runner_validate_timeout_sec() {
   return 0
 }
 
-_runner_capture_int_trap() {
-  local trap_line
-
-  trap_line="$(trap -p INT 2>/dev/null || true)"
-  if [[ -z "$trap_line" ]]; then
-    _runner_prior_int=''
-    return 0
-  fi
-  # bash 5.3+ prints SIGINT; older bash prints INT.
-  _runner_prior_int="$(printf '%s' "$trap_line" \
-    | sed -E "s/^trap -- '(.*)' SIG?INT/\1/")"
-  if [[ "$_runner_prior_int" == "$trap_line" ]]; then
-    _runner_prior_int="$(printf '%s' "$trap_line" \
-      | sed -E 's/^trap -- "(.*)" SIG?INT/\1/')"
-  fi
-  if [[ "$_runner_prior_int" == "$trap_line" ]]; then
-    _runner_prior_int=''
-  fi
-  # Avoid chaining back into ourselves when refreshing the trap.
-  if [[ "$_runner_prior_int" == *'_runner_on_int'* ]]; then
-    _runner_prior_int=''
-  fi
-}
-
 _runner_on_int() {
   local label cmdline pid
 
@@ -226,9 +201,8 @@ _runner_on_int() {
 
   # Do not exit here: let wait(1) return so runner_exec can record exit_status,
   # .order, and runner_report_command_failure (same path as a normal failure).
-  if [[ -n "${_runner_prior_int:-}" ]]; then
-    eval "${_runner_prior_int}"
-  fi
+  # Prior INT traps are not chained — callers should use EXIT for cleanup
+  # (runner-bootstrap already chains EXIT).
 }
 
 # runner_print_int_banner <label> <cmdline>
@@ -251,9 +225,8 @@ runner_exit_code_is_signal_int() {
 }
 
 _runner_install_int_trap() {
-  # Always (re)install. Subshells inherit a parent INT trap that may not fire
-  # correctly for wait(1); refreshing ensures Ctrl-C prints the active command.
-  _runner_capture_int_trap
+  # Replace any prior INT trap for the duration of runner commands. Do not try
+  # to parse/eval trap -p output (lossy). EXIT cleanup stays with runner-bootstrap.
   trap '_runner_on_int' INT
   _runner_int_trap_installed=1
 }
@@ -374,8 +347,8 @@ runner_exec() {
   runner_set_active_command "$label" "$cmdline_quoted" "$!" "$uuid"
   wait "$_runner_active_pid" || exit_code=$?
   # When wait is interrupted by SIGINT, bash may return 130 here; the INT trap
-  # sets _runner_interrupted and kills the child. Finalize via the normal
-  # artifact + failure-report path (do not exit early from the trap).
+  # sets _runner_interrupted and kills the child. Fall through to the normal
+  # artifact + failure-report + stream-stdout path.
   if (( _runner_interrupted )) || runner_exit_code_is_signal_int "$exit_code"; then
     int_pid="${_runner_active_pid:-0}"
     if [[ "$int_pid" =~ ^[1-9][0-9]*$ ]]; then
@@ -386,14 +359,10 @@ runner_exec() {
     if (( ! _runner_interrupted )); then
       runner_print_int_banner "$_runner_active_label" "$_runner_active_cmdline"
     fi
-    runner_clear_active_command
-    exit_code=130
-    printf '%s\n' "$exit_code" >"${run_dir}/${_runner_artifact_exit_status}"
-    printf '%s\n' "$uuid" >>"${RUNNER_SESSION_DIR}/.order"
-    if ! (( probe )); then
-      runner_report_command_failure "$label" "$exit_code" "$uuid"
+    # Preserve SIGTERM (143) when that is what wait reported; default Ctrl-C to 130.
+    if ! runner_exit_code_is_signal_int "$exit_code"; then
+      exit_code=130
     fi
-    return 130
   fi
   runner_clear_active_command
 
