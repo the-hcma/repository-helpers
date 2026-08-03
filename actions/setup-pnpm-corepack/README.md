@@ -37,7 +37,7 @@ helper changes.
 Root app (`package.json` / lockfile at repo root):
 
 ```yaml
-- uses: actions/checkout@v7.0.0
+- uses: actions/checkout@v7.0.1
 - uses: actions/setup-node@v6.4.0
   with:
     node-version: '24'
@@ -49,7 +49,7 @@ Nested app (`packageManager` under `web/`, e.g. domesti-bot) — keep install in
 same directory as the action input:
 
 ```yaml
-- uses: actions/checkout@v7.0.0
+- uses: actions/checkout@v7.0.1
 - uses: actions/setup-node@v6.4.0
   with:
     node-version: '24'
