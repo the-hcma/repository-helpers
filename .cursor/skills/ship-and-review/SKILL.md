@@ -232,6 +232,8 @@ of the same event type also mark Copilot exhausted for the day (acceptable for s
 | `success` or output “no new issues” / “0 bugs reported” | Clean — `complete_ready` when no unaddressed Bugbot threads |
 | `neutral` / `failure` with bugs reported | Findings — triage review comments (exit **3** or **5** while comments post) |
 | output “usage limit reached” / usage or spend limit | Quota exhausted — exit **7** (give-up when no fallback remains) |
+| issue comment “Skipping Bugbot… disabled for this repository” | Unavailable for that repo for the day (`disabled_repos` cache; #449) — fallback chain |
+| “disabled for your account” / “currently disabled” | Account unavailable for the day (#415) — fallback chain |
 | other “couldn't run” / run failed | Check failed — exit **8** |
 
 Use `./scripts/wait-for-agent-review request --pr <n>` with `AGENT_REVIEW_AGENT=bugbot` to request Bugbot directly.
