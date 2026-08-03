@@ -585,9 +585,9 @@ dep_stack_submit_gh_pr_fallback() {
     # Positional branch selector matches gh_pr_number_for_new_branch (not --head).
     existing_pr="$(dep_runner_gh_stdout "dep-updater gh pr view fallback" -- \
       pr view "$branch" --repo "${repo_owner}/${repo_name}" \
-      --json number --jq '.number' 2>/dev/null || true)"
+      --json number,state --jq 'if .state == "OPEN" then .number else empty end' 2>/dev/null || true)"
     if [[ -n "$existing_pr" ]]; then
-      log "[gh-stack] Branch ${branch} already has PR #${existing_pr}; skipping push and create."
+      log "[gh-stack] Branch ${branch} already has open PR #${existing_pr}; skipping push and create."
       return 0
     fi
     die "gh pr fallback: failed to push ${branch}"
@@ -5173,8 +5173,10 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
   local -a transitive_candidates=()
   local -a direct_passing=()
   local -a direct_failing=()
+  local -a union_direct=()
   local constraint_op pkg cur new line
-  local filter_out filter_rc
+  local filter_out filter_rc filter_unverifiable=0
+  local line_item
 
   while IFS=' ' read -r pkg cur new; do
     [[ -z "$pkg" ]] && continue
@@ -5236,9 +5238,12 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
       log "[python/uv] WARNING: lockfile filter unverifiable; falling back to dry-run-passing direct updates."
       dep_updater_append_ecosystem_failure \
         "python|lock verify unverifiable; emitted dry-run-passing directs without lockfile filter"
-      printf '%s\n' "${direct_passing[@]}"
+      filter_unverifiable=1
+      union_direct+=("${direct_passing[@]}")
     elif [[ -n "$filter_out" ]]; then
-      printf '%s\n' "$filter_out"
+      while IFS= read -r line_item; do
+        [[ -n "$line_item" ]] && union_direct+=("$line_item")
+      done <<<"$filter_out"
     fi
   fi
 
@@ -5250,8 +5255,31 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
       log "[python/uv] WARNING: lockfile filter unverifiable for dry-run-failing directs; skipping those candidates."
       dep_updater_append_ecosystem_failure \
         "python|lock verify unverifiable; skipped dry-run-failing directs"
+      filter_unverifiable=1
     elif [[ -n "$filter_out" ]]; then
-      printf '%s\n' "$filter_out"
+      while IFS= read -r line_item; do
+        [[ -n "$line_item" ]] && union_direct+=("$line_item")
+      done <<<"$filter_out"
+    fi
+  fi
+
+  # Joint lock check: survivors from separate group filters can still conflict
+  # when applied together in batch_update_all.
+  if [[ ${#union_direct[@]} -gt 0 ]]; then
+    if (( filter_unverifiable == 0 )) && [[ ${#union_direct[@]} -gt 1 ]]; then
+      filter_rc=0
+      filter_out="$(py_uv_filter_outdated_lines "$target_dir" "${union_direct[@]}")" \
+        && filter_rc=0 || filter_rc=$?
+      if (( filter_rc != 0 )); then
+        log "[python/uv] WARNING: joint lockfile filter unverifiable; emitting per-group survivors."
+        dep_updater_append_ecosystem_failure \
+          "python|joint lock verify unverifiable; emitted per-group survivors"
+        printf '%s\n' "${union_direct[@]}"
+      elif [[ -n "$filter_out" ]]; then
+        printf '%s\n' "$filter_out"
+      fi
+    else
+      printf '%s\n' "${union_direct[@]}"
     fi
   fi
 
@@ -5395,14 +5423,14 @@ py_uv_filter_outdated_lines() {
     fi
 
     if ! grep -qF 'No solution found when resolving dependencies' "$log_file"; then
-      log "[python/uv] WARNING: could not verify proposed updates against lockfile; skipping python direct updates for this scan."
+      log "[python/uv] WARNING: could not verify proposed updates against lockfile (non-resolution uv lock failure)."
       rm -f "$log_file"
       return 1
     fi
 
     blame_pkg="$(py_uv_parse_blame_direct_dep "$log_file" 2>/dev/null || true)"
     if [[ -z "$blame_pkg" ]]; then
-      log "[python/uv] WARNING: lockfile verification failed (unparsed uv resolver error); skipping python direct updates."
+      log "[python/uv] WARNING: lockfile verification failed (unparsed uv resolver error)."
       rm -f "$log_file"
       return 1
     fi
@@ -5777,7 +5805,7 @@ rust_clippy_failure_is_host_incompatible() {
   local -r text="$1"
   [[ -z "$text" ]] && return 1
   if grep -qiE \
-    'requires macos or ios|only (available|supported) on (macos|ios|windows|android)|cannot find .* for .*apple-darwin|linking with .*-apple-darwin|ld: framework not found|-framework ' \
+    'requires macos or ios|only (available|supported) on (macos|ios|windows|android)|cannot find .* for .*apple-darwin|linking with .*-apple-darwin' \
     <<<"$text"
   then
     return 0
