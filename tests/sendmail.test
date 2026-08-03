@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Tests for scripts/lib/sendmail — explicit stdin under runner_exec.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+lib="${script_dir}/../scripts/lib/sendmail"
+readonly lib
+
+pass=0
+fail=0
+
+printf '\n=== static: explicit stdin via temp file + bash -c ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'msg_file="$(mktemp)"' "$lib" \
+  && grep -qF 'cat >"$msg_file"' "$lib" \
+  && grep -qF 'bash -c' "$lib" \
+  && grep -qF 'sendmail -t -oi -f "$1" <"$2"' "$lib" \
+  && grep -qF 'runner_exec "sendmail deliver"' "$lib" \
+  && grep -qF "trap 'rm -f" "$lib" \
+  && ! grep -qE '_sendmail_runner_exec|sendmail -t -oi -f "\$from_addr"$' "$lib"; then
+  printf '[PASS] sendmail: copies stdin to temp file and redirects inside runner_exec\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] sendmail: missing explicit stdin wiring (or still relies on inherited stdin)\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: pipeline stdin reaches mock sendmail under runner ===\n'
+tmp=""
+tmp="$(mktemp -d)"
+capture="${tmp}/captured.eml"
+mkdir -p "${tmp}/bin"
+cat >"${tmp}/bin/sendmail" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cat >"${SENDMAIL_CAPTURE:?}"
+EOF
+chmod +x "${tmp}/bin/sendmail"
+
+export PATH="${tmp}/bin:${PATH}"
+export SENDMAIL_CAPTURE="$capture"
+export RUNNER_SESSION_ROOT="${tmp}/runner-sessions"
+export REPO_HELPERS_TEST_MODE=0
+unset REPO_HELPERS_SENDMAIL_BREADCRUMB
+
+# Fresh source in a subshell so runner session is isolated.
+# shellcheck disable=SC1090,SC1091
+if (
+  source "${script_dir}/../scripts/lib/runner-bootstrap"
+  runner_session_begin "sendmail-test-pipeline" >/dev/null
+  # Force re-load of sendmail (idempotent guard may have fired in parent).
+  unset -f repo_helpers_sendmail 2>/dev/null || true
+  source "$lib"
+  printf 'Subject: pipeline\n\npipeline-body\n' | repo_helpers_sendmail 'from@test.example'
+); then
+  if [[ -f "$capture" ]] && grep -qF 'pipeline-body' "$capture"; then
+    printf '[PASS] sendmail: pipeline body delivered to mock sendmail\n'
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] sendmail: mock capture missing pipeline body\n'
+    fail=$(( fail + 1 ))
+  fi
+else
+  printf '[FAIL] sendmail: pipeline delivery exited non-zero\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: here-string stdin reaches mock sendmail under runner ===\n'
+# Here-string on the wrapper would NOT reach a bare backgrounded sendmail;
+# the temp-file path must still deliver.
+rm -f "$capture"
+# shellcheck disable=SC1090,SC1091
+if (
+  source "${script_dir}/../scripts/lib/runner-bootstrap"
+  runner_session_begin "sendmail-test-herestring" >/dev/null
+  unset -f repo_helpers_sendmail 2>/dev/null || true
+  source "$lib"
+  repo_helpers_sendmail 'from@test.example' <<<$'Subject: herestring\n\nherestring-body\n'
+); then
+  if [[ -f "$capture" ]] && grep -qF 'herestring-body' "$capture"; then
+    printf '[PASS] sendmail: here-string body delivered to mock sendmail\n'
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] sendmail: mock capture missing here-string body\n'
+    fail=$(( fail + 1 ))
+  fi
+else
+  printf '[FAIL] sendmail: here-string delivery exited non-zero\n'
+  fail=$(( fail + 1 ))
+fi
+
+rm -rf "$tmp"
+
+printf '\n=== results ===\n'
+printf 'Passed: %d  Failed: %d\n' "$pass" "$fail"
+test_summary
