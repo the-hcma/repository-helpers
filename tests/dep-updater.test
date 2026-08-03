@@ -3638,6 +3638,135 @@ else
     "$gh_stack_fallback_exit" "$gh_stack_fallback_out" "$(cat "$gh_stack_log" 2>/dev/null || true)"
   fail=$(( fail + 1 ))
 fi
+
+# Layer 4: push fails but PR already exists → recover without pr create.
+: >"$gh_stack_log"
+cat >"${gh_stack_fake_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${GH_STACK_LOG:?}"
+if [[ "$*" == *'stack submit'* ]]; then
+  printf '⚠ Stacked PRs are not enabled for this repository\n' >&2
+  exit 9
+fi
+if [[ "$*" == 'pr view dep-updates/npm-second --repo OWNER/mock-repo --json number --jq .number' \
+  || "$*" == 'pr view dep-updates/npm-second --repo OWNER/mock-repo --json number -q .number' ]]; then
+  printf '42\n'
+  exit 0
+fi
+if [[ "$*" == *'pr view'* && "$*" == *'dep-updates/npm-second'* ]]; then
+  printf '42\n'
+  exit 0
+fi
+if [[ "$*" == *'pr create'* ]]; then
+  printf 'unexpected pr create when PR already exists\n' >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 1
+MOCK_GH
+chmod +x "${gh_stack_fake_bin}/gh"
+cat >"${gh_stack_fake_bin}/git" <<'MOCK_GIT'
+#!/usr/bin/env bash
+set -euo pipefail
+joined="$*"
+if [[ "$joined" == *'push --set-upstream origin HEAD'* ]]; then
+  exit 1
+fi
+exec /usr/bin/git "$@"
+MOCK_GIT
+chmod +x "${gh_stack_fake_bin}/git"
+
+set +e
+gh_stack_recover_out="$(
+  PATH="${gh_stack_fake_bin}:${PATH}" \
+  GH_STACK_LOG="$gh_stack_log" \
+  bash -c '
+    set -euo pipefail
+    worktree_path="$1"
+    state_file="$2"
+    dep_stacking_tool="gh-stack"
+    wt_base_branch="dep-updater-wt-base"
+    repo_owner="OWNER"
+    repo_name="mock-repo"
+    die() { printf "DIE: %s\n" "$*" >&2; exit 1; }
+    log() { printf "LOG: %s\n" "$*"; }
+    state_get() {
+      case "$1" in
+        base_branch) echo main ;;
+        *) true ;;
+      esac
+    }
+    run_command() { shift; "$@"; }
+    run_in_worktree() { (cd "$worktree_path" && "$@"); }
+    dep_runner_sh() {
+      local -r label="$1"; shift
+      [[ "${1:-}" == "--" ]] || return 2
+      shift
+      bash -c "$*"
+    }
+    dep_runner_sh_stdout() {
+      local -r label="$1"; shift
+      [[ "${1:-}" == "--" ]] || return 2
+      shift
+      bash -c "$*"
+    }
+    dep_runner_gh() {
+      shift
+      [[ "${1:-}" == "--" ]] && shift
+      gh "$@"
+    }
+    dep_runner_gh_stdout() {
+      shift
+      [[ "${1:-}" == "--" ]] && shift
+      gh "$@"
+    }
+    dep_runner_git_c_stdout() {
+      shift
+      local -r repo="$1"; shift
+      [[ "${1:-}" == "--" ]] && shift
+      git -C "$repo" "$@"
+    }
+    dep_stacking_is_gh_stack() { [[ "$dep_stacking_tool" == "gh-stack" ]]; }
+    dep_stacking_is_graphite() { return 1; }
+    eval "$3"
+    dep_stack_submit_current
+  ' _ "$gh_stack_wt" "$gh_stack_state" "$gh_stack_helpers" 2>&1
+)"
+gh_stack_recover_exit=$?
+set -e
+
+if [[ "$gh_stack_recover_exit" -eq 0 ]] \
+  && ! grep -qF 'pr create' "$gh_stack_log" \
+  && grep -qF 'pr view' "$gh_stack_log" \
+  && grep -qiF 'already has PR #42' <<<"$gh_stack_recover_out"; then
+  printf '[PASS] gh-stack submit: recovers when push fails but PR already exists\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] gh-stack submit: expected push-fail PR recovery (exit=%s)\n%s\ngh_log:\n%s\n' \
+    "$gh_stack_recover_exit" "$gh_stack_recover_out" "$(cat "$gh_stack_log" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+
+# Static: fallback must not use unsupported gh pr view --head.
+# shellcheck disable=SC2016  # awk/grep needles are literal source tokens
+fallback_body="$(awk '
+  /^dep_stack_submit_gh_pr_fallback\(\)/ {p=1}
+  p {print}
+  p && /^}/ {exit}
+' "$script")"
+if grep -qE 'pr view[^\n]*--head|--head[^\n]*pr view' <<<"$fallback_body"; then
+  printf '[FAIL] gh-stack fallback: must not use gh pr view --head (use positional branch)\n'
+  fail=$(( fail + 1 ))
+elif grep -qF 'pr view "$branch"' <<<"$fallback_body" \
+  && grep -qF 'return 0' <<<"$fallback_body"; then
+  printf '[PASS] gh-stack fallback: positional pr view + early return when PR exists\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] gh-stack fallback: missing positional pr view or early return on existing PR\n'
+  fail=$(( fail + 1 ))
+fi
+
 rm -rf "$gh_stack_adopt_dir"
 
 printf '\n=== static: die records first failure ===\n'
