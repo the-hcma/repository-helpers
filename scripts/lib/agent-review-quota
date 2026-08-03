@@ -540,6 +540,101 @@ agent_review_bugbot_quota_text_is_repo_disabled() {
     "source '${bugbot_profile}'; agent_review_profile_text_is_repo_disabled \"\${BUGBOT_QUOTA_PROBE_TEXT}\""
 }
 
+# Current OWNER/NAME for per-repo Bugbot disable checks (optional; empty when unknown).
+agent_review_bugbot_quota_context_repo() {
+  local repo
+
+  repo="${AGENT_REVIEW_GITHUB_REPO:-}"
+  if [[ -z "${repo}" ]] && declare -F agent_review_repo_from_git_origin >/dev/null 2>&1; then
+    repo="$(agent_review_repo_from_git_origin || true)"
+  fi
+  if [[ -z "${repo}" ]]; then
+    return 1
+  fi
+  printf '%s' "${repo}"
+}
+
+# True when <repo> is in today's Bugbot disabled_repos list (#449).
+agent_review_bugbot_quota_repo_is_disabled() {
+  local -r repo="$1"
+  local entry
+
+  [[ -n "${repo}" ]] || return 1
+  agent_review_bugbot_quota_read_cache || return 1
+  while IFS= read -r entry || [[ -n "${entry}" ]]; do
+    [[ -z "${entry}" ]] && continue
+    if [[ "${entry}" == "${repo}" ]]; then
+      return 0
+    fi
+  done < <(printf '%s' "${agent_review_bugbot_quota_disabled_repos:-}" | tr ',' '\n')
+  return 1
+}
+
+# Merge <repo> into disabled_repos without marking org-wide exhausted (#449).
+agent_review_bugbot_quota_mark_repo_disabled() {
+  local -r repo="$1"
+  local -r reason_text="${2:-Bugbot disabled for this repository.}"
+  local -r evidence_url="${3:-}"
+  local state_file today checked_at reason_quoted evidence_quoted repos_quoted
+  local exhausted_flag=0 confirmed_flag=0 probe_requested_flag=0 probe_attempted_flag=0
+  local probe_at='' existing_repos='' entry found=0
+
+  [[ -n "${repo}" ]] || return 1
+  agent_review_bugbot_quota_read_cache || true
+  exhausted_flag="${agent_review_bugbot_quota_exhausted_today:-0}"
+  confirmed_flag=0
+  probe_requested_flag="${agent_review_bugbot_quota_probe_requested_today:-0}"
+  probe_attempted_flag="${agent_review_bugbot_quota_probe_attempted_today:-0}"
+  probe_at="${agent_review_bugbot_quota_probe_requested_at:-}"
+  existing_repos="${agent_review_bugbot_quota_disabled_repos:-}"
+  while IFS= read -r entry || [[ -n "${entry}" ]]; do
+    [[ -z "${entry}" ]] && continue
+    if [[ "${entry}" == "${repo}" ]]; then
+      found=1
+      break
+    fi
+  done < <(printf '%s' "${existing_repos}" | tr ',' '\n')
+  if [[ "${found}" != '1' ]]; then
+    if [[ -n "${existing_repos}" ]]; then
+      existing_repos="${existing_repos},${repo}"
+    else
+      existing_repos="${repo}"
+    fi
+  fi
+  agent_review_bugbot_quota_ensure_state_dir
+  state_file="$(agent_review_bugbot_quota_state_file)"
+  today="$(agent_review_copilot_quota_local_day)"
+  checked_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  reason_quoted="$(agent_review_quota_quote_env_value "${reason_text}")"
+  repos_quoted="$(agent_review_quota_quote_env_value "${existing_repos}")"
+  {
+    cat <<EOF
+valid_date=${today}
+exhausted=${exhausted_flag}
+confirmed=${confirmed_flag}
+probe_requested=${probe_requested_flag}
+probe_attempted=${probe_attempted_flag}
+source=observed_repo_disabled
+checked_at=${checked_at}
+reason=${reason_quoted}
+disabled_repos=${repos_quoted}
+EOF
+    if [[ -n "${probe_at}" && "${probe_at}" =~ ^[0-9]+$ ]]; then
+      printf 'probe_requested_at=%s\n' "${probe_at}"
+    fi
+    if [[ -n "${evidence_url}" ]]; then
+      evidence_quoted="$(agent_review_quota_quote_env_value "${evidence_url}")"
+      printf 'evidence_url=%s\n' "${evidence_quoted}"
+    fi
+  } >"${state_file}"
+  agent_review_bugbot_quota_exhausted_today="${exhausted_flag}"
+  agent_review_bugbot_quota_confirmed_today=0
+  agent_review_bugbot_quota_disabled_repos="${existing_repos}"
+  agent_review_bugbot_quota_cache_source='observed_repo_disabled'
+  agent_review_bugbot_quota_cache_reason="${reason_text}"
+  agent_review_bugbot_quota_cache_evidence_url="${evidence_url}"
+}
+
 agent_review_bugbot_quota_check_run_is_exhausted() {
   local -r run_json="${1:-}"
   local profiles_dir bugbot_profile
@@ -572,13 +667,14 @@ agent_review_bugbot_quota_read_cache() {
   # evidence_url/retry_after/checked_at must be local: sourcing the cache would otherwise
   # collide with caller `local -r evidence_url` (e.g. mark_exhausted) and abort under set -e.
   local state_file today valid_date exhausted confirmed probe_requested source reason
-  local evidence_url retry_after checked_at probe_requested_at probe_attempted
+  local evidence_url retry_after checked_at probe_requested_at probe_attempted disabled_repos
 
   agent_review_bugbot_quota_exhausted_today=0
   agent_review_bugbot_quota_confirmed_today=0
   agent_review_bugbot_quota_probe_requested_today=0
   agent_review_bugbot_quota_probe_requested_at=0
   agent_review_bugbot_quota_probe_attempted_today=0
+  agent_review_bugbot_quota_disabled_repos=''
   agent_review_bugbot_quota_cache_source=''
   agent_review_bugbot_quota_cache_reason=''
   agent_review_bugbot_quota_cache_evidence_url=''
@@ -598,6 +694,7 @@ agent_review_bugbot_quota_read_cache() {
   probe_attempted="${probe_attempted:-0}"
   source="${source:-cache}"
   reason="${reason:-}"
+  disabled_repos="${disabled_repos:-}"
   if [[ "${valid_date}" != "${today}" ]]; then
     return 1
   fi
@@ -606,6 +703,7 @@ agent_review_bugbot_quota_read_cache() {
   agent_review_bugbot_quota_cache_evidence_url="${evidence_url:-}"
   agent_review_bugbot_quota_cache_retry_after="${retry_after:-}"
   agent_review_bugbot_quota_probe_requested_at="${probe_requested_at}"
+  agent_review_bugbot_quota_disabled_repos="${disabled_repos}"
   if [[ "${exhausted}" == '1' ]]; then
     agent_review_bugbot_quota_exhausted_today=1
   else
@@ -638,8 +736,8 @@ agent_review_bugbot_quota_write_cache() {
   local probe_requested_flag="${5:-}"
   local evidence_url="${6:-}"
   local retry_after="${7:-}"
-  local state_file today checked_at reason_quoted evidence_quoted retry_quoted
-  local probe_at='' probe_attempted_flag=0
+  local state_file today checked_at reason_quoted evidence_quoted retry_quoted repos_quoted
+  local probe_at='' probe_attempted_flag=0 disabled_repos=''
 
   if [[ -z "${confirmed_flag}" ]]; then
     if [[ "${exhausted_flag}" == '1' ]]; then
@@ -659,6 +757,17 @@ agent_review_bugbot_quota_write_cache() {
     fi
     probe_at="${agent_review_quota_cache_probe_requested_at:-}"
     probe_attempted_flag="${agent_review_quota_cache_probe_attempted:-0}"
+  fi
+  # Preserve per-repo disabled list across unrelated cache writes (#449).
+  if [[ -n "${agent_review_bugbot_quota_disabled_repos:-}" ]]; then
+    disabled_repos="${agent_review_bugbot_quota_disabled_repos}"
+  elif [[ -f "${state_file}" ]]; then
+    # shellcheck disable=SC1090  # scratch cache path is operator-local runtime state
+    disabled_repos="$(
+      # shellcheck disable=SC2034  # only disabled_repos is used from sourced cache
+      source "${state_file}"
+      printf '%s' "${disabled_repos:-}"
+    )"
   fi
   probe_requested_flag="${probe_requested_flag:-0}"
   if [[ "${exhausted_flag}" == '0' && "${confirmed_flag}" != '1' ]] \
@@ -697,6 +806,10 @@ EOF
     if [[ -n "${probe_at}" && "${probe_at}" =~ ^[0-9]+$ ]]; then
       printf 'probe_requested_at=%s\n' "${probe_at}"
     fi
+    if [[ -n "${disabled_repos}" ]]; then
+      repos_quoted="$(agent_review_quota_quote_env_value "${disabled_repos}")"
+      printf 'disabled_repos=%s\n' "${repos_quoted}"
+    fi
     if [[ -n "${evidence_url}" ]]; then
       evidence_quoted="$(agent_review_quota_quote_env_value "${evidence_url}")"
       printf 'evidence_url=%s\n' "${evidence_quoted}"
@@ -707,6 +820,7 @@ EOF
     fi
   } >"${state_file}"
   agent_review_bugbot_quota_exhausted_today="${exhausted_flag}"
+  agent_review_bugbot_quota_disabled_repos="${disabled_repos}"
   if [[ "${confirmed_flag}" == '1' ]]; then
     agent_review_bugbot_quota_confirmed_today=1
   else
@@ -846,6 +960,8 @@ query {
     if agent_review_bugbot_quota_text_is_exhausted "${body}"; then
       if agent_review_bugbot_quota_text_is_repo_disabled "${body}"; then
         reason="Bugbot comment on ${repo}#${pr} at ${at} reports disabled for this repository."
+        agent_review_bugbot_quota_mark_repo_disabled "${repo}" "${reason}"
+        continue
       elif [[ "${body,,}" == *"disabled"* || "${body,,}" == *"not enabled"* ]]; then
         reason="Bugbot comment on ${repo}#${pr} at ${at} reports disabled for your account."
       else
@@ -927,6 +1043,8 @@ agent_review_bugbot_quota_refresh_for_today() {
 }
 
 agent_review_bugbot_quota_skip_request() {
+  local context_repo
+
   if [[ "${AGENT_REVIEW_AGENT:-copilot}" != 'bugbot' ]]; then
     return 1
   fi
@@ -934,6 +1052,18 @@ agent_review_bugbot_quota_skip_request() {
   if [[ "${agent_review_bugbot_quota_exhausted_today:-0}" == '1' ]]; then
     printf 'Bugbot unavailable (cached for %s; source=%s)\n' \
       "$(agent_review_copilot_quota_local_day)" "${agent_review_bugbot_quota_cache_source:-cache}" >&2
+    if [[ -n "${agent_review_bugbot_quota_cache_reason:-}" ]]; then
+      printf '  %s\n' "${agent_review_bugbot_quota_cache_reason}" >&2
+    fi
+    return 0
+  fi
+  context_repo="$(agent_review_bugbot_quota_context_repo || true)"
+  if [[ -n "${context_repo}" ]] \
+    && agent_review_bugbot_quota_repo_is_disabled "${context_repo}"; then
+    printf 'Bugbot disabled for %s (cached for %s; source=%s)\n' \
+      "${context_repo}" \
+      "$(agent_review_copilot_quota_local_day)" \
+      "${agent_review_bugbot_quota_cache_source:-cache}" >&2
     if [[ -n "${agent_review_bugbot_quota_cache_reason:-}" ]]; then
       printf '  %s\n' "${agent_review_bugbot_quota_cache_reason}" >&2
     fi
@@ -1631,7 +1761,7 @@ agent_review_agent_quota_cache_retry_after_for_agent() {
 # True when <agent_id> daily quota cache reports exhaustion (no log output).
 agent_review_agent_quota_exhausted_for_agent() {
   local -r agent_id="$1"
-  local exhausted retry_after now now_epoch retry_epoch
+  local exhausted retry_after now now_epoch retry_epoch context_repo
 
   case "${agent_id}" in
     copilot)
@@ -1643,6 +1773,13 @@ agent_review_agent_quota_exhausted_for_agent() {
       agent_review_bugbot_quota_refresh_for_today
       exhausted="${agent_review_bugbot_quota_exhausted_today:-0}"
       retry_after="${agent_review_bugbot_quota_cache_retry_after:-}"
+      if [[ "${exhausted}" != '1' ]]; then
+        context_repo="$(agent_review_bugbot_quota_context_repo || true)"
+        if [[ -n "${context_repo}" ]] \
+          && agent_review_bugbot_quota_repo_is_disabled "${context_repo}"; then
+          return 0
+        fi
+      fi
       ;;
     coderabbit)
       agent_review_coderabbit_quota_refresh_for_today
@@ -1708,19 +1845,16 @@ agent_review_agent_quota_clear_observed_for_agent() {
 
 # True when all agents in the quota chain are exhausted without a retry window.
 agent_review_all_quotas_exhausted() {
-  agent_review_copilot_quota_refresh_for_today
-  agent_review_bugbot_quota_refresh_for_today
-  agent_review_coderabbit_quota_refresh_for_today
-  [[ "${agent_review_copilot_quota_exhausted_today:-0}" == '1' \
-    && "${agent_review_bugbot_quota_exhausted_today:-0}" == '1' \
-    && "${agent_review_coderabbit_quota_exhausted_today:-0}" == '1' ]]
+  agent_review_agent_quota_exhausted_for_agent copilot \
+    && agent_review_agent_quota_exhausted_for_agent bugbot \
+    && agent_review_agent_quota_exhausted_for_agent coderabbit
 }
 
 # agent_review_agent_unavailable_reason_for_agent <agent_id>
 # Compact machine token for check JSON / wait_reason (empty when agent is available).
 agent_review_agent_unavailable_reason_for_agent() {
   local -r agent_id="$1"
-  local reason retry_after lower
+  local reason retry_after lower bugbot_repo
 
   if agent_review_agent_quota_rate_limited_for_agent "${agent_id}"; then
     retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent "${agent_id}")"
@@ -1736,13 +1870,22 @@ agent_review_agent_unavailable_reason_for_agent() {
   fi
   reason="$(agent_review_agent_quota_cache_reason_for_agent "${agent_id}")"
   lower="${reason,,}"
-  # Prefer repository-scoped wording (#449) over account-level (#415).
+  # Precise repo-disabled wording only (#449). Do not match bare "repository" in the
+  # slug (e.g. the-hcma/repository-helpers + "disabled for your account").
   if [[ "${lower}" == *"disabled for this repository"* ]] \
     || [[ "${lower}" == *"disabled for the repository"* ]] \
-    || [[ "${lower}" == *"disabled_for_repository"* ]] \
-    || { [[ "${lower}" == *"disabled"* ]] && [[ "${lower}" == *"repository"* ]]; }; then
+    || [[ "${lower}" == *"disabled_for_repository"* ]]; then
     printf 'disabled_for_repository'
     return 0
+  fi
+  if [[ "${agent_id}" == 'bugbot' ]]; then
+    bugbot_repo=''
+    bugbot_repo="$(agent_review_bugbot_quota_context_repo || true)"
+    if [[ -n "${bugbot_repo}" ]] \
+      && agent_review_bugbot_quota_repo_is_disabled "${bugbot_repo}"; then
+      printf 'disabled_for_repository'
+      return 0
+    fi
   fi
   if [[ "${lower}" == *"disabled"* ]]; then
     printf 'disabled_for_account'
