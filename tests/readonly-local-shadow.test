@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# readonly-local-shadow.test — bash cannot local-shadow a script-level readonly.
+#
+# ShellCheck does not detect this (koalaman/shellcheck#2090). When a top-level
+# script has `readonly foo` and sources a lib that does `local foo`, bash prints
+# `local: foo: readonly variable` and (with set -e, outside conditionals) aborts.
+# Even under `||` / `if`, the local fails and the outer readonly leaks in.
+#
+# This test statically walks scripts → sourced scripts/lib/* edges and fails on
+# name intersections. Prefer prefixed locals in shared libs (em_*, dwg_*, …).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+repo_root="$(cd "${script_dir}/.." && pwd)"
+readonly repo_root
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+pass=0
+fail=0
+
+is_bash_script() {
+  local -r path="$1"
+  local first
+  [[ -f "$path" ]] || return 1
+  first="$(head -n 1 "$path" 2>/dev/null || true)"
+  [[ "$first" == '#!'*bash* ]]
+}
+
+# Print script-level readonly names (one per line). Skips function bodies.
+script_level_readonly_names() {
+  local -r path="$1"
+  awk '
+    BEGIN { brace = 0; in_func = 0 }
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0
+      if (!in_func && line ~ /^[A-Za-z_][A-Za-z0-9_]*\(\)[[:space:]]*\{/) {
+        in_func = 1
+        brace = gsub(/\{/, "{", line) - gsub(/\}/, "}", line)
+        if (brace <= 0) { in_func = 0; brace = 0 }
+        next
+      }
+      if (!in_func && line ~ /^function[[:space:]]/) {
+        if (index(line, "{") > 0) {
+          in_func = 1
+          brace = gsub(/\{/, "{", line) - gsub(/\}/, "}", line)
+          if (brace <= 0) { in_func = 0; brace = 0 }
+        }
+        next
+      }
+      if (in_func) {
+        brace += gsub(/\{/, "{", line) - gsub(/\}/, "}", line)
+        if (brace <= 0) { in_func = 0; brace = 0 }
+        next
+      }
+      if (match(line, /^readonly[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)/, m)) {
+        print m[1]
+      }
+      brace += gsub(/\{/, "{", line) - gsub(/\}/, "}", line)
+      if (brace < 0) brace = 0
+    }
+  ' "$path"
+}
+
+# Print local variable names declared in a file (one per line).
+lib_local_names() {
+  local -r path="$1"
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*local([[:space:]]+-[[:alnum:]]+)*[[:space:]]+/ {
+      line = $0
+      sub(/^[[:space:]]*local([[:space:]]+-[[:alnum:]]+)*/, "", line)
+      sub(/#.*/, "", line)
+      n = split(line, toks, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        tok = toks[i]
+        if (tok == "" || tok ~ /^-/) continue
+        sub(/=.*/, "", tok)
+        if (tok ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print tok
+      }
+    }
+  ' "$path"
+}
+
+# Resolve scripts/lib basenames referenced by source "…" lines.
+sourced_lib_paths() {
+  local -r path="$1"
+  local raw leaf candidate
+  while IFS= read -r raw; do
+    [[ "$raw" == *'/lib/'* || "$raw" == *'scripts/lib'* ]] || continue
+    leaf="${raw##*/}"
+    leaf="${leaf//\}/}"
+    leaf="${leaf//\"/}"
+    [[ -n "$leaf" && "$leaf" != *'$'* ]] || continue
+    candidate="${repo_root}/scripts/lib/${leaf}"
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+    fi
+  done < <(grep -E '^\s*(source|\.)\s+"' "$path" | sed -E 's/.*(source|\.)[[:space:]]+"([^"]+)".*/\2/')
+}
+
+printf '\n=== static: script→lib readonly ∩ local (direct source edges) ===\n'
+collision_report="$(mktemp)"
+: >"$collision_report"
+while IFS= read -r -d '' caller; do
+  is_bash_script "$caller" || continue
+  mapfile -t ro_names < <(script_level_readonly_names "$caller" | sort -u)
+  ((${#ro_names[@]} > 0)) || continue
+  mapfile -t libs < <(sourced_lib_paths "$caller" | sort -u)
+  ((${#libs[@]} > 0)) || continue
+  for lib in "${libs[@]}"; do
+    mapfile -t local_names < <(lib_local_names "$lib" | sort -u)
+    ((${#local_names[@]} > 0)) || continue
+    for name in "${ro_names[@]}"; do
+      for lname in "${local_names[@]}"; do
+        if [[ "$name" == "$lname" ]]; then
+          printf '%s\tsources\t%s\tlocal/readonly\t%s\n' \
+            "${caller#"$repo_root"/}" "${lib#"$repo_root"/}" "$name" \
+            >>"$collision_report"
+        fi
+      done
+    done
+  done
+done < <(find "${repo_root}/scripts" -type f ! -path '*/lib/*' -print0)
+
+if [[ ! -s "$collision_report" ]]; then
+  printf '[PASS] readonly-local-shadow: no script→lib name collisions\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] readonly-local-shadow: colliding names (rename lib locals):\n'
+  sed 's/^/  /' "$collision_report" >&2
+  fail=$(( fail + 1 ))
+fi
+rm -f "$collision_report"
+
+printf '\n=== runtime: email-multipart under readonly subject ===\n'
+out=""
+out="$(
+  bash -c '
+    set -euo pipefail
+    readonly subject="[notifier] updates needed"
+    readonly body="hello"
+    # shellcheck disable=SC1091
+    source "$1"
+    repo_helpers_email_write_multipart "to@t" "from@t" "from@t" "$subject" "$body"
+  ' bash "${repo_root}/scripts/lib/email-multipart"
+)"
+if grep -qF 'Subject: [notifier] updates needed' <<<"$out"; then
+  printf '[PASS] readonly-local-shadow: email-multipart tolerates readonly subject\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] readonly-local-shadow: email-multipart failed under readonly subject\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== runtime: worktree-guard under readonly repo_dir ===\n'
+guard_err="$(mktemp)"
+guard_rc=0
+bash -c '
+  set -euo pipefail
+  repo_root="$1"
+  readonly repo_dir="$repo_root"
+  readonly repo_root
+  # shellcheck disable=SC1091
+  source "$repo_root/scripts/lib/runner-bootstrap"
+  # shellcheck disable=SC1091
+  source "$repo_root/scripts/lib/dev-worktree-guard"
+  # Return value is primary/not-primary; only care that local shadowing does not fire.
+  dev_worktree_is_primary "$repo_dir" >/dev/null || true
+' bash "$repo_root" 2>"$guard_err" || guard_rc=$?
+if (( guard_rc == 0 )) && ! grep -q 'readonly variable' "$guard_err"; then
+  printf '[PASS] readonly-local-shadow: worktree-guard tolerates readonly repo_dir\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] readonly-local-shadow: worktree-guard still shadows repo_dir\n'
+  sed 's/^/  /' "$guard_err" >&2 || true
+  fail=$(( fail + 1 ))
+fi
+rm -f "$guard_err"
+
+printf '\n=== runtime: ci-secret-scan under readonly script_dir ===\n'
+css_err="$(mktemp)"
+css_rc=0
+bash -c '
+  set -euo pipefail
+  readonly script_dir=/tmp/fake-script-dir-should-not-matter
+  # shellcheck disable=SC1091
+  source "$1"
+  ci_secret_scan_repo_dir >/dev/null
+' bash "${repo_root}/scripts/lib/ci-secret-scan" 2>"$css_err" || css_rc=$?
+if (( css_rc == 0 )) && ! grep -q 'readonly variable' "$css_err"; then
+  printf '[PASS] readonly-local-shadow: ci-secret-scan tolerates readonly script_dir\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] readonly-local-shadow: ci-secret-scan still shadows script_dir\n'
+  sed 's/^/  /' "$css_err" >&2 || true
+  fail=$(( fail + 1 ))
+fi
+rm -f "$css_err"
+
+printf '\n=== runtime: run-context under readonly repo_dir ===\n'
+rc_err="$(mktemp)"
+rc_rc=0
+bash -c '
+  set -euo pipefail
+  repo_root="$1"
+  readonly repo_dir="$repo_root"
+  # shellcheck disable=SC1091
+  source "$repo_root/scripts/lib/runner-bootstrap"
+  # shellcheck disable=SC1091
+  source "$repo_root/scripts/lib/run-context"
+  rc_runner_git_rev_parse "probe" "$repo_dir" >/dev/null || true
+' bash "$repo_root" 2>"$rc_err" || rc_rc=$?
+if (( rc_rc == 0 )) && ! grep -q 'readonly variable' "$rc_err"; then
+  printf '[PASS] readonly-local-shadow: run-context tolerates readonly repo_dir\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] readonly-local-shadow: run-context still shadows repo_dir\n'
+  sed 's/^/  /' "$rc_err" >&2 || true
+  fail=$(( fail + 1 ))
+fi
+rm -f "$rc_err"
+
+printf '\n=== results ===\n'
+printf 'Passed: %d  Failed: %d\n' "$pass" "$fail"
+test_summary
