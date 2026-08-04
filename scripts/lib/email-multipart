@@ -3,7 +3,16 @@
 #
 # Matches the layout used by dep-updater-notifier: monospace body in text/plain and
 # HTML <pre> for mail clients that prefer HTML.
-set -euo pipefail
+# shellcheck shell=bash
+
+if declare -F repo_helpers_email_write_multipart >/dev/null 2>&1; then
+  return 0
+fi
+
+_em_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _em_lib_dir
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_em_lib_dir}/runner-ensure"
 
 # repo_helpers_email_html_from_plain <plain-text>
 # Escape HTML specials and wrap https:// URLs in <a href>. Trailing sentence
@@ -12,42 +21,52 @@ set -euo pipefail
 repo_helpers_email_html_from_plain() {
   # Prefer em_* names: callers often have script-level readonly subject/body/plain.
   local -r em_plain="$1"
+  local em_awk em_html
 
   # awk: one pass so we linkify before / as part of escaping (avoids breaking
   # <a> tags, and keeps & in query strings as &amp; inside href).
-  printf '%s' "$em_plain" | awk '
-    function html_esc(s) {
-      gsub(/&/, "\\&amp;", s)
-      gsub(/</, "\\&lt;", s)
-      gsub(/>/, "\\&gt;", s)
-      gsub(/"/, "\\&quot;", s)
-      return s
-    }
-    {
-      line = $0
-      out = ""
-      while (match(line, /https:\/\/[^[:space:]"<>]+/)) {
-        pre = substr(line, 1, RSTART - 1)
-        url = substr(line, RSTART, RLENGTH)
-        line = substr(line, RSTART + RLENGTH)
-        while ((n = length(url)) > 0) {
-          last = substr(url, n, 1)
-          # Trailing sentence / bracket punctuation stays outside the href.
-          if (index(".,;:!?)]}", last) == 0) {
-            break
-          }
-          line = last line
-          url = substr(url, 1, n - 1)
-        }
-        if (url == "") {
-          continue
-        }
-        esc = html_esc(url)
-        out = out html_esc(pre) "<a href=\"" esc "\">" esc "</a>"
+  # Feed awk via printf inside runner_sh (not a here-string): runner_exec
+  # backgrounds with empty stdin and would blank the HTML part.
+  em_awk="$(cat <<'AWK'
+function html_esc(s) {
+  gsub(/&/, "\\&amp;", s)
+  gsub(/</, "\\&lt;", s)
+  gsub(/>/, "\\&gt;", s)
+  gsub(/"/, "\\&quot;", s)
+  return s
+}
+{
+  line = $0
+  out = ""
+  while (match(line, /https:\/\/[^[:space:]"<>]+/)) {
+    pre = substr(line, 1, RSTART - 1)
+    url = substr(line, RSTART, RLENGTH)
+    line = substr(line, RSTART + RLENGTH)
+    while ((n = length(url)) > 0) {
+      last = substr(url, n, 1)
+      # Trailing sentence / bracket punctuation stays outside the href.
+      if (index(".,;:!?)]}", last) == 0) {
+        break
       }
-      print out html_esc(line)
+      line = last line
+      url = substr(url, 1, n - 1)
     }
-  '
+    if (url == "") {
+      continue
+    }
+    esc = html_esc(url)
+    out = out html_esc(pre) "<a href=\"" esc "\">" esc "</a>"
+  }
+  print out html_esc(line)
+}
+AWK
+)"
+
+  em_html="$(
+    runner_sh_stdout "email-multipart html from plain" -- \
+      "printf '%s' $(printf '%q' "$em_plain") | awk $(printf '%q' "$em_awk")"
+  )"
+  printf '%s' "$em_html"
 }
 
 # repo_helpers_email_write_multipart <to> <from> <reply_to> <subject> <body> [boundary_prefix]
@@ -62,9 +81,13 @@ repo_helpers_email_write_multipart() {
   local -r em_subject="$4"
   local -r em_body="$5"
   local em_boundary_prefix="${6:-dep-updater}"
-  local em_boundary em_html_body
+  local em_boundary em_html_body em_token
 
-  em_boundary="${em_boundary_prefix}-$(date +%s%N | md5sum | head -c16)"
+  em_token="$(
+    runner_sh_stdout "email-multipart boundary token" -- \
+      'date +%s%N | md5sum | head -c16'
+  )"
+  em_boundary="${em_boundary_prefix}-${em_token}"
   em_html_body="$(repo_helpers_email_html_from_plain "$em_body")"
 
   printf 'To: %s\n' "$em_to"
