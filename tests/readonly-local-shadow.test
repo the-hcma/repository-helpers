@@ -31,25 +31,44 @@ is_bash_script() {
 }
 
 # Print script-level readonly names (one per line). Skips function bodies.
+# Tracks functions only (not if/for braces): readonly inside a top-level if is
+# still script-level and must be reported. Supports name() {, function name {,
+# and a signature line with { on the following line.
 script_level_readonly_names() {
   local -r path="$1"
   awk '
-    BEGIN { brace = 0; in_func = 0 }
+    BEGIN { brace = 0; in_func = 0; pending_func = 0 }
     /^[[:space:]]*#/ { next }
     {
       line = $0
+      if (pending_func) {
+        if (line ~ /^[[:space:]]*\{/) {
+          in_func = 1
+          pending_func = 0
+          brace = gsub(/\{/, "{", line) - gsub(/\}/, "}", line)
+          if (brace <= 0) { in_func = 0; brace = 0 }
+          next
+        }
+        pending_func = 0
+      }
       if (!in_func && line ~ /^[A-Za-z_][A-Za-z0-9_]*\(\)[[:space:]]*\{/) {
         in_func = 1
         brace = gsub(/\{/, "{", line) - gsub(/\}/, "}", line)
         if (brace <= 0) { in_func = 0; brace = 0 }
         next
       }
-      if (!in_func && line ~ /^function[[:space:]]/) {
-        if (index(line, "{") > 0) {
-          in_func = 1
-          brace = gsub(/\{/, "{", line) - gsub(/\}/, "}", line)
-          if (brace <= 0) { in_func = 0; brace = 0 }
-        }
+      if (!in_func && line ~ /^[A-Za-z_][A-Za-z0-9_]*\(\)[[:space:]]*$/) {
+        pending_func = 1
+        next
+      }
+      if (!in_func && line ~ /^function[[:space:]]+[A-Za-z_][A-Za-z0-9_]*([[:space:]]*\(\))?[[:space:]]*\{/) {
+        in_func = 1
+        brace = gsub(/\{/, "{", line) - gsub(/\}/, "}", line)
+        if (brace <= 0) { in_func = 0; brace = 0 }
+        next
+      }
+      if (!in_func && line ~ /^function[[:space:]]+[A-Za-z_][A-Za-z0-9_]*([[:space:]]*\(\))?[[:space:]]*$/) {
+        pending_func = 1
         next
       }
       if (in_func) {
@@ -60,21 +79,25 @@ script_level_readonly_names() {
       if (match(line, /^readonly[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)/, m)) {
         print m[1]
       }
-      brace += gsub(/\{/, "{", line) - gsub(/\}/, "}", line)
-      if (brace < 0) brace = 0
     }
   ' "$path"
 }
 
 # Print local variable names declared in a file (one per line).
+# Accepts `local name`, `local -r name=…`, and adjacent flag forms like `local -rn name`.
 lib_local_names() {
   local -r path="$1"
   awk '
     /^[[:space:]]*#/ { next }
-    /^[[:space:]]*local([[:space:]]+-[[:alnum:]]+)*[[:space:]]+/ {
+    /^[[:space:]]*local([[:space:]]|$)/ {
       line = $0
-      sub(/^[[:space:]]*local([[:space:]]+-[[:alnum:]]+)*/, "", line)
+      sub(/^[[:space:]]*local[[:space:]]*/, "", line)
       sub(/#.*/, "", line)
+      # Drop leading flag tokens (-r, -a, -n, -rx, …) then take names.
+      while (match(line, /^-[[:alnum:]]+[[:space:]]+/)) {
+        line = substr(line, RLENGTH + 1)
+      }
+      if (match(line, /^-[[:alnum:]]+$/)) next
       n = split(line, toks, /[[:space:]]+/)
       for (i = 1; i <= n; i++) {
         tok = toks[i]
@@ -86,7 +109,7 @@ lib_local_names() {
   ' "$path"
 }
 
-# Resolve scripts/lib basenames referenced by source "…" lines.
+# Resolve scripts/lib basenames referenced by source "…" / source '…' lines.
 sourced_lib_paths() {
   local -r path="$1"
   local raw leaf candidate
@@ -95,12 +118,16 @@ sourced_lib_paths() {
     leaf="${raw##*/}"
     leaf="${leaf//\}/}"
     leaf="${leaf//\"/}"
+    leaf="${leaf//\'/}"
     [[ -n "$leaf" && "$leaf" != *'$'* ]] || continue
     candidate="${repo_root}/scripts/lib/${leaf}"
     if [[ -f "$candidate" ]]; then
       printf '%s\n' "$candidate"
     fi
-  done < <(grep -E '^\s*(source|\.)\s+"' "$path" | sed -E 's/.*(source|\.)[[:space:]]+"([^"]+)".*/\2/')
+  done < <(
+    grep -E "^[[:space:]]*(source|\.)[[:space:]]+[\"']" "$path" \
+      | sed -E "s/.*(source|\.)[[:space:]]+[\"']([^\"']+)[\"'].*/\2/"
+  )
 }
 
 printf '\n=== static: script→lib readonly ∩ local (direct source edges) ===\n'
