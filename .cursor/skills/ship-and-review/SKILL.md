@@ -60,13 +60,18 @@ This polls until required checks finish. On failure it prints:
 1. Failed check names + URLs (`ERROR: CI failures for PR #…`)
 2. Filtered job log excerpts under **`==> CI failure details for coding agent`** (test `[FAIL]` lines, `--- results: … failed`, `ERROR:`, shell errors)
 
-**Agent iteration loop when CI is red:**
+**Agent iteration loop when CI is red (including loop exit 10):**
 
-1. Read the failure report from `post-pr-submission-checks` (or `gh run view <id> --log-failed`).
+Exit **10** (`CI_FAILED`) is **coding-agent ownership**, not operator give-up — the loop does
+**not** email or post a loop-stopped comment (same as exit **3**). Retrieve failure details,
+identify a fix, push, and resume. Escalate to a human **only** when a fix cannot be identified.
+
+1. Read the failure report from `post-pr-submission-checks` (or the loop’s stderr CI lines /
+   `gh run view <id> --log-failed`).
 2. Fix in the stack worktree; run `scripts/dev/pre-pr-checks`.
-3. Push (`gt modify` + `scripts/dev/submit-stack` or `gt submit`).
+3. Push (`gt modify` + `scripts/dev/submit-stack` or `gt submit` / `gh stack submit`).
 4. Re-run `scripts/dev/post-pr-submission-checks --pr <n>` until green.
-5. Only then start or resume `./scripts/wait-for-agent-review loop --pr <n>`.
+5. Resume `./scripts/wait-for-agent-review loop --pr <n>`.
 
 Do **not** skip CI monitoring with `--no-wait` / `--no-wait-ci` unless the user explicitly opts out. The agent review loop also blocks when `ci_ready` is false.
 
@@ -252,5 +257,5 @@ Use `./scripts/wait-for-agent-review request --pr <n>` with `AGENT_REVIEW_AGENT=
 | 7 | All agents in quota chain exhausted — give-up emailed + PR comment posted |
 | 8 | Agent GitHub check failed to run (non-quota; see check output on PR) |
 | 9 | Wait idle break — no PR activity with all agent quotas exhausted (`loop` continues) |
-| 10 | Required CI checks failed — fix CI before agent review or thread triage |
+| 10 | Required CI failed — coding agent must fix and resume; no operator email (escalate only if unfixable) |
 | 11 | Permanent merge block (`DIRTY`/`CONFLICTING`/`DRAFT`) — human intervention |
