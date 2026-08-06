@@ -496,17 +496,40 @@ expanded_unit_timer_path() {
 }
 
 # write_expanded_unit_files <unit_basename> <target_service> [target_timer]
-# Mirrors installed units into ~/.config/share/systemd-units/.
+# Keeps a readable copy of installed units under ~/.config/share/systemd-units/
+# for show-services (systemd loads from ~/.config/systemd/user/ instead).
+# Only copies when the mirror is missing or differs; prints unchanged vs updated.
 write_expanded_unit_files() {
     local -r unit_basename="$1"
     local -r target_service="$2"
     local target_timer="${3:-}"
+    local mirror_service
+    local mirror_timer
+    local service_copy_changed=false
 
+    mirror_service="$(expanded_unit_service_path "$unit_basename")"
     mkdir -p "$expanded_units_dir"
-    cp "$target_service" "$(expanded_unit_service_path "$unit_basename")"
-    if [[ -n "$target_timer" && -f "$target_timer" ]]; then
-        cp "$target_timer" "$(expanded_unit_timer_path "$unit_basename")"
+
+    if [[ ! -f "$mirror_service" ]] \
+        || ! diff --brief "$target_service" "$mirror_service" > /dev/null 2>&1; then
+        cp "$target_service" "$mirror_service"
+        service_copy_changed=true
     fi
+
+    if [[ -n "$target_timer" && -f "$target_timer" ]]; then
+        mirror_timer="$(expanded_unit_timer_path "$unit_basename")"
+        if [[ ! -f "$mirror_timer" ]] \
+            || ! diff --brief "$target_timer" "$mirror_timer" > /dev/null 2>&1; then
+            cp "$target_timer" "$mirror_timer"
+        fi
+    fi
+
+    if [[ "$service_copy_changed" == "true" ]]; then
+        echo "✅ Readable unit copy updated: $mirror_service"
+    else
+        echo "✅ Readable unit copy unchanged: $mirror_service"
+    fi
+    echo "   (for show-services; installed unit is under ${target_dir}/)"
 }
 
 # unit_target_service_path <unit_basename>
@@ -1499,6 +1522,7 @@ while IFS= read -r unit_basename; do
     deploy_refresh_needed=0
     service_changed=true
     timer_changed=false
+    running_full=""
 
     local_source_service="$(unit_source_service_path "$unit_basename")"
     local_target_service="$(unit_target_service_path "$unit_basename")"
@@ -1514,7 +1538,6 @@ while IFS= read -r unit_basename; do
 
     main_pid=""
     if main_pid="$(service_main_pid "$service_filename")"; then
-        running_full=""
         if running_full="$(read_deployed_commit_from_pid "$main_pid")"; then
             if [[ -n "$desired_full" && "$running_full" != "$desired_full" ]]; then
                 deploy_refresh_needed=1
@@ -1531,6 +1554,8 @@ while IFS= read -r unit_basename; do
     fi
     if [[ "$deploy_refresh_needed" == "1" ]]; then
         any_deploy_refresh_needed=true
+    elif [[ -n "$desired_full" && -n "$running_full" && "$running_full" == "$desired_full" ]]; then
+        echo "   Already at desired commit — verifying install only (no deploy/restart unless something differs)."
     fi
 
     if [[ -L "$local_target_service" ]]; then
@@ -1580,22 +1605,27 @@ while IFS= read -r unit_basename; do
 
     if [[ -f "$local_target_service" ]]; then
         write_expanded_unit_files "$unit_basename" "$local_target_service" "$local_target_timer"
-        echo "✅ Expanded unit mirrored: ${expanded_units_dir}/${unit_basename}.service"
     fi
 done <<<"$unit_basenames"
 
 # 4. Create log directory
 mkdir -p "$log_dir"
-echo "✅ Log directory: $log_dir"
+echo "✅ Log directory ready: $log_dir"
 
 # 5. Enable lingering for the current user (designated host only)
 current_user="$(whoami)"
+linger_status=""
 if host_runs_units; then
-    echo "👤 Enabling lingering for user: $current_user"
     if [[ "$kernel_name" == "Darwin" ]]; then
         echo "ℹ️  Skipping loginctl enable-linger (Linux hosts only; not available on macOS)."
     else
-        loginctl enable-linger "$current_user"
+        linger_status="$(loginctl show-user "$current_user" -p Linger --value 2>/dev/null || true)"
+        if [[ "$linger_status" == "yes" ]]; then
+            echo "✅ User lingering already enabled for $current_user (no change)."
+        else
+            echo "👤 Enabling lingering for user: $current_user"
+            loginctl enable-linger "$current_user"
+        fi
     fi
 else
     echo "ℹ️  Skipping loginctl enable-linger (service host ${condition_host_value} / ${condition_host_machine_id}; this host is $(current_hostname_short))"
@@ -1705,5 +1735,13 @@ while IFS= read -r unit_basename; do
 done <<<"$unit_basenames"
 
 echo ""
-echo "✨ ${service_name} systemd units successfully configured!"
+if [[ "$any_unit_changed" == "false" \
+    && "$any_timer_changed" == "false" \
+    && "$any_stale_removed" == "false" \
+    && "$any_deploy_refresh_needed" == "false" \
+    && "$code_changed" == "false" ]]; then
+    echo "✨ ${service_name} systemd units already up to date."
+else
+    echo "✨ ${service_name} systemd units successfully configured!"
+fi
 check_status

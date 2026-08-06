@@ -35,8 +35,9 @@ not atomically claim the lock when two starts race (`Persistent` catch-up plus
 New timer oneshots must use both conventions.
 
 Unit **templates** (with `@@REPO_DIR@@`) live in each repository's `etc/systemd/`.
-`setup-service` expands them into `~/.config/systemd/user/` and mirrors the
-expanded units under `~/.config/share/systemd-units/`.
+`setup-service` expands them into `~/.config/systemd/user/` and keeps a readable
+copy under `~/.config/share/systemd-units/` for `scripts/show-services` (systemd
+loads the install path, not the readable copy).
 `setup-service` injects **`ConditionHost=|<machine-id>`** and **`ConditionHost=|<hostname>`** (both triggering) using the values in
 `~/.config/user-services-machine-id` and `~/.config/user-services-host`
 (and records FQDN in `user-services-host-fqdn` for status output) so units

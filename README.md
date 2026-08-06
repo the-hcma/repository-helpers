@@ -187,8 +187,8 @@ Further detail (protect-main rules, branch hygiene, CVE workflow template):
 
 `scripts/setup-service` reads unit templates from `etc/systemd/<unit>.service`
 in the invoking repository, substitutes `@@REPO_DIR@@`, injects `DEPLOYED_COMMIT`
-and `ConditionHost=|<machine-id>` guards, installs under `~/.config/systemd/user/`, and mirrors expanded
-units to `~/.config/share/systemd-units/`. Enables companion timers when
+and `ConditionHost=|<machine-id>` guards, installs under `~/.config/systemd/user/`, and keeps a
+readable copy under `~/.config/share/systemd-units/` for `scripts/show-services`. Enables companion timers when
 `etc/systemd/<unit>.timer` exists.
 
 For service repositories, provide an executable `scripts/on-deploy` hook:
