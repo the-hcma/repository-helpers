@@ -146,7 +146,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` + `.cursor/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve |
 | Stacking-tool marker + rule | yes | — | `.github/stacking-tool` (`graphite`\|`gh-stack`) and thin `.cursor/rules/stacking-tool.mdc` (skill breadcrumbs; no copied skill bodies) |
 | UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
-| UV + Release Please lock sync | yes | — | uv + `release-please.yml` repos require `release-please-config` `extra-files` bumping `uv.lock` package version ([release-please#2561](https://github.com/googleapis/release-please/issues/2561)) |
+| UV + Release Please lock sync | yes | — | uv + `release-please.yml` repos require `release-please-config` `extra-files` bumping `uv.lock` via `@.name.value` jsonpath ([release-please#2561](https://github.com/googleapis/release-please/issues/2561)) |
 | Python static CI job | yes | — | Python (`pyproject.toml` + ruff) repos run ruff check/format + typecheck in one `Python lint & format checks` job via `.github/ci/python-static`; no split `Ruff`/`Pyright`/`Mypy`/`Backend Lint` jobs in **any** `.github/workflows/*`; cutover aliases must gate on `needs.python-static.result == 'success'` (or share conclusion via `aliases:` / `steps.*.outcome`) — see `.cursor/rules/python-static-ci-job.mdc` |
 | `.cursor/rules` gitignore | yes | — | `.gitignore` must not block `.cursor/rules/` |
 | Dependabot release age | yes | — | `cooldown` on every `dependabot.yml` updates entry (`release-age-defaults`) |

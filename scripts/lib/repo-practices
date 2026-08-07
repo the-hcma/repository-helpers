@@ -1315,7 +1315,8 @@ rp_release_please_config_relpath_from_workflow() {
 }
 
 # True when release-please config bumps the editable package version in uv.lock.
-# Prefer @.name== (TOML strings → JSON strings); @.name.value silently fails to match.
+# Require @.name.value== — release-please's TOML updater treats string nodes as
+# objects with .value; plain @.name== matches nothing ("No entries modified").
 # See googleapis/release-please#2561.
 rp_release_please_config_has_uv_lock_extra_files() {
   local -r config_text="$1"
@@ -1335,9 +1336,8 @@ rp_release_please_config_has_uv_lock_extra_files() {
     | map(select(
         (.type // "") == "toml"
         and (.path // "") == "uv.lock"
-        and ((.jsonpath // "") | test("\\$\\.package\\[\\?\\(@\\.name=="))
+        and ((.jsonpath // "") | test("\\$\\.package\\[\\?\\(@\\.name\\.value=="))
         and ((.jsonpath // "") | test("\\]\\.version$"))
-        and (((.jsonpath // "") | contains(".name.value")) | not)
       ))
     | length > 0
   ' >/dev/null || exit_code=$?
@@ -1358,7 +1358,7 @@ rp_check_uv_release_please_lock_sync() {
   local layout_ec=0
   local fetch_ec=0
   local path_ec=0
-  local workflow_text config_relpath config_text workflows_json
+  local workflow_text config_relpath config_text
   local workflow_name workflow_path workflow_blob assert_found=0
 
   rp_repo_has_uv_python_layout "$slug" || layout_ec=$?
@@ -1381,12 +1381,18 @@ rp_check_uv_release_please_lock_sync() {
     rp_log_gh_api_fail "$slug" 'could not read .github/workflows/release-please.yml'
     return 1
   fi
-  if (( fetch_ec != 0 )) || [[ -z "$workflow_text" ]]; then
-    rp_log_gh_api_fail "$slug" 'could not read .github/workflows/release-please.yml'
-    return 1
+  if [[ -z "$workflow_text" ]]; then
+    repo_fail=1
+    rp_log_fail \
+      "${slug}: .github/workflows/release-please.yml missing or empty after Release Please detection"
+    return "$repo_fail"
   fi
 
   config_relpath="$(rp_release_please_config_relpath_from_workflow "$workflow_text")"
+  if [[ "$config_relpath" == /* || "$config_relpath" == *'..'* ]]; then
+    rp_log_fail "${slug}: unsafe release-please config-file path: ${config_relpath}"
+    return 1
+  fi
   path_ec=0
   rp_gh_path_check "$slug" "$config_relpath" || path_ec=$?
   if (( path_ec == 2 )); then
@@ -1399,7 +1405,7 @@ rp_check_uv_release_please_lock_sync() {
       "${slug}: missing ${config_relpath} with uv.lock extra-files for Release Please + uv"
     if [[ "$rp_suggest" -eq 1 ]]; then
       rp_log_suggest \
-        "${slug}: add ${config_relpath} packages.\".\".extra-files toml entry for uv.lock (googleapis/release-please#2561; jsonpath \$.package[?(@.name=='<project.name>')].version — use @.name not @.name.value)"
+        "${slug}: add ${config_relpath} packages.\".\".extra-files toml entry for uv.lock (googleapis/release-please#2561; jsonpath \$.package[?(@.name.value=='<project.name>')].version — use @.name.value not @.name)"
     fi
   else
     fetch_ec=0
@@ -1415,7 +1421,7 @@ rp_check_uv_release_please_lock_sync() {
         "${slug}: ${config_relpath} must bump uv.lock package version via extra-files (Release Please + uv)"
       if [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest \
-          "${slug}: add toml extra-files path=uv.lock jsonpath=\$.package[?(@.name=='<project.name>')].version (not @.name.value; see googleapis/release-please#2561)"
+          "${slug}: add toml extra-files path=uv.lock jsonpath=\$.package[?(@.name.value=='<project.name>')].version (not plain @.name; see googleapis/release-please#2561)"
       fi
     fi
   fi
@@ -1428,26 +1434,20 @@ rp_check_uv_release_please_lock_sync() {
   # Optional companion: CI assert before uv sync so silent jsonpath misses fail fast.
   if [[ "$rp_suggest" -eq 1 ]]; then
     assert_found=0
-    fetch_ec=0
-    workflows_json="$(rp_runner_exec_stdout "repo-practices gh list workflows" --probe \
-      -- gh api "repos/${slug}/contents/.github/workflows")" || fetch_ec=$?
-    if (( fetch_ec == 0 )) && [[ -n "$workflows_json" ]]; then
-      while IFS= read -r workflow_name; do
-        [[ -n "$workflow_name" ]] || continue
-        [[ "$workflow_name" == *.yml || "$workflow_name" == *.yaml ]] || continue
-        workflow_path=".github/workflows/${workflow_name}"
-        fetch_ec=0
-        workflow_blob="$(rp_fetch_github_text_file "$slug" "$workflow_path")" || fetch_ec=$?
-        if (( fetch_ec != 0 )); then
-          continue
-        fi
-        if rp_repo_mentions_uv_lock_version_assert "$workflow_blob"; then
-          assert_found=1
-          break
-        fi
-      done < <(rp_runner_jq_file "repo-practices workflow names" "$workflows_json" -r \
-        '.[]? | select(.type=="file") | .name // empty')
-    fi
+    while IFS= read -r workflow_name; do
+      [[ -n "$workflow_name" ]] || continue
+      [[ "$workflow_name" == *.yml || "$workflow_name" == *.yaml ]] || continue
+      workflow_path=".github/workflows/${workflow_name}"
+      fetch_ec=0
+      workflow_blob="$(rp_fetch_github_text_file "$slug" "$workflow_path")" || fetch_ec=$?
+      if (( fetch_ec != 0 )); then
+        continue
+      fi
+      if rp_repo_mentions_uv_lock_version_assert "$workflow_blob"; then
+        assert_found=1
+        break
+      fi
+    done < <(rp_fetch_workflow_file_names "$slug")
     path_ec=0
     rp_gh_path_check "$slug" '.github/ci/assert-uv-lock-version' || path_ec=$?
     if (( path_ec == 0 )); then
