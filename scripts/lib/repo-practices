@@ -205,6 +205,8 @@ Audits GitHub conventions for org repositories:
 
   Release Please (when release-please.yml exists):
     - squash-only repo settings; squash_merge_commit_message=BLANK
+    - uv.lock + pyproject.toml: release-please-config extra-files bumps uv.lock
+      package version (googleapis/release-please#2561)
 
 --new-repo: audit a single repo with SUGGEST hints and a setup checklist (requires --repo).
 --strict-onboarding: require full org onboarding, including merge-it, for audited repos.
@@ -1281,6 +1283,183 @@ rp_check_uv_python_cve_check_workflow() {
   rp_log_check_ok "${slug}" 'uv Python: daily CVE check workflow (cve-check.yml)' \
     "$(rp_github_url "$slug" "/blob/main/${workflow_path}")"
   return 0
+}
+
+# Default Release Please config path when the workflow does not set config-file.
+readonly rp_RELEASE_PLEASE_CONFIG_DEFAULT='release-please-config.json'
+
+# Relpath of release-please config from workflow YAML (default when unset).
+rp_release_please_config_relpath_from_workflow() {
+  local -r text="$1"
+  local path
+
+  path="$(
+    awk '
+      /config-file:/ {
+        line = $0
+        sub(/.*config-file:[[:space:]]*/, "", line)
+        gsub(/["'\'']/, "", line)
+        sub(/[[:space:]].*/, "", line)
+        if (line != "") {
+          print line
+          exit
+        }
+      }
+    ' <<<"$text"
+  )"
+  if [[ -n "$path" ]]; then
+    printf '%s\n' "$path"
+  else
+    printf '%s\n' "$rp_RELEASE_PLEASE_CONFIG_DEFAULT"
+  fi
+}
+
+# True when release-please config bumps the editable package version in uv.lock.
+# Prefer @.name== (TOML strings → JSON strings); @.name.value silently fails to match.
+# See googleapis/release-please#2561.
+rp_release_please_config_has_uv_lock_extra_files() {
+  local -r config_text="$1"
+  local exit_code=0
+
+  rp_runner_jq_file "repo-practices release-please uv.lock extra-files" \
+    "$config_text" -e '
+    def extras:
+      ([.["extra-files"] // []]
+        + [
+            (.packages // {})
+            | to_entries[]
+            | .value["extra-files"] // []
+          ])
+      | flatten;
+    extras
+    | map(select(
+        (.type // "") == "toml"
+        and (.path // "") == "uv.lock"
+        and ((.jsonpath // "") | test("\\$\\.package\\[\\?\\(@\\.name=="))
+        and ((.jsonpath // "") | test("\\]\\.version$"))
+        and (((.jsonpath // "") | contains(".name.value")) | not)
+      ))
+    | length > 0
+  ' >/dev/null || exit_code=$?
+  (( exit_code == 0 ))
+}
+
+# Suggest-only: CI assert that uv.lock self-version matches pyproject (optional).
+rp_repo_mentions_uv_lock_version_assert() {
+  local -r text="$1"
+
+  grep -qiE 'assert-uv-lock-version|uv\.lock.*pyproject|pyproject.*uv\.lock.*(version|match)' \
+    <<<"$text"
+}
+
+rp_check_uv_release_please_lock_sync() {
+  local slug="$1"
+  local repo_fail=0
+  local layout_ec=0
+  local fetch_ec=0
+  local path_ec=0
+  local workflow_text config_relpath config_text workflows_json
+  local workflow_name workflow_path workflow_blob assert_found=0
+
+  rp_repo_has_uv_python_layout "$slug" || layout_ec=$?
+  if (( layout_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not detect uv Python layout (uv.lock / pyproject.toml)'
+    return 1
+  fi
+  if (( layout_ec != 0 )); then
+    return 0
+  fi
+
+  if ! rp_repo_has_release_please "$slug"; then
+    return 0
+  fi
+
+  fetch_ec=0
+  workflow_text="$(rp_fetch_github_text_file "$slug" \
+    '.github/workflows/release-please.yml')" || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/workflows/release-please.yml'
+    return 1
+  fi
+  if (( fetch_ec != 0 )) || [[ -z "$workflow_text" ]]; then
+    rp_log_gh_api_fail "$slug" 'could not read .github/workflows/release-please.yml'
+    return 1
+  fi
+
+  config_relpath="$(rp_release_please_config_relpath_from_workflow "$workflow_text")"
+  path_ec=0
+  rp_gh_path_check "$slug" "$config_relpath" || path_ec=$?
+  if (( path_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" "could not read ${config_relpath}"
+    return 1
+  fi
+  if (( path_ec == 1 )); then
+    repo_fail=1
+    rp_log_fail \
+      "${slug}: missing ${config_relpath} with uv.lock extra-files for Release Please + uv"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add ${config_relpath} packages.\".\".extra-files toml entry for uv.lock (googleapis/release-please#2561; jsonpath \$.package[?(@.name=='<project.name>')].version — use @.name not @.name.value)"
+    fi
+  else
+    fetch_ec=0
+    config_text="$(rp_fetch_github_text_file "$slug" "$config_relpath")" || fetch_ec=$?
+    if (( fetch_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" "could not read ${config_relpath}"
+      return 1
+    fi
+    if [[ -z "$config_text" ]] \
+      || ! rp_release_please_config_has_uv_lock_extra_files "$config_text"; then
+      repo_fail=1
+      rp_log_fail \
+        "${slug}: ${config_relpath} must bump uv.lock package version via extra-files (Release Please + uv)"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: add toml extra-files path=uv.lock jsonpath=\$.package[?(@.name=='<project.name>')].version (not @.name.value; see googleapis/release-please#2561)"
+      fi
+    fi
+  fi
+
+  if (( repo_fail == 0 )); then
+    rp_log_check_ok "$slug" 'uv Python: Release Please uv.lock self-version sync' \
+      "$(rp_github_url "$slug" "/blob/main/${config_relpath}")"
+  fi
+
+  # Optional companion: CI assert before uv sync so silent jsonpath misses fail fast.
+  if [[ "$rp_suggest" -eq 1 ]]; then
+    assert_found=0
+    fetch_ec=0
+    workflows_json="$(rp_runner_exec_stdout "repo-practices gh list workflows" --probe \
+      -- gh api "repos/${slug}/contents/.github/workflows")" || fetch_ec=$?
+    if (( fetch_ec == 0 )) && [[ -n "$workflows_json" ]]; then
+      while IFS= read -r workflow_name; do
+        [[ -n "$workflow_name" ]] || continue
+        [[ "$workflow_name" == *.yml || "$workflow_name" == *.yaml ]] || continue
+        workflow_path=".github/workflows/${workflow_name}"
+        fetch_ec=0
+        workflow_blob="$(rp_fetch_github_text_file "$slug" "$workflow_path")" || fetch_ec=$?
+        if (( fetch_ec != 0 )); then
+          continue
+        fi
+        if rp_repo_mentions_uv_lock_version_assert "$workflow_blob"; then
+          assert_found=1
+          break
+        fi
+      done < <(rp_runner_jq_file "repo-practices workflow names" "$workflows_json" -r \
+        '.[]? | select(.type=="file") | .name // empty')
+    fi
+    path_ec=0
+    rp_gh_path_check "$slug" '.github/ci/assert-uv-lock-version' || path_ec=$?
+    if (( path_ec == 0 )); then
+      assert_found=1
+    fi
+    if (( assert_found == 0 )); then
+      rp_log_suggest \
+        "${slug}: consider CI assert that uv.lock package version matches pyproject.toml project.version (run before uv sync; see scripts/lib/repo-practices-workflows/assert-uv-lock-version.snippet)"
+    fi
+  fi
+
+  return "$repo_fail"
 }
 
 # Canonical job name for the combined Python lint/format/typecheck CI job.
@@ -5607,6 +5786,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_uv_python_cve_check_workflow "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_uv_release_please_lock_sync "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_python_static_ci_job "$slug"; then
