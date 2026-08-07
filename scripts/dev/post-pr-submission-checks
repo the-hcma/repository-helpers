@@ -172,7 +172,8 @@ ci_repo_slug_for_pr() {
 
 require_ci_success() {
   local -r pr="$1"
-  local rollup failures repo latest
+  local rollup failures repo latest conclusion
+  local fail_line fail_count
 
   repo="$(ci_repo_slug_for_pr)"
   if [[ -n "$repo" ]]; then
@@ -181,22 +182,37 @@ require_ci_success() {
     rollup="$(ci_rollup_json_for_pr "$pr")"
   fi
   # Newest row per check name supersedes stale CANCELLED/SKIPPED from prior runs.
+  # Shared gating treats CANCELLED-only as pending (#454), not success or failure.
   # Exclude CodeRabbit / Bugbot: they start on push and are owned by agent-review.
   latest="$(ci_rollup_latest_by_name_json "$rollup")"
   latest="$(ci_rollup_without_agent_product_checks "$latest")"
-  if ci_rollup_has_pending_or_in_progress "$latest"; then
-    return 2
-  fi
-
-  failures="$(ci_rollup_failed_lines "$latest" | head -n 20 || true)"
-  if [[ -n "$failures" ]]; then
-    printf '%s\n' "ERROR: CI failures for PR #${pr}:" >&2
-    printf '%s\n' "$failures" >&2
-    ci_agent_report_failed_logs_for_pr "$pr" "$repo" || true
-    return 1
-  fi
-
-  return 0
+  conclusion="$(ci_rollup_conclusion_for_gating "$latest" "")"
+  case "$conclusion" in
+    success)
+      return 0
+      ;;
+    failure)
+      failures=""
+      fail_count=0
+      while IFS= read -r fail_line; do
+        [[ -z "$fail_line" ]] && continue
+        failures+="${fail_line}"$'\n'
+        fail_count=$(( fail_count + 1 ))
+        if (( fail_count >= 20 )); then
+          break
+        fi
+      done < <(ci_rollup_failed_lines "$latest" || true)
+      printf '%s\n' "ERROR: CI failures for PR #${pr}:" >&2
+      if [[ -n "$failures" ]]; then
+        printf '%s' "$failures" >&2
+      fi
+      ci_agent_report_failed_logs_for_pr "$pr" "$repo" || true
+      return 1
+      ;;
+    *)
+      return 2
+      ;;
+  esac
 }
 
 wait_for_ci_success() {
@@ -204,6 +220,8 @@ wait_for_ci_success() {
   local -r timeout_raw="${POST_PR_CHECKS_TIMEOUT:-20m}"
   local -r poll_raw="${POST_PR_CHECKS_POLL_SECS:-10}"
   local timeout_secs poll_secs start now elapsed rc exit_code state
+  local rollup_to repo_to latest_to cancelled_to
+  local cancel_line cancel_count
 
   timeout_secs=""
   if ! timeout_secs="$(parse_duration_seconds "$timeout_raw")"; then
@@ -237,6 +255,29 @@ wait_for_ci_success() {
     if (( elapsed >= timeout_secs )); then
       printf 'ERROR: WAIT_TIMEOUT post-pr-submission-checks pr=%s waited=%ss timeout=%ss\n' \
         "$pr" "$elapsed" "$timeout_secs" >&2
+      # Surface stuck CANCELLED rows so operators can tell cancel stalls from true pending (#454).
+      repo_to="$(ci_repo_slug_for_pr 2>/dev/null || true)"
+      if [[ -n "$repo_to" ]]; then
+        rollup_to="$(ci_rollup_json_for_pr "$pr" "$repo_to" 2>/dev/null || true)"
+      else
+        rollup_to="$(ci_rollup_json_for_pr "$pr" 2>/dev/null || true)"
+      fi
+      latest_to="$(ci_rollup_latest_by_name_json "${rollup_to:-[]}")"
+      latest_to="$(ci_rollup_without_agent_product_checks "$latest_to")"
+      cancelled_to=""
+      cancel_count=0
+      while IFS= read -r cancel_line; do
+        [[ -z "$cancel_line" ]] && continue
+        cancelled_to+="${cancel_line}"$'\n'
+        cancel_count=$(( cancel_count + 1 ))
+        if (( cancel_count >= 20 )); then
+          break
+        fi
+      done < <(ci_rollup_cancelled_lines "$latest_to" || true)
+      if [[ -n "$cancelled_to" ]]; then
+        printf 'NOTE: CANCELLED checks still present (waiting, not treated as CI failed):\n' >&2
+        printf '%s' "$cancelled_to" >&2
+      fi
       return 1
     fi
     sleep "$poll_secs"
