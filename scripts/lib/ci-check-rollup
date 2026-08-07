@@ -110,9 +110,13 @@ ci_rollup_conclusion_for_gating() {
   # SKIPPED/NEUTRAL are non-fatal but must not alone satisfy merge gating
   # (tsp-maximizer#128 / repository-helpers#430: push workflows skip jobs when a
   # PR already exists, which previously looked "green").
+  # CANCELLED is not a hard failure: cancel-in-progress concurrency often leaves
+  # CANCELLED rows beside a green sibling run for the same check name on the same
+  # head (repository-helpers#454). Bare CANCELLED after latest-by-name stays
+  # pending so waiters keep polling instead of closing the PR.
   ci_rollup_jq_file "ci-rollup gating conclusion" "$rollup_json" -r --argjson required "$required_json" '
     def fail_conclusions:
-      ["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"];
+      ["FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"];
     def ok_conclusions:
       ["SUCCESS", "SKIPPED", "NEUTRAL"];
     def is_failure($c):
@@ -131,7 +135,8 @@ ci_rollup_conclusion_for_gating() {
         or ($v | test("(?i)dependabot"));
     def is_incomplete($e):
       ((.conclusion // "") == "")
-        or ((.status // "") != "" and (.status // "") != "COMPLETED");
+        or ((.status // "") != "" and (.status // "") != "COMPLETED")
+        or ((.conclusion // "") == "CANCELLED");
     def rollup_entry($r; $ctx):
       ($r | map(select((.name // .context // "") == $ctx)) | .[0] // null);
 
@@ -212,11 +217,15 @@ ci_rollup_latest_by_name_json() {
   # Path-filter re-runs often re-emit required job names as SKIPPED after SUCCESS
   # (repository-helpers#438); keeping newest-only left gating pending forever (#430
   # still applies when the only rows are soft — no invented SUCCESS).
-  # CANCELLED stays hard: gating treats it as failure, so SUCCESS→CANCELLED must
-  # not fall back to the earlier SUCCESS.
+  # CANCELLED is also superseded by any non-cancelled outcome for the same name:
+  # cancel-in-progress leaves CANCELLED beside a green sibling run on the same
+  # head (repository-helpers#454). CANCELLED-only names stay CANCELLED and gate
+  # as pending (see ci_rollup_conclusion_for_gating).
   ci_rollup_jq_file "ci-rollup latest by name" "$normalized" -c '
     def is_soft($c):
       (["SKIPPED", "NEUTRAL"] | index($c // "")) != null;
+    def is_cancelled($c):
+      ($c // "") == "CANCELLED";
     [.[]?
       | select((.name // .context // "") != "")]
     | group_by(.name // .context // "unknown")
@@ -225,6 +234,10 @@ ci_rollup_latest_by_name_json() {
         | ($sorted | .[-1]) as $newest
         | if is_soft($newest.conclusion) then
             ($sorted | map(select(is_soft(.conclusion) | not)) | .[-1] // $newest)
+          elif is_cancelled($newest.conclusion) then
+            ($sorted
+              | map(select(is_cancelled(.conclusion) | not))
+              | .[-1] // $newest)
           else
             $newest
           end
@@ -275,6 +288,7 @@ ci_rollup_failed_lines() {
       | select(.conclusion != "SUCCESS")
       | select(.conclusion != "SKIPPED")
       | select(.conclusion != "NEUTRAL")
+      | select(.conclusion != "CANCELLED")
       | select(.conclusion != "")
     ]
     | .[]
@@ -295,6 +309,7 @@ ci_rollup_failure_details_json() {
       | select(.conclusion != "SUCCESS")
       | select(.conclusion != "SKIPPED")
       | select(.conclusion != "NEUTRAL")
+      | select(.conclusion != "CANCELLED")
       | select(.conclusion != "")
     ]
   ' 2>/dev/null || printf '[]\n'
