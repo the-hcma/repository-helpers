@@ -380,15 +380,17 @@ timer_standby_disable() {
     local stop_exit=0
 
     if host_runs_units; then
-        return 0
+        return 1
     fi
     if [[ "$timer_filename" != *.timer ]]; then
         echo "⏭️  ${timer_filename}: timer_standby_disable expects a *.timer unit; skipping"
-        return 0
+        return 1
     fi
 
     # Exit 0 = active; 3 = inactive (systemd); other = probe failure.
     # --probe: inactive (3) is the common standby case after the first stop.
+    # Return 0 when a local stop ran; 1 when nothing mutated (callers may set
+    # any_runtime_action from the exit status).
     runner_exec "systemctl is-active --quiet ${timer_filename}" --probe -- \
       systemctl --user is-active --quiet "$timer_filename" || is_active_exit=$?
     if (( is_active_exit == 0 )); then
@@ -398,7 +400,7 @@ timer_standby_disable() {
         if (( stop_exit != 0 )); then
             # Best-effort: ConditionHost already prevents firing; do not abort setup-service.
             echo "⚠️  ${timer_filename}: stop failed on $(current_hostname_short) (exit ${stop_exit}); leaving unit as-is (NFS wants intact)."
-            return 0
+            return 1
         fi
         echo "⏭️  ${timer_filename}: stopped on $(current_hostname_short) (ConditionHost skips schedule; NFS wants left intact for ${condition_host_value})."
         return 0
@@ -407,9 +409,10 @@ timer_standby_disable() {
         # Best-effort: standby may lack a user manager (no linger / bus unreachable).
         # Do not abort setup-service — ConditionHost already prevents the timer from firing.
         echo "⚠️  ${timer_filename}: is-active probe failed on $(current_hostname_short) (exit ${is_active_exit}); skipping local stop (user systemd unavailable?)."
-        return 0
+        return 1
     fi
     echo "⏭️  ${timer_filename}: skipped on $(current_hostname_short) (ConditionHost; not disabling shared NFS wants — timers run on ${condition_host_value})."
+    return 1
 }
 
 # warn_host_skips_service
@@ -667,7 +670,9 @@ timer_only_drop_stale_default_target_link() {
     if [[ -L "$default_link" || -f "$default_link" ]]; then
         rm -f "$default_link"
         echo "⏭️  ${service_filename}: removed stale default.target link (timer-only activation)."
+        return 0
     fi
+    return 1
 }
 
 # service_display_label
@@ -1700,7 +1705,9 @@ while IFS= read -r unit_basename; do
         # Timer-driven oneshots: enable the timer only. Do not link the service into
         # default.target (that caused a second run on every user-session start, overlapping
         # the daily timer and doubling GitHub API traffic).
-        timer_only_drop_stale_default_target_link "$service_filename"
+        if timer_only_drop_stale_default_target_link "$service_filename"; then
+            any_runtime_action=true
+        fi
         if host_runs_units; then
             echo "⏰ Enabling timer: ${timer_filename}"
             if ! systemctl --user is-enabled --quiet "$timer_filename" 2>/dev/null \
@@ -1710,7 +1717,9 @@ while IFS= read -r unit_basename; do
             systemctl --user enable --now "$timer_filename"
             echo "⏭️  ${service_filename}: oneshot — runs on timer schedule (not started now)."
         else
-            timer_standby_disable "$timer_filename"
+            if timer_standby_disable "$timer_filename"; then
+                any_runtime_action=true
+            fi
             echo "⏭️  ${service_filename}: oneshot — skipped on $(current_hostname_short) (service host ${condition_host_value} / ${condition_host_machine_id})."
         fi
         continue
@@ -1731,7 +1740,9 @@ while IFS= read -r unit_basename; do
             fi
             systemctl --user enable --now "$timer_filename"
         else
-            timer_standby_disable "$timer_filename"
+            if timer_standby_disable "$timer_filename"; then
+                any_runtime_action=true
+            fi
         fi
     fi
 
@@ -1781,9 +1792,12 @@ if [[ "$any_unit_changed" == "false" \
     && "$any_timer_changed" == "false" \
     && "$any_stale_removed" == "false" \
     && "$any_deploy_refresh_needed" == "false" \
-    && "$code_changed" == "false" \
-    && "$any_runtime_action" == "false" ]]; then
-    echo "✨ ${service_name} unit/deploy state already up to date."
+    && "$code_changed" == "false" ]]; then
+    if [[ "$any_runtime_action" == "true" ]]; then
+        echo "✨ ${service_name}: unit/code content unchanged; runtime state updated."
+    else
+        echo "✨ ${service_name}: unit/code content unchanged."
+    fi
 else
     echo "✨ ${service_name} systemd units successfully configured!"
 fi
