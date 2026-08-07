@@ -168,6 +168,84 @@ assert_exit_nonzero "timeout" "$out" "$exit_code"
 assert_contains "timeout line" "$out" "ERROR: WAIT_TIMEOUT post-pr-submission-checks"
 rm -rf "$tmp"
 
+printf '\n=== functional: CANCELLED-only stays pending until timeout (#454) ===\n'
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin"
+
+cat >"${mock_bin}/git" <<'MOCK_GIT'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *'branch --show-current'* ]]; then
+  printf '%s\n' 'my-branch'
+  exit 0
+fi
+if [[ "$*" == *'rev-parse --abbrev-ref @{u}'* ]]; then
+  printf '%s\n' 'origin/my-branch'
+  exit 0
+fi
+printf 'unexpected git call: %s\n' "$*" >&2
+exit 1
+MOCK_GIT
+chmod +x "${mock_bin}/git"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'repo view'* && "$args" == *'nameWithOwner'* ]]; then
+  printf 'the-hcma/mock-repo\n'
+  exit 0
+fi
+if [[ "$args" == *'pr list'* ]]; then
+  printf '42\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json state'* ]]; then
+  printf 'OPEN\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json isDraft'* ]]; then
+  printf 'false\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json body'* ]]; then
+  printf '%s\n' $'## Summary\n- ok\n\n## Test plan\n- ok\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json statusCheckRollup'* ]]; then
+  printf '%s\n' '[{"name":"Frontend","conclusion":"CANCELLED","status":"COMPLETED","detailsUrl":"https://example.invalid/job/9"}]'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(PATH="${mock_bin}:${PATH}" POST_PR_CHECKS_TIMEOUT=1s POST_PR_CHECKS_POLL_SECS=1 bash "$script" 2>&1)"
+exit_code=$?
+set -e
+
+assert_exit_nonzero "cancelled-only timeout" "$out" "$exit_code"
+assert_contains "cancelled-only timeout line" "$out" "ERROR: WAIT_TIMEOUT post-pr-submission-checks"
+assert_contains "cancelled-only note" "$out" "NOTE: CANCELLED checks still present"
+assert_contains "cancelled-only name" "$out" "Frontend"
+if grep -qF 'ERROR: CI failures' <<<"$out"; then
+  printf '[FAIL] cancelled-only: must not report ERROR: CI failures\n%s\n' "$out"
+  fail=$(( fail + 1 ))
+else
+  printf '[PASS] cancelled-only: no false CI failures line\n'
+  pass=$(( pass + 1 ))
+fi
+rm -rf "$tmp"
+
 printf '\n=== static: CI failure agent report wiring ===\n'
 # shellcheck disable=SC2016  # static assert matches literal source text
 if grep -qF 'ci_agent_report_failed_logs_for_pr' "$script" \
@@ -183,7 +261,7 @@ fi
 # shellcheck disable=SC2016  # static assert matches literal source text
 if grep -qF 'ci_rollup_latest_by_name_json' "$script" \
   && grep -qF 'ci_rollup_conclusion_for_gating' "$script" \
-  && grep -qF 'ci_rollup_failed_lines "$latest"' "$script" \
+  && grep -qF 'ci_rollup_cancelled_lines' "$script" \
   && grep -qF 'ci_rollup_without_agent_product_checks' "$script"; then
   printf '[PASS] post-pr-submission-checks: gates via shared rollup conclusion (#454)\n'
   pass=$(( pass + 1 ))
