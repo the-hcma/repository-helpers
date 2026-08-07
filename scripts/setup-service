@@ -380,15 +380,17 @@ timer_standby_disable() {
     local stop_exit=0
 
     if host_runs_units; then
-        return 0
+        return 1
     fi
     if [[ "$timer_filename" != *.timer ]]; then
         echo "⏭️  ${timer_filename}: timer_standby_disable expects a *.timer unit; skipping"
-        return 0
+        return 1
     fi
 
     # Exit 0 = active; 3 = inactive (systemd); other = probe failure.
     # --probe: inactive (3) is the common standby case after the first stop.
+    # Return 0 when a local stop ran; 1 when nothing mutated (callers may set
+    # any_runtime_action from the exit status).
     runner_exec "systemctl is-active --quiet ${timer_filename}" --probe -- \
       systemctl --user is-active --quiet "$timer_filename" || is_active_exit=$?
     if (( is_active_exit == 0 )); then
@@ -398,7 +400,7 @@ timer_standby_disable() {
         if (( stop_exit != 0 )); then
             # Best-effort: ConditionHost already prevents firing; do not abort setup-service.
             echo "⚠️  ${timer_filename}: stop failed on $(current_hostname_short) (exit ${stop_exit}); leaving unit as-is (NFS wants intact)."
-            return 0
+            return 1
         fi
         echo "⏭️  ${timer_filename}: stopped on $(current_hostname_short) (ConditionHost skips schedule; NFS wants left intact for ${condition_host_value})."
         return 0
@@ -407,9 +409,10 @@ timer_standby_disable() {
         # Best-effort: standby may lack a user manager (no linger / bus unreachable).
         # Do not abort setup-service — ConditionHost already prevents the timer from firing.
         echo "⚠️  ${timer_filename}: is-active probe failed on $(current_hostname_short) (exit ${is_active_exit}); skipping local stop (user systemd unavailable?)."
-        return 0
+        return 1
     fi
     echo "⏭️  ${timer_filename}: skipped on $(current_hostname_short) (ConditionHost; not disabling shared NFS wants — timers run on ${condition_host_value})."
+    return 1
 }
 
 # warn_host_skips_service
@@ -496,17 +499,66 @@ expanded_unit_timer_path() {
 }
 
 # write_expanded_unit_files <unit_basename> <target_service> [target_timer]
-# Mirrors installed units into ~/.config/share/systemd-units/.
+# Keeps a readable copy of installed units under ~/.config/share/systemd-units/
+# for show-services (systemd loads from ~/.config/systemd/user/ instead).
+# Only copies when the mirror is missing or differs; prints unchanged vs updated.
 write_expanded_unit_files() {
     local -r unit_basename="$1"
     local -r target_service="$2"
     local target_timer="${3:-}"
+    local mirror_service
+    local mirror_timer
+    local service_copy_changed=false
+    local timer_copy_changed=false
+    local diff_rc
 
+    mirror_service="$(expanded_unit_service_path "$unit_basename")"
     mkdir -p "$expanded_units_dir"
-    cp "$target_service" "$(expanded_unit_service_path "$unit_basename")"
-    if [[ -n "$target_timer" && -f "$target_timer" ]]; then
-        cp "$target_timer" "$(expanded_unit_timer_path "$unit_basename")"
+
+    if [[ ! -f "$mirror_service" ]]; then
+        cp "$target_service" "$mirror_service"
+        service_copy_changed=true
+    else
+        diff_rc=0
+        diff --brief "$target_service" "$mirror_service" > /dev/null 2>&1 || diff_rc=$?
+        if [[ "$diff_rc" -eq 1 ]]; then
+            cp "$target_service" "$mirror_service"
+            service_copy_changed=true
+        elif [[ "$diff_rc" -ge 2 ]]; then
+            echo "⚠️  Readable service unit copy: diff failed (exit ${diff_rc}); leaving ${mirror_service} as-is." >&2
+        fi
     fi
+
+    if [[ -n "$target_timer" && -f "$target_timer" ]]; then
+        mirror_timer="$(expanded_unit_timer_path "$unit_basename")"
+        if [[ ! -f "$mirror_timer" ]]; then
+            cp "$target_timer" "$mirror_timer"
+            timer_copy_changed=true
+        else
+            diff_rc=0
+            diff --brief "$target_timer" "$mirror_timer" > /dev/null 2>&1 || diff_rc=$?
+            if [[ "$diff_rc" -eq 1 ]]; then
+                cp "$target_timer" "$mirror_timer"
+                timer_copy_changed=true
+            elif [[ "$diff_rc" -ge 2 ]]; then
+                echo "⚠️  Readable timer unit copy: diff failed (exit ${diff_rc}); leaving ${mirror_timer} as-is." >&2
+            fi
+        fi
+    fi
+
+    if [[ "$service_copy_changed" == "true" ]]; then
+        echo "✅ Readable service unit copy updated: $mirror_service"
+    else
+        echo "✅ Readable service unit copy unchanged: $mirror_service"
+    fi
+    if [[ -n "${mirror_timer:-}" ]]; then
+        if [[ "$timer_copy_changed" == "true" ]]; then
+            echo "✅ Readable timer unit copy updated: $mirror_timer"
+        else
+            echo "✅ Readable timer unit copy unchanged: $mirror_timer"
+        fi
+    fi
+    echo "   (for show-services; installed units are under ${target_dir}/)"
 }
 
 # unit_target_service_path <unit_basename>
@@ -618,7 +670,9 @@ timer_only_drop_stale_default_target_link() {
     if [[ -L "$default_link" || -f "$default_link" ]]; then
         rm -f "$default_link"
         echo "⏭️  ${service_filename}: removed stale default.target link (timer-only activation)."
+        return 0
     fi
+    return 1
 }
 
 # service_display_label
@@ -1475,6 +1529,7 @@ any_unit_changed=false
 any_timer_changed=false
 any_stale_removed=false
 any_deploy_refresh_needed=false
+any_runtime_action=false
 
 desired_unit_args=()
 while IFS= read -r unit_basename; do
@@ -1499,6 +1554,7 @@ while IFS= read -r unit_basename; do
     deploy_refresh_needed=0
     service_changed=true
     timer_changed=false
+    running_full=""
 
     local_source_service="$(unit_source_service_path "$unit_basename")"
     local_target_service="$(unit_target_service_path "$unit_basename")"
@@ -1514,7 +1570,6 @@ while IFS= read -r unit_basename; do
 
     main_pid=""
     if main_pid="$(service_main_pid "$service_filename")"; then
-        running_full=""
         if running_full="$(read_deployed_commit_from_pid "$main_pid")"; then
             if [[ -n "$desired_full" && "$running_full" != "$desired_full" ]]; then
                 deploy_refresh_needed=1
@@ -1531,6 +1586,8 @@ while IFS= read -r unit_basename; do
     fi
     if [[ "$deploy_refresh_needed" == "1" ]]; then
         any_deploy_refresh_needed=true
+    elif [[ -n "$desired_full" && -n "$running_full" && "$running_full" == "$desired_full" ]]; then
+        echo "   Already at desired commit — verifying install only (no deploy/restart unless something differs)."
     fi
 
     if [[ -L "$local_target_service" ]]; then
@@ -1580,22 +1637,27 @@ while IFS= read -r unit_basename; do
 
     if [[ -f "$local_target_service" ]]; then
         write_expanded_unit_files "$unit_basename" "$local_target_service" "$local_target_timer"
-        echo "✅ Expanded unit mirrored: ${expanded_units_dir}/${unit_basename}.service"
     fi
 done <<<"$unit_basenames"
 
 # 4. Create log directory
 mkdir -p "$log_dir"
-echo "✅ Log directory: $log_dir"
+echo "✅ Log directory ready: $log_dir"
 
 # 5. Enable lingering for the current user (designated host only)
 current_user="$(whoami)"
+linger_status=""
 if host_runs_units; then
-    echo "👤 Enabling lingering for user: $current_user"
     if [[ "$kernel_name" == "Darwin" ]]; then
         echo "ℹ️  Skipping loginctl enable-linger (Linux hosts only; not available on macOS)."
     else
-        loginctl enable-linger "$current_user"
+        linger_status="$(loginctl show-user "$current_user" -p Linger --value 2>/dev/null || true)"
+        if [[ "$linger_status" == "yes" ]]; then
+            echo "✅ User lingering already enabled for $current_user (no change)."
+        else
+            echo "👤 Enabling lingering for user: $current_user"
+            loginctl enable-linger "$current_user"
+        fi
     fi
 else
     echo "ℹ️  Skipping loginctl enable-linger (service host ${condition_host_value} / ${condition_host_machine_id}; this host is $(current_hostname_short))"
@@ -1643,27 +1705,44 @@ while IFS= read -r unit_basename; do
         # Timer-driven oneshots: enable the timer only. Do not link the service into
         # default.target (that caused a second run on every user-session start, overlapping
         # the daily timer and doubling GitHub API traffic).
-        timer_only_drop_stale_default_target_link "$service_filename"
+        if timer_only_drop_stale_default_target_link "$service_filename"; then
+            any_runtime_action=true
+        fi
         if host_runs_units; then
             echo "⏰ Enabling timer: ${timer_filename}"
+            if ! systemctl --user is-enabled --quiet "$timer_filename" 2>/dev/null \
+                || ! systemctl --user is-active --quiet "$timer_filename" 2>/dev/null; then
+                any_runtime_action=true
+            fi
             systemctl --user enable --now "$timer_filename"
             echo "⏭️  ${service_filename}: oneshot — runs on timer schedule (not started now)."
         else
-            timer_standby_disable "$timer_filename"
+            if timer_standby_disable "$timer_filename"; then
+                any_runtime_action=true
+            fi
             echo "⏭️  ${service_filename}: oneshot — skipped on $(current_hostname_short) (service host ${condition_host_value} / ${condition_host_machine_id})."
         fi
         continue
     fi
 
     if host_runs_units; then
+        if ! systemctl --user is-enabled --quiet "$service_filename" 2>/dev/null; then
+            any_runtime_action=true
+        fi
         systemctl --user enable "$service_filename"
     fi
     if [[ -f "$local_source_timer" ]]; then
         if host_runs_units; then
             echo "⏰ Enabling timer: ${timer_filename}"
+            if ! systemctl --user is-enabled --quiet "$timer_filename" 2>/dev/null \
+                || ! systemctl --user is-active --quiet "$timer_filename" 2>/dev/null; then
+                any_runtime_action=true
+            fi
             systemctl --user enable --now "$timer_filename"
         else
-            timer_standby_disable "$timer_filename"
+            if timer_standby_disable "$timer_filename"; then
+                any_runtime_action=true
+            fi
         fi
     fi
 
@@ -1684,26 +1763,42 @@ while IFS= read -r unit_basename; do
     if [[ "$any_unit_changed" == "true" || "$any_timer_changed" == "true" ]]; then
         echo "🔄 Restarting ${service_filename} (config changed)..."
         systemctl_user_or_fail restart "$service_filename" "$local_target_service" "$local_source_service" "$service_filename" || exit 1
+        any_runtime_action=true
         continue
     fi
     if [[ "$code_changed" == "true" ]]; then
         echo "🔄 Restarting ${service_filename} (code changed)..."
         systemctl_user_or_fail restart "$service_filename" "$local_target_service" "$local_source_service" "$service_filename" || exit 1
+        any_runtime_action=true
         continue
     fi
     if ! systemctl --user is-active --quiet "$service_filename"; then
         echo "🚀 Starting ${service_filename} (was not running)..."
         systemctl_user_or_fail start "$service_filename" "$local_target_service" "$local_source_service" "$service_filename" || exit 1
+        any_runtime_action=true
         continue
     fi
     if [[ "$force_restart" == "1" ]]; then
         echo "🔄 Restarting ${service_filename} (forced)..."
         systemctl_user_or_fail restart "$service_filename" "$local_target_service" "$local_source_service" "$service_filename" || exit 1
+        any_runtime_action=true
         continue
     fi
     echo "⏭️  ${service_filename}: config and code unchanged — no restart needed."
 done <<<"$unit_basenames"
 
 echo ""
-echo "✨ ${service_name} systemd units successfully configured!"
+if [[ "$any_unit_changed" == "false" \
+    && "$any_timer_changed" == "false" \
+    && "$any_stale_removed" == "false" \
+    && "$any_deploy_refresh_needed" == "false" \
+    && "$code_changed" == "false" ]]; then
+    if [[ "$any_runtime_action" == "true" ]]; then
+        echo "✨ ${service_name}: unit/code content unchanged; runtime state updated."
+    else
+        echo "✨ ${service_name}: unit/code content unchanged."
+    fi
+else
+    echo "✨ ${service_name} systemd units successfully configured!"
+fi
 check_status
