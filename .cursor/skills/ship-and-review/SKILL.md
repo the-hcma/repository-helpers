@@ -225,6 +225,12 @@ the loop (exit **3**).
 CodeRabbit runs via its GitHub App / Actions after pushes. Copilot and Bugbot are probed with
 explicit review requests on new PR heads when quota is unknown.
 
+**Copilot code review vs coding agent:** request Copilot with
+`gh pr edit <n> --add-reviewer '@copilot'` (profile default; bot
+`copilot-pull-request-reviewer`). Never `@copilot` issue comments or
+`--add-assignee '@copilot'` from the loop — those start the **coding agent**
+(commits / `copilot_work_*`), not code review (`repository-helpers#461`).
+
 **Copilot timeline failures:** credit exhaustion sometimes appears only as a PR timeline event
 `copilot_work_finished_failure` (GitHub App `copilot-swe-agent`) with no issue comment or review
 body. Quota observe scans that timeline event for the local calendar day. Non-quota work failures

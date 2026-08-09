@@ -38,13 +38,13 @@ assert_contains "trigger help lists request" "$trigger_out" "request"
 printf '\n=== static: agent profile copilot ===\n'
 if grep -qF 'agent_review_profile_review_is_empty' "$profile" \
   && grep -qF 'agent_review_profile_request' "$profile" \
-  && grep -qF '@copilot' "$profile" \
-  && grep -qF 'runner_exec "copilot profile request comment"' "$profile" \
-  && grep -qF 'gh pr comment' "$profile"; then
-  printf '[PASS] copilot profile: @copilot PR comment request via runner\n'
+  && grep -qF -- "--add-reviewer '@copilot'" "$profile" \
+  && grep -qF 'runner_exec "copilot profile request reviewer"' "$profile" \
+  && grep -qF 'gh pr edit' "$profile"; then
+  printf '[PASS] copilot profile: code-review request via --add-reviewer runner\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] copilot profile: missing @copilot comment request wiring\n'
+  printf '[FAIL] copilot profile: missing reviewer-api request wiring\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -932,12 +932,14 @@ else
 fi
 
 if grep -qF 'request_exit=$?' "$profile" \
-  && grep -qF 'runner_exec "copilot profile request comment"' "$profile" \
-  && ! grep -qF 'gh pr edit' "$profile"; then
-  printf '[PASS] copilot profile: captures gh exit code outside negated if\n'
+  && grep -qF 'runner_exec "copilot profile request reviewer"' "$profile" \
+  && grep -qF "gh pr edit" "$profile" \
+  && grep -qF -- "--add-reviewer '@copilot'" "$profile" \
+  && ! grep -qF 'copilot profile request comment' "$profile"; then
+  printf '[PASS] copilot profile: captures gh exit code; uses --add-reviewer not comment\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] copilot profile: still uses gh pr edit or bad exit capture\n'
+  printf '[FAIL] copilot profile: missing reviewer request or bad exit capture\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -4019,18 +4021,136 @@ else
   fail=$(( fail + 1 ))
 fi
 
-printf '\n=== static: copilot comment review request ===\n'
+printf '\n=== static: copilot reviewer-api review request ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text
 if grep -qF "agent_review_profile_request_visible='true'" "$profile" \
+  && grep -qF "gh pr edit" "$profile" \
+  && grep -qF -- "--add-reviewer '@copilot'" "$profile" \
+  && grep -qF 'copilot profile request reviewer' "$profile" \
+  && ! grep -qF 'copilot profile request comment' "$profile" \
+  && ! grep -qF "gh pr comment" "$profile" \
   && grep -qF 'agent_review_profile_request_already_sent' "$profile" \
+  && grep -qF 'agent_review_copilot_review_requests_pending_in_snapshot' "$profile" \
+  && grep -qF 'agent_review_fresh_agent_review_on_head' "$profile" \
   && grep -qF 'agent_review_profile_agent_requested_from_snapshot' "$profile" \
   && grep -qF 'agent_review_profile_request_already_sent' "$wait_script" \
-  && grep -qF 'agent_review_profile_agent_requested_from_snapshot' "$lib"; then
-  printf '[PASS] copilot: requests via @copilot PR comment with per-head idempotency\n'
+  && grep -qF 'agent_review_profile_agent_requested_from_snapshot' "$lib" \
+  && grep -qF 'reviews(last:100)' "$lib"; then
+  printf '[PASS] copilot: requests via --add-reviewer with reviewRequests/head idempotency\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] copilot: missing @copilot comment request or idempotency wiring\n'
+  printf '[FAIL] copilot: missing reviewer-api request or idempotency wiring\n'
   fail=$(( fail + 1 ))
 fi
+
+# Happy-path request must not post an @copilot issue comment (coding agent; #461).
+if grep -qF -- "--add-reviewer '@copilot'" "$profile" \
+  && ! awk '
+    /^agent_review_profile_request\(\)/ { in_fn=1 }
+    in_fn && /^}/ { in_fn=0 }
+    in_fn && /gh pr comment/ { found=1 }
+    END { exit found ? 0 : 1 }
+  ' "$profile"; then
+  printf '[PASS] copilot: profile request path does not post @copilot comments\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot: profile request still posts gh pr comment\n'
+  fail=$(( fail + 1 ))
+fi
+
+# Assigning Copilot engages the coding agent — must never appear in the request path.
+if ! awk '
+  /^agent_review_profile_request\(\)/ { in_fn=1 }
+  in_fn && /^}/ { in_fn=0 }
+  in_fn && /--add-assignee/ { found=1 }
+  END { exit found ? 0 : 1 }
+' "$profile"; then
+  printf '[PASS] copilot: request path never assigns Copilot coding agent\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot: request path must not use --add-assignee @copilot\n'
+  fail=$(( fail + 1 ))
+fi
+
+tmp_already_sent_pending="$(mktemp)"
+cat >"${tmp_already_sent_pending}" <<'EOF'
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "headRefOid": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "reviewRequests": {
+          "pageInfo": { "hasNextPage": false },
+          "nodes": [{ "requestedReviewer": { "login": "copilot-pull-request-reviewer" } }]
+        },
+        "reviews": { "pageInfo": { "hasPreviousPage": false }, "nodes": [] },
+        "comments": { "pageInfo": { "hasNextPage": false }, "nodes": [] }
+      }
+    }
+  }
+}
+EOF
+if bash -c "
+  source '${lib}'
+  source '${copilot_profile}'
+  agent_review_use_agent copilot
+  agent_review_repo_parts() { printf 'o r\n'; }
+  agent_review_graphql_request_snapshot() { cat '${tmp_already_sent_pending}'; }
+  agent_review_assert_review_requests_complete() { return 0; }
+  agent_review_profile_request_already_sent 'o/r' 1
+"; then
+  printf '[PASS] copilot: already_sent true when reviewRequests pending\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot: already_sent missed pending reviewRequests\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_already_sent_pending}"
+
+tmp_already_sent_delivered="$(mktemp)"
+cat >"${tmp_already_sent_delivered}" <<'EOF'
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "headRefOid": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "reviewRequests": {
+          "pageInfo": { "hasNextPage": false },
+          "nodes": []
+        },
+        "reviews": {
+          "pageInfo": { "hasPreviousPage": false },
+          "nodes": [{
+            "author": { "login": "copilot-pull-request-reviewer" },
+            "state": "COMMENTED",
+            "body": "Looks good — no blocking issues.",
+            "submittedAt": "2026-08-09T12:00:00Z",
+            "commit": { "oid": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" }
+          }]
+        },
+        "comments": { "pageInfo": { "hasNextPage": false }, "nodes": [] }
+      }
+    }
+  }
+}
+EOF
+if bash -c "
+  source '${lib}'
+  source '${copilot_profile}'
+  agent_review_use_agent copilot
+  agent_review_repo_parts() { printf 'o r\n'; }
+  agent_review_graphql_request_snapshot() { cat '${tmp_already_sent_delivered}'; }
+  agent_review_assert_review_requests_complete() { return 0; }
+  agent_review_assert_reviews_complete() { return 0; }
+  agent_review_profile_request_already_sent 'o/r' 1
+"; then
+  printf '[PASS] copilot: already_sent true when code review delivered on head\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] copilot: already_sent missed delivered head review\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_already_sent_delivered}"
 
 if bash -c "
   source '${lib}'

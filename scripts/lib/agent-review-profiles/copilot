@@ -6,9 +6,11 @@
 agent_review_profile_id='copilot'
 agent_review_profile_request_login_regex='copilot'
 agent_review_profile_thread_login_regex='copilot'
-# nudge | on_push — Copilot needs an explicit @copilot PR comment (issue #347).
+# nudge | on_push — request Copilot code review via reviewer API (issue #461).
 agent_review_profile_trigger='nudge'
-# Copilot is triggered by mentioning @copilot in a PR comment (not --add-reviewer).
+# Visible in the PR Reviewers sidebar (gh pr edit --add-reviewer '@copilot').
+# Do not @mention Copilot in a PR comment or assign Copilot on the PR — those
+# engage the coding agent (pushes commits), not code review (#461).
 agent_review_profile_request_visible='true'
 
 if [[ -z "${_copilot_lib_dir:-}" ]]; then
@@ -281,7 +283,14 @@ agent_review_profile_latest_review_body_on_head() {
   local -r pr="$4"
   local body short_head comments_json
 
-  : "${snapshot}"
+  if declare -F agent_review_latest_nonempty_agent_review_body_on_head >/dev/null 2>&1; then
+    body="$(agent_review_latest_nonempty_agent_review_body_on_head "${snapshot}" "${head}")"
+    if [[ -n "${body}" ]]; then
+      printf '%s' "${body}"
+      return 0
+    fi
+  fi
+
   comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
   body="$(agent_review_copilot_success_issue_comment_for_head "${comments_json}" "${head}")"
   if [[ -n "${body}" ]]; then
@@ -346,6 +355,8 @@ agent_review_copilot_pr_head() {
 }
 
 # agent_review_copilot_request_comment_body <head_oid>
+# Legacy probe body (issue #347). Kept for tests and mid-flight PR detection only —
+# agent_review_profile_request uses --add-reviewer (issue #461).
 agent_review_copilot_request_comment_body() {
   local -r head="$1"
   local marker
@@ -565,17 +576,34 @@ agent_review_copilot_success_issue_comment_url_for_head() {
 }
 
 # agent_review_profile_request_already_sent <repo> <pr>
-# True when this head already has an @copilot probe comment from wait-for-agent-review.
+# True when Copilot code review is pending, already delivered on this head, or a
+# legacy wait-for-agent-review @copilot probe comment exists for this head.
 agent_review_profile_request_already_sent() {
   local -r repo="$1"
   local -r pr="$2"
-  local head marker comments_json
+  local owner name snapshot head marker comments_json
 
-  head="$(agent_review_copilot_pr_head "${repo}" "${pr}")"
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  snapshot="$(agent_review_graphql_request_snapshot "${owner}" "${name}" "${pr}")"
+  agent_review_assert_review_requests_complete "${snapshot}"
+  if agent_review_copilot_review_requests_pending_in_snapshot "${snapshot}"; then
+    return 0
+  fi
+  head="$(ar_runner_jq_file "copilot profile already-sent head" "${snapshot}" -r \
+    '.data.repository.pullRequest.headRefOid // ""')"
   [[ -n "${head}" ]] || return 1
+  if declare -F agent_review_fresh_agent_review_on_head >/dev/null 2>&1 \
+    && agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
+    return 0
+  fi
+  # Legacy mid-flight loops that still used an @copilot probe comment.
   marker="$(agent_review_copilot_request_marker "${head}")"
-  comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
-  agent_review_copilot_comments_contain_marker "${comments_json}" "${marker}" true
+  comments_json="$(ar_runner_jq_file "copilot profile already-sent comments" "${snapshot}" -c \
+    '.data.repository.pullRequest.comments.nodes // []')"
+  if [[ -z "${comments_json}" || "${comments_json}" == 'null' ]]; then
+    return 1
+  fi
+  agent_review_copilot_comments_contain_marker "${comments_json}" "${marker}" false
 }
 
 # agent_review_profile_agent_requested_from_snapshot <snapshot>
@@ -604,20 +632,22 @@ agent_review_profile_agent_requested_from_snapshot() {
 }
 
 # agent_review_profile_request <repo> <pr>
+# Request Copilot *code review* via the reviewer API (gh ≥ 2.88).
 # Exit 7 when Copilot review quota/billing blocks the request.
+# Never posts @copilot comments or assigns Copilot (coding agent).
 agent_review_profile_request() {
   local -r repo="$1"
   local -r pr="$2"
-  local head body err_file err_text request_exit
+  local err_file err_text request_exit
 
   if agent_review_profile_request_already_sent "${repo}" "${pr}"; then
     return 0
   fi
-  head="$(agent_review_copilot_pr_head "${repo}" "${pr}")"
-  body="$(agent_review_copilot_request_comment_body "${head}")"
   err_file="$(mktemp "${TMPDIR:-/tmp}/agent-review-request.XXXXXX")"
   request_exit=0
-  if runner_exec "copilot profile request comment" -- gh pr comment "${pr}" --repo "${repo}" --body "${body}" 2>"${err_file}"; then
+  # Maps to REST reviewers login copilot-pull-request-reviewer (not coding agent).
+  if runner_exec "copilot profile request reviewer" -- \
+    gh pr edit "${pr}" --repo "${repo}" --add-reviewer '@copilot' 2>"${err_file}"; then
     rm -f "${err_file}"
     return 0
   fi
