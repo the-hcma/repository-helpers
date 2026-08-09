@@ -225,9 +225,9 @@ the loop (exit **3**).
 CodeRabbit runs via its GitHub App / Actions after pushes. Copilot and Bugbot are probed with
 explicit review requests on new PR heads when quota is unknown.
 
-**Copilot code review vs coding agent:** request Copilot with
-`gh pr edit <n> --add-reviewer '@copilot'` (profile default; bot
-`copilot-pull-request-reviewer`). Never `@copilot` issue comments or
+**Copilot code review vs coding agent:** request Copilot via REST
+`requested_reviewers` with `copilot-pull-request-reviewer` (equivalent to
+`gh pr edit <n> --add-reviewer '@copilot'`). Never `@copilot` issue comments or
 `--add-assignee '@copilot'` from the loop — those start the **coding agent**
 (commits / `copilot_work_*`), not code review (`repository-helpers#461`).
 

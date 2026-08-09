@@ -470,7 +470,8 @@ When CI is green, follow **`.cursor/skills/ship-and-review/SKILL.md`** (deep pla
 See the Skill for CodeRabbit on_push policy, early-complete loop semantics, per-agent quota fallback, and exit codes (**`scripts/wait-for-agent-review --help`** is the SSOT).
 
 **Copilot code review vs coding agent:** the review loop requests Copilot via
-`gh pr edit --add-reviewer '@copilot'` (bot login `copilot-pull-request-reviewer`).
+REST `requested_reviewers` with login `copilot-pull-request-reviewer` (same as
+`gh pr edit --add-reviewer '@copilot'`).
 Do **not** post `@copilot` issue comments or `--add-assignee '@copilot'` from the loop —
 those engage **Copilot coding agent** (pushes commits / `copilot_work_*` timeline events),
 not code review (`repository-helpers#461`).
