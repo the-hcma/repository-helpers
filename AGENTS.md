@@ -469,6 +469,13 @@ When CI is green, follow **`.cursor/skills/ship-and-review/SKILL.md`** (deep pla
 
 See the Skill for CodeRabbit on_push policy, early-complete loop semantics, per-agent quota fallback, and exit codes (**`scripts/wait-for-agent-review --help`** is the SSOT).
 
+**Copilot code review vs coding agent:** the review loop requests Copilot via
+REST `requested_reviewers` with login `copilot-pull-request-reviewer` (same as
+`gh pr edit --add-reviewer '@copilot'`).
+Do **not** post `@copilot` issue comments or `--add-assignee '@copilot'` from the loop —
+those engage **Copilot coding agent** (pushes commits / `copilot_work_*` timeline events),
+not code review (`repository-helpers#461`).
+
 **Copilot timeline failures:** credit exhaustion sometimes appears only as a PR timeline event
 `copilot_work_finished_failure` (GitHub App `copilot-swe-agent`) with no issue comment or review
 body. Quota observe scans that timeline event for the local calendar day. Non-quota work failures

@@ -6,9 +6,15 @@
 agent_review_profile_id='copilot'
 agent_review_profile_request_login_regex='copilot'
 agent_review_profile_thread_login_regex='copilot'
-# nudge | on_push — Copilot needs an explicit @copilot PR comment (issue #347).
+# Code-review bot only (already_sent / pending reviewRequests). Accept optional
+# `[bot]` suffix (REST) while GraphQL often omits it (observed on #462).
+agent_review_copilot_code_review_login_regex='^copilot-pull-request-reviewer(\[bot\])?$'
+# nudge | on_push — request Copilot code review via reviewer API (issue #461).
 agent_review_profile_trigger='nudge'
-# Copilot is triggered by mentioning @copilot in a PR comment (not --add-reviewer).
+# Visible in the PR Reviewers sidebar via REST requested_reviewers
+# (copilot-pull-request-reviewer; equivalent to the gh reviewer @copilot alias).
+# Do not @mention Copilot in a PR comment or assign Copilot on the PR — those
+# engage the coding agent (pushes commits), not code review (#461).
 agent_review_profile_request_visible='true'
 
 if [[ -z "${_copilot_lib_dir:-}" ]]; then
@@ -202,7 +208,7 @@ agent_review_profile_review_is_empty() {
 }
 
 # agent_review_copilot_review_requests_pending_in_snapshot <snapshot>
-# True when GitHub still shows a pending Copilot review request on the PR.
+# True when GitHub still shows a pending Copilot *code review* request on the PR.
 agent_review_copilot_review_requests_pending_in_snapshot() {
   local -r snapshot="$1"
   local exit_code
@@ -210,15 +216,91 @@ agent_review_copilot_review_requests_pending_in_snapshot() {
   exit_code=0
   # shellcheck disable=SC2016  # jq filter uses $re variable, not shell expansion
   ar_runner_jq_file "copilot profile review requests pending" "${snapshot}" -e \
-    --arg re "${agent_review_profile_request_login_regex}" \
+    --arg re "${agent_review_copilot_code_review_login_regex}" \
     '[.data.repository.pullRequest.reviewRequests.nodes[]
       | .requestedReviewer | (.login // .slug // "")
       | select(test($re;"i"))] | length > 0' >/dev/null || exit_code=$?
   (( exit_code == 0 ))
 }
 
+# agent_review_copilot_reviews_snapshot_truncated <snapshot>
+# True when GraphQL reviews(last:100) has older pages (hasPreviousPage).
+agent_review_copilot_reviews_snapshot_truncated() {
+  local -r snapshot="$1"
+  local exit_code
+
+  [[ -n "${snapshot}" ]] || return 1
+  exit_code=0
+  ar_runner_jq_file "copilot profile reviews truncated" "${snapshot}" -e \
+    '.data.repository.pullRequest.reviews.pageInfo.hasPreviousPage == true' \
+    >/dev/null || exit_code=$?
+  (( exit_code == 0 ))
+}
+
+# agent_review_copilot_review_delivered_via_rest <repo> <pr> <head>
+# Paginated REST scan for a code-review-bot review on <head> (covers >100 reviews).
+agent_review_copilot_review_delivered_via_rest() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local owner name api_json exit_code
+
+  [[ -n "${repo}" && -n "${pr}" && -n "${head}" ]] || return 1
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  exit_code=0
+  api_json="$(ar_runner_gh_api_stream "copilot profile paginated reviews" \
+    "repos/${owner}/${name}/pulls/${pr}/reviews" --paginate)" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "${api_json}" ]]; then
+    return 1
+  fi
+  exit_code=0
+  # shellcheck disable=SC2016  # jq filter uses $re / $head, not shell expansion
+  ar_runner_jq_file "copilot profile delivered via rest" "${api_json}" -e -rs \
+    --arg head "${head}" \
+    --arg re "${agent_review_copilot_code_review_login_regex}" '
+    [.[] | .[]
+      | select((.user.login // "") | test($re;"i"))
+      | select((.state // "") != "PENDING")
+      | select((.commit_id // "") == $head)] | length > 0' >/dev/null || exit_code=$?
+  (( exit_code == 0 ))
+}
+
+# agent_review_copilot_latest_code_review_body_via_rest <repo> <pr> <head>
+# Latest non-empty code-review-bot body on <head> via paginated REST.
+agent_review_copilot_latest_code_review_body_via_rest() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local owner name api_json exit_code
+
+  [[ -n "${repo}" && -n "${pr}" && -n "${head}" ]] || {
+    printf ''
+    return 0
+  }
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  exit_code=0
+  api_json="$(ar_runner_gh_api_stream "copilot profile paginated reviews body" \
+    "repos/${owner}/${name}/pulls/${pr}/reviews" --paginate)" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "${api_json}" ]]; then
+    printf ''
+    return 0
+  fi
+  # shellcheck disable=SC2016  # jq filter uses $re / $head, not shell expansion
+  ar_runner_jq_file "copilot profile latest code review body via rest" "${api_json}" -rs \
+    --arg head "${head}" \
+    --arg re "${agent_review_copilot_code_review_login_regex}" '
+    [.[] | .[]
+      | select((.user.login // "") | test($re;"i"))
+      | select((.state // "") != "PENDING")
+      | select((.commit_id // "") == $head)
+      | select((.body // "") | length > 0)]
+    | sort_by(.submitted_at // "")
+    | if length > 0 then last.body else "" end'
+}
+
 # agent_review_copilot_review_delivered_on_head <snapshot> <head> <repo> <pr>
-# True when Copilot posted a formal review or substantive issue-comment reply for this head.
+# True when Copilot code-review bot posted a formal review or a substantive
+# issue-comment reply for this head.
 agent_review_copilot_review_delivered_on_head() {
   local -r snapshot="$1"
   local -r head="$2"
@@ -226,7 +308,15 @@ agent_review_copilot_review_delivered_on_head() {
   local -r pr="$4"
   local comments_json body
 
-  if agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
+  if agent_review_copilot_review_delivered_in_snapshot_nodes "${snapshot}" "${head}"; then
+    return 0
+  fi
+  # Paginate REST only when reviews(last:100) is truncated and no code-review
+  # request is still pending. While pending, a new delivery lands in the newest
+  # window; REST-every-poll on long-lived PRs would burn GitHub rate limits.
+  if agent_review_copilot_reviews_snapshot_truncated "${snapshot}" \
+    && ! agent_review_copilot_review_requests_pending_in_snapshot "${snapshot}" \
+    && agent_review_copilot_review_delivered_via_rest "${repo}" "${pr}" "${head}"; then
     return 0
   fi
   comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
@@ -243,12 +333,15 @@ agent_review_profile_review_outstanding() {
   local -r pr="$4"
   local comments_json
 
+  # Delivered-on-head wins even if GraphQL still lists a stale reviewRequest.
+  if agent_review_copilot_review_delivered_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    return 1
+  fi
   if agent_review_copilot_review_requests_pending_in_snapshot "${snapshot}"; then
     return 0
   fi
   comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
-  if agent_review_copilot_probe_comment_sent_for_head "${comments_json}" "${head}" \
-    && ! agent_review_copilot_review_delivered_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+  if agent_review_copilot_probe_comment_sent_for_head "${comments_json}" "${head}"; then
     return 0
   fi
   return 1
@@ -273,6 +366,29 @@ agent_review_profile_fresh_on_head() {
   agent_review_profile_review_complete_on_head "${1}" "${2}" "${3}" "${4}"
 }
 
+# agent_review_copilot_latest_code_review_body_on_head <snapshot> <head>
+# Latest non-empty formal review body from the code-review bot only (not coding agent).
+agent_review_copilot_latest_code_review_body_on_head() {
+  local -r snapshot="$1"
+  local -r head="$2"
+
+  [[ -n "${snapshot}" && -n "${head}" ]] || {
+    printf ''
+    return 0
+  }
+  # shellcheck disable=SC2016  # jq filter uses $re / $head, not shell expansion
+  ar_runner_jq_file "copilot profile latest code review body" "${snapshot}" -r \
+    --arg head "${head}" \
+    --arg re "${agent_review_copilot_code_review_login_regex}" '
+    [(.data.repository.pullRequest.reviews.nodes // [])[]
+      | select((.author.login // "") | test($re;"i"))
+      | select(.state != "PENDING")
+      | select((.commit.oid // "") == $head)
+      | select((.body // "") | length > 0)]
+    | sort_by(.submittedAt // "")
+    | if length > 0 then last.body else "" end'
+}
+
 # agent_review_profile_latest_review_body_on_head <snapshot> <head> <repo> <pr>
 agent_review_profile_latest_review_body_on_head() {
   local -r snapshot="$1"
@@ -281,7 +397,19 @@ agent_review_profile_latest_review_body_on_head() {
   local -r pr="$4"
   local body short_head comments_json
 
-  : "${snapshot}"
+  # Use the code-review bot login regex — not agent_review_latest_nonempty_agent_review_body_on_head,
+  # which matches the broad request_login_regex ('copilot') and can return coding-agent bodies.
+  body="$(agent_review_copilot_latest_code_review_body_on_head "${snapshot}" "${head}")"
+  if [[ -z "${body}" ]] \
+    && agent_review_copilot_reviews_snapshot_truncated "${snapshot}" \
+    && ! agent_review_copilot_review_requests_pending_in_snapshot "${snapshot}"; then
+    body="$(agent_review_copilot_latest_code_review_body_via_rest "${repo}" "${pr}" "${head}")"
+  fi
+  if [[ -n "${body}" ]]; then
+    printf '%s' "${body}"
+    return 0
+  fi
+
   comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
   body="$(agent_review_copilot_success_issue_comment_for_head "${comments_json}" "${head}")"
   if [[ -n "${body}" ]]; then
@@ -346,6 +474,8 @@ agent_review_copilot_pr_head() {
 }
 
 # agent_review_copilot_request_comment_body <head_oid>
+# Legacy probe body (issue #347). Kept for tests and mid-flight PR detection only —
+# agent_review_profile_request uses REST requested_reviewers (issue #461).
 agent_review_copilot_request_comment_body() {
   local -r head="$1"
   local marker
@@ -564,15 +694,51 @@ agent_review_copilot_success_issue_comment_url_for_head() {
   return 1
 }
 
+# agent_review_copilot_review_delivered_in_snapshot_nodes <snapshot> <head>
+# Best-effort: true when any fetched Copilot review node is on <head>.
+# Does not assert reviews pagination completeness — already_sent must not die on
+# PRs with >100 reviews (request path idempotency; repository-helpers#461).
+agent_review_copilot_review_delivered_in_snapshot_nodes() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local exit_code
+
+  [[ -n "${snapshot}" && -n "${head}" ]] || return 1
+  exit_code=0
+  # shellcheck disable=SC2016  # jq filter uses $re / $head, not shell expansion
+  ar_runner_jq_file "copilot profile delivered review in nodes" "${snapshot}" -e \
+    --arg head "${head}" \
+    --arg re "${agent_review_copilot_code_review_login_regex}" \
+    '[(.data.repository.pullRequest.reviews.nodes // [])[]
+      | select((.author.login // "") | test($re;"i"))
+      | select(.state != "PENDING")
+      | select((.commit.oid // "") == $head)] | length > 0' >/dev/null || exit_code=$?
+  (( exit_code == 0 ))
+}
+
 # agent_review_profile_request_already_sent <repo> <pr>
-# True when this head already has an @copilot probe comment from wait-for-agent-review.
+# True when Copilot code review is pending, already delivered on this head, or a
+# legacy wait-for-agent-review @copilot probe comment exists for this head.
 agent_review_profile_request_already_sent() {
   local -r repo="$1"
   local -r pr="$2"
-  local head marker comments_json
+  local owner name snapshot head marker comments_json
 
-  head="$(agent_review_copilot_pr_head "${repo}" "${pr}")"
+  read -r owner name < <(agent_review_repo_parts "${repo}")
+  snapshot="$(agent_review_graphql_request_snapshot "${owner}" "${name}" "${pr}")"
+  # Do not die on truncated reviewRequests(first:10); scan fetched nodes only.
+  if agent_review_copilot_review_requests_pending_in_snapshot "${snapshot}"; then
+    return 0
+  fi
+  head="$(ar_runner_jq_file "copilot profile already-sent head" "${snapshot}" -r \
+    '.data.repository.pullRequest.headRefOid // ""')"
   [[ -n "${head}" ]] || return 1
+  # Includes REST pagination when GraphQL reviews(last:100) is truncated.
+  if agent_review_copilot_review_delivered_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    return 0
+  fi
+  # Legacy mid-flight loops that still used an @copilot probe comment.
+  # Paginate all issue comments — snapshot comments(last:30) can miss older probes.
   marker="$(agent_review_copilot_request_marker "${head}")"
   comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
   agent_review_copilot_comments_contain_marker "${comments_json}" "${marker}" true
@@ -604,20 +770,26 @@ agent_review_profile_agent_requested_from_snapshot() {
 }
 
 # agent_review_profile_request <repo> <pr>
+# Request Copilot *code review* via REST requested_reviewers
+# (`copilot-pull-request-reviewer`). Prefer REST over the gh @copilot reviewer
+# alias so older gh cannot mis-resolve @copilot to a non-bot login.
 # Exit 7 when Copilot review quota/billing blocks the request.
+# Never posts @copilot comments or assigns Copilot (coding agent).
 agent_review_profile_request() {
   local -r repo="$1"
   local -r pr="$2"
-  local head body err_file err_text request_exit
+  local err_file err_text request_exit owner name
 
   if agent_review_profile_request_already_sent "${repo}" "${pr}"; then
     return 0
   fi
-  head="$(agent_review_copilot_pr_head "${repo}" "${pr}")"
-  body="$(agent_review_copilot_request_comment_body "${head}")"
+  read -r owner name < <(agent_review_repo_parts "${repo}")
   err_file="$(mktemp "${TMPDIR:-/tmp}/agent-review-request.XXXXXX")"
   request_exit=0
-  if runner_exec "copilot profile request comment" -- gh pr comment "${pr}" --repo "${repo}" --body "${body}" 2>"${err_file}"; then
+  # Keep `gh` on the same line as runner_exec for the runner-adoption ratchet.
+  if runner_exec "copilot profile request reviewer" -- gh api --method POST \
+    "repos/${owner}/${name}/pulls/${pr}/requested_reviewers" \
+    -f 'reviewers[]=copilot-pull-request-reviewer[bot]' 2>"${err_file}"; then
     rm -f "${err_file}"
     return 0
   fi
