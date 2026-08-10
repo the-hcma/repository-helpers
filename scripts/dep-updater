@@ -5485,6 +5485,92 @@ py_uv_filter_outdated_lines() {
   return 0
 }
 
+# py_uv_exclude_newer_cutoff_iso
+# UTC timestamp for uv --exclude-newer-package (dep-updater release-age gate).
+py_uv_exclude_newer_cutoff_iso() {
+  local now_epoch cutoff_epoch
+  now_epoch="$(date +%s)"
+  cutoff_epoch=$(( now_epoch - dep_updater_minimum_release_age_minutes * 60 ))
+  date -u -d "@${cutoff_epoch}" +'%Y-%m-%dT%H:%M:%SZ'
+}
+
+# py_uv_lock_highest_version <lockfile> <pkg>
+# Prints the highest version of pkg in a uv.lock (marker splits may list several).
+py_uv_lock_highest_version() {
+  local -r lockfile="$1"
+  local -r pkg="$2"
+  local pkg_lc versions
+  [[ -f "$lockfile" ]] || return 1
+  pkg_lc="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+  versions="$(awk -v want="$pkg_lc" '
+    /^name = "/ {
+      name = $0
+      sub(/^name = "/, "", name)
+      sub(/"$/, "", name)
+      gsub(/_/, "-", name)
+      tracking = (tolower(name) == want)
+      next
+    }
+    tracking && /^version = "/ {
+      ver = $0
+      sub(/^version = "/, "", ver)
+      sub(/"$/, "", ver)
+      print ver
+      tracking = 0
+    }
+  ' "$lockfile")"
+  [[ -n "$versions" ]] || return 1
+  printf '%s\n' "$versions" | sort -V | tail -n 1
+}
+
+# py_uv_lock_upgrade_package <worktree> <pkg> <new_ver>
+# Upgrades a transitive (or unconstrained) package via
+# `uv lock --upgrade-package` so marker-split resolution can keep an older
+# pin on exotic environments (e.g. PyPy+win32) while landing the new version
+# elsewhere. `uv add pkg==ver` forces a universal pin and fails in those cases.
+# Returns 0 when the lock's highest version for pkg equals new_ver.
+py_uv_lock_upgrade_package() {
+  local -r worktree="$1"
+  local -r pkg="$2"
+  local -r new_ver="$3"
+  local cutoff lockfile before after out exit_code
+
+  lockfile="${worktree}/uv.lock"
+  [[ -f "$lockfile" ]] || return 1
+  cutoff="$(py_uv_exclude_newer_cutoff_iso)"
+  before="$(py_uv_lock_highest_version "$lockfile" "$pkg" 2>/dev/null || true)"
+  out="$(dep_runner_uv_dir_capture "uv lock --upgrade-package ${pkg}" "$worktree" -- \
+    lock --upgrade-package "$pkg" --exclude-newer-package "${pkg}=${cutoff}")" \
+    && exit_code=0 || exit_code=$?
+  if (( exit_code != 0 )); then
+    printf '%s' "$out"
+    return "$exit_code"
+  fi
+  after="$(py_uv_lock_highest_version "$lockfile" "$pkg" 2>/dev/null || true)"
+  if [[ "$after" != "$new_ver" ]]; then
+    log "[python/uv] ${pkg}: lock upgrade left version at '${after:-?}' (wanted ${new_ver}; was ${before:-?})."
+    return 1
+  fi
+  return 0
+}
+
+# py_uv_actual_lines_from_lock <worktree> <planned_lines>
+# Emits planned "pkg old new" rows whose highest uv.lock version equals new.
+py_uv_actual_lines_from_lock() {
+  local -r worktree="$1"
+  local -r planned_lines="$2"
+  local lockfile pkg old_ver new_ver highest
+  lockfile="${worktree}/uv.lock"
+  [[ -f "$lockfile" && -n "$planned_lines" ]] || return 0
+  while IFS=' ' read -r pkg old_ver new_ver; do
+    [[ -z "$pkg" || -z "$new_ver" ]] && continue
+    highest="$(py_uv_lock_highest_version "$lockfile" "$pkg" 2>/dev/null || true)"
+    if [[ "$highest" == "$new_ver" ]]; then
+      printf '%s %s %s\n' "$pkg" "${old_ver:--}" "$new_ver"
+    fi
+  done <<< "$planned_lines"
+}
+
 # py_uv_probe_transitive_upgrade <scan_root> <installed_json> <pkg> <cur> <new>
 # Per-package dry-run for outdated packages not declared in pyproject.toml.
 py_uv_probe_transitive_upgrade() {
@@ -5561,7 +5647,7 @@ py_update_one() {
 
   case "$tool" in
     uv)
-      local uv_out uv_exit uv_constraint_op uv_spec
+      local uv_out uv_exit uv_constraint_op
       uv_constraint_op="$(py_constraint_op "$pkg" "${dir}/pyproject.toml")"
       # Invariant: always write >= (never ==) — dep-updater must not re-pin.
       if [[ "$uv_constraint_op" == ">=" || "$uv_constraint_op" == "==" || "$uv_constraint_op" == "~=" ]]; then
@@ -5575,22 +5661,30 @@ py_update_one() {
           return 0
         fi
         uv_out="$(dep_runner_uv_dir_capture "uv lock" "$worktree_path" -- lock)" && uv_exit=0 || uv_exit=$?
-      else
-        uv_spec="${pkg}==${new_ver}"
-        uv_out="$(dep_runner_uv_dir_capture "uv add" "$worktree_path" -- add "$uv_spec")" && uv_exit=0 || uv_exit=$?
-      fi
-      if (( uv_exit != 0 )); then
-        # Revert pyproject.toml: sed already modified it for >= / == / ~= constraints
-        # but the lock failed, so the change must not accumulate into a future commit.
-        if [[ "$uv_constraint_op" == ">=" || "$uv_constraint_op" == "==" || "$uv_constraint_op" == "~=" ]]; then
+        if (( uv_exit != 0 )); then
+          # Revert pyproject.toml: sed already modified it but the lock failed.
           run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
+          log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
+          log "$uv_out"
+          return 0
         fi
-        log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
-        log "$uv_out"
-        return 0
+        run_command "git worktree" git -C "$worktree_path" add pyproject.toml uv.lock
+        files_changed="pyproject.toml + uv.lock"
+      else
+        # Transitive / unconstrained: prefer marker-aware lock upgrade over
+        # `uv add pkg==ver` (universal pin breaks PyPy+win32 marker splits).
+        uv_out="$(py_uv_lock_upgrade_package "$worktree_path" "$pkg" "$new_ver" 2>&1)" \
+          && uv_exit=0 || uv_exit=$?
+        if (( uv_exit != 0 )); then
+          run_command "git worktree" git -C "$worktree_path" checkout -- uv.lock 2>/dev/null || true
+          run_command "git worktree" git -C "$worktree_path" clean --force -- uv.lock 2>/dev/null || true
+          log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
+          [[ -n "$uv_out" ]] && log "$uv_out"
+          return 0
+        fi
+        run_command "git worktree" git -C "$worktree_path" add uv.lock
+        files_changed="uv.lock"
       fi
-      run_command "git worktree" git -C "$worktree_path" add pyproject.toml uv.lock
-      files_changed="pyproject.toml + uv.lock"
       ;;
     poetry)
       local poetry_out poetry_exit
@@ -6209,7 +6303,11 @@ batch_update_all() {
   local -r branch="dep-updates/batch-${batch_ts}"
   local any_npm=0 any_py=0
   local py_out py_exit b_constraint_op b_spec actual_py_lines dep_kind dep_package
+  local uv_floor_batch uv_upgrade_success
+  local -a uv_upgrade_specs=()
   local -a cargo_add_args=()
+  local lock_actual_lines seen_py_pkgs pkg_norm lock_bak
+  local pkg old_ver new_ver
 
   dep_updater_ensure_eco_fail_file
 
@@ -6393,8 +6491,9 @@ batch_update_all() {
       any_py=1
     fi
     if [[ -n "$py_lines_arg" && "$security_only" == '0' ]]; then
-      local uv_floor_batch=0 uv_add_success=0
-      local -a uv_add_specs=()
+      uv_floor_batch=0
+      uv_upgrade_success=0
+      uv_upgrade_specs=()
       while IFS=' ' read -r pkg _old new_ver; do
         [[ -z "$pkg" ]] && continue
         log "[python/${py_tool}] Update: ${pkg} → ${new_ver}"
@@ -6409,7 +6508,8 @@ batch_update_all() {
               fi
               uv_floor_batch=1
             else
-              uv_add_specs+=("${pkg}==${new_ver}")
+              # Transitive / unconstrained — upgrade via lock (not uv add).
+              uv_upgrade_specs+=("${pkg} ${new_ver}")
             fi
             ;;
           poetry)
@@ -6443,16 +6543,24 @@ batch_update_all() {
             uv_floor_batch=0
           fi
         fi
-        for b_spec in "${uv_add_specs[@]}"; do
-          py_out="$(dep_runner_uv_dir_capture "uv batch add" "$worktree_path" -- add "$b_spec")" && py_exit=0 || py_exit=$?
+        for b_spec in "${uv_upgrade_specs[@]}"; do
+          read -r pkg new_ver <<<"$b_spec"
+          [[ -z "$pkg" || -z "$new_ver" ]] && continue
+          lock_bak="$(mktemp)"
+          cp "${worktree_path}/uv.lock" "$lock_bak"
+          py_out="$(py_uv_lock_upgrade_package "$worktree_path" "$pkg" "$new_ver" 2>&1)" \
+            && py_exit=0 || py_exit=$?
           if (( py_exit != 0 )); then
-            log "[python/uv] Skipping ${b_spec}: dependency resolution failed."
-            log "$py_out"
+            cp "$lock_bak" "${worktree_path}/uv.lock"
+            rm -f "$lock_bak"
+            log "[python/uv] Skipping ${pkg}==${new_ver}: dependency resolution failed."
+            [[ -n "$py_out" ]] && log "$py_out"
             continue
           fi
-          uv_add_success=1
+          rm -f "$lock_bak"
+          uv_upgrade_success=1
         done
-        if [[ "$uv_floor_batch" == '1' || "$uv_add_success" == '1' ]]; then
+        if [[ "$uv_floor_batch" == '1' || "$uv_upgrade_success" == '1' ]]; then
           any_py=1
         fi
       else
@@ -6472,10 +6580,11 @@ batch_update_all() {
       esac
     fi
 
-    # Compute actual_py_lines by parsing the staged pyproject.toml diff.
-    # py_lines_arg comes from py_outdated and includes transitive packages that are
-    # only updated in uv.lock — not direct constraint changes.  Diffing the staged
-    # file gives the ground truth: only entries whose specifier was actually modified.
+    # Compute actual_py_lines from staged changes only (never fall back to the
+    # planned py_lines_arg — failed/skipped packages must not appear in the
+    # PR body or batch email summary).
+    # 1) Direct constraint edits in pyproject.toml
+    # 2) Transitive lock upgrades whose uv.lock highest version equals the plan
     actual_py_lines=""
     if [[ "$any_py" == '1' ]]; then
       actual_py_lines="$(
@@ -6533,6 +6642,25 @@ batch_update_all() {
           }
         ' 2>/dev/null || true
       )"
+      # Merge lockfile-only landings (transitive upgrade-package path).
+      seen_py_pkgs=""
+      while IFS=' ' read -r pkg _o _n; do
+        [[ -z "$pkg" ]] && continue
+        seen_py_pkgs="${seen_py_pkgs}"$'\n'"$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+      done <<< "${actual_py_lines}"
+      lock_actual_lines="$(py_uv_actual_lines_from_lock "$worktree_path" "$py_lines_arg")"
+      while IFS=' ' read -r pkg old_ver new_ver; do
+        [[ -z "$pkg" ]] && continue
+        pkg_norm="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+        if printf '%s\n' "$seen_py_pkgs" | grep -qxF "$pkg_norm"; then
+          continue
+        fi
+        if [[ -n "$actual_py_lines" ]]; then
+          actual_py_lines="${actual_py_lines}"$'\n'"${pkg} ${old_ver} ${new_ver}"
+        else
+          actual_py_lines="${pkg} ${old_ver} ${new_ver}"
+        fi
+      done <<< "${lock_actual_lines}"
     fi
   fi
 
@@ -6676,11 +6804,11 @@ batch_update_all() {
           printf "| %s | \`%s\` | \`%s\` | \`%s\` | no | - |\n" "npm" "$pkg" "$old_ver" "$new_ver"
         done <<< "$actual_npm_lines"
       fi
-      if [[ -n "${actual_py_lines:-${py_lines_arg}}" ]]; then
+      if [[ -n "$actual_py_lines" ]]; then
         while IFS=' ' read -r pkg old_ver new_ver; do
           [[ -z "$pkg" ]] && continue
           printf "| python/%s | \`%s\` | \`%s\` | \`%s\` | no | - |\n" "$py_tool" "$pkg" "$old_ver" "$new_ver"
-        done <<< "${actual_py_lines:-${py_lines_arg}}"
+        done <<< "$actual_py_lines"
       fi
       if [[ "$any_rust" == '1' && -n "$rust_lines_arg" ]]; then
         while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
@@ -6730,14 +6858,14 @@ batch_update_all() {
         done <<< "$actual_npm_lines"
         printf '\n'
       fi
-      if [[ -n "${actual_py_lines:-${py_lines_arg}}" ]]; then
+      if [[ -n "$actual_py_lines" ]]; then
         printf '## Python updates\n\n'
         printf '| Package | From | To |\n'
         printf '|---|---|---|\n'
         while IFS=' ' read -r pkg old_ver new_ver; do
           [[ -z "$pkg" ]] && continue
           printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$pkg" "$old_ver" "$new_ver"
-        done <<< "${actual_py_lines:-${py_lines_arg}}"
+        done <<< "$actual_py_lines"
       fi
       if [[ "$any_rust" == '1' && -n "$rust_lines_arg" ]]; then
         printf '## Rust updates\n\n'
@@ -6789,7 +6917,7 @@ batch_update_all() {
   while IFS=' ' read -r pkg old_ver new_ver; do
     [[ -z "$pkg" ]] && continue
     add_summary_line "python/${py_tool}" "$pkg" "$old_ver" "$new_ver" "$branch" "$pr_num" "no" "-"
-  done <<< "${actual_py_lines:-${py_lines_arg:-}}"
+  done <<< "${actual_py_lines:-}"
   while IFS=' ' read -r pkg _current fix _cves; do
     [[ -z "$pkg" ]] && continue
     add_summary_line "python/${py_tool}" "$pkg" "$_current" "$fix" "$branch" "$pr_num" "yes" "${_cves:--}"
@@ -6807,7 +6935,7 @@ batch_update_all() {
     done <<< "${gha_lines_arg:-}"
   fi
   if [[ -z "$actual_npm_lines" && -z "$npm_audit_lines_arg" && \
-        -z "${actual_py_lines:-${py_lines_arg:-}}" && -z "$py_audit_lines_arg" && \
+        -z "$actual_py_lines" && -z "$py_audit_lines_arg" && \
         "$any_rust" == '0' && "$any_gha" == '0' ]]; then
     add_summary_line "batch" "$branch" "-" "-" "$branch" "$pr_num" "no" "-"
   fi
