@@ -1950,13 +1950,191 @@ else
   fail=$(( fail + 1 ))
 fi
 
-# batch_update_all must use staged pyproject.toml diff to determine actual changes
-# (not py_lines_arg directly) so transitive-only packages are excluded from the PR body
-if grep -q 'diff --cached -- pyproject.toml' "$script"; then
-  printf '[PASS] batch_update_all: uses staged diff to build actual Python update list\n'
+# batch_update_all must use staged pyproject.toml + uv.lock ground truth for
+# actual_py_lines (never fall back to planned py_lines_arg for uv — that
+# re-reported failed/skipped packages such as autobahn in my-tracks#1262).
+# Non-uv tools may still use planned lines via report_py_lines when apply succeeded.
+if grep -q 'diff --cached -- pyproject.toml' "$script" \
+  && grep -qF 'py_uv_actual_lines_from_lock' "$script" \
+  && grep -qF 'report_py_lines' "$script" \
+  && ! grep -qE 'actual_py_lines:-\$\{py_lines_arg' "$script"; then
+  printf '[PASS] batch_update_all: actual_py_lines from staged diff/lock; report_py_lines gates non-uv fallback\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] batch_update_all: staged diff for actual_py_lines not found\n'
+  printf '[FAIL] batch_update_all: must not fall back to py_lines_arg for uv PR/summary reporting\n'
+  fail=$(( fail + 1 ))
+fi
+
+# Extras on constraint lines must strip so cryptography[ssh] reports as cryptography.
+# shellcheck disable=SC2016  # assert literal awk regex spelling in source
+if grep -qF 'gsub(/\[[^]]*\]/, "", line)' "$script" \
+  && ! grep -qF 'gsub(/\\[[^]]*\\]/, "", line)' "$script"; then
+  printf '[PASS] actual_py_lines awk: extras gsub matches TOML [extra] (single backslash)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] actual_py_lines awk: extras gsub must use /\\[[^]]*\\]/ (not doubled backslashes)\n'
+  fail=$(( fail + 1 ))
+fi
+extras_awk_out="$(
+  printf '%s\n' \
+    '- "cryptography[ssh]>=42.0.0"' \
+    '+ "cryptography[ssh]>=43.0.0"' \
+    '__LISTED__' \
+    'cryptography 42.0.0 43.0.0' | awk '
+      /^__LISTED__$/ { in_listed = 1; next }
+      in_listed {
+        split($0, f, " ")
+        if (f[1] == "") next
+        p = tolower(f[1])
+        fallback_old[p] = f[2]
+        fallback_name[p] = f[1]
+        next
+      }
+      /^---/ || /^[+][+][+]/ { next }
+      {
+        sign = substr($0, 1, 1)
+        if (sign != "+" && sign != "-") next
+        line = substr($0, 2)
+        gsub(/^[[:space:]"]+/, "", line)
+        gsub(/\[[^]]*\]/, "", line)
+        op = ""
+        i = index(line, ">=")
+        if (i > 0) { op = ">="; pkg = substr(line, 1, i-1); ver = substr(line, i+2) }
+        if (op == "") next
+        gsub(/[[:space:]]/, "", pkg)
+        if (pkg !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/) next
+        gsub(/[",:[:space:]].*/, "", ver)
+        if (pkg == "" || ver == "") next
+        pk = tolower(pkg)
+        if (sign == "-") { d_old[pk] = ver; d_old_name[pk] = pkg }
+        else              { d_new[pk] = ver; d_new_name[pk] = pkg }
+      }
+      END {
+        for (pk in d_new) {
+          nv = d_new[pk]
+          if (pk in d_old) {
+            if (d_old[pk] == nv) continue
+            ov = d_old[pk]
+            nm = d_old_name[pk]
+          } else if (pk in fallback_old) {
+            ov = fallback_old[pk]
+            nm = fallback_name[pk]
+          } else { continue }
+          print nm " " ov " " nv
+        }
+      }
+    '
+)"
+if [[ "$extras_awk_out" == 'cryptography 42.0.0 43.0.0' ]]; then
+  printf '[PASS] actual_py_lines awk: reports extras-constrained floor bumps\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] actual_py_lines awk: extras bump expected cryptography row, got: %s\n' "$extras_awk_out"
+  fail=$(( fail + 1 ))
+fi
+
+# Transitive uv bumps must use lock --upgrade-package (marker-aware), not uv add.
+# Age-gate the target only (--exclude-newer-package); never global --exclude-newer
+# (that breaks same-run CVE pins newer than the cutoff).
+upgrade_fn="$(awk '/^py_uv_lock_upgrade_package\(\)/,/^}$/' "$script")"
+exclude_fn="$(awk '/^py_uv_exclude_newer_cutoff_iso\(\)/,/^}$/' "$script")"
+# shellcheck disable=SC2016 # assert literal --exclude-newer flag shapes in source
+if grep -qF 'py_uv_lock_upgrade_package' "$script" \
+  && grep -qF -- '--upgrade-package' <<<"$upgrade_fn" \
+  && grep -qF -- '--exclude-newer-package' <<<"$upgrade_fn" \
+  && ! grep -qF -- '--exclude-newer "$cutoff"' <<<"$upgrade_fn" \
+  && grep -qF 'time_log_now_utc_epoch' <<<"$exclude_fn" \
+  && grep -qF 'time_log_epoch_to_iso8601_utc' <<<"$exclude_fn" \
+  && ! grep -qE 'date -u -d|date \+%s' <<<"$exclude_fn"; then
+  printf '[PASS] uv transitive apply: upgrade-package + per-package exclude-newer via time_log\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv transitive apply: expected upgrade-package, --exclude-newer-package only, time_log cutoff\n'
+  fail=$(( fail + 1 ))
+fi
+
+# Missing HEAD uv.lock must not drop staged lock landings from reports.
+printf '\n=== behavioural: lock report with missing HEAD uv.lock ===\n'
+lock_report_tmp="$(mktemp -d)"
+(
+  cd "$lock_report_tmp"
+  git init --quiet
+  git config user.email 'test@example.com'
+  git config user.name 'test'
+  git commit --allow-empty --quiet -m 'init'
+  cat >uv.lock <<'EOF'
+version = 1
+
+[[package]]
+name = "autobahn"
+version = "26.7.1"
+EOF
+  git add uv.lock
+)
+lock_report_out="$(
+  # shellcheck disable=SC1090  # extracted helpers from script under test
+  source <(
+    awk '/^py_uv_lock_highest_version\(\)/,/^}$/' "$script"
+    awk '/^py_uv_actual_lines_from_lock\(\)/,/^}$/' "$script"
+  )
+  py_uv_actual_lines_from_lock "$lock_report_tmp" $'autobahn 25.12.2 26.7.1'
+)"
+rm -rf "$lock_report_tmp"
+if [[ "$lock_report_out" == 'autobahn 25.12.2 26.7.1' ]]; then
+  printf '[PASS] lock report: missing HEAD uv.lock still reports staged landing\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] lock report: expected staged landing line, got: %s\n' "$lock_report_out"
+  fail=$(( fail + 1 ))
+fi
+
+# Batch floor lock failure must snapshot/restore uv.lock — never git clean it away.
+printf '\n=== behavioural: floor lock failure restores snapshotted uv.lock ===\n'
+floor_restore_tmp="$(mktemp -d)"
+(
+  cd "$floor_restore_tmp"
+  git init --quiet
+  git config user.email 'test@example.com'
+  git config user.name 'test'
+  printf 'name = "demo"\nversion = "0.1.0"\n' >pyproject.toml
+  printf 'ORIGINAL_LOCK\n' >uv.lock
+  git add pyproject.toml
+  git commit --quiet -m 'init'
+)
+floor_bak="$(mktemp)"
+cp "${floor_restore_tmp}/uv.lock" "$floor_bak"
+printf 'CORRUPTED_BY_FAILED_LOCK\n' >"${floor_restore_tmp}/uv.lock"
+printf 'name = "demo"\nversion = "0.2.0"\n' >"${floor_restore_tmp}/pyproject.toml"
+(
+  # Stub run_command for the extracted helper (shellcheck cannot see indirect calls).
+  # shellcheck disable=SC2317,SC2329
+  run_command() { shift; "$@" || true; }
+  # shellcheck disable=SC1090  # extracted helper from script under test
+  source <(awk '/^py_uv_restore_after_failed_floor_lock\(\)/,/^}$/' "$script")
+  py_uv_restore_after_failed_floor_lock "$floor_restore_tmp" "$floor_bak"
+)
+if [[ "$(cat "${floor_restore_tmp}/uv.lock")" == 'ORIGINAL_LOCK' ]] \
+  && [[ "$(cat "${floor_restore_tmp}/pyproject.toml")" == $'name = "demo"\nversion = "0.1.0"' ]] \
+  && [[ ! -f "$floor_bak" ]] \
+  && grep -qF 'py_uv_restore_after_failed_floor_lock' "$script" \
+  && ! grep -qE 'clean --force -- uv\.lock' "$script"; then
+  printf '[PASS] uv-batch-floor: restore helper returns snapshotted uv.lock (no git clean)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv-batch-floor: restore helper did not restore lock/pyproject or git clean remains\n'
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$floor_restore_tmp"
+
+# batch path must call py_uv_lock_upgrade_package (not only py_update_one) and must
+# not uv add unconstrained packages (forces universal pins).
+batch_update_fn="$(awk '/^batch_update_all\(\)/,/^}$/' "$script")"
+if grep -qF 'py_uv_lock_upgrade_package' <<<"$batch_update_fn" \
+  && ! grep -qE 'uv batch add|uv_add_specs' <<<"$batch_update_fn"; then
+  printf '[PASS] uv-batch-apply: batch_update_all uses upgrade-package (not uv add)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv-batch-apply: batch_update_all must call py_uv_lock_upgrade_package and not uv add\n'
   fail=$(( fail + 1 ))
 fi
 
