@@ -13,7 +13,7 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | Dependencies | `scripts/dep-updater` | Create stacked dependency-update PRs (npm, Python, Rust, Actions). |
 | Batch automation | `scripts/dep-updater-batch-run` | Daily `--batch --all` across a scan root; email report. |
 | Repo practices | `scripts/github-repo-lint` | Audit/onboard org repos (merge queue, `protect-main`, workflows). |
-| Merge settings | `scripts/check-merge-settings` | Thin wrapper (merge + Graphite only). |
+| Merge settings | `scripts/check-merge-settings` | Thin wrapper (merge + GitHub MQ only). |
 | Lockfile drift | `scripts/check-lockfile-drift` | Compare lockfiles to registry constraints. |
 | pnpm cutover | `scripts/grandfather-pnpm-release-age` | One-time `minimumReleaseAgeExclude` for existing lockfiles. |
 | Systemd | `scripts/setup-service`, `scripts/setup-github-repo-lint`, `scripts/show-services` | Install timers/units; status summary. |
@@ -90,7 +90,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 
 ## dep-updater Behavioral Invariants
 
-- **Stacking backend follows `.github/stacking-tool`.** Consumer repos declare `graphite` or `gh-stack` in `.github/stacking-tool`. dep-updater uses `gt track` / `gt submit` for Graphite and `gh stack submit` for gh-stack. Merge enqueue uses Graphite MQ labels (`merge-it`, plus `merge-mq` when that label exists on the repo) or `gh pr merge --auto --squash` for gh-stack / GitHub merge queue repos.
+- **Stacking backend follows `.github/stacking-tool`.** Consumer repos declare `graphite` or `gh-stack` in `.github/stacking-tool`. dep-updater uses `gt track` / `gt submit` for Graphite and `gh stack submit` for gh-stack. Merge enqueue uses `gh pr merge --auto --squash` (GitHub native merge queue — org default). Leftover `merge-it` / `merge-mq` labels are ignored and must not select Graphite MQ enqueue.
 - **Never introduce `==` pins (Python).** dep-updater always writes `>=` floor constraints when bumping a Python dependency. It must never lock a package to an exact version.
 - **Respect existing pins for pip / pipenv / poetry.** For these ecosystems, `==` signals a deliberate user decision to lock a specific version. dep-updater skips those packages entirely (`py_is_pinned`).
 - **uv `==` pins are not treated as intentional freezes.** dep-updater updates them and promotes the constraint to `>=` on bump. The transitive constraint check (`uv pip install --dry-run`) still gates upgrades that would violate real transitive constraints.
@@ -117,7 +117,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 
 ## Repository practices (new and existing repos)
 
-Run **`scripts/github-repo-lint`** to audit or onboard a GitHub repository against org conventions (merge settings, Graphite merge queue, branch cleanup, Dependabot auto-merge, and dependency release-age policy: Dependabot `cooldown` and pnpm `minimumReleaseAge` per `scripts/lib/release-age-defaults`).
+Run **`scripts/github-repo-lint`** to audit or onboard a GitHub repository against org conventions (merge settings, GitHub native merge queue, branch cleanup, Dependabot auto-merge, and dependency release-age policy: Dependabot `cooldown` and pnpm `minimumReleaseAge` per `scripts/lib/release-age-defaults`).
 
 ```bash
 scripts/github-repo-lint --new-repo --repo OWNER/NAME       # checklist + SUGGEST hints
@@ -126,7 +126,7 @@ scripts/github-repo-lint --all --org the-hcma               # every repo in the 
 scripts/github-repo-lint --apply-fix --repo OWNER/NAME      # patch settings + candidate workflow PRs
 ```
 
-**`scripts/check-merge-settings`** is a thin wrapper (merge + Graphite only). Prefer **`github-repo-lint`** for full coverage including branch cleanup workflows.
+**`scripts/check-merge-settings`** is a thin wrapper (merge + GitHub MQ only). Prefer **`github-repo-lint`** for full coverage including branch cleanup workflows.
 
 ### `github-repo-lint` checks
 
@@ -137,9 +137,9 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Check | Full audit | Merge-only | What it validates |
 | --- | --- | --- | --- |
 | Release Please squash settings | yes | yes | Repos with `release-please.yml` use squash-only merges on `main` |
-| `protect-main` ruleset | yes | yes | Squash-only + Graphite App bypass or GitHub `merge_queue` on `refs/heads/main` when `merge-it`, GitHub MQ, or Release Please |
-| Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts, push via Graphite only (org standard) |
-| Graphite merge queue wiring | yes | yes | `merge-it` label (strict repos), `merge-mq` when present, `merged-pr-closer.yml`, `ci.yml` `gtmq_merge_*` skip, dependabot auto-merge when `dependabot.yml` exists |
+| `protect-main` ruleset | yes | yes | Squash-only + GitHub `merge_queue` (`SQUASH`) on `refs/heads/main` when GitHub MQ, Release Please, or strict onboarding |
+| Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts; no Graphite-only push restrictions (GitHub MQ profile) |
+| GitHub merge queue wiring | yes | yes | `protect-main` `merge_queue`, `ci.yml` `merge_group`, dependabot auto-merge via `gh pr merge --auto` when `dependabot.yml` exists |
 | Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |
 | Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
 | License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
@@ -157,49 +157,48 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 
 `--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via the stacking backend selected by `.github/stacking-tool` (`graphite` or `gh-stack`; org default `graphite` when the marker is missing) in the target repo clone.
 
-See [`.cursor/skills/graphite/SKILL.md`](.cursor/skills/graphite/SKILL.md) for Graphite stacked PRs when `.github/stacking-tool` is `graphite`, and the **`merge-it`** label. This repo trials **`gh-stack`** — see [`.cursor/skills/gh-stack/SKILL.md`](.cursor/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc).
+See [`.cursor/skills/graphite/SKILL.md`](.cursor/skills/graphite/SKILL.md) for Graphite **stacking** (`gt`) when `.github/stacking-tool` is `graphite`. This repo trials **`gh-stack`** — see [`.cursor/skills/gh-stack/SKILL.md`](.cursor/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc). Stacking is separate from merge enqueue (GitHub MQ).
 
 ### `protect-main` ruleset (required)
 
-Any repo with **`merge-it`** (Graphite merge queue), **GitHub merge queue** (`merge_queue` rule), or **`release-please.yml`** must use the ruleset **`protect-main`** on `refs/heads/main`. Classic branch protection alone is **not** sufficient — the checker requires the ruleset.
+Any repo with **GitHub merge queue** (`merge_queue` rule), **`release-please.yml`**, or **strict onboarding** must use the ruleset **`protect-main`** on `refs/heads/main`. Classic branch protection alone is **not** sufficient — the checker requires the ruleset. Org default enqueue is GitHub native merge queue (not Graphite MQ).
 
 | Ruleset rule | Purpose |
 | --- | --- |
 | `deletion` | Block branch deletion |
 | `non_fast_forward` | Block force-push |
-| `pull_request` with `allowed_merge_methods: ["squash"]` | Squash-only merges (Release Please + merge queues) |
-| `bypass_actors`: Graphite App (`actor_id` **158384**, Integration, `always`) | Graphite MQ can land on `main` (Graphite MQ repos) |
-| `merge_queue` with `merge_method: SQUASH` | Native GitHub merge queue (this repo) |
+| `pull_request` with `allowed_merge_methods: ["squash"]` | Squash-only merges (Release Please + merge queue) |
+| `merge_queue` with `merge_method: SQUASH` | Native GitHub merge queue (org default) |
 
-Classic branch protection on **`main`** is also required (org standard). It complements the ruleset — reviews, CI, and push restrictions — while **`protect-main`** enforces squash-only merges and either Graphite bypass or GitHub `merge_queue`.
+Graphite App bypass (`actor_id` **158384**) is **not** required for the org GitHub MQ profile. Leftover Graphite Integration bypass actors may be removed via `--apply-fix`.
 
-| Classic setting | Graphite MQ repos | GitHub MQ (this repo) |
-| --- | --- | --- |
-| Required reviews | CODEOWNERS, dismiss stale; **0** approvals | same |
-| Bypass (reviews) | **graphite-app**; **dependabot** when present; org owner | org owner (+ dependabot when present) |
-| Push restrictions | **graphite-app** only | **none** (GitHub MQ lands merges) |
-| Required status checks | All `ci.yml` job contexts except `guard`, `changed-files`, `secret-scan`, `workflow-lint` | same |
-| Strict | `true` | same |
-| Force-push / delete | disabled | same |
-| `enforce_admins` | `false` (warn if enabled) | same |
+Classic branch protection on **`main`** is also required (org standard). It complements the ruleset — reviews and CI — while **`protect-main`** enforces squash-only merges and GitHub `merge_queue`.
+
+| Classic setting | GitHub MQ (org default) |
+| --- | --- |
+| Required reviews | CODEOWNERS, dismiss stale; **0** approvals |
+| Bypass (reviews) | org owner (+ dependabot when present) |
+| Push restrictions | **none** (GitHub MQ lands merges) |
+| Required status checks | All `ci.yml` job contexts except `guard`, `changed-files`, `secret-scan`, `workflow-lint` |
+| Strict | `true` |
+| Force-push / delete | disabled |
+| `enforce_admins` | `false` (warn if enabled) |
 
 Create or repair ruleset + classic settings with
 `scripts/github-repo-lint --repo OWNER/NAME --apply-fix`. Run it from the target
-repository clone when you want candidate workflow fixes emitted as a Graphite stack
+repository clone when you want candidate workflow fixes emitted as a stack
 under `.worktrees/repo-practices-candidate-fixes-wt`.
 
-**`merge-mq`** is not the default enqueue label. Use it only when Graphite MQ for that repo is wired to **`merge-mq`**; otherwise use **`merge-it`** only.
+### Org default: GitHub merge queue
 
-### This repo: GitHub merge queue
-
-**`repository-helpers`** uses **GitHub’s native merge queue** (not Graphite MQ):
+**Org default** is **GitHub’s native merge queue** (not Graphite MQ):
 
 - `protect-main` includes a `merge_queue` rule (`SQUASH`)
-- `ci.yml` triggers on `merge_group` (and ignores `gh-readonly-queue/**` pushes)
+- `ci.yml` triggers on `merge_group` (and ignores `gh-readonly-queue/**` pushes when needed)
 - Merge with **Enable auto-merge** / **Merge when ready** (or `gh pr merge --auto --squash`)
-- Do **not** use the `merge-it` label here — that enqueues Graphite MQ on other org repos
+- Do **not** use the `merge-it` label to land PRs — leftover labels are harmless noise and are ignored by dep-updater
 
-Disable this repo in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue) so Graphite does not also try to land PRs.
+Disable org repos in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue) so Graphite does not also try to land PRs. Graphite **stacking** (`gt`, `.github/stacking-tool`) remains supported and is unrelated to merge enqueue.
 
 ### Branch hygiene
 
@@ -277,9 +276,9 @@ Nested app (`packageManager` under `web/`):
 See [`actions/setup-pnpm-corepack/README.md`](actions/setup-pnpm-corepack/README.md) for
 inputs, caching, and consumer checklist.
 
-### Merge settings and Graphite merge queue
+### Merge settings and GitHub merge queue
 
-With no `--repo`, the script audits the **current git repository** when run inside a clone (from `origin`). Outside a clone, discovery includes repositories that have `release-please.yml` or a **`merge-it`** label (use `--all` to scan every org repo).
+With no `--repo`, the script audits the **current git repository** when run inside a clone (from `origin`). Outside a clone, discovery includes repositories that have `release-please.yml`, GitHub `merge_queue`, or a leftover **`merge-it`** label (use `--all` to scan every org repo).
 
 ```bash
 scripts/check-merge-settings                      # current repo in a clone; else discover
@@ -300,22 +299,20 @@ Repositories with `/.github/workflows/release-please.yml` must use **squash merg
 | Squash commit title | `PR_TITLE` |
 | Ruleset `protect-main` | `allowed_merge_methods`: `["squash"]` only |
 
-### Graphite merge queue
+### GitHub merge queue
 
-The script verifies GitHub-side wiring (not Graphite app UI settings) when a **`merge-it`** label exists **and** the repo is not on GitHub’s native merge queue (`protect-main` `merge_queue` rule). When GitHub MQ is enabled, the checker validates `ci.yml` `merge_group` instead.
+Org default is GitHub’s native merge queue. The checker validates `protect-main` `merge_queue` (`SQUASH`), `ci.yml` `merge_group`, and Dependabot auto-merge via `gh pr merge --auto` when `dependabot.yml` exists.
 
-| Check | Other audited repos | This repo (`repository-helpers`) |
-| --- | --- | --- |
-| Label `merge-it` | required | not used (GitHub MQ) |
-| Label `merge-mq` | required only when that label exists on the repo (MQ wired to `merge-mq`) | — |
-| `merged-pr-closer.yml` detects `graphite-app` / merge queue | required | warn if missing |
-| `ci.yml` skips `gtmq_merge_*` | required | n/a (GitHub MQ) |
-| `ci.yml` `merge_group` trigger | required when GitHub MQ | required |
-| `dependabot-auto-merge.yml` with `merge-it` when `dependabot.yml` exists | required | warn |
-| `protect-main` bypass for Graphite App (`actor_id` **158384**) | required when Graphite MQ | n/a (use `merge_queue`) |
-| Classic `main` protection (org standard) | required when `merge-it` or Release Please | required (no Graphite-only push restrictions) |
+| Check | Org repos (GitHub MQ) |
+| --- | --- |
+| `protect-main` `merge_queue` (`SQUASH`) | required |
+| Graphite App bypass on `protect-main` | not required (remove leftover bypass via `--apply-fix`) |
+| `ci.yml` `merge_group` trigger | required |
+| `dependabot-auto-merge.yml` with `gh pr merge --auto` when `dependabot.yml` exists | required (strict / onboarding) |
+| Classic `main` protection (org standard) | required (no Graphite-only push restrictions) |
+| Label `merge-it` / `merge-mq` | leftover only — harmless; do not use to land PRs |
 
-**Manual (Graphite MQ repos, not checked via `gh`):** enable the repo in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue), set merge strategy to **squash**, and wire enqueue labels (`merge-it`, or `merge-mq` when that repo uses it).
+**Manual:** disable org repos in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue) so Graphite does not also try to land PRs. Keep using Graphite (or `gh-stack`) for **stacking** only — selected by `.github/stacking-tool`.
 
 ---
 
@@ -449,7 +446,7 @@ Service repositories install via `scripts/setup-service` and optionally implemen
   - Also verifies the **primary worktree** is unchanged when checks finish.
 - Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).
 - PRs must be **published (not draft)** so reviewers see them normally. Prefer `scripts/dev/submit-stack` for non-interactive submit (implies `--publish`).
-- To merge a PR in **this** repo: enable auto-merge / Merge when ready so GitHub’s merge queue lands it (`gh pr merge --auto --squash`). Do **not** use `merge-it` here. **Other org repos** still use `gh pr edit <number> --add-label merge-it` for Graphite MQ. **Exception:** `dep-updater` batch runs (`--batch`, including daily `--batch --all`) may use `gh pr merge --auto --squash` after CI passes (`--merge-via gh`, the batch default); `--auto` lets GitHub wait for required checks / the merge queue.
+- To merge a PR in **any org repo**: enable auto-merge / Merge when ready so GitHub’s merge queue lands it (`gh pr merge --auto --squash`). Do **not** use `merge-it` to enqueue. `dep-updater` batch runs (`--batch`, including daily `--batch --all`) use the same path after CI passes (`--merge-via gh` / `merge-queue` both mean `--auto --squash`; leftover `merge-it` is ignored).
 - Follow **Conventional Commits**: `feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`.
 - Each commit must pass all CI checks (see below) before being pushed.
 - Never merge a PR until **all checks have run and are green** (no skipped required checks).

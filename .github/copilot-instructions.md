@@ -32,7 +32,8 @@ the primary clone (`main` worktree).
 - Never push directly to `main`. Create a stack layer per `.github/stacking-tool`
   (`gt create` when `graphite`, `gh stack init` / `gh stack add` when `gh-stack`),
   then `scripts/dev/submit-stack`.
-- To merge a PR: `gh pr edit <number> --add-label merge-it`. Never `gh pr merge`.
+- To merge a PR: `gh pr merge --auto --squash` (Enable auto-merge / GitHub merge
+  queue — org default). Do not use `merge-it` to land PRs.
 
 ## Submit and ship
 

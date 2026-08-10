@@ -120,7 +120,7 @@ The services have different responsibilities:
   reports summarize what changed, what failed, and whether the run timed out.
 - **GitHub Repo Lint** is report-only. It monitors repository settings and
   workflow compliance, then tells you when to run `github-repo-lint --apply-fix` or
-  complete manual Graphite app steps.
+  disable Graphite’s merge-queue UI for org repos (GitHub MQ is the org default).
 
 ## Dependency Updater
 
@@ -130,9 +130,9 @@ of this checkout: `dep-updater` processes each immediate child directory that
 contains a `.git` folder.
 
 Batch runs default to **`--merge-via gh`**: after CI passes, each batch PR is
-squash-merged with `gh pr merge --auto` (not the Graphite merge queue). Set
-`DEP_UPDATER_MERGE_VIA=merge-queue` in `~/.config/dep-updater.env` to roll back to
-the merge-queue path.
+enqueued on GitHub’s merge queue with `gh pr merge --auto --squash`.
+`DEP_UPDATER_MERGE_VIA=merge-queue` is an alias for the same enqueue path
+(leftover `merge-it` labels are ignored).
 
 Before each run, `scripts/dep-updater-batch-run` runs `git fetch --prune origin` on
 this checkout and on each repository under the scan root so batch updates use the
@@ -314,12 +314,13 @@ scripts/github-repo-lint --repo OWNER/NAME --apply-fix
 ```
 
 `--apply-fix` can repair supported Release Please squash settings, `protect-main`
-ruleset settings, and classic `main` branch protection. When run from the target
-repository clone, it also prepares candidate workflow fixes in
-`.worktrees/repo-practices-candidate-fixes-wt` and submits a Graphite stack for
-review. Candidate workflow templates live under `scripts/lib/repo-practices-workflows/`
-so they can be reviewed and linted directly. Graphite app merge queue configuration
-remains manual and is reported as a manual step in the output.
+ruleset settings (squash-only + GitHub `merge_queue`), and classic `main` branch
+protection. When run from the target repository clone, it also prepares candidate
+workflow fixes in `.worktrees/repo-practices-candidate-fixes-wt` and submits a
+stack for review. Candidate workflow templates live under
+`scripts/lib/repo-practices-workflows/` so they can be reviewed and linted
+directly. Disable org repos in Graphite’s merge-queue UI so Graphite does not
+also try to land PRs.
 
 ### Status, logs, and trial runs
 
