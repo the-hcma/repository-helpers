@@ -144,6 +144,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
 | License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
 | Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` + `.cursor/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve |
+| Session-start read guidance | yes | — | `.cursor/rules/read-agents-and-rules.mdc` requires reading `AGENTS.md` and `.cursor/rules/` at the start of every new agent session |
 | Stacking-tool marker + rule | yes | — | `.github/stacking-tool` (`graphite`\|`gh-stack`) and thin `.cursor/rules/stacking-tool.mdc` (skill breadcrumbs; no copied skill bodies) |
 | UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
 | UV + Release Please lock sync | yes | — | uv + `release-please.yml` repos require `release-please-config` `extra-files` bumping `uv.lock` via `@.name.value` jsonpath ([release-please#2561](https://github.com/googleapis/release-please/issues/2561)) |
