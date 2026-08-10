@@ -125,8 +125,6 @@ log_reset=""
 repo_owner=""
 repo_name=""
 dep_stacking_tool=""
-_dep_repo_label_names=""
-_dep_repo_label_names_fetched=0
 
 pnpm_ignored_build_pkgs=""
 
@@ -451,33 +449,6 @@ dep_stacking_is_graphite() {
 
 dep_stacking_is_gh_stack() {
   [[ "$dep_stacking_tool" == "$stacking_tool_value_gh_stack" ]]
-}
-
-dep_fetch_repo_label_names() {
-  local labels_out labels_exit=0
-
-  if [[ "$_dep_repo_label_names_fetched" == '1' ]]; then
-    return 0
-  fi
-
-  labels_out="$(dep_runner_gh_stdout "dep-updater repo labels" -- api \
-    "repos/${repo_owner}/${repo_name}/labels" --paginate --jq '.[].name' 2>/dev/null)" \
-    || labels_exit=$?
-  if (( labels_exit != 0 )); then
-    die "Could not list labels for ${repo_owner}/${repo_name} (needed to decide merge-mq / merge-it enqueue)."
-  fi
-  _dep_repo_label_names="$labels_out"
-  _dep_repo_label_names_fetched=1
-}
-
-dep_repo_has_label() {
-  local -r label="$1"
-  dep_fetch_repo_label_names
-  grep -qxF "$label" <<<"$_dep_repo_label_names"
-}
-
-dep_uses_graphite_merge_queue_labels() {
-  dep_repo_has_label 'merge-it'
 }
 
 # Rebuild local gh-stack tracking for prior state branches + the current branch
@@ -878,28 +849,14 @@ dep_enqueue_pr_for_merge_queue() {
   local -r pr_number="$1"
   local merge_out merge_exit=0
 
-  if dep_stacking_is_gh_stack || ! dep_uses_graphite_merge_queue_labels; then
-    merge_out="$(dep_runner_gh_stdout "dep-updater gh pr merge auto" -- pr merge "$pr_number" \
-      --repo "${repo_owner}/${repo_name}" \
-      --auto --squash 2>&1)" || merge_exit=$?
-    if (( merge_exit != 0 )); then
-      die "Could not enable auto-merge on PR #${pr_number}: ${merge_out}"
-    fi
-    if [[ -n "$merge_out" ]]; then
-      log "$merge_out"
-    fi
-    return 0
+  merge_out="$(dep_runner_gh_stdout "dep-updater gh pr merge auto" -- pr merge "$pr_number" \
+    --repo "${repo_owner}/${repo_name}" \
+    --auto --squash 2>&1)" || merge_exit=$?
+  if (( merge_exit != 0 )); then
+    die "Could not enable auto-merge on PR #${pr_number}: ${merge_out}"
   fi
-
-  dep_runner_gh "gh api merge-it label" -- api "repos/${repo_owner}/${repo_name}/issues/${pr_number}/labels" \
-    --method POST \
-    -f labels[]=merge-it >/dev/null \
-    || die "Could not add merge-it label to PR #${pr_number}"
-  if dep_repo_has_label 'merge-mq'; then
-    dep_runner_gh "gh api merge-mq label" -- api "repos/${repo_owner}/${repo_name}/issues/${pr_number}/labels" \
-      --method POST \
-      -f labels[]=merge-mq >/dev/null \
-      || die "Could not add merge-mq label to PR #${pr_number} (repo has merge-mq label)"
+  if [[ -n "$merge_out" ]]; then
+    log "$merge_out"
   fi
 }
 
@@ -908,26 +865,9 @@ pr_has_merge_enqueue_pending() {
   local -r pr_number="$1"
   local raw
 
-  if dep_stacking_is_gh_stack || ! dep_uses_graphite_merge_queue_labels; then
-    raw="$(dep_runner_gh_stdout "dep-updater gh pr autoMergeRequest" -- pr view "$pr_number" \
-      --repo "${repo_owner}/${repo_name}" \
-      --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null || true)"
-    case "$raw" in
-      true|false) printf '%s' "$raw" ;;
-      *) printf 'unknown' ;;
-    esac
-    return 0
-  fi
-
-  pr_has_merge_it_label "$pr_number"
-}
-
-# Prints exactly one of: true, false, unknown (never guess on API failure).
-pr_has_merge_it_label() {
-  local -r pr_number="$1"
-  local raw
-  raw="$(dep_runner_gh_stdout "gh api" -- api "repos/${repo_owner}/${repo_name}/issues/${pr_number}" \
-    --jq 'any(.labels[]?; .name == "merge-it")' 2>/dev/null || true)"
+  raw="$(dep_runner_gh_stdout "dep-updater gh pr autoMergeRequest" -- pr view "$pr_number" \
+    --repo "${repo_owner}/${repo_name}" \
+    --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null || true)"
   case "$raw" in
     true|false) printf '%s' "$raw" ;;
     *) printf 'unknown' ;;
@@ -966,8 +906,9 @@ Options:
                     Override via DEP_UPDATER_INCLUDE_PRIVATE=1.
   --merge-timeout <min>  Minutes to wait for all PRs to merge (default: 15)
   --merge-via <mode>  How to land PRs after CI passes: gh | merge-queue
-                    (default: gh for --batch, merge-queue otherwise; override via
-                    DEP_UPDATER_MERGE_VIA)
+                    (default: gh — GitHub MQ via --auto --squash; override via
+                    DEP_UPDATER_MERGE_VIA). merge-queue is an alias for the same
+                    enqueue helper (also --auto --squash; leftover merge-it is ignored).
   --no-wait-ci      Skip CI polling between PRs
   --no-wait-merge   Exit after stack is submitted; print cleanup command
   --quiet           Suppress non-error log lines
@@ -1165,11 +1106,9 @@ parse_args() {
     merge_via="${DEP_UPDATER_MERGE_VIA}"
   fi
   if [[ -z "$merge_via" ]]; then
-    if [[ "$batch" == '1' ]]; then
-      merge_via='gh'
-    else
-      merge_via='merge-queue'
-    fi
+    # Org default is GitHub MQ via gh --auto (issue #466); both batch and
+    # interactive runs use the same enqueue path.
+    merge_via='gh'
   fi
   case "$merge_via" in
     gh|merge-queue) ;;
@@ -7561,10 +7500,8 @@ maybe_label_top_pr_for_merge() {
   dep_enqueue_pr_for_merge_queue "$top_pr"
   if [[ "$_merge_it_poll_pr" == "$top_pr" && "$_merge_it_poll_had_label" == 'true' ]]; then
     log "Re-applying merge enqueue on top PR #${top_pr} (was present last poll, now absent)."
-  elif dep_stacking_is_gh_stack || ! dep_uses_graphite_merge_queue_labels; then
-    log "Enabled auto-merge on top PR #${top_pr}."
   else
-    log "Added merge-it label to top PR #${top_pr}."
+    log "Enabled auto-merge on top PR #${top_pr}."
   fi
 }
 
@@ -7885,37 +7822,19 @@ merge_pr_via_gh_single() {
   # required (error: cannot use -d / delete-branch when merge queue enabled).
   # Head-branch cleanup is handled by the repo delete_branch_on_merge setting /
   # cleanup workflows. Keep in sync with dep_enqueue_pr_for_merge_queue
-  # (--auto --squash only).
-  #
-  # Graphite MQ repos (merge-it label, allow_auto_merge often false): enqueue via
-  # labels instead of gh --auto (issue #430 / tsp-maximizer#128).
-  if dep_uses_graphite_merge_queue_labels && ! dep_stacking_is_gh_stack; then
-    log "Repo uses Graphite merge queue; enqueuing PR #${pr_num} via merge-it (not gh --auto)…"
-    dep_enqueue_pr_for_merge_queue "$pr_num"
-  else
-    log "Enabling auto-merge for PR #${pr_num} via gh (squash)…"
-    merge_out=""
-    merge_exit=0
-    merge_out="$(dep_runner_gh_stdout "gh pr" -- pr merge "$pr_num" \
-      --repo "${repo_owner}/${repo_name}" \
-      --auto --squash 2>&1)" || merge_exit=$?
-    if (( merge_exit != 0 )); then
-      if printf '%s' "$merge_out" \
-        | grep -qiE 'enablePullRequestAutoMerge|Auto merge is not allowed'; then
-        if dep_repo_has_label 'merge-it'; then
-          log "gh --auto unavailable; falling back to merge-it labels for PR #${pr_num}…"
-          dep_enqueue_pr_for_merge_queue "$pr_num"
-        else
-          record_first_failure "gh merge failed: pr=#${pr_num}: ${merge_out}"
-          die "gh merge failed: pr=#${pr_num}: ${merge_out}"
-        fi
-      else
-        record_first_failure "gh merge failed: pr=#${pr_num}: ${merge_out}"
-        die "gh merge failed: pr=#${pr_num}: ${merge_out}"
-      fi
-    elif [[ -n "$merge_out" ]]; then
-      log "$merge_out"
-    fi
+  # (--auto --squash only). Org default is GitHub MQ (issue #466) — never
+  # enqueue via leftover merge-it labels.
+  log "Enabling auto-merge for PR #${pr_num} via gh (squash)…"
+  merge_out=""
+  merge_exit=0
+  merge_out="$(dep_runner_gh_stdout "gh pr" -- pr merge "$pr_num" \
+    --repo "${repo_owner}/${repo_name}" \
+    --auto --squash 2>&1)" || merge_exit=$?
+  if (( merge_exit != 0 )); then
+    record_first_failure "gh merge failed: pr=#${pr_num}: ${merge_out}"
+    die "gh merge failed: pr=#${pr_num}: ${merge_out}"
+  elif [[ -n "$merge_out" ]]; then
+    log "$merge_out"
   fi
 
   elapsed=0
