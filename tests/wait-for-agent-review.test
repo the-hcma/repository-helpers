@@ -2465,6 +2465,17 @@ if grep -qF 'cmd_loop_handle_coderabbit_rate_limit' "$wait_script" \
   && grep -qF 'pending feedback during CodeRabbit rate-limit wait' "$wait_script" \
   && grep -qF 'merged during CodeRabbit rate-limit wait' "$wait_script" \
   && grep -qF 'merged before CodeRabbit post-cooldown grace' "$wait_script" \
+  && grep -qF 'CodeRabbit rate-limited — requesting fallback nudge agent' "$wait_script" \
+  && grep -qF "cmd_loop_maybe_request_agents_on_head \"\${repo}\" \"\${pr}\" \"\${head}\" \"\" '1'" "$wait_script" \
+  && grep -qF 'skip_probe_mark' "$wait_script" \
+  && awk '
+    /^cmd_loop_handle_coderabbit_rate_limit\(/ { in_fn=1 }
+    in_fn && /requesting fallback nudge agent/ { fallback=1 }
+    in_fn && /cmd_loop_maybe_request_agents_on_head/ { if (fallback) req=1 }
+    in_fn && /coderabbit rate-limit poll sleep/ { if (req) sleep_after=1 }
+    in_fn && /^}/ { exit }
+    END { exit(sleep_after ? 0 : 1) }
+  ' "$wait_script" \
   && awk '
     /^cmd_loop_handle_coderabbit_rate_limit\(/ { in_fn=1 }
     in_fn && /agent_review_abort_if_pending_threads/ { abort=1 }
@@ -2488,6 +2499,11 @@ consumer_rule="${script_dir}/../scripts/lib/repo-practices-cursor/pr-ship-and-re
 if grep -qF '@coderabbitai review' "$skill" \
   && grep -qF 'on_push' "$skill" \
   && grep -qF 'poll-while-rate-limited' "$skill" \
+  && grep -qF 'While CodeRabbit is rate-limited' "$skill" \
+  && grep -qF 'issue #460' "$skill" \
+  && grep -qF 'does **not**' "$skill" \
+  && grep -qF 'probe_attempted' "$skill" \
+  && grep -qF 'requesting fallback nudge agent' "$wait_script" \
   && grep -qF 'AGENT_REVIEW_CODERABBIT_RATE_LIMIT_POLL' "$skill" \
   && grep -qF 'AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE' "$skill" \
   && grep -qF '60s' "$skill" \
@@ -2824,6 +2840,7 @@ if bash -c "
   agent_review_loop_wait_remove() { return 0; }
   agent_review_loop_set_stop() { return 0; }
   agent_review_use_agent() { return 0; }
+  cmd_loop_maybe_request_agents_on_head() { return 0; }
   agent_review_abort_if_pending_threads() { return 3; }
   agent_review_repo_parts() { printf 'o r\n'; }
   agent_review_graphql_pr_snapshot() { printf '{}\n'; }
@@ -2861,6 +2878,7 @@ if out="$(bash -c "
   agent_review_loop_wait_add() { return 0; }
   agent_review_loop_wait_remove() { return 0; }
   agent_review_use_agent() { return 0; }
+  cmd_loop_maybe_request_agents_on_head() { return 0; }
   agent_review_abort_if_pending_threads() { return 0; }
   agent_review_pr_is_merged() { return 0; }
   agent_review_repo_parts() { printf 'o r\n'; }
@@ -2900,6 +2918,7 @@ if bash -c "
   agent_review_loop_wait_remove() { return 0; }
   agent_review_loop_set_stop() { return 0; }
   agent_review_use_agent() { return 0; }
+  cmd_loop_maybe_request_agents_on_head() { return 0; }
   agent_review_abort_if_pending_threads() { return 0; }
   agent_review_agent_quota_seconds_until_retry_for_agent() { printf '120\n'; }
   agent_review_repo_parts() { printf 'o r\n'; }
@@ -2933,6 +2952,108 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -f "${tmp_rate_limit_poll2}" "${tmp_sleep_log2}"
+
+# Hermetic (#460): CR rate-limited → real maybe_request nudges Copilot (not stubbed).
+tmp_rate_limit_fallback="$(mktemp)"
+tmp_copilot_quota_fb="$(mktemp)"
+tmp_bugbot_quota_fb="$(mktemp)"
+tmp_request_log="$(mktemp)"
+if out="$(bash -c "
+  set -euo pipefail
+  source '${wait_script}'
+  AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE='${tmp_rate_limit_fallback}'
+  AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE='${tmp_copilot_quota_fb}'
+  AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE='${tmp_bugbot_quota_fb}'
+  agent_review_coderabbit_quota_write_cache 1 observed \
+    'rate limited' '' '' '' '2099-06-01T12:00:00Z'
+  agent_review_copilot_quota_write_cache 0 cache 'unset'
+  agent_review_named_pr_check_succeeded() { return 1; }
+  agent_review_agent_signed_off_on_head() { return 1; }
+  agent_review_loop_wait_add() { return 0; }
+  agent_review_loop_wait_remove() { return 0; }
+  agent_review_use_agent() {
+    AGENT_REVIEW_AGENT=\"\$1\"
+    export AGENT_REVIEW_AGENT
+    return 0
+  }
+  agent_review_abort_if_pending_threads() { return 0; }
+  agent_review_pr_is_merged() { return 1; }
+  agent_review_repo_parts() { printf 'o r\n'; }
+  agent_review_graphql_pr_snapshot() { printf '{}\n'; }
+  agent_review_resolve_repo() { printf '%s\n' \"\${1}\"; }
+  agent_review_resolve_pr() { printf '%s\n' \"\${1}\"; }
+  cmd_loop_agent_response_seen() { return 1; }
+  agent_review_quota_mark_probe_requested_for_agent() {
+    printf 'mark_probe agent=%s\n' \"\$1\" >>'${tmp_request_log}'
+    return 0
+  }
+  agent_review_sync_active_probe_agent() { return 0; }
+  cmd_request() {
+    printf 'cmd_request agent=%s repo=%s pr=%s\n' \
+      \"\${AGENT_REVIEW_AGENT:-}\" \"\$1\" \"\$2\" >>'${tmp_request_log}'
+    return 0
+  }
+  polls=0
+  agent_review_agent_quota_rate_limited_for_agent() {
+    local agent=\"\$1\"
+    if [[ \"\$agent\" == 'coderabbit' ]]; then
+      polls=\$((polls + 1))
+      if (( polls <= 2 )); then
+        return 0
+      fi
+      return 1
+    fi
+    return 1
+  }
+  # Keep exhausted/probe semantics for real maybe_request; only shorten the sleep loop.
+  agent_review_agent_quota_seconds_until_retry_for_agent() { printf '120\n'; }
+  agent_review_default_coderabbit_rate_limit_poll_s=5
+  run_command() { return 0; }
+  set +e
+  cmd_loop_handle_coderabbit_rate_limit 'o/r' '1' 'abc1234deadbeef' 2>&1
+  rc=\$?
+  set -e
+  (( rc == 0 ))
+  grep -qF 'cmd_request agent=copilot repo=o/r pr=1' '${tmp_request_log}'
+  [[ \"\$(grep -c cmd_request '${tmp_request_log}')\" -eq 1 ]]
+  ! grep -qF 'mark_probe ' '${tmp_request_log}'
+")" \
+  && grep -qF 'CodeRabbit rate-limited — requesting fallback nudge agent' <<<"${out}" \
+  && grep -qF 'skip_probe_mark — requested copilot' <<<"${out}"; then
+  printf '[PASS] hermetic: CR rate-limited requests Copilot without probe marker (#460)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] hermetic: CR rate-limited did not request Copilot without probe marker (#460)\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_rate_limit_fallback}" "${tmp_copilot_quota_fb}" "${tmp_bugbot_quota_fb}" "${tmp_request_log}"
+
+# Hermetic (#460): CR available (no rate-limit) → do not request fallback via rate-limit handler.
+tmp_fallback_skip="$(mktemp)"
+if bash -c "
+  set -euo pipefail
+  source '${wait_script}'
+  agent_review_agent_quota_cache_retry_after_for_agent() { printf ''; }
+  agent_review_agent_quota_rate_limited_for_agent() { return 1; }
+  agent_review_agent_signed_off_on_head() { return 1; }
+  cmd_loop_maybe_request_agents_on_head() {
+    printf 'unexpected_fallback\n' >>'${tmp_fallback_skip}'
+    return 0
+  }
+  set +e
+  cmd_loop_handle_coderabbit_rate_limit 'o/r' '1' 'abc1234deadbeef'
+  rc=\$?
+  set -e
+  (( rc == 1 ))
+  ! grep -q . '${tmp_fallback_skip}'
+"; then
+  printf '[PASS] hermetic: CR available skips rate-limit fallback request (#460)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] hermetic: CR available spuriously requested fallback (#460)\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_fallback_skip}"
 
 # shellcheck disable=SC2016  # static assert matches literal source text
 if grep -qF 'agent_review_agent_quota_rate_limited_for_agent "${agent}"' "$wait_script"; then

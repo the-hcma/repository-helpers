@@ -1320,6 +1320,16 @@ cmd_loop_handle_coderabbit_rate_limit() {
   if agent_review_agent_quota_rate_limited_for_agent 'coderabbit'; then
     agent_review_loop_wait_add 'coderabbit' "${head}"
     agent_review_use_agent "${saved_agent}"
+    # Issue #460: while CodeRabbit is rate-limited it cannot deliver promptly.
+    # Request the next nudge agent (Copilot → Bugbot) so a mid-wait sign-off can
+    # clear this cooldown. maybe_request skips exhausted/on_push CodeRabbit and
+    # is idempotent per head via already_reviewed. Pass skip_probe_mark=1 so this
+    # mid-cooldown nudge does not burn the host-wide per-day probe_attempted
+    # marker (otherwise a second CR rate-limit episode same day would escalate
+    # past Copilot to Bugbot while Copilot never reviewed — Vortex on #468).
+    printf 'wait-for-agent-review: CodeRabbit rate-limited — requesting fallback nudge agent on PR #%s head %s\n' \
+      "${pr}" "${head:0:7}" >&2
+    cmd_loop_maybe_request_agents_on_head "${repo}" "${pr}" "${head}" "" '1'
     # shellcheck disable=SC2154  # rate-limit poll/wait defaults assigned in scripts/lib/agent-review
     poll_s="${agent_review_default_coderabbit_rate_limit_poll_s}"
     if (( poll_s < 1 )); then
@@ -1557,13 +1567,16 @@ cmd_loop_handle_coderabbit_rate_limit() {
 #   nudge   — post an explicit PR comment / request (Copilot, Bugbot).
 # Escalates to the next agent when a request is blocked or quota is exhausted.
 cmd_loop_maybe_request_agents_on_head() {
-  local repo pr head last_head agent profiles_dir profile_path request_exit saved_agent
-  local current_agent owner name snapshot
+  local repo pr head last_head skip_probe_mark agent profiles_dir profile_path request_exit
+  local saved_agent current_agent owner name snapshot
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
   head="${3:-}"
   last_head="${4:-}"
+  # Optional 5th arg: '1' skips the host-wide per-day probe_attempted mark (CR
+  # rate-limit mid-cooldown nudge — issue #460 / Vortex #468).
+  skip_probe_mark="${5:-0}"
   if [[ -z "${head}" ]]; then
     return 0
   fi
@@ -1605,6 +1618,14 @@ cmd_loop_maybe_request_agents_on_head() {
           "${repo}" >&2
         continue
       fi
+    fi
+    # Rate-limited agents are already skipped by probe (exhausted+retry_after), but
+    # continue past on_push agents that somehow still surface so Copilot/Bugbot can
+    # unblock a CodeRabbit cooldown (issue #460).
+    if agent_review_agent_quota_rate_limited_for_agent "${agent}"; then
+      printf 'wait-for-agent-review: skip %s — rate-limited; trying next agent on PR #%s\n' \
+        "${agent}" "${pr}" >&2
+      continue
     fi
     if [[ "${agent_review_profile_trigger:-nudge}" == 'on_push' \
       || "${agent_review_profile_auto_review:-false}" == 'true' ]]; then
@@ -1648,8 +1669,13 @@ cmd_loop_maybe_request_agents_on_head() {
       && agent_review_bugbot_quota_repo_is_disabled "${repo}"; then
       continue
     fi
-    agent_review_quota_mark_probe_requested_for_agent "${agent}" \
-      "${agent} review requested on PR #${pr} to probe quota."
+    if [[ "${skip_probe_mark}" != '1' ]]; then
+      agent_review_quota_mark_probe_requested_for_agent "${agent}" \
+        "${agent} review requested on PR #${pr} to probe quota."
+    else
+      printf 'wait-for-agent-review: skip_probe_mark — requested %s without daily probe marker on PR #%s\n' \
+        "${agent}" "${pr}" >&2
+    fi
     agent_review_loop_wait_add "${agent}" "${head}"
     agent_review_use_agent "${agent}"
     return 0
