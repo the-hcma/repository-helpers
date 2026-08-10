@@ -51,7 +51,8 @@ if grep -qF "stacking_tool_marker_relpath='.github/stacking-tool'" "$lib" \
   && grep -qF 'stacking_tool_submit_as' "$lib" \
   && grep -qF 'stacking_tool_restack' "$lib" \
   && grep -qF 'stacking_tool_session_sync' "$lib" \
-  && grep -qF 'stacking_tool_session_sync_as' "$lib"; then
+  && grep -qF 'stacking_tool_session_sync_as' "$lib" \
+  && grep -qF 'stacking_tool_graphite_usable' "$lib"; then
   pass_case 'stacking-tool defines marker constants and operation helpers'
 else
   fail_case 'stacking-tool defines marker constants and operation helpers'
@@ -76,7 +77,9 @@ if grep -qF 'runner_sh "stacking-tool session git fetch" --timeout 20' "$lib" \
   && grep -qF 'runner_sh "stacking-tool gh stack sync" --timeout 20' "$lib" \
   && grep -qF 'runner_sh "stacking-tool gt submit after restack" --timeout 120' "$lib" \
   && grep -qF '&& exec gt sync' "$lib" \
-  && grep -qF '&& exec git fetch --prune origin' "$lib"; then
+  && grep -qF '&& exec git fetch --prune origin' "$lib" \
+  && grep -qF 'stacking_tool_graphite_usable' "$lib" \
+  && grep -qF 'skipping gt sync (git fetch only)' "$lib"; then
   pass_case 'session sync / restack envelope network calls with --timeout'
 else
   fail_case 'session sync / restack envelope network calls with --timeout'
@@ -242,6 +245,64 @@ else
 fi
 rm -rf "$fake_bin"
 
+printf '\n=== functional: session_sync_as skips gt sync when Graphite unusable ===\n'
+fake_bin="$(mktemp -d)"
+gt_log="${fake_bin}/gt.log"
+session_repo="$(mktemp -d)"
+git -C "$session_repo" init --initial-branch=main -q
+git -C "$session_repo" config user.email 't@example.com'
+git -C "$session_repo" config user.name 't'
+git -C "$session_repo" commit --allow-empty -q -m 'init'
+# Bare remote so git fetch --prune origin succeeds.
+session_remote="$(mktemp -d)"
+git -C "$session_remote" init --bare -q --initial-branch=main
+git -C "$session_repo" remote add origin "$session_remote"
+git -C "$session_repo" push -u origin main -q
+
+cat >"${fake_bin}/gt" <<'MOCK_GT'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${GT_LOG:?}"
+# Simulate expired / unused Graphite auth.
+if [[ "${1:-}" == 'auth' ]]; then
+  printf 'ERROR: Your Graphite auth token is invalid/expired.\n' >&2
+  exit 1
+fi
+exit 0
+MOCK_GT
+chmod +x "${fake_bin}/gt"
+
+session_exit=0
+session_log="$(
+  PATH="${fake_bin}:${PATH}" GT_LOG="$gt_log" \
+    stacking_tool_session_sync_as 'graphite' "$session_repo" 2>&1
+)" || session_exit=$?
+if [[ "$session_exit" -eq 0 ]] \
+  && grep -qF 'skipping gt sync (git fetch only)' <<<"$session_log" \
+  && ! grep -qE '(^|[[:space:]])sync([[:space:]]|$)' "$gt_log" \
+  && grep -qF 'auth' "$gt_log"; then
+  pass_case 'session_sync_as graphite falls back to git fetch when gt auth fails'
+else
+  fail_case "session_sync_as graphite falls back to git fetch when gt auth fails (exit=${session_exit})"
+  printf '%s\n' "$session_log" >&2
+  cat "$gt_log" >&2 || true
+fi
+
+# Missing gt entirely → also fetch-only (no die).
+rm -f "${fake_bin}/gt"
+session_exit=0
+session_log="$(
+  PATH="${fake_bin}:/usr/bin:/bin" \
+    stacking_tool_session_sync_as 'graphite' "$session_repo" 2>&1
+)" || session_exit=$?
+if [[ "$session_exit" -eq 0 ]] \
+  && grep -qF 'skipping gt sync (git fetch only)' <<<"$session_log"; then
+  pass_case 'session_sync_as graphite falls back when gt is missing'
+else
+  fail_case "session_sync_as graphite falls back when gt is missing (exit=${session_exit})"
+fi
+rm -rf "$fake_bin" "$session_repo" "$session_remote"
+
 rm -rf "$tmp_repo"
 
 printf '\n=== functional: stacking_tool_require_cli ===\n'
@@ -291,6 +352,48 @@ if [[ -f "${rh_root}/.cursor/rules/stacking-tool.mdc" ]] \
 else
   fail_case 'stacking-tool rule references marker and both skills'
 fi
+
+printf '\n=== static: scripts that invoke gt/gh stack must gate on stacking-tool ===\n'
+# Ratchet: bare Graphite / gh-stack CLI use outside scripts/lib/stacking-tool must
+# source the shared lib and reference a marker-aware gate (issue #387 follow-up).
+ratchet_fail=0
+ratchet_report="$(mktemp)"
+while IFS= read -r -d '' script_path; do
+  base="$(basename "$script_path")"
+  if [[ "$base" == 'stacking-tool' ]]; then
+    continue
+  fi
+  # Non-comment lines that look like real gt / gh stack CLI usage (not install hints).
+  invoke_lines="$(
+    { grep -nE '(^|[^[:alnum:]_-])gt[[:space:]]+(auth|submit|sync|restack|track|create|info|modify|branch)\b' "$script_path" || true
+      grep -nE '(^|[^[:alnum:]_-])gh[[:space:]]+stack[[:space:]]' "$script_path" || true
+    } | grep -vE '^[0-9]+:[[:space:]]*#' || true
+  )"
+  if [[ -z "${invoke_lines}" ]]; then
+    continue
+  fi
+  if ! grep -qF 'lib/stacking-tool' "$script_path"; then
+    printf 'missing stacking-tool source: %s\n' "$script_path" >>"$ratchet_report"
+    ratchet_fail=1
+    continue
+  fi
+  if ! grep -qE \
+    'stacking_tool_read|stacking_tool_read_optional|stacking_tool_read_or_org_default|stacking_tool_submit|stacking_tool_restack|stacking_tool_session_sync|stacking_tool_require_cli|stacking_tool_submit_as|dep_stacking_is_|start_dev_stacking_tool_value|rp_stacking_tool_marker_content_for_apply_fix' \
+    "$script_path"; then
+    printf 'missing marker-aware gate: %s\n' "$script_path" >>"$ratchet_report"
+    ratchet_fail=1
+  fi
+done < <(find "${rh_root}/scripts" "${rh_root}/scripts/dev" "${rh_root}/scripts/lib" \
+  -maxdepth 1 -type f ! -name '*.md' ! -name '*.yml' ! -name '*.yaml' ! -name '*.json' \
+  -print0 | sort -z)
+
+if [[ "$ratchet_fail" -eq 0 ]]; then
+  pass_case 'scripts invoking gt/gh stack source stacking-tool and gate on marker'
+else
+  fail_case 'scripts invoking gt/gh stack source stacking-tool and gate on marker'
+  cat "$ratchet_report" >&2 || true
+fi
+rm -f "$ratchet_report"
 
 printf '\n=== summary ===\n'
 printf 'pass=%s fail=%s\n' "$pass" "$fail"
