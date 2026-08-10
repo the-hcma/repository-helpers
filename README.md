@@ -119,8 +119,8 @@ for the Bash + Python extraction proposal.
 
 ## Repository Practices
 
-`scripts/github-repo-lint` audits org conventions: merge queue wiring (Graphite MQ
-or GitHub’s native merge queue), `protect-main`, classic branch protection, branch
+`scripts/github-repo-lint` audits org conventions: GitHub native merge queue
+wiring (org default), `protect-main`, classic branch protection, branch
 cleanup workflows, release-age policy, license/CODEOWNERS metadata, cursor rules,
 and uv Python CVE checks. See [github-repo-lint checks](#github-repo-lint-checks)
 for the full list.
@@ -144,14 +144,15 @@ scripts/github-repo-lint --repo OWNER/NAME --apply-fix
 ```
 
 `--apply-fix` can repair supported GitHub settings such as Release Please squash
-settings, the `protect-main` ruleset, and classic `main` branch protection. When
-run from the target repository clone, it also prepares candidate workflow fixes in
-a dedicated `.worktrees/repo-practices-candidate-fixes-wt` worktree and submits
-them as a Graphite stack for review (`gt track` / `gt submit`; not yet
+settings, the `protect-main` ruleset (squash-only + `merge_queue` SQUASH), and
+classic `main` branch protection (GitHub MQ profile). When run from the target
+repository clone, it also prepares candidate workflow fixes in a dedicated
+`.worktrees/repo-practices-candidate-fixes-wt` worktree and submits them as a
+stack for review (`gt track` / `gt submit` when Graphite stacking; not yet
 marker-aware for `gh-stack`). Candidate workflow templates live under
 `scripts/lib/repo-practices-workflows/` so they can be reviewed and linted
-directly. Graphite app merge queue configuration (for Graphite MQ repos) remains a
-manual step and is reported as such.
+directly. Disable org repos in Graphite’s merge-queue UI so Graphite does not
+also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
 
 ### `github-repo-lint` checks
 
@@ -161,9 +162,9 @@ manual step and is reported as such.
 | Check | Full audit | Merge-only | What it validates |
 | --- | --- | --- | --- |
 | Release Please squash settings | yes | yes | Repos with `release-please.yml` use squash-only merges on `main` |
-| `protect-main` ruleset | yes | yes | Squash-only + Graphite App bypass **or** GitHub `merge_queue` on `refs/heads/main` when `merge-it`, GitHub MQ, or Release Please |
-| Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts; Graphite-only push on Graphite MQ repos (org standard) |
-| Graphite / GitHub merge queue | yes | yes | Graphite: `merge-it` (strict), `merge-mq` when present, `merged-pr-closer.yml`, `ci.yml` `gtmq_merge_*` skip, dependabot auto-merge when `dependabot.yml` exists. GitHub MQ: `ci.yml` `merge_group` |
+| `protect-main` ruleset | yes | yes | Squash-only + GitHub `merge_queue` (`SQUASH`) on `refs/heads/main` when GitHub MQ, Release Please, or strict onboarding |
+| Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts; no Graphite-only push restrictions (GitHub MQ profile) |
+| GitHub merge queue wiring | yes | yes | `protect-main` `merge_queue`, `ci.yml` `merge_group`, dependabot auto-merge via `gh pr merge --auto` when `dependabot.yml` exists |
 | Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |
 | Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
 | License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
@@ -258,9 +259,10 @@ When `check` reports `complete_ready: true` (agent sign-off on the current head)
 scripts/wait-for-agent-review complete --pr <n>   # emails the operator; does not self-approve
 ```
 
-**Merging this repo:** use GitHub’s merge queue (`gh pr merge --auto --squash` /
-Enable auto-merge). Do **not** use the `merge-it` label here — that enqueues
-Graphite MQ on other org repos.
+**Merging (org default):** use GitHub’s merge queue (`gh pr merge --auto --squash` /
+Enable auto-merge). Do **not** use the `merge-it` label to land PRs — leftover
+labels are ignored. Graphite stacking (`gt`) remains available via
+`.github/stacking-tool`; disable Graphite’s merge-queue UI for org repos.
 
 Configure `~/.config/agent-review.env` from `etc/agent-review.env.example` (SMTP,
 `AGENT_REVIEW_REPORT_TO`, early-complete when nothing outstanding, **12h** PR
@@ -278,7 +280,7 @@ for the full review playbook; skills under `.cursor/skills/{graphite,gh-stack}/`
 | `scripts/dep-updater` | Dependency bumps → stacked PR(s) for one repo (`graphite` or `gh-stack`). |
 | `scripts/dep-updater-batch-run` | Daily batch across a scan root; email report. |
 | `scripts/github-repo-lint` | Org repo practices audit / `--apply-fix`. |
-| `scripts/check-merge-settings` | Merge + Graphite MQ settings only. |
+| `scripts/check-merge-settings` | Merge + GitHub MQ settings only. |
 | `scripts/check-lockfile-drift` | Lockfile vs manifest drift check. |
 | `scripts/grandfather-pnpm-release-age` | One-time pnpm release-age cutover helper. |
 | `scripts/wait-for-agent-review` | Agent review loop, triage, operator email (no self-approve). |
