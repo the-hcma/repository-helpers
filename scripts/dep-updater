@@ -5574,9 +5574,10 @@ py_uv_actual_lines_from_lock() {
     return 0
   fi
   head_lock="$(mktemp)"
+  # Missing HEAD lock (first-ever / untracked) ⇒ empty baseline so staged
+  # landings still report instead of silently dropping every transitive row.
   if ! git -C "$worktree" show HEAD:uv.lock >"$head_lock" 2>/dev/null; then
-    rm -f "$head_lock"
-    return 0
+    : >"$head_lock"
   fi
   while IFS=' ' read -r pkg old_ver new_ver; do
     [[ -z "$pkg" || -z "$new_ver" ]] && continue
@@ -6556,10 +6557,27 @@ batch_update_all() {
       done <<< "$py_lines_arg"
       if [[ "$py_tool" == "uv" ]]; then
         if [[ "$uv_floor_batch" == '1' ]]; then
+          # Snapshot uv.lock before floor lock so a failure cannot wipe an
+          # untracked pre-existing lock via `git clean` (checkout is a no-op).
+          lock_bak=""
+          if [[ -f "${worktree_path}/uv.lock" ]]; then
+            lock_bak="$(mktemp)"
+            cp "${worktree_path}/uv.lock" "$lock_bak"
+          fi
           py_out="$(dep_runner_uv_dir_capture "uv batch lock" "$worktree_path" -- lock)" && py_exit=0 || py_exit=$?
           if (( py_exit != 0 )); then
-            run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml uv.lock 2>/dev/null || true
-            run_command "git worktree" git -C "$worktree_path" clean --force -- uv.lock 2>/dev/null || true
+            run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
+            if [[ -n "$lock_bak" ]]; then
+              cp "$lock_bak" "${worktree_path}/uv.lock"
+              rm -f "$lock_bak"
+            else
+              run_command "git worktree" git -C "$worktree_path" checkout -- uv.lock 2>/dev/null || true
+              if [[ -f "${worktree_path}/uv.lock" ]] \
+                && ! git -C "$worktree_path" ls-files --error-unmatch -- uv.lock >/dev/null 2>&1; then
+                rm -f "${worktree_path}/uv.lock"
+              fi
+            fi
+            lock_bak=""
             if grep -qF 'No solution found when resolving dependencies' <<<"$py_out"; then
               log "[python/uv] Skipping python batch floor bumps: dependency resolution failed."
               log "$py_out"
@@ -6571,6 +6589,9 @@ batch_update_all() {
                 "python|batch uv lock failed (non-resolution; floors reverted)"
             fi
             uv_floor_batch=0
+          else
+            rm -f "$lock_bak"
+            lock_bak=""
           fi
         fi
         for b_spec in "${uv_upgrade_specs[@]}"; do
