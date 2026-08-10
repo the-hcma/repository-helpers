@@ -181,20 +181,21 @@ Usage:
 
 Audits GitHub conventions for org repositories:
 
-  protect-main ruleset (when merge-it or release-please.yml exists):
+  protect-main ruleset (when GitHub MQ, release-please.yml, or strict onboarding):
     - squash-only allowed_merge_methods on main
-    - Graphite App bypass (Integration actor_id 158384)
+    - merge_queue rule (merge_method SQUASH) — org default enqueue path
 
-  Classic branch protection on main (same repos; org standard):
-    - CODEOWNERS reviews, dismiss stale, Graphite + Dependabot bypass, owner bypass
-    - push restricted to Graphite App; required CI contexts from ci.yml; strict checks
+  Classic branch protection on main (same repos; org GitHub MQ profile):
+    - CODEOWNERS reviews, dismiss stale, Dependabot bypass when present, owner bypass
+    - no Graphite-only push restrictions; required CI contexts from ci.yml; strict checks
 
   Branch hygiene (strict repos):
     - cleanup-branch-on-merge.yml (delete head branch when PR merges)
     - cleanup-merged-branches.yml (daily sweep + workflow_dispatch)
 
-  Graphite merge queue (when merge-it label exists):
-    - enqueue labels, merged-pr-closer, ci gtmq skip, dependabot auto-merge
+  GitHub merge queue (org default):
+    - ci.yml merge_group trigger; enqueue via gh pr merge --auto --squash / Enable auto-merge
+    - dependabot auto-merge workflow (gh pr merge --auto) when dependabot.yml exists
 
   Repository metadata:
     - top-level license file
@@ -203,6 +204,7 @@ Audits GitHub conventions for org repositories:
     - .cursor/rules/pr-ship-and-review.mdc (canonical agent review loop)
     - .cursor/rules/read-agents-and-rules.mdc (session-start: read AGENTS.md + rules)
     - .gitignore must not ignore .cursor/rules/ (org cursor rules must be trackable)
+    - .github/stacking-tool (graphite|gh-stack) + stacking-tool cursor rule
 
   Release Please (when release-please.yml exists):
     - squash-only repo settings; squash_merge_commit_message=BLANK
@@ -210,13 +212,13 @@ Audits GitHub conventions for org repositories:
       package version (googleapis/release-please#2561)
 
 --new-repo: audit a single repo with SUGGEST hints and a setup checklist (requires --repo).
---strict-onboarding: require full org onboarding, including merge-it, for audited repos.
---all: audit every repository in the org (not only merge-it / release-please).
+--strict-onboarding: require full org onboarding, including GitHub merge queue, for audited repos.
+--all: audit every repository in the org (not only release-please / GitHub MQ / merge-it leftovers).
 --include-private: include private GitHub repositories in org discovery and enforcer scans
 (default: skip private repos in bulk discovery; explicit --repo and current-clone audits are
 always included). Override via GITHUB_REPO_LINT_INCLUDE_PRIVATE=1.
 With no --repo: audit the current git repository when run inside a clone (origin on GitHub);
-otherwise discover org repos with release-please.yml or merge-it.
+otherwise discover org repos with release-please.yml, GitHub MQ, or merge-it leftovers.
 --suggest: print SUGGEST lines with remediation hints (non-zero exit still on FAIL).
 --compact: print one passed-repos line plus grouped failures and fixes (implies --suggest).
 
@@ -3494,10 +3496,15 @@ rp_repo_has_merge_it_label() {
 
 rp_repo_should_audit_default() {
   local slug="$1"
+  local mq_exit=0
   if rp_repo_has_release_please "$slug"; then
     return 0
   fi
   if rp_repo_has_merge_it_label "$slug"; then
+    return 0
+  fi
+  rp_repo_uses_github_merge_queue "$slug" || mq_exit=$?
+  if (( mq_exit == 0 )); then
     return 0
   fi
   return 1
@@ -3670,13 +3677,7 @@ rp_protect_main_create_payload() {
       "include": ["refs/heads/main"]
     }
   },
-  "bypass_actors": [
-    {
-      "actor_id": 158384,
-      "actor_type": "Integration",
-      "bypass_mode": "always"
-    }
-  ],
+  "bypass_actors": [],
   "rules": [
     {"type": "deletion"},
     {"type": "non_fast_forward"},
@@ -3691,6 +3692,18 @@ rp_protect_main_create_payload() {
         "required_review_thread_resolution": false,
         "allowed_merge_methods": ["squash"]
       }
+    },
+    {
+      "type": "merge_queue",
+      "parameters": {
+        "merge_method": "SQUASH",
+        "max_entries_to_build": 5,
+        "min_entries_to_merge": 1,
+        "max_entries_to_merge": 5,
+        "min_entries_to_merge_wait_minutes": 0,
+        "grouping_strategy": "ALLGREEN",
+        "check_response_timeout_minutes": 60
+      }
     }
   ]
 }
@@ -3701,7 +3714,7 @@ rp_apply_protect_main_create() {
   local slug="$1"
   local payload
   payload="$(rp_protect_main_create_payload)"
-  rp_log_warn "${slug}: creating protect-main ruleset (squash-only + Graphite bypass)"
+  rp_log_warn "${slug}: creating protect-main ruleset (squash-only + GitHub merge queue)"
   local post_exit_code=0
   printf '%s' "$payload" | runner_exec "repo-practices gh create protect-main ruleset" \
     -- gh api --method POST "repos/${slug}/rulesets" --input - || post_exit_code=$?
@@ -3792,6 +3805,69 @@ rp_fix_ci_workflow_for_stacked_prs() {
   ' <<<"$text"
 }
 
+# rp_fix_ci_workflow_add_merge_group <text>
+# Insert merge_group under on: when missing. When push.branches exists, also ignore
+# gh-readonly-queue/** via branches-ignore (or append if branches-ignore already set).
+rp_fix_ci_workflow_add_merge_group() {
+  local text="$1"
+  if grep -qE '^[[:space:]]*merge_group:' <<<"$text"; then
+    printf '%s' "$text"
+    return 0
+  fi
+  awk '
+    BEGIN { in_on = 0; in_push = 0; push_indent = -1; inserted = 0; saw_branches_ignore = 0 }
+    /^on:[[:space:]]*$/ {
+      in_on = 1
+      print
+      next
+    }
+    in_on && /^[^[:space:]]/ {
+      if (!inserted) {
+        print "  merge_group:"
+        inserted = 1
+      }
+      in_on = 0
+      in_push = 0
+      push_indent = -1
+      print
+      next
+    }
+    in_on && /^[[:space:]]*push:[[:space:]]*$/ {
+      in_push = 1
+      push_indent = match($0, /[^ ]/) - 1
+      print
+      next
+    }
+    in_push {
+      cur = match($0, /[^ ]/) - 1
+      if (cur <= push_indent && $0 !~ /^[[:space:]]*$/) {
+        in_push = 0
+        push_indent = -1
+      } else if ($0 ~ /^[[:space:]]*branches-ignore:[[:space:]]*$/) {
+        saw_branches_ignore = 1
+        print
+        print "      - '\''gh-readonly-queue/**'\''"
+        next
+      } else if ($0 ~ /^[[:space:]]*branches:[[:space:]]*/) {
+        # Prefer branches-ignore for queue temp branches when push uses branches.
+        if (!saw_branches_ignore) {
+          print
+          indent = substr($0, 1, match($0, /[^ ]/) - 1)
+          print indent "branches-ignore:"
+          print indent "  - '\''gh-readonly-queue/**'\''"
+          next
+        }
+      }
+    }
+    { print }
+    END {
+      if (in_on && !inserted) {
+        print "  merge_group:"
+      }
+    }
+  ' <<<"$text"
+}
+
 # Emit CI check context names for branch protection (job display name, else job id).
 # Skips guard/changed-files/secret-scan/workflow-lint (optional CI gates, not merge blockers).
 rp_discover_ci_status_contexts() {
@@ -3857,9 +3933,10 @@ rp_fetch_classic_main_protection_json() {
 rp_classic_protection_bypass_apps_json() {
   local slug="$1"
   local apps
-  apps='["'"${rp_GRAPHITE_APP_SLUG}"'"]'
+  # Org default is GitHub merge queue — do not grant graphite-app review bypass.
+  apps='[]'
   if rp_repo_has_dependabot "$slug"; then
-    apps='["'"${rp_GRAPHITE_APP_SLUG}"'","'"${rp_DEPENDABOT_APP_SLUG}"'"]'
+    apps='["'"${rp_DEPENDABOT_APP_SLUG}"'"]'
   fi
   printf '%s' "$apps"
 }
@@ -3871,16 +3948,14 @@ rp_validate_classic_main_protection_json() {
   local expected
   local -a expected_contexts=()
   local ctx
-  local github_mq=0
+  # Org default is GitHub MQ: no Graphite-only push restrictions / review bypass.
+  local github_mq=1
   local mq_exit=0
 
   rp_repo_uses_github_merge_queue "$slug" || mq_exit=$?
   if (( mq_exit == 2 )); then
     rp_log_gh_api_fail "$slug" 'could not read protect-main ruleset'
     return 1
-  fi
-  if (( mq_exit == 0 )); then
-    github_mq=1
   fi
 
   local jq_exit_code=0
@@ -3911,17 +3986,6 @@ rp_validate_classic_main_protection_json() {
     rp_log_fail "${slug}: classic main protection must require CODEOWNERS review"
     fail=1
   fi
-  if [[ "$github_mq" -eq 0 ]]; then
-    jq_exit_code=0
-    rp_runner_jq_file "repo-practices graphite review bypass" "$protection_json" \
-      --arg slug "${rp_GRAPHITE_APP_SLUG}" \
-      -e '[.required_pull_request_reviews.bypass_pull_request_allowances.apps[]?.slug] | index($slug) != null' \
-      >/dev/null || jq_exit_code=$?
-    if (( jq_exit_code != 0 )); then
-      rp_log_fail "${slug}: classic main protection must bypass ${rp_GRAPHITE_APP_SLUG} for reviews"
-      fail=1
-    fi
-  fi
   if rp_repo_has_dependabot "$slug"; then
     jq_exit_code=0
     rp_runner_jq_file "repo-practices dependabot review bypass" "$protection_json" \
@@ -3946,16 +4010,6 @@ rp_validate_classic_main_protection_json() {
       if [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest "${slug}: clear classic push restrictions on main (GitHub MQ lands merges)"
       fi
-      fail=1
-    fi
-  else
-    jq_exit_code=0
-    rp_runner_jq_file "repo-practices graphite push restriction" "$protection_json" \
-      --arg slug "${rp_GRAPHITE_APP_SLUG}" \
-      -e '[.restrictions.apps[]?.slug] | index($slug) != null' \
-      >/dev/null || jq_exit_code=$?
-    if (( jq_exit_code != 0 )); then
-      rp_log_fail "${slug}: classic main protection must restrict pushes on main to ${rp_GRAPHITE_APP_SLUG}"
       fail=1
     fi
   fi
@@ -4009,7 +4063,6 @@ rp_apply_classic_main_protection() {
   local -a contexts=()
   local ctx
   local bypass_apps_json payload
-  local github_mq=0
   local restrictions_json
   local mq_exit=0
 
@@ -4025,12 +4078,8 @@ rp_apply_classic_main_protection() {
     rp_log_gh_api_fail "$slug" 'could not read protect-main ruleset'
     return 1
   fi
-  if (( mq_exit == 0 )); then
-    github_mq=1
-    restrictions_json='null'
-  else
-    restrictions_json='{"users":[],"teams":[],"apps":["graphite-app"]}'
-  fi
+  # Org default is GitHub MQ: never restrict pushes to graphite-app.
+  restrictions_json='null'
 
   if [[ "${#contexts[@]}" -eq 0 ]]; then
     payload="$(rp_runner_jq_n "repo-practices classic protection payload empty contexts" \
@@ -4084,11 +4133,7 @@ rp_apply_classic_main_protection() {
       }')"
   fi
 
-  if [[ "$github_mq" -eq 1 ]]; then
-    rp_log_warn "${slug}: applying classic main branch protection (GitHub merge queue; no push restrictions)"
-  else
-    rp_log_warn "${slug}: applying classic main branch protection (org standard)"
-  fi
+  rp_log_warn "${slug}: applying classic main branch protection (GitHub merge queue; no push restrictions)"
   printf '%s' "$payload" | runner_exec "repo-practices gh put classic protection" \
     -- gh api -X PUT "repos/${slug}/branches/main/protection" --input -
 }
@@ -4727,18 +4772,19 @@ rp_print_new_repo_checklist() {
 ==> New repository checklist for ${slug}
     Run: scripts/github-repo-lint --repo ${slug} --suggest
 
-    GitHub labels:
-      [ ] merge-it (Graphite merge queue enqueue; default for org repos)
-      [ ] merge-mq (only when Graphite MQ enqueue label is merge-mq)
+    Merge enqueue (GitHub native merge queue — org default):
+      [ ] protect-main merge_queue (SQUASH); enqueue with GitHub auto-merge (squash)
+      [ ] Do not rely on merge-it / Graphite MQ for landing PRs
 
     Workflows under .github/workflows/:
-      [ ] ci.yml with gtmq_merge_* skip in a guard job
+      [ ] ci.yml with merge_group: trigger (ignore push to gh-readonly-queue/** when needed)
       [ ] ci.yml secret-scan job invoking .github/ci/secret-scan (canonical; timeout-minutes + per-SHA concurrency)
-      [ ] merged-pr-closer.yml (push to main, graphite-app merge-queue comments, stale MQ draft cleanup)
       [ ] cleanup-branch-on-merge.yml (delete branch on PR merge)
       [ ] cleanup-merged-branches.yml (daily stale-branch sweep)
-      [ ] dependabot-auto-merge.yml OR auto-merge-dependabot.yml (when dependabot.yml exists)
+      [ ] dependabot-auto-merge.yml OR auto-merge-dependabot.yml (when dependabot.yml exists;
+          enable auto-merge squash — not merge-it labels)
       [ ] cve-check.yml (daily pip-audit CVE check for uv+pyproject repos)
+      [ ] merged-pr-closer.yml (optional hygiene for leftover Graphite MQ drafts)
 
     Dependency release age (scripts/lib/release-age-defaults):
       [ ] dependabot.yml: cooldown default-days: ${release_age_dependabot_days} on every updates entry
@@ -4751,15 +4797,16 @@ rp_print_new_repo_checklist() {
       [ ] Do not use pnpm/action-setup or setup-node cache: 'pnpm'
       [ ] Path filters / deps-changed gates include .github/workflows/** so adoption PRs run install
 
-    Branch protection (required when using merge-it or Release Please):
-      [ ] protect-main ruleset on refs/heads/main (squash-only + Graphite App bypass)
-      [ ] classic main protection (CODEOWNERS, CI contexts, push via Graphite only)
+    Branch protection (required for GitHub MQ / Release Please / strict onboarding):
+      [ ] protect-main ruleset on refs/heads/main (squash-only + merge_queue SQUASH)
+      [ ] classic main protection (CODEOWNERS, CI contexts, no Graphite-only push restrictions)
 
     Release Please (optional):
       [ ] release-please.yml + squash-only repo settings (scripts/github-repo-lint --apply-fix)
 
-    Graphite (manual in app.graphite.com):
-      [ ] Enable merge queue on main, strategy squash, enqueue label merge-it
+    Graphite app (manual):
+      [ ] Disable this repo in Graphite merge queue settings so Graphite does not also try to land PRs
+          (https://app.graphite.com/settings/merge-queue)
 
     Docs in the service repo:
       [ ] LICENSE with copyright notice
@@ -4769,7 +4816,7 @@ rp_print_new_repo_checklist() {
       [ ] .gitignore must not ignore .cursor/rules/ (un-ignore if ignoring other .cursor content)
       [ ] .github/stacking-tool (graphite|gh-stack)
       [ ] .cursor/rules/stacking-tool.mdc (thin marker rule; template in ${rp_THIS_REPO_NAME})
-      [ ] merge-it / Graphite merge queue flow (AGENTS.md)
+      [ ] GitHub merge queue / auto-merge flow (AGENTS.md)
       [ ] RELEASING.md when using Release Please
 
 CHECKLIST
@@ -4944,44 +4991,31 @@ rp_validate_ruleset_methods_json() {
 }
 
 rp_validate_graphite_bypass_json() {
-  local slug="$1"
-  local ruleset_json="$2"
-
-  if [[ -z "$ruleset_json" ]]; then
-    rp_log_fail "${slug}: protect-main ruleset required (classic branch protection is not sufficient)"
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest "${slug}: create protect-main ruleset with Graphite App bypass (actor_id ${rp_GRAPHITE_APP_ACTOR_ID})"
-    fi
-    return 1
-  fi
-
-  # Native GitHub merge queue replaces Graphite App bypass on protect-main.
-  if rp_ruleset_has_github_merge_queue "$ruleset_json"; then
-    return 0
-  fi
-
-  local bypass_exit_code=0
-  rp_runner_jq_file "repo-practices graphite ruleset bypass" "$ruleset_json" \
-    --argjson id "$rp_GRAPHITE_APP_ACTOR_ID" \
-    -e '.bypass_actors // [] | any(.actor_id == $id and .actor_type == "Integration" and (.bypass_mode == "always" or .bypass_mode == "pull_request"))' \
-    >/dev/null || bypass_exit_code=$?
-  if (( bypass_exit_code == 0 )); then
-    return 0
-  fi
-
-  rp_log_fail "${slug}: protect-main must bypass Graphite App (Integration actor_id ${rp_GRAPHITE_APP_ACTOR_ID})"
-  return 1
+  # Org default is GitHub merge queue. Leftover Graphite Integration bypass
+  # (actor_id 158384) on protect-main is harmless and not required.
+  # Keep signature for callers in rp_check_protect_main_ruleset.
+  : "${1:-}" "${2:-}"
+  return 0
 }
 
 # rp_validate_github_merge_queue_ruleset <slug> <ruleset_json>
-# When merge_queue is present, require squash merge method on the queue rule.
+# When protect-main exists, require a merge_queue rule with squash merge method.
 rp_validate_github_merge_queue_ruleset() {
   local slug="$1"
   local ruleset_json="$2"
   local method
 
-  if ! rp_ruleset_has_github_merge_queue "$ruleset_json"; then
+  if [[ -z "$ruleset_json" ]]; then
     return 0
+  fi
+
+  if ! rp_ruleset_has_github_merge_queue "$ruleset_json"; then
+    rp_log_fail "${slug}: protect-main must include a merge_queue rule (GitHub merge queue)"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add merge_queue (merge_method ${rp_GITHUB_MQ_MERGE_METHOD}) via --apply-fix"
+    fi
+    return 1
   fi
 
   method="$(rp_runner_jq_file "repo-practices merge_queue merge_method" "$ruleset_json" \
@@ -5029,7 +5063,6 @@ rp_validate_graphite_workflows() {
   local path_ec=0
   local fetch_ec=0
   local secret_scan_script
-  local merge_mq_exit_code=0
 
   path_ec=0
   rp_gh_path_check "$slug" '.github/workflows/merged-pr-closer.yml' || path_ec=$?
@@ -5060,9 +5093,9 @@ rp_validate_graphite_workflows() {
       rp_log_gh_api_fail "$slug" 'could not read .github/workflows/merged-pr-closer.yml'
       fail=1
     elif [[ -z "$closer_text" ]] \
-      || ! grep -qF 'graphite-app' <<<"$closer_text" \
+      || ! grep -qF "${rp_GRAPHITE_APP_SLUG}" <<<"$closer_text" \
       || ! grep -qF 'Graphite merge queue' <<<"$closer_text"; then
-      rp_log_fail "${slug}: merged-pr-closer.yml must detect graphite-app Graphite merge queue comments"
+      rp_log_fail "${slug}: merged-pr-closer.yml must detect ${rp_GRAPHITE_APP_SLUG} Graphite merge queue comments"
       if [[ "$rp_apply_fix" -eq 1 ]]; then
         rp_queue_candidate_file_fix "$slug" '.github/workflows/merged-pr-closer.yml' \
           "$(rp_candidate_merged_pr_closer_workflow)" \
@@ -5215,7 +5248,7 @@ rp_validate_graphite_workflows() {
             'chore: add dependabot auto-merge workflow'
         fi
         if [[ "$rp_suggest" -eq 1 ]]; then
-          rp_log_suggest "${slug}: add dependabot-auto-merge.yml (labels merge-it for Graphite MQ)"
+          rp_log_suggest "${slug}: add dependabot-auto-merge.yml (gh pr merge --auto --squash for GitHub MQ)"
         fi
         fail=1
       fi
@@ -5226,23 +5259,10 @@ rp_validate_graphite_workflows() {
       if (( fetch_ec == 2 )); then
         rp_log_gh_api_fail "$slug" "could not read ${dependabot_workflow}"
         fail=1
-      elif [[ -z "$dependabot_auto_text" ]] || ! grep -qF 'merge-it' <<<"$dependabot_auto_text"; then
-        rp_log_fail "${slug}: ${dependabot_workflow} must add merge-it label"
-        if [[ "$rp_apply_fix" -eq 1 ]]; then
-          rp_queue_candidate_file_fix "$slug" "$dependabot_workflow" \
-            "$(rp_candidate_dependabot_auto_merge_workflow)" \
-            'add-dependabot-auto-merge' \
-            'chore: update dependabot auto-merge workflow'
-        fi
-        fail=1
-      fi
-      merge_mq_exit_code=0
-      rp_runner_jq_file "repo-practices merge-mq label check" "$labels_json" \
-        -e 'index("merge-mq") != null' >/dev/null || merge_mq_exit_code=$?
-      if (( merge_mq_exit_code == 0 )) \
-        && [[ -n "${dependabot_auto_text:-}" ]] \
-        && ! grep -qF 'merge-mq' <<<"$dependabot_auto_text"; then
-        rp_log_fail "${slug}: ${dependabot_workflow} must add merge-mq when merge-mq label exists"
+      elif [[ -z "$dependabot_auto_text" ]] \
+        || ! grep -qF 'gh pr merge' <<<"$dependabot_auto_text" \
+        || ! grep -qF -- '--auto' <<<"$dependabot_auto_text"; then
+        rp_log_fail "${slug}: ${dependabot_workflow} must enable auto-merge via gh pr merge --auto"
         if [[ "$rp_apply_fix" -eq 1 ]]; then
           rp_queue_candidate_file_fix "$slug" "$dependabot_workflow" \
             "$(rp_candidate_dependabot_auto_merge_workflow)" \
@@ -5419,6 +5439,86 @@ rp_apply_protect_main_squash_methods() {
     -- gh api -X PUT "repos/${owner}/${name}/rulesets/${ruleset_id}" --input -
 }
 
+# rp_apply_protect_main_github_mq_shape <slug>
+# Ensure protect-main has merge_queue (SQUASH) and no Graphite Integration bypass.
+rp_apply_protect_main_github_mq_shape() {
+  local slug="$1"
+  local owner name ruleset_id payload
+  owner="${slug%%/*}"
+  name="${slug#*/}"
+  local ruleset_id_raw ruleset_exit_code=0
+  set +e
+  ruleset_id_raw="$(rp_runner_gh_api_stream "repo-practices github-mq ruleset id" \
+    "repos/${owner}/${name}/rulesets" \
+    --jq '.[] | select(.name == "protect-main") | .id')"
+  ruleset_exit_code=$?
+  set -e
+  ruleset_id="${ruleset_id_raw//$'\n'/}"
+  ruleset_id="$(printf '%s' "$ruleset_id" | head -n1)"
+  if (( ruleset_exit_code != 0 )) || [[ -z "$ruleset_id" ]]; then
+    rp_apply_protect_main_create "$slug"
+    return 0
+  fi
+
+  set +e
+  payload="$(rp_runner_exec_stdout "repo-practices fetch ruleset for github-mq shape" \
+    -- gh api "repos/${owner}/${name}/rulesets/${ruleset_id}")"
+  set -e
+  payload="${payload//$'\n'/}"
+  payload="$(rp_runner_jq_file "repo-practices github-mq ruleset payload" "$payload" \
+    --arg method "$rp_GITHUB_MQ_MERGE_METHOD" \
+    --argjson graphite_id "$rp_GRAPHITE_APP_ACTOR_ID" '
+    .bypass_actors = ((.bypass_actors // []) | map(
+      select(.actor_id != $graphite_id or .actor_type != "Integration")
+    ))
+    | .rules = (
+        (.rules // [])
+        | map(
+            if .type == "pull_request" then
+              .parameters.allowed_merge_methods = ["squash"]
+            elif .type == "merge_queue" then
+              .parameters.merge_method = $method
+              | .parameters.max_entries_to_build = (.parameters.max_entries_to_build // 5)
+              | .parameters.min_entries_to_merge = (.parameters.min_entries_to_merge // 1)
+              | .parameters.max_entries_to_merge = (.parameters.max_entries_to_merge // 5)
+              | .parameters.min_entries_to_merge_wait_minutes =
+                  (.parameters.min_entries_to_merge_wait_minutes // 0)
+              | .parameters.grouping_strategy = (.parameters.grouping_strategy // "ALLGREEN")
+              | .parameters.check_response_timeout_minutes =
+                  (.parameters.check_response_timeout_minutes // 60)
+            else .
+            end
+          )
+        | if any(.type == "merge_queue") then .
+          else . + [{
+            type: "merge_queue",
+            parameters: {
+              merge_method: $method,
+              max_entries_to_build: 5,
+              min_entries_to_merge: 1,
+              max_entries_to_merge: 5,
+              min_entries_to_merge_wait_minutes: 0,
+              grouping_strategy: "ALLGREEN",
+              check_response_timeout_minutes: 60
+            }
+          }]
+          end
+      )
+    | {
+        name,
+        target,
+        enforcement,
+        conditions,
+        bypass_actors,
+        rules
+      }
+  ')"
+
+  rp_log_warn "${slug}: patching protect-main ruleset ${ruleset_id} (squash-only + GitHub merge queue)"
+  printf '%s' "$payload" | runner_exec "repo-practices gh put protect-main github-mq" \
+    -- gh api -X PUT "repos/${owner}/${name}/rulesets/${ruleset_id}" --input -
+}
+
 rp_check_release_please() {
   local slug="$1"
   local repo_fail=0
@@ -5517,6 +5617,20 @@ rp_check_protect_main_ruleset() {
         methods_json="$(rp_fetch_protect_main_merge_methods "$ruleset_json")"
       fi
     fi
+    if [[ -n "$ruleset_json" ]] && ! rp_ruleset_has_github_merge_queue "$ruleset_json"; then
+      rp_apply_protect_main_github_mq_shape "$slug"
+      set +e
+      ruleset_json="$(rp_fetch_protect_main_ruleset "$slug")"
+      fetch_exit=$?
+      set -e
+      if (( fetch_exit == 2 )); then
+        rp_log_gh_api_fail "$slug" 'could not read protect-main ruleset after GitHub MQ patch'
+        return 1
+      fi
+      if [[ -n "$ruleset_json" ]]; then
+        methods_json="$(rp_fetch_protect_main_merge_methods "$ruleset_json")"
+      fi
+    fi
   fi
 
   if ! rp_validate_ruleset_methods_json "$slug" "$methods_json"; then
@@ -5530,13 +5644,8 @@ rp_check_protect_main_ruleset() {
   fi
 
   if [[ "$repo_fail" -eq 0 ]]; then
-    if rp_ruleset_has_github_merge_queue "$ruleset_json"; then
-      rp_log_check_ok "$slug" 'protect-main ruleset (squash-only + GitHub merge queue)' \
-        "$(rp_github_url "$slug" '/settings/rules')"
-    else
-      rp_log_check_ok "$slug" 'protect-main ruleset (squash-only + Graphite bypass)' \
-        "$(rp_github_url "$slug" '/settings/rules')"
-    fi
+    rp_log_check_ok "$slug" 'protect-main ruleset (squash-only + GitHub merge queue)' \
+      "$(rp_github_url "$slug" '/settings/rules')"
   else
     rp_log_check_fail "$slug" 'protect-main ruleset (see AGENTS.md; fix with --apply-fix)' \
       "$(rp_github_url "$slug" '/settings/rules')"
@@ -5628,9 +5737,15 @@ rp_check_classic_main_protection() {
 rp_check_github_merge_queue() {
   local slug="$1"
   local repo_fail=0
-  local ci_text
+  local ci_text ci_fixed
   local fetch_ec=0
   local path_ec=0
+  local dependabot_workflow dependabot_auto_text
+  local strict=0
+
+  if rp_is_strict_repo "$slug"; then
+    strict=1
+  fi
 
   path_ec=0
   rp_gh_path_check "$slug" '.github/workflows/ci.yml' || path_ec=$?
@@ -5639,6 +5754,9 @@ rp_check_github_merge_queue() {
     repo_fail=1
   elif (( path_ec == 1 )); then
     rp_log_fail "${slug}: missing .github/workflows/ci.yml (required for GitHub merge queue checks)"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: add .github/workflows/ci.yml with merge_group: under on:"
+    fi
     repo_fail=1
   else
     fetch_ec=0
@@ -5651,7 +5769,65 @@ rp_check_github_merge_queue() {
       if [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest "${slug}: add merge_group: under on: in .github/workflows/ci.yml"
       fi
+      if [[ "$rp_apply_fix" -eq 1 ]] && [[ -n "${ci_text:-}" ]]; then
+        ci_fixed="$(rp_fix_ci_workflow_add_merge_group "$ci_text")"
+        rp_queue_candidate_file_fix "$slug" '.github/workflows/ci.yml' \
+          "$ci_fixed" \
+          'add-ci-merge-group' \
+          'fix(ci): trigger CI on merge_group for GitHub MQ'
+        rp_compact_record_fix "$slug" "${slug}: candidate PR: add merge_group trigger to ci.yml"
+      fi
       repo_fail=1
+    fi
+  fi
+
+  # Dependabot auto-merge for GitHub MQ (strict repos with dependabot.yml).
+  path_ec=0
+  rp_gh_path_check "$slug" '.github/dependabot.yml' || path_ec=$?
+  if (( path_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/dependabot.yml'
+    repo_fail=1
+  elif (( path_ec == 0 )); then
+    dependabot_workflow="$(rp_dependabot_auto_merge_workflow_path "$slug" || true)"
+    if [[ -z "$dependabot_workflow" ]]; then
+      if [[ "$strict" -eq 1 ]]; then
+        rp_log_fail "${slug}: dependabot.yml present but no dependabot auto-merge workflow"
+        if [[ "$rp_apply_fix" -eq 1 ]]; then
+          rp_queue_candidate_file_fix "$slug" '.github/workflows/dependabot-auto-merge.yml' \
+            "$(rp_candidate_dependabot_auto_merge_workflow)" \
+            'add-dependabot-auto-merge' \
+            'chore: add dependabot auto-merge workflow'
+        fi
+        if [[ "$rp_suggest" -eq 1 ]]; then
+          rp_log_suggest \
+            "${slug}: add dependabot-auto-merge.yml (gh pr merge --auto --squash for GitHub MQ)"
+        fi
+        repo_fail=1
+      fi
+    else
+      fetch_ec=0
+      dependabot_auto_text="$(rp_fetch_github_text_file "$slug" "$dependabot_workflow")" \
+        || fetch_ec=$?
+      if (( fetch_ec == 2 )); then
+        rp_log_gh_api_fail "$slug" "could not read ${dependabot_workflow}"
+        repo_fail=1
+      elif [[ -z "$dependabot_auto_text" ]] \
+        || ! grep -qF 'gh pr merge' <<<"$dependabot_auto_text" \
+        || ! grep -qF -- '--auto' <<<"$dependabot_auto_text"; then
+        rp_log_fail \
+          "${slug}: ${dependabot_workflow} must enable auto-merge via gh pr merge --auto"
+        if [[ "$rp_apply_fix" -eq 1 ]]; then
+          rp_queue_candidate_file_fix "$slug" "$dependabot_workflow" \
+            "$(rp_candidate_dependabot_auto_merge_workflow)" \
+            'add-dependabot-auto-merge' \
+            'chore: update dependabot auto-merge for GitHub MQ'
+        fi
+        if [[ "$rp_suggest" -eq 1 ]]; then
+          rp_log_suggest \
+            "${slug}: sync dependabot-auto-merge.yml to use gh pr merge --auto --squash"
+        fi
+        repo_fail=1
+      fi
     fi
   fi
 
@@ -5671,75 +5847,30 @@ rp_check_github_merge_queue() {
 
 rp_check_graphite_merge_queue() {
   local slug="$1"
-  local repo_fail=0
-  local strict=0
-  local labels_json
-  local labels_fetch_exit=0
-  local merge_it_exit=0
   local mq_exit=0
 
-  # Only take the GitHub MQ path on a positive detection. API errors (exit 2)
-  # fall through to the Graphite label/workflow checks — protect-main already
-  # reports ruleset fetch failures, and strict-onboarding still needs merge-it.
+  # Org default is GitHub native merge queue. Graphite MQ / merge-it is no longer
+  # the happy path; leftover Graphite wiring is not required.
   rp_repo_uses_github_merge_queue "$slug" || mq_exit=$?
   if (( mq_exit == 0 )); then
     rp_check_github_merge_queue "$slug"
     return $?
   fi
-
-  set +e
-  labels_json="$(rp_fetch_repo_labels_json "$slug")"
-  labels_fetch_exit=$?
-  set -e
-  if (( labels_fetch_exit == 2 )); then
-    rp_log_gh_api_fail "$slug" 'could not list repository labels'
-    rp_log_check_fail "$slug" 'Graphite merge queue setup (GitHub API error; retry)' \
-      "$(rp_github_url "$slug" '/tree/main/.github/workflows')"
+  if (( mq_exit == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read protect-main ruleset for merge queue check'
+    rp_log_check_fail "$slug" 'GitHub merge queue setup (GitHub API error; retry)' \
+      "$(rp_github_url "$slug" '/settings/rules')"
     return 1
   fi
 
-  merge_it_exit=0
-  rp_runner_jq_file "repo-practices merge-it label" "$labels_json" \
-    -e 'index("merge-it") != null' >/dev/null || merge_it_exit=$?
-  if (( merge_it_exit != 0 )); then
-    if [[ "$rp_strict_onboarding" -eq 1 ]] \
-      || { [[ "$rp_merge_only" -eq 0 ]] && rp_is_strict_repo "$slug"; }; then
-      rp_log_fail "${slug}: merge-it label is required for full org onboarding"
-      rp_log_suggest "${slug}: create merge-it label and enable Graphite merge queue on main"
-      return 1
-    fi
-    if [[ "$rp_new_repo" -eq 1 ]]; then
-      rp_log_suggest "${slug}: create merge-it label and enable Graphite merge queue on main"
-    fi
-    return 0
+  # No merge_queue yet: require GitHub MQ wiring for strict onboarding / strict repos.
+  if [[ "$rp_strict_onboarding" -eq 1 ]] \
+    || { [[ "$rp_merge_only" -eq 0 ]] && rp_is_strict_repo "$slug"; }; then
+    rp_check_github_merge_queue "$slug"
+    return $?
   fi
 
-  if rp_is_strict_repo "$slug"; then
-    strict=1
-  fi
-
-  if ! rp_validate_graphite_enqueue_labels "$slug" "$labels_json"; then
-    repo_fail=1
-  fi
-  if ! rp_validate_graphite_workflows "$slug" "$strict" "$labels_json"; then
-    repo_fail=1
-  fi
-
-  if [[ "$repo_fail" -eq 0 ]]; then
-    rp_log_check_ok "$slug" 'Graphite merge queue GitHub wiring' \
-      "$(rp_github_url "$slug" '/tree/main/.github/workflows')"
-    rp_log_manual_step \
-      'You: enable merge queue on main (squash strategy) in Graphite' \
-      'https://app.graphite.com/settings/merge-queue'
-  else
-    rp_log_check_fail "$slug" 'Graphite merge queue setup (see AGENTS.md and .cursor/skills/graphite/SKILL.md)' \
-      "$(rp_github_url "$slug" '/tree/main/.github/workflows')"
-    rp_log_manual_step \
-      'You: enable merge queue on main (squash strategy) in Graphite' \
-      'https://app.graphite.com/settings/merge-queue'
-  fi
-
-  return "$repo_fail"
+  return 0
 }
 
 rp_check_branch_hygiene() {
