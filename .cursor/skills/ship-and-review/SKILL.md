@@ -219,8 +219,10 @@ If quota-limited, wait the cooldown with **poll-while-rate-limited** feedback po
 review on head, the loop may post a one-shot `@coderabbitai full review` (idempotent per head).
 **While CodeRabbit is rate-limited**, the loop still **requests the next nudge agent**
 (Copilot, then Bugbot) so a mid-cooldown sign-off can clear the wait without a manual
-`AGENT_REVIEW_AGENT=copilot request` (issue #460). Prefer CodeRabbit when it can deliver;
-Copilot is a fallback unblock, not a permanent replacement.
+`AGENT_REVIEW_AGENT=copilot request` (issue #460). That mid-cooldown nudge does **not**
+set the host-wide per-day `probe_attempted` marker, so a later episode the same day can
+still probe Copilot instead of escalating past it to Bugbot. Prefer CodeRabbit when it
+can deliver; Copilot is a fallback unblock, not a permanent replacement.
 **When CodeRabbit says wait** (“More reviews will be available in N minutes”), do **not**
 re-ask — keep waiting until `retry_after`; the full-review helper hard-refuses while
 rate-limited. Rate-limit stubs are not reviews. Mid-cooldown human/agent feedback wakes
