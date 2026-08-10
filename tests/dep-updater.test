@@ -1983,27 +1983,77 @@ else
 fi
 
 # Missing HEAD uv.lock must not drop staged lock landings from reports.
-lock_report_fn="$(awk '/^py_uv_actual_lines_from_lock\(\)/,/^}$/' "$script")"
-# shellcheck disable=SC2016  # static assert matches literal source text
-if grep -qF ': >"$head_lock"' <<<"$lock_report_fn" \
-  && ! grep -qE 'show HEAD:uv.lock.*>.*&&.*return 0|show HEAD:uv.lock.*return 0' <<<"$lock_report_fn"; then
-  printf '[PASS] lock report: missing HEAD uv.lock uses empty baseline (still reports landings)\n'
+printf '\n=== behavioural: lock report with missing HEAD uv.lock ===\n'
+lock_report_tmp="$(mktemp -d)"
+(
+  cd "$lock_report_tmp"
+  git init --quiet
+  git config user.email 'test@example.com'
+  git config user.name 'test'
+  git commit --allow-empty --quiet -m 'init'
+  cat >uv.lock <<'EOF'
+version = 1
+
+[[package]]
+name = "autobahn"
+version = "26.7.1"
+EOF
+  git add uv.lock
+)
+lock_report_out="$(
+  # shellcheck disable=SC1090  # extracted helpers from script under test
+  source <(
+    awk '/^py_uv_lock_highest_version\(\)/,/^}$/' "$script"
+    awk '/^py_uv_actual_lines_from_lock\(\)/,/^}$/' "$script"
+  )
+  py_uv_actual_lines_from_lock "$lock_report_tmp" $'autobahn 25.12.2 26.7.1'
+)"
+rm -rf "$lock_report_tmp"
+if [[ "$lock_report_out" == 'autobahn 25.12.2 26.7.1' ]]; then
+  printf '[PASS] lock report: missing HEAD uv.lock still reports staged landing\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] lock report: missing HEAD uv.lock must use empty baseline, not early return\n'
+  printf '[FAIL] lock report: expected staged landing line, got: %s\n' "$lock_report_out"
   fail=$(( fail + 1 ))
 fi
 
 # Batch floor lock failure must snapshot/restore uv.lock — never git clean it away.
-batch_update_fn="$(awk '/^batch_update_all\(\)/,/^}$/' "$script")"
-if grep -qF 'Snapshot uv.lock before floor lock' <<<"$batch_update_fn" \
-  && ! grep -qE 'clean --force -- uv\.lock' <<<"$batch_update_fn"; then
-  printf '[PASS] uv-batch-floor: restores snapshotted uv.lock on failure (no git clean)\n'
+printf '\n=== behavioural: floor lock failure restores snapshotted uv.lock ===\n'
+floor_restore_tmp="$(mktemp -d)"
+(
+  cd "$floor_restore_tmp"
+  git init --quiet
+  git config user.email 'test@example.com'
+  git config user.name 'test'
+  printf 'name = "demo"\nversion = "0.1.0"\n' >pyproject.toml
+  printf 'ORIGINAL_LOCK\n' >uv.lock
+  git add pyproject.toml
+  git commit --quiet -m 'init'
+)
+floor_bak="$(mktemp)"
+cp "${floor_restore_tmp}/uv.lock" "$floor_bak"
+printf 'CORRUPTED_BY_FAILED_LOCK\n' >"${floor_restore_tmp}/uv.lock"
+printf 'name = "demo"\nversion = "0.2.0"\n' >"${floor_restore_tmp}/pyproject.toml"
+(
+  # Stub run_command for the extracted helper (shellcheck cannot see indirect calls).
+  # shellcheck disable=SC2317,SC2329
+  run_command() { shift; "$@" || true; }
+  # shellcheck disable=SC1090  # extracted helper from script under test
+  source <(awk '/^py_uv_restore_after_failed_floor_lock\(\)/,/^}$/' "$script")
+  py_uv_restore_after_failed_floor_lock "$floor_restore_tmp" "$floor_bak"
+)
+if [[ "$(cat "${floor_restore_tmp}/uv.lock")" == 'ORIGINAL_LOCK' ]] \
+  && [[ "$(cat "${floor_restore_tmp}/pyproject.toml")" == $'name = "demo"\nversion = "0.1.0"' ]] \
+  && [[ ! -f "$floor_bak" ]] \
+  && grep -qF 'py_uv_restore_after_failed_floor_lock' "$script" \
+  && ! grep -qE 'clean --force -- uv\.lock' "$script"; then
+  printf '[PASS] uv-batch-floor: restore helper returns snapshotted uv.lock (no git clean)\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] uv-batch-floor: must snapshot/restore uv.lock; must not git clean uv.lock\n'
+  printf '[FAIL] uv-batch-floor: restore helper did not restore lock/pyproject or git clean remains\n'
   fail=$(( fail + 1 ))
 fi
+rm -rf "$floor_restore_tmp"
 
 # batch path must call py_uv_lock_upgrade_package (not only py_update_one) and must
 # not uv add unconstrained packages (forces universal pins).
