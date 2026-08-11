@@ -159,6 +159,16 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 
 See [`.cursor/skills/graphite/SKILL.md`](.cursor/skills/graphite/SKILL.md) for Graphite **stacking** (`gt`) when `.github/stacking-tool` is `graphite`. This repo trials **`gh-stack`** — see [`.cursor/skills/gh-stack/SKILL.md`](.cursor/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc). Stacking is separate from merge enqueue (GitHub MQ).
 
+### Lexicographic code organization (org Cursor rule)
+
+Canonical rule: [`.cursor/rules/lexicographic-code-organization.mdc`](.cursor/rules/lexicographic-code-organization.mdc)
+(public block then private `_` block; ASCII sort within each; sorted closed-set literals such as
+`frozenset` / enum members).
+
+Consumer repos should **copy** that file into their `.cursor/rules/` (or symlink it from a local
+`repository-helpers` clone). Ensure `.gitignore` does not ignore `.cursor/rules/` (same policy as
+other org cursor rules). This repo does not yet distribute the rule via `github-repo-lint`.
+
 ### `protect-main` ruleset (required)
 
 Any repo with **GitHub merge queue** (`merge_queue` rule), **`release-please.yml`**, or **strict onboarding** must use the ruleset **`protect-main`** on `refs/heads/main`. Classic branch protection alone is **not** sufficient — the checker requires the ruleset. Org default enqueue is GitHub native merge queue (not Graphite MQ).
