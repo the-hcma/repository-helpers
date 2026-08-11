@@ -13,6 +13,8 @@ rp_ORG_OWNER_BYPASS_USER='thehcma'
 rp_THIS_REPO_NAME='repository-helpers'
 # GitHub merge-queue rule must squash (matches org Release Please / Graphite policy).
 rp_GITHUB_MQ_MERGE_METHOD='SQUASH'
+# Fail stuck MQ entries sooner when Actions leaves required checks in_progress.
+rp_GITHUB_MQ_CHECK_RESPONSE_TIMEOUT_MINUTES=15
 
 rp_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly rp_lib_dir
@@ -3665,7 +3667,7 @@ rp_repo_requires_protect_main_ruleset() {
 }
 
 rp_protect_main_create_payload() {
-  cat <<'RULESET'
+  cat <<RULESET
 {
   "name": "protect-main",
   "target": "branch",
@@ -3701,7 +3703,7 @@ rp_protect_main_create_payload() {
         "max_entries_to_merge": 5,
         "min_entries_to_merge_wait_minutes": 0,
         "grouping_strategy": "ALLGREEN",
-        "check_response_timeout_minutes": 60
+        "check_response_timeout_minutes": ${rp_GITHUB_MQ_CHECK_RESPONSE_TIMEOUT_MINUTES}
       }
     }
   ]
@@ -4998,11 +5000,13 @@ rp_validate_graphite_bypass_json() {
 }
 
 # rp_validate_github_merge_queue_ruleset <slug> <ruleset_json>
-# When protect-main exists, require a merge_queue rule with squash merge method.
+# When protect-main exists, require a merge_queue rule with squash merge method
+# and org-default check_response_timeout_minutes.
 rp_validate_github_merge_queue_ruleset() {
   local slug="$1"
   local ruleset_json="$2"
   local method
+  local check_timeout_minutes
 
   if [[ -z "$ruleset_json" ]]; then
     return 0
@@ -5019,13 +5023,25 @@ rp_validate_github_merge_queue_ruleset() {
 
   method="$(rp_runner_jq_file "repo-practices merge_queue merge_method" "$ruleset_json" \
     -r '[.rules[]? | select(.type == "merge_queue") | .parameters.merge_method // empty] | first // empty')"
-  if [[ "$method" == "$rp_GITHUB_MQ_MERGE_METHOD" ]]; then
+  if [[ "$method" != "$rp_GITHUB_MQ_MERGE_METHOD" ]]; then
+    rp_log_fail "${slug}: protect-main merge_queue merge_method must be ${rp_GITHUB_MQ_MERGE_METHOD} (got: ${method:-missing})"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: set protect-main merge_queue parameters.merge_method to ${rp_GITHUB_MQ_MERGE_METHOD}"
+    fi
+    return 1
+  fi
+
+  check_timeout_minutes="$(rp_runner_jq_file "repo-practices merge_queue check_response_timeout" "$ruleset_json" \
+    -r '[.rules[]? | select(.type == "merge_queue") | .parameters.check_response_timeout_minutes // empty] | first // empty')"
+  if [[ "$check_timeout_minutes" == "$rp_GITHUB_MQ_CHECK_RESPONSE_TIMEOUT_MINUTES" ]]; then
     return 0
   fi
 
-  rp_log_fail "${slug}: protect-main merge_queue merge_method must be ${rp_GITHUB_MQ_MERGE_METHOD} (got: ${method:-missing})"
+  rp_log_fail \
+    "${slug}: protect-main merge_queue check_response_timeout_minutes must be ${rp_GITHUB_MQ_CHECK_RESPONSE_TIMEOUT_MINUTES} (got: ${check_timeout_minutes:-missing})"
   if [[ "$rp_suggest" -eq 1 ]]; then
-    rp_log_suggest "${slug}: set protect-main merge_queue parameters.merge_method to ${rp_GITHUB_MQ_MERGE_METHOD}"
+    rp_log_suggest \
+      "${slug}: set protect-main merge_queue check_response_timeout_minutes to ${rp_GITHUB_MQ_CHECK_RESPONSE_TIMEOUT_MINUTES} via --apply-fix"
   fi
   return 1
 }
@@ -5466,6 +5482,7 @@ rp_apply_protect_main_github_mq_shape() {
   payload="${payload//$'\n'/}"
   payload="$(rp_runner_jq_file "repo-practices github-mq ruleset payload" "$payload" \
     --arg method "$rp_GITHUB_MQ_MERGE_METHOD" \
+    --argjson timeout "$rp_GITHUB_MQ_CHECK_RESPONSE_TIMEOUT_MINUTES" \
     --argjson graphite_id "$rp_GRAPHITE_APP_ACTOR_ID" '
     .bypass_actors = ((.bypass_actors // []) | map(
       select(.actor_id != $graphite_id or .actor_type != "Integration")
@@ -5483,8 +5500,7 @@ rp_apply_protect_main_github_mq_shape() {
               | .parameters.min_entries_to_merge_wait_minutes =
                   (.parameters.min_entries_to_merge_wait_minutes // 0)
               | .parameters.grouping_strategy = (.parameters.grouping_strategy // "ALLGREEN")
-              | .parameters.check_response_timeout_minutes =
-                  (.parameters.check_response_timeout_minutes // 60)
+              | .parameters.check_response_timeout_minutes = $timeout
             else .
             end
           )
@@ -5498,7 +5514,7 @@ rp_apply_protect_main_github_mq_shape() {
               max_entries_to_merge: 5,
               min_entries_to_merge_wait_minutes: 0,
               grouping_strategy: "ALLGREEN",
-              check_response_timeout_minutes: 60
+              check_response_timeout_minutes: $timeout
             }
           }]
           end
