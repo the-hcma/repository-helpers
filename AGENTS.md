@@ -178,7 +178,7 @@ Any repo with **GitHub merge queue** (`merge_queue` rule), **`release-please.yml
 | `deletion` | Block branch deletion |
 | `non_fast_forward` | Block force-push |
 | `pull_request` with `allowed_merge_methods: ["squash"]` | Squash-only merges (Release Please + merge queue) |
-| `merge_queue` with `merge_method: SQUASH` | Native GitHub merge queue (org default) |
+| `merge_queue` with `merge_method: SQUASH` | Native GitHub merge queue (org default); `check_response_timeout_minutes: 15` |
 
 Graphite App bypass (`actor_id` **158384**) is **not** required for the org GitHub MQ profile. Leftover Graphite Integration bypass actors may be removed via `--apply-fix`.
 
