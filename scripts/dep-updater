@@ -5799,13 +5799,16 @@ rust_is_pinned() {
   return 1
 }
 
-# List direct outdated crates as: name current target kind package
+# List direct outdated crates as TSV:
+#   name<TAB>current<TAB>target<TAB>kind<TAB>package<TAB>platform
+# platform is cargo-outdated's target cfg/triple (e.g. cfg(target_os = "macos")),
+# or "-" when the dep is not platform-specific. Tabs keep spaces in platform intact.
 # Uses cargo-outdated JSON (--root-deps-only; --workspace when applicable).
 # Optional $1: directory to scan (defaults to $dir).
 rust_outdated() {
   local -r target_dir="${1:-$dir}"
   local -a outdated_args=(--root-deps-only --format json)
-  local json_out dep_name cur target dep_kind dep_package
+  local json_out dep_name cur target dep_kind dep_package dep_platform
 
   if rust_workspace_enabled "$target_dir"; then
     outdated_args+=(--workspace)
@@ -5818,6 +5821,9 @@ rust_outdated() {
   # sentinel "---" (no newer version within the caret/range), fall through to
   # latest — otherwise out-of-range bumps like tungstenite 0.29→0.30 are dropped
   # because jq's // only treats null/false/empty as missing, not "---".
+  # Use join("\t") rather than @tsv: platform cfg strings contain double quotes
+  # (cfg(target_os = "macos")), and @tsv may quote/escape those fields so cargo
+  # add --target would receive a corrupted value.
   # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
   dep_runner_jq_with_args "cargo outdated rows" "$json_out" -r '
         (if type == "array" then .[] else . end)
@@ -5831,9 +5837,17 @@ rust_outdated() {
            else $d.latest
            end) as $target
         | select($target != "---" and $d.project != $target)
-        | "\($d.name | split(" -> ") | last) \($d.project) \($target) \($d.kind // "Normal") \($crate // "-")"
+        | [
+            ($d.name | split(" -> ") | last),
+            $d.project,
+            $target,
+            ($d.kind // "Normal"),
+            ($crate // "-"),
+            (if ($d.platform == null or $d.platform == "") then "-" else $d.platform end)
+          ]
+        | join("\t")
       ' 2>/dev/null \
-    | while IFS=' ' read -r dep_name cur target dep_kind dep_package; do
+    | while IFS=$'\t' read -r dep_name cur target dep_kind dep_package dep_platform; do
         [[ -z "$dep_name" ]] && continue
         [[ "$dep_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
         if rust_is_pinned "$dep_name" "$target_dir"; then
@@ -5842,7 +5856,9 @@ rust_outdated() {
         fi
         [[ -z "$dep_kind" ]] && dep_kind="Normal"
         [[ -z "$dep_package" ]] && dep_package="-"
-        printf '%s %s %s %s %s\n' "$dep_name" "$cur" "$target" "$dep_kind" "$dep_package"
+        [[ -z "$dep_platform" ]] && dep_platform="-"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$dep_name" "$cur" "$target" "$dep_kind" "$dep_package" "$dep_platform"
       done
 }
 
@@ -5965,13 +5981,15 @@ rust_recover_post_bump_clippy() {
 }
 
 # Bump one direct dependency and open a stacked PR.
-# Args: $1=crate, $2=current version, $3=target version, $4=dependency kind, $5=workspace package
+# Args: $1=crate, $2=current version, $3=target version, $4=dependency kind,
+#       $5=workspace package, $6=platform (cargo --target cfg/triple, or "-")
 rust_update_one() {
   local -r pkg="$1"
   local -r old_ver="$2"
   local -r new_ver="$3"
   local -r dep_kind="${4:-Normal}"
   local -r dep_package="${5:--}"
+  local -r dep_platform="${6:--}"
   local safe_name
   safe_name="$(sanitize_branch_name "$pkg")"
   local -r branch="dep-updates/rust-${safe_name}"
@@ -6006,6 +6024,11 @@ rust_update_one() {
     Build)       cargo_add_args=(--build "${cargo_add_args[@]}") ;;
     *)           : ;;
   esac
+  # Platform-specific deps must use --target so cargo updates the existing
+  # [target.'cfg(…)'.dependencies] pin instead of adding a second root entry.
+  if [[ -n "$dep_platform" && "$dep_platform" != "-" ]]; then
+    cargo_add_args=(--target "$dep_platform" "${cargo_add_args[@]}")
+  fi
   if rust_workspace_enabled "$worktree_path" && [[ "$dep_package" != "-" ]]; then
     cargo_add_args=(--package "$dep_package" "${cargo_add_args[@]}")
   fi
@@ -6303,7 +6326,7 @@ batch_update_all() {
   batch_ts="$(time_log_date_utc '%Y%m%dT%H%M%S')"
   local -r branch="dep-updates/batch-${batch_ts}"
   local any_npm=0 any_py=0
-  local py_out py_exit b_constraint_op b_spec actual_py_lines='' dep_kind dep_package
+  local py_out py_exit b_constraint_op b_spec actual_py_lines='' dep_kind dep_package dep_platform
   local uv_floor_batch uv_upgrade_success report_py_lines
   local -a uv_upgrade_specs=()
   local -a cargo_add_args=()
@@ -6682,7 +6705,7 @@ batch_update_all() {
   # ── Rust / Cargo ─────────────────────────────────────────────────────────
   local any_rust=0
   if [[ "$has_rust" == '1' && -n "$rust_lines_arg" && "$security_only" == '0' ]]; then
-    while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+    while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
       [[ -z "$pkg" ]] && continue
       log "[rust] Batch update: ${pkg} ${old_ver} → ${new_ver}"
       cargo_add_args=("${pkg}@${new_ver}")
@@ -6691,6 +6714,9 @@ batch_update_all() {
         Build)       cargo_add_args=(--build "${cargo_add_args[@]}") ;;
         *)           : ;;
       esac
+      if [[ -n "${dep_platform:-}" && "${dep_platform}" != "-" ]]; then
+        cargo_add_args=(--target "$dep_platform" "${cargo_add_args[@]}")
+      fi
       if rust_workspace_enabled "$worktree_path" && [[ "${dep_package:-"-"}" != "-" ]]; then
         cargo_add_args=(--package "$dep_package" "${cargo_add_args[@]}")
       fi
@@ -6835,7 +6861,7 @@ batch_update_all() {
         done <<< "$report_py_lines"
       fi
       if [[ "$any_rust" == '1' && -n "$rust_lines_arg" ]]; then
-        while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+        while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
           [[ -z "$pkg" ]] && continue
           printf "| rust/cargo | \`%s\` | \`%s\` | \`%s\` | no | - |\n" "$pkg" "$old_ver" "$new_ver"
         done <<< "$rust_lines_arg"
@@ -6895,7 +6921,7 @@ batch_update_all() {
         printf '## Rust updates\n\n'
         printf '| Crate | From | To |\n'
         printf '|---|---|---|\n'
-        while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+        while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
           [[ -z "$pkg" ]] && continue
           printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$pkg" "$old_ver" "$new_ver"
         done <<< "$rust_lines_arg"
@@ -6947,7 +6973,7 @@ batch_update_all() {
     add_summary_line "python/${py_tool}" "$pkg" "$_current" "$fix" "$branch" "$pr_num" "yes" "${_cves:--}"
   done <<< "${py_audit_lines_arg:-}"
   if [[ "$any_rust" == '1' ]]; then
-    while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+    while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
       [[ -z "$pkg" ]] && continue
       add_summary_line "rust/cargo" "$pkg" "$old_ver" "$new_ver" "$branch" "$pr_num" "no" "-"
     done <<< "${rust_lines_arg:-}"
@@ -8085,7 +8111,7 @@ _emit_report_json() {
     done <<< "$gha_lines"
   fi
   if [[ -n "$rust_lines" ]]; then
-    while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+    while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
       [[ -z "$pkg" ]] && continue
       # shellcheck disable=SC2016  # jq row accumulator uses jq variables, not shell expansion
       updates_json="$(dep_runner_jq_with_args "dep-updater report-json rust update row" "$updates_json" \
@@ -8870,7 +8896,7 @@ if [[ "$dry_run" == '1' ]]; then
     done <<< "$py_lines"
   fi
   if [[ -n "$rust_lines" ]]; then
-    while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+    while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
       [[ -z "$pkg" ]] && continue
       all_rows+=("rust/cargo|$pkg|$old_ver|$new_ver")
     done <<< "$rust_lines"
@@ -8985,12 +9011,17 @@ if [[ "$dry_run" == '1' ]]; then
     fi
 
     if [[ -n "$rust_lines" ]]; then
-      while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+      while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
         [[ -z "$pkg" ]] && continue
-        local safe_rust rust_branch rust_commit
+        local safe_rust rust_branch rust_commit rust_cmd
         safe_rust="$(sanitize_branch_name "$pkg")"
         rust_branch="dep-updates/rust-${safe_rust}"
         rust_commit="chore(deps): bump ${pkg} from ${old_ver} to ${new_ver}"
+        rust_cmd='cargo add'
+        if [[ -n "${dep_platform:-}" && "${dep_platform}" != "-" ]]; then
+          rust_cmd+=" --target $(printf '%q' "$dep_platform")"
+        fi
+        rust_cmd+=" $(printf '%q' "${pkg}@${new_ver}")"
         pr_index=$(( pr_index + 1 ))
         print_dry_run_pr_plan \
           "$pr_index" \
@@ -8999,7 +9030,7 @@ if [[ "$dry_run" == '1' ]]; then
           "$rust_commit" \
           "Cargo.toml + Cargo.lock" \
           "${pkg} ${old_ver} ${new_ver}" \
-          "cargo add ${pkg}@${new_ver}"
+          "$rust_cmd"
       done <<< "$rust_lines"
     fi
 
@@ -9164,9 +9195,9 @@ else
 
   # Process Rust / Cargo
   if [[ -n "$rust_lines" ]]; then
-    while IFS=' ' read -r pkg old_ver new_ver dep_kind dep_package; do
+    while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
       [[ -z "$pkg" ]] && continue
-      rust_update_one "$pkg" "$old_ver" "$new_ver" "$dep_kind" "$dep_package"
+      rust_update_one "$pkg" "$old_ver" "$new_ver" "$dep_kind" "$dep_package" "$dep_platform"
     done <<< "$rust_lines"
   fi
 
