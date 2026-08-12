@@ -168,8 +168,9 @@ Canonical rule: [`.cursor/rules/lexicographic-code-organization.mdc`](.cursor/ru
 
 Consumer repos should **copy** that file into their `.cursor/rules/` (or symlink it from a local
 `repository-helpers` clone). Ensure `.gitignore` does not ignore `.cursor/rules/` (same policy as
-other org cursor rules). Also copy `.cursor/rules/repo-practices-after-config-change.mdc` (or
-apply via `github-repo-lint --apply-fix` when candidate wiring is enabled for your repo).
+other org cursor rules). Prefer `github-repo-lint --apply-fix` (uses
+`scripts/lib/repo-practices-cursor/repo-practices-after-config-change.mdc`) or copy
+that template into `.cursor/rules/`.
 
 ### `protect-main` ruleset (required)
 
