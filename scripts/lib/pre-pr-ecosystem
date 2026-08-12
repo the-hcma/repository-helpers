@@ -12,6 +12,8 @@ _prec_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly _prec_lib_dir
 # shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
 source "${_prec_lib_dir}/runner-ensure"
+# shellcheck disable=SC1091
+source "${_prec_lib_dir}/github-repo-slug"
 
 # Populated by prec_detect_profile / prec_load_skip_env (lowercase; not exported).
 prec_detected=()
@@ -289,6 +291,143 @@ prec_detect_profile() {
     prec_detected+=('bash-tests')
     prec_plan_add_job 'tests'
   fi
+  if prec_should_plan_repo_practices_lint "$root"; then
+    prec_detected+=('repo-practices')
+    prec_plan_add_job 'repo-practices-lint'
+  fi
+}
+
+# True when a changed path should trigger org repo-practices audit before submit.
+prec_relpath_is_repo_practices_sensitive() {
+  local -r relpath="$1"
+
+  [[ "$relpath" == .github/* ]] && return 0
+  case "$relpath" in
+    pnpm-workspace.yaml) return 0 ;;
+    release-please-config.json) return 0 ;;
+    .release-please-manifest.json) return 0 ;;
+    scripts/lib/repo-practices-workflows/*) return 0 ;;
+    web/pnpm-workspace.yaml) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Append unique repo-practices-sensitive paths from a git diff name-only stream.
+prec_collect_repo_practices_sensitive_from_diff() {
+  local -r root="$1"
+  local -n _prec_sensitive_out=$2
+  local -a seen=()
+  local relpath line dup=0 s
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    relpath="${line#./}"
+    if ! prec_relpath_is_repo_practices_sensitive "$relpath"; then
+      continue
+    fi
+    dup=0
+    for s in "${seen[@]+"${seen[@]}"}"; do
+      if [[ "$s" == "$relpath" ]]; then
+        dup=1
+        break
+      fi
+    done
+    if (( dup == 0 )); then
+      seen+=("$relpath")
+      _prec_sensitive_out+=("$relpath")
+    fi
+  done < <(prec_git_diff_name_only_for_repo_practices "$root")
+}
+
+# Name-only diff vs main plus staged/unstaged edits on HEAD.
+prec_git_diff_name_only_for_repo_practices() {
+  local -r root="$1"
+  local ref diff_exit_code=0
+
+  ref=''
+  if runner_exec "prec git rev-parse origin/main" --probe \
+    -- git -C "$root" rev-parse --verify --quiet origin/main; then
+    ref='origin/main'
+  elif runner_exec "prec git rev-parse main" --probe \
+    -- git -C "$root" rev-parse --verify --quiet main; then
+    ref='main'
+  fi
+
+  if [[ -n "$ref" ]]; then
+    runner_exec_stdout "prec git diff name-only vs ${ref}" \
+      -- git -C "$root" diff --name-only "${ref}...HEAD" \
+      || diff_exit_code=$?
+    if (( diff_exit_code != 0 )); then
+      printf '==> warn: git diff vs %s failed (exit %s); using working-tree diff only\n' \
+        "$ref" "$diff_exit_code" >&2
+    fi
+  fi
+
+  runner_exec_stdout "prec git diff name-only working tree" \
+    -- git -C "$root" diff --name-only HEAD \
+    || true
+  runner_exec_stdout "prec git diff name-only cached" \
+    -- git -C "$root" diff --name-only --cached HEAD \
+    || true
+}
+
+prec_resolve_github_repo_lint_script() {
+  local -r root="$1"
+  local helpers_dir candidate
+
+  if [[ -f "${root}/scripts/github-repo-lint" ]]; then
+    printf '%s\n' "${root}/scripts/github-repo-lint"
+    return 0
+  fi
+  helpers_dir="${REPOSITORY_HELPERS_DIR:-}"
+  if [[ -n "$helpers_dir" && -f "${helpers_dir}/scripts/github-repo-lint" ]]; then
+    printf '%s\n' "${helpers_dir}/scripts/github-repo-lint"
+    return 0
+  fi
+  candidate="${root}/../repository-helpers/scripts/github-repo-lint"
+  if [[ -f "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  candidate="${HOME}/work/ai/repository-helpers/scripts/github-repo-lint"
+  if [[ -f "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+prec_should_plan_repo_practices_lint() {
+  local -r root="$1"
+  local -a touched=()
+
+  prec_collect_repo_practices_sensitive_from_diff "$root" touched
+  if [[ "${#touched[@]}" -eq 0 ]]; then
+    return 1
+  fi
+  if ! prec_resolve_github_repo_lint_script "$root" >/dev/null; then
+    printf '==> note: repo-practices-sensitive paths changed but github-repo-lint not found; skipping repo-practices-lint job\n' >&2
+    return 1
+  fi
+  return 0
+}
+
+prec_run_repo_practices_lint() {
+  local -r root="$1"
+  local slug lint_script lint_exit_code=0
+
+  slug="$(gh_slug_from_repo_dir "$root")" || {
+    printf '==> warn: repo-practices-lint skipped (origin is not a GitHub OWNER/NAME remote)\n' >&2
+    return 0
+  }
+  lint_script="$(prec_resolve_github_repo_lint_script "$root")" || {
+    printf '==> warn: repo-practices-lint skipped (scripts/github-repo-lint not found)\n' >&2
+    return 0
+  }
+
+  run_command "pre-pr repo-practices lint (${slug})" env NO_COLOR=1 "$lint_script" \
+    --repo "$slug" --suggest --strict-onboarding || lint_exit_code=$?
+  return "$lint_exit_code"
 }
 
 # prec_format_detected — print comma-separated detected ecosystems (or "none").
@@ -323,7 +462,7 @@ prec_job_is_planned() {
 
 # prec_require_tools_for_planned — die if a tool needed by a planned job is missing.
 prec_require_tools_for_planned() {
-  local need_shellcheck=0 need_actionlint=0 need_rg=0 need_uv=0 need_pnpm=0 need_cargo=0
+  local need_shellcheck=0 need_actionlint=0 need_rg=0 need_uv=0 need_pnpm=0 need_cargo=0 need_gh=0
 
   prec_job_is_planned 'shellcheck' && need_shellcheck=1
   prec_job_is_planned 'actionlint' && need_actionlint=1
@@ -333,6 +472,7 @@ prec_require_tools_for_planned() {
   prec_job_is_planned 'ts-root' && need_pnpm=1
   prec_job_is_planned 'cargo-fmt' && need_cargo=1
   prec_job_is_planned 'cargo-clippy' && need_cargo=1
+  prec_job_is_planned 'repo-practices-lint' && need_gh=1
 
   command -v bash >/dev/null 2>&1 || prec_die "bash not found on PATH"
 
@@ -359,6 +499,10 @@ prec_require_tools_for_planned() {
   if [[ "$need_cargo" -eq 1 ]]; then
     command -v cargo >/dev/null 2>&1 \
       || prec_die "cargo not found on PATH. Install: https://www.rust-lang.org/tools/install"
+  fi
+  if [[ "$need_gh" -eq 1 ]]; then
+    command -v gh >/dev/null 2>&1 \
+      || prec_die "gh not found on PATH (required for planned repo-practices-lint job)"
   fi
 }
 

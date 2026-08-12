@@ -144,6 +144,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
 | License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
 | Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` + `.cursor/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve |
+| Repo practices after config change | yes | — | `.cursor/rules/repo-practices-after-config-change.mdc` requires `github-repo-lint` after workflow/config edits; `pre-pr-checks` runs detect-first `repo-practices-lint` when the diff touches those paths |
 | Session-start read guidance | yes | — | `.cursor/rules/read-agents-and-rules.mdc` requires reading `AGENTS.md` and `.cursor/rules/` at the start of every new agent session |
 | Stacking-tool marker + rule | yes | — | `.github/stacking-tool` (`graphite`\|`gh-stack`) and thin `.cursor/rules/stacking-tool.mdc` (skill breadcrumbs; no copied skill bodies) |
 | UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
@@ -167,7 +168,9 @@ Canonical rule: [`.cursor/rules/lexicographic-code-organization.mdc`](.cursor/ru
 
 Consumer repos should **copy** that file into their `.cursor/rules/` (or symlink it from a local
 `repository-helpers` clone). Ensure `.gitignore` does not ignore `.cursor/rules/` (same policy as
-other org cursor rules). This repo does not yet distribute the rule via `github-repo-lint`.
+other org cursor rules). Prefer `github-repo-lint --apply-fix` (uses
+`scripts/lib/repo-practices-cursor/repo-practices-after-config-change.mdc`) or copy
+that template into `.cursor/rules/`.
 
 ### `protect-main` ruleset (required)
 
