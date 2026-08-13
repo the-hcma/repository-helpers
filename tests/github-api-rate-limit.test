@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# tests/github-api-rate-limit.test — GitHub API rate-limit wait/retry helpers.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+lib="${root}/scripts/lib/github-api-rate-limit"
+# shellcheck source=scripts/lib/runner-bootstrap
+source "${root}/scripts/lib/runner-bootstrap"
+# shellcheck source=scripts/lib/github-api-rate-limit
+source "$lib"
+
+fail=0
+pass=0
+pass_case() {
+  printf '[PASS] %s\n' "$1"
+  pass=$((pass + 1))
+}
+fail_case() {
+  printf '[FAIL] %s\n' "$1"
+  fail=$((fail + 1))
+}
+
+printf '\n=== static: github-api-rate-limit wiring ===\n'
+if grep -qF 'github_api_exec_with_rate_limit_retry' \
+  "${root}/scripts/lib/agent-review" \
+  && grep -qF 'github_api_exec_with_rate_limit_retry' \
+    "${root}/scripts/lib/repo-practices" \
+  && grep -qF 'github_api_exec_with_rate_limit_retry' \
+    "${root}/scripts/lib/ci-check-rollup" \
+  && grep -qF 'github_api_wait_for_rate_limit' \
+    "${root}/scripts/lib/repo-practices"; then
+  pass_case "agent-review, repo-practices, and ci-check-rollup use rate-limit retry"
+else
+  fail_case "missing rate-limit retry wiring in gh wrappers"
+fi
+
+if grep -qF 'NOTE: GITHUB_RATE_LIMIT_WAIT' "$lib" \
+  && grep -qF 'ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT' "$lib" \
+  && grep -qF 'ERROR: GITHUB_RATE_LIMIT' "$lib"; then
+  pass_case "emits machine-parseable NOTE/ERROR rate-limit lines"
+else
+  fail_case "missing machine-parseable rate-limit NOTE/ERROR lines"
+fi
+
+printf '\n=== behavioural: detail detection ===\n'
+if github_api_detail_is_rate_limited 'API rate limit exceeded for user ID 1'; then
+  pass_case "detects primary API rate limit exceeded"
+else
+  fail_case "missed primary API rate limit exceeded"
+fi
+if github_api_detail_is_rate_limited 'You have exceeded a secondary rate limit'; then
+  pass_case "detects secondary rate limit"
+else
+  fail_case "missed secondary rate limit"
+fi
+if github_api_detail_is_rate_limited 'HTTP 429: too many requests'; then
+  pass_case "detects HTTP 429"
+else
+  fail_case "missed HTTP 429"
+fi
+if ! github_api_detail_is_rate_limited 'HTTP 401 Bad credentials'; then
+  pass_case "does not treat auth failures as rate limit"
+else
+  fail_case "auth failure wrongly classified as rate limit"
+fi
+
+printf '\n=== behavioural: retry-after parse ===\n'
+parsed="$(_github_api_parse_retry_after_seconds 'Retry after 12 seconds' || true)"
+if [[ "$parsed" == '12' ]]; then
+  pass_case "parses retry after N seconds"
+else
+  fail_case "retry-after seconds parse failed (got=${parsed})"
+fi
+parsed="$(_github_api_parse_retry_after_seconds 'Please wait 3 minutes before retrying' || true)"
+if [[ "$parsed" == '180' ]]; then
+  pass_case "parses wait N minutes"
+else
+  fail_case "wait minutes parse failed (got=${parsed})"
+fi
+
+printf '\n=== behavioural: exec retries then fails closed ===\n'
+mock_bin="$(mktemp -d)"
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'gh: API rate limit exceeded for user ID 9\n' >&2
+exit 1
+EOF
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      github_api_rate_limit_max_retries=2
+      github_api_wait_for_rate_limit() {
+        printf "NOTE: GITHUB_RATE_LIMIT_WAIT fake\n" >&2
+        return 0
+      }
+      github_api_exec_with_rate_limit_retry "test-rate" -- gh api user
+    ' 2>&1
+)"
+ec=$?
+set -e
+
+if (( ec != 0 )) \
+  && grep -qF 'NOTE: GITHUB_RATE_LIMIT_HIT' <<<"$out" \
+  && grep -qF 'ERROR: GITHUB_RATE_LIMIT' <<<"$out"; then
+  pass_case "retries on rate limit then emits ERROR: GITHUB_RATE_LIMIT"
+else
+  fail_case "retry fail-closed broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+state_file="${MOCK_GH_STATE:?}"
+n=0
+if [[ -f "$state_file" ]]; then
+  n="$(cat "$state_file")"
+fi
+n=$((n + 1))
+printf '%s' "$n" >"$state_file"
+if (( n == 1 )); then
+  printf 'gh: API rate limit exceeded\n' >&2
+  exit 1
+fi
+printf '{"login":"ok"}\n'
+exit 0
+EOF
+chmod +x "${mock_bin}/gh"
+state="$(mktemp)"
+printf '0' >"$state"
+
+set +e
+out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" \
+    MOCK_GH_STATE="$state" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      github_api_rate_limit_max_retries=3
+      github_api_wait_for_rate_limit() {
+        printf "NOTE: GITHUB_RATE_LIMIT_WAIT fake\n" >&2
+        return 0
+      }
+      github_api_exec_with_rate_limit_retry "test-rate-ok" -- gh api user
+    ' 2>&1
+)"
+ec=$?
+set -e
+
+if (( ec == 0 )) \
+  && grep -qF 'NOTE: GITHUB_RATE_LIMIT_HIT' <<<"$out" \
+  && grep -qF '{"login":"ok"}' <<<"$out"; then
+  pass_case "retries after wait and succeeds when quota returns"
+else
+  fail_case "retry-success path broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+rm -rf "$mock_bin" "$state"
+
+printf '\n=== skill docs mention GitHub API rate limits ===\n'
+skill="${root}/.cursor/skills/ship-and-review/SKILL.md"
+if grep -qF 'GitHub API rate limit' "$skill"; then
+  pass_case "ship-and-review skill documents GitHub API rate-limit wait"
+else
+  fail_case "ship-and-review skill missing GitHub API rate-limit guidance"
+fi
+
+printf '\n--- results: %s passed, %s failed ---\n' "$pass" "$fail"
+(( fail == 0 ))

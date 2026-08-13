@@ -75,6 +75,15 @@ identify a fix, push, and resume. Escalate to a human **only** when a fix cannot
 
 Do **not** skip CI monitoring with `--no-wait` / `--no-wait-ci` unless the user explicitly opts out. The agent review loop also blocks when `ci_ready` is false.
 
+**GitHub API rate limits (not CodeRabbit):** `scripts/lib/github-api-rate-limit` wraps
+agent-review / repo-practices / CI-rollup `gh` calls. On `API rate limit exceeded` /
+secondary limits / HTTP 429, helpers print `NOTE: GITHUB_RATE_LIMIT_HIT` then
+`NOTE: GITHUB_RATE_LIMIT_WAIT` and sleep until `rate_limit` reset (or a short backoff).
+Exhausted retries emit `ERROR: GITHUB_RATE_LIMIT`; wait budget expiry emits
+`ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT`. Tune with `GITHUB_API_RATE_LIMIT_MAX_RETRIES`,
+`GITHUB_API_RATE_LIMIT_MAX_WAIT_S`, `GITHUB_API_RATE_LIMIT_POLL_S`. Do **not** treat this
+as a hard local failure while NOTES show an active wait — let the wait finish, then resume.
+
 Use `scripts/dev/ship-and-review --no-agent-review` when you only want submit + CI (no loop).
 Use `--no-submit --pr <n>` when the PR already exists (CI + loop only).
 Use `scripts/dev/submit-stack --no-wait-ci` only when CI monitoring is handled separately.
