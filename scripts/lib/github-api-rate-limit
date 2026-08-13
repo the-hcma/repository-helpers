@@ -4,11 +4,14 @@
 # Used by agent-review and repo-practices gh wrappers so coding-agent flows sleep
 # until reset instead of failing hard on HTTP 403 "API rate limit exceeded".
 #
+# Backoff prefers HTTP response headers (Retry-After, X-RateLimit-Reset) from
+# `gh api --include rate_limit`, not guessed sleeps.
+#
 # Env overrides:
 #   GITHUB_API_RATE_LIMIT_MAX_RETRIES   wait-and-retry cycles (default 3)
 #   GITHUB_API_RATE_LIMIT_MAX_WAIT_S   total wait budget per wait (default 3600)
 #   GITHUB_API_RATE_LIMIT_POLL_S       sleep chunk while waiting (default 30)
-#   GITHUB_API_RATE_LIMIT_RETRY_SLEEP_S  fallback when reset unknown (default 60)
+#   GITHUB_API_RATE_LIMIT_RETRY_SLEEP_S  fallback when headers unavailable (default 60)
 
 if declare -F github_api_detail_is_rate_limited >/dev/null 2>&1; then
   return 0
@@ -25,16 +28,31 @@ github_api_rate_limit_poll_s="${GITHUB_API_RATE_LIMIT_POLL_S:-30}"
 github_api_rate_limit_retry_sleep_s="${GITHUB_API_RATE_LIMIT_RETRY_SLEEP_S:-60}"
 
 # github_api_detail_is_rate_limited <detail>
-# True for primary/secondary GitHub API rate-limit wording (403 or 429).
+# True for primary/secondary GitHub API rate-limit wording (anchored; not bare "429").
 github_api_detail_is_rate_limited() {
   local -r detail="$1"
   local lower
 
   lower="$(printf '%s' "$detail" | tr '[:upper:]' '[:lower:]')"
-  [[ "$lower" == *'rate limit'* \
-    || "$lower" == *'rate limited'* \
-    || "$lower" == *'secondary rate'* \
-    || "$detail" == *'429'* ]]
+  [[ "$lower" == *'api rate limit exceeded'* \
+    || "$lower" == *'secondary rate limit'* \
+    || "$lower" == *'http 429'* \
+    || "$lower" == *'(http 429)'* \
+    || "$lower" == *'was made too recently'* ]]
+}
+
+# github_api_detail_is_secondary_rate_limited <detail>
+# True when detail looks like a secondary / abuse / HTTP 429 limit (core.remaining may
+# still be > 0).
+github_api_detail_is_secondary_rate_limited() {
+  local -r detail="$1"
+  local lower
+
+  lower="$(printf '%s' "$detail" | tr '[:upper:]' '[:lower:]')"
+  [[ "$lower" == *'secondary rate limit'* \
+    || "$lower" == *'http 429'* \
+    || "$lower" == *'(http 429)'* \
+    || "$lower" == *'was made too recently'* ]]
 }
 
 # github_api_exec_with_rate_limit_retry <label> [--probe] -- <cmd> [args…]
@@ -42,7 +60,7 @@ github_api_detail_is_rate_limited() {
 github_api_exec_with_rate_limit_retry() {
   local label probe=0
   local -a cmd=()
-  local exit_code attempt max_retries detail
+  local exit_code attempt max_retries detail headers
 
   label="${1:?github_api_exec_with_rate_limit_retry: label required}"
   shift
@@ -96,19 +114,35 @@ github_api_exec_with_rate_limit_retry() {
     fi
     printf 'NOTE: GITHUB_RATE_LIMIT_HIT label=%s attempt=%s/%s detail=%s\n' \
       "$label" "$attempt" "$max_retries" "$detail" >&2
-    github_api_wait_for_rate_limit "$detail" || return $?
+    headers="$(github_api_fetch_rate_limit_headers || true)"
+    github_api_wait_for_rate_limit "$detail" "$headers" || return $?
     attempt=$((attempt + 1))
   done
   return "$exit_code"
 }
 
-# github_api_rate_limit_core_reset_epoch
-# Prints core.reset unix epoch from gh api rate_limit (empty on failure).
-github_api_rate_limit_core_reset_epoch() {
+# github_api_fetch_rate_limit_headers
+# Prints `gh api --include rate_limit` output (status/headers/body) for backoff parsing.
+github_api_fetch_rate_limit_headers() {
   local out exit_code
 
   exit_code=0
   # gh must stay on the runner_exec_stdout line (runner-adoption ratchet).
+  out="$(runner_exec_stdout "github-api-rate-limit include rate_limit" --probe -- gh api --include rate_limit 2>/dev/null)" \
+    || exit_code=$?
+  if (( exit_code != 0 )) && [[ -z "$out" ]]; then
+    return 1
+  fi
+  printf '%s' "$out"
+  return 0
+}
+
+# github_api_rate_limit_core_reset_epoch
+# Prints core.reset unix epoch from gh api rate_limit JSON (empty on failure).
+github_api_rate_limit_core_reset_epoch() {
+  local out exit_code
+
+  exit_code=0
   out="$(runner_exec_stdout "github-api-rate-limit core reset" --probe -- gh api rate_limit --jq '.resources.core.reset // empty' 2>/dev/null)" \
     || exit_code=$?
   if (( exit_code != 0 )); then
@@ -130,12 +164,16 @@ github_api_runner_last_detail_is_rate_limited() {
   github_api_detail_is_rate_limited "$detail"
 }
 
-# github_api_wait_for_rate_limit [detail]
-# Sleeps until core reset (or fallback backoff). Exit 124 on WAIT_TIMEOUT.
+# github_api_wait_for_rate_limit [detail] [headers_text]
+# Sleeps using Retry-After / X-RateLimit-Reset headers when available.
+# Exit 124 on WAIT_TIMEOUT. max_wait=0 means fail-fast (no sleep).
 github_api_wait_for_rate_limit() {
   local -r detail="${1:-}"
+  local headers="${2:-}"
   local max_wait poll fallback_sleep
   local waited=0 sleep_s remaining reset_epoch now retry_after_s
+  local secondary=0 header_reset header_retry
+  local deadline=0
 
   max_wait="${github_api_rate_limit_max_wait_s}"
   poll="${github_api_rate_limit_poll_s}"
@@ -150,64 +188,96 @@ github_api_wait_for_rate_limit() {
     fallback_sleep=60
   fi
 
+  if github_api_detail_is_secondary_rate_limited "$detail"; then
+    secondary=1
+  fi
+
+  if [[ -z "$headers" ]]; then
+    headers="$(github_api_fetch_rate_limit_headers || true)"
+  fi
+
+  header_retry="$(_github_api_header_value "$headers" 'retry-after')"
+  header_reset="$(_github_api_header_value "$headers" 'x-ratelimit-reset')"
   retry_after_s="$(_github_api_parse_retry_after_seconds "$detail")"
+  if [[ -n "$header_retry" && "$header_retry" =~ ^[0-9]+$ ]]; then
+    retry_after_s="$header_retry"
+  fi
+
+  now="$(date +%s)"
+  if [[ -n "$retry_after_s" && "$retry_after_s" =~ ^[0-9]+$ ]]; then
+    deadline=$((now + retry_after_s))
+    printf 'NOTE: GITHUB_RATE_LIMIT_HEADERS retry_after=%ss source=header_or_body\n' \
+      "$retry_after_s" >&2
+  elif [[ -n "$header_reset" && "$header_reset" =~ ^[0-9]+$ ]]; then
+    deadline="$header_reset"
+    printf 'NOTE: GITHUB_RATE_LIMIT_HEADERS x_ratelimit_reset=%s\n' "$header_reset" >&2
+  fi
+
+  if (( max_wait == 0 )); then
+    printf 'ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT timeout=0s\n' >&2
+    return 124
+  fi
 
   while (( waited < max_wait )); do
+    now="$(date +%s)"
+    sleep_s=0
     reset_epoch=""
-    if reset_epoch="$(github_api_rate_limit_core_reset_epoch)"; then
-      now="$(date +%s)"
+
+    if (( deadline > now )); then
+      sleep_s=$((deadline - now))
+      printf 'NOTE: GITHUB_RATE_LIMIT_WAIT deadline=%s remaining=%ss sleep_budget=%ss waited=%ss/%ss\n' \
+        "$deadline" "$sleep_s" "$poll" "$waited" "$max_wait" >&2
+    elif reset_epoch="$(github_api_rate_limit_core_reset_epoch)"; then
       remaining=$((reset_epoch - now))
-      if (( remaining <= 0 )); then
+      if (( remaining <= 0 )) && (( secondary == 0 )); then
         printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR reset=%s waited=%ss\n' \
           "$reset_epoch" "$waited" >&2
         return 0
       fi
-      sleep_s="$remaining"
-      if (( sleep_s > poll )); then
-        sleep_s="$poll"
+      if (( remaining > 0 )); then
+        sleep_s="$remaining"
+        printf 'NOTE: GITHUB_RATE_LIMIT_WAIT reset_epoch=%s remaining=%ss waited=%ss/%ss\n' \
+          "$reset_epoch" "$remaining" "$waited" "$max_wait" >&2
       fi
-      if (( waited + sleep_s > max_wait )); then
-        sleep_s=$((max_wait - waited))
-      fi
-      if (( sleep_s < 1 )); then
-        sleep_s=1
-      fi
-      printf 'NOTE: GITHUB_RATE_LIMIT_WAIT reset_epoch=%s remaining=%ss sleep=%ss waited=%ss/%ss\n' \
-        "$reset_epoch" "$remaining" "$sleep_s" "$waited" "$max_wait" >&2
-    else
+    fi
+
+    if (( sleep_s < 1 )); then
       sleep_s="$fallback_sleep"
-      if [[ -n "$retry_after_s" ]]; then
-        sleep_s="$retry_after_s"
-        retry_after_s=""
-      fi
-      if (( sleep_s > poll )); then
-        sleep_s="$poll"
-      fi
-      if (( waited + sleep_s > max_wait )); then
-        sleep_s=$((max_wait - waited))
-      fi
-      if (( sleep_s < 1 )); then
-        sleep_s=1
-      fi
       printf 'NOTE: GITHUB_RATE_LIMIT_WAIT reset_unknown sleep=%ss waited=%ss/%ss\n' \
         "$sleep_s" "$waited" "$max_wait" >&2
     fi
+    if (( sleep_s > poll )); then
+      sleep_s="$poll"
+    fi
+    if (( waited + sleep_s > max_wait )); then
+      sleep_s=$((max_wait - waited))
+    fi
+    if (( sleep_s < 1 )); then
+      break
+    fi
+
     run_command "github-api-rate-limit wait sleep" sleep "$sleep_s"
     waited=$((waited + sleep_s))
+    now="$(date +%s)"
 
-    # Re-check: if remaining quota returned, stop early.
-    if reset_epoch="$(github_api_rate_limit_core_reset_epoch)"; then
-      now="$(date +%s)"
-      remaining=$((reset_epoch - now))
-      # Also check remaining count when available.
+    if (( deadline > 0 && now >= deadline )); then
+      printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR deadline_reached waited=%ss\n' "$waited" >&2
+      return 0
+    fi
+
+    # Primary limits: clear when core remaining recovers. Secondary: ignore remaining.
+    if (( secondary == 0 )); then
       if _github_api_core_remaining_positive; then
-        printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR remaining_ok waited=%ss\n' "$waited" >&2
-        return 0
-      fi
-      if (( remaining <= 0 )); then
-        printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR reset=%s waited=%ss\n' \
-          "$reset_epoch" "$waited" >&2
-        return 0
+        if reset_epoch="$(github_api_rate_limit_core_reset_epoch)"; then
+          remaining=$((reset_epoch - now))
+          if (( remaining <= 0 )); then
+            printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR remaining_ok waited=%ss\n' "$waited" >&2
+            return 0
+          fi
+        else
+          printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR remaining_ok waited=%ss\n' "$waited" >&2
+          return 0
+        fi
       fi
     fi
   done
@@ -229,6 +299,29 @@ _github_api_core_remaining_positive() {
   (( out > 0 ))
 }
 
+# _github_api_header_value <headers_text> <name>
+# Prints the first matching HTTP header value (case-insensitive name).
+_github_api_header_value() {
+  local -r text="$1"
+  local -r name="$2"
+  local line lower_name key val
+
+  lower_name="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line//$'\r'/}"
+    [[ "$line" == *:* ]] || continue
+    key="${line%%:*}"
+    val="${line#*:}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    key="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$key" == "$lower_name" ]]; then
+      printf '%s' "$val"
+      return 0
+    fi
+  done <<<"$text"
+  return 1
+}
+
 _github_api_last_stderr_summary() {
   local uuid stderr_text line
 
@@ -245,7 +338,7 @@ _github_api_last_stderr_summary() {
 }
 
 # _github_api_parse_retry_after_seconds <detail>
-# Best-effort parse of "Retry after N seconds" / "wait N minute(s)".
+# Best-effort parse of "Retry after N seconds" / "wait N minute(s)" from body text.
 _github_api_parse_retry_after_seconds() {
   local -r detail="$1"
   local lower n
@@ -255,9 +348,14 @@ _github_api_parse_retry_after_seconds() {
     printf '%s' "${BASH_REMATCH[1]}"
     return 0
   fi
-  if [[ "$lower" =~ ([0-9]+)[[:space:]]*minute ]]; then
+  if [[ "$lower" =~ ([0-9]+)[[:space:]]*minutes? ]]; then
     n="${BASH_REMATCH[1]}"
     printf '%s' "$((n * 60))"
+    return 0
+  fi
+  # "a few minutes" → conservative 180s
+  if [[ "$lower" == *'few minutes'* ]]; then
+    printf '180'
     return 0
   fi
   return 1

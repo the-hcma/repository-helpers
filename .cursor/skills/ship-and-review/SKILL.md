@@ -77,9 +77,10 @@ Do **not** skip CI monitoring with `--no-wait` / `--no-wait-ci` unless the user 
 
 **GitHub API rate limits (not CodeRabbit):** `scripts/lib/github-api-rate-limit` wraps
 agent-review / repo-practices / CI-rollup `gh` calls. On `API rate limit exceeded` /
-secondary limits / HTTP 429, helpers print `NOTE: GITHUB_RATE_LIMIT_HIT` then
-`NOTE: GITHUB_RATE_LIMIT_WAIT` and sleep until `rate_limit` reset (or a short backoff).
-Exhausted retries emit `ERROR: GITHUB_RATE_LIMIT`; wait budget expiry emits
+secondary limits / HTTP 429, helpers print `NOTE: GITHUB_RATE_LIMIT_HIT`, fetch backoff
+from `gh api --include rate_limit` headers (`Retry-After`, `X-RateLimit-Reset`), then
+`NOTE: GITHUB_RATE_LIMIT_WAIT` / `NOTE: GITHUB_RATE_LIMIT_HEADERS` and sleep until that
+deadline. Exhausted retries emit `ERROR: GITHUB_RATE_LIMIT`; wait budget expiry emits
 `ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT`. Tune with `GITHUB_API_RATE_LIMIT_MAX_RETRIES`,
 `GITHUB_API_RATE_LIMIT_MAX_WAIT_S`, `GITHUB_API_RATE_LIMIT_POLL_S`. Do **not** treat this
 as a hard local failure while NOTES show an active wait — let the wait finish, then resume.
