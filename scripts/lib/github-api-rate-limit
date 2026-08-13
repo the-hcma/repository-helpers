@@ -161,6 +161,25 @@ github_api_rate_limit_core_reset_epoch() {
   return 1
 }
 
+# github_api_rate_limit_depleted_reset_epoch
+# Soonest .reset among core/graphql/search resources with remaining == 0.
+github_api_rate_limit_depleted_reset_epoch() {
+  local out exit_code
+
+  exit_code=0
+  # shellcheck disable=SC2016  # jq program is a literal string
+  out="$(runner_exec_stdout "github-api-rate-limit depleted reset" --probe -- gh api rate_limit --jq '[.resources.core, .resources.graphql, .resources.search] | map(select((.remaining // 0) == 0) | .reset) | if length == 0 then empty else min end' 2>/dev/null)" \
+    || exit_code=$?
+  if (( exit_code != 0 )); then
+    return 1
+  fi
+  if [[ "$out" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  return 1
+}
+
 # github_api_runner_last_detail_is_rate_limited
 # True when the most recent runner stderr summary looks rate-limited.
 github_api_runner_last_detail_is_rate_limited() {
@@ -202,9 +221,9 @@ github_api_wait_for_rate_limit() {
     headers="$(github_api_fetch_rate_limit_headers || true)"
   fi
 
-  header_retry="$(_github_api_header_value "$headers" 'retry-after')"
-  header_reset="$(_github_api_header_value "$headers" 'x-ratelimit-reset')"
-  retry_after_s="$(_github_api_parse_retry_after_seconds "$detail")"
+  header_retry="$(_github_api_header_value "$headers" 'retry-after' || true)"
+  header_reset="$(_github_api_header_value "$headers" 'x-ratelimit-reset' || true)"
+  retry_after_s="$(_github_api_parse_retry_after_seconds "$detail" || true)"
   if [[ -n "$header_retry" && "$header_retry" =~ ^[0-9]+$ ]]; then
     retry_after_s="$header_retry"
   fi
@@ -214,9 +233,17 @@ github_api_wait_for_rate_limit() {
     deadline=$((now + retry_after_s))
     printf 'NOTE: GITHUB_RATE_LIMIT_HEADERS retry_after=%ss source=header_or_body\n' \
       "$retry_after_s" >&2
-  elif [[ -n "$header_reset" && "$header_reset" =~ ^[0-9]+$ ]]; then
+  elif (( secondary == 0 )) && [[ -n "$header_reset" && "$header_reset" =~ ^[0-9]+$ ]]; then
+    # Primary only: X-RateLimit-Reset from a rate_limit probe is meaningful for
+    # core. Secondary 429 Retry-After lives on the failed response (not here).
     deadline="$header_reset"
     printf 'NOTE: GITHUB_RATE_LIMIT_HEADERS x_ratelimit_reset=%s\n' "$header_reset" >&2
+  elif (( secondary == 1 )); then
+    # No Retry-After in body/headers: poll briefly then return so the outer
+    # retry can re-attempt (do not burn max_wait on unrelated core.reset).
+    deadline=$((now + fallback_sleep))
+    printf 'NOTE: GITHUB_RATE_LIMIT_HEADERS secondary_fallback=%ss\n' \
+      "$fallback_sleep" >&2
   fi
 
   if (( max_wait == 0 )); then
@@ -229,10 +256,9 @@ github_api_wait_for_rate_limit() {
     sleep_s=0
     reset_epoch=""
 
-    # Clear as soon as primary quota is available again (core.remaining > 0).
-    # Do not use (reset_epoch - now) <= 0 — reset is normally still in the future
-    # even after recovery.
-    if (( secondary == 0 )) && _github_api_core_remaining_positive; then
+    # Primary: clear when core/graphql/search all have remaining > 0 (GraphQL and
+    # Search use separate budgets; core-only would skip the wait entirely).
+    if (( secondary == 0 )) && _github_api_primary_quota_available; then
       printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR remaining_ok waited=%ss\n' "$waited" >&2
       return 0
     fi
@@ -245,7 +271,7 @@ github_api_wait_for_rate_limit() {
       sleep_s=$((deadline - now))
       printf 'NOTE: GITHUB_RATE_LIMIT_WAIT deadline=%s remaining=%ss sleep_budget=%ss waited=%ss/%ss\n' \
         "$deadline" "$sleep_s" "$poll" "$waited" "$max_wait" >&2
-    elif (( secondary == 0 )) && reset_epoch="$(github_api_rate_limit_core_reset_epoch)"; then
+    elif (( secondary == 0 )) && reset_epoch="$(github_api_rate_limit_depleted_reset_epoch)"; then
       remaining=$((reset_epoch - now))
       if (( remaining > 0 )); then
         sleep_s="$remaining"
@@ -278,17 +304,6 @@ github_api_wait_for_rate_limit() {
 }
 
 # --- private ---
-
-_github_api_core_remaining_positive() {
-  local out exit_code
-
-  exit_code=0
-  out="$(runner_exec_stdout "github-api-rate-limit core remaining" --probe -- gh api rate_limit --jq '.resources.core.remaining // 0' 2>/dev/null)" \
-    || exit_code=$?
-  (( exit_code == 0 )) || return 1
-  [[ "$out" =~ ^[0-9]+$ ]] || return 1
-  (( out > 0 ))
-}
 
 # _github_api_header_value <headers_text> <name>
 # Prints the first matching HTTP header value (case-insensitive name).
@@ -350,4 +365,17 @@ _github_api_parse_retry_after_seconds() {
     return 0
   fi
   return 1
+}
+
+# _github_api_primary_quota_available
+# True when core, graphql, and search each report remaining > 0.
+_github_api_primary_quota_available() {
+  local out exit_code
+
+  exit_code=0
+  # shellcheck disable=SC2016  # jq program is a literal string
+  out="$(runner_exec_stdout "github-api-rate-limit primary remaining" --probe -- gh api rate_limit --jq '([.resources.core.remaining // 0, .resources.graphql.remaining // 0, .resources.search.remaining // 0] | all(. > 0))' 2>/dev/null)" \
+    || exit_code=$?
+  (( exit_code == 0 )) || return 1
+  [[ "$out" == 'true' ]]
 }

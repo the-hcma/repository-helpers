@@ -113,13 +113,22 @@ else
 fi
 
 if grep -qF 'remaining_ok' "$lib" \
-  && grep -qF '_github_api_core_remaining_positive' "$lib" \
+  && grep -qF '_github_api_primary_quota_available' "$lib" \
+  && grep -qF 'github_api_rate_limit_depleted_reset_epoch' "$lib" \
+  && grep -qF 'resources.graphql' "$lib" \
   && ! grep -qE 'remaining <= 0.*secondary == 0' "$lib"; then
-  pass_case "clears primary wait on core.remaining > 0 (not reset-in-past)"
+  pass_case "clears primary wait on core/graphql/search remaining > 0"
 else
-  fail_case "quota-recovery clear condition missing or still uses remaining<=0"
+  fail_case "quota-recovery clear condition missing multi-resource check"
 fi
 
+if grep -qF 'secondary_fallback' "$lib" \
+  && grep -qF 'secondary == 0' "$lib" \
+  && grep -qF "x-ratelimit-reset" "$lib"; then
+  pass_case "secondary waits use Retry-After/fallback, not core X-RateLimit-Reset"
+else
+  fail_case "secondary fallback / primary-only reset wiring missing"
+fi
 # shellcheck disable=SC2016  # assert literal --stream-stdout absence in retry loop
 if grep -qF 'runner_read "$uuid" stdout' "$lib" \
   && ! awk '
@@ -220,6 +229,125 @@ else
 fi
 
 rm -rf "$mock_bin" "$state"
+
+printf '\n=== behavioural: wait respects graphql depletion + secondary fallback ===\n'
+mock_bin="$(mktemp -d)"
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+json='{"resources":{"core":{"remaining":5000,"reset":9999999999},"graphql":{"remaining":0,"reset":1700000100},"search":{"remaining":30,"reset":9999999999}}}'
+# Honor --jq like real gh for hermetic wait tests.
+jq_expr=""
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--jq" ]]; then
+    jq_expr="$arg"
+  fi
+  prev="$arg"
+done
+if [[ "$*" == *'rate_limit'* ]]; then
+  if [[ -n "$jq_expr" ]]; then
+    printf '%s' "$json" | jq -r "$jq_expr"
+  else
+    printf '%s\n' "$json"
+  fi
+  exit 0
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+EOF
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      run_command() {
+        local label="$1"
+        shift
+        if [[ "${1:-}" == "--timeout" ]]; then
+          shift 2
+        fi
+        if [[ "${1:-}" == "sleep" ]]; then
+          return 0
+        fi
+        "$@"
+      }
+      github_api_rate_limit_max_wait_s=5
+      github_api_rate_limit_poll_s=5
+      github_api_rate_limit_retry_sleep_s=5
+      date() { if [[ "${1:-}" == "+%s" ]]; then printf "1700000000\n"; else command date "$@"; fi; }
+      github_api_wait_for_rate_limit "API rate limit exceeded for user ID 1" "" 2>&1
+      printf "EC=%s\n" "$?"
+    '
+)"
+ec=$?
+set -e
+
+if grep -qF 'NOTE: GITHUB_RATE_LIMIT_WAIT reset_epoch=1700000100' <<<"$out" \
+  && ! grep -qF 'remaining_ok' <<<"$out"; then
+  pass_case "primary wait uses graphql depleted reset (not core remaining_ok)"
+else
+  fail_case "graphql depleted wait broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    MOCK_DATE_STATE="$(mktemp)" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      run_command() {
+        local label="$1"
+        shift
+        if [[ "${1:-}" == "--timeout" ]]; then
+          shift 2
+        fi
+        if [[ "${1:-}" == "sleep" ]]; then
+          # Mark that a wait sleep happened so date can advance past deadline.
+          printf "slept\n" >>"${MOCK_DATE_STATE}"
+          return 0
+        fi
+        "$@"
+      }
+      github_api_rate_limit_max_wait_s=120
+      github_api_rate_limit_poll_s=60
+      github_api_rate_limit_retry_sleep_s=60
+      date() {
+        if [[ "${1:-}" != "+%s" ]]; then
+          command date "$@"
+          return
+        fi
+        if grep -q slept "${MOCK_DATE_STATE}" 2>/dev/null; then
+          printf "1700000061\n"
+        else
+          printf "1700000000\n"
+        fi
+      }
+      headers=$'"'"'HTTP/2.0 200\r\nX-RateLimit-Reset: 9999999999\r\n\r\n{}'"'"'
+      github_api_wait_for_rate_limit "You have exceeded a secondary rate limit. Please retry again later." "$headers" 2>&1
+    '
+)"
+ec=$?
+set -e
+
+if (( ec == 0 )) \
+  && grep -qF 'secondary_fallback=60s' <<<"$out" \
+  && grep -qF 'deadline_reached' <<<"$out" \
+  && ! grep -qF 'x_ratelimit_reset=9999999999' <<<"$out"; then
+  pass_case "secondary wait uses fallback deadline, not core X-RateLimit-Reset"
+else
+  fail_case "secondary fallback wait broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+rm -rf "$mock_bin"
 
 printf '\n=== skill docs mention GitHub API rate limits ===\n'
 skill="${root}/.cursor/skills/ship-and-review/SKILL.md"
