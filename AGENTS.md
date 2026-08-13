@@ -126,7 +126,7 @@ scripts/github-repo-lint --all --org the-hcma               # every repo in the 
 scripts/github-repo-lint --apply-fix --repo OWNER/NAME      # patch settings + candidate workflow PRs
 ```
 
-CI (`.github/workflows/github-repo-lint.yml`) runs the same `--all --strict-onboarding --compact` audit when enforcement paths change (cursor rules, `scripts/lib/repo-practices*`). It needs repo/org secret **`GITHUB_REPO_LINT_TOKEN`** with the same access as a local `gh` login (`repo` classic PAT, or fine-grained `administration:read` + `contents:read` on every org repo). The default `github.token` cannot read sibling merge settings or classic branch protection.
+CI (`.github/workflows/github-repo-lint.yml`) runs the same `--all --strict-onboarding --compact` audit when enforcement paths change (cursor rules, `scripts/lib/repo-practices*`). The job waits on environment **`github-repo-lint`** (required reviewer) so a human Approves the run in the Actions UI before org-wide API access. After approval, environment secret **`REPO_LINT_TOKEN`** is available (`github.token` cannot read sibling merge settings or classic branch protection).
 
 **`scripts/check-merge-settings`** is a thin wrapper (merge + GitHub MQ only). Prefer **`github-repo-lint`** for full coverage including branch cleanup workflows.
 
