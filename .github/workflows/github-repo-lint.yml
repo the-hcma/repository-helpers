@@ -3,27 +3,19 @@ name: GitHub Repo Lint
 # Full org audit matching local:
 #   scripts/github-repo-lint --org ORG --all --strict-onboarding --compact
 #
-# The job uses environment github-repo-lint (required reviewer). Approve the
-# waiting run in the Actions UI; that unlocks environment secret
-# REPO_LINT_TOKEN. The default github.token cannot read sibling-repo
-# merge settings or classic branch protection.
+# Mandatory only when this PR *adds* a consumer cursor-rule template under
+# scripts/lib/repo-practices-cursor/. Other PRs still report the required check
+# (org repo-practices audit) as success without environment approval.
+#
+# The audit job uses environment github-repo-lint (required reviewer). Approve
+# the waiting run in the Actions UI; that unlocks environment secret
+# REPO_LINT_TOKEN. The default github.token cannot read sibling-repo merge
+# settings or classic branch protection.
 
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
-    paths:
-      - .cursor/rules/**
-      - .github/workflows/github-repo-lint.yml
-      - scripts/lib/repo-practices
-      - scripts/lib/repo-practices-cursor/**
-  push:
-    branches:
-      - main
-    paths:
-      - .cursor/rules/**
-      - .github/workflows/github-repo-lint.yml
-      - scripts/lib/repo-practices
-      - scripts/lib/repo-practices-cursor/**
+  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -31,12 +23,61 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: github-repo-lint-${{ github.event.pull_request.number || github.sha }}
+  group: github-repo-lint-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.sha }}
   cancel-in-progress: true
 
 jobs:
-  org-practices-audit:
-    name: org repo-practices audit
+  detect-new-rule:
+    name: detect new org cursor rule
+    runs-on: ubuntu-latest
+    outputs:
+      needed: ${{ steps.detect.outputs.needed }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          if [[ "${EVENT_NAME}" == 'workflow_dispatch' ]]; then
+            echo 'needed=true' >> "${GITHUB_OUTPUT}"
+            echo 'workflow_dispatch: run full org audit'
+            exit 0
+          fi
+          base=''
+          head=''
+          if [[ "${EVENT_NAME}" == 'pull_request' ]]; then
+            base="${PR_BASE}"
+            head="${PR_HEAD}"
+          else
+            base="${MG_BASE}"
+            head="${MG_HEAD}"
+          fi
+          if [[ -z "${base}" || -z "${head}" ]]; then
+            echo 'needed=false' >> "${GITHUB_OUTPUT}"
+            echo 'ERROR: missing base/head SHAs; not requiring org audit'
+            exit 0
+          fi
+          added="$(git diff --diff-filter=A --name-only "${base}...${head}" -- \
+            scripts/lib/repo-practices-cursor/ || true)"
+          if [[ -n "${added}" ]]; then
+            echo 'needed=true' >> "${GITHUB_OUTPUT}"
+            printf 'New org cursor-rule template(s):\n%s\n' "${added}"
+          else
+            echo 'needed=false' >> "${GITHUB_OUTPUT}"
+            echo 'No new scripts/lib/repo-practices-cursor/ files; org audit not required'
+          fi
+
+  org-practices-run:
+    name: run org repo-practices audit
+    needs: detect-new-rule
+    if: needs.detect-new-rule.outputs.needed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: github-repo-lint
@@ -60,3 +101,25 @@ jobs:
           fi
           org="${GITHUB_REPOSITORY%%/*}"
           scripts/github-repo-lint --org "$org" --all --strict-onboarding --compact
+
+  org-practices-audit:
+    name: org repo-practices audit
+    needs: [detect-new-rule, org-practices-run]
+    if: always() && needs.detect-new-rule.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate required check
+        env:
+          NEEDED: ${{ needs.detect-new-rule.outputs.needed }}
+          AUDIT: ${{ needs.org-practices-run.result }}
+        run: |
+          if [[ "${NEEDED}" != 'true' ]]; then
+            echo 'No new org cursor-rule template; required check passes'
+            exit 0
+          fi
+          if [[ "${AUDIT}" == 'success' ]]; then
+            echo 'Org repo-practices audit passed'
+            exit 0
+          fi
+          echo "Org repo-practices audit required but result=${AUDIT}"
+          exit 1
