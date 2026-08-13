@@ -12,6 +12,7 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | --- | --- | --- |
 | Dependencies | `scripts/dep-updater` | Create stacked dependency-update PRs (npm, Python, Rust, Actions). |
 | Batch automation | `scripts/dep-updater-batch-run` | Daily `--batch --all` across a scan root; email report. |
+| Dep-updater CI | `scripts/dep-updater-ci-org-dry-run` | Clone org repos and `--batch --all --dry-run` for PR validation. |
 | Repo practices | `scripts/github-repo-lint` | Audit/onboard org repos (merge queue, `protect-main`, workflows). |
 | Merge settings | `scripts/check-merge-settings` | Thin wrapper (merge + GitHub MQ only). |
 | Lockfile drift | `scripts/check-lockfile-drift` | Compare lockfiles to registry constraints. |
@@ -127,6 +128,8 @@ scripts/github-repo-lint --apply-fix --repo OWNER/NAME      # patch settings + c
 ```
 
 CI (`.github/workflows/github-repo-lint.yml`) runs the same `--all --strict-onboarding --compact` audit only when a PR changes `.cursor/rules/**`, `scripts/lib/repo-practices-cursor/**`, or `scripts/lib/repo-practices`. Path filters skip the workflow (and the approval prompt) otherwise. Approve the waiting environment **`github-repo-lint`** in the Actions UI to unlock **`REPO_LINT_TOKEN`**.
+
+CI (`.github/workflows/dep-updater.yml`) runs `scripts/dep-updater-ci-org-dry-run` (clone org repos, then `dep-updater --batch --all --dry-run --include-private`) only when a PR changes `scripts/dep-updater`, `scripts/dep-updater-batch-run`, `scripts/dep-updater-ci-org-dry-run`, `scripts/dep-updater-notifier`, or `scripts/lib/release-age-defaults`. Path filters skip the workflow (and the approval prompt) otherwise. Approve the waiting environment **`dep-updater`** in the Actions UI to unlock **`DEP_UPDATER_TOKEN`** (same access as local `gh`; set from `gh auth token`).
 
 **`scripts/check-merge-settings`** is a thin wrapper (merge + GitHub MQ only). Prefer **`github-repo-lint`** for full coverage including branch cleanup workflows.
 
