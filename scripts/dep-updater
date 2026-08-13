@@ -5021,6 +5021,44 @@ py_is_pinned() {
   return 1
 }
 
+# _py_outdated_dedupe_candidate_lines <array_name>
+# Collapse duplicate package rows, keeping the highest proposed version.
+_py_outdated_dedupe_candidate_lines() {
+  local -n lines_ref=$1
+  local -A best_new_by_pkg=()
+  local -A best_line_by_pkg=()
+  local line pkg _cur new existing_new
+  local -a deduped=()
+  local pkg_key
+
+  if [[ ${#lines_ref[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  for line in "${lines_ref[@]}"; do
+    [[ -z "$line" ]] && continue
+    read -r pkg _cur new <<<"$line"
+    [[ -z "$pkg" || -z "$new" ]] && continue
+    existing_new="${best_new_by_pkg[$pkg]:-}"
+    if [[ -z "$existing_new" ]]; then
+      best_new_by_pkg[$pkg]="$new"
+      best_line_by_pkg[$pkg]="$line"
+      continue
+    fi
+    if [[ "$(printf '%s\n%s\n' "$existing_new" "$new" | sort -V | tail -1)" == "$new" \
+      && "$new" != "$existing_new" ]]; then
+      best_new_by_pkg[$pkg]="$new"
+      best_line_by_pkg[$pkg]="$line"
+    fi
+  done
+
+  deduped=()
+  for pkg_key in "${!best_line_by_pkg[@]}"; do
+    deduped+=("${best_line_by_pkg[$pkg_key]}")
+  done
+  lines_ref=("${deduped[@]}")
+}
+
 py_outdated() {
   local -r tool="$1"
   local -r target_dir="${2:-$dir}"
@@ -5083,14 +5121,14 @@ py_outdated() {
         # Use sort -V: if the smaller of the two is the floor, the floor is stale.
         ge_lower="$(printf '%s\n%s\n' "$ge_floor" "$ge_installed" | sort -V | head -1)"
         if [[ "$ge_lower" == "$ge_floor" ]]; then
-          # Only add if not already present in raw_lines (e.g. from uv pip list).
-          if ! printf '%s\n' "$raw_lines" | grep -qi "^${ge_pkg} "; then
-            if [[ -n "$raw_lines" ]]; then
-              raw_lines="${raw_lines}
+          # Always merge a stale-floor row (cur=floor, new=installed). uv-outdated
+          # may already list installed→registry-latest; that row can be dropped when
+          # latest is too new, which must not suppress floor sync (bunnify ruff #285).
+          if [[ -n "$raw_lines" ]]; then
+            raw_lines="${raw_lines}
 ${ge_pkg} ${ge_floor} ${ge_installed}"
-            else
-              raw_lines="${ge_pkg} ${ge_floor} ${ge_installed}"
-            fi
+          else
+            raw_lines="${ge_pkg} ${ge_floor} ${ge_installed}"
           fi
         fi
       done < <(awk '
@@ -5145,6 +5183,10 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
     fi
     candidate_lines+=("$pkg $cur $new")
   done <<< "$raw_lines"
+
+  if [[ ${#candidate_lines[@]} -gt 0 ]]; then
+    _py_outdated_dedupe_candidate_lines candidate_lines
+  fi
 
   if [[ "$tool" != "uv" ]]; then
     for line in "${candidate_lines[@]}"; do
