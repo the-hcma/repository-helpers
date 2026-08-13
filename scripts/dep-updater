@@ -5021,11 +5021,101 @@ py_is_pinned() {
   return 1
 }
 
+# _py_outdated_collapse_lowest_cur_lines <array_name>
+# Collapse duplicate package rows before the PyPI eligibility walk, keeping the
+# lowest current version (stale floor over installed). Walking from the floor
+# still finds newer age-eligible releases; walking only from installed drops
+# floor-sync when registry latest is too new (bunnify ruff #285).
+_py_outdated_collapse_lowest_cur_lines() {
+  local -n lowest_cur_ref=$1
+  local -A best_cur_by_pkg=()
+  local -A best_line_by_pkg=()
+  local line pkg cur _new existing_cur norm_pkg
+  local -a collapsed=()
+  local pkg_key
+
+  if [[ ${#lowest_cur_ref[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  for line in "${lowest_cur_ref[@]}"; do
+    [[ -z "$line" ]] && continue
+    read -r pkg cur _new <<<"$line"
+    [[ -z "$pkg" || -z "$cur" ]] && continue
+    norm_pkg="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+    existing_cur="${best_cur_by_pkg[$norm_pkg]:-}"
+    if [[ -z "$existing_cur" ]]; then
+      best_cur_by_pkg[$norm_pkg]="$cur"
+      best_line_by_pkg[$norm_pkg]="$line"
+      continue
+    fi
+    if [[ "$(printf '%s\n%s\n' "$existing_cur" "$cur" | sort -V | head -1)" == "$cur" \
+      && "$cur" != "$existing_cur" ]]; then
+      best_cur_by_pkg[$norm_pkg]="$cur"
+      best_line_by_pkg[$norm_pkg]="$line"
+    fi
+  done
+
+  collapsed=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && collapsed+=("$line")
+  done < <(
+    for pkg_key in "${!best_line_by_pkg[@]}"; do
+      printf '%s\n' "${best_line_by_pkg[$pkg_key]}"
+    done | sort
+  )
+  lowest_cur_ref=("${collapsed[@]}")
+}
+
+# _py_outdated_dedupe_candidate_lines <array_name>
+# Collapse duplicate package rows, keeping the highest proposed version.
+_py_outdated_dedupe_candidate_lines() {
+  local -n lines_ref=$1
+  local -A best_new_by_pkg=()
+  local -A best_line_by_pkg=()
+  local line pkg _cur new existing_new norm_pkg
+  local -a deduped=()
+  local pkg_key
+
+  if [[ ${#lines_ref[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  for line in "${lines_ref[@]}"; do
+    [[ -z "$line" ]] && continue
+    read -r pkg _cur new <<<"$line"
+    [[ -z "$pkg" || -z "$new" ]] && continue
+    norm_pkg="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+    existing_new="${best_new_by_pkg[$norm_pkg]:-}"
+    if [[ -z "$existing_new" ]]; then
+      best_new_by_pkg[$norm_pkg]="$new"
+      best_line_by_pkg[$norm_pkg]="$line"
+      continue
+    fi
+    if [[ "$(printf '%s\n%s\n' "$existing_new" "$new" | sort -V | tail -1)" == "$new" \
+      && "$new" != "$existing_new" ]]; then
+      best_new_by_pkg[$norm_pkg]="$new"
+      best_line_by_pkg[$norm_pkg]="$line"
+    fi
+  done
+
+  deduped=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && deduped+=("$line")
+  done < <(
+    for pkg_key in "${!best_line_by_pkg[@]}"; do
+      printf '%s\n' "${best_line_by_pkg[$pkg_key]}"
+    done | sort
+  )
+  lines_ref=("${deduped[@]}")
+}
+
 py_outdated() {
   local -r tool="$1"
   local -r target_dir="${2:-$dir}"
   local raw_lines pyproject installed_json ge_dep ge_pkg ge_floor ge_installed ge_lower
   local eligible
+  local -a raw_line_arr=()
   installed_json=""
   case "$tool" in
     uv)
@@ -5083,14 +5173,14 @@ py_outdated() {
         # Use sort -V: if the smaller of the two is the floor, the floor is stale.
         ge_lower="$(printf '%s\n%s\n' "$ge_floor" "$ge_installed" | sort -V | head -1)"
         if [[ "$ge_lower" == "$ge_floor" ]]; then
-          # Only add if not already present in raw_lines (e.g. from uv pip list).
-          if ! printf '%s\n' "$raw_lines" | grep -qi "^${ge_pkg} "; then
-            if [[ -n "$raw_lines" ]]; then
-              raw_lines="${raw_lines}
+          # Always merge a stale-floor row (cur=floor, new=installed). uv-outdated
+          # may already list installed→registry-latest; that row can be dropped when
+          # latest is too new, which must not suppress floor sync (bunnify ruff #285).
+          if [[ -n "$raw_lines" ]]; then
+            raw_lines="${raw_lines}
 ${ge_pkg} ${ge_floor} ${ge_installed}"
-            else
-              raw_lines="${ge_pkg} ${ge_floor} ${ge_installed}"
-            fi
+          else
+            raw_lines="${ge_pkg} ${ge_floor} ${ge_installed}"
           fi
         fi
       done < <(awk '
@@ -5125,7 +5215,18 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
   local filter_out filter_rc filter_unverifiable=0
   local line_item
 
-  while IFS=' ' read -r pkg cur new; do
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && raw_line_arr+=("$line")
+  done <<< "$raw_lines"
+  if [[ ${#raw_line_arr[@]} -gt 0 ]]; then
+    # One PyPI walk per package: keep the stale-floor cur when both a uv-outdated
+    # row and a floor row exist (do not drop the floor row — that reintroduces #285).
+    _py_outdated_collapse_lowest_cur_lines raw_line_arr
+  fi
+
+  for line in "${raw_line_arr[@]}"; do
+    [[ -z "$line" ]] && continue
+    read -r pkg cur new <<<"$line"
     [[ -z "$pkg" ]] && continue
     # Validate PEP 508 package name — drop any mangled strings from raw_lines.
     [[ "$pkg" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
@@ -5144,7 +5245,11 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
       continue
     fi
     candidate_lines+=("$pkg $cur $new")
-  done <<< "$raw_lines"
+  done
+
+  if [[ ${#candidate_lines[@]} -gt 0 ]]; then
+    _py_outdated_dedupe_candidate_lines candidate_lines
+  fi
 
   if [[ "$tool" != "uv" ]]; then
     for line in "${candidate_lines[@]}"; do
