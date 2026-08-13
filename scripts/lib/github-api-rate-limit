@@ -56,11 +56,13 @@ github_api_detail_is_secondary_rate_limited() {
 }
 
 # github_api_exec_with_rate_limit_retry <label> [--probe] -- <cmd> [args…]
-# Runs via runner_exec --stream-stdout. On rate-limit stderr, waits and retries.
+# Runs via runner_exec (no mid-attempt stdout stream). On success, prints that
+# attempt's captured stdout once — avoids concatenating partial --paginate pages
+# from a rate-limited attempt with a full retry.
 github_api_exec_with_rate_limit_retry() {
   local label probe=0
   local -a cmd=()
-  local exit_code attempt max_retries detail headers
+  local exit_code attempt max_retries detail headers uuid
 
   label="${1:?github_api_exec_with_rate_limit_retry: label required}"
   shift
@@ -96,11 +98,15 @@ github_api_exec_with_rate_limit_retry() {
   while (( attempt <= max_retries )); do
     exit_code=0
     if (( probe )); then
-      runner_exec "$label" --probe --stream-stdout -- "${cmd[@]}" || exit_code=$?
+      runner_exec "$label" --probe -- "${cmd[@]}" || exit_code=$?
     else
-      runner_exec "$label" --stream-stdout -- "${cmd[@]}" || exit_code=$?
+      runner_exec "$label" -- "${cmd[@]}" || exit_code=$?
     fi
     if (( exit_code == 0 )); then
+      uuid="$(runner_last_id)"
+      if [[ -n "$uuid" ]]; then
+        runner_read "$uuid" stdout 2>/dev/null || true
+      fi
       return 0
     fi
     detail="$(_github_api_last_stderr_summary)"
@@ -223,17 +229,24 @@ github_api_wait_for_rate_limit() {
     sleep_s=0
     reset_epoch=""
 
+    # Clear as soon as primary quota is available again (core.remaining > 0).
+    # Do not use (reset_epoch - now) <= 0 — reset is normally still in the future
+    # even after recovery.
+    if (( secondary == 0 )) && _github_api_core_remaining_positive; then
+      printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR remaining_ok waited=%ss\n' "$waited" >&2
+      return 0
+    fi
+    if (( deadline > 0 && now >= deadline )); then
+      printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR deadline_reached waited=%ss\n' "$waited" >&2
+      return 0
+    fi
+
     if (( deadline > now )); then
       sleep_s=$((deadline - now))
       printf 'NOTE: GITHUB_RATE_LIMIT_WAIT deadline=%s remaining=%ss sleep_budget=%ss waited=%ss/%ss\n' \
         "$deadline" "$sleep_s" "$poll" "$waited" "$max_wait" >&2
-    elif reset_epoch="$(github_api_rate_limit_core_reset_epoch)"; then
+    elif (( secondary == 0 )) && reset_epoch="$(github_api_rate_limit_core_reset_epoch)"; then
       remaining=$((reset_epoch - now))
-      if (( remaining <= 0 )) && (( secondary == 0 )); then
-        printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR reset=%s waited=%ss\n' \
-          "$reset_epoch" "$waited" >&2
-        return 0
-      fi
       if (( remaining > 0 )); then
         sleep_s="$remaining"
         printf 'NOTE: GITHUB_RATE_LIMIT_WAIT reset_epoch=%s remaining=%ss waited=%ss/%ss\n' \
@@ -258,28 +271,6 @@ github_api_wait_for_rate_limit() {
 
     run_command "github-api-rate-limit wait sleep" sleep "$sleep_s"
     waited=$((waited + sleep_s))
-    now="$(date +%s)"
-
-    if (( deadline > 0 && now >= deadline )); then
-      printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR deadline_reached waited=%ss\n' "$waited" >&2
-      return 0
-    fi
-
-    # Primary limits: clear when core remaining recovers. Secondary: ignore remaining.
-    if (( secondary == 0 )); then
-      if _github_api_core_remaining_positive; then
-        if reset_epoch="$(github_api_rate_limit_core_reset_epoch)"; then
-          remaining=$((reset_epoch - now))
-          if (( remaining <= 0 )); then
-            printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR remaining_ok waited=%ss\n' "$waited" >&2
-            return 0
-          fi
-        else
-          printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR remaining_ok waited=%ss\n' "$waited" >&2
-          return 0
-        fi
-      fi
-    fi
   done
 
   printf 'ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT timeout=%ss\n' "$max_wait" >&2
