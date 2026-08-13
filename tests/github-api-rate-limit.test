@@ -139,11 +139,11 @@ else
 fi
 
 if grep -qF 'secondary_fallback' "$lib" \
-  && grep -qF 'secondary == 0' "$lib" \
-  && grep -qF "x-ratelimit-reset" "$lib"; then
-  pass_case "secondary waits use Retry-After/fallback, not core X-RateLimit-Reset"
+  && grep -qF 'x_ratelimit_reset' "$lib" \
+  && grep -qF 'deadline_elapsed_still_depleted' "$lib"; then
+  pass_case "primary prefers X-RateLimit-Reset; secondary uses Retry-After/fallback"
 else
-  fail_case "secondary fallback / primary-only reset wiring missing"
+  fail_case "primary/secondary deadline priority wiring missing"
 fi
 # shellcheck disable=SC2016  # assert literal --stream-stdout absence in retry loop
 if grep -qF 'runner_read "$uuid" stdout' "$lib" \
@@ -363,6 +363,65 @@ else
   printf '%s\n' "$out"
 fi
 
+rm -rf "$mock_bin"
+
+printf '\n=== behavioural: primary prefers X-RateLimit-Reset over body few-minutes ===\n'
+mock_bin="$(mktemp -d)"
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Still depleted after a short body deadline would have elapsed.
+json='{"resources":{"core":{"remaining":0,"reset":1700003600},"graphql":{"remaining":5000,"reset":9999999999},"search":{"remaining":30,"reset":9999999999}}}'
+jq_expr=""
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--jq" ]]; then jq_expr="$arg"; fi
+  prev="$arg"
+done
+if [[ "$*" == *'rate_limit'* ]]; then
+  if [[ -n "$jq_expr" ]]; then
+    printf '%s' "$json" | jq -r "$jq_expr"
+  else
+    printf '%s\n' "$json"
+  fi
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      run_command() {
+        local label="$1"; shift
+        if [[ "${1:-}" == "--timeout" ]]; then shift 2; fi
+        if [[ "${1:-}" == "sleep" ]]; then return 0; fi
+        "$@"
+      }
+      github_api_rate_limit_max_wait_s=10
+      github_api_rate_limit_poll_s=10
+      github_api_rate_limit_retry_sleep_s=10
+      date() { if [[ "${1:-}" == "+%s" ]]; then printf "1700000000\n"; else command date "$@"; fi; }
+      headers=$'"'"'HTTP/2.0 200\r\nX-RateLimit-Reset: 1700003600\r\n\r\n{}'"'"'
+      github_api_wait_for_rate_limit "API rate limit exceeded for user ID 1. Please wait a few minutes before you try again." "$headers" 2>&1
+    '
+)"
+ec=$?
+set -e
+
+if grep -qF 'x_ratelimit_reset=1700003600' <<<"$out" \
+  && ! grep -qF 'retry_after=180s' <<<"$out" \
+  && grep -qF 'deadline=1700003600' <<<"$out"; then
+  pass_case "primary wait prefers X-RateLimit-Reset over body few-minutes"
+else
+  fail_case "primary deadline priority broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
 rm -rf "$mock_bin"
 
 printf '\n=== behavioural: max_wait=0 fails fast without calling gh ===\n'
