@@ -152,6 +152,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Repo practices after config change | yes | — | `.cursor/rules/repo-practices-after-config-change.mdc` requires `github-repo-lint` after workflow/config edits; `pre-pr-checks` runs detect-first `repo-practices-lint` when the diff touches those paths |
 | Session-start read guidance | yes | — | `.cursor/rules/read-agents-and-rules.mdc` requires reading `AGENTS.md` and `.cursor/rules/` at the start of every new agent session |
 | Stacking-tool marker + rule | yes | — | `.github/stacking-tool` (`graphite`\|`gh-stack`) and thin `.cursor/rules/stacking-tool.mdc` (skill breadcrumbs; no copied skill bodies) |
+| Stacking docs consistency | yes | — | When marker is `gh-stack`, fail if `AGENTS.md` still prescribes Graphite/`gt`/`merge-it` without `gh stack`, if `pr-ship-and-review.mdc` still has Graphite-only `gt create`/`gt submit`, or if root `GRAPHITE.md` remains; graphite marker gets a soft suggest if docs are gh-stack-only. Skips this repo (dual SSOT). Cutover checklist: `.cursor/rules/stacking-tool.mdc` |
 | UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
 | UV + Release Please lock sync | yes | — | uv + `release-please.yml` repos require `release-please-config` `extra-files` bumping `uv.lock` via `@.name.value` jsonpath ([release-please#2561](https://github.com/googleapis/release-please/issues/2561)) |
 | Python static CI job | yes | — | Python (`pyproject.toml` + ruff) repos run ruff check/format + typecheck in one `Python lint & format checks` job via `.github/ci/python-static`; no split `Ruff`/`Pyright`/`Mypy`/`Backend Lint` jobs in **any** `.github/workflows/*`; cutover aliases must gate on `needs.python-static.result == 'success'` (or share conclusion via `aliases:` / `steps.*.outcome`) — see `.cursor/rules/python-static-ci-job.mdc` |
@@ -164,6 +165,24 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 `--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via the stacking backend selected by `.github/stacking-tool` (`graphite` or `gh-stack`; org default `graphite` when the marker is missing) in the target repo clone.
 
 See [`.cursor/skills/graphite/SKILL.md`](.cursor/skills/graphite/SKILL.md) for Graphite **stacking** (`gt`) when `.github/stacking-tool` is `graphite`. This repo trials **`gh-stack`** — see [`.cursor/skills/gh-stack/SKILL.md`](.cursor/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc). Stacking is separate from merge enqueue (GitHub MQ).
+
+### Stacking-tool marker cutover checklist
+
+When flipping `.github/stacking-tool` (or landing an MQ / `gh-stack` cutover PR) in a
+**consumer** repo, also:
+
+1. Update `AGENTS.md` stacking and merge guidance to match the marker (GitHub auto-merge:
+   `gh pr merge --auto --squash` — not `merge-it`).
+2. Rewrite `.cursor/rules/pr-ship-and-review.mdc` submit block to the marker-aware template
+   in `scripts/lib/repo-practices-cursor/pr-ship-and-review.mdc` (or document both backends
+   gated on the marker — never leave a Graphite-only `gt create` / `gt submit` snippet when
+   the marker is `gh-stack`).
+3. Delete root `GRAPHITE.md` when switching to `gh-stack` (canonical skills live here).
+4. Keep `.cursor/rules/stacking-tool.mdc` aligned with
+   `scripts/lib/repo-practices-cursor/stacking-tool.mdc`.
+5. Run `scripts/github-repo-lint --repo OWNER/NAME --suggest --strict-onboarding` and clear
+   stacking-docs consistency findings (`--apply-fix` can rewrite pr-ship; AGENTS /
+   `GRAPHITE.md` are usually human-driven).
 
 ### Lexicographic code organization (org Cursor rule)
 

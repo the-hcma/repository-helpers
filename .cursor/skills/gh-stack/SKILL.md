@@ -48,6 +48,19 @@ git config rerere.enabled true           # remember conflict resolutions (skips 
 git config remote.pushDefault origin     # if multiple remotes exist (skips remote picker)
 ```
 
+## Org marker cutover (consumer repos)
+
+When switching a consumer repo to `gh-stack` via `.github/stacking-tool`:
+
+1. Update `AGENTS.md` stacking/merge docs (`gh stack` + `gh pr merge --auto --squash`; no `merge-it`).
+2. Align `.cursor/rules/pr-ship-and-review.mdc` submit block with the marker-aware template
+   in repository-helpers `scripts/lib/repo-practices-cursor/pr-ship-and-review.mdc`.
+3. Delete root `GRAPHITE.md` (this skill is SSOT).
+4. Keep `.cursor/rules/stacking-tool.mdc` in sync with the consumer template.
+5. Run `scripts/github-repo-lint --repo OWNER/NAME --suggest --strict-onboarding`.
+
+See also `.cursor/rules/stacking-tool.mdc` (Marker cutover checklist).
+
 ## Agent rules
 
 **All `gh stack` commands must be run non-interactively.** Every command invocation must include the flags and positional arguments needed to avoid prompts, TUIs, and interactive menus. If a command would prompt for input, it will hang indefinitely.
