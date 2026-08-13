@@ -126,7 +126,7 @@ scripts/github-repo-lint --all --org the-hcma               # every repo in the 
 scripts/github-repo-lint --apply-fix --repo OWNER/NAME      # patch settings + candidate workflow PRs
 ```
 
-CI (`.github/workflows/github-repo-lint.yml`) runs the same `--all --strict-onboarding --compact` audit when a PR **adds** a template under `scripts/lib/repo-practices-cursor/` (required check `org repo-practices audit`). Other PRs report that check as success without org API access. When the audit runs, environment **`github-repo-lint`** waits for a reviewer to Approve in the Actions UI, which unlocks **`REPO_LINT_TOKEN`**.
+CI (`.github/workflows/github-repo-lint.yml`) runs the same `--all --strict-onboarding --compact` audit when a PR changes `.cursor/rules/**`, `scripts/lib/repo-practices-cursor/**`, or `scripts/lib/repo-practices` (create, update, or delete). Path filters skip the workflow on unrelated PRs. The job waits on environment **`github-repo-lint`**; Approve in the Actions UI unlocks **`REPO_LINT_TOKEN`**.
 
 **`scripts/check-merge-settings`** is a thin wrapper (merge + GitHub MQ only). Prefer **`github-repo-lint`** for full coverage including branch cleanup workflows.
 
