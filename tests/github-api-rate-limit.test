@@ -34,6 +34,22 @@ else
   fail_case "missing rate-limit retry wiring in gh wrappers"
 fi
 
+# shellcheck disable=SC2016  # assert literal call sites for labels/workflows helpers
+if grep -nF 'rp_fetch_repo_labels_json' "${root}/scripts/lib/repo-practices" >/dev/null \
+  && awk '
+    /^rp_fetch_repo_labels_json\(/ { in_fn=1 }
+    in_fn && /^}/ { in_fn=0 }
+    in_fn && /rp_runner_gh_api_stream/ { labels=1 }
+    /^rp_fetch_workflow_file_names\(/ { in_wf=1 }
+    in_wf && /^}/ { in_wf=0 }
+    in_wf && /rp_runner_gh_api_stream/ { workflows=1 }
+    END { exit (labels && workflows) ? 0 : 1 }
+  ' "${root}/scripts/lib/repo-practices"; then
+  pass_case "labels and workflow-list fetches use rate-limit gh api stream"
+else
+  fail_case "labels/workflow fetches still bypass rate-limit retry"
+fi
+
 if grep -qF 'NOTE: GITHUB_RATE_LIMIT_WAIT' "$lib" \
   && grep -qF 'ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT' "$lib" \
   && grep -qF 'ERROR: GITHUB_RATE_LIMIT' "$lib" \
@@ -347,6 +363,39 @@ else
   printf '%s\n' "$out"
 fi
 
+rm -rf "$mock_bin"
+
+printf '\n=== behavioural: max_wait=0 fails fast without calling gh ===\n'
+mock_bin="$(mktemp -d)"
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+printf 'gh should not run on max_wait=0\n' >&2
+exit 99
+EOF
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      github_api_rate_limit_max_wait_s=0
+      github_api_wait_for_rate_limit "API rate limit exceeded" "" 2>&1
+    '
+)"
+ec=$?
+set -e
+
+if (( ec == 124 )) \
+  && grep -qF 'ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT timeout=0s' <<<"$out" \
+  && ! grep -qF 'gh should not run' <<<"$out"; then
+  pass_case "max_wait=0 returns 124 without invoking gh"
+else
+  fail_case "max_wait=0 fail-fast broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
 rm -rf "$mock_bin"
 
 printf '\n=== skill docs mention GitHub API rate limits ===\n'
