@@ -183,8 +183,9 @@ also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
 | `ci-secret-scan` gitleaks pin | yes* | — | Warn when `scripts/lib/ci-secret-scan` pins gitleaks behind the release-age-eligible version (*this repo only) |
 
 `--suggest` prints remediation lines; `--apply-fix` queues candidate
-workflow/cursor-rule PRs via **Graphite** (`gt track` / `gt submit`) in the
-target clone (not yet marker-aware for `gh-stack`).
+workflow/cursor-rule PRs via the stacking backend selected by
+`.github/stacking-tool` (`graphite` → `gt track` / `gt submit`; `gh-stack` →
+`gh stack init` / `gh stack submit`).
 
 Further detail (protect-main rules, branch hygiene, CVE workflow template):
 [AGENTS.md](AGENTS.md#repository-practices-new-and-existing-repos).
