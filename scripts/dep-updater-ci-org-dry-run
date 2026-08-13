@@ -27,7 +27,9 @@ org=""
 scan_root=""
 
 usage() {
-  sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # Keep sed on the runner_sh line for the adoption ratchet / capture.
+  runner_sh_stdout "dep-updater-ci-org-dry-run usage" -- \
+    "sed -n '2,11p' $(printf '%q' "${BASH_SOURCE[0]}") | sed 's/^# \{0,1\}//'"
 }
 
 die() {
@@ -84,22 +86,44 @@ resolve_org() {
 }
 
 resolve_scan_root() {
-  local resolved exit_code=0
+  local temp_base resolved_base resolved exit_code=0
+
+  temp_base="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+  resolved_base=""
+  set +e
+  resolved_base="$(runner_exec_stdout "dep-updater-ci-org-dry-run realpath temp base" \
+    -- realpath "$temp_base")"
+  exit_code=$?
+  set -e
+  resolved_base="${resolved_base//$'\n'/}"
+  if (( exit_code != 0 )) || [[ -z "$resolved_base" ]] || [[ ! -d "$resolved_base" ]]; then
+    die "Could not resolve temp base for scan-root: ${temp_base}"
+  fi
 
   if [[ -z "$scan_root" ]]; then
-    scan_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/dep-updater-scan"
+    scan_root="${resolved_base}/dep-updater-scan"
   fi
-  mkdir -p "$scan_root"
+
+  # Resolve before mkdir/rm so a caller cannot point --scan-root at an arbitrary
+  # existing tree. Require the canonical path under RUNNER_TEMP/TMPDIR.
   resolved=""
   set +e
   resolved="$(runner_exec_stdout "dep-updater-ci-org-dry-run realpath scan-root" \
-    -- realpath "$scan_root")"
+    -- realpath --canonicalize-missing "$scan_root")"
   exit_code=$?
   set -e
   resolved="${resolved//$'\n'/}"
-  if (( exit_code != 0 )) || [[ -z "$resolved" ]] || [[ ! -d "$resolved" ]]; then
+  if (( exit_code != 0 )) || [[ -z "$resolved" ]]; then
     die "Could not resolve --scan-root: ${scan_root}"
   fi
+  case "$resolved" in
+    "${resolved_base}"|"${resolved_base}"/*) ;;
+    *)
+      die "--scan-root must resolve under ${resolved_base} (got ${resolved})"
+      ;;
+  esac
+
+  run_command "dep-updater-ci-org-dry-run mkdir scan-root" -- mkdir -p "$resolved"
   scan_root="$resolved"
 }
 
@@ -120,15 +144,24 @@ clone_org_repos() {
   local -r owner="$1"
   local -r root="$2"
   local name archived dest clone_exit=0 list_exit=0 listed=0 cloned=0 consumer=0
-  local list_file fail_slug=""
+  local list_file fail_slug="" exit_code=0
 
-  list_file="$(mktemp)"
+  list_file=""
+  set +e
+  list_file="$(runner_exec_stdout "dep-updater-ci-org-dry-run mktemp repo list" -- mktemp)"
+  exit_code=$?
+  set -e
+  list_file="${list_file//$'\n'/}"
+  if (( exit_code != 0 )) || [[ -z "$list_file" ]]; then
+    die 'Failed to create temporary org-repo list file'
+  fi
+  list_exit=0
   set +e
   list_org_repos_tsv "$owner" >"$list_file"
   list_exit=$?
   set -e
   if (( list_exit != 0 )); then
-    rm -f "$list_file"
+    run_command "dep-updater-ci-org-dry-run rm repo list" -- rm -f "$list_file"
     die "Failed to list repositories for org ${owner} (check DEP_UPDATER_TOKEN / GH_TOKEN access)"
   fi
 
@@ -140,10 +173,17 @@ clone_org_repos() {
       continue
     fi
     dest="${root}/${name}"
+    case "$dest" in
+      "${root}"/*) ;;
+      *)
+        fail_slug="${owner}/${name}"
+        break
+        ;;
+    esac
     if [[ -e "${dest}/.git" ]]; then
       log "[ci-dry-run] Reusing existing clone: ${dest}"
     else
-      rm -rf "$dest"
+      run_command "dep-updater-ci-org-dry-run rm stale clone ${name}" -- rm -rf "$dest"
       clone_exit=0
       # Keep gh on the same line as runner_exec (runner-adoption ratchet).
       runner_exec "dep-updater-ci-org-dry-run gh repo clone ${name}" -- gh repo clone "${owner}/${name}" "$dest" -- --depth 1 \
@@ -158,7 +198,7 @@ clone_org_repos() {
       consumer=$(( consumer + 1 ))
     fi
   done <"$list_file"
-  rm -f "$list_file"
+  run_command "dep-updater-ci-org-dry-run rm repo list" -- rm -f "$list_file"
 
   if [[ -n "$fail_slug" ]]; then
     die "Failed to clone ${fail_slug} into ${root}/${fail_slug##*/}"
