@@ -170,6 +170,8 @@ declare -A rp_candidate_fix_paths=()
 declare -A rp_candidate_fix_contents=()
 declare -A rp_candidate_fix_branch_suffixes=()
 declare -A rp_candidate_fix_messages=()
+declare -A rp_scan_root_clone_dirs=()
+rp_scan_root_clone_index_ready=0
 
 rp_usage() {
   local -r prog="${1:-check-repo-practices}"
@@ -3188,6 +3190,120 @@ rp_git_remote_slug_for_dir() {
   return 1
 }
 
+# Primary clone for this lib (not a linked worktree under .worktrees/).
+rp_helpers_primary_checkout_dir() {
+  local helpers_root primary_dir quoted_root porcelain line exit_code=0
+
+  helpers_root="$(cd "${rp_lib_dir}/../.." && pwd)"
+  quoted_root="$(printf '%q' "$helpers_root")"
+  porcelain=""
+  set +e
+  porcelain="$(runner_sh_stdout "repo-practices primary worktree" -- \
+    "git -C ${quoted_root} worktree list --porcelain")"
+  exit_code=$?
+  set -e
+  primary_dir=""
+  if (( exit_code == 0 )) && [[ -n "$porcelain" ]]; then
+    while IFS= read -r line; do
+      if [[ "$line" == worktree\ * ]]; then
+        primary_dir="${line#worktree }"
+        break
+      fi
+    done <<<"$porcelain"
+  fi
+  if [[ -n "$primary_dir" ]]; then
+    printf '%s\n' "$primary_dir"
+    return 0
+  fi
+  printf '%s\n' "$helpers_root"
+}
+
+# Index sibling clones under the scan root once per process (slug → checkout).
+rp_index_scan_root_clones() {
+  local root entry entry_name entry_real top entry_slug resolved exit_code=0
+
+  if [[ "${rp_scan_root_clone_index_ready}" -eq 1 ]]; then
+    return 0
+  fi
+  rp_scan_root_clone_index_ready=1
+
+  root="$(rp_local_repo_scan_root || true)"
+  [[ -n "$root" ]] || return 0
+
+  for entry in "${root}"/*; do
+    [[ -e "$entry" ]] || continue
+    [[ -d "$entry" ]] || continue
+    entry_name="${entry##*/}"
+    [[ "$entry_name" == .* ]] && continue
+
+    top=""
+    set +e
+    top="$(rp_runner_exec_stdout "repo-practices git show-toplevel scan" \
+      -- git -C "$entry" rev-parse --show-toplevel)"
+    exit_code=$?
+    set -e
+    top="${top//$'\n'/}"
+    if (( exit_code != 0 )) || [[ -z "$top" ]]; then
+      continue
+    fi
+    resolved=""
+    set +e
+    resolved="$(runner_exec_stdout "repo-practices realpath scan entry" -- realpath "$top")"
+    exit_code=$?
+    set -e
+    resolved="${resolved//$'\n'/}"
+    if (( exit_code != 0 )) || [[ -z "$resolved" ]]; then
+      continue
+    fi
+    set +e
+    entry_real="$(runner_exec_stdout "repo-practices realpath scan dir" -- realpath "$entry")"
+    exit_code=$?
+    set -e
+    entry_real="${entry_real//$'\n'/}"
+    if (( exit_code != 0 )) || [[ "$resolved" != "$entry_real" ]]; then
+      continue
+    fi
+
+    entry_slug="$(rp_git_remote_slug_for_dir "$resolved" || true)"
+    if [[ -n "$entry_slug" ]]; then
+      rp_scan_root_clone_dirs["$entry_slug"]="$resolved"
+    fi
+  done
+}
+
+# Parent directory of sibling git clones (enforcer default: repository-helpers/..).
+rp_local_repo_scan_root() {
+  local root helpers_root resolved exit_code=0
+
+  root="${GITHUB_REPO_LINT_SCAN_ROOT:-}"
+  if [[ -z "$root" ]]; then
+    helpers_root="$(rp_helpers_primary_checkout_dir)"
+    root="${helpers_root}/.."
+  fi
+  resolved=""
+  set +e
+  resolved="$(runner_exec_stdout "repo-practices realpath scan root" -- realpath "$root")"
+  exit_code=$?
+  set -e
+  resolved="${resolved//$'\n'/}"
+  if (( exit_code != 0 )) || [[ -z "$resolved" ]] || [[ ! -d "$resolved" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$resolved"
+}
+
+# Resolve a local clone under GITHUB_REPO_LINT_SCAN_ROOT (or repository-helpers/..).
+rp_resolve_local_repo_dir_from_scan_root() {
+  local slug="$1"
+
+  rp_index_scan_root_clones
+  if [[ -n "${rp_scan_root_clone_dirs[$slug]:-}" ]]; then
+    printf '%s\n' "${rp_scan_root_clone_dirs[$slug]}"
+    return 0
+  fi
+  return 1
+}
+
 rp_resolve_local_repo_dir() {
   local slug="$1"
   local repo_root repo_slug
@@ -3200,15 +3316,218 @@ rp_resolve_local_repo_dir() {
   git_exit_code=$?
   set -e
   repo_root="${repo_root//$'\n'/}"
-  if (( git_exit_code != 0 )); then
-    repo_root=""
+  if (( git_exit_code == 0 )) && [[ -n "$repo_root" ]]; then
+    repo_slug="$(rp_git_remote_slug_for_dir "$repo_root" || true)"
+    if [[ "$repo_slug" == "$slug" ]]; then
+      printf '%s\n' "$repo_root"
+      return 0
+    fi
   fi
-  if [[ -z "$repo_root" ]]; then
+
+  rp_resolve_local_repo_dir_from_scan_root "$slug"
+}
+
+# True for single-file candidate fixes that can land via the GitHub Contents API.
+rp_candidate_fix_path_is_api_eligible() {
+  local -r path="$1"
+
+  [[ "$path" == .cursor/rules/* ]] && return 0
+  [[ "$path" == '.github/stacking-tool' ]] && return 0
+  return 1
+}
+
+# Create or update one file on a branch and open a PR (no local clone required).
+rp_apply_file_pr_via_api() {
+  local slug="$1"
+  local path="$2"
+  local content="$3"
+  local branch_name="$4"
+  local message="$5"
+  local title="$6"
+  local body="$7"
+  local default_branch base_sha pr_url encoded_content existing_sha existing_ref_sha
+  local quoted_content
+  local ref_exit_code=0 pr_list_exit_code=0 existing_exit_code=0
+  local default_exit_code=0 base_sha_exit_code=0 encode_exit_code=0
+  local create_ref_exit_code=0 delete_exit_code=0 put_exit_code=0 create_pr_exit_code=0
+  local existing_ref_sha_exit_code=0
+  local -a put_args=()
+
+  default_branch=""
+  set +e
+  default_branch="$(rp_runner_gh_api_stream "repo-practices file-pr default branch" "repos/${slug}" \
+    --jq '.default_branch // "main"')"
+  default_exit_code=$?
+  set -e
+  default_branch="${default_branch//$'\n'/}"
+  if (( default_exit_code != 0 )) || [[ -z "$default_branch" ]]; then
+    rp_log_warn "${slug}: failed to read default branch for API file PR (${path})"
     return 1
   fi
-  repo_slug="$(rp_git_remote_slug_for_dir "$repo_root" || true)"
-  if [[ "$repo_slug" == "$slug" ]]; then
-    printf '%s\n' "$repo_root"
+
+  base_sha=""
+  set +e
+  base_sha="$(rp_runner_gh_api_stream "repo-practices file-pr base sha" \
+    "repos/${slug}/git/ref/heads/${default_branch}" --jq '.object.sha')"
+  base_sha_exit_code=$?
+  set -e
+  base_sha="${base_sha//$'\n'/}"
+  if (( base_sha_exit_code != 0 )) || [[ -z "$base_sha" ]]; then
+    rp_log_warn "${slug}: failed to read ${default_branch} SHA for API file PR (${path})"
+    return 1
+  fi
+
+  set +e
+  pr_url="$(rp_runner_exec_stdout "repo-practices gh pr list file fix" \
+    -- gh pr list --repo "$slug" --head "$branch_name" --state open --json url \
+      --jq '.[0].url // empty')"
+  pr_list_exit_code=$?
+  set -e
+  pr_url="${pr_url//$'\n'/}"
+  if (( pr_list_exit_code != 0 )); then
+    pr_url=""
+  fi
+  if [[ -n "$pr_url" ]]; then
+    rp_log_warn "${slug}: candidate file PR already exists: ${pr_url}"
+    return 0
+  fi
+
+  ref_exit_code=0
+  runner_exec "repo-practices gh ref heads file fix branch" --probe \
+    -- gh api "repos/${slug}/git/ref/heads/${branch_name}" || ref_exit_code=$?
+  if (( ref_exit_code == 0 )); then
+    existing_ref_sha=""
+    set +e
+    existing_ref_sha="$(rp_runner_gh_api_stream "repo-practices file-pr existing ref sha" \
+      "repos/${slug}/git/ref/heads/${branch_name}" --jq '.object.sha')"
+    existing_ref_sha_exit_code=$?
+    set -e
+    existing_ref_sha="${existing_ref_sha//$'\n'/}"
+    if (( existing_ref_sha_exit_code != 0 )) || [[ -z "$existing_ref_sha" ]]; then
+      rp_log_warn "${slug}: failed to read existing ${branch_name} SHA for ${path}"
+      return 1
+    fi
+    if [[ "$existing_ref_sha" != "$base_sha" ]]; then
+      delete_exit_code=0
+      runner_exec "repo-practices gh delete stale file fix ref" \
+        -- gh api -X DELETE "repos/${slug}/git/refs/heads/${branch_name}" \
+        || delete_exit_code=$?
+      if (( delete_exit_code != 0 )); then
+        rp_log_warn "${slug}: failed to replace stale branch ${branch_name} for ${path}"
+        return 1
+      fi
+      ref_exit_code=1
+    fi
+  fi
+  if (( ref_exit_code != 0 )); then
+    create_ref_exit_code=0
+    runner_exec "repo-practices gh create file fix ref" \
+      -- gh api -X POST "repos/${slug}/git/refs" \
+        -f "ref=refs/heads/${branch_name}" \
+        -f "sha=${base_sha}" || create_ref_exit_code=$?
+    if (( create_ref_exit_code != 0 )); then
+      rp_log_warn "${slug}: failed to create branch ${branch_name} for ${path}"
+      return 1
+    fi
+  fi
+
+  quoted_content="$(printf '%q' "$content")"
+  encoded_content=""
+  set +e
+  encoded_content="$(runner_sh_stdout "repo-practices file-pr base64" -- \
+    "printf '%s' ${quoted_content} | base64 | tr -d '\\n'")"
+  encode_exit_code=$?
+  set -e
+  encoded_content="${encoded_content//$'\n'/}"
+  if (( encode_exit_code != 0 )) || [[ -z "$encoded_content" ]]; then
+    rp_log_warn "${slug}: failed to encode ${path} for API file PR"
+    return 1
+  fi
+  existing_sha=""
+  set +e
+  existing_sha="$(rp_runner_exec_stdout "repo-practices gh file fix sha" --probe \
+    -- gh api "repos/${slug}/contents/${path}?ref=${branch_name}" --jq '.sha')"
+  existing_exit_code=$?
+  set -e
+  existing_sha="${existing_sha//$'\n'/}"
+  if (( existing_exit_code != 0 )); then
+    existing_sha=""
+  fi
+
+  put_args=(
+    -X PUT
+    "repos/${slug}/contents/${path}"
+    -f "message=${message}"
+    -f "content=${encoded_content}"
+    -f "branch=${branch_name}"
+  )
+  if [[ -n "$existing_sha" ]]; then
+    put_args+=(-f "sha=${existing_sha}")
+  fi
+  put_exit_code=0
+  runner_exec "repo-practices gh put file fix" -- gh api "${put_args[@]}" || put_exit_code=$?
+  if (( put_exit_code != 0 )); then
+    rp_log_warn "${slug}: failed to write ${path} via Contents API"
+    return 1
+  fi
+
+  pr_url=""
+  set +e
+  pr_url="$(rp_runner_exec_stdout "repo-practices gh pr create file fix" \
+    -- gh pr create \
+      --repo "$slug" \
+      --head "$branch_name" \
+      --base "$default_branch" \
+      --title "$title" \
+      --body "$body")"
+  create_pr_exit_code=$?
+  set -e
+  pr_url="${pr_url//$'\n'/}"
+  if (( create_pr_exit_code != 0 )) || [[ -z "$pr_url" ]]; then
+    rp_log_warn "${slug}: failed to open candidate file PR for ${path}"
+    return 1
+  fi
+  rp_log_warn "${slug}: created candidate file PR: ${pr_url}"
+}
+
+# Apply API-eligible queued fixes when no local clone is available.
+rp_apply_candidate_fixes_via_api() {
+  local slug="$1"
+  local key key_slug path content branch_suffix message branch_name title body
+  local applied=0 skipped_ineligible=0 apply_exit_code=0
+
+  for key in "${rp_candidate_fix_keys[@]}"; do
+    key_slug="${key%%|*}"
+    [[ "$key_slug" == "$slug" ]] || continue
+    path="${rp_candidate_fix_paths[$key]}"
+    if ! rp_candidate_fix_path_is_api_eligible "$path"; then
+      rp_log_warn "${slug}: candidate fix ${path} requires a local clone (not API-eligible)"
+      skipped_ineligible=1
+      continue
+    fi
+    content="${rp_candidate_fix_contents[$key]}"
+    branch_suffix="${rp_candidate_fix_branch_suffixes[$key]}"
+    message="${rp_candidate_fix_messages[$key]}"
+    branch_name="repo-practices/${branch_suffix}"
+    title="$message"
+    body="$(cat <<EOF
+## Summary
+- Repository-practices remediation for \`${path}\`.
+
+## Test plan
+- Org cursor-rule / practices template sync only.
+EOF
+)"
+    apply_exit_code=0
+    rp_apply_file_pr_via_api "$slug" "$path" "$content" "$branch_name" \
+      "$message" "$title" "$body" || apply_exit_code=$?
+    if (( apply_exit_code != 0 )); then
+      continue
+    fi
+    applied=1
+  done
+
+  if [[ "$applied" -eq 1 && "$skipped_ineligible" -eq 0 ]]; then
     return 0
   fi
   return 1
@@ -3385,6 +3704,9 @@ rp_apply_candidate_fix_stack() {
 
   created_any=0
   if ! repo_dir="$(rp_resolve_local_repo_dir "$slug")"; then
+    if rp_apply_candidate_fixes_via_api "$slug"; then
+      return 0
+    fi
     rp_log_warn "${slug}: candidate workflow PRs require running --apply-fix from the local clone"
     return 0
   fi
