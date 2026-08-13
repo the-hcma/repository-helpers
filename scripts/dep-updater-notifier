@@ -292,6 +292,34 @@ dun_append_failure_report() {
   fi
 }
 
+# dun_record_missing_origin <repo_dir>
+# Skip clones with no resolvable GitHub origin and record an actionable warning.
+dun_record_missing_origin() {
+  local -r repo="$1"
+  local origin_add
+  local origin_cmd
+  local origin_set
+  local quoted_repo
+  local repo_name
+
+  repo_name="$(dun_repo_basename "$repo")"
+  quoted_repo="$(printf '%q' "$repo")"
+  # Split add vs set-url: runner-adoption treats `|| git` on one line as a bare invocation.
+  origin_add="git -C ${quoted_repo} remote add origin https://github.com/OWNER/NAME.git"
+  origin_set="git -C ${quoted_repo} remote set-url origin https://github.com/OWNER/NAME.git"
+  origin_cmd="${origin_add} || ${origin_set}"
+
+  log "Skipping ${repo_name}: no resolvable GitHub origin URL."
+  dun_record_failure \
+    "${repo_name}: no resolvable GitHub origin URL (add or set-url origin to https://github.com/OWNER/NAME.git)" \
+    "$origin_cmd"
+  append_report "=== ${repo_name} === (skipped: no resolvable GitHub origin URL)"
+  append_report "Point origin at a GitHub URL so the notifier can label the clone as OWNER/NAME and skip archived remotes."
+  append_report "path: ${repo}"
+  append_report "command: ${origin_cmd}"
+  append_report ""
+}
+
 discover_repos() {
   local -r roots_csv="${DEP_UPDATER_NOTIFIER_ROOTS:-$default_repo_root}"
   local -r repos_csv="${DEP_UPDATER_NOTIFIER_REPOS:-}"
@@ -310,10 +338,42 @@ discover_repos() {
     fi
     for child in "$root"/*; do
       [[ -d "$child" ]] || continue
+      # Directory symlinks (e.g. ~/work/ai/foo -> ~/.local/share/foo) are live
+      # installs, not scan-root clones. Match batch-all `find -type d`.
+      if [[ -L "$child" ]]; then
+        continue
+      fi
       [[ -e "$child/.git" ]] || continue
       printf '%s\n' "$child"
     done
   done < <(tr ':' '\n' <<<"$roots_csv" | sed '/^$/d')
+}
+
+# dun_repo_basename <repo_dir>
+# Directory name with trailing slashes stripped (basename without an external call).
+dun_repo_basename() {
+  local name="$1"
+
+  while [[ "$name" == */ ]]; do
+    name="${name%/}"
+  done
+  printf '%s' "${name##*/}"
+}
+
+# dun_repo_display_name <repo_dir>
+# OWNER/NAME from origin when resolvable; directory basename only when origin
+# cannot be read (missing directory). Clones without origin are skipped before scan.
+dun_repo_display_name() {
+  local -r repo="$1"
+  local slug
+
+  slug=""
+  slug="$(gh_slug_from_repo_dir "$repo" 2>/dev/null || true)"
+  if [[ -n "$slug" ]]; then
+    printf '%s' "$slug"
+    return 0
+  fi
+  dun_repo_basename "$repo"
 }
 
 # dun_skip_archived_repo <repo_dir>
@@ -465,14 +525,21 @@ fi
 
 if (( ${#repos[@]} > 0 )); then
 for repo in "${repos[@]}"; do
-  repo_name="$(basename "$repo")"
-
   if [[ ! -d "$repo" ]]; then
+    repo_name="$(dun_repo_basename "$repo")"
     log "Skipping ${repo_name}: directory not found."
     append_report "=== ${repo_name} === (directory not found: ${repo})"
     append_report ""
     continue
   fi
+
+  slug=""
+  slug="$(gh_slug_from_repo_dir "$repo" 2>/dev/null || true)"
+  if [[ -z "$slug" ]]; then
+    dun_record_missing_origin "$repo"
+    continue
+  fi
+  repo_name="$slug"
 
   if dun_skip_archived_repo "$repo"; then
     log "Skipping ${repo_name}: archived GitHub repository."
@@ -710,7 +777,7 @@ body_lines+=("──────────────────────
 body_lines+=("To update:")
 if (( ${#update_repos_paths[@]} > 0 )); then
   for upd_repo in "${update_repos_paths[@]}"; do
-    upd_name="$(basename "$upd_repo")"
+    upd_name="$(dun_repo_display_name "$upd_repo")"
     body_lines+=("  ${upd_name}:  cd ${upd_repo} && ${dep_updater} [--batch] [--security-only]")
   done
 fi

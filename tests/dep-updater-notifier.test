@@ -17,9 +17,34 @@ make_tmpdir() {
   printf '%s\n' "$tmp"
 }
 
+stage_clone_with_origin() {
+  local -r dir="$1"
+  local -r slug="$2"
+  mkdir -p "$dir"
+  git -C "$dir" init --quiet
+  git -C "$dir" remote add origin "https://github.com/${slug}.git"
+}
+
+stage_gh_not_archived_mock() {
+  local -r tmp="$1"
+  mkdir -p "$tmp/bin" "$tmp/.local/bin"
+  cat >"$tmp/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == 'api' && "${2:-}" == repos/* ]]; then
+  printf 'false\n'
+  exit 0
+fi
+printf 'unexpected gh invocation: %s\n' "$*" >&2
+exit 1
+EOF
+  chmod +x "$tmp/bin/gh"
+  cp "$tmp/bin/gh" "$tmp/.local/bin/gh"
+}
+
 stage_notifier_bundle() {
   local -r tmp="$1"
-  mkdir -p "$tmp/bin/lib"
+  mkdir -p "$tmp/bin/lib" "$tmp/.local/bin"
   cp "scripts/dep-updater-notifier" "$tmp/bin/dep-updater-notifier"
   cp scripts/lib/time-log "$tmp/bin/lib/time-log"
   cp scripts/lib/tooling-path "$tmp/bin/lib/tooling-path"
@@ -31,6 +56,7 @@ stage_notifier_bundle() {
   cp scripts/lib/runner-ensure "$tmp/bin/lib/runner-ensure"
   cp scripts/lib/runner-bootstrap "$tmp/bin/lib/runner-bootstrap"
   cp scripts/lib/github-repo-slug "$tmp/bin/lib/github-repo-slug"
+  stage_gh_not_archived_mock "$tmp"
 }
 
 # Keep mocks first, then the bash that runs this suite (shebang via env), then
@@ -50,7 +76,9 @@ run_discovery() {
   trap 'rm -rf "$tmp"' RETURN
 
   local -r sendmail_breadcrumb="${tmp}/sendmail.invoked"
-  mkdir -p "$tmp/work/ai/bunnify/.git" "$tmp/work/ai/my-tracks/.git"
+  mkdir -p "$tmp/work/ai"
+  stage_clone_with_origin "$tmp/work/ai/bunnify" 'the-hcma/example-repo'
+  stage_clone_with_origin "$tmp/work/ai/my-tracks" 'the-hcma/example-tracks'
 
   stage_notifier_bundle "$tmp"
 
@@ -89,12 +117,17 @@ EOF
   assert_contains 'email includes Reply-To header' "$out" "Reply-To: dep-updater-notifier-no-reply@example.com"
   assert_contains 'email subject mentions updates' "$out" \
     "Subject: [dep-updater-notifier] dependency updates needed"
-  assert_contains 'email body includes discovered repo section' "$out" "=== bunnify ==="
+  assert_contains 'email body includes GitHub slug section' "$out" \
+    "=== the-hcma/example-repo ==="
+  assert_not_contains 'email section uses slug not directory basename' "$out" \
+    "=== bunnify ==="
   # Sole-update rows used to vanish: $(jq) strips the trailing newline and
   # `while read` drops the only line → header-only "Outdated packages" tables.
   assert_contains 'email body lists the sole outdated package' "$out" "astral-sh/setup-uv"
   assert_contains 'email body lists the from version' "$out" "v7"
   assert_contains 'email body lists the to version' "$out" "v8"
+  assert_contains 'To update line uses GitHub slug' "$out" \
+    "the-hcma/example-repo:  cd $tmp/work/ai/bunnify &&"
 }
 
 run_short_flags() {
@@ -104,7 +137,8 @@ run_short_flags() {
   trap 'rm -rf "$tmp"' RETURN
 
   local -r sendmail_breadcrumb="${tmp}/sendmail.invoked"
-  mkdir -p "$tmp/work/ai/bunnify/.git"
+  mkdir -p "$tmp/work/ai"
+  stage_clone_with_origin "$tmp/work/ai/bunnify" 'the-hcma/example-repo'
   stage_notifier_bundle "$tmp"
 
   cat >"$tmp/bin/dep-updater" <<'EOF'
@@ -119,7 +153,7 @@ EOF
     "$tmp/bin/dep-updater-notifier" -p -v 2>"$tmp/stderr")"
   err="$(cat "$tmp/stderr")"
 
-  assert_contains 'verbose output appears on stderr' "$err" "Checking bunnify"
+  assert_contains 'verbose output appears on stderr' "$err" "Checking the-hcma/example-repo"
   assert_contains 'email includes To header' "$out" "To: johndoe@example.com"
   assert_contains 'email includes From header' "$out" "From: dep-updater-notifier-no-reply@example.com"
   assert_contains 'email includes Reply-To header' "$out" "Reply-To: dep-updater-notifier-no-reply@example.com"
@@ -134,7 +168,8 @@ run_env_file_report_addresses() {
   trap 'rm -rf "$tmp"' RETURN
 
   local -r sendmail_breadcrumb="${tmp}/sendmail.invoked"
-  mkdir -p "$tmp/work/ai/bunnify/.git" "$tmp/.config"
+  mkdir -p "$tmp/work/ai" "$tmp/.config"
+  stage_clone_with_origin "$tmp/work/ai/bunnify" 'the-hcma/example-repo'
   stage_notifier_bundle "$tmp"
 
   cat >"$tmp/.config/dep-updater.env" <<'EOF'
@@ -165,7 +200,8 @@ run_missing_env_file_fails_outside_test_mode() {
   readonly tmp
   trap 'rm -rf "$tmp"' RETURN
 
-  mkdir -p "$tmp/work/ai/bunnify/.git"
+  mkdir -p "$tmp/work/ai"
+  stage_clone_with_origin "$tmp/work/ai/bunnify" 'the-hcma/example-repo'
   stage_notifier_bundle "$tmp"
   cat >"$tmp/bin/dep-updater" <<'EOF'
 #!/usr/bin/env bash
@@ -188,7 +224,8 @@ run_failure_not_cron_silent() {
   trap 'rm -rf "$tmp"' RETURN
   local -r sendmail_breadcrumb="${tmp}/sendmail.invoked"
 
-  mkdir -p "$tmp/work/ai/bunnify/.git"
+  mkdir -p "$tmp/work/ai"
+  stage_clone_with_origin "$tmp/work/ai/bunnify" 'the-hcma/example-repo'
   stage_notifier_bundle "$tmp"
 
   cat >"$tmp/bin/dep-updater" <<'EOF'
@@ -205,13 +242,13 @@ EOF
   err="$(cat "$tmp/stderr")"
 
   assert_contains 'stderr includes cron failure summary' "$err" \
-    "ERROR: dep-updater-notifier failed: bunnify:"
+    "ERROR: dep-updater-notifier failed: the-hcma/example-repo:"
   assert_contains 'stderr includes failed scan command' "$err" \
     "command: $tmp/bin/dep-updater --report-json --dir $tmp/work/ai/bunnify"
   assert_not_contains 'stderr does not say see email' "$err" \
     "see email for details"
   assert_contains 'stderr includes run_command FAIL block' "$err" \
-    "[FAIL] dep-updater: bunnify"
+    "[FAIL] dep-updater: the-hcma/example-repo"
   assert_contains 'stderr includes exit code' "$err" \
     "exit code: 1"
   assert_contains 'stderr includes dep-updater error line' "$err" \
@@ -229,7 +266,8 @@ run_failure_email_lists_stderr_in_plain_body() {
   readonly tmp
   trap 'rm -rf "$tmp"' RETURN
 
-  mkdir -p "$tmp/work/ai/bunnify/.git"
+  mkdir -p "$tmp/work/ai"
+  stage_clone_with_origin "$tmp/work/ai/bunnify" 'the-hcma/example-repo'
   stage_notifier_bundle "$tmp"
 
   cat >"$tmp/bin/dep-updater" <<'EOF'
@@ -247,7 +285,7 @@ EOF
   assert_contains 'print-mode email body labels dep-updater stderr' "$mail_out" "dep-updater stderr:"
   assert_contains 'print-mode email body includes stderr text' "$mail_out" "ERROR: tool missing under cron"
   assert_contains 'email section header includes actionable reason' "$mail_out" \
-    "=== bunnify === (scan failed: tool missing under cron)"
+    "=== the-hcma/example-repo === (scan failed: tool missing under cron)"
   assert_contains 'email body includes failed scan command' "$mail_out" \
     "command: $tmp/bin/dep-updater --report-json --dir $tmp/work/ai/bunnify"
 }
@@ -258,7 +296,8 @@ run_failure_email_header_from_runner_stderr_block() {
   readonly tmp
   trap 'rm -rf "$tmp"' RETURN
 
-  mkdir -p "$tmp/work/ai/bunnify/.git"
+  mkdir -p "$tmp/work/ai"
+  stage_clone_with_origin "$tmp/work/ai/bunnify" 'the-hcma/example-repo'
   stage_notifier_bundle "$tmp"
 
   cat >"$tmp/bin/dep-updater" <<'EOF'
@@ -279,7 +318,7 @@ EOF
     "$tmp/bin/dep-updater-notifier" --print 2>/dev/null || true)"
 
   assert_contains 'email header lifts nested runner stderr hint' "$mail_out" \
-    '=== bunnify === (scan failed: gh auth: unknown command "setup-git" for "gh")'
+    '=== the-hcma/example-repo === (scan failed: gh auth: unknown command "setup-git" for "gh")'
 }
 
 run_failure_email_header_uses_first_runner_stderr_block() {
@@ -288,7 +327,8 @@ run_failure_email_header_uses_first_runner_stderr_block() {
   readonly tmp
   trap 'rm -rf "$tmp"' RETURN
 
-  mkdir -p "$tmp/work/ai/bunnify/.git"
+  mkdir -p "$tmp/work/ai"
+  stage_clone_with_origin "$tmp/work/ai/bunnify" 'the-hcma/example-repo'
   stage_notifier_bundle "$tmp"
 
   cat >"$tmp/bin/dep-updater" <<'EOF'
@@ -311,7 +351,7 @@ EOF
     "$tmp/bin/dep-updater-notifier" --print 2>/dev/null || true)"
 
   assert_contains 'email header uses first nested runner stderr block' "$mail_out" \
-    '=== bunnify === (scan failed: first step: first failure message)'
+    '=== the-hcma/example-repo === (scan failed: first step: first failure message)'
   assert_not_contains 'email header does not merge later stderr blocks' "$mail_out" \
     'scan failed: second step'
 }
@@ -322,7 +362,8 @@ run_failure_email_header_uses_first_nonblank_stderr_line() {
   readonly tmp
   trap 'rm -rf "$tmp"' RETURN
 
-  mkdir -p "$tmp/work/ai/bunnify/.git"
+  mkdir -p "$tmp/work/ai"
+  stage_clone_with_origin "$tmp/work/ai/bunnify" 'the-hcma/example-repo'
   stage_notifier_bundle "$tmp"
 
   cat >"$tmp/bin/dep-updater" <<'EOF'
@@ -342,7 +383,7 @@ EOF
     "$tmp/bin/dep-updater-notifier" --print 2>/dev/null || true)"
 
   assert_contains 'email header uses first non-blank stderr line' "$mail_out" \
-    '=== bunnify === (scan failed: gh auth: unknown command "setup-git" for "gh")'
+    '=== the-hcma/example-repo === (scan failed: gh auth: unknown command "setup-git" for "gh")'
   assert_not_contains 'email header ignores trailing usage text' "$mail_out" \
     'scan failed: gh auth: Usage:'
 }
@@ -354,7 +395,8 @@ run_failure_stderr_includes_invalid_json_reason() {
   trap 'rm -rf "$tmp"' RETURN
   local -r sendmail_breadcrumb="${tmp}/sendmail.invoked"
 
-  mkdir -p "$tmp/work/ai/bunnify/.git"
+  mkdir -p "$tmp/work/ai"
+  stage_clone_with_origin "$tmp/work/ai/bunnify" 'the-hcma/example-repo'
   stage_notifier_bundle "$tmp"
 
   cat >"$tmp/bin/dep-updater" <<'EOF'
@@ -371,7 +413,7 @@ EOF
   err="$(cat "$tmp/stderr")"
 
   assert_contains 'stderr names invalid-json repo' "$err" \
-    'ERROR: dep-updater-notifier failed: bunnify: invalid JSON on stdout (exit code 0)'
+    'ERROR: dep-updater-notifier failed: the-hcma/example-repo: invalid JSON on stdout (exit code 0)'
   assert_contains 'stderr includes failed scan command for invalid json' "$err" \
     "command: $tmp/bin/dep-updater --report-json --dir $tmp/work/ai/bunnify"
   if [[ -f "$sendmail_breadcrumb" ]]; then
@@ -450,9 +492,12 @@ EOF
     "$tmp/bin/dep-updater-notifier" --print 2>"$tmp/stderr")"
   err="$(cat "$tmp/stderr")"
 
-  assert_contains 'email includes active repo' "$out" "=== active ==="
+  assert_contains 'email includes active repo slug' "$out" \
+    "=== the-hcma/example-active ==="
   assert_contains 'email lists active package' "$out" "actions/checkout"
   assert_not_contains 'email omits archived repo section' "$out" "=== archived ==="
+  assert_not_contains 'email omits archived repo slug' "$out" \
+    "=== the-hcma/example-archived ==="
   assert_not_contains 'stderr has no archived scan failure' "$err" "archived:"
   if [[ ! -e "$archived_scan_breadcrumb" ]]; then
     pass_case 'archived repository is not scanned'
@@ -461,37 +506,119 @@ EOF
   fi
 }
 
-# Missing origin must not pollute runner_last_failure_* used for dep-updater emails.
-run_no_origin_failure_reports_dep_updater() {
-  local tmp out err
+# Missing origin: skip the scan, warn in the report, and do not blame git remote get-url.
+run_no_origin_skips_with_actionable_warning() {
+  local tmp out err spaced_cmd slash_out
   tmp="$(make_tmpdir)"
   readonly tmp
   trap 'rm -rf "$tmp"' RETURN
 
   local -r sendmail_breadcrumb="${tmp}/sendmail.invoked"
+  local -r scan_breadcrumb="${tmp}/orphan-scan.invoked"
   mkdir -p "$tmp/work/ai/orphan" "$tmp/.local/bin"
   stage_notifier_bundle "$tmp"
 
   git -C "$tmp/work/ai/orphan" init --quiet
+  mkdir -p "$tmp/work/ai/has space"
+  git -C "$tmp/work/ai/has space" init --quiet
   # No origin remote — archived probe's git remote get-url fails (must be --probe).
 
   cat >"$tmp/bin/dep-updater" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+: >"${DEP_UPDATER_ORPHAN_SCAN_BREADCRUMB:?}"
 printf '%s\n' 'ERROR: simulated scan boom' >&2
 exit 2
 EOF
   chmod +x "$tmp/bin/dep-updater" "$tmp/bin/dep-updater-notifier"
 
   out="$(env -u DEP_UPDATER_ENV_FILE HOME="$tmp" PATH="$(notifier_test_path "$tmp")" \
+    DEP_UPDATER_ORPHAN_SCAN_BREADCRUMB="$scan_breadcrumb" \
     REPO_HELPERS_TEST_MODE=1 REPO_HELPERS_SENDMAIL_BREADCRUMB="$sendmail_breadcrumb" \
     "$tmp/bin/dep-updater-notifier" --print 2>"$tmp/stderr" || true)"
   err="$(cat "$tmp/stderr")"
 
-  assert_contains 'email reports dep-updater failure reason' "$out" 'simulated scan boom'
-  assert_contains 'email command is dep-updater scan' "$out" 'dep-updater --report-json'
-  assert_not_contains 'email does not blame missing origin remote' "$out" 'git remote get-url'
-  assert_not_contains 'stderr does not blame missing origin remote' "$err" 'git remote get-url'
+  assert_contains 'email skips clone without GitHub origin' "$out" \
+    '=== orphan === (skipped: no resolvable GitHub origin URL)'
+  assert_contains 'email tells operator to point origin at GitHub' "$out" \
+    'Point origin at a GitHub URL so the notifier can label the clone as OWNER/NAME'
+  assert_contains 'email includes clone path' "$out" "path: $tmp/work/ai/orphan"
+  assert_contains 'email includes git remote add origin command' "$out" \
+    "command: git -C $tmp/work/ai/orphan remote add origin https://github.com/OWNER/NAME.git || git -C $tmp/work/ai/orphan remote set-url origin https://github.com/OWNER/NAME.git"
+  spaced_cmd="$(printf 'git -C %q remote add origin https://github.com/OWNER/NAME.git || git -C %q remote set-url origin https://github.com/OWNER/NAME.git' \
+    "$tmp/work/ai/has space" "$tmp/work/ai/has space")"
+  assert_contains 'email quotes clone paths that contain spaces' "$out" \
+    "command: ${spaced_cmd}"
+  assert_contains 'stderr names missing origin as a notifier failure' "$err" \
+    'orphan: no resolvable GitHub origin URL'
+  assert_not_contains 'email does not scan a clone without origin' "$out" 'simulated scan boom'
+  assert_not_contains 'email does not blame missing origin remote probe' "$out" 'git remote get-url'
+  assert_not_contains 'stderr does not blame missing origin remote probe' "$err" 'git remote get-url'
+  if [[ ! -e "$scan_breadcrumb" ]]; then
+    pass_case 'clone without origin is not scanned'
+  else
+    fail_case 'clone without origin is not scanned'
+  fi
+
+  slash_out="$(env -u DEP_UPDATER_ENV_FILE HOME="$tmp" PATH="$(notifier_test_path "$tmp")" \
+    DEP_UPDATER_NOTIFIER_REPOS="$tmp/work/ai/orphan/" \
+    REPO_HELPERS_TEST_MODE=1 \
+    "$tmp/bin/dep-updater-notifier" --print 2>/dev/null || true)"
+  assert_contains 'trailing slash still names the clone orphan' "$slash_out" \
+    '=== orphan === (skipped: no resolvable GitHub origin URL)'
+  assert_not_contains 'trailing slash does not emit an empty section title' "$slash_out" \
+    '=== ==='
+}
+
+run_skips_directory_symlinks() {
+  local tmp out
+  tmp="$(make_tmpdir)"
+  readonly tmp
+  trap 'rm -rf "$tmp"' RETURN
+
+  local -r sendmail_breadcrumb="${tmp}/sendmail.invoked"
+  local -r symlink_scan_breadcrumb="${tmp}/symlink-scan.invoked"
+  mkdir -p "$tmp/work/ai" "$tmp/share"
+  stage_clone_with_origin "$tmp/work/ai/active" 'the-hcma/example-active'
+  stage_clone_with_origin "$tmp/share/live-clone" 'the-hcma/example-live'
+  ln -s "$tmp/share/live-clone" "$tmp/work/ai/live-clone"
+  stage_notifier_bundle "$tmp"
+
+  cat >"$tmp/bin/dep-updater" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+dir=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dir) dir="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+repo="$(basename "$dir")"
+if [[ "$repo" == 'live-clone' ]]; then
+  : >"${DEP_UPDATER_SYMLINK_SCAN_BREADCRUMB:?}"
+  printf '%s' '{"has_updates":true,"has_cves":false,"updates":[{"ecosystem":"gha","package":"actions/checkout","from":"v4","to":"v5"}],"cves":[]}'
+  exit 0
+fi
+printf '%s' '{"has_updates":true,"has_cves":false,"updates":[{"ecosystem":"gha","package":"actions/setup-node","from":"v4","to":"v5"}],"cves":[]}'
+EOF
+  chmod +x "$tmp/bin/dep-updater" "$tmp/bin/dep-updater-notifier"
+
+  out="$(env -u DEP_UPDATER_ENV_FILE HOME="$tmp" PATH="$(notifier_test_path "$tmp")" \
+    DEP_UPDATER_SYMLINK_SCAN_BREADCRUMB="$symlink_scan_breadcrumb" \
+    REPO_HELPERS_TEST_MODE=1 REPO_HELPERS_SENDMAIL_BREADCRUMB="$sendmail_breadcrumb" \
+    "$tmp/bin/dep-updater-notifier" --print 2>/dev/null)"
+
+  assert_contains 'email includes real clone slug' "$out" \
+    "=== the-hcma/example-active ==="
+  assert_not_contains 'email omits symlinked clone basename' "$out" "=== live-clone ==="
+  assert_not_contains 'email omits symlinked clone slug' "$out" \
+    "=== the-hcma/example-live ==="
+  if [[ ! -e "$symlink_scan_breadcrumb" ]]; then
+    pass_case 'directory symlink under scan root is not scanned'
+  else
+    fail_case 'directory symlink under scan root is not scanned'
+  fi
 }
 
 printf '\n=== static: empty arrays safe under set -u ===\n'
@@ -521,12 +648,36 @@ printf '\n=== static: dep-updater-notifier stream newline restore ===\n'
 if grep -qF 'dun_runner_print_stream' "$notifier_script" \
   && grep -qF 'dun_runner_jq_stream' "$notifier_script" \
   && grep -qF 'dun_skip_archived_repo' "$notifier_script" \
+  && grep -qF 'dun_repo_display_name' "$notifier_script" \
+  && grep -qF 'dun_repo_basename' "$notifier_script" \
+  && grep -qF 'dun_record_missing_origin' "$notifier_script" \
   && grep -qF 'github-repo-slug' "$notifier_script" \
   && grep -qF '.updates|length' "$notifier_script" \
   && ! grep -qF 'dun_runner_print_captured' "$notifier_script"; then
-  pass_case 'dep-updater-notifier: stream-only newline restore, archived skip, updates|length gate'
+  pass_case 'dep-updater-notifier: stream-only newline restore, archived skip, slug labels, updates|length gate'
 else
-  fail_case 'dep-updater-notifier: missing stream/archived-skip wiring (or scalar print_captured)'
+  fail_case 'dep-updater-notifier: missing stream/archived-skip/slug wiring (or scalar print_captured)'
+fi
+
+printf '\n=== static: missing-origin suggested command avoids runner-adoption || git ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'origin_cmd="${origin_add} || ${origin_set}"' "$notifier_script" \
+  && grep -qF 'origin_add="git -C ${quoted_repo} remote add origin https://github.com/OWNER/NAME.git"' \
+    "$notifier_script" \
+  && grep -qF 'origin_set="git -C ${quoted_repo} remote set-url origin https://github.com/OWNER/NAME.git"' \
+    "$notifier_script" \
+  && ! grep -qE '[|][[:space:]]*git[[:space:]]' "$notifier_script"; then
+  pass_case 'missing-origin command is assembled without a || git token on one line'
+else
+  fail_case 'missing-origin suggested git command would trip runner-adoption (|| git)'
+fi
+
+printf '\n=== static: dep-updater-notifier skips scan-root directory symlinks ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF '[[ -L "$child" ]]' "$notifier_script"; then
+  pass_case 'dep-updater-notifier: discover_repos skips directory symlinks'
+else
+  fail_case 'dep-updater-notifier: discover_repos must skip directory symlinks'
 fi
 
 printf '\n=== static: dep-updater-notifier multipart via email-multipart ===\n'
@@ -585,8 +736,11 @@ run_failure_stderr_includes_invalid_json_reason
 echo "=== discovery: skips archived GitHub repositories ==="
 run_skips_archived_repos
 
-echo "=== failure: missing origin does not pollute dep-updater failure report ==="
-run_no_origin_failure_reports_dep_updater
+echo "=== discovery: skips clones without GitHub origin and warns ==="
+run_no_origin_skips_with_actionable_warning
+
+echo "=== discovery: skips directory symlinks under the scan root ==="
+run_skips_directory_symlinks
 
 echo "=== done ==="
 test_summary
