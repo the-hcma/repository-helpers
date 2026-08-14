@@ -9,9 +9,10 @@ readonly rh_root
 
 checker="${rh_root}/scripts/github-repo-lint"
 lib="${rh_root}/scripts/lib/repo-practices"
+runner_bootstrap="${rh_root}/scripts/lib/runner-bootstrap"
 merge_wrapper="${rh_root}/scripts/check-merge-settings"
 templates_dir="${rh_root}/scripts/lib/repo-practices-workflows"
-readonly checker lib merge_wrapper templates_dir
+readonly checker lib runner_bootstrap merge_wrapper templates_dir
 
 # shellcheck source=tests/lib/test-assert
 source "${script_dir}/lib/test-assert"
@@ -159,6 +160,7 @@ fi
 
 if grep -qF 'gh_repo_is_private' "$checker" \
   && grep -qF 'Skipping private repository' "$checker" \
+  && grep -qF 'Skipping non-org repository' "$checker" \
   && grep -qF 'rp_include_private=1' "$checker"; then
   printf '[PASS] github-repo-lint enforcer skips private local clones by default\n'
   pass=$(( pass + 1 ))
@@ -180,11 +182,23 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== static: gh api body retries use a file, not stdin pipe ===\n'
+# shellcheck disable=SC2016  # assert literal --input "$tmp" in source
+if grep -qF 'rp_runner_gh_api_input' "$lib" \
+  && grep -qF -- '--input "$tmp"' "$lib" \
+  && ! grep -nE 'rp_runner_gh_api_stream.*--input -|--input -.*rp_runner_gh_api_stream' "$lib"; then
+  printf '[PASS] repo-practices: ruleset/protection writes retry from a temp file\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] repo-practices: piped --input - cannot be retried after a rate limit\n'
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== static: expected probes omitted from email failures ===\n'
 # shellcheck disable=SC2016,SC1003  # static assert matches literal source text
 if grep -qF 'runner_exec "$label" --probe -- jq' "$lib" \
-  && grep -qF 'runner_exec "repo-practices gh path exists' "$lib" \
-  && grep -qF 'rp_runner_exec_stdout "repo-practices gh fetch' "$lib" \
+  && grep -qF 'rp_runner_gh_api_stream "repo-practices gh path exists' "$lib" \
+  && grep -qF 'rp_runner_gh_api_stream "repo-practices gh fetch' "$lib" \
   && grep -qF 'rp_runner_gh_api_stream "repo-practices protect-main ruleset id" --probe' "$lib" \
   && grep -qF 'rp_runner_gh_api_stream "repo-practices classic main protection" --probe' "$lib" \
   && grep -qF ' --probe \' "$lib"; then
@@ -2891,6 +2905,7 @@ gh_stack_and_gt_docs=$'Use gh stack or gt create\n'
 gh_stack_negation_with_bare_gt=$'Use gt for stacking. Do not use gh stack.\n'
 merge_it_only_agents=$'- To merge, add the merge-it label.\n'
 merge_it_forbid_agents=$'- Do not use merge-it — merge via gh pr merge --auto --squash\n'
+gt_forbid_agents=$'- Do not use gt create or gt submit — use gh stack submit\n- Prefer gh stack init\n'
 if bash -c "source '${lib}'
   rp_pr_ship_has_graphite_only_submit_snippet \"\$1\"
 " _ "$graphite_only_pr_ship" \
@@ -2912,6 +2927,9 @@ if bash -c "source '${lib}'
   && ! bash -c "source '${lib}'
   rp_agents_md_prescribes_graphite_primary_stacking \"\$1\"
 " _ "$merge_it_forbid_agents" \
+  && ! bash -c "source '${lib}'
+  rp_agents_md_prescribes_graphite_primary_stacking \"\$1\"
+" _ "$gt_forbid_agents" \
   && bash -c "source '${lib}'
   rp_docs_prescribe_gh_stack_without_graphite \"\$1\"
 " _ "$gh_stack_only_docs" \
@@ -2925,6 +2943,175 @@ if bash -c "source '${lib}'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] stacking docs helpers: predicate mismatch\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: pr-ship marker resolver prefers GitHub over local clone ===\n'
+marker_mock_dir="$(mktemp -d)"
+marker_mock_bin="${marker_mock_dir}/bin"
+mkdir -p "$marker_mock_bin" "$marker_mock_dir/scan/example-repo/.github"
+printf 'graphite\n' >"$marker_mock_dir/scan/example-repo/.github/stacking-tool"
+git -C "$marker_mock_dir/scan/example-repo" init -q
+git -C "$marker_mock_dir/scan/example-repo" remote add origin "https://github.com/the-hcma/example-repo.git"
+export RUNNER_SESSION_ROOT="${marker_mock_dir}/runner-sessions"
+cat >"${marker_mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'contents/.github/stacking-tool'* ]]; then
+  printf '%s\n' '{"content":"Z2gtc3RhY2sK"}'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${marker_mock_bin}/gh"
+cat >"${marker_mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${marker_mock_bin}/jq"
+marker_resolver_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    source "$2"
+    export PATH="$3:${PATH}"
+    export GITHUB_REPO_LINT_SCAN_ROOT="$4/scan"
+    export RP_GH_API_MAX_ATTEMPTS=1
+    export RP_GH_API_RETRY_SLEEP_SECS=0
+    marker_ec=0
+    marker="$(rp_pr_ship_stacking_marker_for_slug the-hcma/example-repo)" || marker_ec=$?
+    if (( marker_ec != 0 )); then
+      printf "unexpected_ec=%s\n" "$marker_ec"
+      exit 1
+    fi
+    if [[ "$marker" != gh-stack ]]; then
+      printf "marker=%s\n" "$marker"
+      exit 1
+    fi
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib" "$marker_mock_bin" "$marker_mock_dir"
+)" || marker_resolver_out="fail:${marker_resolver_out}"
+rm -rf "$marker_mock_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$marker_resolver_out" == 'ok' ]]; then
+  printf '[PASS] pr-ship marker resolver: GitHub marker wins over local defaults\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] pr-ship marker resolver: GitHub-first resolution (%s)\n' "$marker_resolver_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: pr-ship marker resolver fails on GitHub API error ===\n'
+marker_api_err_dir="$(mktemp -d)"
+marker_api_err_bin="${marker_api_err_dir}/bin"
+mkdir -p "$marker_api_err_bin"
+export RUNNER_SESSION_ROOT="${marker_api_err_dir}/runner-sessions"
+cat >"${marker_api_err_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+printf 'gh: HTTP 503: unavailable\n' >&2
+exit 1
+MOCK_GH
+chmod +x "${marker_api_err_bin}/gh"
+cat >"${marker_api_err_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${marker_api_err_bin}/jq"
+marker_api_err_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    source "$2"
+    export PATH="$3:${PATH}"
+    export RP_GH_API_MAX_ATTEMPTS=1
+    export RP_GH_API_RETRY_SLEEP_SECS=0
+    marker_ec=0
+    marker="$(rp_pr_ship_stacking_marker_for_slug the-hcma/example-repo)" || marker_ec=$?
+    if (( marker_ec == 2 )) && [[ -z "$marker" ]]; then
+      printf "ok\n"
+      exit 0
+    fi
+    printf "ec=%s marker=%s\n" "$marker_ec" "$marker"
+    exit 1
+  ' bash "$runner_bootstrap" "$lib" "$marker_api_err_bin"
+)" || marker_api_err_out="fail:${marker_api_err_out}"
+rm -rf "$marker_api_err_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$marker_api_err_out" == 'ok' ]]; then
+  printf '[PASS] pr-ship marker resolver: GitHub API error returns exit 2\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] pr-ship marker resolver: expected fetch_ec=2 (%s)\n' "$marker_api_err_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: stacking docs predicates use runner grep probes ===\n'
+if grep -qF 'rp_text_probe_grep_f' "$lib" \
+  && grep -qF 'rp_text_probe_grep_iE' "$lib" \
+  && grep -qF 'runner_exec' "$lib" \
+  && grep -qF 'fetch_ec == 2' "$lib" \
+  && awk '
+    /^rp_pr_ship_stacking_marker_for_slug\(\)/ { in_fn=1 }
+    in_fn && /rp_fetch_github_text_file/ { gh_first=1 }
+    in_fn && /rp_resolve_local_repo_dir/ { local_after=1 }
+    in_fn && /^}/ {
+      if (gh_first && local_after) { exit 0 }
+      exit 1
+    }
+    END { if (!in_fn) exit 1 }
+  ' "$lib"; then
+  printf '[PASS] stacking docs: runner grep probes and GitHub-first marker resolver\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] stacking docs: missing runner grep probes or GitHub-first marker\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: pr-ship apply-fix template matches stacking-tool marker ===\n'
+pr_ship_marker_unit_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    graphite_rendered="$(rp_pr_ship_and_review_rule_template_for_marker "$2")"
+    gh_stack_rendered="$(rp_pr_ship_and_review_rule_template_for_marker "$3")"
+    if ! rp_pr_ship_has_graphite_only_submit_snippet "$graphite_rendered"; then
+      printf "graphite_template_not_graphite_only\n"
+      exit 1
+    fi
+    if rp_pr_ship_has_graphite_only_submit_snippet "$gh_stack_rendered"; then
+      printf "gh_stack_template_still_graphite_only\n"
+      exit 1
+    fi
+    if ! grep -qE "^gt create " <<<"$graphite_rendered" \
+      || ! grep -qE "^# gh stack init" <<<"$graphite_rendered"; then
+      printf "graphite_template_submit_block\n"
+      exit 1
+    fi
+    if ! grep -qE "^# gt create " <<<"$gh_stack_rendered" \
+      || ! grep -qE "^gh stack init" <<<"$gh_stack_rendered" \
+      || ! grep -qE "^gh stack submit" <<<"$gh_stack_rendered"; then
+      printf "gh_stack_template_submit_block\n"
+      exit 1
+    fi
+    if ! rp_pr_ship_and_review_rule_is_valid "$graphite_rendered" "the-hcma/example-repo" \
+      || ! rp_pr_ship_and_review_rule_is_valid "$gh_stack_rendered" "the-hcma/example-repo"; then
+      printf "rendered_template_invalid\n"
+      exit 1
+    fi
+    printf "ok\n"
+  ' bash "$lib" graphite gh-stack
+)" || pr_ship_marker_unit_out="fail:${pr_ship_marker_unit_out}"
+if [[ "$pr_ship_marker_unit_out" == 'ok' ]]; then
+  printf '[PASS] pr-ship apply-fix: gh-stack marker uncomments gh stack submit lines\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] pr-ship apply-fix: marker-aware template render (%s)\n' \
+    "$pr_ship_marker_unit_out"
   fail=$(( fail + 1 ))
 fi
 
@@ -3295,7 +3482,12 @@ rm -rf "$mock_dir"
 printf '\n=== static: pr-ship apply-fix queues candidate branch ===\n'
 if grep -qF 'add-pr-ship-and-review' "$lib" \
   && grep -qF 'sync-pr-ship-and-review' "$lib" \
-  && grep -qF 'rp_pr_ship_and_review_rule_template' "$lib"; then
+  && grep -qF 'rp_pr_ship_and_review_rule_template' "$lib" \
+  && grep -qF 'rp_pr_ship_and_review_rule_template_for_marker' "$lib" \
+  && grep -qF 'rp_pr_ship_stacking_marker_for_slug' "$lib" \
+  && grep -qF 'runner_exec_stdout "repo-practices pr-ship template urls"' "$lib" \
+  && grep -qF 'runner_exec_stdout "repo-practices pr-ship gh-stack marker"' "$lib" \
+  && grep -qF 'runner_exec_stdout "repo-practices stacking-tool template urls"' "$lib"; then
   printf '[PASS] pr-ship-rule: --apply-fix queues candidate cursor rule branch\n'
   pass=$(( pass + 1 ))
 else
@@ -3307,6 +3499,7 @@ printf '\n=== static: stacking-tool check and apply-fix wiring ===\n'
 if grep -qF 'rp_check_stacking_tool' "$lib" \
   && grep -qF 'rp_check_stacking_docs_consistency' "$lib" \
   && grep -qF 'rp_pr_ship_has_graphite_only_submit_snippet' "$lib" \
+  && grep -qF 'rp_pr_ship_and_review_rule_template_for_marker' "$lib" \
   && grep -qF 'rp_agents_md_prescribes_graphite_primary_stacking' "$lib" \
   && grep -qF 'sync-pr-ship-stacking-docs' "$lib" \
   && grep -qF 'add-stacking-tool-marker' "$lib" \
@@ -4442,6 +4635,7 @@ if [[ -f "$grl_ci_workflow" ]] \
   && grep -qF 'scripts/lib/repo-practices' "$grl_ci_workflow" \
   && grep -qF 'scripts/lib/repo-practices-cursor/**' "$grl_ci_workflow" \
   && grep -qF 'environment: github-repo-lint' "$grl_ci_workflow" \
+  && grep -qF 'approve-pending-deployments' "$grl_ci_workflow" \
   && grep -qF 'workflow_dispatch:' "$grl_ci_workflow" \
   && ! grep -qF 'merge_group:' "$grl_ci_workflow" \
   && grep -qF 'secrets.REPO_LINT_TOKEN' "$grl_ci_workflow" \
@@ -4459,7 +4653,8 @@ org_rollout_rule="${rh_root}/.cursor/rules/org-cursor-rule-rollout.mdc"
 if [[ -f "$org_rollout_rule" ]] \
   && grep -qF -- '--apply-fix' "$org_rollout_rule" \
   && grep -qF -- '--all' "$org_rollout_rule" \
-  && grep -qF 'scripts/lib/repo-practices-cursor/' "$org_rollout_rule"; then
+  && grep -qF 'scripts/lib/repo-practices-cursor/' "$org_rollout_rule" \
+  && grep -qF 'approve-pending-deployments' "$org_rollout_rule"; then
   printf '[PASS] org-cursor-rule-rollout rule documents org-wide deployment\n'
   pass=$(( pass + 1 ))
 else

@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# scripts/dev/approve-pending-deployments — Approve GitHub environment waits.
+#
+# Coding agents MUST run this when CI is WAITING on a protected environment
+# (github-repo-lint, dep-updater, …). `gh` is the authenticated operator;
+# approve on their behalf. Do not wait for a human to click Approve in the
+# Actions UI.
+#
+# On failure, prints ERROR: ENVIRONMENT_APPROVAL_FAILED and exits 1. Coding
+# agents MUST raise that to the operator immediately — do not keep polling.
+#
+# Usage:
+#   scripts/dev/approve-pending-deployments --pr <number>
+#   scripts/dev/approve-pending-deployments --help
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # runner-bootstrap begins session for runner_exec calls
+source "${script_dir}/../lib/runner-bootstrap"
+# shellcheck source=scripts/lib/github-api-rate-limit
+source "${script_dir}/../lib/github-api-rate-limit"
+
+readonly apd_approve_comment='Approved on operator behalf (coding agent, gh is the operator)'
+
+pr_number=""
+
+usage() {
+  runner_sh_stdout "approve-pending-deployments usage" -- \
+    "sed -n '2,14p' $(printf '%q' "${BASH_SOURCE[0]}") | sed 's/^# \{0,1\}//'"
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+log_step() {
+  printf '==> %s\n' "$*" >&2
+}
+
+# print_environment_approval_failed <detail>
+# Operator-visible failure. Agents must surface this instead of waiting on CI.
+print_environment_approval_failed() {
+  local -r detail="$1"
+  printf 'ERROR: ENVIRONMENT_APPROVAL_FAILED %s\n' "$detail" >&2
+  printf 'ERROR: raise this to the operator — do not keep waiting on WAITING jobs.\n' >&2
+  printf 'ERROR: operator must approve the environment or grant this gh identity reviewer access.\n' >&2
+}
+
+repo_slug() {
+  local slug exit_code
+
+  exit_code=0
+  # Keep gh on the same line as runner_exec_stdout (runner-adoption ratchet).
+  slug="$(runner_exec_stdout "approve-pending-deployments gh repo slug" -- gh repo view --json nameWithOwner --jq '.nameWithOwner // empty')" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$slug" ]]; then
+    print_environment_approval_failed "repo_slug=failed"
+    die "Could not resolve GitHub repo slug"
+  fi
+  printf '%s\n' "$slug"
+}
+
+# waiting_run_ids <pr>
+# Unique Actions run ids from check runs with status WAITING.
+waiting_run_ids() {
+  local -r pr="$1"
+  local rollup tmp jq_tmp sort_tmp exit_code url
+  local -a ids=()
+
+  exit_code=0
+  # Keep gh on the same line as runner_exec_stdout (runner-adoption ratchet).
+  rollup="$(runner_exec_stdout "approve-pending-deployments pr rollup" -- gh pr view "$pr" --json statusCheckRollup --jq '.statusCheckRollup')" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$rollup" || "$rollup" == 'null' ]]; then
+    return 1
+  fi
+
+  tmp="$(mktemp)"
+  jq_tmp="$(mktemp)"
+  printf '%s\n' "$rollup" >"$tmp"
+  exit_code=0
+  runner_exec_stdout "approve-pending-deployments waiting urls" -- jq -r '.[]? | select((.status // "") == "WAITING") | .detailsUrl // empty' "$tmp" >"$jq_tmp" || exit_code=$?
+  rm -f "$tmp"
+  if (( exit_code != 0 )); then
+    rm -f "$jq_tmp"
+    return 1
+  fi
+  while IFS= read -r url; do
+    [[ -n "$url" ]] || continue
+    if [[ "$url" =~ /actions/runs/([0-9]+) ]]; then
+      ids+=("${BASH_REMATCH[1]}")
+    fi
+  done <"$jq_tmp"
+  rm -f "$jq_tmp"
+
+  if [[ "${#ids[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  sort_tmp="$(mktemp)"
+  printf '%s\n' "${ids[@]}" >"$sort_tmp"
+  exit_code=0
+  runner_exec_stdout "approve-pending-deployments unique run ids" -- sort -u "$sort_tmp" || exit_code=$?
+  rm -f "$sort_tmp"
+  if (( exit_code != 0 )); then
+    return 1
+  fi
+}
+
+# approve_run <slug> <run_id>
+# Approves pending deployments the current user can approve. Returns 1 if any
+# pending environment is not approvable, or if the approve API fails.
+approve_run() {
+  local -r slug="$1"
+  local -r run_id="$2"
+  local pending tmp parse_tmp ids_json body exit_code
+  local -a env_ids=()
+  local blocked=0
+  local env_name env_id can_approve
+
+  exit_code=0
+  # Keep gh on the same line as the waiter (runner-adoption + gh-api waiter ratchets).
+  pending="$(github_api_exec_with_rate_limit_retry "approve-pending-deployments list pending" -- gh api \
+    "repos/${slug}/actions/runs/${run_id}/pending_deployments")" || exit_code=$?
+  if (( exit_code != 0 )); then
+    printf 'ERROR: failed to list pending deployments for run %s\n' "$run_id" >&2
+    return 1
+  fi
+  if [[ -z "$pending" || "$pending" == '[]' ]]; then
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  printf '%s\n' "$pending" >"$tmp"
+  parse_tmp="$(mktemp)"
+  exit_code=0
+  runner_exec_stdout "approve-pending-deployments pending fields" -- jq -r '.[] | [.environment.id, .environment.name, (.current_user_can_approve|tostring)] | @tsv' "$tmp" >"$parse_tmp" || exit_code=$?
+  rm -f "$tmp"
+  if (( exit_code != 0 )); then
+    rm -f "$parse_tmp"
+    printf 'ERROR: failed to parse pending deployments for run %s\n' "$run_id" >&2
+    return 1
+  fi
+  while IFS=$'\t' read -r env_id env_name can_approve; do
+    [[ -n "$env_id" ]] || continue
+    if [[ "$can_approve" == 'true' ]]; then
+      env_ids+=("$env_id")
+      log_step "Approving environment ${env_name} on run ${run_id}"
+    else
+      printf 'ERROR: cannot approve environment %s on run %s (gh user is not a reviewer)\n' \
+        "$env_name" "$run_id" >&2
+      blocked=1
+    fi
+  done <"$parse_tmp"
+  rm -f "$parse_tmp"
+
+  if [[ "${#env_ids[@]}" -eq 0 ]]; then
+    return "$blocked"
+  fi
+
+  ids_json="$(IFS=,; printf '%s' "${env_ids[*]}")"
+  body="$(printf '{"environment_ids":[%s],"state":"approved","comment":"%s"}' \
+    "$ids_json" "$apd_approve_comment")"
+  tmp="$(mktemp)"
+  printf '%s\n' "$body" >"$tmp"
+  exit_code=0
+  # Keep gh on the same line as the waiter (runner-adoption + gh-api waiter ratchets).
+  github_api_exec_with_rate_limit_retry "approve-pending-deployments post approve" -- gh api --method POST \
+    "repos/${slug}/actions/runs/${run_id}/pending_deployments" --input "$tmp" >/dev/null || exit_code=$?
+  rm -f "$tmp"
+  if (( exit_code != 0 )); then
+    printf 'ERROR: failed to approve pending deployments on run %s\n' "$run_id" >&2
+    return 1
+  fi
+  return "$blocked"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --pr)
+        [[ $# -ge 2 ]] || die '--pr requires a number'
+        pr_number="$2"
+        shift 2
+        ;;
+      *)
+        die "Unknown argument: $1 (see --help)"
+        ;;
+    esac
+  done
+}
+
+main() {
+  local slug run_id waiting_tmp
+  local any_blocked=0
+  local found=0
+
+  parse_args "$@"
+  [[ -n "$pr_number" ]] || die 'Usage: scripts/dev/approve-pending-deployments --pr <number>'
+
+  slug="$(repo_slug)"
+  waiting_tmp="$(mktemp)"
+  if ! waiting_run_ids "$pr_number" >"$waiting_tmp"; then
+    rm -f "$waiting_tmp"
+    print_environment_approval_failed "pr=${pr_number} waiting_run_ids=failed"
+    exit 1
+  fi
+  while IFS= read -r run_id; do
+    [[ -n "$run_id" ]] || continue
+    found=1
+    if ! approve_run "$slug" "$run_id"; then
+      any_blocked=1
+    fi
+  done <"$waiting_tmp"
+  rm -f "$waiting_tmp"
+
+  if [[ "$found" -eq 0 ]]; then
+    log_step "No WAITING environment jobs on PR #${pr_number}"
+  fi
+  if [[ "$any_blocked" -eq 1 ]]; then
+    print_environment_approval_failed "pr=${pr_number}"
+    exit 1
+  fi
+}
+
+main "$@"

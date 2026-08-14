@@ -8,6 +8,8 @@ lib="${root}/scripts/lib/github-api-rate-limit"
 source "${root}/scripts/lib/runner-bootstrap"
 # shellcheck source=scripts/lib/github-api-rate-limit
 source "$lib"
+# shellcheck source=tests/lib/gh-api-waiter-count
+source "${root}/tests/lib/gh-api-waiter-count"
 
 fail=0
 pass=0
@@ -48,6 +50,34 @@ if grep -nF 'rp_fetch_repo_labels_json' "${root}/scripts/lib/repo-practices" >/d
   pass_case "labels and workflow-list fetches use rate-limit gh api stream"
 else
   fail_case "labels/workflow fetches still bypass rate-limit retry"
+fi
+
+printf '\n=== static: gh api invocations use the waiter ===\n'
+if rp_gh_api_waiter_skip_file 'scripts/lib/github-api-rate-limit' \
+  && rp_gh_api_waiter_skip_file 'scripts/lib/ci-secret-scan' \
+  && ! rp_gh_api_waiter_skip_file 'scripts/lib/repo-practices'; then
+  pass_case "waiter ratchet skips probe lib and copied secret-scan"
+else
+  fail_case "waiter ratchet skip list is wrong"
+fi
+
+if rp_gh_api_waiter_line_bypasses '  runner_exec "x" -- gh api foo' \
+  && rp_gh_api_waiter_line_bypasses '  runner_exec_stdout "x" --probe -- gh api foo' \
+  && ! rp_gh_api_waiter_line_bypasses '  github_api_exec_with_rate_limit_retry "x" -- gh api foo' \
+  && ! rp_gh_api_waiter_line_bypasses '    detail='\''gh api request failed'\''' \
+  && ! rp_gh_api_waiter_line_bypasses '  # typically a gh api error'; then
+  pass_case "waiter ratchet flags runner gh api and ignores comments/strings"
+else
+  fail_case "waiter ratchet line classifier is wrong"
+fi
+
+waiter_bypass_lines=""
+waiter_bypass_lines="$(rp_gh_api_waiter_collect_bypasses "$root")"
+if [[ -z "$waiter_bypass_lines" ]]; then
+  pass_case "scripts gh api invocations go through github_api_exec_with_rate_limit_retry"
+else
+  fail_case "scripts gh api invocations go through github_api_exec_with_rate_limit_retry"
+  printf '%s\n' "$waiter_bypass_lines" >&2
 fi
 
 if grep -qF 'NOTE: GITHUB_RATE_LIMIT_WAIT' "$lib" \
@@ -360,6 +390,81 @@ if (( ec == 0 )) \
   pass_case "secondary wait uses fallback deadline, not core X-RateLimit-Reset"
 else
   fail_case "secondary fallback wait broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+json='{"resources":{"core":{"remaining":5000,"reset":9999999999},"graphql":{"remaining":5000,"reset":9999999999},"search":{"remaining":30,"reset":9999999999}}}'
+jq_expr=""
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--jq" ]]; then
+    jq_expr="$arg"
+  fi
+  prev="$arg"
+done
+if [[ "$*" == *'rate_limit'* ]]; then
+  if [[ -n "$jq_expr" ]]; then
+    printf '%s' "$json" | jq -r "$jq_expr"
+  else
+    printf '%s\n' "$json"
+  fi
+  exit 0
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+EOF
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    MOCK_DATE_STATE="$(mktemp)" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      run_command() {
+        local label="$1"
+        shift
+        if [[ "${1:-}" == "--timeout" ]]; then
+          shift 2
+        fi
+        if [[ "${1:-}" == "sleep" ]]; then
+          printf "slept\n" >>"${MOCK_DATE_STATE}"
+          return 0
+        fi
+        "$@"
+      }
+      github_api_rate_limit_max_wait_s=120
+      github_api_rate_limit_poll_s=60
+      github_api_rate_limit_retry_sleep_s=60
+      date() {
+        if [[ "${1:-}" != "+%s" ]]; then
+          command date "$@"
+          return
+        fi
+        if grep -q slept "${MOCK_DATE_STATE}" 2>/dev/null; then
+          printf "1700000061\n"
+        else
+          printf "1700000000\n"
+        fi
+      }
+      github_api_wait_for_rate_limit "API rate limit exceeded for user ID 1" "" 2>&1
+    '
+)"
+ec=$?
+set -e
+
+if (( ec == 0 )) \
+  && grep -qF 'secondary_fallback=60s' <<<"$out" \
+  && grep -qF 'deadline_reached' <<<"$out" \
+  && ! grep -qF 'remaining_ok waited=0s' <<<"$out"; then
+  pass_case "403 with remaining>0 waits secondary fallback (not remaining_ok at t=0)"
+else
+  fail_case "403 remaining_ok short-circuit still present (ec=${ec})"
   printf '%s\n' "$out"
 fi
 

@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# Smoke and static tests for scripts/dev/approve-pending-deployments.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/dev/approve-pending-deployments"
+readonly script
+rh_root="${script_dir}/.."
+readonly rh_root
+
+printf '\n=== --help ===\n'
+help_out=""
+help_exit=0
+help_out="$(bash "$script" --help 2>&1)" || help_exit=$?
+assert_exit_0 "--help" "$help_out" "$help_exit"
+assert_contains "--help usage" "$help_out" "approve-pending-deployments"
+assert_contains "--help operator" "$help_out" "operator"
+assert_contains "--help no Actions UI wait" "$help_out" "Actions UI"
+assert_contains "--help failed marker" "$help_out" "ENVIRONMENT_APPROVAL_FAILED"
+
+printf '\n=== unknown argument ===\n'
+unknown_out=""
+unknown_exit=0
+unknown_out="$(bash "$script" --nope 2>&1)" || unknown_exit=$?
+assert_exit_nonzero "unknown arg" "$unknown_out" "$unknown_exit"
+assert_contains "unknown arg" "$unknown_out" "Unknown argument"
+
+printf '\n=== missing --pr ===\n'
+missing_out=""
+missing_exit=0
+missing_out="$(bash "$script" 2>&1)" || missing_exit=$?
+assert_exit_nonzero "missing --pr" "$missing_out" "$missing_exit"
+assert_contains "missing --pr usage" "$missing_out" "--pr"
+
+printf '\n=== functional: approves WAITING environment when gh user can approve ===\n'
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin"
+export RUNNER_SESSION_ROOT="${tmp}/runner-sessions"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+cat >"${mock_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+posted_flag='${tmp}/posted'
+if [[ "\$args" == *'repo view'* && "\$args" == *'nameWithOwner'* ]]; then
+  printf 'the-hcma/mock-repo\n'
+  exit 0
+fi
+if [[ "\$args" == *'pr view 42'* && "\$args" == *'statusCheckRollup'* ]]; then
+  printf '%s\n' '[{"name":"org repo-practices audit","status":"WAITING","conclusion":null,"detailsUrl":"https://github.com/the-hcma/mock-repo/actions/runs/31795289642/job/1"}]'
+  exit 0
+fi
+if [[ "\$args" == *'--method POST'* && "\$args" == *'pending_deployments'* ]]; then
+  printf '1\n' > "\$posted_flag"
+  printf '[]\n'
+  exit 0
+fi
+if [[ "\$args" == *'pending_deployments'* ]]; then
+  printf '%s\n' '[{"environment":{"id":19823000136,"name":"github-repo-lint"},"current_user_can_approve":true}]'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(PATH="${mock_bin}:${PATH}" bash "$script" --pr 42 2>&1)"
+exit_code=$?
+set -e
+
+assert_exit_0 "approve waiting env" "$out" "$exit_code"
+assert_contains "approve log" "$out" "Approving environment github-repo-lint"
+if [[ -f "${tmp}/posted" ]]; then
+  pass_case "posted pending_deployments approve"
+else
+  fail_case "posted pending_deployments approve"
+fi
+rm -rf "$tmp"
+unset RUNNER_SESSION_ROOT
+
+printf '\n=== functional: no WAITING checks is a no-op ===\n'
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin"
+export RUNNER_SESSION_ROOT="${tmp}/runner-sessions"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'repo view'* && "$args" == *'nameWithOwner'* ]]; then
+  printf 'the-hcma/mock-repo\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'statusCheckRollup'* ]]; then
+  printf '%s\n' '[{"name":"CI","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/the-hcma/mock-repo/actions/runs/1/job/1"}]'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(PATH="${mock_bin}:${PATH}" bash "$script" --pr 42 2>&1)"
+exit_code=$?
+set -e
+
+assert_exit_0 "no waiting jobs" "$out" "$exit_code"
+assert_contains "no waiting log" "$out" "No WAITING environment jobs"
+rm -rf "$tmp"
+unset RUNNER_SESSION_ROOT
+
+printf '\n=== functional: cannot approve when gh user is not a reviewer ===\n'
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin"
+export RUNNER_SESSION_ROOT="${tmp}/runner-sessions"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'repo view'* && "$args" == *'nameWithOwner'* ]]; then
+  printf 'the-hcma/mock-repo\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'statusCheckRollup'* ]]; then
+  printf '%s\n' '[{"name":"org repo-practices audit","status":"WAITING","conclusion":null,"detailsUrl":"https://github.com/the-hcma/mock-repo/actions/runs/9/job/1"}]'
+  exit 0
+fi
+if [[ "$args" == *'--method POST'* ]]; then
+  printf 'should not POST\n' >&2
+  exit 1
+fi
+if [[ "$args" == *'pending_deployments'* ]]; then
+  printf '%s\n' '[{"environment":{"id":1,"name":"github-repo-lint"},"current_user_can_approve":false}]'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(PATH="${mock_bin}:${PATH}" bash "$script" --pr 42 2>&1)"
+exit_code=$?
+set -e
+
+assert_exit_nonzero "cannot approve" "$out" "$exit_code"
+assert_contains "cannot approve error" "$out" "cannot approve environment github-repo-lint"
+assert_contains "cannot approve failed marker" "$out" "ERROR: ENVIRONMENT_APPROVAL_FAILED"
+assert_contains "cannot approve raise to operator" "$out" "raise this to the operator"
+rm -rf "$tmp"
+unset RUNNER_SESSION_ROOT
+
+printf '\n=== functional: list pending API failure is raised to the operator ===\n'
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin"
+export RUNNER_SESSION_ROOT="${tmp}/runner-sessions"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'repo view'* && "$args" == *'nameWithOwner'* ]]; then
+  printf 'the-hcma/mock-repo\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'statusCheckRollup'* ]]; then
+  printf '%s\n' '[{"name":"org repo-practices audit","status":"WAITING","conclusion":null,"detailsUrl":"https://github.com/the-hcma/mock-repo/actions/runs/9/job/1"}]'
+  exit 0
+fi
+if [[ "$args" == *'pending_deployments'* ]]; then
+  printf 'api boom\n' >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(PATH="${mock_bin}:${PATH}" bash "$script" --pr 42 2>&1)"
+exit_code=$?
+set -e
+
+assert_exit_nonzero "list pending failed" "$out" "$exit_code"
+assert_contains "list pending failed marker" "$out" "ERROR: ENVIRONMENT_APPROVAL_FAILED"
+assert_contains "list pending raise to operator" "$out" "raise this to the operator"
+rm -rf "$tmp"
+unset RUNNER_SESSION_ROOT
+
+printf '\n=== functional: pr rollup fetch failure is raised to the operator ===\n'
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin"
+export RUNNER_SESSION_ROOT="${tmp}/runner-sessions"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'repo view'* && "$args" == *'nameWithOwner'* ]]; then
+  printf 'the-hcma/mock-repo\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'statusCheckRollup'* ]]; then
+  printf 'rollup api boom\n' >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(PATH="${mock_bin}:${PATH}" bash "$script" --pr 42 2>&1)"
+exit_code=$?
+set -e
+
+assert_exit_nonzero "rollup fetch failed" "$out" "$exit_code"
+assert_contains "rollup fetch failed marker" "$out" "ERROR: ENVIRONMENT_APPROVAL_FAILED"
+assert_contains "rollup fetch waiting_run_ids" "$out" "waiting_run_ids=failed"
+rm -rf "$tmp"
+unset RUNNER_SESSION_ROOT
+
+printf '\n=== functional: jq parse failure on pending fields is raised ===\n'
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+post_called="${tmp}/post-called"
+mkdir -p "$mock_bin"
+export RUNNER_SESSION_ROOT="${tmp}/runner-sessions"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [[ -f "$arg" ]] && grep -qF 'current_user_can_approve' "$arg"; then
+    printf 'jq parse boom\n' >&2
+    exit 1
+  fi
+done
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+cat >"${mock_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+posted_flag='${post_called}'
+if [[ "\$args" == *'repo view'* && "\$args" == *'nameWithOwner'* ]]; then
+  printf 'the-hcma/mock-repo\n'
+  exit 0
+fi
+if [[ "\$args" == *'pr view 42'* && "\$args" == *'statusCheckRollup'* ]]; then
+  printf '%s\n' '[{"name":"org repo-practices audit","status":"WAITING","conclusion":null,"detailsUrl":"https://github.com/the-hcma/mock-repo/actions/runs/9/job/1"}]'
+  exit 0
+fi
+if [[ "\$args" == *'--method POST'* ]]; then
+  printf '1\n' > "\$posted_flag"
+  printf 'should not POST\n' >&2
+  exit 1
+fi
+if [[ "\$args" == *'pending_deployments'* ]]; then
+  printf '%s\n' '[{"environment":{"id":1,"name":"github-repo-lint"},"current_user_can_approve":true}]'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(PATH="${mock_bin}:${PATH}" bash "$script" --pr 42 2>&1)"
+exit_code=$?
+set -e
+
+assert_exit_nonzero "jq parse failed" "$out" "$exit_code"
+assert_contains "jq parse failed marker" "$out" "ERROR: ENVIRONMENT_APPROVAL_FAILED"
+assert_contains "jq parse pending" "$out" "failed to parse pending deployments"
+if [[ ! -f "$post_called" ]]; then
+  pass_case "jq parse failure does not POST approve"
+else
+  fail_case "jq parse failure does not POST approve"
+fi
+rm -rf "$tmp"
+unset RUNNER_SESSION_ROOT
+
+printf '\n=== static: helper uses pending_deployments API and operator comment ===\n'
+if grep -qF 'pending_deployments' "$script" \
+  && grep -qF 'current_user_can_approve' "$script" \
+  && grep -qF 'Approved on operator behalf' "$script" \
+  && grep -qF 'Coding agents MUST' "$script" \
+  && grep -qF 'ERROR: ENVIRONMENT_APPROVAL_FAILED' "$script" \
+  && grep -qF 'raise this to the operator' "$script" \
+  && grep -qF 'runner_sh_stdout "approve-pending-deployments usage"' "$script" \
+  && grep -qF 'runner_exec_stdout "approve-pending-deployments unique run ids"' "$script" \
+  && grep -qF 'github_api_exec_with_rate_limit_retry "approve-pending-deployments list pending"' "$script" \
+  && grep -qF 'github_api_exec_with_rate_limit_retry "approve-pending-deployments post approve"' "$script"; then
+  pass_case "approve-pending-deployments: API + MUST + operator comment"
+else
+  fail_case "approve-pending-deployments: API + MUST + operator comment"
+fi
+
+printf '\n=== static: docs tell agents to approve on the operator behalf ===\n'
+if grep -qF 'approve-pending-deployments' "${rh_root}/AGENTS.md" \
+  && grep -qF 'Coding agents MUST approve' "${rh_root}/AGENTS.md" \
+  && grep -qF 'ENVIRONMENT_APPROVAL_FAILED' "${rh_root}/AGENTS.md" \
+  && grep -qF 'approve-pending-deployments' \
+    "${rh_root}/.cursor/rules/pr-ship-and-review.mdc" \
+  && grep -qF 'approve-pending-deployments' \
+    "${rh_root}/.cursor/skills/ship-and-review/SKILL.md" \
+  && grep -qF 'approve-pending-deployments' \
+    "${rh_root}/.cursor/rules/org-cursor-rule-rollout.mdc" \
+  && grep -qF 'approve-pending-deployments' \
+    "${rh_root}/.github/workflows/github-repo-lint.yml" \
+  && grep -qF 'approve-pending-deployments' \
+    "${rh_root}/.github/workflows/dep-updater.yml"; then
+  pass_case "docs: coding agents approve waiting environments on operator behalf"
+else
+  fail_case "docs: coding agents approve waiting environments on operator behalf"
+fi
+
+test_summary

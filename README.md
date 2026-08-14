@@ -38,7 +38,7 @@ compliance drift and points to the explicit `--apply-fix` remediation command.
 | Service | Script | Schedule | Purpose |
 | --- | --- | --- | --- |
 | `dep-updater.service` | `scripts/dep-updater-batch-run` | 03:00 daily | Create/update dependency PRs across a scan root and email the run report. |
-| `github-repo-lint.service` | `scripts/github-repo-lint` | 04:00 daily | Monitor local GitHub clones for repository-practices compliance and email the report. |
+| `github-repo-lint.service` | `scripts/github-repo-lint` | 04:00 daily | Monitor local clones for the configured org (default `the-hcma`) and email the repository-practices report. |
 
 `dep-updater.service` is the automation worker. It fetches every repository under
 the scan root, runs `dep-updater --batch --all`, streams the run to
@@ -46,10 +46,11 @@ the scan root, runs `dep-updater --batch --all`, streams the run to
 or timeout report by email. When updates are created, the report lists them from
 structured JSON; when none are created, it says so explicitly.
 
-`github-repo-lint.service` is the compliance monitor. It discovers local
-GitHub clones under a scan root, runs strict repository-practices checks for each
-one, emails the daily report, and exits non-zero when any repository fails. It does
-not apply repairs automatically.
+`github-repo-lint.service` is the compliance monitor. It discovers local GitHub
+clones under a scan root for the configured organization (default `the-hcma`;
+other owners are skipped, matching `github-repo-lint --org the-hcma --all`), runs
+strict repository-practices checks for each one, emails the daily report, and
+exits non-zero when any repository fails. It does not apply repairs automatically.
 
 Install or inspect them from this repository:
 
@@ -67,8 +68,8 @@ scripts/show-services
 ```
 
 `github-repo-lint` (no args) reuses `~/.config/dep-updater.env` for SMTP by default.
-Use `~/.config/github-repo-lint.env` when you need a different scan root or
-report settings.
+Use `~/.config/github-repo-lint.env` when you need a different scan root, org
+filter (`GITHUB_REPO_LINT_ORG`), or report settings.
 
 `scripts/show-services` prints a read-only summary of every systemd service template
 in this repo, including installed status, active/enabled state, timer next run,
@@ -148,8 +149,8 @@ settings, the `protect-main` ruleset (squash-only + `merge_queue` SQUASH), and
 classic `main` branch protection (GitHub MQ profile). When run from the target
 repository clone, it also prepares candidate workflow fixes in a dedicated
 `.worktrees/repo-practices-candidate-fixes-wt` worktree and submits them as a
-stack for review (`gt track` / `gt submit` when Graphite stacking; not yet
-marker-aware for `gh-stack`). Candidate workflow templates live under
+stack for review (`gt track` / `gt submit` when the marker is `graphite`, or
+`gh stack submit` when the marker is `gh-stack`). Candidate workflow templates live under
 `scripts/lib/repo-practices-workflows/` so they can be reviewed and linted
 directly. Disable org repos in Graphite’s merge-queue UI so Graphite does not
 also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).

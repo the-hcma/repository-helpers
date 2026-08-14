@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Count `gh api` invocations that do not go through github_api_exec_with_rate_limit_retry.
+set -euo pipefail
+
+# rp_gh_api_waiter_skip_file <path>
+# Return 0 when file should be excluded from the scan.
+rp_gh_api_waiter_skip_file() {
+  local -r path="$1"
+  case "$path" in
+    # Probes inside the waiter must not recurse through the waiter.
+    scripts/lib/github-api-rate-limit)
+      return 0
+      ;;
+    # Synced verbatim to consumer .github/ci/secret-scan — no waiter lib beside it.
+    scripts/lib/ci-secret-scan)
+      return 0
+      ;;
+    *.yml|*.mdc|*.snippet)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# rp_gh_api_waiter_line_bypasses <line>
+# Return 0 when the line invokes `gh api` without the rate-limit waiter.
+rp_gh_api_waiter_line_bypasses() {
+  local -r line="$1"
+
+  [[ "$line" =~ ^[[:space:]]*# ]] && return 1
+  [[ "$line" == *'github_api_exec_with_rate_limit_retry'* ]] && return 1
+  [[ "$line" =~ gh[[:space:]]+api ]] || return 1
+
+  if [[ "$line" =~ (run_command|run_command_or_die|runner_exec|runner_exec_stdout|runner_sh|runner_sh_stdout) ]]; then
+    return 0
+  fi
+  if [[ "$line" =~ --[[:space:]]+gh[[:space:]]+api ]]; then
+    return 0
+  fi
+  if [[ "$line" =~ ^[[:space:]]*gh[[:space:]]+api ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# rp_gh_api_waiter_list_files <adoption-root>
+rp_gh_api_waiter_list_files() {
+  local -r adoption_root="$1"
+
+  {
+    find "${adoption_root}/scripts" -maxdepth 1 -type f 2>/dev/null || true
+    find "${adoption_root}/scripts/dev" -type f 2>/dev/null || true
+    find "${adoption_root}/scripts/lib" -type f 2>/dev/null || true
+  } | sed "s|^${adoption_root}/||" | sort -u
+}
+
+# rp_gh_api_waiter_collect_bypasses <adoption-root>
+# Prints "relative-path:line-number:line" for each bypass.
+rp_gh_api_waiter_collect_bypasses() {
+  local -r adoption_root="$1"
+  local rel_path path line lineno
+
+  while IFS= read -r rel_path; do
+    [[ -n "$rel_path" ]] || continue
+    if rp_gh_api_waiter_skip_file "$rel_path"; then
+      continue
+    fi
+    path="${adoption_root}/${rel_path}"
+    [[ -f "$path" ]] || continue
+    lineno=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      lineno=$((lineno + 1))
+      if rp_gh_api_waiter_line_bypasses "$line"; then
+        printf '%s:%s:%s\n' "$rel_path" "$lineno" "$line"
+      fi
+    done <"$path"
+  done < <(rp_gh_api_waiter_list_files "$adoption_root")
+}

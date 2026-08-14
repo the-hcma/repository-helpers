@@ -80,6 +80,22 @@ rp_runner_exec_stdout() {
   runner_exec_stdout "$label" "$@"
 }
 
+# rp_runner_gh_api_input <label> <payload> [gh-api-args…]
+# Writes payload to a temp file so rate-limit retries can re-read --input.
+rp_runner_gh_api_input() {
+  local -r label="$1"
+  local -r payload="$2"
+  shift 2
+  local tmp exit_code
+
+  tmp="$(mktemp)"
+  printf '%s' "$payload" >"$tmp"
+  exit_code=0
+  rp_runner_gh_api_stream "$label" "$@" --input "$tmp" >/dev/null || exit_code=$?
+  rm -f "$tmp"
+  return "$exit_code"
+}
+
 # rp_runner_gh_api_stream <label> [--probe] [gh-api-args…]
 # Waits and retries when GitHub returns a primary/secondary API rate limit.
 rp_runner_gh_api_stream() {
@@ -647,8 +663,8 @@ rp_gh_path_check() {
   attempt=1
   while (( attempt <= max_attempts )); do
     exit_code=0
-    runner_exec "repo-practices gh path exists ${path}" --probe \
-      -- gh api "repos/${slug}/contents/${path}" || exit_code=$?
+    rp_runner_gh_api_stream "repo-practices gh path exists ${path}" --probe \
+      "repos/${slug}/contents/${path}" >/dev/null || exit_code=$?
     if (( exit_code == 0 )); then
       return 0
     fi
@@ -691,8 +707,8 @@ rp_fetch_github_text_file() {
   while (( attempt <= max_attempts )); do
     fetch_exit_code=0
     set +e
-    response="$(rp_runner_exec_stdout "repo-practices gh fetch ${path}" --probe \
-      -- gh api "repos/${slug}/contents/${path}")"
+    response="$(rp_runner_gh_api_stream "repo-practices gh fetch ${path}" --probe \
+      "repos/${slug}/contents/${path}")"
     fetch_exit_code=$?
     set -e
     if (( fetch_exit_code == 0 )) && [[ -n "$response" ]]; then
@@ -724,6 +740,48 @@ rp_fetch_github_text_file() {
 rp_text_has_copyright_notice() {
   local -r text="$1"
   grep -Eiq 'copyright[[:space:]]*(\([cC]\))?[[:space:]]*[0-9]{4}' <<<"$text"
+}
+
+# grep -qF on a text blob via runner (predicate probes for lint helpers).
+rp_text_probe_grep_f() {
+  local -r label="$1"
+  local -r needle="$2"
+  local -r text="$3"
+  local tmp exit_code=0
+
+  tmp="$(mktemp)"
+  printf '%s' "$text" >"$tmp"
+  runner_exec "$label" --probe -- grep -qF "$needle" "$tmp" || exit_code=$?
+  rm -f "$tmp"
+  return "$exit_code"
+}
+
+# grep -qiE on a text blob via runner (predicate probes for lint helpers).
+rp_text_probe_grep_iE() {
+  local -r label="$1"
+  local -r pattern="$2"
+  local -r text="$3"
+  local tmp exit_code=0
+
+  tmp="$(mktemp)"
+  printf '%s' "$text" >"$tmp"
+  runner_exec "$label" --probe -- grep -qiE "$pattern" "$tmp" || exit_code=$?
+  rm -f "$tmp"
+  return "$exit_code"
+}
+
+# grep -qiF on a text blob via runner (case-insensitive fixed-string probes).
+rp_text_probe_grep_iF() {
+  local -r label="$1"
+  local -r needle="$2"
+  local -r text="$3"
+  local tmp exit_code=0
+
+  tmp="$(mktemp)"
+  printf '%s' "$text" >"$tmp"
+  runner_exec "$label" --probe -- grep -qiF "$needle" "$tmp" || exit_code=$?
+  rm -f "$tmp"
+  return "$exit_code"
 }
 
 rp_fetch_repo_license_file() {
@@ -826,12 +884,71 @@ rp_pr_ship_and_review_rule_template() {
   if [[ ! -f "$path" ]]; then
     rp_die "internal error: missing cursor rule template: ${path}"
   fi
-  sed -e "s|@@PR_SHIP_CANONICAL_RULE_URL@@|${rule_url}|g" \
-    -e "s|@@PR_SHIP_CANONICAL_SKILL_URL@@|${skill_url}|g" "$path"
+  runner_exec_stdout "repo-practices pr-ship template urls" -- sed -e "s|@@PR_SHIP_CANONICAL_RULE_URL@@|${rule_url}|g" -e "s|@@PR_SHIP_CANONICAL_SKILL_URL@@|${skill_url}|g" "$path"
+}
+
+# Render the consumer pr-ship template with the active submit backend matching
+# the stacking-tool marker. The on-disk template is Graphite-first (org default);
+# gh-stack repos get gt create/submit commented and gh stack lines uncommented
+# so apply-fix does not reinstall a Graphite-only snippet.
+rp_pr_ship_and_review_rule_template_for_marker() {
+  local -r marker="$1"
+  local text tmp result exit_code=0
+
+  text="$(rp_pr_ship_and_review_rule_template)"
+  if [[ "$marker" != "$stacking_tool_value_gh_stack" ]]; then
+    printf '%s\n' "$text"
+    return 0
+  fi
+  tmp="$(mktemp)"
+  printf '%s\n' "$text" >"$tmp"
+  result="$(runner_exec_stdout "repo-practices pr-ship gh-stack marker" -- sed -E -e 's/^(gt create )/# \1/' -e 's/^(gt submit )/# \1/' -e 's/^# (gh stack )/\1/' -e 's/^# (git add -A)/\1/' "$tmp")" || exit_code=$?
+  rm -f "$tmp"
+  if (( exit_code != 0 )); then
+    rp_die "internal error: pr-ship gh-stack template sed failed"
+  fi
+  printf '%s\n' "$result"
+}
+
+# Resolve graphite|gh-stack for apply-fix: GitHub marker is authoritative; local
+# clone marker only when remote is absent. Exit 2 on GitHub API error.
+rp_pr_ship_stacking_marker_for_slug() {
+  local -r slug="$1"
+  local repo_dir local_value marker_text marker_value
+  local fetch_ec=0
+
+  marker_text="$(rp_fetch_github_text_file "$slug" "$stacking_tool_marker_relpath")" \
+    || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    return 2
+  fi
+  if (( fetch_ec == 0 )) && [[ -n "$marker_text" ]]; then
+    marker_value="$(stacking_tool_normalize "$marker_text")"
+    if stacking_tool_is_valid "$marker_value"; then
+      printf '%s' "$marker_value"
+      return 0
+    fi
+  fi
+
+  repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+  if [[ -n "$repo_dir" ]]; then
+    local_value="$(stacking_tool_read_optional "$repo_dir" || true)"
+    if [[ -n "$local_value" ]]; then
+      printf '%s' "$local_value"
+      return 0
+    fi
+  fi
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    printf '%s' "$stacking_tool_value_gh_stack"
+    return 0
+  fi
+  printf '%s' "$stacking_tool_org_default"
 }
 
 rp_pr_ship_and_review_rule_content_for_apply_fix() {
   local slug="$1"
+  local marker="${2:-}"
   local repo_dir local_path
 
   if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
@@ -844,7 +961,14 @@ rp_pr_ship_and_review_rule_content_for_apply_fix() {
       fi
     fi
   fi
-  rp_pr_ship_and_review_rule_template
+  if [[ -z "$marker" ]]; then
+    local marker_ec=0
+    marker="$(rp_pr_ship_stacking_marker_for_slug "$slug")" || marker_ec=$?
+    if (( marker_ec == 2 )); then
+      rp_die "could not read ${stacking_tool_marker_relpath} for ${slug} (GitHub API error)"
+    fi
+  fi
+  rp_pr_ship_and_review_rule_template_for_marker "$marker"
 }
 
 # True when the cursor rule references the canonical wait-for-agent-review flow
@@ -968,8 +1092,7 @@ rp_stacking_tool_rule_template() {
   if [[ ! -f "$path" ]]; then
     rp_die "internal error: missing cursor rule template: ${path}"
   fi
-  sed -e "s|@@STACKING_TOOL_GRAPHITE_SKILL_URL@@|${graphite_url}|g" \
-    -e "s|@@STACKING_TOOL_GH_STACK_SKILL_URL@@|${gh_stack_url}|g" "$path"
+  runner_exec_stdout "repo-practices stacking-tool template urls" -- sed -e "s|@@STACKING_TOOL_GRAPHITE_SKILL_URL@@|${graphite_url}|g" -e "s|@@STACKING_TOOL_GH_STACK_SKILL_URL@@|${gh_stack_url}|g" "$path"
 }
 
 rp_stacking_tool_rule_content_for_apply_fix() {
@@ -989,25 +1112,16 @@ rp_stacking_tool_rule_content_for_apply_fix() {
   rp_stacking_tool_rule_template
 }
 
-# Prefer an existing valid local marker (so a clone can seed gh-stack before
-# apply-fix), then this-repo trial default, else org Graphite default.
+# GitHub marker is authoritative (same resolver as pr-ship apply-fix).
 rp_stacking_tool_marker_content_for_apply_fix() {
   local slug="$1"
-  local repo_dir local_value
+  local marker marker_ec=0
 
-  repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
-  if [[ -n "$repo_dir" ]]; then
-    local_value="$(stacking_tool_read_optional "$repo_dir" || true)"
-    if [[ -n "$local_value" ]]; then
-      printf '%s' "$local_value"
-      return 0
-    fi
+  marker="$(rp_pr_ship_stacking_marker_for_slug "$slug")" || marker_ec=$?
+  if (( marker_ec == 2 )); then
+    rp_die "could not read ${stacking_tool_marker_relpath} for ${slug} (GitHub API error)"
   fi
-  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
-    printf '%s' "$stacking_tool_value_gh_stack"
-    return 0
-  fi
-  printf '%s' "$stacking_tool_org_default"
+  printf '%s' "$marker"
 }
 
 # True when the stacking-tool cursor rule references the marker and both
@@ -1141,11 +1255,18 @@ rp_agents_md_prescribes_graphite_primary_stacking() {
   local -r text="$1"
   local cleaned
 
-  if grep -qiE 'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view|sync|rebase)' <<<"$text" \
-    || grep -qiE 'gh-stack[[:space:]]+(init|add|submit|view|sync|rebase)' <<<"$text"; then
+  if rp_text_probe_grep_iE 'repo-practices agents gh-stack usage' \
+    'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view|sync|rebase)' "$text" \
+    || rp_text_probe_grep_iE 'repo-practices agents gh-stack usage alt' \
+    'gh-stack[[:space:]]+(init|add|submit|view|sync|rebase)' "$text"; then
     return 1
   fi
-  if grep -qF 'gt create' <<<"$text" || grep -qF 'gt submit' <<<"$text"; then
+  cleaned="$(
+    grep -viE '(do[[:space:]]+not|don'\''t|never)[[:space:]]+.{0,40}gt[[:space:]]+(create|submit)' \
+      <<<"$text" || true
+  )"
+  if rp_text_probe_grep_f 'repo-practices agents gt create' 'gt create' "$cleaned" \
+    || rp_text_probe_grep_f 'repo-practices agents gt submit' 'gt submit' "$cleaned"; then
     return 0
   fi
   # Positive merge-it prescription only (skip leftover / do-not-use notes).
@@ -1155,8 +1276,8 @@ rp_agents_md_prescribes_graphite_primary_stacking() {
     grep -viE '(do[[:space:]]+not|don'\''t|never)[[:space:]]+(add|use|apply).{0,40}merge-it' \
       <<<"$text" || true
   )"
-  if grep -qiE '(add|use|apply)[[:space:]]+([[:alpha:]]+[[:space:]]+){0,2}merge-it' \
-    <<<"$cleaned"; then
+  if rp_text_probe_grep_iE 'repo-practices agents merge-it' \
+    '(add|use|apply)[[:space:]]+([[:alpha:]]+[[:space:]]+){0,2}merge-it' "$cleaned"; then
     return 0
   fi
   return 1
@@ -1167,15 +1288,18 @@ rp_docs_prescribe_gh_stack_without_graphite() {
   local -r text="$1"
 
   # Require command-shaped gh stack usage (negations like "do not use gh stack" do not count).
-  if ! grep -qiE 'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view|sync|rebase)' <<<"$text" \
-    && ! grep -qiE 'gh-stack[[:space:]]+(init|add|submit|view|sync|rebase)' <<<"$text"; then
+  if ! rp_text_probe_grep_iE 'repo-practices docs gh-stack usage' \
+    'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view|sync|rebase)' "$text" \
+    && ! rp_text_probe_grep_iE 'repo-practices docs gh-stack usage alt' \
+    'gh-stack[[:space:]]+(init|add|submit|view|sync|rebase)' "$text"; then
     return 1
   fi
   # Clear when Graphite/gt guidance is present (exact create/submit, name, or bare gt <cmd>).
-  if grep -qiF 'gt create' <<<"$text" \
-    || grep -qiF 'gt submit' <<<"$text" \
-    || grep -qiF 'graphite' <<<"$text" \
-    || grep -qiE '(^|[^[:alnum:]_-])gt[[:space:]]+[[:alpha:]]' <<<"$text"; then
+  if rp_text_probe_grep_iF 'repo-practices docs gt create' 'gt create' "$text" \
+    || rp_text_probe_grep_iF 'repo-practices docs gt submit' 'gt submit' "$text" \
+    || rp_text_probe_grep_iF 'repo-practices docs graphite' 'graphite' "$text" \
+    || rp_text_probe_grep_iE 'repo-practices docs bare gt cmd' \
+    '(^|[^[:alnum:]_-])gt[[:space:]]+[[:alpha:]]' "$text"; then
     return 1
   fi
   return 0
@@ -1195,12 +1319,15 @@ rp_pr_ship_has_graphite_only_submit_snippet() {
   local -r text="$1"
   local cleaned
 
-  if ! grep -qF 'gt create' <<<"$text" && ! grep -qF 'gt submit' <<<"$text"; then
+  if ! rp_text_probe_grep_f 'repo-practices pr-ship gt create' 'gt create' "$text" \
+    && ! rp_text_probe_grep_f 'repo-practices pr-ship gt submit' 'gt submit' "$text"; then
     return 1
   fi
   cleaned="$(rp_docs_text_without_hash_comments "$text")"
-  if grep -qiE 'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view)' <<<"$cleaned" \
-    || grep -qiE 'gh-stack[[:space:]]+(init|add|submit|view)' <<<"$cleaned"; then
+  if rp_text_probe_grep_iE 'repo-practices pr-ship gh stack usage' \
+    'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view)' "$cleaned" \
+    || rp_text_probe_grep_iE 'repo-practices pr-ship gh-stack usage' \
+    'gh-stack[[:space:]]+(init|add|submit|view)' "$cleaned"; then
     return 1
   fi
   return 0
@@ -1265,7 +1392,7 @@ rp_check_stacking_docs_consistency() {
         "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_rule_path}")"
       if [[ "$rp_apply_fix" -eq 1 ]]; then
         rp_queue_candidate_file_fix "$slug" "$rp_pr_ship_and_review_rule_path" \
-          "$(rp_pr_ship_and_review_rule_content_for_apply_fix "$slug")" \
+          "$(rp_pr_ship_and_review_rule_content_for_apply_fix "$slug" "$marker_value")" \
           'sync-pr-ship-stacking-docs' \
           'chore: replace pr-ship rule with marker-aware template'
       fi
@@ -3609,8 +3736,8 @@ rp_apply_file_pr_via_api() {
   fi
 
   ref_exit_code=0
-  runner_exec "repo-practices gh ref heads file fix branch" --probe \
-    -- gh api "repos/${slug}/git/ref/heads/${branch_name}" || ref_exit_code=$?
+  rp_runner_gh_api_stream "repo-practices gh ref heads file fix branch" --probe \
+    "repos/${slug}/git/ref/heads/${branch_name}" >/dev/null || ref_exit_code=$?
   if (( ref_exit_code == 0 )); then
     existing_ref_sha=""
     set +e
@@ -3625,9 +3752,9 @@ rp_apply_file_pr_via_api() {
     fi
     if [[ "$existing_ref_sha" != "$base_sha" ]]; then
       delete_exit_code=0
-      runner_exec "repo-practices gh delete stale file fix ref" \
-        -- gh api -X DELETE "repos/${slug}/git/refs/heads/${branch_name}" \
-        || delete_exit_code=$?
+      rp_runner_gh_api_stream "repo-practices gh delete stale file fix ref" \
+        -X DELETE "repos/${slug}/git/refs/heads/${branch_name}" \
+        >/dev/null || delete_exit_code=$?
       if (( delete_exit_code != 0 )); then
         rp_log_warn "${slug}: failed to replace stale branch ${branch_name} for ${path}"
         return 1
@@ -3637,10 +3764,10 @@ rp_apply_file_pr_via_api() {
   fi
   if (( ref_exit_code != 0 )); then
     create_ref_exit_code=0
-    runner_exec "repo-practices gh create file fix ref" \
-      -- gh api -X POST "repos/${slug}/git/refs" \
+    rp_runner_gh_api_stream "repo-practices gh create file fix ref" \
+      -X POST "repos/${slug}/git/refs" \
         -f "ref=refs/heads/${branch_name}" \
-        -f "sha=${base_sha}" || create_ref_exit_code=$?
+        -f "sha=${base_sha}" >/dev/null || create_ref_exit_code=$?
     if (( create_ref_exit_code != 0 )); then
       rp_log_warn "${slug}: failed to create branch ${branch_name} for ${path}"
       return 1
@@ -3661,8 +3788,8 @@ rp_apply_file_pr_via_api() {
   fi
   existing_sha=""
   set +e
-  existing_sha="$(rp_runner_exec_stdout "repo-practices gh file fix sha" --probe \
-    -- gh api "repos/${slug}/contents/${path}?ref=${branch_name}" --jq '.sha')"
+  existing_sha="$(rp_runner_gh_api_stream "repo-practices gh file fix sha" --probe \
+    "repos/${slug}/contents/${path}?ref=${branch_name}" --jq '.sha')"
   existing_exit_code=$?
   set -e
   existing_sha="${existing_sha//$'\n'/}"
@@ -3681,7 +3808,8 @@ rp_apply_file_pr_via_api() {
     put_args+=(-f "sha=${existing_sha}")
   fi
   put_exit_code=0
-  runner_exec "repo-practices gh put file fix" -- gh api "${put_args[@]}" || put_exit_code=$?
+  rp_runner_gh_api_stream "repo-practices gh put file fix" "${put_args[@]}" \
+    >/dev/null || put_exit_code=$?
   if (( put_exit_code != 0 )); then
     rp_log_warn "${slug}: failed to write ${path} via Contents API"
     return 1
@@ -4043,21 +4171,21 @@ rp_apply_codeowners_pr() {
   fi
 
   local ref_exit_code=0
-  runner_exec "repo-practices gh ref heads codeowners branch" \
-    -- gh api "repos/${slug}/git/ref/heads/${branch_name}" || ref_exit_code=$?
+  rp_runner_gh_api_stream "repo-practices gh ref heads codeowners branch" --probe \
+    "repos/${slug}/git/ref/heads/${branch_name}" >/dev/null || ref_exit_code=$?
   if (( ref_exit_code != 0 )); then
-    runner_exec "repo-practices gh create codeowners ref" \
-      -- gh api -X POST "repos/${slug}/git/refs" \
+    rp_runner_gh_api_stream "repo-practices gh create codeowners ref" \
+      -X POST "repos/${slug}/git/refs" \
         -f "ref=refs/heads/${branch_name}" \
-        -f "sha=${base_sha}"
+        -f "sha=${base_sha}" >/dev/null
   fi
 
   content="# Repository ownership"$'\n'"* @${login}"$'\n'
   encoded_content="$(printf '%s' "$content" | base64 | tr -d '\n')"
   local existing_exit_code=0
   set +e
-  existing_sha="$(rp_runner_exec_stdout "repo-practices gh codeowners sha" \
-    -- gh api "repos/${slug}/contents/.github/CODEOWNERS?ref=${branch_name}" \
+  existing_sha="$(rp_runner_gh_api_stream "repo-practices gh codeowners sha" --probe \
+    "repos/${slug}/contents/.github/CODEOWNERS?ref=${branch_name}" \
       --jq '.sha')"
   existing_exit_code=$?
   set -e
@@ -4076,7 +4204,7 @@ rp_apply_codeowners_pr() {
   if [[ -n "$existing_sha" ]]; then
     put_args+=(-f "sha=${existing_sha}")
   fi
-  runner_exec "repo-practices gh put codeowners" -- gh api "${put_args[@]}"
+  rp_runner_gh_api_stream "repo-practices gh put codeowners" "${put_args[@]}" >/dev/null
 
   pr_url="$(rp_runner_exec_stdout "repo-practices gh pr create codeowners" \
     -- gh pr create \
@@ -4382,8 +4510,8 @@ rp_apply_protect_main_create() {
   payload="$(rp_protect_main_create_payload)"
   rp_log_warn "${slug}: creating protect-main ruleset (squash-only + GitHub merge queue)"
   local post_exit_code=0
-  printf '%s' "$payload" | runner_exec "repo-practices gh create protect-main ruleset" \
-    -- gh api --method POST "repos/${slug}/rulesets" --input - || post_exit_code=$?
+  rp_runner_gh_api_input "repo-practices gh create protect-main ruleset" "$payload" \
+    --method POST "repos/${slug}/rulesets" || post_exit_code=$?
   (( post_exit_code == 0 ))
 }
 
@@ -4800,8 +4928,8 @@ rp_apply_classic_main_protection() {
   fi
 
   rp_log_warn "${slug}: applying classic main branch protection (GitHub merge queue; no push restrictions)"
-  printf '%s' "$payload" | runner_exec "repo-practices gh put classic protection" \
-    -- gh api -X PUT "repos/${slug}/branches/main/protection" --input -
+  rp_runner_gh_api_input "repo-practices gh put classic protection" "$payload" \
+    -X PUT "repos/${slug}/branches/main/protection"
 }
 
 rp_dependabot_auto_merge_workflow_path() {
@@ -6069,12 +6197,12 @@ rp_validate_workflow_file_extensions() {
 rp_apply_repo_settings() {
   local slug="$1"
   rp_log_warn "${slug}: applying squash-only repository settings"
-  runner_exec "repo-practices gh patch repo settings" -- gh api -X PATCH "repos/${slug}" \
+  rp_runner_gh_api_stream "repo-practices gh patch repo settings" -X PATCH "repos/${slug}" \
     -f allow_merge_commit=false \
     -f allow_rebase_merge=false \
     -f allow_squash_merge=true \
     -f squash_merge_commit_message=BLANK \
-    -f squash_merge_commit_title=PR_TITLE
+    -f squash_merge_commit_title=PR_TITLE >/dev/null
 }
 
 rp_apply_protect_main_squash_methods() {
@@ -6097,8 +6225,8 @@ rp_apply_protect_main_squash_methods() {
   fi
 
   set +e
-  payload="$(rp_runner_exec_stdout "repo-practices fetch ruleset for patch" \
-    -- gh api "repos/${owner}/${name}/rulesets/${ruleset_id}")"
+  payload="$(rp_runner_gh_api_stream "repo-practices fetch ruleset for patch" \
+    "repos/${owner}/${name}/rulesets/${ruleset_id}")"
   set -e
   payload="${payload//$'\n'/}"
   payload="$(rp_runner_jq_file "repo-practices patch ruleset payload" "$payload" '
@@ -6119,8 +6247,8 @@ rp_apply_protect_main_squash_methods() {
   ')"
 
   rp_log_warn "${slug}: patching protect-main ruleset ${ruleset_id} (squash-only)"
-  printf '%s' "$payload" | runner_exec "repo-practices gh put protect-main ruleset" \
-    -- gh api -X PUT "repos/${owner}/${name}/rulesets/${ruleset_id}" --input -
+  rp_runner_gh_api_input "repo-practices gh put protect-main ruleset" "$payload" \
+    -X PUT "repos/${owner}/${name}/rulesets/${ruleset_id}"
 }
 
 # rp_apply_protect_main_github_mq_shape <slug>
@@ -6145,8 +6273,8 @@ rp_apply_protect_main_github_mq_shape() {
   fi
 
   set +e
-  payload="$(rp_runner_exec_stdout "repo-practices fetch ruleset for github-mq shape" \
-    -- gh api "repos/${owner}/${name}/rulesets/${ruleset_id}")"
+  payload="$(rp_runner_gh_api_stream "repo-practices fetch ruleset for github-mq shape" \
+    "repos/${owner}/${name}/rulesets/${ruleset_id}")"
   set -e
   payload="${payload//$'\n'/}"
   payload="$(rp_runner_jq_file "repo-practices github-mq ruleset payload" "$payload" \
@@ -6199,8 +6327,8 @@ rp_apply_protect_main_github_mq_shape() {
   ')"
 
   rp_log_warn "${slug}: patching protect-main ruleset ${ruleset_id} (squash-only + GitHub merge queue)"
-  printf '%s' "$payload" | runner_exec "repo-practices gh put protect-main github-mq" \
-    -- gh api -X PUT "repos/${owner}/${name}/rulesets/${ruleset_id}" --input -
+  rp_runner_gh_api_input "repo-practices gh put protect-main github-mq" "$payload" \
+    -X PUT "repos/${owner}/${name}/rulesets/${ruleset_id}"
 }
 
 rp_check_release_please() {
