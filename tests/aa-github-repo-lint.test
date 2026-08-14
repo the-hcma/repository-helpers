@@ -9,9 +9,10 @@ readonly rh_root
 
 checker="${rh_root}/scripts/github-repo-lint"
 lib="${rh_root}/scripts/lib/repo-practices"
+runner_bootstrap="${rh_root}/scripts/lib/runner-bootstrap"
 merge_wrapper="${rh_root}/scripts/check-merge-settings"
 templates_dir="${rh_root}/scripts/lib/repo-practices-workflows"
-readonly checker lib merge_wrapper templates_dir
+readonly checker lib runner_bootstrap merge_wrapper templates_dir
 
 # shellcheck source=tests/lib/test-assert
 source "${script_dir}/lib/test-assert"
@@ -2892,6 +2893,7 @@ gh_stack_and_gt_docs=$'Use gh stack or gt create\n'
 gh_stack_negation_with_bare_gt=$'Use gt for stacking. Do not use gh stack.\n'
 merge_it_only_agents=$'- To merge, add the merge-it label.\n'
 merge_it_forbid_agents=$'- Do not use merge-it — merge via gh pr merge --auto --squash\n'
+gt_forbid_agents=$'- Do not use gt create or gt submit — use gh stack submit\n- Prefer gh stack init\n'
 if bash -c "source '${lib}'
   rp_pr_ship_has_graphite_only_submit_snippet \"\$1\"
 " _ "$graphite_only_pr_ship" \
@@ -2913,6 +2915,9 @@ if bash -c "source '${lib}'
   && ! bash -c "source '${lib}'
   rp_agents_md_prescribes_graphite_primary_stacking \"\$1\"
 " _ "$merge_it_forbid_agents" \
+  && ! bash -c "source '${lib}'
+  rp_agents_md_prescribes_graphite_primary_stacking \"\$1\"
+" _ "$gt_forbid_agents" \
   && bash -c "source '${lib}'
   rp_docs_prescribe_gh_stack_without_graphite \"\$1\"
 " _ "$gh_stack_only_docs" \
@@ -2926,6 +2931,127 @@ if bash -c "source '${lib}'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] stacking docs helpers: predicate mismatch\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: pr-ship marker resolver prefers GitHub over local clone ===\n'
+marker_mock_dir="$(mktemp -d)"
+marker_mock_bin="${marker_mock_dir}/bin"
+mkdir -p "$marker_mock_bin"
+export RUNNER_SESSION_ROOT="${marker_mock_dir}/runner-sessions"
+cat >"${marker_mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'contents/.github/stacking-tool'* ]]; then
+  printf '%s\n' '{"content":"Z2gtc3RhY2sK"}'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${marker_mock_bin}/gh"
+cat >"${marker_mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${marker_mock_bin}/jq"
+marker_resolver_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    source "$2"
+    export PATH="$3:${PATH}"
+    export RP_GH_API_MAX_ATTEMPTS=1
+    export RP_GH_API_RETRY_SLEEP_SECS=0
+    marker_ec=0
+    marker="$(rp_pr_ship_stacking_marker_for_slug the-hcma/example-repo)" || marker_ec=$?
+    if (( marker_ec != 0 )); then
+      printf "unexpected_ec=%s\n" "$marker_ec"
+      exit 1
+    fi
+    if [[ "$marker" != gh-stack ]]; then
+      printf "marker=%s\n" "$marker"
+      exit 1
+    fi
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib" "$marker_mock_bin"
+)" || marker_resolver_out="fail:${marker_resolver_out}"
+rm -rf "$marker_mock_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$marker_resolver_out" == 'ok' ]]; then
+  printf '[PASS] pr-ship marker resolver: GitHub marker wins over local defaults\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] pr-ship marker resolver: GitHub-first resolution (%s)\n' "$marker_resolver_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: pr-ship marker resolver fails on GitHub API error ===\n'
+marker_api_err_dir="$(mktemp -d)"
+marker_api_err_bin="${marker_api_err_dir}/bin"
+mkdir -p "$marker_api_err_bin"
+export RUNNER_SESSION_ROOT="${marker_api_err_dir}/runner-sessions"
+cat >"${marker_api_err_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+printf 'gh: HTTP 503: unavailable\n' >&2
+exit 1
+MOCK_GH
+chmod +x "${marker_api_err_bin}/gh"
+cat >"${marker_api_err_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${marker_api_err_bin}/jq"
+marker_api_err_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    source "$2"
+    export PATH="$3:${PATH}"
+    export RP_GH_API_MAX_ATTEMPTS=1
+    export RP_GH_API_RETRY_SLEEP_SECS=0
+    marker_ec=0
+    marker="$(rp_pr_ship_stacking_marker_for_slug the-hcma/example-repo)" || marker_ec=$?
+    if (( marker_ec == 2 )) && [[ -z "$marker" ]]; then
+      printf "ok\n"
+      exit 0
+    fi
+    printf "ec=%s marker=%s\n" "$marker_ec" "$marker"
+    exit 1
+  ' bash "$runner_bootstrap" "$lib" "$marker_api_err_bin"
+)" || marker_api_err_out="fail:${marker_api_err_out}"
+rm -rf "$marker_api_err_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$marker_api_err_out" == 'ok' ]]; then
+  printf '[PASS] pr-ship marker resolver: GitHub API error returns exit 2\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] pr-ship marker resolver: expected fetch_ec=2 (%s)\n' "$marker_api_err_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: stacking docs predicates use runner grep probes ===\n'
+if grep -qF 'rp_text_probe_grep_f' "$lib" \
+  && grep -qF 'rp_text_probe_grep_iE' "$lib" \
+  && grep -qF 'runner_exec' "$lib" \
+  && grep -qF 'fetch_ec == 2' "$lib" \
+  && awk '
+    /^rp_pr_ship_stacking_marker_for_slug\(\)/ { in_fn=1 }
+    in_fn && /rp_fetch_github_text_file/ { gh_first=1 }
+    in_fn && /rp_resolve_local_repo_dir/ { local_after=1 }
+    in_fn && /^}/ {
+      if (gh_first && local_after) { exit 0 }
+      exit 1
+    }
+    END { if (!in_fn) exit 1 }
+  ' "$lib"; then
+  printf '[PASS] stacking docs: runner grep probes and GitHub-first marker resolver\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] stacking docs: missing runner grep probes or GitHub-first marker\n'
   fail=$(( fail + 1 ))
 fi
 

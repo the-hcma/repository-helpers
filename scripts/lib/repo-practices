@@ -726,6 +726,34 @@ rp_text_has_copyright_notice() {
   grep -Eiq 'copyright[[:space:]]*(\([cC]\))?[[:space:]]*[0-9]{4}' <<<"$text"
 }
 
+# grep -qF on a text blob via runner (predicate probes for lint helpers).
+rp_text_probe_grep_f() {
+  local -r label="$1"
+  local -r needle="$2"
+  local -r text="$3"
+  local tmp exit_code=0
+
+  tmp="$(mktemp)"
+  printf '%s' "$text" >"$tmp"
+  runner_exec "$label" --probe -- grep -qF "$needle" "$tmp" || exit_code=$?
+  rm -f "$tmp"
+  return "$exit_code"
+}
+
+# grep -qiE on a text blob via runner (predicate probes for lint helpers).
+rp_text_probe_grep_iE() {
+  local -r label="$1"
+  local -r pattern="$2"
+  local -r text="$3"
+  local tmp exit_code=0
+
+  tmp="$(mktemp)"
+  printf '%s' "$text" >"$tmp"
+  runner_exec "$label" --probe -- grep -qiE "$pattern" "$tmp" || exit_code=$?
+  rm -f "$tmp"
+  return "$exit_code"
+}
+
 rp_fetch_repo_license_file() {
   local slug="$1"
   local license_path text
@@ -852,28 +880,31 @@ rp_pr_ship_and_review_rule_template_for_marker() {
   printf '%s\n' "$result"
 }
 
-# Resolve graphite|gh-stack for apply-fix: local clone marker, then GitHub
-# contents, then this-repo trial default / org Graphite default.
+# Resolve graphite|gh-stack for apply-fix: GitHub marker is authoritative; local
+# clone marker only when remote is absent. Exit 2 on GitHub API error.
 rp_pr_ship_stacking_marker_for_slug() {
   local -r slug="$1"
   local repo_dir local_value marker_text marker_value
   local fetch_ec=0
+
+  marker_text="$(rp_fetch_github_text_file "$slug" "$stacking_tool_marker_relpath")" \
+    || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    return 2
+  fi
+  if (( fetch_ec == 0 )) && [[ -n "$marker_text" ]]; then
+    marker_value="$(stacking_tool_normalize "$marker_text")"
+    if stacking_tool_is_valid "$marker_value"; then
+      printf '%s' "$marker_value"
+      return 0
+    fi
+  fi
 
   repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
   if [[ -n "$repo_dir" ]]; then
     local_value="$(stacking_tool_read_optional "$repo_dir" || true)"
     if [[ -n "$local_value" ]]; then
       printf '%s' "$local_value"
-      return 0
-    fi
-  fi
-
-  marker_text="$(rp_fetch_github_text_file "$slug" "$stacking_tool_marker_relpath")" \
-    || fetch_ec=$?
-  if (( fetch_ec == 0 )) && [[ -n "$marker_text" ]]; then
-    marker_value="$(stacking_tool_normalize "$marker_text")"
-    if stacking_tool_is_valid "$marker_value"; then
-      printf '%s' "$marker_value"
       return 0
     fi
   fi
@@ -901,7 +932,11 @@ rp_pr_ship_and_review_rule_content_for_apply_fix() {
     fi
   fi
   if [[ -z "$marker" ]]; then
-    marker="$(rp_pr_ship_stacking_marker_for_slug "$slug")"
+    local marker_ec=0
+    marker="$(rp_pr_ship_stacking_marker_for_slug "$slug")" || marker_ec=$?
+    if (( marker_ec == 2 )); then
+      rp_die "could not read ${stacking_tool_marker_relpath} for ${slug} (GitHub API error)"
+    fi
   fi
   rp_pr_ship_and_review_rule_template_for_marker "$marker"
 }
@@ -1199,11 +1234,18 @@ rp_agents_md_prescribes_graphite_primary_stacking() {
   local -r text="$1"
   local cleaned
 
-  if grep -qiE 'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view|sync|rebase)' <<<"$text" \
-    || grep -qiE 'gh-stack[[:space:]]+(init|add|submit|view|sync|rebase)' <<<"$text"; then
+  if rp_text_probe_grep_iE 'repo-practices agents gh-stack usage' \
+    'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view|sync|rebase)' "$text" \
+    || rp_text_probe_grep_iE 'repo-practices agents gh-stack usage alt' \
+    'gh-stack[[:space:]]+(init|add|submit|view|sync|rebase)' "$text"; then
     return 1
   fi
-  if grep -qF 'gt create' <<<"$text" || grep -qF 'gt submit' <<<"$text"; then
+  cleaned="$(
+    grep -viE '(do[[:space:]]+not|don'\''t|never)[[:space:]]+.{0,40}gt[[:space:]]+(create|submit)' \
+      <<<"$text" || true
+  )"
+  if rp_text_probe_grep_f 'repo-practices agents gt create' 'gt create' "$cleaned" \
+    || rp_text_probe_grep_f 'repo-practices agents gt submit' 'gt submit' "$cleaned"; then
     return 0
   fi
   # Positive merge-it prescription only (skip leftover / do-not-use notes).
@@ -1213,8 +1255,8 @@ rp_agents_md_prescribes_graphite_primary_stacking() {
     grep -viE '(do[[:space:]]+not|don'\''t|never)[[:space:]]+(add|use|apply).{0,40}merge-it' \
       <<<"$text" || true
   )"
-  if grep -qiE '(add|use|apply)[[:space:]]+([[:alpha:]]+[[:space:]]+){0,2}merge-it' \
-    <<<"$cleaned"; then
+  if rp_text_probe_grep_iE 'repo-practices agents merge-it' \
+    '(add|use|apply)[[:space:]]+([[:alpha:]]+[[:space:]]+){0,2}merge-it' "$cleaned"; then
     return 0
   fi
   return 1
@@ -1225,15 +1267,18 @@ rp_docs_prescribe_gh_stack_without_graphite() {
   local -r text="$1"
 
   # Require command-shaped gh stack usage (negations like "do not use gh stack" do not count).
-  if ! grep -qiE 'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view|sync|rebase)' <<<"$text" \
-    && ! grep -qiE 'gh-stack[[:space:]]+(init|add|submit|view|sync|rebase)' <<<"$text"; then
+  if ! rp_text_probe_grep_iE 'repo-practices docs gh-stack usage' \
+    'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view|sync|rebase)' "$text" \
+    && ! rp_text_probe_grep_iE 'repo-practices docs gh-stack usage alt' \
+    'gh-stack[[:space:]]+(init|add|submit|view|sync|rebase)' "$text"; then
     return 1
   fi
   # Clear when Graphite/gt guidance is present (exact create/submit, name, or bare gt <cmd>).
-  if grep -qiF 'gt create' <<<"$text" \
-    || grep -qiF 'gt submit' <<<"$text" \
-    || grep -qiF 'graphite' <<<"$text" \
-    || grep -qiE '(^|[^[:alnum:]_-])gt[[:space:]]+[[:alpha:]]' <<<"$text"; then
+  if rp_text_probe_grep_f 'repo-practices docs gt create' 'gt create' "$text" \
+    || rp_text_probe_grep_f 'repo-practices docs gt submit' 'gt submit' "$text" \
+    || rp_text_probe_grep_f 'repo-practices docs graphite' 'graphite' "$text" \
+    || rp_text_probe_grep_iE 'repo-practices docs bare gt cmd' \
+    '(^|[^[:alnum:]_-])gt[[:space:]]+[[:alpha:]]' "$text"; then
     return 1
   fi
   return 0
@@ -1253,12 +1298,15 @@ rp_pr_ship_has_graphite_only_submit_snippet() {
   local -r text="$1"
   local cleaned
 
-  if ! grep -qF 'gt create' <<<"$text" && ! grep -qF 'gt submit' <<<"$text"; then
+  if ! rp_text_probe_grep_f 'repo-practices pr-ship gt create' 'gt create' "$text" \
+    && ! rp_text_probe_grep_f 'repo-practices pr-ship gt submit' 'gt submit' "$text"; then
     return 1
   fi
   cleaned="$(rp_docs_text_without_hash_comments "$text")"
-  if grep -qiE 'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view)' <<<"$cleaned" \
-    || grep -qiE 'gh-stack[[:space:]]+(init|add|submit|view)' <<<"$cleaned"; then
+  if rp_text_probe_grep_iE 'repo-practices pr-ship gh stack usage' \
+    'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view)' "$cleaned" \
+    || rp_text_probe_grep_iE 'repo-practices pr-ship gh-stack usage' \
+    'gh-stack[[:space:]]+(init|add|submit|view)' "$cleaned"; then
     return 1
   fi
   return 0
