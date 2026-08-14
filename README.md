@@ -38,7 +38,7 @@ compliance drift and points to the explicit `--apply-fix` remediation command.
 | Service | Script | Schedule | Purpose |
 | --- | --- | --- | --- |
 | `dep-updater.service` | `scripts/dep-updater-batch-run` | 03:00 daily | Create/update dependency PRs across a scan root and email the run report. |
-| `github-repo-lint.service` | `scripts/github-repo-lint` | 04:00 daily | Monitor local GitHub clones for repository-practices compliance and email the report. |
+| `github-repo-lint.service` | `scripts/github-repo-lint` | 04:00 daily | Monitor local `the-hcma` clones for repository-practices compliance and email the report. |
 
 `dep-updater.service` is the automation worker. It fetches every repository under
 the scan root, runs `dep-updater --batch --all`, streams the run to
@@ -47,9 +47,10 @@ or timeout report by email. When updates are created, the report lists them from
 structured JSON; when none are created, it says so explicitly.
 
 `github-repo-lint.service` is the compliance monitor. It discovers local
-GitHub clones under a scan root, runs strict repository-practices checks for each
-one, emails the daily report, and exits non-zero when any repository fails. It does
-not apply repairs automatically.
+`the-hcma` GitHub clones under a scan root (skips other owners, matching
+`github-repo-lint --org the-hcma --all`), runs strict repository-practices checks
+for each one, emails the daily report, and exits non-zero when any repository
+fails. It does not apply repairs automatically.
 
 Install or inspect them from this repository:
 
@@ -67,8 +68,8 @@ scripts/show-services
 ```
 
 `github-repo-lint` (no args) reuses `~/.config/dep-updater.env` for SMTP by default.
-Use `~/.config/github-repo-lint.env` when you need a different scan root or
-report settings.
+Use `~/.config/github-repo-lint.env` when you need a different scan root, org
+filter (`GITHUB_REPO_LINT_ORG`), or report settings.
 
 `scripts/show-services` prints a read-only summary of every systemd service template
 in this repo, including installed status, active/enabled state, timer next run,

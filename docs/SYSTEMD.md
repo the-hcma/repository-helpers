@@ -272,13 +272,13 @@ systemctl --user daemon-reload
 ## GitHub Repo Lint (enforcer)
 
 The **GitHub Repo Lint enforcer** scans GitHub clones under a root path and runs
-`scripts/github-repo-lint --strict-onboarding --compact` across the discovered
-repositories. It emails a daily report and exits non-zero when any repository fails
-the checks.
+`scripts/github-repo-lint --strict-onboarding --compact` across discovered
+`the-hcma` repositories (other owners are skipped). It emails a daily report and
+exits non-zero when any repository fails the checks.
 
 It reuses `~/.config/dep-updater.env` for SMTP. Add
 `~/.config/github-repo-lint.env` only for enforcer-specific overrides,
-such as the scan root:
+such as the scan root or `GITHUB_REPO_LINT_ORG`:
 
 ```bash
 cat >~/.config/github-repo-lint.env <<'EOF'
