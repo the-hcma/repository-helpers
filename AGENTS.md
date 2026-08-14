@@ -23,6 +23,7 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | Dev workflow | `scripts/dev/start-development` | Worktree + Graphite sync entry point. |
 | Dev workflow | `scripts/dev/pre-pr-checks` | Detect-first local CI gates (bash + Python/TS/Rust when present). |
 | Dev workflow | `scripts/dev/submit-stack` | `pre-pr-checks` → `gt submit` → `post-pr-submission-checks`. |
+| Dev workflow | `scripts/dev/approve-pending-deployments` | Approve WAITING environment jobs on the operator's behalf. |
 | Dev workflow | `scripts/dev/post-pr-submission-checks` | Wait for PR CI; print agent-friendly failure excerpts. |
 | Dev workflow | `scripts/dev/ship-and-review` | Submit + CI wait + `wait-for-agent-review loop`. |
 
@@ -127,9 +128,17 @@ scripts/github-repo-lint --all --org the-hcma               # every repo in the 
 scripts/github-repo-lint --apply-fix --repo OWNER/NAME      # patch settings + candidate workflow PRs
 ```
 
-CI (`.github/workflows/github-repo-lint.yml`) runs the same `--all --strict-onboarding --compact` audit only when a PR changes `.cursor/rules/**`, `.github/workflows/github-repo-lint.yml`, `scripts/github-repo-lint`, `scripts/lib/repo-practices-cursor/**`, or `scripts/lib/repo-practices`. Path filters skip the workflow (and the approval prompt) otherwise. Approve the waiting environment **`github-repo-lint`** in the Actions UI to unlock **`REPO_LINT_TOKEN`**.
+CI (`.github/workflows/github-repo-lint.yml`) runs the same `--all --strict-onboarding --compact` audit only when a PR changes `.cursor/rules/**`, `.github/workflows/github-repo-lint.yml`, `scripts/github-repo-lint`, `scripts/lib/repo-practices-cursor/**`, or `scripts/lib/repo-practices`. Path filters skip the workflow (and the approval prompt) otherwise. When it does run, environment **`github-repo-lint`** waits to unlock **`REPO_LINT_TOKEN`**.
 
-CI (`.github/workflows/dep-updater.yml`) runs `scripts/dep-updater-ci-org-dry-run` (clone org repos, then `dep-updater --batch --all --dry-run --include-private`) only when a PR changes `.github/workflows/dep-updater.yml`, `scripts/dep-updater`, `scripts/dep-updater-batch-run`, `scripts/dep-updater-ci-org-dry-run`, `scripts/dep-updater-notifier`, or `scripts/lib/release-age-defaults`. Path filters skip the workflow (and the approval prompt) otherwise. Approve the waiting environment **`dep-updater`** in the Actions UI to unlock **`DEP_UPDATER_TOKEN`** (same access as local `gh`; set from `gh auth token`).
+CI (`.github/workflows/dep-updater.yml`) runs `scripts/dep-updater-ci-org-dry-run` (clone org repos, then `dep-updater --batch --all --dry-run --include-private`) only when a PR changes `.github/workflows/dep-updater.yml`, `scripts/dep-updater`, `scripts/dep-updater-batch-run`, `scripts/dep-updater-ci-org-dry-run`, `scripts/dep-updater-notifier`, or `scripts/lib/release-age-defaults`. Path filters skip the workflow (and the approval prompt) otherwise. When it does run, environment **`dep-updater`** waits to unlock **`DEP_UPDATER_TOKEN`** (same access as local `gh`; set from `gh auth token`).
+
+**Coding agents MUST approve those waiting environments on the operator's behalf.** `gh` is the authenticated operator; do not wait for a human to click Approve in the Actions UI. `scripts/dev/post-pr-submission-checks` does this while waiting for CI. To approve immediately:
+
+```bash
+scripts/dev/approve-pending-deployments --pr <n>
+```
+
+If approval fails, those commands print **`ERROR: ENVIRONMENT_APPROVAL_FAILED`**. Stop and tell the operator — do not keep polling CI. The operator must approve the waiting environment or grant this `gh` identity reviewer access.
 
 **`scripts/check-merge-settings`** is a thin wrapper (merge + GitHub MQ only). Prefer **`github-repo-lint`** for full coverage including branch cleanup workflows.
 
