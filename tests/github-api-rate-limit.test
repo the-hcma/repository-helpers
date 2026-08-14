@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+# tests/github-api-rate-limit.test — GitHub API rate-limit wait/retry helpers.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+lib="${root}/scripts/lib/github-api-rate-limit"
+# shellcheck source=scripts/lib/runner-bootstrap
+source "${root}/scripts/lib/runner-bootstrap"
+# shellcheck source=scripts/lib/github-api-rate-limit
+source "$lib"
+
+fail=0
+pass=0
+pass_case() {
+  printf '[PASS] %s\n' "$1"
+  pass=$((pass + 1))
+}
+fail_case() {
+  printf '[FAIL] %s\n' "$1"
+  fail=$((fail + 1))
+}
+
+printf '\n=== static: github-api-rate-limit wiring ===\n'
+if grep -qF 'github_api_exec_with_rate_limit_retry' \
+  "${root}/scripts/lib/agent-review" \
+  && grep -qF 'github_api_exec_with_rate_limit_retry' \
+    "${root}/scripts/lib/repo-practices" \
+  && grep -qF 'github_api_exec_with_rate_limit_retry' \
+    "${root}/scripts/lib/ci-check-rollup" \
+  && grep -qF 'github_api_wait_for_rate_limit' \
+    "${root}/scripts/lib/repo-practices"; then
+  pass_case "agent-review, repo-practices, and ci-check-rollup use rate-limit retry"
+else
+  fail_case "missing rate-limit retry wiring in gh wrappers"
+fi
+
+# shellcheck disable=SC2016  # assert literal call sites for labels/workflows helpers
+if grep -nF 'rp_fetch_repo_labels_json' "${root}/scripts/lib/repo-practices" >/dev/null \
+  && awk '
+    /^rp_fetch_repo_labels_json\(/ { in_fn=1 }
+    in_fn && /^}/ { in_fn=0 }
+    in_fn && /rp_runner_gh_api_stream/ { labels=1 }
+    /^rp_fetch_workflow_file_names\(/ { in_wf=1 }
+    in_wf && /^}/ { in_wf=0 }
+    in_wf && /rp_runner_gh_api_stream/ { workflows=1 }
+    END { exit (labels && workflows) ? 0 : 1 }
+  ' "${root}/scripts/lib/repo-practices"; then
+  pass_case "labels and workflow-list fetches use rate-limit gh api stream"
+else
+  fail_case "labels/workflow fetches still bypass rate-limit retry"
+fi
+
+if grep -qF 'NOTE: GITHUB_RATE_LIMIT_WAIT' "$lib" \
+  && grep -qF 'ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT' "$lib" \
+  && grep -qF 'ERROR: GITHUB_RATE_LIMIT' "$lib" \
+  && grep -qF 'sleep_ec == 124' "${root}/scripts/lib/repo-practices"; then
+  pass_case "emits machine-parseable NOTE/ERROR rate-limit lines"
+else
+  fail_case "missing machine-parseable rate-limit NOTE/ERROR lines"
+fi
+
+printf '\n=== behavioural: detail detection ===\n'
+if github_api_detail_is_rate_limited 'API rate limit exceeded for user ID 1'; then
+  pass_case "detects primary API rate limit exceeded"
+else
+  fail_case "missed primary API rate limit exceeded"
+fi
+if github_api_detail_is_rate_limited 'You have exceeded a secondary rate limit'; then
+  pass_case "detects secondary rate limit"
+else
+  fail_case "missed secondary rate limit"
+fi
+if github_api_detail_is_rate_limited 'HTTP 429: too many requests'; then
+  pass_case "detects HTTP 429"
+else
+  fail_case "missed HTTP 429"
+fi
+if ! github_api_detail_is_rate_limited 'Could not resolve to a Pull Request with the number of 429.'; then
+  pass_case "does not treat PR number 429 as rate limit"
+else
+  fail_case "PR number 429 wrongly classified as rate limit"
+fi
+if ! github_api_detail_is_rate_limited 'HTTP 401 Bad credentials'; then
+  pass_case "does not treat auth failures as rate limit"
+else
+  fail_case "auth failure wrongly classified as rate limit"
+fi
+
+printf '\n=== behavioural: header backoff parse ===\n'
+hdr=$'HTTP/2.0 403 Forbidden\r\nRetry-After: 42\r\nX-RateLimit-Reset: 2000000000\r\n\r\n{}'
+if [[ "$(_github_api_header_value "$hdr" 'retry-after')" == '42' ]]; then
+  pass_case "parses Retry-After response header"
+else
+  fail_case "Retry-After header parse failed"
+fi
+if [[ "$(_github_api_header_value "$hdr" 'x-ratelimit-reset')" == '2000000000' ]]; then
+  pass_case "parses X-RateLimit-Reset response header"
+else
+  fail_case "X-RateLimit-Reset header parse failed"
+fi
+
+printf '\n=== behavioural: retry-after body parse ===\n'
+parsed="$(_github_api_parse_retry_after_seconds 'Retry after 12 seconds' || true)"
+if [[ "$parsed" == '12' ]]; then
+  pass_case "parses retry after N seconds"
+else
+  fail_case "retry-after seconds parse failed (got=${parsed})"
+fi
+parsed="$(_github_api_parse_retry_after_seconds 'Please wait 3 minutes before retrying' || true)"
+if [[ "$parsed" == '180' ]]; then
+  pass_case "parses wait N minutes"
+else
+  fail_case "wait minutes parse failed (got=${parsed})"
+fi
+parsed="$(_github_api_parse_retry_after_seconds 'Please wait a few minutes before you try again' || true)"
+if [[ "$parsed" == '180' ]]; then
+  pass_case "parses a few minutes as 180s"
+else
+  fail_case "few minutes parse failed (got=${parsed})"
+fi
+
+printf '\n=== static: prefers HTTP headers for backoff ===\n'
+if grep -qF 'github_api_fetch_rate_limit_headers' "$lib" \
+  && grep -qF 'gh api --include rate_limit' "$lib" \
+  && grep -qF 'NOTE: GITHUB_RATE_LIMIT_HEADERS' "$lib"; then
+  pass_case "fetches rate_limit --include headers for backoff"
+else
+  fail_case "missing header-based backoff wiring"
+fi
+
+if grep -qF 'remaining_ok' "$lib" \
+  && grep -qF '_github_api_primary_quota_available' "$lib" \
+  && grep -qF 'github_api_rate_limit_depleted_reset_epoch' "$lib" \
+  && grep -qF 'resources.graphql' "$lib" \
+  && ! grep -qE 'remaining <= 0.*secondary == 0' "$lib"; then
+  pass_case "clears primary wait on core/graphql/search remaining > 0"
+else
+  fail_case "quota-recovery clear condition missing multi-resource check"
+fi
+
+if grep -qF 'secondary_fallback' "$lib" \
+  && grep -qF 'x_ratelimit_reset' "$lib" \
+  && grep -qF 'deadline_elapsed_still_depleted' "$lib"; then
+  pass_case "primary prefers X-RateLimit-Reset; secondary uses Retry-After/fallback"
+else
+  fail_case "primary/secondary deadline priority wiring missing"
+fi
+# shellcheck disable=SC2016  # assert literal --stream-stdout absence in retry loop
+if grep -qF 'runner_read "$uuid" stdout' "$lib" \
+  && ! awk '
+    /^github_api_exec_with_rate_limit_retry\(/ { in_fn=1 }
+    in_fn && /^}/ { in_fn=0 }
+    in_fn && /--stream-stdout/ { found=1 }
+    END { exit found ? 0 : 1 }
+  ' "$lib"; then
+  pass_case "retry emits stdout only after success (no mid-attempt stream)"
+else
+  fail_case "retry still streams stdout per attempt (paginate duplicate risk)"
+fi
+
+printf '\n=== behavioural: exec retries then fails closed ===\n'
+mock_bin="$(mktemp -d)"
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'gh: API rate limit exceeded for user ID 9\n' >&2
+exit 1
+EOF
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      github_api_rate_limit_max_retries=2
+      github_api_wait_for_rate_limit() {
+        printf "NOTE: GITHUB_RATE_LIMIT_WAIT fake\n" >&2
+        return 0
+      }
+      github_api_exec_with_rate_limit_retry "test-rate" -- gh api user
+    ' 2>&1
+)"
+ec=$?
+set -e
+
+if (( ec != 0 )) \
+  && grep -qF 'NOTE: GITHUB_RATE_LIMIT_HIT' <<<"$out" \
+  && grep -qF 'ERROR: GITHUB_RATE_LIMIT' <<<"$out"; then
+  pass_case "retries on rate limit then emits ERROR: GITHUB_RATE_LIMIT"
+else
+  fail_case "retry fail-closed broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+state_file="${MOCK_GH_STATE:?}"
+n=0
+if [[ -f "$state_file" ]]; then
+  n="$(cat "$state_file")"
+fi
+n=$((n + 1))
+printf '%s' "$n" >"$state_file"
+if (( n == 1 )); then
+  printf 'gh: API rate limit exceeded\n' >&2
+  exit 1
+fi
+printf '{"login":"ok"}\n'
+exit 0
+EOF
+chmod +x "${mock_bin}/gh"
+state="$(mktemp)"
+printf '0' >"$state"
+
+set +e
+out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" \
+    MOCK_GH_STATE="$state" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      github_api_rate_limit_max_retries=3
+      github_api_wait_for_rate_limit() {
+        printf "NOTE: GITHUB_RATE_LIMIT_WAIT fake\n" >&2
+        return 0
+      }
+      github_api_exec_with_rate_limit_retry "test-rate-ok" -- gh api user
+    ' 2>&1
+)"
+ec=$?
+set -e
+
+if (( ec == 0 )) \
+  && grep -qF 'NOTE: GITHUB_RATE_LIMIT_HIT' <<<"$out" \
+  && grep -qF '{"login":"ok"}' <<<"$out"; then
+  pass_case "retries after wait and succeeds when quota returns"
+else
+  fail_case "retry-success path broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+rm -rf "$mock_bin" "$state"
+
+printf '\n=== behavioural: wait respects graphql depletion + secondary fallback ===\n'
+mock_bin="$(mktemp -d)"
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+json='{"resources":{"core":{"remaining":5000,"reset":9999999999},"graphql":{"remaining":0,"reset":1700000100},"search":{"remaining":30,"reset":9999999999}}}'
+# Honor --jq like real gh for hermetic wait tests.
+jq_expr=""
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--jq" ]]; then
+    jq_expr="$arg"
+  fi
+  prev="$arg"
+done
+if [[ "$*" == *'rate_limit'* ]]; then
+  if [[ -n "$jq_expr" ]]; then
+    printf '%s' "$json" | jq -r "$jq_expr"
+  else
+    printf '%s\n' "$json"
+  fi
+  exit 0
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+EOF
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      run_command() {
+        local label="$1"
+        shift
+        if [[ "${1:-}" == "--timeout" ]]; then
+          shift 2
+        fi
+        if [[ "${1:-}" == "sleep" ]]; then
+          return 0
+        fi
+        "$@"
+      }
+      github_api_rate_limit_max_wait_s=5
+      github_api_rate_limit_poll_s=5
+      github_api_rate_limit_retry_sleep_s=5
+      date() { if [[ "${1:-}" == "+%s" ]]; then printf "1700000000\n"; else command date "$@"; fi; }
+      github_api_wait_for_rate_limit "API rate limit exceeded for user ID 1" "" 2>&1
+      printf "EC=%s\n" "$?"
+    '
+)"
+ec=$?
+set -e
+
+if grep -qF 'NOTE: GITHUB_RATE_LIMIT_WAIT reset_epoch=1700000100' <<<"$out" \
+  && ! grep -qF 'remaining_ok' <<<"$out"; then
+  pass_case "primary wait uses graphql depleted reset (not core remaining_ok)"
+else
+  fail_case "graphql depleted wait broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    MOCK_DATE_STATE="$(mktemp)" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      run_command() {
+        local label="$1"
+        shift
+        if [[ "${1:-}" == "--timeout" ]]; then
+          shift 2
+        fi
+        if [[ "${1:-}" == "sleep" ]]; then
+          # Mark that a wait sleep happened so date can advance past deadline.
+          printf "slept\n" >>"${MOCK_DATE_STATE}"
+          return 0
+        fi
+        "$@"
+      }
+      github_api_rate_limit_max_wait_s=120
+      github_api_rate_limit_poll_s=60
+      github_api_rate_limit_retry_sleep_s=60
+      date() {
+        if [[ "${1:-}" != "+%s" ]]; then
+          command date "$@"
+          return
+        fi
+        if grep -q slept "${MOCK_DATE_STATE}" 2>/dev/null; then
+          printf "1700000061\n"
+        else
+          printf "1700000000\n"
+        fi
+      }
+      headers=$'"'"'HTTP/2.0 200\r\nX-RateLimit-Reset: 9999999999\r\n\r\n{}'"'"'
+      github_api_wait_for_rate_limit "You have exceeded a secondary rate limit. Please retry again later." "$headers" 2>&1
+    '
+)"
+ec=$?
+set -e
+
+if (( ec == 0 )) \
+  && grep -qF 'secondary_fallback=60s' <<<"$out" \
+  && grep -qF 'deadline_reached' <<<"$out" \
+  && ! grep -qF 'x_ratelimit_reset=9999999999' <<<"$out"; then
+  pass_case "secondary wait uses fallback deadline, not core X-RateLimit-Reset"
+else
+  fail_case "secondary fallback wait broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+rm -rf "$mock_bin"
+
+printf '\n=== behavioural: primary prefers X-RateLimit-Reset over body few-minutes ===\n'
+mock_bin="$(mktemp -d)"
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Still depleted after a short body deadline would have elapsed.
+json='{"resources":{"core":{"remaining":0,"reset":1700003600},"graphql":{"remaining":5000,"reset":9999999999},"search":{"remaining":30,"reset":9999999999}}}'
+jq_expr=""
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--jq" ]]; then jq_expr="$arg"; fi
+  prev="$arg"
+done
+if [[ "$*" == *'rate_limit'* ]]; then
+  if [[ -n "$jq_expr" ]]; then
+    printf '%s' "$json" | jq -r "$jq_expr"
+  else
+    printf '%s\n' "$json"
+  fi
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      run_command() {
+        local label="$1"; shift
+        if [[ "${1:-}" == "--timeout" ]]; then shift 2; fi
+        if [[ "${1:-}" == "sleep" ]]; then return 0; fi
+        "$@"
+      }
+      github_api_rate_limit_max_wait_s=10
+      github_api_rate_limit_poll_s=10
+      github_api_rate_limit_retry_sleep_s=10
+      date() { if [[ "${1:-}" == "+%s" ]]; then printf "1700000000\n"; else command date "$@"; fi; }
+      headers=$'"'"'HTTP/2.0 200\r\nX-RateLimit-Reset: 1700003600\r\n\r\n{}'"'"'
+      github_api_wait_for_rate_limit "API rate limit exceeded for user ID 1. Please wait a few minutes before you try again." "$headers" 2>&1
+    '
+)"
+ec=$?
+set -e
+
+if grep -qF 'x_ratelimit_reset=1700003600' <<<"$out" \
+  && ! grep -qF 'retry_after=180s' <<<"$out" \
+  && grep -qF 'deadline=1700003600' <<<"$out"; then
+  pass_case "primary wait prefers X-RateLimit-Reset over body few-minutes"
+else
+  fail_case "primary deadline priority broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+rm -rf "$mock_bin"
+
+printf '\n=== behavioural: max_wait=0 fails fast without calling gh ===\n'
+mock_bin="$(mktemp -d)"
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+printf 'gh should not run on max_wait=0\n' >&2
+exit 99
+EOF
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      github_api_rate_limit_max_wait_s=0
+      github_api_wait_for_rate_limit "API rate limit exceeded" "" 2>&1
+    '
+)"
+ec=$?
+set -e
+
+if (( ec == 124 )) \
+  && grep -qF 'ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT timeout=0s' <<<"$out" \
+  && ! grep -qF 'gh should not run' <<<"$out"; then
+  pass_case "max_wait=0 returns 124 without invoking gh"
+else
+  fail_case "max_wait=0 fail-fast broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+rm -rf "$mock_bin"
+
+printf '\n=== skill docs mention GitHub API rate limits ===\n'
+skill="${root}/.cursor/skills/ship-and-review/SKILL.md"
+if grep -qF 'GitHub API rate limit' "$skill"; then
+  pass_case "ship-and-review skill documents GitHub API rate-limit wait"
+else
+  fail_case "ship-and-review skill missing GitHub API rate-limit guidance"
+fi
+
+printf '\n--- results: %s passed, %s failed ---\n' "$pass" "$fail"
+(( fail == 0 ))

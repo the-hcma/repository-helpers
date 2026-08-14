@@ -32,6 +32,9 @@ source "${rp_lib_dir}/github-repo-slug"
 # shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
 source "${rp_lib_dir}/runner-ensure"
 
+# shellcheck source=scripts/lib/github-api-rate-limit
+source "${rp_lib_dir}/github-api-rate-limit"
+
 # shellcheck source=scripts/lib/stacking-tool
 source "${rp_lib_dir}/stacking-tool"
 
@@ -78,6 +81,7 @@ rp_runner_exec_stdout() {
 }
 
 # rp_runner_gh_api_stream <label> [--probe] [gh-api-args…]
+# Waits and retries when GitHub returns a primary/secondary API rate limit.
 rp_runner_gh_api_stream() {
   local -r label="$1"
   local probe=0
@@ -86,15 +90,12 @@ rp_runner_gh_api_stream() {
     probe=1
     shift
   fi
-  local exit_code
 
-  exit_code=0
   if (( probe )); then
-    runner_exec "$label" --probe --stream-stdout -- gh api "$@" || exit_code=$?
+    github_api_exec_with_rate_limit_retry "$label" --probe -- gh api "$@"
   else
-    runner_exec "$label" --stream-stdout -- gh api "$@" || exit_code=$?
+    github_api_exec_with_rate_limit_retry "$label" -- gh api "$@"
   fi
-  return "$exit_code"
 }
 
 # rp_runner_git_stream <label> [git-args…]
@@ -594,6 +595,14 @@ rp_gh_api_max_attempts() {
 
 rp_gh_api_retry_sleep() {
   local secs="${RP_GH_API_RETRY_SLEEP_SECS:-1}"
+  local detail
+
+  # Primary/secondary rate limits need wait-until-reset, not a 1s nudge.
+  detail="$(rp_runner_last_stderr_summary || true)"
+  if github_api_detail_is_rate_limited "$detail"; then
+    github_api_wait_for_rate_limit "$detail"
+    return $?
+  fi
   if [[ "$secs" == '0' ]]; then
     return 0
   fi
@@ -631,7 +640,7 @@ rp_gh_api_classify_contents_failure() {
 rp_gh_path_check() {
   local -r slug="$1"
   local -r path="$2"
-  local attempt max_attempts exit_code class_ec
+  local attempt max_attempts exit_code class_ec sleep_ec
 
   max_attempts="$(rp_gh_api_max_attempts)"
   attempt=1
@@ -645,7 +654,11 @@ rp_gh_path_check() {
     class_ec=0
     rp_gh_api_classify_contents_failure "$attempt" || class_ec=$?
     if (( class_ec == 3 )); then
-      rp_gh_api_retry_sleep
+      sleep_ec=0
+      rp_gh_api_retry_sleep || sleep_ec=$?
+      if (( sleep_ec == 124 )); then
+        return 2
+      fi
       attempt=$(( attempt + 1 ))
       continue
     fi
@@ -670,7 +683,7 @@ rp_fetch_github_text_file() {
   local path="$2"
   local response encoded decoded
   local fetch_exit_code=0
-  local attempt max_attempts class_ec
+  local attempt max_attempts class_ec sleep_ec
 
   max_attempts="$(rp_gh_api_max_attempts)"
   attempt=1
@@ -694,7 +707,11 @@ rp_fetch_github_text_file() {
     class_ec=0
     rp_gh_api_classify_contents_failure "$attempt" || class_ec=$?
     if (( class_ec == 3 )); then
-      rp_gh_api_retry_sleep
+      sleep_ec=0
+      rp_gh_api_retry_sleep || sleep_ec=$?
+      if (( sleep_ec == 124 )); then
+        return 2
+      fi
       attempt=$(( attempt + 1 ))
       continue
     fi
@@ -4022,8 +4039,8 @@ rp_fetch_repo_labels_json() {
   local exit_code=0
 
   set +e
-  rp_runner_exec_stdout "repo-practices repo labels" \
-    -- gh api "repos/${slug}/labels" --paginate --jq '[.[].name]'
+  rp_runner_gh_api_stream "repo-practices repo labels" \
+    "repos/${slug}/labels" --paginate --jq '[.[].name]'
   exit_code=$?
   set -e
   if (( exit_code != 0 )); then
@@ -4607,8 +4624,8 @@ rp_fetch_workflow_file_names() {
 
   local fetch_exit_code=0
   set +e
-  response="$(rp_runner_exec_stdout "repo-practices gh list workflows" \
-    -- gh api "repos/${slug}/contents/.github/workflows")"
+  response="$(rp_runner_gh_api_stream "repo-practices gh list workflows" \
+    "repos/${slug}/contents/.github/workflows")"
   fetch_exit_code=$?
   set -e
   if (( fetch_exit_code != 0 )) || [[ -z "$response" ]]; then
