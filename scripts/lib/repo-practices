@@ -212,6 +212,7 @@ Audits GitHub conventions for org repositories:
     - .cursor/rules/repo-practices-after-config-change.mdc (run github-repo-lint after config/workflow edits)
     - .gitignore must not ignore .cursor/rules/ (org cursor rules must be trackable)
     - .github/stacking-tool (graphite|gh-stack) + stacking-tool cursor rule
+    - stacking docs consistency (AGENTS.md / pr-ship / GRAPHITE.md vs marker)
 
   Release Please (when release-please.yml exists):
     - squash-only repo settings; squash_merge_commit_message=BLANK
@@ -1124,6 +1125,204 @@ rp_check_stacking_tool() {
   else
     rp_log_check_ok "$slug" 'stacking-tool cursor rule' \
       "$(rp_github_url "$slug" "/blob/main/${rp_stacking_tool_rule_path}")"
+  fi
+
+  return "$repo_fail"
+}
+
+readonly rp_agents_md_path='AGENTS.md'
+readonly rp_graphite_md_path='GRAPHITE.md'
+
+# True when AGENTS.md still teaches Graphite / merge-it as the stacking path without
+# describing gh-stack *usage* (init/add/submit/view) as the workflow.
+# Any mention of "gh stack" (including "do not use") does not clear this — require a
+# command-shaped usage pattern so negated references still surface Graphite drift.
+rp_agents_md_prescribes_graphite_primary_stacking() {
+  local -r text="$1"
+  local cleaned
+
+  if grep -qiE 'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view|sync|rebase)' <<<"$text" \
+    || grep -qiE 'gh-stack[[:space:]]+(init|add|submit|view|sync|rebase)' <<<"$text"; then
+    return 1
+  fi
+  if grep -qF 'gt create' <<<"$text" || grep -qF 'gt submit' <<<"$text"; then
+    return 0
+  fi
+  # Positive merge-it prescription only (skip leftover / do-not-use notes).
+  # Match "add/use/apply … merge-it" including "add the merge-it label". Drop lines that
+  # forbid the label first so "Do not use merge-it" is not a false positive.
+  cleaned="$(
+    grep -viE '(do[[:space:]]+not|don'\''t|never)[[:space:]]+(add|use|apply).{0,40}merge-it' \
+      <<<"$text" || true
+  )"
+  if grep -qiE '(add|use|apply)[[:space:]]+([[:alpha:]]+[[:space:]]+){0,2}merge-it' \
+    <<<"$cleaned"; then
+    return 0
+  fi
+  return 1
+}
+
+# Soft inverse for graphite markers: docs prescribe gh-stack usage with no Graphite/gt path.
+rp_docs_prescribe_gh_stack_without_graphite() {
+  local -r text="$1"
+
+  # Require command-shaped gh stack usage (negations like "do not use gh stack" do not count).
+  if ! grep -qiE 'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view|sync|rebase)' <<<"$text" \
+    && ! grep -qiE 'gh-stack[[:space:]]+(init|add|submit|view|sync|rebase)' <<<"$text"; then
+    return 1
+  fi
+  # Clear when Graphite/gt guidance is present (exact create/submit, name, or bare gt <cmd>).
+  if grep -qiF 'gt create' <<<"$text" \
+    || grep -qiF 'gt submit' <<<"$text" \
+    || grep -qiF 'graphite' <<<"$text" \
+    || grep -qiE '(^|[^[:alnum:]_-])gt[[:space:]]+[[:alpha:]]' <<<"$text"; then
+    return 1
+  fi
+  return 0
+}
+
+# Drop single-# comment lines (shell / example comments). Keep ## markdown headings.
+rp_docs_text_without_hash_comments() {
+  local -r text="$1"
+
+  grep -vE '^[[:space:]]*#[^#]' <<<"$text" || true
+}
+
+# True when pr-ship still ships a Graphite-only create/submit snippet (no gh stack usage).
+# Either gt create or gt submit is enough; a command-shaped gh stack path clears the flag.
+# Commented-out `# gh stack …` lines do not clear (avoids dual-example drift).
+rp_pr_ship_has_graphite_only_submit_snippet() {
+  local -r text="$1"
+  local cleaned
+
+  if ! grep -qF 'gt create' <<<"$text" && ! grep -qF 'gt submit' <<<"$text"; then
+    return 1
+  fi
+  cleaned="$(rp_docs_text_without_hash_comments "$text")"
+  if grep -qiE 'gh[[:space:]]+stack[[:space:]]+(init|add|submit|view)' <<<"$cleaned" \
+    || grep -qiE 'gh-stack[[:space:]]+(init|add|submit|view)' <<<"$cleaned"; then
+    return 1
+  fi
+  return 0
+}
+
+# Marker vs leftover Graphite docs (AGENTS.md / pr-ship / GRAPHITE.md).
+# Skips this repo (intentional dual SSOT). Soft-suggest only for graphite→gh-stack drift.
+rp_check_stacking_docs_consistency() {
+  local slug="$1"
+  local repo_fail=0
+  local marker_text marker_value pr_ship_text agents_text graphite_md_text
+  local fetch_ec=0
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    rp_log_check_ok "$slug" 'stacking docs consistency (skipped; dual SSOT)' \
+      "$(rp_github_url "$slug" "/blob/main/${stacking_tool_marker_relpath}")"
+    return 0
+  fi
+
+  fetch_ec=0
+  marker_text="$(rp_fetch_github_text_file "$slug" "$stacking_tool_marker_relpath")" \
+    || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" "could not read ${stacking_tool_marker_relpath}"
+    return 1
+  fi
+  if [[ -z "$marker_text" ]]; then
+    return 0
+  fi
+  marker_value="$(stacking_tool_normalize "$marker_text")"
+  if ! stacking_tool_is_valid "$marker_value"; then
+    return 0
+  fi
+
+  fetch_ec=0
+  pr_ship_text="$(rp_fetch_github_text_file "$slug" "$rp_pr_ship_and_review_rule_path")" \
+    || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" "could not read ${rp_pr_ship_and_review_rule_path}"
+    return 1
+  fi
+  fetch_ec=0
+  agents_text="$(rp_fetch_github_text_file "$slug" "$rp_agents_md_path")" || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" "could not read ${rp_agents_md_path}"
+    return 1
+  fi
+  fetch_ec=0
+  graphite_md_text="$(rp_fetch_github_text_file "$slug" "$rp_graphite_md_path")" \
+    || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" "could not read ${rp_graphite_md_path}"
+    return 1
+  fi
+
+  if [[ "$marker_value" == "$stacking_tool_value_gh_stack" ]]; then
+    if [[ -n "$pr_ship_text" ]] \
+      && rp_pr_ship_has_graphite_only_submit_snippet "$pr_ship_text"; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'pr-ship-and-review still has Graphite-only gt create/gt submit (marker is gh-stack)' \
+        "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_rule_path}")"
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
+        rp_queue_candidate_file_fix "$slug" "$rp_pr_ship_and_review_rule_path" \
+          "$(rp_pr_ship_and_review_rule_content_for_apply_fix "$slug")" \
+          'sync-pr-ship-stacking-docs' \
+          'chore: replace pr-ship rule with marker-aware template'
+      fi
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: replace .cursor/rules/pr-ship-and-review.mdc with the marker-aware template (full file; scripts/lib/repo-practices-cursor/pr-ship-and-review.mdc) — repo-specific edits outside the submit block are overwritten"
+      fi
+    elif [[ -n "$pr_ship_text" ]]; then
+      rp_log_check_ok "$slug" 'pr-ship stacking docs match gh-stack marker' \
+        "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_rule_path}")"
+    fi
+
+    if [[ -n "$agents_text" ]] \
+      && rp_agents_md_prescribes_graphite_primary_stacking "$agents_text"; then
+      # AGENTS is repo-specific — detect + suggest only (do not fail the audit).
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: AGENTS.md still prescribes Graphite/gt/merge-it while marker is gh-stack — update stacking/merge for gh stack + GitHub auto-merge (gh pr merge --auto --squash); do not prescribe merge-it"
+      else
+        rp_log_warn \
+          "${slug}: AGENTS.md still prescribes Graphite/gt/merge-it while marker is gh-stack (re-run with --suggest)"
+      fi
+    elif [[ -n "$agents_text" ]]; then
+      rp_log_check_ok "$slug" 'AGENTS.md stacking docs match gh-stack marker' \
+        "$(rp_github_url "$slug" "/blob/main/${rp_agents_md_path}")"
+    fi
+
+    if [[ -n "$graphite_md_text" ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'root GRAPHITE.md still present (marker is gh-stack; skill in repository-helpers is SSOT)' \
+        "$(rp_github_url "$slug" "/blob/main/${rp_graphite_md_path}")"
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: delete GRAPHITE.md and point agents at .cursor/rules/stacking-tool.mdc + repository-helpers gh-stack skill"
+      fi
+    else
+      rp_log_check_ok "$slug" 'no root GRAPHITE.md (gh-stack)' \
+        "$(rp_github_url "$slug" '/tree/main')"
+    fi
+  elif [[ "$marker_value" == "$stacking_tool_value_graphite" ]]; then
+    if [[ -n "$pr_ship_text" ]] \
+      && rp_docs_prescribe_gh_stack_without_graphite "$pr_ship_text"; then
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: pr-ship-and-review mentions gh stack only; marker is graphite — restore a gt create/gt submit path or flip .github/stacking-tool"
+      fi
+    fi
+    if [[ -n "$agents_text" ]] \
+      && rp_docs_prescribe_gh_stack_without_graphite "$agents_text"; then
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: AGENTS.md mentions gh stack only; marker is graphite — restore Graphite/gt guidance or flip .github/stacking-tool"
+      fi
+    fi
+    rp_log_check_ok "$slug" 'stacking docs consistency (graphite marker)' \
+      "$(rp_github_url "$slug" "/blob/main/${stacking_tool_marker_relpath}")"
   fi
 
   return "$repo_fail"
@@ -5285,7 +5484,9 @@ rp_print_new_repo_checklist() {
       [ ] .gitignore must not ignore .cursor/rules/ (un-ignore if ignoring other .cursor content)
       [ ] .github/stacking-tool (graphite|gh-stack)
       [ ] .cursor/rules/stacking-tool.mdc (thin marker rule; template in ${rp_THIS_REPO_NAME})
-      [ ] GitHub merge queue / auto-merge flow (AGENTS.md)
+      [ ] AGENTS.md + pr-ship submit block match the marker (no leftover Graphite-only gt/merge-it when gh-stack)
+      [ ] No root GRAPHITE.md when marker is gh-stack (skill in ${rp_THIS_REPO_NAME} is SSOT)
+      [ ] GitHub merge queue / auto-merge flow (AGENTS.md — use gh pr merge --auto --squash, not merge-it)
       [ ] RELEASING.md when using Release Please
 
 CHECKLIST
@@ -6542,6 +6743,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_stacking_tool "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_stacking_docs_consistency "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_read_agents_and_rules "$slug"; then

@@ -171,6 +171,8 @@ also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
 | Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` + `.cursor/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve |
 | Repo practices after config change | yes | — | `.cursor/rules/repo-practices-after-config-change.mdc` requires `github-repo-lint` after workflow/config edits; `pre-pr-checks` runs detect-first `repo-practices-lint` when the diff touches those paths |
 | Session-start read guidance | yes | — | `.cursor/rules/read-agents-and-rules.mdc` requires reading `AGENTS.md` and `.cursor/rules/` at the start of every new agent session |
+| Stacking-tool marker + rule | yes | — | `.github/stacking-tool` + thin stacking-tool cursor rule |
+| Stacking docs consistency | yes | — | `gh-stack` marker vs leftover Graphite docs (`AGENTS.md` / pr-ship / `GRAPHITE.md`) |
 | UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
 | UV + Release Please lock sync | yes | — | uv + `release-please.yml` repos require `release-please-config` `extra-files` bumping `uv.lock` via `@.name.value` jsonpath ([release-please#2561](https://github.com/googleapis/release-please/issues/2561)) |
 | Python static CI job | yes | — | Python (`pyproject.toml` + ruff) repos run ruff check/format + typecheck in one `Python lint & format checks` job via `.github/ci/python-static`; no split `Ruff`/`Pyright`/`Mypy`/`Backend Lint` publishers in **any** workflow; cutover must share the combined job/step conclusion |
@@ -181,8 +183,9 @@ also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
 | `ci-secret-scan` gitleaks pin | yes* | — | Warn when `scripts/lib/ci-secret-scan` pins gitleaks behind the release-age-eligible version (*this repo only) |
 
 `--suggest` prints remediation lines; `--apply-fix` queues candidate
-workflow/cursor-rule PRs via **Graphite** (`gt track` / `gt submit`) in the
-target clone (not yet marker-aware for `gh-stack`).
+workflow/cursor-rule PRs via the stacking backend selected by
+`.github/stacking-tool` (`graphite` → `gt track` / `gt submit`; `gh-stack` →
+`gh stack init` / `gh stack submit`).
 
 Further detail (protect-main rules, branch hygiene, CVE workflow template):
 [AGENTS.md](AGENTS.md#repository-practices-new-and-existing-repos).
