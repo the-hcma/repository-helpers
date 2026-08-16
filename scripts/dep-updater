@@ -3870,7 +3870,8 @@ prepare_worktree() {
   # subsequent worktree operations don’t fail.
   run_command "git repo" git -C "$dir" worktree prune >/dev/null 2>&1 || true
 
-  local existing_wt=""
+  local branch_info_status existing_wt
+  existing_wt=""
   if [[ -f "$state_file" ]]; then
     existing_wt="$(state_get "worktree")"
     if [[ -n "$existing_wt" && -d "$existing_wt" ]]; then
@@ -3910,7 +3911,12 @@ prepare_worktree() {
       fi
 
       # Sanity check: verify the stacking backend can operate on the current branch.
-      if ! dep_stack_branch_info_ok; then
+      branch_info_status=0
+      dep_stack_branch_info_ok || branch_info_status=$?
+      if (( branch_info_status == 124 )); then
+        die "Graphite branch inspection timed out; preserving existing worktree: ${worktree_path}"
+      fi
+      if (( branch_info_status != 0 )); then
         offer_worktree_reset
         # offer_worktree_reset either dies or recreates the worktree via
         # create_worktree, which marks worktree_path readonly.
@@ -3944,7 +3950,9 @@ prepare_worktree() {
 }
 
 ensure_gt_tracked() {
-  local current_branch
+  local branch_info_status current_branch
+  local -a track_args=(--force)
+
   current_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current)"
   # On main — always known to Graphite; nothing to track.
   if [[ "$current_branch" == 'main' ]]; then
@@ -3952,11 +3960,20 @@ ensure_gt_tracked() {
   fi
   # For any other branch (including the throwaway wt_base_branch) — ensure
   # Graphite tracks it so gt create can stack child branches on top of it.
-  # Give the throwaway branch an explicit parent and bound Graphite commands;
-  # gt track has occasionally waited forever without producing output.
-  if ! dep_stack_graphite_branch_info_ok; then
-    dep_stack_graphite_track --force -p main \
-      || die "Could not register '${current_branch}' with Graphite. Cannot create stack.\n  Try manually in worktree: graphite track --parent main"
+  branch_info_status=0
+  dep_stack_graphite_branch_info_ok || branch_info_status=$?
+  if (( branch_info_status == 124 )); then
+    die "Graphite branch inspection timed out for '${current_branch}'. Cannot create stack."
+  fi
+  if (( branch_info_status != 0 )); then
+    # Prefer an explicit parent in the normal layout, but retain Graphite's
+    # auto-detection for supported repositories whose local trunk is not main.
+    if runner_exec "git main branch probe" --probe -- \
+      git -C "$worktree_path" show-ref --verify --quiet refs/heads/main; then
+      track_args+=(-p main)
+    fi
+    dep_stack_graphite_track "${track_args[@]}" \
+      || die "Could not register '${current_branch}' with Graphite. Cannot create stack."
   fi
 }
 
