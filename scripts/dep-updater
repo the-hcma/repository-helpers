@@ -51,6 +51,8 @@ source "${dep_script_dir}/lib/stacking-tool"
 
 dep_updater_minimum_release_age_minutes="$release_age_dep_updater_minutes"
 readonly dep_updater_minimum_release_age_minutes
+dep_graphite_command_timeout_seconds="${DEP_UPDATER_GRAPHITE_TIMEOUT_SECONDS:-20}"
+readonly dep_graphite_command_timeout_seconds
 # shellcheck disable=SC1091
 source "${dep_script_dir}/lib/ci-check-rollup"
 # shellcheck disable=SC1091
@@ -518,9 +520,9 @@ dep_stack_register_branch() {
 
   dep_stacking_is_graphite || return 0
   if [[ "$parent_branch" == "$wt_base_branch" ]]; then
-    run_in_worktree gt track -p main
+    dep_stack_graphite_track -p main
   else
-    run_in_worktree gt track -p "$parent_branch"
+    dep_stack_graphite_track -p "$parent_branch"
   fi
 }
 
@@ -533,7 +535,7 @@ dep_stack_register_branch_optional() {
     return
   fi
   dep_stacking_is_graphite || return 0
-  run_in_worktree gt track -p main 2>/dev/null || true
+  dep_stack_graphite_track --runner-probe -p main 2>/dev/null || true
 }
 
 # dep_stack_submit_gh_pr_fallback
@@ -630,7 +632,7 @@ dep_stack_submit_current() {
 
 dep_stack_track_force() {
   dep_stacking_is_graphite || return 0
-  run_in_worktree gt track --force \
+  dep_stack_graphite_track --runner-probe --force \
     || log "Warning: could not track branch with Graphite."
 }
 
@@ -644,7 +646,38 @@ dep_stack_branch_info_ok() {
     run_in_worktree gh stack view --json >/dev/null 2>&1
     return $?
   fi
-  run_in_worktree gt branch info &>/dev/null 2>&1
+  dep_stack_graphite_branch_info_ok
+}
+
+dep_stack_graphite_branch_info_ok() {
+  local quoted_wt
+  quoted_wt="$(printf '%q' "$worktree_path")"
+  runner_sh "gt branch info" --probe --timeout "$dep_graphite_command_timeout_seconds" -- \
+    "cd ${quoted_wt} && exec gt branch info >/dev/null 2>&1"
+}
+
+dep_stack_graphite_track() {
+  local probe quoted_args quoted_wt arg
+  local -a runner_opts=() track_args=()
+
+  probe=0
+  if [[ "${1:-}" == '--runner-probe' ]]; then
+    probe=1
+    shift
+  fi
+  track_args=("$@")
+  runner_opts=(--timeout "$dep_graphite_command_timeout_seconds")
+  if (( probe == 1 )); then
+    runner_opts=(--probe "${runner_opts[@]}")
+  fi
+
+  quoted_args=""
+  for arg in "${track_args[@]}"; do
+    quoted_args+=" $(printf '%q' "$arg")"
+  done
+  quoted_wt="$(printf '%q' "$worktree_path")"
+  runner_sh "gt track" "${runner_opts[@]}" -- \
+    "cd ${quoted_wt} && exec gt track${quoted_args}"
 }
 
 dep_stack_needs_rebase() {
@@ -3783,11 +3816,11 @@ create_worktree() {
 # ---------------------------------------------------------------------------
 
 offer_worktree_reset() {
-  local current_branch
+  local auto_reset branches_csv current_branch prs_csv
   current_branch="$(dep_runner_git_c_stdout "git worktree" "$worktree_path" -- branch --show-current 2>/dev/null || echo '(detached)')"
-
-  local branches_csv
   branches_csv="$(state_get "branches")"
+  prs_csv="$(state_get "prs")"
+  auto_reset=0
 
   log "Worktree is unusable: branch '${current_branch}' is not tracked by Graphite."
   log "  Worktree: ${worktree_path}"
@@ -3796,7 +3829,11 @@ offer_worktree_reset() {
     log "  To clean up those PRs and branches later, run: $0 --cleanup --dir ${dir}"
   fi
 
-  if ! prompt_yes_no "Delete this worktree and start fresh?" "y"; then
+  if ! is_interactive && [[ -z "$branches_csv" && -z "$prs_csv" ]] \
+    && [[ "$current_branch" == "$wt_base_branch" ]]; then
+    auto_reset=1
+    log "[worktree] Auto-recovering abandoned untracked worktree (no stack branches or PRs)."
+  elif ! prompt_yes_no "Delete this worktree and start fresh?" "y"; then
     die "Cannot proceed with unusable worktree. To clean up manually, run: $0 --cleanup --dir ${dir}"
   fi
 
@@ -3816,7 +3853,11 @@ offer_worktree_reset() {
 
   # Clear state so create_worktree starts from scratch
   rm -f "$state_file"
-  log "Broken worktree deleted. Creating a new worktree…"
+  if (( auto_reset == 1 )); then
+    log "[worktree] Abandoned worktree removed. Creating a fresh worktree…"
+  else
+    log "Broken worktree deleted. Creating a new worktree…"
+  fi
 
   # worktree_path is not yet readonly at this call site; reset before create_worktree assigns it.
   worktree_path=""
@@ -3911,9 +3952,10 @@ ensure_gt_tracked() {
   fi
   # For any other branch (including the throwaway wt_base_branch) — ensure
   # Graphite tracks it so gt create can stack child branches on top of it.
-  # Use --force so Graphite auto-detects the trunk parent.
-  if ! run_in_worktree gt branch info &>/dev/null 2>&1; then
-    run_in_worktree gt track --force \
+  # Give the throwaway branch an explicit parent and bound Graphite commands;
+  # gt track has occasionally waited forever without producing output.
+  if ! dep_stack_graphite_branch_info_ok; then
+    dep_stack_graphite_track --force -p main \
       || die "Could not register '${current_branch}' with Graphite. Cannot create stack.\n  Try manually in worktree: graphite track --parent main"
   fi
 }
@@ -9195,10 +9237,16 @@ existing_branches="$(state_get "branches")"
 existing_prs="$(state_get "prs")"
 
 prepare_worktree
+
+dep_updater_ensure_eco_fail_file
+# A fresh throwaway worktree has no recoverable stack state. Arm cleanup before
+# Graphite tracking so a timeout cannot leak the worktree and poison the next run.
+if [[ -z "$existing_branches" && -z "$existing_prs" ]]; then
+  _cleanup_trap_active=1
+fi
 dep_stack_ensure_tracked
 
 # Worktree is live — any unexpected exit from here should trigger cleanup.
-dep_updater_ensure_eco_fail_file
 _cleanup_trap_active=1
 
 run_command "git worktree" git -C "$worktree_path" fetch origin --prune 2>/dev/null || true
