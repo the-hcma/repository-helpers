@@ -283,7 +283,7 @@ for the full review playbook; skills under `.cursor/skills/{graphite,gh-stack}/`
 
 | Script | Purpose |
 | --- | --- |
-| `scripts/dep-updater` | Dependency bumps → stacked PR(s) for one repo (`gh-stack` when `.github/stacking-tool` is absent; `graphite` when marked). |
+| `scripts/dep-updater` | Dependency bumps → stacked PR(s) for one repo (`gh-stack` when the marker is absent; otherwise per `.github/stacking-tool`). |
 | `scripts/dep-updater-batch-run` | Daily batch across a scan root; email report. |
 | `scripts/github-repo-lint` | Org repo practices audit / `--apply-fix`. |
 | `scripts/check-merge-settings` | Merge + GitHub MQ settings only. |
