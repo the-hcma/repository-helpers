@@ -5485,11 +5485,14 @@ py_uv_parse_verify_filter_pkg() {
     return 1
   fi
   pkg="$(printf '%s' "$line" \
-    | sed -nE 's/.*(?:constraint rewrite was a no-op for |lock did not land )([A-Za-z0-9][A-Za-z0-9._-]*).*/\1/p' \
-    | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+    | sed -nE \
+      -e 's/.*constraint rewrite was a no-op for ([A-Za-z0-9][A-Za-z0-9._-]*).*/\1/p' \
+      -e 's/.*lock did not land ([A-Za-z0-9][A-Za-z0-9._-]*).*/\1/p' \
+    | head -n 1)"
   if [[ -z "$pkg" ]]; then
     return 1
   fi
+  pkg="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
   printf '%s' "$pkg"
   return 0
 }
@@ -5618,6 +5621,7 @@ py_uv_filter_outdated_lines() {
   log_file="$(mktemp)"
 
   while [[ ${#pending_outdated[@]} -gt 0 ]]; do
+    : >"$log_file"
     if py_uv_try_lockfile_with_updates "$scan_root" "$log_file" "${pending_outdated[@]}"; then
       filtered_lines=("${pending_outdated[@]}")
       rm -f "$log_file"
@@ -6624,6 +6628,9 @@ batch_update_all() {
   local any_npm=0 any_py=0
   local py_out py_exit b_constraint_op b_spec actual_py_lines='' dep_kind dep_package dep_platform
   local uv_floor_batch uv_upgrade_success report_py_lines
+  local pyproject_bak verified_floor_lines floor_line floor_pkg _floor_old floor_new floor_highest
+  local -a uv_floor_lines=()
+  local -a verified_floor_lines=()
   local -a uv_upgrade_specs=()
   local -a cargo_add_args=()
   local lock_actual_lines seen_py_pkgs pkg_norm lock_bak
@@ -6853,8 +6860,11 @@ batch_update_all() {
       done <<< "$py_lines_arg"
       if [[ "$py_tool" == "uv" ]]; then
         if [[ "$uv_floor_batch" == '1' ]]; then
-          # Snapshot uv.lock before floor lock so a failure cannot wipe an
-          # untracked pre-existing lock via `git clean` (checkout is a no-op).
+          # Snapshot pyproject.toml and uv.lock before floor lock so failures can
+          # revert unverified floors or restore the pre-lock lockfile.
+          pyproject_bak=""
+          pyproject_bak="$(mktemp)"
+          cp "${worktree_path}/pyproject.toml" "$pyproject_bak"
           lock_bak=""
           if [[ -f "${worktree_path}/uv.lock" ]]; then
             lock_bak="$(mktemp)"
@@ -6863,7 +6873,9 @@ batch_update_all() {
           py_out="$(dep_runner_uv_dir_capture "uv batch lock" "$worktree_path" -- lock)" && py_exit=0 || py_exit=$?
           if (( py_exit != 0 )); then
             py_uv_restore_after_failed_floor_lock "$worktree_path" "$lock_bak"
+            rm -f "$pyproject_bak" "$lock_bak"
             lock_bak=""
+            pyproject_bak=""
             if grep -qF 'No solution found when resolving dependencies' <<<"$py_out"; then
               log "[python/uv] Skipping python batch floor bumps: dependency resolution failed."
               log "$py_out"
@@ -6875,20 +6887,57 @@ batch_update_all() {
                 "python|batch uv lock failed (non-resolution; floors reverted)"
             fi
             uv_floor_batch=0
+            uv_floor_lines=()
           else
-            rm -f "$lock_bak"
-            lock_bak=""
+            verified_floor_lines=()
             for floor_line in "${uv_floor_lines[@]}"; do
               read -r floor_pkg _floor_old floor_new <<<"$floor_line"
               [[ -z "$floor_pkg" || -z "$floor_new" ]] && continue
               floor_highest="$(py_uv_lock_highest_version "${worktree_path}/uv.lock" "$floor_pkg" \
                 2>/dev/null || true)"
               if py_uv_version_at_least "$floor_highest" "$floor_new"; then
+                verified_floor_lines+=("$floor_line")
                 log "[python/${py_tool}] Update: ${floor_pkg} → ${floor_new}"
               else
                 log "[python/uv] Skipping ${floor_pkg} ${floor_new}: lock stayed at ${floor_highest:-?}."
               fi
             done
+            if [[ ${#verified_floor_lines[@]} -lt ${#uv_floor_lines[@]} ]]; then
+              cp "$pyproject_bak" "${worktree_path}/pyproject.toml"
+              uv_floor_lines=()
+              for floor_line in "${verified_floor_lines[@]}"; do
+                read -r floor_pkg _floor_old floor_new <<<"$floor_line"
+                [[ -z "$floor_pkg" || -z "$floor_new" ]] && continue
+                if ! py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$floor_pkg" "$floor_new"; then
+                  log "[python/uv] ERROR: batch re-rewrite failed for ${floor_pkg} after verification."
+                  dep_updater_append_ecosystem_failure "python|batch re-rewrite failed for ${floor_pkg}"
+                  uv_floor_batch=0
+                  break
+                fi
+                uv_floor_lines+=("$floor_line")
+              done
+              if [[ "$uv_floor_batch" == '1' && ${#uv_floor_lines[@]} -gt 0 ]]; then
+                py_out="$(dep_runner_uv_dir_capture "uv batch lock verify" "$worktree_path" -- lock)" \
+                  && py_exit=0 || py_exit=$?
+                if (( py_exit != 0 )); then
+                  py_uv_restore_after_failed_floor_lock "$worktree_path" "$lock_bak"
+                  log "[python/uv] Skipping verified floor bumps: dependency resolution failed on re-lock."
+                  log "$py_out"
+                  uv_floor_batch=0
+                  uv_floor_lines=()
+                fi
+              elif [[ ${#uv_floor_lines[@]} -eq 0 ]]; then
+                if [[ -n "$lock_bak" ]]; then
+                  cp "$lock_bak" "${worktree_path}/uv.lock"
+                fi
+                uv_floor_batch=0
+              fi
+            else
+              uv_floor_lines=("${verified_floor_lines[@]}")
+            fi
+            rm -f "$pyproject_bak" "$lock_bak"
+            lock_bak=""
+            pyproject_bak=""
           fi
         fi
         for b_spec in "${uv_upgrade_specs[@]}"; do
