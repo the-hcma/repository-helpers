@@ -1061,6 +1061,7 @@ fi
 
 if grep -qF 'agent_review_abort_if_pending_threads' "$lib" \
   && grep -qF 'agent_review_pending_thread_count_from_snapshot' "$lib" \
+  && grep -qF 'agent_review_open_thread_count_from_snapshot' "$lib" \
   && grep -qF 'agent_review_agent_threads_needs_resolve_json_from_snapshot' "$lib" \
   && grep -qF 'agent_threads_needs_resolve' "$lib" \
   && grep -qF 'agent_review_abort_if_pending_threads' "$wait_script"; then
@@ -3214,6 +3215,137 @@ else
 fi
 rm -f "${tmp_human_fixture}"
 
+printf '\n=== functional: GraphQL threads beat REST waits (#497) ===\n'
+tmp_cr_497="$(mktemp)"
+printf '%s' "${cr_thread_fixture}" >"${tmp_cr_497}"
+tmp_rest_log_497="$(mktemp)"
+: >"${tmp_rest_log_497}"
+if pending="$(AGENT_REVIEW_AGENT=copilot AGENT_REVIEW_RESOLVED_COMMENTS_FILE="$(mktemp)" bash -c "
+  source '${lib}'
+  agent_review_load_agent_profile
+  agent_review_authenticated_login_optional() { return 1; }
+  agent_review_authenticated_login() {
+    printf 'REST_LOGIN\n' >>'${tmp_rest_log_497}'
+    agent_review_die 'could not determine authenticated GitHub login (rate limited)'
+  }
+  agent_review_pr_issue_comments_json() {
+    printf 'REST_COMMENTS\n' >>'${tmp_rest_log_497}'
+    printf '[]'
+  }
+  github_api_wait_for_rate_limit() {
+    printf 'REST_WAIT\n' >>'${tmp_rest_log_497}'
+    return 1
+  }
+  agent_review_pending_thread_count_from_snapshot 'the-hcma/mock-repo' 650 \"\$(cat '${tmp_cr_497}')\"
+")" && [[ "${pending}" == '1' ]] && [[ ! -s "${tmp_rest_log_497}" ]]; then
+  printf '[PASS] pending count: GraphQL CodeRabbit thread skips REST login/comments (#497)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] pending count: expected 1 thread without REST (got %s, rest_log=%s)\n' \
+    "${pending:-<empty>}" "$(tr '\n' ',' <"${tmp_rest_log_497}" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+
+: >"${tmp_rest_log_497}"
+abort_rc=0
+abort_out="$(AGENT_REVIEW_AGENT=copilot AGENT_REVIEW_RESOLVED_COMMENTS_FILE="$(mktemp)" bash -c "
+  source '${lib}'
+  agent_review_load_agent_profile
+  agent_review_graphql_pr_snapshot() { cat '${tmp_cr_497}'; }
+  agent_review_assert_snapshot_complete() { return 0; }
+  agent_review_authenticated_login_optional() { return 1; }
+  agent_review_authenticated_login() {
+    printf 'REST_LOGIN\n' >>'${tmp_rest_log_497}'
+    agent_review_die 'could not determine authenticated GitHub login (rate limited)'
+  }
+  agent_review_pr_issue_comments_json() {
+    printf 'REST_COMMENTS\n' >>'${tmp_rest_log_497}'
+    printf '[]'
+  }
+  github_api_wait_for_rate_limit() {
+    printf 'REST_WAIT\n' >>'${tmp_rest_log_497}'
+    return 1
+  }
+  agent_review_abort_if_pending_threads 'the-hcma/mock-repo' 650
+" 2>/dev/null)" || abort_rc=$?
+if (( abort_rc == 3 )) \
+  && [[ ! -s "${tmp_rest_log_497}" ]] \
+  && [[ "$(printf '%s' "${abort_out}" | jq -r '.pending_feedback | length')" == '1' ]] \
+  && [[ "$(printf '%s' "${abort_out}" | jq -r '.pending_feedback[0].thread_id // empty')" == 'PRRT_cr' ]]; then
+  printf '[PASS] abort: GraphQL threads return 3 without REST login/comments (#497)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] abort: expected exit 3 + thread triage without REST (rc=%s rest_log=%s)\n' \
+    "${abort_rc}" "$(tr '\n' ',' <"${tmp_rest_log_497}" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+
+thread_and_review_497="$(jq -nc \
+  --argjson thread "$(printf '%s' "${cr_thread_fixture}" | jq '.data.repository.pullRequest.reviewThreads.nodes[0]')" \
+  '{data:{repository:{pullRequest:{
+    headRefOid:"abc1234deadbeef",
+    reviews:{nodes:[{
+      databaseId:99,
+      author:{login:"coderabbitai"},
+      state:"COMMENTED",
+      body:"**Request changes**\n\nActionable comments posted: 2",
+      url:"https://example.com/pullrequestreview-99",
+      submittedAt:"2026-06-19T16:00:00Z",
+      commit:{oid:"abc1234deadbeef"}
+    }]},
+    reviewThreads:{nodes:[$thread]},
+    comments:{nodes:[]}
+  }}}}')"
+tmp_thread_review_497="$(mktemp)"
+printf '%s' "${thread_and_review_497}" >"${tmp_thread_review_497}"
+: >"${tmp_rest_log_497}"
+if kinds="$(AGENT_REVIEW_AGENT=copilot AGENT_REVIEW_RESOLVED_COMMENTS_FILE="$(mktemp)" bash -c "
+  source '${lib}'
+  agent_review_load_agent_profile
+  agent_review_authenticated_login_optional() { return 1; }
+  agent_review_authenticated_login() {
+    printf 'REST_LOGIN\n' >>'${tmp_rest_log_497}'
+    agent_review_die 'could not determine authenticated GitHub login (rate limited)'
+  }
+  agent_review_pr_issue_comments_json() {
+    printf 'REST_COMMENTS\n' >>'${tmp_rest_log_497}'
+    printf '[]'
+  }
+  agent_review_feedback_pending_json 'the-hcma/mock-repo' 650 \"\$(cat '${tmp_thread_review_497}')\"
+" | jq -r '[.[].kind] | sort | join(",")')" \
+  && [[ "${kinds}" == *'review_thread'* ]] \
+  && [[ "${kinds}" == *'pull_request_review'* ]] \
+  && [[ ! -s "${tmp_rest_log_497}" ]]; then
+  printf '[PASS] pending json: snapshot review bodies fill in beside GraphQL threads without REST (#497)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] pending json: expected review_thread+pull_request_review without REST (got %s)\n' \
+    "${kinds:-<empty>}"
+  fail=$(( fail + 1 ))
+fi
+issue_with_thread_fixture='[{"id":"9100","user":{"login":"thehcma"},"created_at":"2026-06-19T16:00:00Z","body":"Please also ship the product follow-up before merge.","html_url":"https://example.com/ic/9100"}]'
+tmp_issue_with_thread="$(mktemp)"
+printf '%s' "${issue_with_thread_fixture}" >"${tmp_issue_with_thread}"
+tmp_cr_merge_497="$(mktemp)"
+printf '%s' "${cr_thread_fixture}" >"${tmp_cr_merge_497}"
+if pending_count="$(AGENT_REVIEW_AGENT=copilot AGENT_REVIEW_RESOLVED_COMMENTS_FILE="$(mktemp)" bash -c "
+  source '${lib}'
+  agent_review_load_agent_profile
+  agent_review_authenticated_login_optional() { printf 'thehcma'; return 0; }
+  agent_review_authenticated_login() { printf 'thehcma'; }
+  agent_review_pr_issue_comments_json() { cat '${tmp_issue_with_thread}'; }
+  agent_review_feedback_pending_json 'the-hcma/mock-repo' 650 \"\$(cat '${tmp_cr_merge_497}')\"
+" | jq 'length')" && [[ "${pending_count}" == '2' ]]; then
+  printf '[PASS] pending json: REST issue comments merge beside GraphQL threads when login succeeds (#497)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] pending json: expected thread+issue comment when REST succeeds (got %s)\n' \
+    "${pending_count:-<empty>}"
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_cr_497}" "${tmp_rest_log_497}" "${tmp_thread_review_497}" \
+  "${tmp_issue_with_thread}" "${tmp_cr_merge_497}"
+
 printf '\n=== functional: resolved thread human follow-up ===\n'
 follow_up_fixture='{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"PRRT_follow","isResolved":true,"comments":{"nodes":[{"databaseId":1,"url":"https://example.com/h/1","author":{"__typename":"User","login":"alice"},"body":"Please confirm X","path":"docs/SYSTEMD.md","line":59,"createdAt":"2026-06-19T16:00:00Z"},{"databaseId":2,"url":"https://example.com/h/2","author":{"__typename":"User","login":"alice"},"body":"Done in abc1234: applied fix","path":"docs/SYSTEMD.md","line":59,"createdAt":"2026-06-19T16:05:00Z"},{"databaseId":3,"url":"https://example.com/h/3","author":{"__typename":"User","login":"alice"},"body":"Did you specifically confirm X?","path":"docs/SYSTEMD.md","line":59,"createdAt":"2026-06-19T16:10:00Z"}]}}]}}}}}'
 tmp_follow_fixture="$(mktemp)"
@@ -3821,6 +3953,47 @@ if grep -qF 'agent_review_unaddressed_threads_json_from_snapshot' "$lib" \
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] loop: missing unified pending-thread gate\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: GraphQL threads beat REST waits (#497) ===\n'
+feedback_lib="${script_dir}/../scripts/lib/agent-review-feedback"
+if grep -qF 'snapshot-only' "$feedback_lib" \
+  && grep -qF 'repository-helpers#497' "$feedback_lib" \
+  && grep -qF 'repository-helpers#497' "$lib" \
+  && grep -qF 'repository-helpers#497' "$wait_script" \
+  && grep -qF 'repository-helpers#497' "$skill" \
+  && grep -qF 'Unaddressed comments beat waiting' "$skill" \
+  && grep -qF 'agent_review_authenticated_login_optional' "$lib" \
+  && grep -qF 'agent_review_feedback_issue_comments_pending_json_fast' "$feedback_lib" \
+  && grep -qF 'agent_review_feedback_reviews_pending_json_fast' "$feedback_lib" \
+  && grep -qF 'agent_review_open_thread_count_from_snapshot' "$lib" \
+  && awk '
+    /^agent_review_abort_if_pending_threads\(/ { in_fn=1 }
+    in_fn && /agent_review_open_thread_count_from_snapshot/ { graphql=1 }
+    in_fn && /agent_review_pending_thread_count_from_snapshot/ { if (graphql) rest_after=1 }
+    in_fn && /^}/ { exit }
+    END { exit(graphql && rest_after ? 0 : 1) }
+  ' "$lib" \
+  && awk '
+    /^agent_review_feedback_pending_json\(/ { in_fn=1 }
+    in_fn && /agent_review_feedback_threads_pending_json/ { threads=1 }
+    in_fn && /agent_review_feedback_issue_comments_pending_json_fast/ { if (threads) fast=1 }
+    in_fn && /snapshot-only/ { if (threads) snapshot=1 }
+    in_fn && /^}/ { exit }
+    END { exit(threads && fast && snapshot ? 0 : 1) }
+  ' "$feedback_lib" \
+  && awk '
+    /^cmd_loop\(/ { in_fn=1 }
+    in_fn && /agent_review_abort_if_pending_threads/ { abort=1 }
+    in_fn && /CodeRabbit workflow in progress/ { if (abort) order_ok=1 }
+    in_fn && /^}/ { exit }
+    END { exit(order_ok ? 0 : 1) }
+  ' "$wait_script"; then
+  printf '[PASS] loop: GraphQL threads are counted before REST and CodeRabbit waits (#497)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] loop: missing GraphQL-threads-before-REST/#497 wiring\n'
   fail=$(( fail + 1 ))
 fi
 
