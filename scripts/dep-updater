@@ -5443,20 +5443,54 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
 # py_uv_rewrite_version_floor <pyproject_path> <pkg> <new_ver>
 # Rewrites a PEP 508 dependency floor in [project].dependencies-style entries:
 #   "pkg>=1.0.0" / "pkg[extra]>=1.0.0" (bundled) or "pkg[extra]" >= 1.0.0 / "pkg" >= 1.0.0
-# Two sed passes (bundled before split). Converts == and ~= to >=. Returns
-# non-zero only when sed itself fails (invalid regexp).
+# Compound caps such as "pkg>=1.0.0,<2" are rewritten to "pkg>=2.0.0" (drops the upper
+# bound — not an intentional freeze). Two sed passes (bundled before split). Converts
+# == and ~= to >=. Returns 1 when sed fails or the constraint line did not change.
 py_uv_rewrite_version_floor() {
   local -r path="$1"
   local -r pkg="$2"
   local -r new_ver="$3"
-  local sed_pkg sed_new_ver
+  local sed_pkg sed_new_ver before
 
+  before="$(mktemp)"
+  cp "$path" "$before"
   sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
   sed_new_ver="$(printf '%s' "$new_ver" | sed 's/[\\&#]/\\&/g')"
   gnu_sed_inplace -E "$path" \
-    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?)(~=|>=|==)([0-9][0-9a-zA-Z.]*)\\\"#\\1>=${sed_new_ver}\\\"#" \
-    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?\")[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*#\\1 >= ${sed_new_ver}#" \
-    || return 1
+    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?)(~=|>=|==)[^\\\"]*\\\"#\\1>=${sed_new_ver}\\\"#" \
+    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?\")[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*([[:space:]]*,[[:space:]]*<[0-9][0-9a-zA-Z.]*)?#\\1 >= ${sed_new_ver}#" \
+    || {
+      cp "$before" "$path"
+      rm -f "$before"
+      return 1
+    }
+  if cmp -s "$path" "$before"; then
+    cp "$before" "$path"
+    rm -f "$before"
+    return 1
+  fi
+  rm -f "$before"
+  return 0
+}
+
+# py_uv_parse_verify_filter_pkg <logfile>
+# Prints a direct dependency to drop from py_uv_filter_outdated_lines pending set.
+py_uv_parse_verify_filter_pkg() {
+  local -r log_file="$1"
+  local line pkg
+
+  line="$(grep -E 'constraint rewrite was a no-op for |lock did not land ' "$log_file" 2>/dev/null \
+    | head -n 1 || true)"
+  if [[ -z "$line" ]]; then
+    return 1
+  fi
+  pkg="$(printf '%s' "$line" \
+    | sed -nE 's/.*(?:constraint rewrite was a no-op for |lock did not land )([A-Za-z0-9][A-Za-z0-9._-]*).*/\1/p' \
+    | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+  if [[ -z "$pkg" ]]; then
+    return 1
+  fi
+  printf '%s' "$pkg"
   return 0
 }
 
@@ -5515,6 +5549,7 @@ py_uv_try_lockfile_with_updates() {
     op="$(py_constraint_op "$pkg" "$pyproject")"
     if [[ "$op" == ">=" || "$op" == "==" || "$op" == "~=" ]]; then
       if ! py_uv_rewrite_version_floor "$pyproject" "$pkg" "$new_ver"; then
+        printf 'constraint rewrite was a no-op for %s\n' "$pkg" >>"$log_file"
         cp "$bak_proj" "$pyproject"
         rm -f "$bak_proj" "$bak_lock"
         return 1
@@ -5523,9 +5558,28 @@ py_uv_try_lockfile_with_updates() {
   done
 
   set +e
-  dep_runner_uv_dir_capture "uv lock verify" "$scan_root" -- lock >"$log_file" 2>&1
+  dep_runner_uv_dir_capture "uv lock verify" "$scan_root" -- lock >>"$log_file" 2>&1
   rc=$?
   set -e
+
+  if (( rc == 0 )); then
+    for line in "${lines[@]}"; do
+      [[ -z "$line" ]] && continue
+      read -r pkg _cur new_ver <<<"$line"
+      [[ -z "$pkg" || -z "$new_ver" ]] && continue
+      op="$(py_constraint_op "$pkg" "$bak_proj")"
+      if [[ "$op" != ">=" && "$op" != "==" && "$op" != "~=" ]]; then
+        continue
+      fi
+      highest="$(py_uv_lock_highest_version "$lockfile" "$pkg" 2>/dev/null || true)"
+      if ! py_uv_version_at_least "$highest" "$new_ver"; then
+        printf 'lock did not land %s at %s (highest %s)\n' \
+          "$pkg" "$new_ver" "${highest:-?}" >>"$log_file"
+        rc=1
+        break
+      fi
+    done
+  fi
 
   cp "$bak_proj" "$pyproject"
   rm -f "$bak_proj"
@@ -5572,6 +5626,34 @@ py_uv_filter_outdated_lines() {
     fi
 
     if ! grep -qF 'No solution found when resolving dependencies' "$log_file"; then
+      blame_pkg="$(py_uv_parse_verify_filter_pkg "$log_file" 2>/dev/null || true)"
+      if [[ -n "$blame_pkg" ]]; then
+        next_outdated=()
+        found_blame_in_pending=0
+        for line in "${pending_outdated[@]}"; do
+          read -r pkg _cur lat <<<"$line"
+          norm_pkg="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+          norm_blame="$(printf '%s' "$blame_pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+          if [[ "$norm_pkg" == "$norm_blame" ]]; then
+            if grep -qF 'constraint rewrite was a no-op' "$log_file"; then
+              log "[python/uv] Filtering ${pkg} → ${lat}: constraint rewrite was a no-op."
+            else
+              log "[python/uv] Filtering ${pkg} → ${lat}: lock did not land ${lat}."
+            fi
+            found_blame_in_pending=1
+            continue
+          fi
+          next_outdated+=("$line")
+        done
+        if [[ "$found_blame_in_pending" -eq 1 ]]; then
+          pending_outdated=("${next_outdated[@]}")
+          if [[ ${#pending_outdated[@]} -eq 0 ]]; then
+            rm -f "$log_file"
+            return 0
+          fi
+          continue
+        fi
+      fi
       log "[python/uv] WARNING: could not verify proposed updates against lockfile (non-resolution uv lock failure)."
       rm -f "$log_file"
       return 1
@@ -5664,6 +5746,16 @@ py_uv_exclude_newer_cutoff_iso() {
   now_epoch="$(time_log_now_utc_epoch)" || return 1
   cutoff_epoch=$(( now_epoch - dep_updater_minimum_release_age_minutes * 60 ))
   time_log_epoch_to_iso8601_utc "$cutoff_epoch"
+}
+
+# py_uv_version_at_least <ver> <minimum>
+# Returns 0 when ver is semantically >= minimum (sort -V).
+py_uv_version_at_least() {
+  local -r ver="$1"
+  local -r minimum="$2"
+
+  [[ -n "$ver" && -n "$minimum" ]] || return 1
+  [[ "$(printf '%s\n' "$minimum" "$ver" | sort -V | head -1)" == "$minimum" ]]
 }
 
 # py_uv_lock_highest_version <lockfile> <pkg>
@@ -5834,8 +5926,6 @@ py_update_one() {
     return 0
   fi
 
-  log "[python/${tool}] ${pkg}: ${old_ver} → ${new_ver}"
-
   case "$tool" in
     uv)
       local uv_out uv_exit uv_constraint_op uv_lock_bak
@@ -5847,10 +5937,10 @@ py_update_one() {
         # leaves pyproject.toml unchanged). Patch the floor with sed instead.
         # For == / ~= constraints, convert to >= so dep-updater never introduces pins.
         if ! py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$pkg" "$new_ver"; then
-          log "[python/uv] ERROR: sed could not rewrite ${pkg} constraint — skipping."
-          dep_updater_append_ecosystem_failure "python|sed failed for ${pkg}"
+          log "[python/uv] Skipping ${pkg} ${new_ver}: constraint rewrite was a no-op."
           return 0
         fi
+        log "[python/${tool}] ${pkg}: ${old_ver} → ${new_ver}"
         uv_out="$(dep_runner_uv_dir_capture "uv lock" "$worktree_path" -- lock)" && uv_exit=0 || uv_exit=$?
         if (( uv_exit != 0 )); then
           # Revert pyproject.toml: sed already modified it but the lock failed.
@@ -5862,6 +5952,7 @@ py_update_one() {
         run_command "git worktree" git -C "$worktree_path" add pyproject.toml uv.lock
         files_changed="pyproject.toml + uv.lock"
       else
+        log "[python/${tool}] ${pkg}: ${old_ver} → ${new_ver}"
         # Transitive / unconstrained: prefer marker-aware lock upgrade over
         # `uv add pkg==ver` (universal pin breaks PyPy+win32 marker splits).
         # Snapshot uv.lock so a failed upgrade cannot delete an untracked lock
@@ -5890,6 +5981,7 @@ py_update_one() {
       fi
       ;;
     poetry)
+      log "[python/${tool}] ${pkg}: ${old_ver} → ${new_ver}"
       local poetry_out poetry_exit
       poetry_out="$(run_in_worktree poetry add "${pkg}@${new_ver}" 2>&1)" && poetry_exit=0 || poetry_exit=$?
       if (( poetry_exit != 0 )); then
@@ -5901,11 +5993,13 @@ py_update_one() {
       files_changed="pyproject.toml + poetry.lock"
       ;;
     pipenv)
+      log "[python/${tool}] ${pkg}: ${old_ver} → ${new_ver}"
       run_in_worktree pipenv install "${pkg}==${new_ver}"
       run_command "git worktree" git -C "$worktree_path" add Pipfile Pipfile.lock
       files_changed="Pipfile + Pipfile.lock"
       ;;
     pip|pip3)
+      log "[python/${tool}] ${pkg}: ${old_ver} → ${new_ver}"
       "$tool" install "${pkg}==${new_ver}"
       "$tool" freeze > "${worktree_path}/requirements.txt"
       run_command "git worktree" git -C "$worktree_path" add requirements.txt
@@ -6720,18 +6814,18 @@ batch_update_all() {
       uv_floor_batch=0
       uv_upgrade_success=0
       uv_upgrade_specs=()
+      uv_floor_lines=()
       while IFS=' ' read -r pkg _old new_ver; do
         [[ -z "$pkg" ]] && continue
-        log "[python/${py_tool}] Update: ${pkg} → ${new_ver}"
         case "$py_tool" in
           uv)
             b_constraint_op="$(py_constraint_op "$pkg" "${worktree_path}/pyproject.toml")"
             if [[ "$b_constraint_op" == ">=" || "$b_constraint_op" == "==" || "$b_constraint_op" == "~=" ]]; then
               if ! py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$pkg" "$new_ver"; then
-                log "[python/uv] ERROR: batch sed failed for ${pkg} — skipping."
-                dep_updater_append_ecosystem_failure "python|batch sed failed for ${pkg}"
+                log "[python/uv] Skipping ${pkg} ${new_ver}: constraint rewrite was a no-op."
                 continue
               fi
+              uv_floor_lines+=("${pkg} ${_old} ${new_ver}")
               uv_floor_batch=1
             else
               # Transitive / unconstrained — upgrade via lock (not uv add).
@@ -6739,6 +6833,7 @@ batch_update_all() {
             fi
             ;;
           poetry)
+            log "[python/${py_tool}] Update: ${pkg} → ${new_ver}"
             py_out="$(run_in_worktree poetry add "${pkg}@${new_ver}" 2>&1)" && py_exit=0 || py_exit=$?
             if (( py_exit != 0 )); then
               log "[python/poetry] Skipping ${pkg} ${new_ver}: dependency resolution failed."
@@ -6746,8 +6841,14 @@ batch_update_all() {
               continue
             fi
             ;;
-          pipenv)  run_in_worktree pipenv install "${pkg}==${new_ver}" ;;
-          pip|pip3) "$py_tool" install "${pkg}==${new_ver}" ;;
+          pipenv)
+            log "[python/${py_tool}] Update: ${pkg} → ${new_ver}"
+            run_in_worktree pipenv install "${pkg}==${new_ver}"
+            ;;
+          pip|pip3)
+            log "[python/${py_tool}] Update: ${pkg} → ${new_ver}"
+            "$py_tool" install "${pkg}==${new_ver}"
+            ;;
         esac
       done <<< "$py_lines_arg"
       if [[ "$py_tool" == "uv" ]]; then
@@ -6777,6 +6878,17 @@ batch_update_all() {
           else
             rm -f "$lock_bak"
             lock_bak=""
+            for floor_line in "${uv_floor_lines[@]}"; do
+              read -r floor_pkg _floor_old floor_new <<<"$floor_line"
+              [[ -z "$floor_pkg" || -z "$floor_new" ]] && continue
+              floor_highest="$(py_uv_lock_highest_version "${worktree_path}/uv.lock" "$floor_pkg" \
+                2>/dev/null || true)"
+              if py_uv_version_at_least "$floor_highest" "$floor_new"; then
+                log "[python/${py_tool}] Update: ${floor_pkg} → ${floor_new}"
+              else
+                log "[python/uv] Skipping ${floor_pkg} ${floor_new}: lock stayed at ${floor_highest:-?}."
+              fi
+            done
           fi
         fi
         for b_spec in "${uv_upgrade_specs[@]}"; do
@@ -6799,6 +6911,7 @@ batch_update_all() {
           fi
           rm -f "$lock_bak"
           uv_upgrade_success=1
+          log "[python/${py_tool}] Update: ${pkg} → ${new_ver}"
         done
         if [[ "$uv_floor_batch" == '1' || "$uv_upgrade_success" == '1' ]]; then
           any_py=1

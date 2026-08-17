@@ -1417,6 +1417,139 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== behavioural: py_uv_rewrite_version_floor compound specifiers ===\n'
+compound_rewrite_tmp="$(mktemp -d)"
+compound_pyproject="${compound_rewrite_tmp}/pyproject.toml"
+cat >"$compound_pyproject" <<'EOF'
+[project]
+name = "demo"
+version = "0.1.0"
+dependencies = [
+  "demo-pkg>=1.0.0,<2",
+  "demo-pkg[extra]>=1.0.0,<2",
+  "split-pkg" >= 1.0.0, <2,
+]
+EOF
+(
+  # shellcheck disable=SC1091
+  source "${script_dir}/../scripts/lib/gnu-sed"
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script")
+  py_uv_rewrite_version_floor "$compound_pyproject" "demo-pkg" "2.0.0"
+  py_uv_rewrite_version_floor "$compound_pyproject" "split-pkg" "2.0.0"
+)
+if grep -qF '"demo-pkg>=2.0.0"' "$compound_pyproject" \
+  && grep -qF '"demo-pkg[extra]>=2.0.0"' "$compound_pyproject" \
+  && grep -qF '"split-pkg" >= 2.0.0' "$compound_pyproject" \
+  && ! grep -qF ',<' "$compound_pyproject"; then
+  printf '[PASS] py-uv-compound: bundled, extras, and split caps rewrite to >= floor\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: compound specifier rewrite failed\n'
+  cat "$compound_pyproject" >&2
+  fail=$(( fail + 1 ))
+fi
+# No-op when the package line is absent.
+if (
+  # shellcheck disable=SC1091
+  source "${script_dir}/../scripts/lib/gnu-sed"
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script")
+  ! py_uv_rewrite_version_floor "$compound_pyproject" "missing-pkg" "9.9.9"
+); then
+  printf '[PASS] py-uv-compound: rewrite returns non-zero on no-op\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: rewrite must fail when constraint line is unchanged\n'
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$compound_rewrite_tmp"
+
+printf '\n=== static: uv compound floor verify helpers ===\n'
+if grep -q '^py_uv_parse_verify_filter_pkg()' "$script" \
+  && grep -qF 'lock did not land' "$script" \
+  && grep -qF 'constraint rewrite was a no-op for' "$script" \
+  && grep -qF 'py_uv_parse_verify_filter_pkg' <<<"$(awk '/^py_uv_filter_outdated_lines\(\)/,/^\}/' "$script")" \
+  && grep -qF 'uv_floor_lines' <<<"$(awk '/^batch_update_all\(\)/,/^\}/' "$script")"; then
+  printf '[PASS] py-uv-compound: verify parser, filter drops, batch defers Update log\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: missing verify parser, filter wiring, or batch log deferral\n'
+  fail=$(( fail + 1 ))
+fi
+
+# shellcheck disable=SC2016  # assert literal batch log template in source
+if ! grep -qF 'log "[python/${py_tool}] Update: ${pkg} → ${new_ver}"' \
+    <<<"$(awk '/^batch_update_all\(\)/,/^\}/' "$script" | awk '/while IFS=. read -r pkg _old new_ver; do/,/done <<< "\$py_lines_arg"/')" \
+  || grep -qF 'uv_floor_lines' <<<"$(awk '/^batch_update_all\(\)/,/^\}/' "$script")"; then
+  printf '[PASS] py-uv-compound: batch uv floor path does not log Update before rewrite\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: batch must not log Update before uv floor rewrite\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== behavioural: py_uv_filter drops compound cap when lock cannot land ===\n'
+if ! command -v uv >/dev/null 2>&1; then
+  printf '[SKIP] uv not on PATH — skipping compound filter probe\n'
+else
+  compound_filter_tmp="$(mktemp -d)"
+  cat >"${compound_filter_tmp}/pyproject.toml" <<'EOF'
+[project]
+name = "compound-filter-demo"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["idna>=3.0,<3.1"]
+EOF
+  cat >"${compound_filter_tmp}/uv.lock" <<'EOF'
+version = 1
+requires-python = ">=3.11"
+
+[[package]]
+name = "idna"
+version = "3.0"
+source = { registry = "https://pypi.org/simple" }
+EOF
+  compound_filter_out="$(
+    dir="$compound_filter_tmp"
+    # shellcheck disable=SC1091
+    source "${script_dir}/../scripts/lib/gnu-sed"
+    # shellcheck disable=SC1090
+    source <(
+      awk '/^py_constraint_op\(\)/,/^}$/' "$script"
+      awk '/^py_uv_version_at_least\(\)/,/^}$/' "$script"
+      awk '/^py_uv_lock_highest_version\(\)/,/^}$/' "$script"
+      awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script"
+      awk '/^py_uv_parse_verify_filter_pkg\(\)/,/^}$/' "$script"
+      awk '/^py_uv_parse_blame_direct_dep\(\)/,/^}$/' "$script"
+      awk '/^py_uv_try_lockfile_with_updates\(\)/,/^}$/' "$script"
+      awk '/^py_uv_filter_outdated_lines\(\)/,/^}$/' "$script"
+    )
+    # shellcheck disable=SC2317,SC2329
+    log() { :; }
+    # shellcheck disable=SC2317,SC2329
+    dep_runner_uv_dir_capture() {
+      local _label="$1"
+      local scan_root="$2"
+      shift 2
+      [[ "$1" == '--' ]] && shift
+      (cd "$scan_root" && uv "$@")
+    }
+    py_uv_filter_outdated_lines "$compound_filter_tmp" "idna 3.0 3.10"
+  )" || compound_filter_rc=$?
+  compound_filter_rc="${compound_filter_rc:-0}"
+  if [[ "$compound_filter_rc" -eq 0 ]] \
+    && [[ "$compound_filter_out" == 'idna 3.0 3.10' ]]; then
+    printf '[PASS] py-uv-compound: filter keeps idna after compound cap rewrite + lock\n'
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] py-uv-compound: filter expected idna 3.0 3.10, rc=%s out=%s\n' \
+      "$compound_filter_rc" "$compound_filter_out"
+    fail=$(( fail + 1 ))
+  fi
+  rm -rf "$compound_filter_tmp"
+fi
+
 printf '\n=== static: npm packument helper and pnpm stale-high clamp ===\n'
 if grep -q '^npm_registry_dist_tag_latest()' "$script" \
   && grep -qF 'DEP_UPDATER_SKIP_NPM_REGISTRY' "$script" \
