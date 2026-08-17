@@ -262,13 +262,13 @@ agent_review_feedback_issue_comments_array_json() {
     | sort_by(.created_at)'
 }
 
-agent_review_feedback_issue_comments_pending_json() {
-  local -r repo="$1"
-  local -r pr="$2"
-  local operator_login comments_json resolved_csv
+agent_review_feedback_issue_comments_pending_from_array_json() {
+  local -r operator_login="$1"
+  local -r repo="$2"
+  local -r pr="$3"
+  local -r comments_json="$4"
+  local resolved_csv
 
-  operator_login="$(agent_review_authenticated_login)"
-  comments_json="$(agent_review_feedback_issue_comments_array_json "${repo}" "${pr}")"
   resolved_csv="$(agent_review_feedback_resolved_ids_for_pr "${repo}" "${pr}")"
   # Include operator-authored conversation comments (product notes) as pending
   # feedback. Probe/bot boilerplate and triage replies ("In reply to …") stay
@@ -324,6 +324,45 @@ agent_review_feedback_issue_comments_pending_json() {
           }
         | select(.state == "unaddressed" or .state == "needs_resolve")
       ]'
+}
+
+agent_review_feedback_issue_comments_pending_json() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local operator_login comments_json
+
+  operator_login="$(agent_review_authenticated_login)"
+  comments_json="$(agent_review_feedback_issue_comments_array_json "${repo}" "${pr}")"
+  agent_review_feedback_issue_comments_pending_from_array_json \
+    "${operator_login}" "${repo}" "${pr}" "${comments_json}"
+}
+
+# Fast REST path for exit-3 triage when GraphQL threads exist: merge issue comments
+# when login + pagination succeed; return [] without rate-limit waits on failure.
+agent_review_feedback_issue_comments_pending_json_fast() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local operator_login comments_json api_json
+
+  if ! operator_login="$(agent_review_authenticated_login_optional)"; then
+    printf '[]'
+    return 0
+  fi
+  api_json="$(GITHUB_API_RATE_LIMIT_MAX_RETRIES=1 \
+    agent_review_pr_issue_comments_json "${repo}" "${pr}")"
+  comments_json="$(ar_runner_jq_file "agent-review feedback issue comments array fast" "${api_json}" -rs '
+    [ .[] | .[]
+      | {
+          id: (.id | tostring),
+          login: (.user.login // ""),
+          body: (.body // ""),
+          html_url: (.html_url // ""),
+          created_at: (.created_at // "")
+        }
+    ]
+    | sort_by(.created_at)')"
+  agent_review_feedback_issue_comments_pending_from_array_json \
+    "${operator_login}" "${repo}" "${pr}" "${comments_json}"
 }
 
 # Reviews on <head> from the GraphQL snapshot (all authors).
@@ -387,6 +426,49 @@ agent_review_feedback_reviews_pending_json() {
   fi
   reviews_json="$(agent_review_feedback_reviews_on_head_array_json "${snapshot}" "${head}")"
   resolved_csv="$(agent_review_feedback_resolved_ids_for_pr "${repo}" "${pr}")"
+  agent_review_feedback_reviews_pending_from_parts_json \
+    "${operator_login}" "${reviews_json}" "${comments_json}" "${resolved_csv}"
+}
+
+# Fast REST merge for exit-3 triage when GraphQL threads exist (no rate-limit sleeps).
+agent_review_feedback_reviews_pending_json_fast() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r snapshot="$3"
+  local -r operator_login="$4"
+  local head reviews_json resolved_csv comments_json api_json
+
+  head="$(ar_runner_jq_file "agent-review feedback head sha" "${snapshot}" -r \
+    '.data.repository.pullRequest.headRefOid // ""')"
+  [[ -n "${head}" ]] || {
+    printf '%s' '[]'
+    return 0
+  }
+  api_json="$(GITHUB_API_RATE_LIMIT_MAX_RETRIES=1 \
+    agent_review_pr_issue_comments_json "${repo}" "${pr}")"
+  comments_json="$(ar_runner_jq_file "agent-review feedback issue comments array fast reviews" "${api_json}" -rs '
+    [ .[] | .[]
+      | {
+          id: (.id | tostring),
+          login: (.user.login // ""),
+          body: (.body // ""),
+          html_url: (.html_url // ""),
+          created_at: (.created_at // "")
+        }
+    ]
+    | sort_by(.created_at)')"
+  reviews_json="$(agent_review_feedback_reviews_on_head_array_json "${snapshot}" "${head}")"
+  resolved_csv="$(agent_review_feedback_resolved_ids_for_pr "${repo}" "${pr}")"
+  agent_review_feedback_reviews_pending_from_parts_json \
+    "${operator_login}" "${reviews_json}" "${comments_json}" "${resolved_csv}"
+}
+
+agent_review_feedback_reviews_pending_from_parts_json() {
+  local -r operator_login="$1"
+  local -r reviews_json="$2"
+  local -r comments_json="$3"
+  local -r resolved_csv="$4"
+
   ar_runner_jq_n "agent-review feedback pending reviews" \
     --argjson reviews "${reviews_json}" \
     --argjson comments "${comments_json}" \
@@ -474,20 +556,26 @@ agent_review_feedback_pending_json() {
   local -r repo="$1"
   local -r pr="$2"
   local -r snapshot="$3"
-  local threads_json issue_json reviews_json thread_count
+  local threads_json issue_json reviews_json thread_count rest_login
 
   threads_json="$(agent_review_feedback_threads_pending_json "${snapshot}")"
   thread_count="$(ar_runner_jq_file "agent-review feedback snapshot thread count" \
     "${threads_json}" 'length')"
   thread_count="${thread_count:-0}"
   if (( thread_count > 0 )); then
-    # GraphQL threads already justify exit 3. Do not wait on REST issue-comment
-    # pagination, gh api user, or the rate-limit harness (repository-helpers#497).
-    # Review bodies still come from the snapshot; issue comments fill in on a
-    # later pass once threads are cleared (or when REST succeeds with no threads).
-    issue_json='[]'
-    reviews_json="$(agent_review_feedback_reviews_pending_json \
-      "${repo}" "${pr}" "${snapshot}" snapshot-only)"
+    # GraphQL threads already justify exit 3. Try REST once without rate-limit
+    # sleeps (repository-helpers#497); fall back to snapshot-only reviews when
+    # gh api user or issue-comment pagination is depleted.
+    rest_login=''
+    if rest_login="$(agent_review_authenticated_login_optional)"; then
+      issue_json="$(agent_review_feedback_issue_comments_pending_json_fast "${repo}" "${pr}")"
+      reviews_json="$(agent_review_feedback_reviews_pending_json_fast \
+        "${repo}" "${pr}" "${snapshot}" "${rest_login}")"
+    else
+      issue_json='[]'
+      reviews_json="$(agent_review_feedback_reviews_pending_json \
+        "${repo}" "${pr}" "${snapshot}" snapshot-only)"
+    fi
   else
     issue_json="$(agent_review_feedback_issue_comments_pending_json "${repo}" "${pr}")"
     reviews_json="$(agent_review_feedback_reviews_pending_json "${repo}" "${pr}" "${snapshot}")"
