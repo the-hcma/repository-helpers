@@ -652,6 +652,10 @@ cat >"${mock_bin}/gh" <<'MOCK_GH'
 #!/usr/bin/env bash
 set -euo pipefail
 args="$*"
+# Child --dir runs probe gh stack after the missing-marker default (issue #493).
+if [[ "$args" == 'stack --help' ]]; then
+  exit 0
+fi
 # Archived check runs before visibility; neither fixture is archived.
 if [[ "$args" == *'.archived'* ]]; then
   printf 'false\n'
@@ -719,6 +723,10 @@ cat >"${mock_bin}/gh" <<'MOCK_GH'
 #!/usr/bin/env bash
 set -euo pipefail
 args="$*"
+# Child --dir runs probe gh stack after the missing-marker default (issue #493).
+if [[ "$args" == 'stack --help' ]]; then
+  exit 0
+fi
 if [[ "$args" == *'.archived'* ]]; then
   if [[ "$args" == *'repos/the-hcma/archived-repo'* ]]; then
     printf 'true\n'
@@ -3791,6 +3799,128 @@ else
   printf '[FAIL] stacking-tool: missing gh-stack adopt helpers, fallback, or broken prereq probe\n'
   fail=$(( fail + 1 ))
 fi
+
+printf '\n=== static: dep-updater missing-marker default is gh-stack ===\n'
+init_stacking_body="$(awk '/^dep_init_stacking_tool\(\)/,/^}/' "$script")"
+core_prereq_body="$(awk '/^check_core_prereqs\(\)/,/^}/' "$script")"
+# shellcheck disable=SC2016  # grep -qF needles are literal source tokens
+if grep -qF 'stacking_tool_read_or_default' <<<"$init_stacking_body" \
+  && grep -qF '"$dir" "$stacking_tool_value_gh_stack" "dep-updater"' <<<"$init_stacking_body" \
+  && ! grep -qF 'stacking_tool_read_or_org_default' <<<"$init_stacking_body"; then
+  printf '[PASS] stacking-tool: missing marker selects gh-stack, not org graphite default\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] stacking-tool: dep_init_stacking_tool must default missing marker to gh-stack\n'
+  fail=$(( fail + 1 ))
+fi
+rebase_main_body="$(awk '/^dep_rebase_stack_on_main\(\)/,/^}/' "$script")"
+# shellcheck disable=SC2016  # grep -qF needles are literal source tokens
+if grep -qF 'stacking_tool_restack_as "$dep_stacking_tool"' <<<"$rebase_main_body" \
+  && ! grep -qF 'stacking_tool_restack "' <<<"$rebase_main_body"; then
+  printf '[PASS] stacking-tool: missing-marker rebase uses resolved backend, not strict marker read\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] stacking-tool: dep_rebase_stack_on_main must restack_as the resolved backend\n'
+  fail=$(( fail + 1 ))
+fi
+if printf '%s' "$core_prereq_body" | grep -qF 'dep_init_stacking_tool' \
+  && printf '%s' "$core_prereq_body" | grep -qF 'dep_stacking_is_graphite' \
+  && awk '
+    /^check_core_prereqs\(\)/ { in_fn=1 }
+    in_fn && /dep_stacking_is_graphite/ { gated=1 }
+    in_fn && gated && /tooling_prereq_check_tools "\[tooling\]" gt/ { ok=1 }
+    in_fn && /^}/ { exit }
+    END { exit(ok ? 0 : 1) }
+  ' "$script"; then
+  printf '[PASS] stacking-tool: gt prereq is required only for explicit graphite\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] stacking-tool: gt prereq must stay inside dep_stacking_is_graphite\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== hermetic: dep_init_stacking_tool marker cases ===\n'
+# shellcheck disable=SC1091  # stacking-tool sourced for hermetic init helper
+source "${script_dir}/../scripts/lib/stacking-tool"
+init_fn="$(awk '/^dep_init_stacking_tool\(\)/,/^}/' "$script")"
+tmp_init_repo="$(mktemp -d)"
+git -C "$tmp_init_repo" -c user.name=test -c user.email=test@example.com init -q
+git -C "$tmp_init_repo" -c user.name=test -c user.email=test@example.com \
+  commit --allow-empty -q -m 'init'
+mkdir -p "${tmp_init_repo}/.github"
+
+run_dep_init_stacking_tool() {
+  local out
+  out="$(
+    dir="$tmp_init_repo"
+    dep_stacking_tool=''
+    eval "$init_fn"
+    dep_init_stacking_tool
+    printf '%s' "$dep_stacking_tool"
+  )"
+  printf '%s' "$out"
+}
+
+missing_init_log="$(
+  rm -f "${tmp_init_repo}/.github/stacking-tool"
+  dir="$tmp_init_repo"
+  dep_stacking_tool=''
+  eval "$init_fn"
+  dep_init_stacking_tool 2>&1 >/dev/null
+  printf '%s' "$dep_stacking_tool"
+)"
+missing_init_value="$(
+  rm -f "${tmp_init_repo}/.github/stacking-tool"
+  run_dep_init_stacking_tool 2>/dev/null
+)"
+if printf '%s' "$missing_init_log" | grep -qF "using missing-marker default 'gh-stack'" \
+  && [[ "$missing_init_value" == 'gh-stack' ]]; then
+  printf '[PASS] hermetic: missing marker selects gh-stack and logs the default\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] hermetic: missing marker must select gh-stack and log the default\n'
+  fail=$(( fail + 1 ))
+  printf '%s\n' "$missing_init_log" >&2
+fi
+
+printf 'graphite\n' >"${tmp_init_repo}/.github/stacking-tool"
+graphite_init_value="$(run_dep_init_stacking_tool 2>/dev/null)"
+if [[ "$graphite_init_value" == 'graphite' ]]; then
+  printf '[PASS] hermetic: graphite marker retains Graphite\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] hermetic: graphite marker must retain Graphite (got %s)\n' \
+    "$graphite_init_value"
+  fail=$(( fail + 1 ))
+fi
+
+printf 'gh-stack\n' >"${tmp_init_repo}/.github/stacking-tool"
+gh_stack_init_value="$(run_dep_init_stacking_tool 2>/dev/null)"
+if [[ "$gh_stack_init_value" == 'gh-stack' ]]; then
+  printf '[PASS] hermetic: gh-stack marker retains gh-stack\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] hermetic: gh-stack marker must retain gh-stack (got %s)\n' \
+    "$gh_stack_init_value"
+  fail=$(( fail + 1 ))
+fi
+
+printf 'not-a-tool\n' >"${tmp_init_repo}/.github/stacking-tool"
+invalid_init_exit=0
+(
+  dir="$tmp_init_repo"
+  dep_stacking_tool=''
+  eval "$init_fn"
+  dep_init_stacking_tool
+) >/dev/null 2>&1 || invalid_init_exit=$?
+if [[ "$invalid_init_exit" -ne 0 ]]; then
+  printf '[PASS] hermetic: invalid marker fails explicitly\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] hermetic: invalid marker must fail explicitly\n'
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$tmp_init_repo"
 
 printf '\n=== functional: gh-stack register adopts via init before submit ===\n'
 gh_stack_adopt_dir="$(mktemp -d)"
