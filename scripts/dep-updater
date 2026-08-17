@@ -670,6 +670,7 @@ dep_stack_graphite_local_main_present() {
 
 dep_stack_graphite_track() {
   local probe quoted_args quoted_wt arg
+  local track_status=0
   local -a runner_opts=() track_args=()
 
   probe=0
@@ -689,7 +690,16 @@ dep_stack_graphite_track() {
   done
   quoted_wt="$(printf '%q' "$worktree_path")"
   runner_sh "gt track" "${runner_opts[@]}" -- \
-    "cd ${quoted_wt} && exec gt track${quoted_args}"
+    "cd ${quoted_wt} && exec gt track${quoted_args}" || track_status=$?
+  if (( track_status == 124 )); then
+    if (( probe == 1 )); then
+      return 124
+    fi
+    # Match the read-path timeout contract: do not fall through to generic
+    # cleanup that deletes a healthy worktree after a merely slow gt track.
+    die "WAIT_TIMEOUT Graphite track timed out; preserving existing worktree: ${worktree_path}"
+  fi
+  return "$track_status"
 }
 
 dep_stack_needs_rebase() {
@@ -7930,6 +7940,7 @@ print_summary() {
 cleanup_on_error() {
   local -r reason="$1"
   local leave_prs_open=0
+  local preserve_worktree=0
   local saved_prs="" saved_p saved_merged saved_state comment
 
   log "Cleaning up after error: ${reason}"
@@ -7937,10 +7948,18 @@ cleanup_on_error() {
 
   # Leave PRs open when the failure is merge/auto-merge config or CI-not-ready —
   # closing them drops a recoverable PR (issue #430 / tsp-maximizer#128).
+  # Graphite timeout dies that say "preserving existing worktree" keep both the
+  # worktree and any same-run PRs so the next attempt does not duplicate stacks.
   case "$reason" in
     *'gh merge failed'*|*'Auto merge is not allowed'*|*'enablePullRequestAutoMerge'*|\
-    *'CI not ready'*|*'refusing gh merge'*|*'is not CI-green'*|WAIT_TIMEOUT*|*'WAIT_TIMEOUT '*)
+    *'CI not ready'*|*'refusing gh merge'*|*'is not CI-green'*|WAIT_TIMEOUT*|*'WAIT_TIMEOUT '*|\
+    *'preserving existing worktree'*)
       leave_prs_open=1
+      ;;
+  esac
+  case "$reason" in
+    *'preserving existing worktree'*)
+      preserve_worktree=1
       ;;
   esac
 
@@ -7978,7 +7997,9 @@ cleanup_on_error() {
       done
     fi
   fi
-  if [[ -n "$worktree_path" && -d "$worktree_path" ]]; then
+  if [[ "$preserve_worktree" == '1' ]]; then
+    log "[worktree] Preserving worktree after timeout: ${worktree_path}"
+  elif [[ -n "$worktree_path" && -d "$worktree_path" ]]; then
     log "[worktree] Removing worktree: $worktree_path"
     run_command "git repo" git -C "$dir" worktree remove --force "$worktree_path" 2>/dev/null \
       || log "Note: worktree directory already removed."
