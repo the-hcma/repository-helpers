@@ -12,7 +12,8 @@ stacked PR workflow support (`gh-stack` or Graphite, selected per repo).
 
 - `scripts/dep-updater` creates stacked dependency update PRs for npm/pnpm, Python
   (`pip`, `uv`, `poetry`, `pipenv`), Rust/Cargo, and GitHub Actions — using
-  Graphite or `gh stack` per the target repo’s `.github/stacking-tool` marker.
+  Graphite or `gh stack` per the target repo’s `.github/stacking-tool` marker
+  (`gh-stack` when the marker is absent; explicit `graphite` keeps Graphite).
 - `scripts/dep-updater-batch-run` runs dependency updates across every clone under a
   scan root, streams a live log, and sends a daily email report.
 - `scripts/github-repo-lint` audits org repository settings (merge queue, branch
@@ -282,7 +283,7 @@ for the full review playbook; skills under `.cursor/skills/{graphite,gh-stack}/`
 
 | Script | Purpose |
 | --- | --- |
-| `scripts/dep-updater` | Dependency bumps → stacked PR(s) for one repo (`graphite` or `gh-stack`). |
+| `scripts/dep-updater` | Dependency bumps → stacked PR(s) for one repo (`gh-stack` when `.github/stacking-tool` is absent; `graphite` when marked). |
 | `scripts/dep-updater-batch-run` | Daily batch across a scan root; email report. |
 | `scripts/github-repo-lint` | Org repo practices audit / `--apply-fix`. |
 | `scripts/check-merge-settings` | Merge + GitHub MQ settings only. |
