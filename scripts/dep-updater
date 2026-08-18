@@ -5481,15 +5481,13 @@ py_uv_parse_verify_filter_pkg() {
   local -r log_file="$1"
   local line pkg
 
-  line="$(grep -E 'constraint rewrite was a no-op for |lock did not land ' "$log_file" 2>/dev/null \
+  line="$(grep -E 'lock did not land ' "$log_file" 2>/dev/null \
     | head -n 1 || true)"
   if [[ -z "$line" ]]; then
     return 1
   fi
   pkg="$(printf '%s' "$line" \
-    | sed -nE \
-      -e 's/.*constraint rewrite was a no-op for ([A-Za-z0-9][A-Za-z0-9._-]*).*/\1/p' \
-      -e 's/.*lock did not land ([A-Za-z0-9][A-Za-z0-9._-]*).*/\1/p' \
+    | sed -nE 's/.*lock did not land ([A-Za-z0-9][A-Za-z0-9._-]*).*/\1/p' \
     | head -n 1)"
   if [[ -z "$pkg" ]]; then
     return 1
@@ -5554,12 +5552,9 @@ py_uv_try_lockfile_with_updates() {
     [[ -z "$pkg" || -z "$new_ver" ]] && continue
     op="$(py_constraint_op "$pkg" "$pyproject")"
     if [[ "$op" == ">=" || "$op" == "==" || "$op" == "~=" ]]; then
-      if ! py_uv_rewrite_version_floor "$pyproject" "$pkg" "$new_ver"; then
-        printf 'constraint rewrite was a no-op for %s\n' "$pkg" >>"$log_file"
-        cp "$bak_proj" "$pyproject"
-        rm -f "$bak_proj" "$bak_lock"
-        return 1
-      fi
+      # No-op rewrite still proceeds to lock (stale uv.lock with an already-raised
+      # floor must not be dropped from the plan).
+      py_uv_rewrite_version_floor "$pyproject" "$pkg" "$new_ver" || true
       floor_pkgs+=("$pkg")
     fi
   done
@@ -5643,11 +5638,7 @@ py_uv_filter_outdated_lines() {
           norm_pkg="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
           norm_blame="$(printf '%s' "$blame_pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
           if [[ "$norm_pkg" == "$norm_blame" ]]; then
-            if grep -qF 'constraint rewrite was a no-op' "$log_file"; then
-              log "[python/uv] Filtering ${pkg} → ${lat}: constraint rewrite was a no-op."
-            else
-              log "[python/uv] Filtering ${pkg} → ${lat}: lock did not land ${lat}."
-            fi
+            log "[python/uv] Filtering ${pkg} → ${lat}: lock did not land ${lat}."
             found_blame_in_pending=1
             continue
           fi
@@ -5964,10 +5955,8 @@ py_update_one() {
         # leaves pyproject.toml unchanged). Patch the floor with sed instead.
         # For == / ~= constraints, convert to >= so dep-updater never introduces pins.
         if ! py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$pkg" "$new_ver"; then
-          log "[python/uv] Skipping ${pkg} ${new_ver}: constraint rewrite was a no-op."
-          return 0
+          : # Floor already at target; still lock to repair a stale uv.lock.
         fi
-        log "[python/${tool}] ${pkg}: ${old_ver} → ${new_ver}"
         uv_out="$(py_uv_floor_lock "uv lock" "$worktree_path" "$pkg")" && uv_exit=0 || uv_exit=$?
         if (( uv_exit != 0 )); then
           # Revert pyproject.toml: sed already modified it but the lock failed.
@@ -5976,6 +5965,7 @@ py_update_one() {
           log "$uv_out"
           return 0
         fi
+        log "[python/${tool}] ${pkg}: ${old_ver} → ${new_ver}"
         run_command "git worktree" git -C "$worktree_path" add pyproject.toml uv.lock
         files_changed="pyproject.toml + uv.lock"
       else
@@ -6857,10 +6847,7 @@ batch_update_all() {
           uv)
             b_constraint_op="$(py_constraint_op "$pkg" "${worktree_path}/pyproject.toml")"
             if [[ "$b_constraint_op" == ">=" || "$b_constraint_op" == "==" || "$b_constraint_op" == "~=" ]]; then
-              if ! py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$pkg" "$new_ver"; then
-                log "[python/uv] Skipping ${pkg} ${new_ver}: constraint rewrite was a no-op."
-                continue
-              fi
+              py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$pkg" "$new_ver" || true
               uv_floor_lines+=("${pkg} ${_old} ${new_ver}")
               uv_floor_batch=1
             else
@@ -6940,12 +6927,10 @@ batch_update_all() {
               for floor_line in "${verified_floor_lines[@]}"; do
                 read -r floor_pkg _floor_old floor_new <<<"$floor_line"
                 [[ -z "$floor_pkg" || -z "$floor_new" ]] && continue
-                if ! py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$floor_pkg" "$floor_new"; then
-                  log "[python/uv] ERROR: batch re-rewrite failed for ${floor_pkg} after verification."
-                  dep_updater_append_ecosystem_failure "python|batch re-rewrite failed for ${floor_pkg}"
-                  uv_floor_batch=0
-                  break
-                fi
+                # No-op is expected when pyproject_bak already has the verified floor
+                # (lock-only repair). Keep the verified line either way.
+                py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$floor_pkg" "$floor_new" \
+                  || true
                 uv_floor_lines+=("$floor_line")
               done
               if [[ "$uv_floor_batch" == '1' && ${#uv_floor_lines[@]} -gt 0 ]]; then

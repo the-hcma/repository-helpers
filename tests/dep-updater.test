@@ -1474,13 +1474,31 @@ rm -rf "$compound_rewrite_tmp"
 printf '\n=== static: uv compound floor verify helpers ===\n'
 if grep -q '^py_uv_parse_verify_filter_pkg()' "$script" \
   && grep -qF 'lock did not land' "$script" \
-  && grep -qF 'constraint rewrite was a no-op for' "$script" \
+  && ! grep -qF 'constraint rewrite was a no-op for' "$script" \
   && grep -qF 'py_uv_parse_verify_filter_pkg' <<<"$(awk '/^py_uv_filter_outdated_lines\(\)/,/^\}/' "$script")" \
   && grep -qF 'uv_floor_lines' <<<"$(awk '/^batch_update_all\(\)/,/^\}/' "$script")"; then
   printf '[PASS] py-uv-compound: verify parser, filter drops, batch defers Update log\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] py-uv-compound: missing verify parser, filter wiring, or batch log deferral\n'
+  fail=$(( fail + 1 ))
+fi
+
+try_lock_fn="$(awk '/^py_uv_try_lockfile_with_updates\(\)/,/^}$/' "$script")"
+py_update_one_fn="$(awk '/^py_update_one\(\)/,/^}$/' "$script")"
+batch_update_fn="$(awk '/^batch_update_all\(\)/,/^}$/' "$script")"
+# shellcheck disable=SC2016  # assert literal rewrite-or-true + floor_pkgs in source
+if grep -qF 'py_uv_rewrite_version_floor "$pyproject" "$pkg" "$new_ver" || true' <<<"$try_lock_fn" \
+  && grep -qF 'floor_pkgs+=("$pkg")' <<<"$try_lock_fn" \
+  && grep -qF 'Floor already at target; still lock' <<<"$py_update_one_fn" \
+  && ! grep -qF 'constraint rewrite was a no-op.' <<<"$py_update_one_fn" \
+  && grep -qF 'py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$pkg" "$new_ver" || true' \
+    <<<"$batch_update_fn" \
+  && ! grep -qF 'ERROR: batch re-rewrite failed' <<<"$batch_update_fn"; then
+  printf '[PASS] py-uv-compound: no-op rewrite still floor-locks (filter, apply, batch)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: no-op rewrite must still run floor lock, not drop the pkg\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -1544,26 +1562,18 @@ fi
 
 printf '\n=== behavioural: py_uv_parse_verify_filter_pkg log messages ===\n'
 verify_parser_log="$(mktemp)"
-printf '%s\n' 'constraint rewrite was a no-op for idna' >"$verify_parser_log"
+printf '%s\n' 'lock did not land django at 6.1 (highest 6.0.8)' >"$verify_parser_log"
 verify_parser_out="$(
   # shellcheck disable=SC1090
   source <(awk '/^py_uv_parse_verify_filter_pkg\(\)/,/^}$/' "$script")
   py_uv_parse_verify_filter_pkg "$verify_parser_log"
 )"
-verify_parser_log2="$(mktemp)"
-printf '%s\n' 'lock did not land django at 6.1 (highest 6.0.8)' >"$verify_parser_log2"
-verify_parser_out2="$(
-  # shellcheck disable=SC1090
-  source <(awk '/^py_uv_parse_verify_filter_pkg\(\)/,/^}$/' "$script")
-  py_uv_parse_verify_filter_pkg "$verify_parser_log2"
-)"
-rm -f "$verify_parser_log" "$verify_parser_log2"
-if [[ "$verify_parser_out" == 'idna' && "$verify_parser_out2" == 'django' ]]; then
-  printf '[PASS] py-uv-compound: verify parser reads no-op and lock-did-not-land lines\n'
+rm -f "$verify_parser_log"
+if [[ "$verify_parser_out" == 'django' ]]; then
+  printf '[PASS] py-uv-compound: verify parser reads lock-did-not-land lines\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] py-uv-compound: verify parser got idna=%s django=%s\n' \
-    "$verify_parser_out" "$verify_parser_out2"
+  printf '[FAIL] py-uv-compound: verify parser got django=%s\n' "$verify_parser_out"
   fail=$(( fail + 1 ))
 fi
 
@@ -1654,6 +1664,94 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$compound_filter_tmp"
+
+printf '\n=== behavioural: py_uv_filter keeps no-op rewrite when lock lands ===\n'
+noop_filter_tmp="$(mktemp -d)"
+mock_uv_bin="${noop_filter_tmp}/bin"
+mkdir -p "$mock_uv_bin"
+cat >"${mock_uv_bin}/uv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == 'lock' ]]; then
+  cat >uv.lock <<'LOCK'
+version = 1
+requires-python = ">=3.11"
+
+[[package]]
+name = "django"
+version = "6.1"
+source = { registry = "https://pypi.org/simple" }
+LOCK
+  exit 0
+fi
+printf 'mock uv: unsupported args: %s\n' "$*" >&2
+exit 1
+EOF
+chmod +x "${mock_uv_bin}/uv"
+cat >"${noop_filter_tmp}/pyproject.toml" <<'EOF'
+[project]
+name = "noop-filter-demo"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["django>=6.1"]
+EOF
+cat >"${noop_filter_tmp}/uv.lock" <<'EOF'
+version = 1
+requires-python = ">=3.11"
+
+[[package]]
+name = "django"
+version = "6.0.8"
+source = { registry = "https://pypi.org/simple" }
+EOF
+noop_filter_out_file="$(mktemp)"
+noop_filter_rc=0
+(
+  dir="$noop_filter_tmp"
+  # shellcheck disable=SC1091
+  source "${script_dir}/../scripts/lib/gnu-sed"
+  # shellcheck disable=SC1090
+  source <(
+    awk '/^py_constraint_op\(\)/,/^}$/' "$script"
+    awk '/^py_uv_version_at_least\(\)/,/^}$/' "$script"
+    awk '/^py_uv_lock_highest_version\(\)/,/^}$/' "$script"
+    awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script"
+    awk '/^py_uv_parse_verify_filter_pkg\(\)/,/^}$/' "$script"
+    awk '/^py_uv_parse_blame_direct_dep\(\)/,/^}$/' "$script"
+    awk '/^py_uv_try_lockfile_with_updates\(\)/,/^}$/' "$script"
+    awk '/^py_uv_filter_outdated_lines\(\)/,/^}$/' "$script"
+  )
+  # shellcheck disable=SC2317,SC2329
+  log() { :; }
+  # shellcheck disable=SC2317,SC2329
+  dep_runner_uv_dir_capture() {
+    local _label="$1"
+    local scan_root="$2"
+    shift 2
+    [[ "$1" == '--' ]] && shift
+    (cd "$scan_root" && PATH="${mock_uv_bin}:${PATH}" uv "$@")
+  }
+  # shellcheck disable=SC2317,SC2329
+  py_uv_floor_lock() {
+    local _label="$1"
+    local scan_root="$2"
+    shift 2
+    dep_runner_uv_dir_capture "$_label" "$scan_root" -- lock
+  }
+  py_uv_filter_outdated_lines "$noop_filter_tmp" "django 6.0.8 6.1"
+) >"$noop_filter_out_file" || noop_filter_rc=$?
+noop_filter_out="$(cat "$noop_filter_out_file")"
+rm -f "$noop_filter_out_file"
+if [[ "$noop_filter_rc" -eq 0 ]] \
+  && [[ "$noop_filter_out" == 'django 6.0.8 6.1' ]]; then
+  printf '[PASS] py-uv-compound: filter keeps django when rewrite is no-op and lock lands\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: no-op filter expected django 6.0.8 6.1, rc=%s out=%s\n' \
+    "$noop_filter_rc" "$noop_filter_out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$noop_filter_tmp"
 
 printf '\n=== static: npm packument helper and pnpm stale-high clamp ===\n'
 if grep -q '^npm_registry_dist_tag_latest()' "$script" \
