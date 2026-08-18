@@ -1463,13 +1463,29 @@ agent_review_pending_thread_count_from_snapshot() {
 agent_review_abort_if_pending_threads() {
   local -r repo="$1"
   local -r pr="$2"
-  local owner name snapshot pending_count triage_json
+  local owner name snapshot pending_count triage_json thread_count
 
   read -r owner name < <(agent_review_repo_parts "${repo}")
   agent_review_require_cmd gh
   agent_review_require_cmd jq
   snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
   agent_review_assert_snapshot_complete "${snapshot}"
+  # GraphQL review threads first — unresolved threads must not wait on REST
+  # issue comments, gh api user, or CodeRabbit (repository-helpers#497).
+  thread_count="$(agent_review_open_thread_count_from_snapshot "${snapshot}")"
+  thread_count="${thread_count:-0}"
+  if (( thread_count > 0 )); then
+    triage_json="$(agent_review_feedback_triage_json "${repo}" "${pr}" "${snapshot}")"
+    pending_count="$(ar_runner_jq_file "agent-review abort pending feedback count" \
+      "${triage_json}" '.pending_feedback | length')"
+    if (( pending_count == 0 )); then
+      pending_count="${thread_count}"
+    fi
+    printf 'wait-for-agent-review: %s feedback item(s) still need a reply or resolve before give-up\n' \
+      "${pending_count}" >&2
+    printf '%s\n' "${triage_json}"
+    return 3
+  fi
   pending_count="$(agent_review_pending_thread_count_from_snapshot "${repo}" "${pr}" "${snapshot}")"
   if (( pending_count == 0 )); then
     return 0
@@ -1766,6 +1782,21 @@ agent_review_authenticated_login() {
     agent_review_die 'could not determine authenticated GitHub login (run gh auth login)'
   fi
   printf '%s' "${login}"
+}
+
+# Like agent_review_authenticated_login but returns 1 on API/rate-limit failure (no die).
+agent_review_authenticated_login_optional() {
+  local login exit_code
+
+  exit_code=0
+  login="$(GITHUB_API_RATE_LIMIT_MAX_RETRIES=1 \
+    ar_runner_gh_api_stream "agent-review authenticated login optional" user --jq '.login')" \
+    || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "${login}" ]]; then
+    return 1
+  fi
+  printf '%s' "${login}"
+  return 0
 }
 
 agent_review_thread_has_human_reply() {
