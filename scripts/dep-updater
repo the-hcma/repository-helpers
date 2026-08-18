@@ -5444,7 +5444,8 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
 # Rewrites a PEP 508 dependency floor in [project].dependencies-style entries:
 #   "pkg>=1.0.0" / "pkg[extra]>=1.0.0" (bundled) or "pkg[extra]" >= 1.0.0 / "pkg" >= 1.0.0
 # Compound caps such as "pkg>=1.0.0,<2" are rewritten to "pkg>=2.0.0" (drops the upper
-# bound — not an intentional freeze). Two sed passes (bundled before split). Converts
+# bound — not an intentional freeze). A trailing PEP 508 environment marker is kept.
+# Two sed passes (bundled before split). Converts
 # == and ~= to >=. Returns 1 when sed fails or the constraint line did not change.
 py_uv_rewrite_version_floor() {
   local -r path="$1"
@@ -5456,8 +5457,9 @@ py_uv_rewrite_version_floor() {
   cp "$path" "$before"
   sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
   sed_new_ver="$(printf '%s' "$new_ver" | sed 's/[\\&#]/\\&/g')"
+  # Bundled: version + optional ,<cap; keep a trailing ;environment-marker.
   gnu_sed_inplace -E "$path" \
-    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?)(~=|>=|==)[^\\\"]*\\\"#\\1>=${sed_new_ver}\\\"#" \
+    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?)(~=|>=|==)[0-9][0-9a-zA-Z.]*(,[[:space:]]*<[0-9][0-9a-zA-Z.]*)?(;[^\\\"]*)?\\\"#\\1>=${sed_new_ver}\\5\\\"#" \
     -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?\")[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*([[:space:]]*,[[:space:]]*<[0-9][0-9a-zA-Z.]*)?#\\1 >= ${sed_new_ver}#" \
     || {
       cp "$before" "$path"
@@ -5769,13 +5771,13 @@ py_uv_lock_highest_version() {
   local -r pkg="$2"
   local pkg_lc versions
   [[ -f "$lockfile" ]] || return 1
-  pkg_lc="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+  pkg_lc="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '._' '-')"
   versions="$(awk -v want="$pkg_lc" '
     /^name = "/ {
       name = $0
       sub(/^name = "/, "", name)
       sub(/"$/, "", name)
-      gsub(/_/, "-", name)
+      gsub(/[._]/, "-", name)
       tracking = (tolower(name) == want)
       next
     }
@@ -6822,6 +6824,11 @@ batch_update_all() {
       uv_upgrade_success=0
       uv_upgrade_specs=()
       uv_floor_lines=()
+      pyproject_bak=""
+      if [[ "$py_tool" == "uv" ]]; then
+        pyproject_bak="$(mktemp)"
+        cp "${worktree_path}/pyproject.toml" "$pyproject_bak"
+      fi
       while IFS=' ' read -r pkg _old new_ver; do
         [[ -z "$pkg" ]] && continue
         case "$py_tool" in
@@ -6860,11 +6867,8 @@ batch_update_all() {
       done <<< "$py_lines_arg"
       if [[ "$py_tool" == "uv" ]]; then
         if [[ "$uv_floor_batch" == '1' ]]; then
-          # Snapshot pyproject.toml and uv.lock before floor lock so failures can
-          # revert unverified floors or restore the pre-lock lockfile.
-          pyproject_bak=""
-          pyproject_bak="$(mktemp)"
-          cp "${worktree_path}/pyproject.toml" "$pyproject_bak"
+          # pyproject_bak is the pre-rewrite snapshot. Snapshot uv.lock before
+          # floor lock so a failure can restore the pre-lock lockfile.
           lock_bak=""
           if [[ -f "${worktree_path}/uv.lock" ]]; then
             lock_bak="$(mktemp)"
@@ -6939,6 +6943,9 @@ batch_update_all() {
             lock_bak=""
             pyproject_bak=""
           fi
+        else
+          rm -f "$pyproject_bak"
+          pyproject_bak=""
         fi
         for b_spec in "${uv_upgrade_specs[@]}"; do
           read -r pkg new_ver <<<"$b_spec"
