@@ -1290,6 +1290,60 @@ cmd_loop_nothing_outstanding() {
   return 0
 }
 
+# Sleep up to total_s seconds in short chunks, aborting with exit 3 when pending
+# feedback appears (same idea as CodeRabbit rate-limit poll — #366 / #369;
+# repository-helpers#501). Returns 0 when the wait elapsed with no pending
+# feedback; 3 when triage is needed.
+cmd_loop_sleep_abort_if_pending() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r total_s="$3"
+  local -r label="${4:-reviews poll}"
+  local remaining sleep_s poll_s pending_exit
+
+  remaining="${total_s}"
+  if ! [[ "${remaining}" =~ ^[0-9]+$ ]] || (( remaining < 1 )); then
+    remaining=1
+  fi
+  # Short chunks so newly arrived threads surface before a full poll interval (#501).
+  # shellcheck disable=SC2154  # agent_review_default_poll_interval_s from sourced lib
+  poll_s=5
+  if (( poll_s > agent_review_default_poll_interval_s )); then
+    poll_s="${agent_review_default_poll_interval_s}"
+  fi
+  if (( poll_s < 1 )); then
+    poll_s=1
+  fi
+
+  while true; do
+    pending_exit=0
+    agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
+    if (( pending_exit == 3 )); then
+      agent_review_loop_set_stop 'THREADS_PENDING' \
+        'Feedback items still need a reply or resolve (threads, issue comments, review bodies).'
+      printf 'wait-for-agent-review: pending feedback during %s wait on PR #%s — surfacing triage (exit 3)\n' \
+        "${label}" "${pr}" >&2
+      return 3
+    fi
+    if (( remaining <= 0 )); then
+      break
+    fi
+    if (( remaining > poll_s )); then
+      sleep_s="${poll_s}"
+    else
+      sleep_s="${remaining}"
+    fi
+    if (( sleep_s < 1 )); then
+      sleep_s=1
+    fi
+    printf 'wait-for-agent-review: %s — sleeping poll chunk %ss (%ss remaining) on PR #%s\n' \
+      "${label}" "${sleep_s}" "${remaining}" "${pr}" >&2
+    run_command "${label} poll sleep" sleep "${sleep_s}"
+    remaining=$((remaining - sleep_s))
+  done
+  return 0
+}
+
 # Sleep until CodeRabbit retry_after (if any), then wait for automatic on-push review.
 # Ordinary "@coderabbitai review" is never posted. After cooldown +
 # AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE (default 60s), if still no review on head,
@@ -1485,7 +1539,12 @@ cmd_loop_handle_coderabbit_rate_limit() {
     printf 'wait-for-agent-review: CodeRabbit cooldown elapsed at %s — waiting %ss grace (of %ss) for on-push review before full review on PR #%s\n' \
       "${retry_after}" "${sleep_s}" "${grace_s}" "${pr}" >&2
     agent_review_use_agent "${saved_agent}"
-    run_command "coderabbit post-cooldown grace sleep" sleep "${sleep_s}"
+    pending_exit=0
+    cmd_loop_sleep_abort_if_pending "${repo}" "${pr}" "${sleep_s}" \
+      'coderabbit post-cooldown grace' || pending_exit=$?
+    if (( pending_exit == 3 )); then
+      return 3
+    fi
     return 0
   fi
 
@@ -1781,7 +1840,7 @@ cmd_complete_idle() {
 cmd_loop() {
   local repo pr pr_started last_head head now
   local pr_cap cycle_cap check_exit ci_exit pending_exit rate_exit status
-  local owner name snapshot complete_exit
+  local owner name snapshot complete_exit status_pending
   local transient_retries transient_max transient_sleep restack_exit
 
   repo="$(agent_review_resolve_repo "${1:-}")"
@@ -1843,7 +1902,8 @@ cmd_loop() {
 
     pending_exit=0
     # Unaddressed GraphQL threads beat REST rate-limit waits and in-flight
-    # CodeRabbit (repository-helpers#497). Abort must return 3 before those waits.
+    # CodeRabbit (repository-helpers#497). Newly arrived threads also abort
+    # mid-wait (repository-helpers#501). Abort must return 3 before those waits.
     agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
     if (( pending_exit == 3 )); then
       agent_review_loop_set_stop 'THREADS_PENDING' \
@@ -1863,7 +1923,12 @@ cmd_loop() {
     if ! agent_review_agent_quota_exhausted_for_agent 'coderabbit' \
       && agent_review_named_pr_check_is_pending "${repo}" "${pr}" 'CodeRabbit'; then
       printf 'wait-for-agent-review loop: CodeRabbit workflow in progress on PR #%s…\n' "${pr}" >&2
-      sleep "${agent_review_default_poll_interval_s}"
+      pending_exit=0
+      cmd_loop_sleep_abort_if_pending "${repo}" "${pr}" \
+        "${agent_review_default_poll_interval_s}" 'CodeRabbit workflow' || pending_exit=$?
+      if (( pending_exit == 3 )); then
+        return 3
+      fi
       continue
     fi
     rate_exit=0
@@ -1947,8 +2012,18 @@ cmd_loop() {
         return 11
         ;;
       5)
-        # Fresh review without "no new comments" — still allow early-complete when
-        # nothing is outstanding (threads clear, agents delivered, CodeRabbit idle).
+        # Fresh review without "no new comments". Threads that landed after the
+        # start-of-loop abort (or while cmd_check ran) must exit 3 rather than
+        # keep polling for Copilot/CodeRabbit (#501).
+        pending_exit=0
+        agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
+        if (( pending_exit == 3 )); then
+          agent_review_loop_set_stop 'THREADS_PENDING' \
+            'Feedback items still need a reply or resolve (threads, issue comments, review bodies).'
+          return 3
+        fi
+        # Still allow early-complete when nothing is outstanding (threads clear,
+        # agents delivered, CodeRabbit idle).
         :
         ;;
       2)
@@ -1963,6 +2038,16 @@ cmd_loop() {
     esac
 
     status="$(cmd_status "${repo}" "${pr}")"
+    status_pending="$(wait_ar_jq_status "$status" '.pending_threads // 0')"
+    if (( status_pending > 0 )); then
+      pending_exit=0
+      agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
+      if (( pending_exit == 3 )); then
+        agent_review_loop_set_stop 'THREADS_PENDING' \
+          'Feedback items still need a reply or resolve (threads, issue comments, review bodies).'
+        return 3
+      fi
+    fi
     cmd_loop_track_outstanding_agent_reviews "${repo}" "${pr}" "${head}" "${snapshot}"
     cmd_loop_refresh_waiting_agents "${repo}" "${pr}" "${head}" "${snapshot}"
 
@@ -2000,7 +2085,12 @@ cmd_loop() {
     if cmd_loop_nothing_outstanding "${repo}" "${pr}" "${status}" "${snapshot}" "${head}"; then
       continue
     fi
-    sleep "${agent_review_default_poll_interval_s}"
+    pending_exit=0
+    cmd_loop_sleep_abort_if_pending "${repo}" "${pr}" \
+      "${agent_review_default_poll_interval_s}" 'reviews poll' || pending_exit=$?
+    if (( pending_exit == 3 )); then
+      return 3
+    fi
   done
 }
 
