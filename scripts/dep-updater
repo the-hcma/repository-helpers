@@ -5527,6 +5527,7 @@ py_uv_try_lockfile_with_updates() {
   local -r log_file="$2"
   shift 2
   local -a lines=("$@")
+  local -a floor_pkgs=()
   local pyproject lockfile bak_proj bak_lock line pkg _cur new_ver op rc
 
   if [[ ${#lines[@]} -eq 0 ]]; then
@@ -5559,11 +5560,12 @@ py_uv_try_lockfile_with_updates() {
         rm -f "$bak_proj" "$bak_lock"
         return 1
       fi
+      floor_pkgs+=("$pkg")
     fi
   done
 
   set +e
-  dep_runner_uv_dir_capture "uv lock verify" "$scan_root" -- lock >>"$log_file" 2>&1
+  py_uv_floor_lock "uv lock verify" "$scan_root" "${floor_pkgs[@]}" >>"$log_file" 2>&1
   rc=$?
   set -e
 
@@ -5752,6 +5754,25 @@ py_uv_exclude_newer_cutoff_iso() {
   now_epoch="$(time_log_now_utc_epoch)" || return 1
   cutoff_epoch=$(( now_epoch - dep_updater_minimum_release_age_minutes * 60 ))
   time_log_epoch_to_iso8601_utc "$cutoff_epoch"
+}
+
+# py_uv_floor_lock <label> <dir> [pkg...]
+# uv lock with --exclude-newer-package for each pkg so a raised >= floor cannot
+# resolve a release still inside the 9-day window.
+py_uv_floor_lock() {
+  local -r label="$1"
+  local -r uv_dir="$2"
+  shift 2
+  local cutoff pkg
+  local -a lock_args=()
+
+  cutoff="$(py_uv_exclude_newer_cutoff_iso)" || return 1
+  lock_args=(lock)
+  for pkg in "$@"; do
+    [[ -z "$pkg" ]] && continue
+    lock_args+=(--exclude-newer-package "${pkg}=${cutoff}")
+  done
+  dep_runner_uv_dir_capture "$label" "$uv_dir" -- "${lock_args[@]}"
 }
 
 # py_uv_version_at_least <ver> <minimum>
@@ -5947,7 +5968,7 @@ py_update_one() {
           return 0
         fi
         log "[python/${tool}] ${pkg}: ${old_ver} → ${new_ver}"
-        uv_out="$(dep_runner_uv_dir_capture "uv lock" "$worktree_path" -- lock)" && uv_exit=0 || uv_exit=$?
+        uv_out="$(py_uv_floor_lock "uv lock" "$worktree_path" "$pkg")" && uv_exit=0 || uv_exit=$?
         if (( uv_exit != 0 )); then
           # Revert pyproject.toml: sed already modified it but the lock failed.
           run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
@@ -6632,6 +6653,7 @@ batch_update_all() {
   local uv_floor_batch uv_upgrade_success report_py_lines
   local pyproject_bak verified_floor_lines floor_line floor_pkg _floor_old floor_new floor_highest
   local -a uv_floor_lines=()
+  local -a floor_pkgs=()
   local -a verified_floor_lines=()
   local -a uv_upgrade_specs=()
   local -a cargo_add_args=()
@@ -6874,7 +6896,13 @@ batch_update_all() {
             lock_bak="$(mktemp)"
             cp "${worktree_path}/uv.lock" "$lock_bak"
           fi
-          py_out="$(dep_runner_uv_dir_capture "uv batch lock" "$worktree_path" -- lock)" && py_exit=0 || py_exit=$?
+          floor_pkgs=()
+          for floor_line in "${uv_floor_lines[@]}"; do
+            read -r floor_pkg _floor_old floor_new <<<"$floor_line"
+            [[ -z "$floor_pkg" ]] && continue
+            floor_pkgs+=("$floor_pkg")
+          done
+          py_out="$(py_uv_floor_lock "uv batch lock" "$worktree_path" "${floor_pkgs[@]}")" && py_exit=0 || py_exit=$?
           if (( py_exit != 0 )); then
             py_uv_restore_after_failed_floor_lock "$worktree_path" "$lock_bak"
             rm -f "$pyproject_bak" "$lock_bak"
@@ -6921,7 +6949,13 @@ batch_update_all() {
                 uv_floor_lines+=("$floor_line")
               done
               if [[ "$uv_floor_batch" == '1' && ${#uv_floor_lines[@]} -gt 0 ]]; then
-                py_out="$(dep_runner_uv_dir_capture "uv batch lock verify" "$worktree_path" -- lock)" \
+                floor_pkgs=()
+                for floor_line in "${uv_floor_lines[@]}"; do
+                  read -r floor_pkg _floor_old floor_new <<<"$floor_line"
+                  [[ -z "$floor_pkg" ]] && continue
+                  floor_pkgs+=("$floor_pkg")
+                done
+                py_out="$(py_uv_floor_lock "uv batch lock verify" "$worktree_path" "${floor_pkgs[@]}")" \
                   && py_exit=0 || py_exit=$?
                 if (( py_exit != 0 )); then
                   py_uv_restore_after_failed_floor_lock "$worktree_path" "$lock_bak"
