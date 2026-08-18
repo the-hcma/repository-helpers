@@ -1417,6 +1417,362 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== behavioural: py_uv_rewrite_version_floor compound specifiers ===\n'
+compound_rewrite_tmp="$(mktemp -d)"
+compound_pyproject="${compound_rewrite_tmp}/pyproject.toml"
+cat >"$compound_pyproject" <<'EOF'
+[project]
+name = "demo"
+version = "0.1.0"
+dependencies = [
+  "demo-pkg>=1.0.0,<2",
+  "demo-pkg[extra]>=1.0.0,<2",
+  "marker-pkg>=1.0.0,<2; sys_platform == 'win32'",
+  "plain-marker>=1.0.0; python_version < '3.11'",
+  "split-pkg" >= 1.0.0, <2,
+]
+EOF
+(
+  # shellcheck disable=SC1091
+  source "${script_dir}/../scripts/lib/gnu-sed"
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script")
+  py_uv_rewrite_version_floor "$compound_pyproject" "demo-pkg" "2.0.0"
+  py_uv_rewrite_version_floor "$compound_pyproject" "marker-pkg" "2.0.0"
+  py_uv_rewrite_version_floor "$compound_pyproject" "plain-marker" "2.0.0"
+  py_uv_rewrite_version_floor "$compound_pyproject" "split-pkg" "2.0.0"
+)
+if grep -qF '"demo-pkg>=2.0.0"' "$compound_pyproject" \
+  && grep -qF '"demo-pkg[extra]>=2.0.0"' "$compound_pyproject" \
+  && grep -qF 'marker-pkg>=2.0.0; sys_platform' "$compound_pyproject" \
+  && grep -qF 'plain-marker>=2.0.0; python_version' "$compound_pyproject" \
+  && grep -qF '"split-pkg" >= 2.0.0' "$compound_pyproject" \
+  && ! grep -qF ',<' "$compound_pyproject"; then
+  printf '[PASS] py-uv-compound: bundled, extras, and split caps rewrite to >= floor\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: compound specifier rewrite failed\n'
+  cat "$compound_pyproject" >&2
+  fail=$(( fail + 1 ))
+fi
+# No-op when the package line is absent.
+if (
+  # shellcheck disable=SC1091
+  source "${script_dir}/../scripts/lib/gnu-sed"
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script")
+  ! py_uv_rewrite_version_floor "$compound_pyproject" "missing-pkg" "9.9.9"
+); then
+  printf '[PASS] py-uv-compound: rewrite returns non-zero on no-op\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: rewrite must fail when constraint line is unchanged\n'
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$compound_rewrite_tmp"
+
+printf '\n=== static: uv compound floor verify helpers ===\n'
+if grep -q '^py_uv_parse_verify_filter_pkg()' "$script" \
+  && grep -qF 'lock did not land' "$script" \
+  && ! grep -qF 'constraint rewrite was a no-op for' "$script" \
+  && grep -qF 'py_uv_parse_verify_filter_pkg' <<<"$(awk '/^py_uv_filter_outdated_lines\(\)/,/^\}/' "$script")" \
+  && grep -qF 'uv_floor_lines' <<<"$(awk '/^batch_update_all\(\)/,/^\}/' "$script")"; then
+  printf '[PASS] py-uv-compound: verify parser, filter drops, batch defers Update log\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: missing verify parser, filter wiring, or batch log deferral\n'
+  fail=$(( fail + 1 ))
+fi
+
+try_lock_fn="$(awk '/^py_uv_try_lockfile_with_updates\(\)/,/^}$/' "$script")"
+py_update_one_fn="$(awk '/^py_update_one\(\)/,/^}$/' "$script")"
+batch_update_fn="$(awk '/^batch_update_all\(\)/,/^}$/' "$script")"
+# shellcheck disable=SC2016  # assert literal rewrite-or-true + floor_pkgs in source
+if grep -qF 'py_uv_rewrite_version_floor "$pyproject" "$pkg" "$new_ver" || true' <<<"$try_lock_fn" \
+  && grep -qF 'floor_pkgs+=("$pkg")' <<<"$try_lock_fn" \
+  && grep -qF 'Floor already at target; still lock' <<<"$py_update_one_fn" \
+  && ! grep -qF 'constraint rewrite was a no-op.' <<<"$py_update_one_fn" \
+  && grep -qF 'py_uv_version_at_least "$floor_highest" "$new_ver"' <<<"$py_update_one_fn" \
+  && grep -qF 'py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$pkg" "$new_ver" || true' \
+    <<<"$batch_update_fn" \
+  && ! grep -qF 'ERROR: batch re-rewrite failed' <<<"$batch_update_fn"; then
+  printf '[PASS] py-uv-compound: no-op rewrite still floor-locks (filter, apply, batch)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: no-op rewrite must still run floor lock, not drop the pkg\n'
+  fail=$(( fail + 1 ))
+fi
+
+batch_update_uv_loop="$(awk '/^batch_update_all\(\)/,/^\}/' "$script" \
+  | awk '/while IFS=. read -r pkg _old new_ver; do/,/done <<< "\$py_lines_arg"/')"
+# shellcheck disable=SC2016  # assert literal batch log template in source
+if ! grep -qF 'log "[python/${py_tool}] Update: ${pkg} → ${new_ver}"' <<<"$batch_update_uv_loop" \
+  && grep -qF 'uv_floor_lines' <<<"$(awk '/^batch_update_all\(\)/,/^\}/' "$script")"; then
+  printf '[PASS] py-uv-compound: batch uv floor path does not log Update before rewrite\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: batch must not log Update before uv floor rewrite\n'
+  fail=$(( fail + 1 ))
+fi
+
+batch_update_fn="$(awk '/^batch_update_all\(\)/,/^}$/' "$script")"
+if awk '
+  /uv_floor_lines=\(\)/ { in_apply = 1 }
+  in_apply && /pyproject_bak=/ && /mktemp/ { bak = 1; next }
+  in_apply && bak && /while IFS=/ && /pkg _old new_ver/ { ok = 1 }
+  END { exit(ok ? 0 : 1) }
+' <<<"$batch_update_fn"; then
+  printf '[PASS] py-uv-compound: batch snapshots pyproject.toml before floor rewrites\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: pyproject_bak must be taken before the floor rewrite loop\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -q '^py_uv_floor_lock()' "$script" \
+  && grep -qF -- '--exclude-newer-package' "$script" \
+  && grep -qF 'py_uv_floor_lock "uv lock"' "$script" \
+  && grep -qF 'py_uv_floor_lock "uv lock verify"' "$script"; then
+  printf '[PASS] py-uv-compound: floor locks pass --exclude-newer-package for each pkg\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: missing py_uv_floor_lock age gate on floor uv lock paths\n'
+  fail=$(( fail + 1 ))
+fi
+
+# shellcheck disable=SC2016  # assert literal Update/orig_floor_pkgs tokens in source
+verify_ln="$(grep -nF 'uv batch lock verify' <<<"$batch_update_fn" | head -n 1 | cut -d: -f1)"
+# shellcheck disable=SC2016  # assert literal Update: ${floor_pkg} in source
+update_ln="$(grep -nF 'Update: ${floor_pkg}' <<<"$batch_update_fn" | tail -n 1 | cut -d: -f1)"
+# shellcheck disable=SC2016  # assert literal orig_floor_pkgs assignment in source
+orig_ln="$(grep -nF 'orig_floor_pkgs=("${floor_pkgs[@]}")' <<<"$batch_update_fn" | head -n 1 | cut -d: -f1)"
+# shellcheck disable=SC2016  # assert literal Update: ${floor_pkg} count in source
+update_count="$(grep -cF 'Update: ${floor_pkg}' <<<"$batch_update_fn" || true)"
+# shellcheck disable=SC2016  # assert literal orig_floor_pkgs expansion in source
+if [[ -n "$verify_ln" && -n "$update_ln" && -n "$orig_ln" ]] \
+  && grep -qF '"${orig_floor_pkgs[@]}"' <<<"$batch_update_fn" \
+  && (( update_count == 1 && update_ln > verify_ln && orig_ln < verify_ln )); then
+  printf '[PASS] py-uv-compound: batch Update log waits for re-lock; re-lock age-gates orig floors\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: batch must log Update after re-lock and age-gate orig_floor_pkgs\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== behavioural: py_uv_lock_highest_version PEP 503 dotted names ===\n'
+dotted_lock="$(mktemp)"
+cat >"$dotted_lock" <<'EOF'
+[[package]]
+name = "zope-interface"
+version = "7.2"
+EOF
+dotted_ver="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_lock_highest_version\(\)/,/^}$/' "$script")
+  py_uv_lock_highest_version "$dotted_lock" "zope.interface"
+)"
+rm -f "$dotted_lock"
+if [[ "$dotted_ver" == '7.2' ]]; then
+  printf '[PASS] py-uv-compound: lock highest version matches PEP 503 dotted names\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: expected zope.interface → 7.2, got %s\n' "$dotted_ver"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== behavioural: py_uv_parse_verify_filter_pkg log messages ===\n'
+verify_parser_log="$(mktemp)"
+printf '%s\n' 'lock did not land django at 6.1 (highest 6.0.8)' >"$verify_parser_log"
+verify_parser_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_parse_verify_filter_pkg\(\)/,/^}$/' "$script")
+  py_uv_parse_verify_filter_pkg "$verify_parser_log"
+)"
+rm -f "$verify_parser_log"
+if [[ "$verify_parser_out" == 'django' ]]; then
+  printf '[PASS] py-uv-compound: verify parser reads lock-did-not-land lines\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: verify parser got django=%s\n' "$verify_parser_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== behavioural: py_uv_filter keeps compound cap rewrite with mock uv lock ===\n'
+compound_filter_tmp="$(mktemp -d)"
+mock_uv_bin="${compound_filter_tmp}/bin"
+mkdir -p "$mock_uv_bin"
+cat >"${mock_uv_bin}/uv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == 'lock' ]]; then
+  cat >uv.lock <<'LOCK'
+version = 1
+requires-python = ">=3.11"
+
+[[package]]
+name = "idna"
+version = "3.10"
+source = { registry = "https://pypi.org/simple" }
+LOCK
+  exit 0
+fi
+printf 'mock uv: unsupported args: %s\n' "$*" >&2
+exit 1
+EOF
+chmod +x "${mock_uv_bin}/uv"
+cat >"${compound_filter_tmp}/pyproject.toml" <<'EOF'
+[project]
+name = "compound-filter-demo"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["idna>=3.0,<3.1"]
+EOF
+cat >"${compound_filter_tmp}/uv.lock" <<'EOF'
+version = 1
+requires-python = ">=3.11"
+
+[[package]]
+name = "idna"
+version = "3.0"
+source = { registry = "https://pypi.org/simple" }
+EOF
+compound_filter_out_file="$(mktemp)"
+compound_filter_rc=0
+(
+  dir="$compound_filter_tmp"
+  # shellcheck disable=SC1091
+  source "${script_dir}/../scripts/lib/gnu-sed"
+  # shellcheck disable=SC1090
+  source <(
+    awk '/^py_constraint_op\(\)/,/^}$/' "$script"
+    awk '/^py_uv_version_at_least\(\)/,/^}$/' "$script"
+    awk '/^py_uv_lock_highest_version\(\)/,/^}$/' "$script"
+    awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script"
+    awk '/^py_uv_parse_verify_filter_pkg\(\)/,/^}$/' "$script"
+    awk '/^py_uv_parse_blame_direct_dep\(\)/,/^}$/' "$script"
+    awk '/^py_uv_try_lockfile_with_updates\(\)/,/^}$/' "$script"
+    awk '/^py_uv_filter_outdated_lines\(\)/,/^}$/' "$script"
+  )
+  # shellcheck disable=SC2317,SC2329
+  log() { :; }
+  # shellcheck disable=SC2317,SC2329
+  dep_runner_uv_dir_capture() {
+    local _label="$1"
+    local scan_root="$2"
+    shift 2
+    [[ "$1" == '--' ]] && shift
+    (cd "$scan_root" && PATH="${mock_uv_bin}:${PATH}" uv "$@")
+  }
+  # shellcheck disable=SC2317,SC2329
+  py_uv_floor_lock() {
+    local _label="$1"
+    local scan_root="$2"
+    shift 2
+    dep_runner_uv_dir_capture "$_label" "$scan_root" -- lock
+  }
+  py_uv_filter_outdated_lines "$compound_filter_tmp" "idna 3.0 3.10"
+) >"$compound_filter_out_file" || compound_filter_rc=$?
+compound_filter_out="$(cat "$compound_filter_out_file")"
+rm -f "$compound_filter_out_file"
+if [[ "$compound_filter_rc" -eq 0 ]] \
+  && [[ "$compound_filter_out" == 'idna 3.0 3.10' ]]; then
+  printf '[PASS] py-uv-compound: filter keeps idna after compound cap rewrite + mock lock\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: filter expected idna 3.0 3.10, rc=%s out=%s\n' \
+    "$compound_filter_rc" "$compound_filter_out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$compound_filter_tmp"
+
+printf '\n=== behavioural: py_uv_filter keeps no-op rewrite when lock lands ===\n'
+noop_filter_tmp="$(mktemp -d)"
+mock_uv_bin="${noop_filter_tmp}/bin"
+mkdir -p "$mock_uv_bin"
+cat >"${mock_uv_bin}/uv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == 'lock' ]]; then
+  cat >uv.lock <<'LOCK'
+version = 1
+requires-python = ">=3.11"
+
+[[package]]
+name = "django"
+version = "6.1"
+source = { registry = "https://pypi.org/simple" }
+LOCK
+  exit 0
+fi
+printf 'mock uv: unsupported args: %s\n' "$*" >&2
+exit 1
+EOF
+chmod +x "${mock_uv_bin}/uv"
+cat >"${noop_filter_tmp}/pyproject.toml" <<'EOF'
+[project]
+name = "noop-filter-demo"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["django>=6.1"]
+EOF
+cat >"${noop_filter_tmp}/uv.lock" <<'EOF'
+version = 1
+requires-python = ">=3.11"
+
+[[package]]
+name = "django"
+version = "6.0.8"
+source = { registry = "https://pypi.org/simple" }
+EOF
+noop_filter_out_file="$(mktemp)"
+noop_filter_rc=0
+(
+  dir="$noop_filter_tmp"
+  # shellcheck disable=SC1091
+  source "${script_dir}/../scripts/lib/gnu-sed"
+  # shellcheck disable=SC1090
+  source <(
+    awk '/^py_constraint_op\(\)/,/^}$/' "$script"
+    awk '/^py_uv_version_at_least\(\)/,/^}$/' "$script"
+    awk '/^py_uv_lock_highest_version\(\)/,/^}$/' "$script"
+    awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script"
+    awk '/^py_uv_parse_verify_filter_pkg\(\)/,/^}$/' "$script"
+    awk '/^py_uv_parse_blame_direct_dep\(\)/,/^}$/' "$script"
+    awk '/^py_uv_try_lockfile_with_updates\(\)/,/^}$/' "$script"
+    awk '/^py_uv_filter_outdated_lines\(\)/,/^}$/' "$script"
+  )
+  # shellcheck disable=SC2317,SC2329
+  log() { :; }
+  # shellcheck disable=SC2317,SC2329
+  dep_runner_uv_dir_capture() {
+    local _label="$1"
+    local scan_root="$2"
+    shift 2
+    [[ "$1" == '--' ]] && shift
+    (cd "$scan_root" && PATH="${mock_uv_bin}:${PATH}" uv "$@")
+  }
+  # shellcheck disable=SC2317,SC2329
+  py_uv_floor_lock() {
+    local _label="$1"
+    local scan_root="$2"
+    shift 2
+    dep_runner_uv_dir_capture "$_label" "$scan_root" -- lock
+  }
+  py_uv_filter_outdated_lines "$noop_filter_tmp" "django 6.0.8 6.1"
+) >"$noop_filter_out_file" || noop_filter_rc=$?
+noop_filter_out="$(cat "$noop_filter_out_file")"
+rm -f "$noop_filter_out_file"
+if [[ "$noop_filter_rc" -eq 0 ]] \
+  && [[ "$noop_filter_out" == 'django 6.0.8 6.1' ]]; then
+  printf '[PASS] py-uv-compound: filter keeps django when rewrite is no-op and lock lands\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: no-op filter expected django 6.0.8 6.1, rc=%s out=%s\n' \
+    "$noop_filter_rc" "$noop_filter_out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$noop_filter_tmp"
+
 printf '\n=== static: npm packument helper and pnpm stale-high clamp ===\n'
 if grep -q '^npm_registry_dist_tag_latest()' "$script" \
   && grep -qF 'DEP_UPDATER_SKIP_NPM_REGISTRY' "$script" \
@@ -2066,14 +2422,13 @@ else
 fi
 
 batch_update_fn="$(awk '/^batch_update_all\(\)/,/^\}/' "$script")"
-batch_uv_lock_count=0
-batch_uv_lock_count="$(printf '%s' "$batch_update_fn" | grep -c 'dep_runner_uv_dir_capture "uv batch lock"' || true)"
-if (( batch_uv_lock_count == 1 )) \
+if grep -qF 'py_uv_floor_lock "uv batch lock"' <<<"$batch_update_fn" \
+  && grep -qF 'py_uv_floor_lock "uv batch lock verify"' <<<"$batch_update_fn" \
   && grep -qF 'uv_floor_batch' <<<"$batch_update_fn"; then
-  printf '[PASS] uv-batch-apply: single uv lock after all pyproject floor rewrites\n'
+  printf '[PASS] uv-batch-apply: age-gated uv lock after all pyproject floor rewrites\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] uv-batch-apply: batch_update_all must run one uv lock for floor bumps\n'
+  printf '[FAIL] uv-batch-apply: batch_update_all must run py_uv_floor_lock for floor bumps\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -2345,6 +2700,48 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$floor_restore_tmp"
+
+printf '\n=== behavioural: floor lock failure keeps security pyproject snapshot ===\n'
+floor_sec_tmp="$(mktemp -d)"
+(
+  cd "$floor_sec_tmp"
+  git init --quiet
+  git config user.email 'test@example.com'
+  git config user.name 'test'
+  printf 'name = "demo"\nversion = "0.1.0"\n' >pyproject.toml
+  printf 'ORIGINAL_LOCK\n' >uv.lock
+  git add pyproject.toml uv.lock
+  git commit --quiet -m 'init'
+)
+floor_sec_lock_bak="$(mktemp)"
+floor_sec_proj_bak="$(mktemp)"
+cp "${floor_sec_tmp}/uv.lock" "$floor_sec_lock_bak"
+printf 'name = "demo"\nversion = "0.1.0"\nidna==3.10\n' >"${floor_sec_tmp}/pyproject.toml"
+cp "${floor_sec_tmp}/pyproject.toml" "$floor_sec_proj_bak"
+printf 'name = "demo"\nversion = "0.2.0"\nidna==3.10\n' >"${floor_sec_tmp}/pyproject.toml"
+printf 'CORRUPTED_BY_FAILED_LOCK\n' >"${floor_sec_tmp}/uv.lock"
+(
+  # shellcheck disable=SC2317,SC2329
+  run_command() { shift; "$@" || true; }
+  # shellcheck disable=SC1090  # extracted helper from script under test
+  source <(awk '/^py_uv_restore_after_failed_floor_lock\(\)/,/^}$/' "$script")
+  py_uv_restore_after_failed_floor_lock "$floor_sec_tmp" "$floor_sec_lock_bak" "$floor_sec_proj_bak"
+)
+# shellcheck disable=SC2016  # assert literal 3-arg restore call in source
+if [[ "$(cat "${floor_sec_tmp}/uv.lock")" == 'ORIGINAL_LOCK' ]] \
+  && grep -qF 'idna==3.10' "${floor_sec_tmp}/pyproject.toml" \
+  && ! grep -qF '0.2.0' "${floor_sec_tmp}/pyproject.toml" \
+  && grep -cF 'py_uv_restore_after_failed_floor_lock "$worktree_path" "$lock_bak" "$pyproject_bak"' \
+    "$script" | grep -qx '2'; then
+  printf '[PASS] uv-batch-floor: restore from pyproject_bak keeps security constraint\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv-batch-floor: failed lock must restore pyproject_bak, not HEAD\n'
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$floor_sec_tmp"
+rm -f "$floor_sec_proj_bak"
+
 
 # batch path must call py_uv_lock_upgrade_package (not only py_update_one) and must
 # not uv add unconstrained packages (forces universal pins).
