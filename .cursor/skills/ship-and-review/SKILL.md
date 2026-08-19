@@ -100,7 +100,9 @@ deadline. Exhausted retries emit `ERROR: GITHUB_RATE_LIMIT`; wait budget expiry 
 as a hard local failure while NOTES show an active wait — let the wait finish, then resume.
 When GraphQL already shows unresolved review threads, `loop` exits **3** immediately and
 does **not** wait on REST issue-comment pagination, `gh api user`, or an in-flight
-CodeRabbit workflow (repository-helpers#497). Unaddressed comments beat waiting.
+CodeRabbit workflow (repository-helpers#497). Threads that appear **while** waiting
+(CodeRabbit on-push, poll sleep, or `check` exit 5) also abort with exit **3**
+(repository-helpers#501). Unaddressed comments beat waiting.
 
 Use `scripts/dev/ship-and-review --no-agent-review` when you only want submit + CI (no loop).
 Use `--no-submit --pr <n>` when the PR already exists (CI + loop only).
