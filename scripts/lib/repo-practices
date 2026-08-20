@@ -223,6 +223,7 @@ Audits GitHub conventions for org repositories:
     - top-level license file
     - copyright notice
     - CODEOWNERS with a repository-wide owner rule
+    - .cursor/rules/git-commit-identity.mdc (no agent/machine co-authors; cli-config attribution)
     - .cursor/rules/pr-ship-and-review.mdc (canonical agent review loop)
     - .cursor/rules/read-agents-and-rules.mdc (session-start: read AGENTS.md + rules)
     - .cursor/rules/repo-practices-after-config-change.mdc (run github-repo-lint after config/workflow edits)
@@ -1450,6 +1451,169 @@ rp_check_stacking_docs_consistency() {
     fi
     rp_log_check_ok "$slug" 'stacking docs consistency (graphite marker)' \
       "$(rp_github_url "$slug" "/blob/main/${stacking_tool_marker_relpath}")"
+  fi
+
+  return "$repo_fail"
+}
+
+readonly rp_git_commit_identity_path='.cursor/rules/git-commit-identity.mdc'
+
+rp_git_commit_identity_template() {
+  local path
+
+  path="${rp_lib_dir}/repo-practices-cursor/git-commit-identity.mdc"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing cursor rule template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat git-commit-identity template" -- cat "$path"
+}
+
+rp_git_commit_identity_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_git_commit_identity_path}"
+      if [[ -f "$local_path" ]]; then
+        rp_runner_exec_stdout "repo-practices cat local git-commit-identity" -- \
+          cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_git_commit_identity_template
+}
+
+# True when AGENTS.md already documents commit-identity / no-co-author policy
+# (soft suggest only — absence does not fail the audit).
+rp_agents_md_mentions_git_commit_identity() {
+  local -r text="$1"
+
+  grep -qiE \
+    'git commit identity|Co-authored-by|Made-with:[[:space:]]*Cursor|attributeCommitsToAgent|cli-config\.json' \
+    <<<"$text"
+}
+
+# True when the cursor rule forbids agent/machine co-authors, requires git
+# user.name/user.email, and instructs agents to verify ~/.cursor/cli-config.json.
+rp_git_commit_identity_is_valid() {
+  local -r text="$1"
+  local cli_config_needle tilde
+
+  # Literal "~/.cursor/…" needle (not home expansion); avoid SC2088 on quoted tilde.
+  tilde='~'
+  cli_config_needle="${tilde}/.cursor/cli-config.json"
+
+  if ! grep -qE '^alwaysApply:[[:space:]]*true([[:space:]]|$)' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qF 'Co-authored-by' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qF 'Made-with: Cursor' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qF -- '--trailer' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qF 'user.name' <<<"$text" || ! grep -qF 'user.email' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qF "$cli_config_needle" <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qF 'attributeCommitsToAgent' <<<"$text" \
+    || ! grep -qF 'attributePRsToAgent' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qiE 'alert|warn|stop|ask|tell|remind' <<<"$text"; then
+    return 1
+  fi
+  return 0
+}
+
+rp_check_git_commit_identity() {
+  local slug="$1"
+  local repo_fail=0
+  local rule_text agents_text repo_dir local_path
+  local fetch_ec=0
+  local agents_ec=0
+
+  # Prefer the local dogfood copy when auditing this repo from a clone/worktree
+  # (new-rule PRs are not on origin/main yet; GitHub Contents would false-fail).
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_git_commit_identity_path}"
+      if [[ -f "$local_path" ]]; then
+        rule_text="$(rp_runner_exec_stdout "repo-practices cat local git-commit-identity check" -- \
+          cat "$local_path")"
+      fi
+    fi
+  fi
+  if [[ -z "${rule_text:-}" ]]; then
+    rule_text="$(rp_fetch_github_text_file "$slug" "$rp_git_commit_identity_path")" \
+      || fetch_ec=$?
+  fi
+  if (( fetch_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" "could not read ${rp_git_commit_identity_path}"
+    return 1
+  fi
+  if [[ -z "$rule_text" ]]; then
+    repo_fail=1
+    rp_log_check_fail "$slug" \
+      'git-commit-identity cursor rule (.cursor/rules/git-commit-identity.mdc)' \
+      "$(rp_github_url "$slug" '/new/main/.cursor/rules/git-commit-identity.mdc')"
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_git_commit_identity_path" \
+        "$(rp_git_commit_identity_content_for_apply_fix "$slug")" \
+        'add-git-commit-identity' \
+        'chore: add git-commit-identity cursor rule'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add .cursor/rules/git-commit-identity.mdc (template: scripts/lib/repo-practices-cursor/)"
+    fi
+  elif ! rp_git_commit_identity_is_valid "$rule_text"; then
+    repo_fail=1
+    rp_log_check_fail "$slug" \
+      'git-commit-identity rule must forbid Co-authored-by / Made-with: Cursor / --trailer, require git user.name/user.email, and require checking ~/.cursor/cli-config.json attribution (alwaysApply: true)' \
+      "$(rp_github_url "$slug" "/blob/main/${rp_git_commit_identity_path}")"
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_git_commit_identity_path" \
+        "$(rp_git_commit_identity_content_for_apply_fix "$slug")" \
+        'sync-git-commit-identity' \
+        'chore: sync git-commit-identity cursor rule'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: sync .cursor/rules/git-commit-identity.mdc to forbid agent/machine co-authors and require cli-config attribution checks"
+    fi
+  else
+    rp_log_check_ok "$slug" 'git-commit-identity cursor rule' \
+      "$(rp_github_url "$slug" "/blob/main/${rp_git_commit_identity_path}")"
+  fi
+
+  # Soft suggest only: document policy in AGENTS.md when present (never fail).
+  if [[ "$rp_suggest" -eq 1 ]]; then
+    agents_text=""
+    if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+      repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+      if [[ -n "$repo_dir" && -f "${repo_dir}/${rp_agents_md_path}" ]]; then
+        agents_text="$(rp_runner_exec_stdout "repo-practices cat local AGENTS.md" -- \
+          cat "${repo_dir}/${rp_agents_md_path}")"
+      fi
+    fi
+    if [[ -z "$agents_text" ]]; then
+      agents_text="$(rp_fetch_github_text_file "$slug" "$rp_agents_md_path")" || agents_ec=$?
+    fi
+    if (( agents_ec != 2 )) && [[ -n "$agents_text" ]] \
+      && ! rp_agents_md_mentions_git_commit_identity "$agents_text"; then
+      rp_log_suggest \
+        "${slug}: optionally document commit-identity policy in AGENTS.md (no Co-authored-by / cli-config attribution)"
+    fi
   fi
 
   return "$repo_fail"
@@ -5606,6 +5770,7 @@ rp_print_new_repo_checklist() {
     Docs in the service repo:
       [ ] LICENSE with copyright notice
       [ ] CODEOWNERS with * @OWNER so all code requires CODEOWNER review
+      [ ] .cursor/rules/git-commit-identity.mdc (no agent/machine co-authors; cli-config attribution; template in ${rp_THIS_REPO_NAME})
       [ ] .cursor/rules/pr-ship-and-review.mdc (agent review loop; template in ${rp_THIS_REPO_NAME})
       [ ] .cursor/rules/read-agents-and-rules.mdc (session-start read AGENTS.md + rules; template in ${rp_THIS_REPO_NAME})
       [ ] .cursor/rules/repo-practices-after-config-change.mdc (run github-repo-lint after config/workflow edits; template in ${rp_THIS_REPO_NAME})
@@ -6865,6 +7030,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_license_metadata "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_git_commit_identity "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_pr_ship_and_review_rule "$slug"; then
