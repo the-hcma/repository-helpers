@@ -158,7 +158,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
 | License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
 | Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` + `.cursor/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve |
-| Git commit identity cursor rule | yes | — | `.cursor/rules/git-commit-identity.mdc` forbids agent/machine co-authors; agents must verify `~/.cursor/cli-config.json` attribution is disabled |
+| Git commit identity cursor rule | yes | — | `.cursor/rules/git-commit-identity.mdc` forbids agent/machine co-authors; agents must verify commit signing (`commit.gpgsign` / `user.signingkey`) and `~/.cursor/cli-config.json` attribution, and surface setup instructions when either is missing |
 | Repo practices after config change | yes | — | `.cursor/rules/repo-practices-after-config-change.mdc` requires `github-repo-lint` after workflow/config edits; `pre-pr-checks` runs detect-first `repo-practices-lint` when the diff touches those paths |
 | Session-start read guidance | yes | — | `.cursor/rules/read-agents-and-rules.mdc` requires reading `AGENTS.md` and `.cursor/rules/` at the start of every new agent session |
 | Stacking-tool marker + rule | yes | — | `.github/stacking-tool` (`graphite`\|`gh-stack`) and thin `.cursor/rules/stacking-tool.mdc` (skill breadcrumbs; no copied skill bodies) |
