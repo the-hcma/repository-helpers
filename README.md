@@ -22,13 +22,13 @@ Most entry points accept `--help`.
 | Tool | What it does |
 | --- | --- |
 | [`dep-updater`](#dep-updater) | Stacked dependency update PRs for one repo (or batch across clones) |
+| [`dep-updater-batch-run`](#dep-updater-batch-run) | Daily `dep-updater --batch --all` + email report (systemd entry point) |
 | [`github-repo-lint`](#github-repo-lint) | Audit / onboard org repos against practices (merge queue, workflows, …) |
 | [`secret-scan`](#secret-scanning) | Local + CI gitleaks scan for leaked credentials (canonical org helper) |
-| [`dep-updater-batch-run`](#dep-updater-batch-run) | Daily `dep-updater --batch --all` + email report (systemd entry point) |
-| [`wait-for-agent-review`](#wait-for-agent-review--ship-and-review) | PR agent review loop (triage, quota fallback, operator email) |
+| [`setup-service` / systemd](#systemd--services) | Install and inspect optional daily user services |
 | [`ship-and-review`](#wait-for-agent-review--ship-and-review) | Submit stack → wait for CI → agent review loop |
 | [`start-development` / ship helpers](#development-workflow) | Worktrees, local CI gates, stack submit, CI wait |
-| [`setup-service` / systemd](#systemd--services) | Install and inspect optional daily user services |
+| [`wait-for-agent-review`](#wait-for-agent-review--ship-and-review) | PR agent review loop (triage, quota fallback, operator email) |
 
 ### `dep-updater`
 
@@ -60,6 +60,18 @@ scripts/dep-updater --batch --all --no-wait-ci --no-wait-merge
 Useful flags: `--ecosystem npm|python|rust|gha|auto`, `--report-json` (implies
 `--dry-run --quiet`), `--merge-via gh|merge-queue`, `--cleanup`, `--rebase`.
 See [Dependency Updates](#dependency-updates) for ecosystem policy details.
+
+### `dep-updater-batch-run`
+
+Entry point for the daily **dep-updater** systemd service: `git fetch`, then
+`dep-updater --batch --all`, then an SMTP (or `--print`) report. Configure
+`~/.config/dep-updater.env` from `etc/dep-updater.env.example`.
+
+```bash
+DEP_UPDATER_BATCH_SCAN_ROOT=/path/to/repos scripts/dep-updater-batch-run --print
+systemctl --user start dep-updater.service
+tail --follow=name --retry ~/scratch/repository-helpers/dep-updater-batch.log
+```
 
 ### `github-repo-lint`
 
@@ -124,17 +136,53 @@ hatch: `PRE_PR_CHECKS_SKIP=secret-scan`). CI `secret-scan` still runs after push
 for triage. Full-history / intake / periodic deep scans (TruffleHog) are
 [#509](https://github.com/the-hcma/repository-helpers/issues/509).
 
-### `dep-updater-batch-run`
+### Development workflow
 
-Entry point for the daily **dep-updater** systemd service: `git fetch`, then
-`dep-updater --batch --all`, then an SMTP (or `--print`) report. Configure
-`~/.config/dep-updater.env` from `etc/dep-updater.env.example`.
+| Script | Purpose | Typical invocation |
+| --- | --- | --- |
+| `scripts/dev/approve-pending-deployments` | Approve WAITING GitHub environments (`github-repo-lint`, `dep-updater`) | `scripts/dev/approve-pending-deployments --pr <n>` |
+| `scripts/dev/post-pr-submission-checks` | Poll required checks; print agent-friendly failure logs | `scripts/dev/post-pr-submission-checks --pr <n>` |
+| `scripts/dev/pre-pr-checks` | Detect-first local CI (shellcheck, tests, Python/TS/Rust when present; secret-scan when adopted) | from `.worktrees/<stack>-wt`: `scripts/dev/pre-pr-checks` |
+| `scripts/dev/start-development` | Prune/sync; create or resume a stack worktree | `scripts/dev/start-development --worktree my-change --no-interactive` |
+| `scripts/dev/submit-stack` | `pre-pr-checks` → stack submit → CI wait | `scripts/dev/submit-stack` |
+
+Never implement on the primary clone — always `cd` into the stack worktree first.
+See [Development](#development).
+
+### Other helpers
+
+| Script | Purpose |
+| --- | --- |
+| `scripts/check-lockfile-drift` | Compare lockfiles to registry constraints (safe throwaway worktree) |
+| `scripts/check-merge-settings` | Thin wrapper: merge + GitHub MQ checks only |
+| `scripts/grandfather-pnpm-release-age` | One-time pnpm `minimumReleaseAge` / exclude cutover for existing lockfiles |
+| `scripts/on-deploy` | Example deploy hook; consumer repos implement their own |
+| `scripts/trigger-agent-review` | Request a review from the configured agent profile |
+
+Shared libraries live under `scripts/lib/` (`agent-review`, `ci-secret-scan`,
+`on-deploy-deps`, `release-age-defaults`, `repo-practices`, `runner`, …).
+
+### Systemd / services
+
+| Script | Purpose |
+| --- | --- |
+| `scripts/setup-github-repo-lint` | Install `github-repo-lint` enforcer unit + timer |
+| `scripts/setup-service` | Install worktree-aware `dep-updater` systemd user unit + timer |
+| `scripts/show-services` | Read-only status of all service templates in this repo |
 
 ```bash
-DEP_UPDATER_BATCH_SCAN_ROOT=/path/to/repos scripts/dep-updater-batch-run --print
-systemctl --user start dep-updater.service
-tail --follow=name --retry ~/scratch/repository-helpers/dep-updater-batch.log
+scripts/setup-service --status
+scripts/setup-github-repo-lint --status
+scripts/show-services
 ```
+
+### Upcoming
+
+Tracked work that extends the tools above (not shipped yet):
+
+| Issue | What it will add |
+| --- | --- |
+| [#509](https://github.com/the-hcma/repository-helpers/issues/509) | New **TruffleHog**-based deep secret/credential audit: full git history on repo intake, durable `.github/` intake marker, `github-repo-lint` check for the marker, and periodic org/timer (or workflow) sweeps. Complements — does not replace — the fast gitleaks PR / pre-submit gate. |
 
 ### `wait-for-agent-review` / `ship-and-review`
 
@@ -158,54 +206,6 @@ submit → CI wait (approves WAITING environments on the operator’s behalf) �
 scripts/dev/ship-and-review
 scripts/dev/ship-and-review --no-submit --pr <n>   # PR already open
 ```
-
-### Development workflow
-
-| Script | Purpose | Typical invocation |
-| --- | --- | --- |
-| `scripts/dev/start-development` | Prune/sync; create or resume a stack worktree | `scripts/dev/start-development --worktree my-change --no-interactive` |
-| `scripts/dev/pre-pr-checks` | Detect-first local CI (shellcheck, tests, Python/TS/Rust when present; secret-scan when adopted) | from `.worktrees/<stack>-wt`: `scripts/dev/pre-pr-checks` |
-| `scripts/dev/submit-stack` | `pre-pr-checks` → stack submit → CI wait | `scripts/dev/submit-stack` |
-| `scripts/dev/post-pr-submission-checks` | Poll required checks; print agent-friendly failure logs | `scripts/dev/post-pr-submission-checks --pr <n>` |
-| `scripts/dev/approve-pending-deployments` | Approve WAITING GitHub environments (`github-repo-lint`, `dep-updater`) | `scripts/dev/approve-pending-deployments --pr <n>` |
-
-Never implement on the primary clone — always `cd` into the stack worktree first.
-See [Development](#development).
-
-### Systemd / services
-
-| Script | Purpose |
-| --- | --- |
-| `scripts/setup-service` | Install worktree-aware `dep-updater` systemd user unit + timer |
-| `scripts/setup-github-repo-lint` | Install `github-repo-lint` enforcer unit + timer |
-| `scripts/show-services` | Read-only status of all service templates in this repo |
-
-```bash
-scripts/setup-service --status
-scripts/setup-github-repo-lint --status
-scripts/show-services
-```
-
-### Other helpers
-
-| Script | Purpose |
-| --- | --- |
-| `scripts/check-merge-settings` | Thin wrapper: merge + GitHub MQ checks only |
-| `scripts/check-lockfile-drift` | Compare lockfiles to registry constraints (safe throwaway worktree) |
-| `scripts/grandfather-pnpm-release-age` | One-time pnpm `minimumReleaseAge` / exclude cutover for existing lockfiles |
-| `scripts/trigger-agent-review` | Request a review from the configured agent profile |
-| `scripts/on-deploy` | Example deploy hook; consumer repos implement their own |
-
-Shared libraries live under `scripts/lib/` (`runner`, `repo-practices`,
-`agent-review`, `ci-secret-scan`, `on-deploy-deps`, `release-age-defaults`, …).
-
-### Upcoming
-
-Tracked work that extends the tools above (not shipped yet):
-
-| Issue | What it will add |
-| --- | --- |
-| [#509](https://github.com/the-hcma/repository-helpers/issues/509) | New **TruffleHog**-based deep secret/credential audit: full git history on repo intake, durable `.github/` intake marker, `github-repo-lint` check for the marker, and periodic org/timer (or workflow) sweeps. Complements — does not replace — the fast gitleaks PR / pre-submit gate. |
 
 ## Daily Services
 
