@@ -36,9 +36,9 @@ Creates **stacked dependency update PRs** for a single repository (or, with
 `--batch --all`, every clone under configured scan roots). Supported ecosystems:
 npm/pnpm, Python (`pip`, `uv`, `poetry`, `pipenv`), Rust/Cargo, and GitHub Actions.
 Stacking follows the target repo’s `.github/stacking-tool` marker (`gh-stack` when
-absent; explicit `graphite` keeps Graphite). Registry releases newer than **9 days**
-are skipped unless the bump fixes a CVE. Work runs in a throwaway worktree under
-`--tmpdir` — the primary clone is not used for stack submit.
+absent; explicit `graphite` keeps Graphite). npm, PyPI, and GitHub Actions releases
+newer than **9 days** are skipped unless the bump fixes a CVE. Work runs in a
+throwaway worktree under `--tmpdir` — the primary clone is not used for stack submit.
 
 ```bash
 # Preview the plan (no git / worktree changes)
@@ -63,12 +63,16 @@ See [Dependency Updates](#dependency-updates) for ecosystem policy details.
 
 ### `dep-updater-batch-run`
 
-Entry point for the daily **dep-updater** systemd service: `git fetch`, then
-`dep-updater --batch --all`, then an SMTP (or `--print`) report. Configure
-`~/.config/dep-updater.env` from `etc/dep-updater.env.example`.
+In service mode, this entry point runs `git fetch`, then `dep-updater --batch --all`,
+and sends an SMTP report. `--print` writes the report to stdout instead; it skips
+SMTP and the batch run. Configure `~/.config/dep-updater.env` from
+`etc/dep-updater.env.example`.
 
 ```bash
+# Report-only (no batch, no SMTP)
 DEP_UPDATER_BATCH_SCAN_ROOT=/path/to/repos scripts/dep-updater-batch-run --print
+
+# Full daily worker
 systemctl --user start dep-updater.service
 tail --follow=name --retry ~/scratch/repository-helpers/dep-updater-batch.log
 ```
@@ -102,7 +106,7 @@ scripts/github-repo-lint --repo OWNER/NAME --apply-fix
 scripts/github-repo-lint --enforcer
 ```
 
-Requires authenticated `gh` and `jq`. Merge-queue-only subset:
+Requires an authenticated `gh` CLI and `jq`. Merge-queue-only subset:
 `scripts/check-merge-settings` (same flags, `--merge-only` behavior). Full check
 table: [github-repo-lint checks](#github-repo-lint-checks).
 
@@ -276,8 +280,8 @@ policy defaults:
   prefix style, updating major-only pins only on newer majors, and skipping SHA or
   local action pins.
 
-For npm packages, registry releases newer than 9 days are skipped unless the bump
-fixes a CVE.
+For npm, PyPI, and GitHub Actions, registry releases newer than 9 days are skipped
+unless the bump fixes a CVE.
 
 See [dep-updater.plan.md](dep-updater.plan.md) for implementation details and
 [dep-updater-hybrid-architecture.plan.md](dep-updater-hybrid-architecture.plan.md)
