@@ -370,6 +370,116 @@ else
   fail_case 'repo-practices-lint detect-first wiring in ecosystem and pre-pr-checks'
 fi
 
+printf '\n=== static: secret-scan wiring ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'prec_should_plan_secret_scan' "$ecosystem_lib" \
+  && grep -qF 'prec_run_secret_scan' "$ecosystem_lib" \
+  && grep -qF 'prec_secret_scan_set_range_env' "$ecosystem_lib" \
+  && grep -qF 'GITLEAKS_BASE' "$ecosystem_lib" \
+  && grep -qF 'scripts/dev/secret-scan' "$ecosystem_lib" \
+  && grep -qF '.github/ci/secret-scan' "$ecosystem_lib" \
+  && grep -qF "secret-scan) start_parallel_job 'secret-scan' prec_run_secret_scan" "$pre_pr_checks" \
+  && grep -qF 'PRE_PR_CHECKS_SKIP=secret-scan' "$pre_pr_checks"; then
+  pass_case 'secret-scan detect-first wiring in ecosystem and pre-pr-checks'
+else
+  fail_case 'secret-scan detect-first wiring in ecosystem and pre-pr-checks'
+fi
+
+printf '\n=== detect: secret-scan with .github/ci/secret-scan ===\n'
+ss_ci_fix="$(mktemp -d)"
+make_git_fixture "$ss_ci_fix"
+mkdir -p "${ss_ci_fix}/.github/ci"
+printf '#!/usr/bin/env bash\ntrue\n' >"${ss_ci_fix}/.github/ci/secret-scan"
+commit_all "$ss_ci_fix"
+unset PRE_PR_CHECKS_SKIP
+prec_detect_profile "$ss_ci_fix"
+planned="$(prec_format_planned_jobs)"
+detected="$(prec_format_detected)"
+if [[ "$detected" == *secret-scan* && "$planned" == *secret-scan* ]]; then
+  pass_case 'ci secret-scan script: plans secret-scan job'
+else
+  fail_case "ci secret-scan script: plans secret-scan (detected=${detected} planned=${planned})"
+fi
+rm -rf "$ss_ci_fix"
+
+printf '\n=== detect: helpers-style with scripts/dev/secret-scan ===\n'
+ss_hs_fix="$(mktemp -d)"
+make_git_fixture "$ss_hs_fix"
+mkdir -p "${ss_hs_fix}/scripts/dev" "${ss_hs_fix}/scripts/lib"
+printf '#!/usr/bin/env bash\ntrue\n' >"${ss_hs_fix}/scripts/dev/pre-pr-checks"
+printf '#!/usr/bin/env bash\ntrue\n' >"${ss_hs_fix}/scripts/dev/secret-scan"
+printf '# shellcheck shell=bash\ntrue\n' >"${ss_hs_fix}/scripts/lib/ci-secret-scan"
+commit_all "$ss_hs_fix"
+prec_detect_profile "$ss_hs_fix"
+planned="$(prec_format_planned_jobs)"
+if [[ "$planned" == *secret-scan* ]]; then
+  pass_case 'helpers-style with secret-scan: plans secret-scan'
+else
+  fail_case "helpers-style with secret-scan: plans secret-scan (got ${planned})"
+fi
+export PRE_PR_CHECKS_SKIP='secret-scan'
+prec_detect_profile "$ss_hs_fix"
+planned="$(prec_format_planned_jobs)"
+if [[ "$planned" != *secret-scan* ]]; then
+  pass_case 'PRE_PR_CHECKS_SKIP=secret-scan removes job'
+else
+  fail_case "PRE_PR_CHECKS_SKIP=secret-scan removes job (got ${planned})"
+fi
+unset PRE_PR_CHECKS_SKIP
+rm -rf "$ss_hs_fix"
+
+printf '\n=== detect: no secret-scan without adoption ===\n'
+ss_none_fix="$(mktemp -d)"
+make_git_fixture "$ss_none_fix"
+printf 'hello\n' >"${ss_none_fix}/README.md"
+commit_all "$ss_none_fix"
+prec_detect_profile "$ss_none_fix"
+planned="$(prec_format_planned_jobs)"
+if [[ "$planned" != *secret-scan* ]]; then
+  pass_case 'plain repo: does not plan secret-scan'
+else
+  fail_case "plain repo: does not plan secret-scan (got ${planned})"
+fi
+rm -rf "$ss_none_fix"
+
+printf '\n=== prec_run_secret_scan leak failure (stub gitleaks) ===\n'
+ss_run_fix="$(mktemp -d "${TMPDIR:-/tmp}/prec-ss-run.XXXXXX")"
+make_git_fixture "$ss_run_fix"
+mkdir -p "${ss_run_fix}/.github/ci" "${ss_run_fix}/stub-bin"
+cp "${script_dir}/../scripts/lib/ci-secret-scan" "${ss_run_fix}/.github/ci/secret-scan"
+chmod +x "${ss_run_fix}/.github/ci/secret-scan"
+(
+  cd "$ss_run_fix"
+  git add -A
+  git commit -q -m 'add secret-scan'
+  git branch -M main
+  git checkout -q -b feat/leak
+  # Intentionally fake credential pattern for gitleaks stub path only.
+  printf 'aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n' >leak.txt
+  git add leak.txt
+  git commit -q -m 'plant leak'
+)
+# shellcheck disable=SC2016  # stub body is literal; prints mitigation-compatible exit
+cat >"${ss_run_fix}/stub-bin/gitleaks" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'leaks found\n' >&2
+exit 1
+STUB
+chmod +x "${ss_run_fix}/stub-bin/gitleaks"
+ss_run_out=""
+ss_run_rc=0
+ss_run_out="$(
+  PATH="${ss_run_fix}/stub-bin:${PATH}" \
+    prec_run_secret_scan "$ss_run_fix" 2>&1
+)" || ss_run_rc=$?
+if [[ "$ss_run_rc" -ne 0 ]] && grep -qF 'ERROR: SECRET_SCAN_LEAK' <<<"$ss_run_out"; then
+  pass_case 'prec_run_secret_scan fails with SECRET_SCAN_LEAK mitigation on stub leak'
+else
+  fail_case "prec_run_secret_scan fails with SECRET_SCAN_LEAK (rc=${ss_run_rc} out=${ss_run_out})"
+fi
+rm -rf "$ss_run_fix"
+
 printf '\n=== prec_run_repo_practices_lint execution ===\n'
 exec_fix="$(mktemp -d "${TMPDIR:-/tmp}/prec-rp-exec.XXXXXX")"
 make_git_fixture "$exec_fix"
