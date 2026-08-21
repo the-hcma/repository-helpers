@@ -240,8 +240,8 @@ scripts/dev/secret-scan            # optional: same gitleaks path without full p
 scripts/dev/submit-stack           # pre-pr-checks + stack submit + CI wait
 ```
 
-`pre-pr-checks` plans a **secret-scan** job when `.github/ci/secret-scan` exists (or in
-this repo via `scripts/dev/secret-scan`). That is the submit-path gate; CI
+`pre-pr-checks` plans a **secret-scan** job when `.github/ci/secret-scan` or
+`scripts/dev/secret-scan` exists. That is the submit-path gate; CI
 `secret-scan` still runs after push for triage. Skip only with
 `PRE_PR_CHECKS_SKIP=secret-scan`. Org-wide / historical deep scans are tracked
 separately (repository-helpers#509).

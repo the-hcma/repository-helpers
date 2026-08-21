@@ -490,10 +490,10 @@ Service repositories install via `scripts/setup-service` and optionally implemen
   - **Python** (`pyproject.toml`): prefer `.github/ci/python-static`; else `uv run` ruff check/format + pyright
   - **TypeScript**: `web/package.json` → pnpm install + typecheck/build; else root pnpm (only when no `web/`) → `pnpm run check` (or typecheck/lint). Both layouts: web wins; root is not also planned.
   - **Rust** (`Cargo.toml`): `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`
-  - **Secret scan**: when `.github/ci/secret-scan` is present, or helpers-style with
-    `scripts/dev/secret-scan` — runs canonical gitleaks (`scripts/lib/ci-secret-scan`)
-    before submit (branch-vs-`main` range when possible). CI `secret-scan` remains
-    post-push triage; this is the submit-path gate (see also deep/org scan #509).
+  - **Secret scan**: when `.github/ci/secret-scan` or `scripts/dev/secret-scan` is
+    present — runs canonical gitleaks (`scripts/lib/ci-secret-scan`) before submit
+    (branch-vs-`main` range when possible). CI `secret-scan` remains post-push
+    triage; this is the submit-path gate (see also deep/org scan #509).
     Skip with `PRE_PR_CHECKS_SKIP=secret-scan`. Manual: `scripts/dev/secret-scan`.
   - Escape hatch: `PRE_PR_CHECKS_SKIP=job1,job2` (documented; no silent skip). Do **not** bypass a failing run with ad-hoc substitutes.
   - Also verifies the **primary worktree** is unchanged when checks finish.
