@@ -235,9 +235,16 @@ gh stack init my-change/topic
 Local quality gates and submit (prefer these over bare `gh stack submit` / `gt submit`):
 
 ```bash
-scripts/dev/pre-pr-checks          # bash -n, shellcheck, all tests/*.test
+scripts/dev/pre-pr-checks          # detect-first local CI mirror (includes secret-scan when adopted)
+scripts/dev/secret-scan            # optional: same gitleaks path without full pre-pr
 scripts/dev/submit-stack           # pre-pr-checks + stack submit + CI wait
 ```
+
+`pre-pr-checks` plans a **secret-scan** job when `.github/ci/secret-scan` or
+`scripts/dev/secret-scan` exists. That is the submit-path gate; CI
+`secret-scan` still runs after push for triage. Skip only with
+`PRE_PR_CHECKS_SKIP=secret-scan`. Org-wide / historical deep scans are tracked
+separately (repository-helpers#509).
 
 End-to-end ship (submit + CI + agent review loop):
 
@@ -296,7 +303,8 @@ for the full review playbook; skills under `.cursor/skills/{graphite,gh-stack}/`
 | `scripts/setup-github-repo-lint` | Install repo-lint timer/service. |
 | `scripts/show-services` | Status of all service templates in this repo. |
 | `scripts/dev/start-development` | Worktree + marker-aware stack sync. |
-| `scripts/dev/pre-pr-checks` | Full local CI mirror. |
+| `scripts/dev/pre-pr-checks` | Full local CI mirror (incl. secret-scan when adopted). |
+| `scripts/dev/secret-scan` | Local gitleaks (canonical `ci-secret-scan`). |
 | `scripts/dev/submit-stack` | Checks, submit, CI wait. |
 | `scripts/dev/post-pr-submission-checks` | PR CI poll + agent-friendly failure logs. |
 | `scripts/dev/ship-and-review` | Submit + CI + agent review loop. |

@@ -21,7 +21,8 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | Deploy hook | `scripts/on-deploy` | Example hook; consumer repos implement their own. |
 | Agent review | `scripts/wait-for-agent-review`, `scripts/trigger-agent-review` | PR review loop, triage, operator email (no self-approve). |
 | Dev workflow | `scripts/dev/start-development` | Worktree + Graphite sync entry point. |
-| Dev workflow | `scripts/dev/pre-pr-checks` | Detect-first local CI gates (bash + Python/TS/Rust when present). |
+| Dev workflow | `scripts/dev/pre-pr-checks` | Detect-first local CI gates (bash + Python/TS/Rust when present; secret-scan when adopted). |
+| Dev workflow | `scripts/dev/secret-scan` | Local gitleaks via canonical `ci-secret-scan` (same as CI / pre-pr secret-scan job). |
 | Dev workflow | `scripts/dev/submit-stack` | `pre-pr-checks` → `gt submit` → `post-pr-submission-checks`. |
 | Dev workflow | `scripts/dev/approve-pending-deployments` | Approve WAITING environment jobs on the operator's behalf. |
 | Dev workflow | `scripts/dev/post-pr-submission-checks` | Wait for PR CI; print agent-friendly failure excerpts. |
@@ -489,6 +490,11 @@ Service repositories install via `scripts/setup-service` and optionally implemen
   - **Python** (`pyproject.toml`): prefer `.github/ci/python-static`; else `uv run` ruff check/format + pyright
   - **TypeScript**: `web/package.json` → pnpm install + typecheck/build; else root pnpm (only when no `web/`) → `pnpm run check` (or typecheck/lint). Both layouts: web wins; root is not also planned.
   - **Rust** (`Cargo.toml`): `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`
+  - **Secret scan**: when `.github/ci/secret-scan` or `scripts/dev/secret-scan` is
+    present — runs canonical gitleaks (`scripts/lib/ci-secret-scan`) before submit
+    (branch-vs-`main` range when possible). CI `secret-scan` remains post-push
+    triage; this is the submit-path gate (see also deep/org scan #509).
+    Skip with `PRE_PR_CHECKS_SKIP=secret-scan`. Manual: `scripts/dev/secret-scan`.
   - Escape hatch: `PRE_PR_CHECKS_SKIP=job1,job2` (documented; no silent skip). Do **not** bypass a failing run with ad-hoc substitutes.
   - Also verifies the **primary worktree** is unchanged when checks finish.
 - Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).
