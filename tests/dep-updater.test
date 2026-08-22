@@ -1171,6 +1171,9 @@ chmod +x "${fnm_path}/gt"
 cat >"${fnm_path}/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-}" == "stack" ]]; then
+  exit 0
+fi
 exit 0
 EOF
 chmod +x "${fnm_path}/gh"
@@ -1178,7 +1181,7 @@ chmod +x "${fnm_path}/gh"
 dry_output=""
 dry_exit=0
 set +e
-dry_output="$(env HOME="$tmp_home" PATH="$(dep_test_path_no_gh_gt)" \
+dry_output="$(env HOME="$tmp_home" PATH="${fnm_path}:$(dep_test_path_no_gh_gt)" \
   "$script" --dry-run --dir "$tmp_repo" 2>&1)"
 dry_exit=$?
 set -e
@@ -2627,6 +2630,62 @@ else
   printf '[FAIL] uv transitive apply: expected upgrade-package, --exclude-newer-package only, time_log cutoff\n'
   fail=$(( fail + 1 ))
 fi
+
+normalize_fn="$(awk '/^py_uv_normalize_lock\(\)/,/^}$/' "$script")"
+lock_check_fn="$(awk '/^py_uv_lock_check\(\)/,/^}$/' "$script")"
+# shellcheck disable=SC2016  # assert literal uv lock subcommand tokens in source
+if grep -qF 'py_uv_normalize_lock' "$script" \
+  && grep -qF 'py_uv_lock_check' "$script" \
+  && grep -qF 'lock --check' <<<"$lock_check_fn" \
+  && grep -qF 'dep_runner_uv_dir_capture "$label" "$uv_dir" -- lock' <<<"$normalize_fn" \
+  && ! grep -qF -- '--exclude-newer-package' <<<"$normalize_fn"; then
+  printf '[PASS] uv lock normalize: plain lock + --check helpers (no exclude-newer in normalize)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv lock normalize: expected py_uv_normalize_lock + py_uv_lock_check without exclude-newer\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'py_uv_normalize_lock "uv lock normalize"' "$script" \
+  && grep -qF 'py_uv_normalize_lock "uv batch lock normalize"' "$script" \
+  && grep -qF 'py_uv_lock_check "uv batch lock --check"' "$script"; then
+  printf '[PASS] uv lock normalize: single and batch paths normalize before git add\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv lock normalize: missing normalize/--check before staging uv.lock\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== behavioural: plain uv lock strips exclude-newer-package from uv.lock ===\n'
+norm_strip_tmp="$(mktemp -d)"
+if command -v uv >/dev/null 2>&1; then
+  norm_strip_rc=0
+  (
+    uv init "$norm_strip_tmp" --lib --name norm-strip-test --vcs none >/dev/null 2>&1
+    cd "$norm_strip_tmp"
+    uv add anyio --no-sync >/dev/null 2>&1
+    gnu_sed_bin="$(command -v gsed || command -v sed)"
+    "$gnu_sed_bin" -i '/^requires-python/a\
+\
+[options.exclude-newer-package]\
+zipp = "2026-01-01T00:00:00Z"\
+' uv.lock
+    uv lock >/dev/null 2>&1
+  ) || norm_strip_rc=$?
+  if [[ "$norm_strip_rc" -eq 0 ]] \
+    && ! grep -qF '[options.exclude-newer-package]' "${norm_strip_tmp}/uv.lock" \
+    && (cd "$norm_strip_tmp" && uv lock --check >/dev/null 2>&1); then
+    printf '[PASS] uv lock normalize: plain uv lock removes exclude-newer and passes --check\n'
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] uv lock normalize: plain uv lock did not produce checkable lock\n'
+    fail=$(( fail + 1 ))
+  fi
+else
+  printf '[FAIL] uv lock normalize: uv not on PATH\n'
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$norm_strip_tmp"
 
 # Missing HEAD uv.lock must not drop staged lock landings from reports.
 printf '\n=== behavioural: lock report with missing HEAD uv.lock ===\n'
