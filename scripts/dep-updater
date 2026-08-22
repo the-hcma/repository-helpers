@@ -4953,6 +4953,17 @@ py_security_update() {
   log "[python/${tool}] Security: patching CVE vulnerabilities…"
 
   local files_changed=""
+  local sec_lock_bak="" sec_pyproject_bak=""
+  if [[ "$tool" == "uv" ]]; then
+    if [[ -f "${worktree_path}/pyproject.toml" ]]; then
+      sec_pyproject_bak="$(mktemp)"
+      cp "${worktree_path}/pyproject.toml" "$sec_pyproject_bak"
+    fi
+    if [[ -f "${worktree_path}/uv.lock" ]]; then
+      sec_lock_bak="$(mktemp)"
+      cp "${worktree_path}/uv.lock" "$sec_lock_bak"
+    fi
+  fi
   while IFS=' ' read -r pkg _current fix _cves; do
     [[ -z "$pkg" ]] && continue
     log "[python/${tool}] Security: bumping ${pkg} to ${fix}…"
@@ -4986,14 +4997,21 @@ py_security_update() {
     if (( norm_exit != 0 )); then
       log "[python/uv] Security: lock normalization failed."
       [[ -n "$norm_out" ]] && log "$norm_out"
-      run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml uv.lock 2>/dev/null || true
+      py_uv_restore_after_failed_floor_lock \
+        "$worktree_path" "$sec_lock_bak" "$sec_pyproject_bak"
+      rm -f "$sec_pyproject_bak" "$sec_lock_bak"
+      dep_updater_append_ecosystem_failure "python|security lock normalization failed"
       return 0
     fi
     if ! py_uv_lock_check "uv security lock --check" "$worktree_path"; then
       log "[python/uv] Security: uv lock --check failed after normalize."
-      run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml uv.lock 2>/dev/null || true
+      py_uv_restore_after_failed_floor_lock \
+        "$worktree_path" "$sec_lock_bak" "$sec_pyproject_bak"
+      rm -f "$sec_pyproject_bak" "$sec_lock_bak"
+      dep_updater_append_ecosystem_failure "python|security uv lock --check failed after normalize"
       return 0
     fi
+    rm -f "$sec_pyproject_bak" "$sec_lock_bak"
   fi
 
   case "$tool" in
@@ -7305,7 +7323,7 @@ batch_update_all() {
   fi
 
   local has_cves=0
-  [[ -n "$npm_audit_lines_arg" || -n "$py_audit_lines_arg" ]] && has_cves=1
+  [[ -n "$npm_audit_lines_arg" || ( -n "$py_audit_lines_arg" && "$any_py" == '1' ) ]] && has_cves=1
 
   local commit_msg
   if [[ "$security_only" == '1' ]]; then
@@ -7349,7 +7367,7 @@ batch_update_all() {
       done <<< "$npm_audit_lines_arg"
       printf '\n'
     fi
-    if [[ -n "$py_audit_lines_arg" ]]; then
+    if [[ -n "$py_audit_lines_arg" && "$any_py" == '1' ]]; then
       printf '## Python CVEs addressed\n\n'
       printf '| Package | Current | Fixed | CVEs |\n'
       printf '|---|---|---|---|\n'
@@ -7394,7 +7412,7 @@ batch_update_all() {
             "$pkg" "$current" "$fix" "${cves/,/, }"
         done <<< "$npm_audit_lines_arg"
       fi
-      if [[ -n "$py_audit_lines_arg" ]]; then
+      if [[ -n "$py_audit_lines_arg" && "$any_py" == '1' ]]; then
         while IFS=' ' read -r pkg current fix cves; do
           [[ -z "$pkg" ]] && continue
           printf "| python/%s | \`%s\` | \`%s\` | \`%s\` | yes | %s |\n" \
@@ -7483,10 +7501,12 @@ batch_update_all() {
     [[ -z "$pkg" ]] && continue
     add_summary_line "python/${py_tool}" "$pkg" "$old_ver" "$new_ver" "$branch" "$pr_num" "no" "-"
   done <<< "${report_py_lines:-}"
-  while IFS=' ' read -r pkg _current fix _cves; do
-    [[ -z "$pkg" ]] && continue
-    add_summary_line "python/${py_tool}" "$pkg" "$_current" "$fix" "$branch" "$pr_num" "yes" "${_cves:--}"
-  done <<< "${py_audit_lines_arg:-}"
+  if [[ "$any_py" == '1' ]]; then
+    while IFS=' ' read -r pkg _current fix _cves; do
+      [[ -z "$pkg" ]] && continue
+      add_summary_line "python/${py_tool}" "$pkg" "$_current" "$fix" "$branch" "$pr_num" "yes" "${_cves:--}"
+    done <<< "${py_audit_lines_arg:-}"
+  fi
   if [[ "$any_rust" == '1' ]]; then
     while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
       [[ -z "$pkg" ]] && continue
@@ -7500,7 +7520,7 @@ batch_update_all() {
     done <<< "${gha_lines_arg:-}"
   fi
   if [[ -z "$actual_npm_lines" && -z "$npm_audit_lines_arg" && \
-        -z "$report_py_lines" && -z "$py_audit_lines_arg" && \
+        -z "$report_py_lines" && ( -z "$py_audit_lines_arg" || "$any_py" != '1' ) && \
         "$any_rust" == '0' && "$any_gha" == '0' ]]; then
     add_summary_line "batch" "$branch" "-" "-" "$branch" "$pr_num" "no" "-"
   fi
