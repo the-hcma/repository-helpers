@@ -6017,13 +6017,26 @@ py_update_one() {
         # existing >= constraint (uv sees 8.0.1 already satisfies >=7.0.0 and
         # leaves pyproject.toml unchanged). Patch the floor with sed instead.
         # For == / ~= constraints, convert to >= so dep-updater never introduces pins.
+        # Snapshot before rewrite/lock so normalize/--check failures can restore
+        # untracked uv.lock (bare checkout is a no-op for untracked files).
+        uv_lock_bak=""
+        pyproject_bak=""
+        if [[ -f "${worktree_path}/pyproject.toml" ]]; then
+          pyproject_bak="$(mktemp)"
+          cp "${worktree_path}/pyproject.toml" "$pyproject_bak"
+        fi
+        if [[ -f "${worktree_path}/uv.lock" ]]; then
+          uv_lock_bak="$(mktemp)"
+          cp "${worktree_path}/uv.lock" "$uv_lock_bak"
+        fi
         if ! py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$pkg" "$new_ver"; then
           : # Floor already at target; still lock to repair a stale uv.lock.
         fi
         uv_out="$(py_uv_floor_lock "uv lock" "$worktree_path" "$pkg")" && uv_exit=0 || uv_exit=$?
         if (( uv_exit != 0 )); then
-          # Revert pyproject.toml: sed already modified it but the lock failed.
-          run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
+          py_uv_restore_after_failed_floor_lock \
+            "$worktree_path" "$uv_lock_bak" "$pyproject_bak"
+          rm -f "$pyproject_bak" "$uv_lock_bak"
           log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
           log "$uv_out"
           return 0
@@ -6031,25 +6044,29 @@ py_update_one() {
         floor_highest="$(py_uv_lock_highest_version "${worktree_path}/uv.lock" "$pkg" \
           2>/dev/null || true)"
         if ! py_uv_version_at_least "$floor_highest" "$new_ver"; then
-          run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
-          run_command "git worktree" git -C "$worktree_path" checkout -- uv.lock 2>/dev/null || true
+          py_uv_restore_after_failed_floor_lock \
+            "$worktree_path" "$uv_lock_bak" "$pyproject_bak"
+          rm -f "$pyproject_bak" "$uv_lock_bak"
           log "[python/uv] Skipping ${pkg} ${new_ver}: lock stayed at ${floor_highest:-?}."
           return 0
         fi
         uv_out="$(py_uv_normalize_lock "uv lock normalize" "$worktree_path")" && uv_exit=0 || uv_exit=$?
         if (( uv_exit != 0 )); then
-          run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
-          run_command "git worktree" git -C "$worktree_path" checkout -- uv.lock 2>/dev/null || true
+          py_uv_restore_after_failed_floor_lock \
+            "$worktree_path" "$uv_lock_bak" "$pyproject_bak"
+          rm -f "$pyproject_bak" "$uv_lock_bak"
           log "[python/uv] Skipping ${pkg} ${new_ver}: lock normalization failed."
           [[ -n "$uv_out" ]] && log "$uv_out"
           return 0
         fi
         if ! py_uv_lock_check "uv lock --check" "$worktree_path"; then
-          run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
-          run_command "git worktree" git -C "$worktree_path" checkout -- uv.lock 2>/dev/null || true
+          py_uv_restore_after_failed_floor_lock \
+            "$worktree_path" "$uv_lock_bak" "$pyproject_bak"
+          rm -f "$pyproject_bak" "$uv_lock_bak"
           log "[python/uv] Skipping ${pkg} ${new_ver}: uv lock --check failed after normalize."
           return 0
         fi
+        rm -f "$pyproject_bak" "$uv_lock_bak"
         log "[python/${tool}] ${pkg}: ${old_ver} → ${new_ver}"
         run_command "git worktree" git -C "$worktree_path" add pyproject.toml uv.lock
         files_changed="pyproject.toml + uv.lock"
