@@ -154,7 +154,9 @@ scripts/secret-audit --repo OWNER/NAME --write-marker
 scripts/secret-audit --all --org the-hcma --include-private
 ```
 
-Automation always passes `--no-update` to TruffleHog (Homebrew and pinned installs).
+Automation always passes `--no-update` to TruffleHog. Installs must match the
+pinned release (`3.97.0`); a mismatched on-PATH binary is replaced from GitHub
+releases after checksum verification.
 On leaks: `ERROR: SECRET_AUDIT_LEAK` — rotate credentials; never write a clean marker.
 
 Daily timer (optional): `scripts/setup-secret-audit` installs `secret-audit.service`

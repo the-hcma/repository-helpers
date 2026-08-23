@@ -8,7 +8,7 @@ This repository ships systemd user services for daily repository maintenance:
 | `github-repo-lint.service` | `scripts/github-repo-lint` | 04:00 daily | Repository-practices compliance |
 | `secret-audit.service` | `scripts/secret-audit-batch-run` | 05:00 daily | TruffleHog org deep-scan results |
 
-Both are oneshot services installed under `~/.config/systemd/user/`, with logs
+All three are oneshot services installed under `~/.config/systemd/user/`, with logs
 under `~/scratch/repository-helpers/`.
 
 ### Timer oneshot conventions
