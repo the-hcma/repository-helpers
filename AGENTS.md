@@ -14,10 +14,12 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | Batch automation | `scripts/dep-updater-batch-run` | Daily `--batch --all` across a scan root; email report. |
 | Dep-updater CI | `scripts/dep-updater-ci-org-dry-run` | Clone org repos and `--batch --all --dry-run` for PR validation. |
 | Repo practices | `scripts/github-repo-lint` | Audit/onboard org repos (merge queue, `protect-main`, workflows). |
+| Secret audit | `scripts/secret-audit` | TruffleHog deep scan (full git history); intake marker (see [docs/secret-audit-trufflehog.md](./docs/secret-audit-trufflehog.md)). |
+| Secret audit batch | `scripts/secret-audit-batch-run` | Daily org TruffleHog sweep; email report (systemd timer). |
 | Merge settings | `scripts/check-merge-settings` | Thin wrapper (merge + GitHub MQ only). |
 | Lockfile drift | `scripts/check-lockfile-drift` | Compare lockfiles to registry constraints. |
 | pnpm cutover | `scripts/grandfather-pnpm-release-age` | One-time `minimumReleaseAgeExclude` for existing lockfiles. |
-| Systemd | `scripts/setup-service`, `scripts/setup-github-repo-lint`, `scripts/show-services` | Install timers/units; status summary. |
+| Systemd | `scripts/setup-service`, `scripts/setup-github-repo-lint`, `scripts/setup-secret-audit`, `scripts/show-services` | Install timers/units; status summary. |
 | Deploy hook | `scripts/on-deploy` | Example hook; consumer repos implement their own. |
 | Agent review | `scripts/wait-for-agent-review`, `scripts/trigger-agent-review` | PR review loop, triage, operator email (no self-approve). |
 | Dev workflow | `scripts/dev/start-development` | Worktree + Graphite sync entry point. |
@@ -162,6 +164,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Git commit identity cursor rule | yes | — | `.cursor/rules/git-commit-identity.mdc` forbids agent/machine co-authors; agents must verify commit signing (`commit.gpgsign` / `user.signingkey`, pinentry-mac / passphrase / per-machine keys / clearsign probe) and `~/.cursor/cli-config.json` attribution, and surface setup instructions when either is missing |
 | Repo practices after config change | yes | — | `.cursor/rules/repo-practices-after-config-change.mdc` requires `github-repo-lint` after workflow/config edits; `pre-pr-checks` runs detect-first `repo-practices-lint` when the diff touches those paths |
 | Session-start read guidance | yes | — | `.cursor/rules/read-agents-and-rules.mdc` requires reading `AGENTS.md` and `.cursor/rules/` at the start of every new agent session |
+| Secret-audit intake marker | yes | — | `.github/secret-audit.json`: missing FAILS `--new-repo` only (SUGGEST under org `--strict-onboarding` during roll-out); invalid/stale FAILS `--new-repo` / `--strict-onboarding` (TruffleHog deep scan — see [docs/secret-audit-trufflehog.md](./docs/secret-audit-trufflehog.md)) |
 | Stacking-tool marker + rule | yes | — | `.github/stacking-tool` (`graphite`\|`gh-stack`) and thin `.cursor/rules/stacking-tool.mdc` (skill breadcrumbs; no copied skill bodies) |
 | Stacking docs consistency | yes | — | When marker is `gh-stack`, fail if `pr-ship-and-review.mdc` still has Graphite-only `gt create`/`gt submit`, or if root `GRAPHITE.md` remains; suggest (non-failing) if `AGENTS.md` still prescribes Graphite/`gt`/`merge-it` without `gh stack`. Graphite marker gets a soft suggest if docs are gh-stack-only. Skips this repo (dual SSOT). Cutover checklist: `.cursor/rules/stacking-tool.mdc` |
 | UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
@@ -493,7 +496,7 @@ Service repositories install via `scripts/setup-service` and optionally implemen
   - **Secret scan**: when `.github/ci/secret-scan` or `scripts/dev/secret-scan` is
     present — runs canonical gitleaks (`scripts/lib/ci-secret-scan`) before submit
     (branch-vs-`main` range when possible). CI `secret-scan` remains post-push
-    triage; this is the submit-path gate (see also deep/org scan #509).
+    triage; this is the submit-path gate (see also deep/org scan #509 — TruffleHog via `scripts/secret-audit` / [docs/secret-audit-trufflehog.md](./docs/secret-audit-trufflehog.md)).
     Skip with `PRE_PR_CHECKS_SKIP=secret-scan`. Manual: `scripts/dev/secret-scan`.
   - Escape hatch: `PRE_PR_CHECKS_SKIP=job1,job2` (documented; no silent skip). Do **not** bypass a failing run with ad-hoc substitutes.
   - Also verifies the **primary worktree** is unchanged when checks finish.

@@ -6,6 +6,7 @@ This repository ships systemd user services for daily repository maintenance:
 | --- | --- | --- | --- |
 | `dep-updater.service` | `scripts/dep-updater-batch-run` | 03:00 daily | Dependency update run results |
 | `github-repo-lint.service` | `scripts/github-repo-lint` | 04:00 daily | Repository-practices compliance |
+| `secret-audit.service` | `scripts/secret-audit-batch-run` | 05:00 daily | TruffleHog org deep-scan results |
 
 Both are oneshot services installed under `~/.config/systemd/user/`, with logs
 under `~/scratch/repository-helpers/`.
@@ -31,6 +32,7 @@ not atomically claim the lock when two starts race (`Persistent` catch-up plus
 | --- | --- |
 | `dep-updater.service` | `~/scratch/repository-helpers/dep-updater-batch.lock` |
 | `github-repo-lint.service` | `~/scratch/repository-helpers/github-repo-lint.lock` |
+| `secret-audit.service` | `~/scratch/repository-helpers/secret-audit-batch.lock` |
 
 New timer oneshots must use both conventions.
 
@@ -339,4 +341,32 @@ systemctl --user disable --now github-repo-lint.timer
 systemctl --user disable github-repo-lint.service
 rm ~/.config/systemd/user/github-repo-lint.{service,timer}
 systemctl --user daemon-reload
+```
+
+## Secret audit (TruffleHog)
+
+Daily **TruffleHog** org deep scan via `scripts/secret-audit-batch-run`. See
+[secret-audit-trufflehog.md](./secret-audit-trufflehog.md) for detectors, result
+filters, marker schema, and AGPL notes.
+
+### Install
+
+```bash
+./scripts/setup-secret-audit
+./scripts/setup-secret-audit --status
+```
+
+Optional `~/.config/secret-audit.env` overlays SMTP / org settings on top of
+`~/.config/dep-updater.env`.
+
+The service unit has **no `[Install]` section** — only `secret-audit.timer`
+starts it (`OnCalendar=05:00`). Follow **Timer oneshot conventions** above for
+the shared `flock` rule.
+
+### Status and logs
+
+```bash
+systemctl --user status secret-audit.service
+systemctl --user list-timers secret-audit.timer
+tail --follow=name --retry ~/scratch/repository-helpers/secret-audit-batch.log
 ```
