@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
 # .cursor/install.sh — Cloud Agent environment bootstrap for repository-helpers.
 #
-# Installs the CLI tools the repository's CI and scripts/dev/pre-pr-checks require
-# but that are not present on the Cursor default base image: shellcheck,
-# actionlint, and gitleaks. bash, git, gh, jq, rg, node, and npm already ship
-# with the base image.
+# Installs the CLI tools the repository's CI (.github/workflows/ci.yml) and
+# scripts/dev/pre-pr-checks require but that are not present on the Cursor
+# default base image: shellcheck and actionlint. bash, git, gh, jq, rg, node,
+# and npm already ship with the base image.
+#
+# gitleaks is intentionally NOT installed here. The secret-scan flow
+# (scripts/dev/secret-scan / scripts/lib/ci-secret-scan) bootstraps gitleaks on
+# demand into ~/.cache/repository-helpers/bin, off the global PATH. The test
+# suite (tests/ci-secret-scan.test) asserts the from-scratch install path and
+# assumes gitleaks is not already discoverable via `command -v`, so putting it
+# on the global PATH would break tests. This mirrors CI, where the test job does
+# not install gitleaks (a separate Secret Scan job does).
 #
 # This script is idempotent (safe to re-run): each tool is installed only when it
 # is missing or pinned to a different version. It is non-interactive and must
 # terminate. Do not add dev servers, tests, or migrations here.
 set -euo pipefail
 
-# Pins mirror .github/workflows/ci.yml and scripts/lib/ci-secret-scan so the
-# environment matches CI. Bump alongside those sources.
+# Pins mirror .github/workflows/ci.yml (actionlint) and the current shellcheck
+# stable release. Bump alongside CI.
 shellcheck_version='0.11.0'
 actionlint_version='1.7.9'
-gitleaks_version='8.30.1'
-readonly shellcheck_version actionlint_version gitleaks_version
+readonly shellcheck_version actionlint_version
 
 bin_dir='/usr/local/bin'
 readonly bin_dir
@@ -73,30 +80,13 @@ install_actionlint() {
   rm -rf "$tmpdir"
 }
 
-install_gitleaks() {
-  if tool_matches gitleaks "$gitleaks_version"; then
-    log "gitleaks ${gitleaks_version} already installed"
-    return 0
-  fi
-  log "installing gitleaks ${gitleaks_version}"
-  local tmpdir url
-  tmpdir="$(mktemp -d)"
-  url="https://github.com/gitleaks/gitleaks/releases/download/v${gitleaks_version}/gitleaks_${gitleaks_version}_linux_x64.tar.gz"
-  curl -fSL --retry 3 --retry-delay 2 -o "${tmpdir}/gitleaks.tar.gz" "$url"
-  tar -xzf "${tmpdir}/gitleaks.tar.gz" -C "$tmpdir" gitleaks
-  sudo install -m 0755 "${tmpdir}/gitleaks" "${bin_dir}/gitleaks"
-  rm -rf "$tmpdir"
-}
-
 main() {
   arch_amd64_only
   install_shellcheck
   install_actionlint
-  install_gitleaks
   log 'versions:'
   shellcheck --version | awk '/version:/{print "  shellcheck " $2}'
   actionlint --version | head -n1 | awk '{print "  actionlint " $1}'
-  gitleaks version 2>/dev/null | awk '{print "  gitleaks " $1}'
   log 'done'
 }
 
