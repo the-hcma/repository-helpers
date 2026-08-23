@@ -4953,6 +4953,17 @@ py_security_update() {
   log "[python/${tool}] Security: patching CVE vulnerabilities…"
 
   local files_changed=""
+  local sec_lock_bak="" sec_pyproject_bak=""
+  if [[ "$tool" == "uv" ]]; then
+    if [[ -f "${worktree_path}/pyproject.toml" ]]; then
+      sec_pyproject_bak="$(mktemp)"
+      cp "${worktree_path}/pyproject.toml" "$sec_pyproject_bak"
+    fi
+    if [[ -f "${worktree_path}/uv.lock" ]]; then
+      sec_lock_bak="$(mktemp)"
+      cp "${worktree_path}/uv.lock" "$sec_lock_bak"
+    fi
+  fi
   while IFS=' ' read -r pkg _current fix _cves; do
     [[ -z "$pkg" ]] && continue
     log "[python/${tool}] Security: bumping ${pkg} to ${fix}…"
@@ -4979,6 +4990,29 @@ py_security_update() {
         ;;
     esac
   done <<< "$audit_lines"
+
+  if [[ "$tool" == "uv" ]]; then
+    local norm_out norm_exit
+    norm_out="$(py_uv_normalize_lock "uv security lock normalize" "$worktree_path")" && norm_exit=0 || norm_exit=$?
+    if (( norm_exit != 0 )); then
+      log "[python/uv] Security: lock normalization failed."
+      [[ -n "$norm_out" ]] && log "$norm_out"
+      py_uv_restore_after_failed_floor_lock \
+        "$worktree_path" "$sec_lock_bak" "$sec_pyproject_bak"
+      rm -f "$sec_pyproject_bak" "$sec_lock_bak"
+      dep_updater_append_ecosystem_failure "python|security lock normalization failed"
+      return 0
+    fi
+    if ! py_uv_lock_check "uv security lock --check" "$worktree_path"; then
+      log "[python/uv] Security: uv lock --check failed after normalize."
+      py_uv_restore_after_failed_floor_lock \
+        "$worktree_path" "$sec_lock_bak" "$sec_pyproject_bak"
+      rm -f "$sec_pyproject_bak" "$sec_lock_bak"
+      dep_updater_append_ecosystem_failure "python|security uv lock --check failed after normalize"
+      return 0
+    fi
+    rm -f "$sec_pyproject_bak" "$sec_lock_bak"
+  fi
 
   case "$tool" in
     uv)      git -C "$worktree_path" add pyproject.toml uv.lock ;;
@@ -5773,6 +5807,58 @@ py_uv_floor_lock() {
   dep_runner_uv_dir_capture "$label" "$uv_dir" -- "${lock_args[@]}"
 }
 
+# py_uv_lock_check <label> <dir>
+# Returns 0 when uv.lock matches pyproject.toml (plain uv lock --check).
+py_uv_lock_check() {
+  local -r label="$1"
+  local -r uv_dir="$2"
+  local rc
+
+  rc=0
+  dep_runner_uv_dir --probe "$label" "$uv_dir" -- lock --check >/dev/null 2>&1 || rc=$?
+  return "$rc"
+}
+
+# py_uv_normalize_lock <label> <dir>
+# Age-gated `uv lock` calls write [options.exclude-newer-package] into uv.lock.
+# Strip that metadata in-place so consumers' `uv lock --check` passes without
+# re-resolving (plain `uv lock` would drop the release-age cutoff).
+py_uv_normalize_lock() {
+  local -r _label="$1"
+  local -r uv_dir="$2"
+  local lockfile="${uv_dir}/uv.lock"
+
+  if ! py_uv_strip_exclude_newer_from_lock "$lockfile"; then
+    printf '%s\n' "failed to strip exclude-newer metadata from uv.lock"
+    return 1
+  fi
+  return 0
+}
+
+# py_uv_strip_exclude_newer_from_lock <lockfile>
+# Remove [options.exclude-newer-package] without changing resolved packages.
+py_uv_strip_exclude_newer_from_lock() {
+  local -r lockfile="$1"
+  local tmp rc quoted_lock quoted_tmp
+
+  [[ -f "$lockfile" ]] || return 1
+  rc=0
+  runner_sh "uv lock strip probe" --probe -- \
+    grep -qF '[options.exclude-newer-package]' "$lockfile" >/dev/null 2>&1 || rc=$?
+  if (( rc != 0 )); then
+    return 0
+  fi
+  tmp="$(runner_sh_stdout "uv lock strip tempfile" -- mktemp)"
+  quoted_lock="$(printf '%q' "$lockfile")"
+  quoted_tmp="$(printf '%q' "$tmp")"
+  if ! dep_runner_sh "uv lock strip exclude-newer" -- \
+    "awk '/^\\[options\\.exclude-newer-package\\]/ { skip=1; next } skip && /^\\[/ { skip=0 } skip { next } { print }' ${quoted_lock} >${quoted_tmp}"; then
+    runner_sh "uv lock strip cleanup" -- rm -f "$tmp"
+    return 1
+  fi
+  dep_runner_sh "uv lock strip install" -- "mv -f ${quoted_tmp} ${quoted_lock}"
+}
+
 # py_uv_version_at_least <ver> <minimum>
 # Returns 0 when ver is semantically >= minimum (sort -V).
 py_uv_version_at_least() {
@@ -5953,7 +6039,7 @@ py_update_one() {
 
   case "$tool" in
     uv)
-      local uv_out uv_exit uv_constraint_op uv_lock_bak floor_highest
+      local uv_out uv_exit uv_constraint_op uv_lock_bak pyproject_bak floor_highest
       uv_constraint_op="$(py_constraint_op "$pkg" "${dir}/pyproject.toml")"
       # Invariant: always write >= (never ==) — dep-updater must not re-pin.
       if [[ "$uv_constraint_op" == ">=" || "$uv_constraint_op" == "==" || "$uv_constraint_op" == "~=" ]]; then
@@ -5961,13 +6047,26 @@ py_update_one() {
         # existing >= constraint (uv sees 8.0.1 already satisfies >=7.0.0 and
         # leaves pyproject.toml unchanged). Patch the floor with sed instead.
         # For == / ~= constraints, convert to >= so dep-updater never introduces pins.
+        # Snapshot before rewrite/lock so normalize/--check failures can restore
+        # untracked uv.lock (bare checkout is a no-op for untracked files).
+        uv_lock_bak=""
+        pyproject_bak=""
+        if [[ -f "${worktree_path}/pyproject.toml" ]]; then
+          pyproject_bak="$(mktemp)"
+          cp "${worktree_path}/pyproject.toml" "$pyproject_bak"
+        fi
+        if [[ -f "${worktree_path}/uv.lock" ]]; then
+          uv_lock_bak="$(mktemp)"
+          cp "${worktree_path}/uv.lock" "$uv_lock_bak"
+        fi
         if ! py_uv_rewrite_version_floor "${worktree_path}/pyproject.toml" "$pkg" "$new_ver"; then
           : # Floor already at target; still lock to repair a stale uv.lock.
         fi
         uv_out="$(py_uv_floor_lock "uv lock" "$worktree_path" "$pkg")" && uv_exit=0 || uv_exit=$?
         if (( uv_exit != 0 )); then
-          # Revert pyproject.toml: sed already modified it but the lock failed.
-          run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
+          py_uv_restore_after_failed_floor_lock \
+            "$worktree_path" "$uv_lock_bak" "$pyproject_bak"
+          rm -f "$pyproject_bak" "$uv_lock_bak"
           log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
           log "$uv_out"
           return 0
@@ -5975,11 +6074,31 @@ py_update_one() {
         floor_highest="$(py_uv_lock_highest_version "${worktree_path}/uv.lock" "$pkg" \
           2>/dev/null || true)"
         if ! py_uv_version_at_least "$floor_highest" "$new_ver"; then
-          run_command "git worktree" git -C "$worktree_path" checkout -- pyproject.toml 2>/dev/null || true
-          run_command "git worktree" git -C "$worktree_path" checkout -- uv.lock 2>/dev/null || true
+          py_uv_restore_after_failed_floor_lock \
+            "$worktree_path" "$uv_lock_bak" "$pyproject_bak"
+          rm -f "$pyproject_bak" "$uv_lock_bak"
           log "[python/uv] Skipping ${pkg} ${new_ver}: lock stayed at ${floor_highest:-?}."
           return 0
         fi
+        uv_out="$(py_uv_normalize_lock "uv lock normalize" "$worktree_path")" && uv_exit=0 || uv_exit=$?
+        if (( uv_exit != 0 )); then
+          py_uv_restore_after_failed_floor_lock \
+            "$worktree_path" "$uv_lock_bak" "$pyproject_bak"
+          rm -f "$pyproject_bak" "$uv_lock_bak"
+          log "[python/uv] Skipping ${pkg} ${new_ver}: lock normalization failed."
+          [[ -n "$uv_out" ]] && log "$uv_out"
+          dep_updater_append_ecosystem_failure "python|lock normalization failed"
+          return 0
+        fi
+        if ! py_uv_lock_check "uv lock --check" "$worktree_path"; then
+          py_uv_restore_after_failed_floor_lock \
+            "$worktree_path" "$uv_lock_bak" "$pyproject_bak"
+          rm -f "$pyproject_bak" "$uv_lock_bak"
+          log "[python/uv] Skipping ${pkg} ${new_ver}: uv lock --check failed after normalize."
+          dep_updater_append_ecosystem_failure "python|lock --check failed after normalize"
+          return 0
+        fi
+        rm -f "$pyproject_bak" "$uv_lock_bak"
         log "[python/${tool}] ${pkg}: ${old_ver} → ${new_ver}"
         run_command "git worktree" git -C "$worktree_path" add pyproject.toml uv.lock
         files_changed="pyproject.toml + uv.lock"
@@ -6005,6 +6124,30 @@ py_update_one() {
           fi
           log "[python/uv] Skipping ${pkg} ${new_ver}: dependency resolution failed."
           [[ -n "$uv_out" ]] && log "$uv_out"
+          return 0
+        fi
+        uv_out="$(py_uv_normalize_lock "uv lock normalize" "$worktree_path")" && uv_exit=0 || uv_exit=$?
+        if (( uv_exit != 0 )); then
+          if [[ -n "$uv_lock_bak" ]]; then
+            cp "$uv_lock_bak" "${worktree_path}/uv.lock"
+            rm -f "$uv_lock_bak"
+          else
+            run_command "git worktree" git -C "$worktree_path" checkout -- uv.lock 2>/dev/null || true
+          fi
+          log "[python/uv] Skipping ${pkg} ${new_ver}: lock normalization failed."
+          [[ -n "$uv_out" ]] && log "$uv_out"
+          dep_updater_append_ecosystem_failure "python|lock normalization failed"
+          return 0
+        fi
+        if ! py_uv_lock_check "uv lock --check" "$worktree_path"; then
+          if [[ -n "$uv_lock_bak" ]]; then
+            cp "$uv_lock_bak" "${worktree_path}/uv.lock"
+            rm -f "$uv_lock_bak"
+          else
+            run_command "git worktree" git -C "$worktree_path" checkout -- uv.lock 2>/dev/null || true
+          fi
+          log "[python/uv] Skipping ${pkg} ${new_ver}: uv lock --check failed after normalize."
+          dep_updater_append_ecosystem_failure "python|lock --check failed after normalize"
           return 0
         fi
         rm -f "$uv_lock_bak"
@@ -7017,9 +7160,27 @@ batch_update_all() {
     fi
     if [[ "$any_py" == '1' ]]; then
       case "$py_tool" in
-        uv)       git -C "$worktree_path" add pyproject.toml uv.lock ;;
-        poetry)   git -C "$worktree_path" add pyproject.toml poetry.lock ;;
-        pipenv)   git -C "$worktree_path" add Pipfile Pipfile.lock ;;
+        uv)
+          py_out="$(py_uv_normalize_lock "uv batch lock normalize" "$worktree_path")" && py_exit=0 || py_exit=$?
+          if (( py_exit != 0 )); then
+            log "[python/uv] ERROR: batch lock normalization failed."
+            [[ -n "$py_out" ]] && log "$py_out"
+            # Reset to HEAD (not pre-normalize bak): restored CVE/floor edits must not
+            # remain dirty for later `git add -u` from other ecosystems (e.g. rust).
+            py_uv_restore_after_failed_floor_lock "$worktree_path" "" ""
+            dep_updater_append_ecosystem_failure "python|batch lock normalization failed"
+            any_py=0
+          elif ! py_uv_lock_check "uv batch lock --check" "$worktree_path"; then
+            log "[python/uv] ERROR: uv lock --check failed after batch normalize."
+            py_uv_restore_after_failed_floor_lock "$worktree_path" "" ""
+            dep_updater_append_ecosystem_failure "python|batch uv lock --check failed after normalize"
+            any_py=0
+          else
+            run_command "git worktree" git -C "$worktree_path" add pyproject.toml uv.lock
+          fi
+          ;;
+        poetry)   run_command "git worktree" git -C "$worktree_path" add pyproject.toml poetry.lock ;;
+        pipenv)   run_command "git worktree" git -C "$worktree_path" add Pipfile Pipfile.lock ;;
         pip|pip3)
           # pip freeze must be run from the project dir to produce correct output.
           "$py_tool" freeze > "${worktree_path}/requirements.txt"
@@ -7200,7 +7361,7 @@ batch_update_all() {
   fi
 
   local has_cves=0
-  [[ -n "$npm_audit_lines_arg" || -n "$py_audit_lines_arg" ]] && has_cves=1
+  [[ -n "$npm_audit_lines_arg" || ( -n "$py_audit_lines_arg" && "$any_py" == '1' ) ]] && has_cves=1
 
   local commit_msg
   if [[ "$security_only" == '1' ]]; then
@@ -7244,7 +7405,7 @@ batch_update_all() {
       done <<< "$npm_audit_lines_arg"
       printf '\n'
     fi
-    if [[ -n "$py_audit_lines_arg" ]]; then
+    if [[ -n "$py_audit_lines_arg" && "$any_py" == '1' ]]; then
       printf '## Python CVEs addressed\n\n'
       printf '| Package | Current | Fixed | CVEs |\n'
       printf '|---|---|---|---|\n'
@@ -7289,7 +7450,7 @@ batch_update_all() {
             "$pkg" "$current" "$fix" "${cves/,/, }"
         done <<< "$npm_audit_lines_arg"
       fi
-      if [[ -n "$py_audit_lines_arg" ]]; then
+      if [[ -n "$py_audit_lines_arg" && "$any_py" == '1' ]]; then
         while IFS=' ' read -r pkg current fix cves; do
           [[ -z "$pkg" ]] && continue
           printf "| python/%s | \`%s\` | \`%s\` | \`%s\` | yes | %s |\n" \
@@ -7378,10 +7539,12 @@ batch_update_all() {
     [[ -z "$pkg" ]] && continue
     add_summary_line "python/${py_tool}" "$pkg" "$old_ver" "$new_ver" "$branch" "$pr_num" "no" "-"
   done <<< "${report_py_lines:-}"
-  while IFS=' ' read -r pkg _current fix _cves; do
-    [[ -z "$pkg" ]] && continue
-    add_summary_line "python/${py_tool}" "$pkg" "$_current" "$fix" "$branch" "$pr_num" "yes" "${_cves:--}"
-  done <<< "${py_audit_lines_arg:-}"
+  if [[ "$any_py" == '1' ]]; then
+    while IFS=' ' read -r pkg _current fix _cves; do
+      [[ -z "$pkg" ]] && continue
+      add_summary_line "python/${py_tool}" "$pkg" "$_current" "$fix" "$branch" "$pr_num" "yes" "${_cves:--}"
+    done <<< "${py_audit_lines_arg:-}"
+  fi
   if [[ "$any_rust" == '1' ]]; then
     while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
       [[ -z "$pkg" ]] && continue
@@ -7395,7 +7558,7 @@ batch_update_all() {
     done <<< "${gha_lines_arg:-}"
   fi
   if [[ -z "$actual_npm_lines" && -z "$npm_audit_lines_arg" && \
-        -z "$report_py_lines" && -z "$py_audit_lines_arg" && \
+        -z "$report_py_lines" && ( -z "$py_audit_lines_arg" || "$any_py" != '1' ) && \
         "$any_rust" == '0' && "$any_gha" == '0' ]]; then
     add_summary_line "batch" "$branch" "-" "-" "$branch" "$pr_num" "no" "-"
   fi

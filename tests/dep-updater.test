@@ -1171,6 +1171,9 @@ chmod +x "${fnm_path}/gt"
 cat >"${fnm_path}/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-}" == "stack" ]]; then
+  exit 0
+fi
 exit 0
 EOF
 chmod +x "${fnm_path}/gh"
@@ -1178,7 +1181,7 @@ chmod +x "${fnm_path}/gh"
 dry_output=""
 dry_exit=0
 set +e
-dry_output="$(env HOME="$tmp_home" PATH="$(dep_test_path_no_gh_gt)" \
+dry_output="$(env HOME="$tmp_home" PATH="${fnm_path}:$(dep_test_path_no_gh_gt)" \
   "$script" --dry-run --dir "$tmp_repo" 2>&1)"
 dry_exit=$?
 set -e
@@ -2434,15 +2437,16 @@ fi
 
 printf '\n=== static: >= floor revert on failure ===\n'
 
-# py_update_one must revert pyproject.toml when uv lock fails after a sed patch
+# py_update_one must restore pyproject.toml when uv lock fails after a sed patch
 # so the file is not left dirty and does not corrupt subsequent update attempts.
+# Prefer snapshot restore (handles untracked locks); bare checkout still counts.
 revert_count=0
-revert_count="$(grep -c 'checkout -- pyproject.toml' "$script" 2>/dev/null || true)"
+revert_count="$(grep -cE 'checkout -- pyproject\.toml|py_uv_restore_after_failed_floor_lock' "$script" 2>/dev/null || true)"
 if (( revert_count >= 2 )); then
-  printf '[PASS] pyproject.toml revert: present in both py_update_one and batch_update_all\n'
+  printf '[PASS] pyproject.toml revert: present via checkout and/or snapshot restore\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] pyproject.toml revert: expected >=2 occurrences, found %d\n' "$revert_count"
+  printf '[FAIL] pyproject.toml revert: expected >=2 restore/checkout occurrences, found %d\n' "$revert_count"
   fail=$(( fail + 1 ))
 fi
 
@@ -2625,6 +2629,133 @@ if grep -qF 'py_uv_lock_upgrade_package' "$script" \
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] uv transitive apply: expected upgrade-package, --exclude-newer-package only, time_log cutoff\n'
+  fail=$(( fail + 1 ))
+fi
+
+normalize_fn="$(awk '/^py_uv_normalize_lock\(\)/,/^}$/' "$script")"
+strip_fn="$(awk '/^py_uv_strip_exclude_newer_from_lock\(\)/,/^}$/' "$script")"
+lock_check_fn="$(awk '/^py_uv_lock_check\(\)/,/^}$/' "$script")"
+# shellcheck disable=SC2016  # assert literal uv lock subcommand tokens in source
+if grep -qF 'py_uv_normalize_lock' "$script" \
+  && grep -qF 'py_uv_strip_exclude_newer_from_lock' "$script" \
+  && grep -qF 'py_uv_lock_check' "$script" \
+  && grep -qF 'lock --check' <<<"$lock_check_fn" \
+  && grep -qF 'options.exclude-newer-package' <<<"$strip_fn" \
+  && grep -qF 'py_uv_strip_exclude_newer_from_lock' <<<"$normalize_fn" \
+  && ! grep -qF 'dep_runner_uv_dir_capture "$label" "$uv_dir" -- lock' <<<"$normalize_fn" \
+  && ! grep -qF -- '--exclude-newer-package' <<<"$normalize_fn"; then
+  printf '[PASS] uv lock normalize: strip options in-place + --check (no re-resolve lock)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv lock normalize: expected strip helper + py_uv_lock_check without plain lock\n'
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'py_uv_normalize_lock "uv lock normalize"' "$script" \
+  && grep -qF 'py_uv_normalize_lock "uv batch lock normalize"' "$script" \
+  && grep -qF 'py_uv_lock_check "uv batch lock --check"' "$script"; then
+  printf '[PASS] uv lock normalize: single and batch paths normalize before git add\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv lock normalize: missing normalize/--check before staging uv.lock\n'
+  fail=$(( fail + 1 ))
+fi
+
+
+# shellcheck disable=SC2016  # assert py_update_one normalize failures record ecosystem failure
+floor_eco_block="$(awk '
+  /uv_constraint_op.*>=.*==.*~=/ {grab=1}
+  grab {print}
+  grab && /files_changed="pyproject\.toml \+ uv\.lock"/ {exit}
+' "$script")"
+trans_eco_block="$(awk '
+  /Transitive \/ unconstrained: prefer marker-aware/,/files_changed="uv\.lock"/
+' "$script")"
+if grep -qF 'dep_updater_append_ecosystem_failure "python|lock normalization failed"' <<<"$floor_eco_block" \
+  && grep -qF 'dep_updater_append_ecosystem_failure "python|lock --check failed after normalize"' <<<"$floor_eco_block" \
+  && grep -qF 'dep_updater_append_ecosystem_failure "python|lock normalization failed"' <<<"$trans_eco_block" \
+  && grep -qF 'dep_updater_append_ecosystem_failure "python|lock --check failed after normalize"' <<<"$trans_eco_block"; then
+  printf '[PASS] uv update-one normalize: records ecosystem failure on normalize/--check skip\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv update-one normalize: expected ecosystem failure on normalize/--check skip\n'
+  fail=$(( fail + 1 ))
+fi
+
+# shellcheck disable=SC2016  # assert direct-floor path snapshots before normalize
+floor_norm_block="$(awk '
+  /uv_constraint_op.*>=.*==.*~=/ {grab=1}
+  grab {print}
+  grab && /files_changed="pyproject\.toml \+ uv\.lock"/ {exit}
+' "$script")"
+if grep -qF 'uv_lock_bak' <<<"$floor_norm_block" \
+  && grep -qF 'py_uv_restore_after_failed_floor_lock' <<<"$floor_norm_block" \
+  && grep -qF 'lock normalization failed' <<<"$floor_norm_block" \
+  && ! grep -qF 'checkout -- uv.lock' <<<"$floor_norm_block"; then
+  printf '[PASS] uv floor normalize: snapshot restore on normalize/--check failure\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv floor normalize: expected uv_lock_bak + restore helper (no bare checkout)\n'
+  fail=$(( fail + 1 ))
+fi
+
+# shellcheck disable=SC2016  # assert security normalize restore + ecosystem failure
+if grep -qF 'dep_updater_append_ecosystem_failure "python|security lock normalization failed"' "$script" \
+  && grep -qF 'dep_updater_append_ecosystem_failure "python|security uv lock --check failed after normalize"' "$script" \
+  && grep -qF 'sec_lock_bak' <<<"$(awk '/^py_security_update\(\)/,/^}$/' "$script")" \
+  && grep -qF 'py_uv_restore_after_failed_floor_lock' \
+    <<<"$(awk '/^py_security_update\(\)/,/^}$/' "$script")" \
+  && ! grep -qF 'checkout -- pyproject.toml uv.lock' \
+    <<<"$(awk '/^py_security_update\(\)/,/^}$/' "$script")"; then
+  printf '[PASS] uv security normalize: snapshot restore + ecosystem failure (no combined checkout)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv security normalize: expected pre-add snapshot restore + ecosystem failure\n'
+  fail=$(( fail + 1 ))
+fi
+
+# shellcheck disable=SC2016  # assert batch PR body gates Python CVEs on any_py
+if grep -qF 'py_audit_lines_arg" && "$any_py" == '\''1'\''' \
+    <<<"$(awk '/^batch_update_all\(\)/,/^}$/' "$script")" \
+  && grep -qF 'if [[ "$any_py" == '\''1'\'' ]]; then' \
+    <<<"$(awk '/^batch_update_all\(\)/,/^}$/' "$script")"; then
+  printf '[PASS] uv batch normalize: Python CVE report/summary gated on any_py\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv batch normalize: Python CVE reporting must require any_py=1\n'
+  fail=$(( fail + 1 ))
+fi
+
+batch_norm_block="$(awk '/^batch_update_all\(\)/,/^}$/' "$script")"
+# shellcheck disable=SC2016  # assert batch normalize failure resets to HEAD (literal $ in grep)
+if grep -qF 'dep_updater_append_ecosystem_failure "python|batch lock normalization failed"' <<<"$batch_norm_block" \
+  && grep -qF 'dep_updater_append_ecosystem_failure "python|batch uv lock --check failed after normalize"' <<<"$batch_norm_block" \
+  && grep -qF 'py_uv_restore_after_failed_floor_lock "$worktree_path" "" ""' <<<"$batch_norm_block" \
+  && ! grep -qF 'batch_norm_lock_bak' <<<"$batch_norm_block"; then
+  printf '[PASS] uv batch normalize: failure resets python files to HEAD + records ecosystem failure\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv batch normalize: expected HEAD reset (empty bak) + ecosystem failure, no batch_norm bak\n'
+  fail=$(( fail + 1 ))
+fi
+
+# shellcheck disable=SC2016  # assert literal uv_lock_bak restore in transitive source
+if awk '/Transitive \/ unconstrained: prefer marker-aware/,/files_changed="uv\.lock"/' "$script" | awk '
+    { prev = line; line = $0 }
+    /py_uv_normalize_lock "uv lock normalize"/ {
+      if (prev ~ /rm -f "\$uv_lock_bak"/) exit 1
+      found = 1
+    }
+    END { exit (found ? 0 : 1) }
+  ' \
+  && awk '/Transitive \/ unconstrained: prefer marker-aware/,/files_changed="uv\.lock"/' "$script" \
+    | grep -qF 'lock normalization failed' \
+  && awk '/Transitive \/ unconstrained: prefer marker-aware/,/files_changed="uv\.lock"/' "$script" \
+    | grep -qF 'cp "$uv_lock_bak" "${worktree_path}/uv.lock"'; then
+  printf '[PASS] uv transitive normalize: keeps uv_lock_bak until normalize/--check succeed\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] uv transitive normalize: uv_lock_bak must survive until after normalize/--check\n'
   fail=$(( fail + 1 ))
 fi
 
