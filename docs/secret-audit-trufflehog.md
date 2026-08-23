@@ -115,11 +115,19 @@ Rules:
   marker is unparseable or stale (>90 days). Missing markers under org
   `--strict-onboarding --all` only SUGGEST (v1 roll-out grandfather until
   operators write markers). Routine audits SUGGEST remediation.
-- Periodic clean runs may refresh `scanned_at` / `git_tip` / version.
+- Periodic clean runs may refresh `scanned_at` / `git_tip` / version **in the
+  local working tree**. Lint reads the marker from the **remote default branch**
+  (Contents API). v1 does **not** auto-commit/push or open a PR for marker
+  refreshes — operators must commit and push (or open a PR) after a clean
+  intake/refresh so `github-repo-lint` sees the new `scanned_at`. Host timer
+  email still reports scan outcome even when markers stay local-only.
 - **Never** write or refresh `status=clean` when TruffleHog reports matching results.
 
 `--write-marker` requires a **local clone** (scan root or cwd). After a clean
 `--all` org scan, markers refresh only for clones that already exist locally.
+A verified leak found during that local refresh fails the run with exit **183**
+(batch emails FAILED); a single clone whose origin fetch fails is skipped with
+WARN so the rest of the sweep can continue.
 
 ## Failure contract
 
