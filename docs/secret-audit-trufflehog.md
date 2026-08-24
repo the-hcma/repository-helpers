@@ -54,8 +54,8 @@ still-valid credentials. Operators may widen to `verified,unknown` or
 | Mode | Command shape | Use |
 | --- | --- | --- |
 | Local full history | `trufflehog --no-update git file://$REPO --results=verified --fail` | Intake / local clone (preferred when a full clone exists) |
-| Single remote repo | `trufflehog --no-update github --repo=OWNER/NAME --token=…` | When no local clone is available |
-| Org sweep | `trufflehog --no-update github --org=ORG --token=…` | Periodic timer / `--all` |
+| Single remote repo | `GITHUB_TOKEN=… trufflehog --no-update github --repo=OWNER/NAME --results=verified --fail` | When no local clone is available (prefer `scripts/secret-audit`; token via env, never argv) |
+| Org sweep | `GITHUB_TOKEN=… trufflehog --no-update github --org=ORG --results=verified --fail` | Periodic timer / `--all` (wrapper sets env + `--fail`) |
 
 **Not used for intake in v1:**
 
