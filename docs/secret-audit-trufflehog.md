@@ -96,7 +96,10 @@ Override pin / install dir / parallelism:
 - `SECRET_AUDIT_CONCURRENCY` (optional positive integer → TruffleHog `--concurrency`;
   omit for TruffleHog’s default worker count — org mode already overlaps clone/scan)
 
-Org sweeps always pass **`--exclude-archived`** so archived repositories are not cloned.
+Org sweeps always pass **`--exclude-archived`** so archived repositories are not
+cloned. Marker refresh after a clean org scan uses the same archived filter via
+`rp_exclude_archived` on `rp_discover_org_repos` (local clones of archived repos
+are skipped).
 
 ## Marker file
 
