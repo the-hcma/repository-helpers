@@ -38,6 +38,9 @@ source "${rp_lib_dir}/github-api-rate-limit"
 # shellcheck source=scripts/lib/stacking-tool
 source "${rp_lib_dir}/stacking-tool"
 
+# shellcheck source=scripts/lib/secret-audit
+source "${rp_lib_dir}/secret-audit"
+
 rp_runner_last_stdout() {
   local uuid
 
@@ -230,6 +233,7 @@ Audits GitHub conventions for org repositories:
     - .gitignore must not ignore .cursor/rules/ (org cursor rules must be trackable)
     - .github/stacking-tool (graphite|gh-stack) + stacking-tool cursor rule
     - stacking docs consistency (AGENTS.md / pr-ship / GRAPHITE.md vs marker)
+    - .github/secret-audit.json (TruffleHog deep-scan intake marker; see docs/secret-audit-trufflehog.md)
 
   Release Please (when release-please.yml exists):
     - squash-only repo settings; squash_merge_commit_message=BLANK
@@ -1154,6 +1158,75 @@ rp_stacking_tool_rule_is_valid() {
   grep -qE \
     'stacking-tool-canonical-gh-stack-skill:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.cursor/skills/gh-stack/SKILL\.md' \
     <<<"$text"
+}
+
+# Validates .github/secret-audit.json after a clean TruffleHog deep scan (#509).
+# Missing markers FAIL under --new-repo only (intake gate). Under --strict-onboarding
+# alone they SUGGEST so org-wide audits can roll out without failing every repo
+# before operators write markers. Invalid/stale markers FAIL under --new-repo or
+# --strict-onboarding; routine audits SUGGEST.
+rp_check_secret_audit_marker() {
+  local slug="$1"
+  local marker_text validation_rc repo_fail=0 fetch_rc=0
+
+  fetch_rc=0
+  marker_text="$(rp_fetch_github_text_file "$slug" "$secret_audit_marker_relpath")" || fetch_rc=$?
+  if (( fetch_rc == 2 )); then
+    # Strict/intake: FAIL. Routine audit: WARN only (do not record FAIL then return 0).
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      rp_log_gh_api_fail "$slug" "secret-audit marker fetch (${secret_audit_marker_relpath})"
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'secret-audit marker fetch failed (GitHub API error)' \
+        "$(rp_github_url "$slug" "/blob/main/${secret_audit_marker_relpath}")"
+    else
+      rp_log_warn \
+        "${slug}: secret-audit marker fetch failed (GitHub API error); retry later"
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: retry secret-audit marker check after GitHub API recovers"
+    fi
+    return "$repo_fail"
+  fi
+  if [[ -z "$marker_text" || "$fetch_rc" -ne 0 ]]; then
+    # Intake only: do not fail org --strict-onboarding --all on missing markers (v1 roll-out).
+    if [[ "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        "secret-audit intake marker (${secret_audit_marker_relpath})" \
+        "$(rp_github_url "$slug" "/new/main/${secret_audit_marker_relpath}")"
+      printf 'ERROR: SECRET_AUDIT_MARKER_MISSING %s\n' "$slug" >&2
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: run scripts/secret-audit --repo ${slug} --write-marker after a clean TruffleHog deep scan (docs/secret-audit-trufflehog.md)"
+      rp_log_manual_step \
+        "scripts/secret-audit --repo ${slug} --write-marker"
+    fi
+    return "$repo_fail"
+  fi
+
+  validation_rc=0
+  secret_audit_validate_marker_json "$marker_text" || validation_rc=$?
+  if (( validation_rc != 0 )); then
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'secret-audit marker invalid or stale' \
+        "$(rp_github_url "$slug" "/blob/main/${secret_audit_marker_relpath}")"
+      printf 'ERROR: SECRET_AUDIT_MARKER_INVALID %s\n' "$slug" >&2
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: re-run scripts/secret-audit --repo ${slug} --write-marker (marker invalid or stale)"
+    fi
+    return "$repo_fail"
+  fi
+
+  rp_log_check_ok "$slug" 'secret-audit intake marker' \
+    "$(rp_github_url "$slug" "/blob/main/${secret_audit_marker_relpath}")"
+  return 0
 }
 
 rp_check_stacking_tool() {
@@ -3790,7 +3863,7 @@ rp_queue_candidate_file_fix() {
 
 rp_git_remote_slug_for_dir() {
   local repo_dir="$1"
-  local remote_url slug
+  local remote_url
 
   local remote_exit_code=0
   set +e
@@ -3799,19 +3872,10 @@ rp_git_remote_slug_for_dir() {
   remote_exit_code=$?
   set -e
   remote_url="${remote_url//$'\n'/}"
-  if (( remote_exit_code != 0 )); then
-    remote_url=""
-  fi
-  if [[ -z "$remote_url" ]]; then
+  if (( remote_exit_code != 0 )) || [[ -z "$remote_url" ]]; then
     return 1
   fi
-  slug="$(printf '%s' "$remote_url" \
-    | sed -E 's#^git@github.com:##; s#^ssh://git@github.com/##; s#^https://github.com/##; s#\.git$##')"
-  if [[ "$slug" == */* ]]; then
-    printf '%s\n' "$slug"
-    return 0
-  fi
-  return 1
+  gh_slug_from_origin_url "$remote_url"
 }
 
 # Primary clone for this lib (not a linked worktree under .worktrees/).
@@ -3957,6 +4021,7 @@ rp_candidate_fix_path_is_api_eligible() {
 
   [[ "$path" == .cursor/rules/* ]] && return 0
   [[ "$path" == '.github/stacking-tool' ]] && return 0
+  [[ "$path" == '.github/secret-audit.json' ]] && return 0
   return 1
 }
 
@@ -5893,6 +5958,7 @@ rp_print_new_repo_checklist() {
       [ ] .cursor/rules/repo-practices-after-config-change.mdc (run github-repo-lint after config/workflow edits; template in ${rp_THIS_REPO_NAME})
       [ ] .gitignore must not ignore .cursor/rules/ (un-ignore if ignoring other .cursor content)
       [ ] .github/stacking-tool (graphite|gh-stack)
+      [ ] .github/secret-audit.json after clean TruffleHog deep scan (scripts/secret-audit --write-marker; docs/secret-audit-trufflehog.md)
       [ ] .cursor/rules/stacking-tool.mdc (thin marker rule; template in ${rp_THIS_REPO_NAME})
       [ ] AGENTS.md + pr-ship submit block match the marker (no leftover Graphite-only gt/merge-it when gh-stack)
       [ ] No root GRAPHITE.md when marker is gh-stack (skill in ${rp_THIS_REPO_NAME} is SSOT)
@@ -7156,6 +7222,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_stacking_tool "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_secret_audit_marker "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_stacking_docs_consistency "$slug"; then

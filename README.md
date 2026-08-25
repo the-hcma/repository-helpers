@@ -9,10 +9,9 @@ repository practice audits, agent review automation, systemd user services, and
 stacked PR workflow support (`gh-stack` or Graphite, selected per repo).
 
 Headline tools: **`dep-updater`** (stacked dependency PRs), **`github-repo-lint`**
-(org repo practices audit), and **secret scanning** (gitleaks via
-`scripts/dev/secret-scan` / CI). Everything else supports shipping, review, and
-daily automation around those. Planned expansion: [#509](https://github.com/the-hcma/repository-helpers/issues/509)
-(deep intake / periodic audit) — see [Upcoming](#upcoming).
+(org repo practices audit), **secret scanning** (gitleaks via
+`scripts/dev/secret-scan` / CI), and **secret audit** (TruffleHog deep history via
+`scripts/secret-audit` — see [docs/secret-audit-trufflehog.md](docs/secret-audit-trufflehog.md)).
 
 ## Command-line tools
 
@@ -25,6 +24,7 @@ Most entry points accept `--help`.
 | [`dep-updater-batch-run`](#dep-updater-batch-run) | Daily `dep-updater --batch --all` + email report (systemd entry point) |
 | [`github-repo-lint`](#github-repo-lint) | Audit / onboard org repos against practices (merge queue, workflows, …) |
 | [`secret-scan`](#secret-scanning) | Local + CI gitleaks scan for leaked credentials (canonical org helper) |
+| [`secret-audit`](#secret-audit-deep-scan) | TruffleHog deep scan (full git history); intake marker + periodic org sweep |
 | [`setup-service` / systemd](#systemd--services) | Install and inspect optional daily user services |
 | [`ship-and-review`](#wait-for-agent-review--ship-and-review) | Submit stack → wait for CI → agent review loop |
 | [`start-development` / ship helpers](#development-workflow) | Worktrees, local CI gates, stack submit, CI wait |
@@ -138,7 +138,30 @@ with rotate / branch-quarantine guidance — do not push and hope CI catches it.
 job when `.github/ci/secret-scan` or `scripts/dev/secret-scan` exists (escape
 hatch: `PRE_PR_CHECKS_SKIP=secret-scan`). CI `secret-scan` still runs after push
 for triage. Full-history / intake / periodic deep scans (TruffleHog) are
-[#509](https://github.com/the-hcma/repository-helpers/issues/509).
+[#509](https://github.com/the-hcma/repository-helpers/issues/509) —
+now implemented as `scripts/secret-audit` (see below).
+
+### Secret audit (deep scan)
+
+Full git history and org-wide sweeps use **TruffleHog** via `scripts/secret-audit`
+(see [docs/secret-audit-trufflehog.md](docs/secret-audit-trufflehog.md)). After a
+**clean** scan, `--write-marker` records proof in `.github/secret-audit.json`;
+`github-repo-lint` checks that marker on intake / strict audits.
+
+```bash
+scripts/secret-audit --repo OWNER/NAME
+scripts/secret-audit --repo OWNER/NAME --write-marker
+scripts/secret-audit --all --org the-hcma --include-private
+```
+
+Automation always passes `--no-update` to TruffleHog. Installs must match the
+pinned release (`3.97.0`); a mismatched on-PATH binary is replaced from GitHub
+releases after checksum verification.
+On leaks: `ERROR: SECRET_AUDIT_LEAK` — rotate credentials; never write a clean marker.
+
+Daily timer (optional): `scripts/setup-secret-audit` installs `secret-audit.service`
+(05:00) running `scripts/secret-audit-batch-run` (org sweep + email).
+
 
 ### Development workflow
 
@@ -186,7 +209,7 @@ Tracked work that extends the tools above (not shipped yet):
 
 | Issue | What it will add |
 | --- | --- |
-| [#509](https://github.com/the-hcma/repository-helpers/issues/509) | New **TruffleHog**-based deep secret/credential audit: full git history on repo intake, durable `.github/` intake marker, `github-repo-lint` check for the marker, and periodic org/timer (or workflow) sweeps. Complements — does not replace — the fast gitleaks PR / pre-submit gate. |
+| ~~[#509](https://github.com/the-hcma/repository-helpers/issues/509)~~ | **Shipped:** TruffleHog deep secret audit (`scripts/secret-audit`), `.github/secret-audit.json` marker, lint check, systemd timer — see [docs/secret-audit-trufflehog.md](docs/secret-audit-trufflehog.md). |
 
 ### `wait-for-agent-review` / `ship-and-review`
 
@@ -323,6 +346,7 @@ also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
 | Git commit identity cursor rule | yes | — | `.cursor/rules/git-commit-identity.mdc` forbids agent/machine co-authors; agents must verify commit signing (`commit.gpgsign` / `user.signingkey`, pinentry-mac / passphrase / per-machine keys / clearsign probe) and `~/.cursor/cli-config.json` attribution, and surface setup instructions when either is missing |
 | Repo practices after config change | yes | — | `.cursor/rules/repo-practices-after-config-change.mdc` requires `github-repo-lint` after workflow/config edits; `pre-pr-checks` runs detect-first `repo-practices-lint` when the diff touches those paths |
 | Session-start read guidance | yes | — | `.cursor/rules/read-agents-and-rules.mdc` requires reading `AGENTS.md` and `.cursor/rules/` at the start of every new agent session |
+| Secret-audit intake marker | yes | — | `.github/secret-audit.json` present, parseable, `status=clean` after TruffleHog deep scan ([docs/secret-audit-trufflehog.md](docs/secret-audit-trufflehog.md)) |
 | Stacking-tool marker + rule | yes | — | `.github/stacking-tool` + thin stacking-tool cursor rule |
 | Stacking docs consistency | yes | — | `gh-stack` marker vs leftover Graphite docs (`AGENTS.md` / pr-ship / `GRAPHITE.md`) |
 | UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
