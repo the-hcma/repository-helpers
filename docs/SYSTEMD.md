@@ -357,7 +357,9 @@ filters, marker schema, and AGPL notes.
 ```
 
 Optional `~/.config/secret-audit.env` overlays SMTP / org settings on top of
-`~/.config/dep-updater.env`.
+`~/.config/dep-updater.env` (see `etc/secret-audit.env.example`). Emails are
+summary-only; full scan transcripts land under
+`~/scratch/repository-helpers/secret-audit-runs/` (or `SECRET_AUDIT_DETAIL_DIR`).
 
 The service unit has **no `[Install]` section** — only `secret-audit.timer`
 starts it (`OnCalendar=05:00`). Follow **Timer oneshot conventions** above for
