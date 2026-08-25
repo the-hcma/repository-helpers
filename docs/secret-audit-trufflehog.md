@@ -65,7 +65,12 @@ still-valid credentials. Operators may widen to `verified,unknown` or
 
 Always pass **`--no-update`** in automation (Homebrew Cellar and pinned installs are
 not writable by the in-binary updater). Upgrade with `brew upgrade trufflehog` or
-by bumping `secret_audit_trufflehog_version` / `TRUFFLEHOG_VERSION`.
+by bumping `secret_audit_trufflehog_version` / `TRUFFLEHOG_VERSION` **and** the
+matching in-repo SHA-256 pins in `secret_audit_trufflehog_pinned_sha256` (release
+`checksums.txt` is not trusted — same mutable host as the tarball).
+
+Checksum verification uses GNU `sha256sum` (Homebrew `coreutils` gnubin on Darwin
+via `tooling_path_ensure_gnu_userland`).
 
 Shallow clones only see shallow history — the wrapper runs `git fetch --unshallow`
 when needed before a `git file://` deep scan.
