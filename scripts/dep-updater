@@ -8816,8 +8816,16 @@ log_batch_all_top_level_dirs() {
   done < <(tr ':' '\n' <<<"$scan_roots_csv" | sed '/^$/d')
 }
 
+# discover_batch_all_slug_lc <slug>
+# Lowercase OWNER/NAME for org-membership map keys (GitHub names are case-insensitive).
+discover_batch_all_slug_lc() {
+  local -r slug="$1"
+  printf '%s' "${slug,,}"
+}
+
 # discover_batch_all_index_local_clones
 # Prints "OWNER/NAME<TAB>abspath" for each git clone under configured scan roots.
+# Slug may be empty when origin is missing or not a GitHub URL.
 discover_batch_all_index_local_clones() {
   local root resolved_root child resolved_child slug
 
@@ -8836,7 +8844,6 @@ discover_batch_all_index_local_clones() {
       resolved_child="$(dep_updater_runner_realpath "$child" 2>/dev/null)" || continue
       slug=""
       slug="$(gh_slug_from_repo_dir "$resolved_child" 2>/dev/null)" || slug=""
-      [[ -n "$slug" ]] || continue
       printf '%s\t%s\n' "$slug" "$resolved_child"
     done < <(find "$resolved_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
   done < <(tr ':' '\n' <<<"$scan_roots_csv" | sed '/^$/d')
@@ -8866,22 +8873,30 @@ discover_batch_all_org_repo_names() {
 # Prints absolute clone paths for org repos that exist under scan roots.
 # Logs skips for org repos with no local clone (visible in the batch email).
 discover_batch_all_repos() {
-  local org name slug path discover_rc=0
-  local names_file
-  local -A clone_by_slug=()
+  local org name slug slug_lc path discover_rc=0
+  local names_file slug_key
+  local -A clone_by_slug_lc=()
+  local -A clone_slug_by_slug_lc=()
+  local -A matched_clone_slug_lc=()
 
   org="${DEP_UPDATER_ORG:-the-hcma}"
 
   while IFS=$'\t' read -r slug path; do
-    [[ -n "$slug" && -n "$path" ]] || continue
-    clone_by_slug["$slug"]="$path"
+    [[ -n "$path" ]] || continue
+    if [[ -z "$slug" ]]; then
+      log "[batch-all] Skipping ${path}: no GitHub origin slug under scan roots"
+      continue
+    fi
+    slug_lc="$(discover_batch_all_slug_lc "$slug")"
+    clone_by_slug_lc["$slug_lc"]="$path"
+    clone_slug_by_slug_lc["$slug_lc"]="$slug"
   done < <(discover_batch_all_index_local_clones)
 
   names_file="$(mktemp)"
   discover_batch_all_org_repo_names "$org" >"$names_file" || discover_rc=$?
   if (( discover_rc != 0 )); then
     rm -f "$names_file"
-    die "Failed to list repositories for org ${org} (GitHub API exit ${discover_rc})"
+    return 1
   fi
 
   log "[batch-all] Org: ${org} (discover via GitHub API; clones under scan roots)"
@@ -8889,14 +8904,23 @@ discover_batch_all_repos() {
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     slug="${org}/${name}"
-    path="${clone_by_slug[$slug]:-}"
+    slug_lc="$(discover_batch_all_slug_lc "$slug")"
+    path="${clone_by_slug_lc[$slug_lc]:-}"
     if [[ -z "$path" ]]; then
       log "[batch-all] Skipping ${slug}: no local clone under scan roots"
       continue
     fi
+    matched_clone_slug_lc["$slug_lc"]=1
     printf '%s\n' "$path"
   done <"$names_file"
   rm -f "$names_file"
+
+  for slug_key in "${!clone_by_slug_lc[@]}"; do
+    if [[ -z "${matched_clone_slug_lc[$slug_key]:-}" ]]; then
+      slug="${clone_slug_by_slug_lc[$slug_key]:-$slug_key}"
+      log "[batch-all] Skipping ${slug}: local clone not in org membership"
+    fi
+  done
 }
 
 _batch_all_interrupted=0
@@ -9047,6 +9071,7 @@ batch_all_dispatch() {
   discover_batch_all_repos >"$discover_file" || discover_rc=$?
   if (( discover_rc != 0 )); then
     rm -f "$discover_file"
+    log "[batch-all] Failed to list org repositories (GitHub API exit ${discover_rc})"
     return "$discover_rc"
   fi
   readarray -t repos_found < <(sort -u "$discover_file")

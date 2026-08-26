@@ -827,6 +827,115 @@ assert_contains "batch --all missing clone skip" "$nloc_batch_out" \
   "[batch-all] Skipping the-hcma/remote-only-repo: no local clone under scan roots"
 assert_not_contains "batch --all missing clone skip" "$nloc_batch_out" "[batch-all] --- remote-only-repo"
 
+printf '\n=== batch --all reports local clones not in org membership ===\n'
+nio_batch_tmp="$(mktemp -d)"
+nio_home="${nio_batch_tmp}/home"
+mkdir -p "${nio_home}/.local/bin" "${nio_batch_tmp}/roots/member-repo" "${nio_batch_tmp}/roots/fork-repo"
+
+git -C "${nio_batch_tmp}/roots/member-repo" \
+  -c user.name=dep-updater-test -c user.email=dep-updater-test@example.com init -q
+git -C "${nio_batch_tmp}/roots/member-repo" \
+  -c user.name=dep-updater-test -c user.email=dep-updater-test@example.com \
+  remote add origin 'https://github.com/the-hcma/member-repo.git'
+git -C "${nio_batch_tmp}/roots/member-repo" \
+  -c user.name=dep-updater-test -c user.email=dep-updater-test@example.com \
+  commit --allow-empty -q -m init
+
+git -C "${nio_batch_tmp}/roots/fork-repo" \
+  -c user.name=dep-updater-test -c user.email=dep-updater-test@example.com init -q
+git -C "${nio_batch_tmp}/roots/fork-repo" \
+  -c user.name=dep-updater-test -c user.email=dep-updater-test@example.com \
+  remote add origin 'https://github.com/other-owner/fork-repo.git'
+git -C "${nio_batch_tmp}/roots/fork-repo" \
+  -c user.name=dep-updater-test -c user.email=dep-updater-test@example.com \
+  commit --allow-empty -q -m init
+
+cat >"${nio_home}/.local/bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == 'stack --help' ]]; then
+  exit 0
+fi
+if [[ "$args" == *'orgs/the-hcma/repos'* ]]; then
+  printf '%s\n' 'member-repo'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${nio_home}/.local/bin/gh"
+
+nio_batch_out=""
+nio_batch_exit=0
+set +e
+nio_batch_out="$(
+  cd "$nio_batch_tmp" \
+    && HOME="$nio_home" PATH="${nio_home}/.local/bin:${PATH}" \
+      "$script" --batch --all --dry-run --scan-root "${nio_batch_tmp}/roots" 2>&1
+)"
+nio_batch_exit=$?
+set -e
+rm -rf "$nio_batch_tmp"
+
+assert_exit_0 "batch --all clone not in org skip" "$nio_batch_out" "$nio_batch_exit"
+assert_contains "batch --all clone not in org skip" "$nio_batch_out" "[batch-all] --- member-repo"
+assert_contains "batch --all clone not in org skip" "$nio_batch_out" \
+  "[batch-all] Skipping other-owner/fork-repo: local clone not in org membership"
+assert_not_contains "batch --all clone not in org skip" "$nio_batch_out" "[batch-all] --- fork-repo"
+
+printf '\n=== batch --all: org API failure returns without die ===\n'
+api_fail_tmp="$(mktemp -d)"
+api_fail_home="${api_fail_tmp}/home"
+mkdir -p "${api_fail_home}/.local/bin" "${api_fail_tmp}/roots/only-repo"
+
+git -C "${api_fail_tmp}/roots/only-repo" \
+  -c user.name=dep-updater-test -c user.email=dep-updater-test@example.com init -q
+git -C "${api_fail_tmp}/roots/only-repo" \
+  -c user.name=dep-updater-test -c user.email=dep-updater-test@example.com \
+  remote add origin 'https://github.com/the-hcma/only-repo.git'
+git -C "${api_fail_tmp}/roots/only-repo" \
+  -c user.name=dep-updater-test -c user.email=dep-updater-test@example.com \
+  commit --allow-empty -q -m init
+
+cat >"${api_fail_home}/.local/bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == 'stack --help' ]]; then
+  exit 0
+fi
+if [[ "$args" == *'orgs/the-hcma/repos'* ]]; then
+  printf 'gh: Not Found\n' >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${api_fail_home}/.local/bin/gh"
+
+api_fail_out=""
+api_fail_exit=0
+set +e
+api_fail_out="$(
+  cd "$api_fail_tmp" \
+    && HOME="$api_fail_home" PATH="${api_fail_home}/.local/bin:${PATH}" \
+      "$script" --batch --all --dry-run --scan-root "${api_fail_tmp}/roots" 2>&1
+)"
+api_fail_exit=$?
+set -e
+rm -rf "$api_fail_tmp"
+
+if [[ "$api_fail_exit" -ne 0 ]] \
+  && grep -qF 'Failed to list org repositories' <<<"$api_fail_out" \
+  && ! grep -qF '[batch-all] --- only-repo' <<<"$api_fail_out"; then
+  printf '[PASS] batch --all org API failure: exit non-zero without processing clones\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] batch --all org API failure: exit=%s output:\n%s\n' "$api_fail_exit" "$api_fail_out"
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== batch --all: rejects combined --dir ===\n'
 fb_dir_out=""
 fb_dir_exit=0
@@ -3809,6 +3918,8 @@ if grep -q '\-\-all' "$script" && grep -q '^discover_batch_all_repos()' "$script
   && grep -qF 'include-private' "$script" \
   && grep -qF 'orgs/${org}/repos' "$script" \
   && grep -qF 'no local clone under scan roots' "$script" \
+  && grep -qF 'local clone not in org membership' "$script" \
+  && grep -qF 'Failed to list org repositories' "$script" \
   && grep -qF 'DEP_UPDATER_INCLUDE_PRIVATE' "$script" \
   && grep -qF 'DEP_UPDATER_ORG' "$script"; then
   printf '[PASS] batch --all: org API discovery, missing-clone skip, and helpers present\n'
