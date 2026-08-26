@@ -8849,23 +8849,16 @@ discover_batch_all_index_local_clones() {
   done < <(tr ':' '\n' <<<"$scan_roots_csv" | sed '/^$/d')
 }
 
-# discover_batch_all_org_repo_names <org>
-# Lists non-archived org repository short names via the GitHub API.
-# Honors include_private (same contract as github-repo-lint --all).
+# discover_batch_all_org_repo_membership_tsv <org>
+# Prints "name<TAB>private<TAB>archived" for every org repository (GitHub API SSOT).
 # Exit non-zero when the org list API fails (do not treat as an empty org).
-discover_batch_all_org_repo_names() {
+discover_batch_all_org_repo_membership_tsv() {
   local -r org="$1"
-  local jq_expr
-
-  if [[ "$include_private" -eq 0 ]]; then
-    jq_expr='.[] | select(.archived == false) | select(.private == false) | .name'
-  else
-    jq_expr='.[] | select(.archived == false) | .name'
-  fi
 
   # Keep gh on the same line as github_api_exec_with_rate_limit_retry (gh-api-waiter ratchet).
   github_api_exec_with_rate_limit_retry "dep-updater batch-all org repos" -- gh api \
-    "orgs/${org}/repos" --paginate --jq "$jq_expr"
+    "orgs/${org}/repos" --paginate \
+    --jq '.[] | [.name, (.private|tostring), (.archived|tostring)] | @tsv'
 }
 
 # discover_batch_all_repos
@@ -8874,10 +8867,13 @@ discover_batch_all_org_repo_names() {
 # Logs skips for org repos with no local clone (visible in the batch email).
 discover_batch_all_repos() {
   local org name slug slug_lc path discover_rc=0
-  local names_file slug_key
+  local membership_file slug_key private archived
   local -A clone_by_slug_lc=()
   local -A clone_slug_by_slug_lc=()
   local -A matched_clone_slug_lc=()
+  local -A org_member_archived=()
+  local -A org_member_private=()
+  local -A org_member_slug_lc=()
 
   org="${DEP_UPDATER_ORG:-the-hcma}"
 
@@ -8892,19 +8888,30 @@ discover_batch_all_repos() {
     clone_slug_by_slug_lc["$slug_lc"]="$slug"
   done < <(discover_batch_all_index_local_clones)
 
-  names_file="$(mktemp)"
-  discover_batch_all_org_repo_names "$org" >"$names_file" || discover_rc=$?
+  membership_file="$(mktemp)"
+  discover_batch_all_org_repo_membership_tsv "$org" >"$membership_file" || discover_rc=$?
   if (( discover_rc != 0 )); then
-    rm -f "$names_file"
-    return 1
+    rm -f "$membership_file"
+    return "$discover_rc"
   fi
 
   log "[batch-all] Org: ${org} (discover via GitHub API; clones under scan roots)"
 
-  while IFS= read -r name; do
+  while IFS=$'\t' read -r name private archived; do
     [[ -n "$name" ]] || continue
     slug="${org}/${name}"
     slug_lc="$(discover_batch_all_slug_lc "$slug")"
+    org_member_slug_lc["$slug_lc"]=1
+    org_member_private["$slug_lc"]="$private"
+    org_member_archived["$slug_lc"]="$archived"
+
+    if [[ "$archived" == "true" ]]; then
+      continue
+    fi
+    if [[ "$include_private" -eq 0 && "$private" == "true" ]]; then
+      continue
+    fi
+
     path="${clone_by_slug_lc[$slug_lc]:-}"
     if [[ -z "$path" ]]; then
       log "[batch-all] Skipping ${slug}: no local clone under scan roots"
@@ -8912,13 +8919,20 @@ discover_batch_all_repos() {
     fi
     matched_clone_slug_lc["$slug_lc"]=1
     printf '%s\n' "$path"
-  done <"$names_file"
-  rm -f "$names_file"
+  done <"$membership_file"
+  rm -f "$membership_file"
 
   for slug_key in "${!clone_by_slug_lc[@]}"; do
-    if [[ -z "${matched_clone_slug_lc[$slug_key]:-}" ]]; then
-      slug="${clone_slug_by_slug_lc[$slug_key]:-$slug_key}"
+    if [[ -n "${matched_clone_slug_lc[$slug_key]:-}" ]]; then
+      continue
+    fi
+    slug="${clone_slug_by_slug_lc[$slug_key]:-$slug_key}"
+    if [[ -z "${org_member_slug_lc[$slug_key]:-}" ]]; then
       log "[batch-all] Skipping ${slug}: local clone not in org membership"
+    elif [[ "${org_member_archived[$slug_key]}" == "true" ]]; then
+      log "[batch-all] Skipping ${slug}: archived org repository"
+    elif [[ "${org_member_private[$slug_key]}" == "true" && "$include_private" -eq 0 ]]; then
+      log "[batch-all] Skipping ${slug}: private org repository (use --include-private)"
     fi
   done
 }
