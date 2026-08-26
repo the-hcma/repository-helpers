@@ -9058,6 +9058,17 @@ batch_all_scrape_actionable_from_log() {
   return 1
 }
 
+# batch_all_ephemeral_clone_safe_to_remove <child_exit>
+# Ephemeral scan-root clones must outlive child worktrees when --no-wait-merge
+# leaves cleanup to the operator, or when the child failed mid-run.
+batch_all_ephemeral_clone_safe_to_remove() {
+  local -r child_exit="$1"
+
+  (( child_exit != 0 )) && return 1
+  [[ "$no_wait_merge" == '1' ]] && return 1
+  return 0
+}
+
 # batch_all_materialize_checkout <slug> <local_path>
 # Prints an absolute checkout path: reuse local_path when set, else depth-1 clone
 # under _batch_all_ephemeral_root. Returns non-zero when ephemeral clone fails.
@@ -9107,7 +9118,7 @@ batch_all_dispatch() {
   local -a child_args repos_found
   local -a failure_summaries=()
   local -a failure_details=()
-  local slug checkout_path repo_ephemeral=0 ephemeral_base
+  local slug checkout_path repo_ephemeral=0 ephemeral_base clone_rc=0
 
   # Palette of ANSI colors cycled across repos so each project's header is visually distinct.
   # Only active when stderr is a TTY (same condition as init_prompt_style).
@@ -9185,7 +9196,18 @@ batch_all_dispatch() {
       repo="$checkout_path"
     else
       repo_ephemeral=1
-      repo="$(batch_all_materialize_checkout "$slug" "")" || continue
+      clone_rc=0
+      repo="$(batch_all_materialize_checkout "$slug" "")" || clone_rc=$?
+      if (( clone_rc != 0 )); then
+        if (( clone_rc == 130 )) || [[ "${_runner_interrupted:-0}" -eq 1 ]]; then
+          _batch_all_interrupted=1
+          break
+        fi
+        if (( worst_exit == 0 || clone_rc > worst_exit )); then
+          worst_exit="$clone_rc"
+        fi
+        continue
+      fi
     fi
     [[ -n "$repo" ]] || continue
     [[ "$_batch_all_interrupted" == '1' ]] && break
@@ -9414,7 +9436,7 @@ batch_all_dispatch() {
     fi
     rm -f "$child_log" "$child_report" "$child_updates"
     _batch_all_active_child_log=""
-    if (( repo_ephemeral )); then
+    if (( repo_ephemeral )) && batch_all_ephemeral_clone_safe_to_remove "$child_exit"; then
       run_command "batch-all rm ephemeral clone $(basename "$repo")" -- rm -rf "$repo"
     fi
   done
