@@ -55,7 +55,7 @@ still-valid credentials. Operators may widen to `verified,unknown` or
 | --- | --- | --- |
 | Local full history | `trufflehog --no-update git file://$REPO --results=verified --fail` | Intake / local clone (preferred when a full clone exists) |
 | Single remote repo | `GITHUB_TOKEN=… trufflehog --no-update github --repo=OWNER/NAME --results=verified --fail` | When no local clone is available (prefer `scripts/secret-audit`; token via env, never argv) |
-| Org sweep | `GITHUB_TOKEN=… trufflehog --no-update github --org=ORG --results=verified --fail` | Periodic timer / `--all` (wrapper sets env + `--fail`) |
+| Org sweep | `GITHUB_TOKEN=… trufflehog --no-update github --org=ORG --exclude-archived --results=verified --fail` | Periodic timer / `--all` (wrapper sets env + `--fail`; optional `--concurrency` via `SECRET_AUDIT_CONCURRENCY`) |
 
 **Not used for intake in v1:**
 
@@ -89,10 +89,17 @@ scripts/secret-audit --repo OWNER/NAME --write-marker
 scripts/secret-audit --all --org the-hcma --include-private --write-marker
 ```
 
-Override pin / install dir:
+Override pin / install dir / parallelism:
 
 - `TRUFFLEHOG_VERSION` (default pin in `scripts/lib/secret-audit`)
 - `SECRET_AUDIT_BIN_DIR` (default `~/.cache/repository-helpers/bin`)
+- `SECRET_AUDIT_CONCURRENCY` (optional positive integer → TruffleHog `--concurrency`;
+  omit for TruffleHog’s default worker count — org mode already overlaps clone/scan)
+
+Org sweeps always pass **`--exclude-archived`** so archived repositories are not
+cloned. Marker refresh after a clean org scan uses the same archived filter via
+`rp_exclude_archived` on `rp_discover_org_repos` (local clones of archived repos
+are skipped).
 
 ## Marker file
 
@@ -159,9 +166,17 @@ scripts/setup-secret-audit
 scripts/setup-secret-audit --status
 ```
 
-Reuses `~/.config/dep-updater.env` for SMTP; optional `~/.config/secret-audit.env`
-(`SECRET_AUDIT_ORG`, `SECRET_AUDIT_INCLUDE_PRIVATE`, report recipients). Follows
-timer oneshot conventions (`docs/SYSTEMD.md`): timer-only activation + flock.
+Reuses `~/.config/dep-updater.env` for SMTP; optional overlay
+`~/.config/secret-audit.env` (see `etc/secret-audit.env.example`) for
+`SECRET_AUDIT_REPORT_TO` / From, org flags, `SECRET_AUDIT_CONCURRENCY`, and detail
+paths. Follows timer oneshot conventions (`docs/SYSTEMD.md`): timer-only activation
++ flock.
+
+**Email privacy:** the batch report is summary-only (PASS/FAIL, org, timing, safe
+aggregate counts, result class, path to host transcript). TruffleHog finding
+payloads are **never** emailed — full output is deposited under
+`SECRET_AUDIT_DETAIL_DIR` (default `~/scratch/repository-helpers/secret-audit-runs/`,
+mode `0600`) and also appended to the batch log.
 
 ## AGPL note
 
@@ -174,5 +189,6 @@ automation does not trigger copyleft on this Bash repo.
 ## Related
 
 - Issue [#509](https://github.com/the-hcma/repository-helpers/issues/509)
+- Issue [#516](https://github.com/the-hcma/repository-helpers/issues/516) — exclude archived; concurrency; summary email
 - Fast gate: `scripts/dev/secret-scan` / `.github/ci/secret-scan` (gitleaks)
 - Lint check: `github-repo-lint` secret-audit intake marker (AGENTS.md / README tables)

@@ -160,7 +160,10 @@ releases after checksum verification.
 On leaks: `ERROR: SECRET_AUDIT_LEAK` — rotate credentials; never write a clean marker.
 
 Daily timer (optional): `scripts/setup-secret-audit` installs `secret-audit.service`
-(05:00) running `scripts/secret-audit-batch-run` (org sweep + email).
+(05:00) running `scripts/secret-audit-batch-run` (org sweep + summary email; finding
+details stay on the host under `secret-audit-runs/`). Org sweeps skip archived
+repos; set `SECRET_AUDIT_REPORT_TO` in `~/.config/secret-audit.env` (see
+`etc/secret-audit.env.example`) or reuse `DEP_UPDATER_REPORT_TO`.
 
 
 ### Development workflow
