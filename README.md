@@ -33,7 +33,8 @@ Most entry points accept `--help`.
 ### `dep-updater`
 
 Creates **stacked dependency update PRs** for a single repository (or, with
-`--batch --all`, every clone under configured scan roots). Supported ecosystems:
+`--batch --all`, org repos from the GitHub API that have a local clone under
+configured scan roots). Supported ecosystems:
 npm/pnpm, Python (`pip`, `uv`, `poetry`, `pipenv`), Rust/Cargo, and GitHub Actions.
 Stacking follows the target repo’s `.github/stacking-tool` marker (`gh-stack` when
 absent; explicit `graphite` keeps Graphite). npm, PyPI, and GitHub Actions releases
@@ -53,7 +54,8 @@ scripts/dep-updater --batch --dir /path/to/repo
 # CVE-fix bumps only
 scripts/dep-updater --security-only --dir /path/to/repo
 
-# Every clone under scan roots (skips archived; skips private unless --include-private)
+# Org membership via GitHub API; run clones under scan roots (skips archived;
+# skips private unless --include-private; logs org repos with no local clone)
 scripts/dep-updater --batch --all --no-wait-ci --no-wait-merge
 ```
 
@@ -245,14 +247,16 @@ compliance drift and points to the explicit `--apply-fix` remediation command.
 
 | Service | Script | Schedule | Purpose |
 | --- | --- | --- | --- |
-| `dep-updater.service` | `scripts/dep-updater-batch-run` | 03:00 daily | Create/update dependency PRs across a scan root and email the run report. |
+| `dep-updater.service` | `scripts/dep-updater-batch-run` | 03:00 daily | Create/update dependency PRs for org repos with local clones and email the run report. |
 | `github-repo-lint.service` | `scripts/github-repo-lint` | 04:00 daily | Monitor org repos (GitHub API; default `the-hcma`) and email the repository-practices report. |
 
-`dep-updater.service` is the automation worker. It fetches every repository under
-the scan root, runs `dep-updater --batch --all`, streams the run to
+`dep-updater.service` is the automation worker. It fetches every local clone under
+the scan root, runs `dep-updater --batch --all` (org API membership + local
+checkouts), streams the run to
 `~/scratch/repository-helpers/dep-updater-batch.log`, and sends a success, failure,
 or timeout report by email. When updates are created, the report lists them from
-structured JSON; when none are created, it says so explicitly.
+structured JSON; when none are created, it says so explicitly. Org repos with no
+local clone appear under **Skipped (no local clone)**.
 
 `github-repo-lint.service` is the compliance monitor. It discovers repositories
 from the GitHub org API (`orgs/<ORG>/repos`, default `the-hcma`; same source as
