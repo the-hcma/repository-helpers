@@ -171,19 +171,30 @@ enforcer_apply_config_defaults() {
 # enforcer_discover_repo_slugs
 # Lists OWNER/NAME slugs from the GitHub org API (rp_discover_org_repos).
 # Honors rp_include_private the same way as github-repo-lint --all.
+# Returns non-zero when the org list API fails (do not treat as an empty org).
 enforcer_discover_repo_slugs() {
-  local name
+  local name discover_rc=0
   local -r org="${enforcer_org:-$rp_DEFAULT_ORG}"
   local -a slugs=()
+  local names_file
+
+  names_file="$(mktemp)"
+  rp_discover_org_repos "$org" >"$names_file" || discover_rc=$?
+  if (( discover_rc != 0 )); then
+    rm -f "$names_file"
+    return "$discover_rc"
+  fi
 
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     slugs+=("${org}/${name}")
-  done < <(rp_discover_org_repos "$org")
+  done <"$names_file"
+  rm -f "$names_file"
 
   if [[ "${#slugs[@]}" -gt 0 ]]; then
     printf '%s\n' "${slugs[@]}" | sort -u
   fi
+  return 0
 }
 
 # Discovery runs inside mapfile process substitution; persist notes via
@@ -371,17 +382,30 @@ enforcer_append_runner_stderr() {
 }
 
 enforcer_run_checks() {
-  local slug check_exit parsed_failure_count
+  local slug check_exit parsed_failure_count discover_rc=0
   local -a check_args=()
   local -a slugs=()
   local -r org="${enforcer_org:-$rp_DEFAULT_ORG}"
+  local discover_file
 
   enforcer_discover_notes_file="$(mktemp)"
   : >"$enforcer_discover_notes_file"
-  mapfile -t slugs < <(enforcer_discover_repo_slugs)
+  discover_file="$(mktemp)"
+  enforcer_discover_repo_slugs >"$discover_file" || discover_rc=$?
   enforcer_load_discover_notes
   rm -f "$enforcer_discover_notes_file"
   enforcer_discover_notes_file=""
+
+  if (( discover_rc != 0 )); then
+    rm -f "$discover_file"
+    enforcer_log "Started:  $(date -Is)"
+    enforcer_log "Org:      ${org}"
+    enforcer_log "ERROR: failed to list repositories for org ${org} (GitHub API exit ${discover_rc})"
+    return 1
+  fi
+
+  mapfile -t slugs <"$discover_file"
+  rm -f "$discover_file"
   enforcer_repo_count="${#slugs[@]}"
   enforcer_failure_count=0
 
@@ -533,14 +557,16 @@ enforcer_main() {
     esac
   done
 
+  enforcer_load_required_env_file
+  enforcer_apply_config_defaults
+
   if [[ "${GITHUB_REPO_LINT_INCLUDE_PRIVATE:-0}" == '1' ]]; then
-    # Consumed by rp_discover_org_repos (sourced lib).
+    # Consumed by rp_discover_org_repos (sourced lib). Re-read after env load so
+    # ~/.config/github-repo-lint.env works for direct/cron runs (not only systemd).
     # shellcheck disable=SC2034
     rp_include_private=1
   fi
 
-  enforcer_load_required_env_file
-  enforcer_apply_config_defaults
   mkdir -p "$(dirname "$enforcer_log_file")"
 
   enforcer_run_log="$(mktemp)"
