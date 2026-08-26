@@ -952,11 +952,13 @@ Modes:
   --rebase          Rebase existing stack on top of newest main
 
 Options:
-  --all             With --batch: run batch updates for every git repo discovered
-                    under the top-level scan directories (see --scan-root). Prints
+  --all             With --batch: discover org repos via the GitHub API
+                    (DEP_UPDATER_ORG, default the-hcma), then run batch updates
+                    for each that has a local clone under --scan-root. Prints
                     each resolved top-level directory before running. Always skips
                     archived GitHub repositories. Skips private GitHub repositories
-                    unless --include-private is set. For quick runs, combine with
+                    unless --include-private is set. Org repos with no local clone
+                    are logged as skips (not mutated). For quick runs, combine with
                     both --no-wait-ci and --no-wait-merge.
   --batch           Combine all updates into a single PR instead of one per package
   --dir <path>      Project root (default: current directory)
@@ -974,9 +976,11 @@ Options:
   --quiet           Suppress non-error log lines
   --report-json     Emit JSON scan report on stdout (implies --dry-run --quiet)
   --scan-root <path>  Parent directory whose immediate child folders are git clones
+                    used to resolve org API membership to local checkouts
                     (--batch --all only; repeat). If omitted, defaults to $HOME/work/ai
                     or $DEP_UPDATER_BATCH_ALL_ROOTS (colon-separated; legacy:
                     $DEP_UPDATER_FAST_BATCH_ROOTS still honored when BATCH_ALL unset).
+                    Org membership is not inferred from this tree alone.
   --security-only   Only create CVE-fix PRs; skip regular version bumps
   --semver-only     npm: respect existing semver range (omit --latest)
   --tmpdir <path>   Directory under which to create the dep-updater worktree
@@ -8812,8 +8816,18 @@ log_batch_all_top_level_dirs() {
   done < <(tr ':' '\n' <<<"$scan_roots_csv" | sed '/^$/d')
 }
 
-discover_batch_all_repos() {
-  local root resolved_root child resolved_child repo_name slug priv_status archived_status
+# discover_batch_all_slug_lc <slug>
+# Lowercase OWNER/NAME for org-membership map keys (GitHub names are case-insensitive).
+discover_batch_all_slug_lc() {
+  local -r slug="$1"
+  printf '%s' "${slug,,}"
+}
+
+# discover_batch_all_index_local_clones
+# Prints "OWNER/NAME<TAB>abspath" for each git clone under configured scan roots.
+# Slug may be empty when origin is missing or not a GitHub URL.
+discover_batch_all_index_local_clones() {
+  local root resolved_root child resolved_child slug
 
   while IFS= read -r root; do
     [[ -n "$root" ]] || continue
@@ -8828,42 +8842,99 @@ discover_batch_all_repos() {
       [[ -e "$child/.git" ]] || continue
       resolved_child=""
       resolved_child="$(dep_updater_runner_realpath "$child" 2>/dev/null)" || continue
-      repo_name="${resolved_child##*/}"
-
       slug=""
       slug="$(gh_slug_from_repo_dir "$resolved_child" 2>/dev/null)" || slug=""
-      if [[ -n "$slug" ]]; then
-        archived_status=0
-        gh_repo_is_archived "$slug" || archived_status=$?
-        case "$archived_status" in
-          0)
-            log "[batch-all] Skipping archived repository: ${repo_name} (${slug})"
-            continue
-            ;;
-          2)
-            log "[batch-all] WARNING: could not determine archived status for ${slug}; skipping"
-            continue
-            ;;
-        esac
-      fi
-      if [[ -n "$slug" ]] && [[ "$include_private" -eq 0 ]]; then
-        priv_status=0
-        gh_repo_is_private "$slug" || priv_status=$?
-        case "$priv_status" in
-          0)
-            log "[batch-all] Skipping private repository: ${repo_name} (${slug})"
-            continue
-            ;;
-          2)
-            log "[batch-all] WARNING: could not determine visibility for ${slug}; skipping"
-            continue
-            ;;
-        esac
-      fi
-
-      printf '%s\n' "$resolved_child"
+      printf '%s\t%s\n' "$slug" "$resolved_child"
     done < <(find "$resolved_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
   done < <(tr ':' '\n' <<<"$scan_roots_csv" | sed '/^$/d')
+}
+
+# discover_batch_all_org_repo_membership_tsv <org>
+# Prints "name<TAB>private<TAB>archived" for every org repository (GitHub API SSOT).
+# Exit non-zero when the org list API fails (do not treat as an empty org).
+discover_batch_all_org_repo_membership_tsv() {
+  local -r org="$1"
+
+  # Keep gh on the same line as github_api_exec_with_rate_limit_retry (gh-api-waiter ratchet).
+  github_api_exec_with_rate_limit_retry "dep-updater batch-all org repos" -- gh api \
+    "orgs/${org}/repos" --paginate \
+    --jq '.[] | [.name, (.private|tostring), (.archived|tostring)] | @tsv'
+}
+
+# discover_batch_all_repos
+# Candidate set = org API membership; local scan roots only supply checkouts.
+# Prints absolute clone paths for org repos that exist under scan roots.
+# Logs skips for org repos with no local clone (visible in the batch email).
+discover_batch_all_repos() {
+  local org name slug slug_lc path discover_rc=0
+  local membership_file slug_key private archived
+  local -A clone_by_slug_lc=()
+  local -A clone_slug_by_slug_lc=()
+  local -A matched_clone_slug_lc=()
+  local -A org_member_archived=()
+  local -A org_member_private=()
+  local -A org_member_slug_lc=()
+
+  org="${DEP_UPDATER_ORG:-the-hcma}"
+
+  while IFS=$'\t' read -r slug path; do
+    [[ -n "$path" ]] || continue
+    if [[ -z "$slug" ]]; then
+      log "[batch-all] Skipping ${path}: no GitHub origin slug under scan roots"
+      continue
+    fi
+    slug_lc="$(discover_batch_all_slug_lc "$slug")"
+    clone_by_slug_lc["$slug_lc"]="$path"
+    clone_slug_by_slug_lc["$slug_lc"]="$slug"
+  done < <(discover_batch_all_index_local_clones)
+
+  membership_file="$(mktemp)"
+  discover_batch_all_org_repo_membership_tsv "$org" >"$membership_file" || discover_rc=$?
+  if (( discover_rc != 0 )); then
+    rm -f "$membership_file"
+    return "$discover_rc"
+  fi
+
+  log "[batch-all] Org: ${org} (discover via GitHub API; clones under scan roots)"
+
+  while IFS=$'\t' read -r name private archived; do
+    [[ -n "$name" ]] || continue
+    slug="${org}/${name}"
+    slug_lc="$(discover_batch_all_slug_lc "$slug")"
+    org_member_slug_lc["$slug_lc"]=1
+    org_member_private["$slug_lc"]="$private"
+    org_member_archived["$slug_lc"]="$archived"
+
+    if [[ "$archived" == "true" ]]; then
+      continue
+    fi
+    if [[ "$include_private" -eq 0 && "$private" == "true" ]]; then
+      continue
+    fi
+
+    path="${clone_by_slug_lc[$slug_lc]:-}"
+    if [[ -z "$path" ]]; then
+      log "[batch-all] Skipping ${slug}: no local clone under scan roots"
+      continue
+    fi
+    matched_clone_slug_lc["$slug_lc"]=1
+    printf '%s\n' "$path"
+  done <"$membership_file"
+  rm -f "$membership_file"
+
+  for slug_key in "${!clone_by_slug_lc[@]}"; do
+    if [[ -n "${matched_clone_slug_lc[$slug_key]:-}" ]]; then
+      continue
+    fi
+    slug="${clone_slug_by_slug_lc[$slug_key]:-$slug_key}"
+    if [[ -z "${org_member_slug_lc[$slug_key]:-}" ]]; then
+      log "[batch-all] Skipping ${slug}: local clone not in org membership"
+    elif [[ "${org_member_archived[$slug_key]}" == "true" ]]; then
+      log "[batch-all] Skipping ${slug}: archived org repository"
+    elif [[ "${org_member_private[$slug_key]}" == "true" && "$include_private" -eq 0 ]]; then
+      log "[batch-all] Skipping ${slug}: private org repository (use --include-private)"
+    fi
+  done
 }
 
 _batch_all_interrupted=0
@@ -8975,7 +9046,7 @@ batch_all_scrape_actionable_from_log() {
 }
 
 batch_all_dispatch() {
-  local dep_self repo child_exit worst_exit
+  local dep_self repo child_exit worst_exit discover_file discover_rc=0
   local -a child_args repos_found
   local -a failure_summaries=()
   local -a failure_details=()
@@ -9010,10 +9081,18 @@ batch_all_dispatch() {
 
   log_batch_all_top_level_dirs
 
-  readarray -t repos_found < <(discover_batch_all_repos | sort -u)
+  discover_file="$(mktemp)"
+  discover_batch_all_repos >"$discover_file" || discover_rc=$?
+  if (( discover_rc != 0 )); then
+    rm -f "$discover_file"
+    log "[batch-all] Failed to list org repositories (GitHub API exit ${discover_rc})"
+    return "$discover_rc"
+  fi
+  readarray -t repos_found < <(sort -u "$discover_file")
+  rm -f "$discover_file"
 
   if [[ ${#repos_found[@]} -eq 0 ]]; then
-    log "[batch-all] No git repositories found under scan roots."
+    log "[batch-all] No org repositories with local clones under scan roots."
     return 0
   fi
 
