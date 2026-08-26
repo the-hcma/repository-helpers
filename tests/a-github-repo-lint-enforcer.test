@@ -69,10 +69,8 @@ fi
 
 printf '\n=== static: strict onboarding monitor ===\n'
 if grep -qF 'enforcer_discover_repo_slugs' "${script_dir}/../scripts/github-repo-lint" \
-  && grep -qF 'gh_slug_from_repo_dir' "${script_dir}/../scripts/github-repo-lint" \
-  && grep -qF 'gh_repo_is_private' "${script_dir}/../scripts/github-repo-lint" \
+  && grep -qF 'rp_discover_org_repos' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF 'enforcer_discover_note' "${script_dir}/../scripts/github-repo-lint" \
-  && grep -qF 'Skipping non-org repository' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF 'enforcer_check_cmd' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF 'enforcer_run_context_command' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF 'enforcer_discover_notes_file' "${script_dir}/../scripts/github-repo-lint" \
@@ -88,16 +86,43 @@ if grep -qF 'enforcer_discover_repo_slugs' "${script_dir}/../scripts/github-repo
   && grep -qF 'lib/runner-bootstrap' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF 'run_command "github-repo-lint enforcer checks"' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF 'enforcer_append_runner_stderr' "${script_dir}/../scripts/github-repo-lint" \
-  && grep -qF 'enforcer_runner_git_show_toplevel' "${script_dir}/../scripts/github-repo-lint" \
+  && ! grep -qF 'enforcer_runner_git_show_toplevel' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF 'parsed_failure_count=' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF '[A-Za-z]//g' "${script_dir}/../scripts/github-repo-lint" \
   && grep -qF 'runner_report_append_command_failures' "${script_dir}/../scripts/github-repo-lint"; then
-  printf '[PASS] monitor: discovers local GitHub repos and runs compact strict checks\n'
+  printf '[PASS] monitor: discovers org repos via GitHub API and runs compact strict checks\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] monitor: missing repo discovery or strict check invocation\n'
   fail=$(( fail + 1 ))
 fi
+
+# write_mock_org_gh <bin-dir> <repo-name> [<repo-name> ...]
+# Lists the given names for orgs/*/repos (public jq filter still matches).
+write_mock_org_gh() {
+  local -r bin_dir="$1"
+  shift
+  local repo
+  mkdir -p "$bin_dir"
+  {
+    cat <<'HDR'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'orgs/'*'/repos'* ]]; then
+HDR
+    for repo in "$@"; do
+      printf "  printf '%%s\\n' '%s'\n" "$repo"
+    done
+    cat <<'FTR'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+FTR
+  } >"${bin_dir}/gh"
+  chmod +x "${bin_dir}/gh"
+}
 
 printf '\n=== static: enforcer singleton lock ===\n'
 if grep -qF 'lib/timer-singleton-lock' "${script_dir}/../scripts/github-repo-lint" \
@@ -143,8 +168,8 @@ rm -rf "$print_tmp"
 if [[ "$print_exit" -eq 0 ]] \
   && grep -qF 'GitHub Repo Lint PASSED' <<<"$print_out" \
   && grep -qF 'scripts/github-repo-lint --repo OWNER/NAME --apply-fix' <<<"$print_out" \
+  && grep -qF 'Org:' <<<"$print_out" \
   && grep -qF 'demo-repo' <<<"$print_out" \
-  && grep -qF 'demo-private' <<<"$print_out" \
   && grep -qF 'multipart/alternative' <<<"$print_out"; then
   printf '[PASS] print: sample multipart email on stdout\n'
   pass=$(( pass + 1 ))
@@ -157,21 +182,8 @@ printf '\n=== mock monitor sends SMTP report on failure ===\n'
 tmp=""
 tmp="$(mktemp -d)"
 write_test_env_file "$tmp"
-mkdir -p "$tmp/scan/ok-repo" "$tmp/scan/bad-repo" "$tmp/scratch" "$tmp/bin"
-git -C "$tmp/scan/ok-repo" init -q
-git -C "$tmp/scan/ok-repo" remote add origin "https://github.com/the-hcma/ok-repo.git"
-git -C "$tmp/scan/bad-repo" init -q
-git -C "$tmp/scan/bad-repo" remote add origin "https://github.com/the-hcma/bad-repo.git"
-
-cat >"$tmp/bin/gh" <<'EOF'
-#!/usr/bin/env bash
-if [[ "${1:-}" == api && "${2:-}" == repos/* ]]; then
-  printf 'false\n'
-  exit 0
-fi
-printf 'false\n'
-EOF
-chmod +x "$tmp/bin/gh"
+mkdir -p "$tmp/scratch" "$tmp/bin"
+write_mock_org_gh "$tmp/bin" ok-repo bad-repo
 
 cat >"$tmp/github-repo-lint-checker" <<'EOF'
 #!/usr/bin/env bash
@@ -200,7 +212,6 @@ monitor_exit=0
   REPO_HELPERS_TEST_MODE=1 \
   REPO_HELPERS_SMTP_BREADCRUMB="$breadcrumb" \
   GITHUB_REPO_LINT_ARGS_LOG="$args_log" \
-  GITHUB_REPO_LINT_SCAN_ROOT="${tmp}/scan" \
   GITHUB_REPO_LINT_LOG="${tmp}/scratch/github-repo-lint.log" \
   GITHUB_REPO_LINT_CHECKER="${tmp}/github-repo-lint-checker" \
   bash "${script_dir}/../scripts/github-repo-lint"
@@ -209,6 +220,7 @@ monitor_exit=0
 if [[ "$monitor_exit" -eq 1 ]] \
   && [[ -f "$breadcrumb" ]] \
   && grep -qF 'GitHub Repo Lint FAILED' "$breadcrumb" \
+  && grep -qF 'Org:      the-hcma' "$breadcrumb" \
   && grep -qF 'Repos:    2 checked, 1 failed' "$breadcrumb" \
   && grep -qF 'scripts/github-repo-lint --repo OWNER/NAME --apply-fix' "$breadcrumb" \
   && grep -qF 'Skipped:' "$breadcrumb" \
@@ -232,19 +244,8 @@ printf '\n=== mock monitor lists passed repos from compact stderr ===\n'
 ok_tmp=""
 ok_tmp="$(mktemp -d)"
 write_test_env_file "$ok_tmp"
-mkdir -p "$ok_tmp/scan/ok-repo" "$ok_tmp/scratch" "$ok_tmp/bin"
-git -C "$ok_tmp/scan/ok-repo" init -q
-git -C "$ok_tmp/scan/ok-repo" remote add origin "https://github.com/the-hcma/ok-repo.git"
-
-cat >"$ok_tmp/bin/gh" <<'EOF'
-#!/usr/bin/env bash
-if [[ "${1:-}" == api && "${2:-}" == repos/* ]]; then
-  printf 'false\n'
-  exit 0
-fi
-printf 'false\n'
-EOF
-chmod +x "$ok_tmp/bin/gh"
+mkdir -p "$ok_tmp/scratch" "$ok_tmp/bin"
+write_mock_org_gh "$ok_tmp/bin" ok-repo
 
 cat >"$ok_tmp/github-repo-lint-checker" <<'EOF'
 #!/usr/bin/env bash
@@ -262,7 +263,6 @@ ok_exit=0
   PATH="${ok_tmp}/bin:${PATH}" \
   REPO_HELPERS_TEST_MODE=1 \
   REPO_HELPERS_SMTP_BREADCRUMB="$ok_breadcrumb" \
-  GITHUB_REPO_LINT_SCAN_ROOT="${ok_tmp}/scan" \
   GITHUB_REPO_LINT_LOG="${ok_tmp}/scratch/github-repo-lint.log" \
   GITHUB_REPO_LINT_CHECKER="${ok_tmp}/github-repo-lint-checker" \
   bash "${script_dir}/../scripts/github-repo-lint"
@@ -282,27 +282,27 @@ else
 fi
 rm -rf "$ok_tmp"
 
-printf '\n=== discovery skip lines do not become repo slugs ===\n'
+printf '\n=== discovery excludes private repos via org API jq filter ===\n'
 disc_tmp=""
 disc_tmp="$(mktemp -d)"
 write_test_env_file "$disc_tmp"
-mkdir -p "$disc_tmp/scan/public-repo" "$disc_tmp/scan/private-repo" "$disc_tmp/bin"
-git -C "$disc_tmp/scan/public-repo" init -q
-git -C "$disc_tmp/scan/public-repo" remote add origin "https://github.com/the-hcma/public-repo.git"
-git -C "$disc_tmp/scan/private-repo" init -q
-git -C "$disc_tmp/scan/private-repo" remote add origin "https://github.com/the-hcma/private-repo.git"
+mkdir -p "$disc_tmp/bin" "$disc_tmp/scratch"
 
 cat >"$disc_tmp/bin/gh" <<'EOF'
 #!/usr/bin/env bash
-if [[ "${1:-}" == api && "${2:-}" == repos/the-hcma/private-repo ]]; then
-  printf 'true\n'
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'orgs/the-hcma/repos'* && "$args" == *'private == false'* ]]; then
+  printf '%s\n' 'public-repo'
   exit 0
 fi
-if [[ "${1:-}" == api && "${2:-}" == repos/the-hcma/public-repo ]]; then
-  printf 'false\n'
+if [[ "$args" == *'orgs/the-hcma/repos'* ]]; then
+  printf '%s\n' 'public-repo'
+  printf '%s\n' 'private-repo'
   exit 0
 fi
-printf 'false\n'
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
 EOF
 chmod +x "$disc_tmp/bin/gh"
 
@@ -322,7 +322,6 @@ disc_monitor_exit=0
   PATH="${disc_tmp}/bin:${PATH}" \
   REPO_HELPERS_TEST_MODE=1 \
   GITHUB_REPO_LINT_ARGS_LOG="$disc_args_log" \
-  GITHUB_REPO_LINT_SCAN_ROOT="${disc_tmp}/scan" \
   GITHUB_REPO_LINT_LOG="${disc_tmp}/scratch/github-repo-lint.log" \
   GITHUB_REPO_LINT_CHECKER="${disc_tmp}/github-repo-lint-checker" \
   bash "${script}"
@@ -330,8 +329,8 @@ disc_monitor_exit=0
 
 if [[ "$disc_monitor_exit" -eq 0 ]] \
   && grep -qF -- '--repo the-hcma/public-repo' "$disc_args_log" \
-  && ! grep -qF 'Skipping private repository' "$disc_args_log"; then
-  printf '[PASS] discovery: private skip log lines are not passed as --repo slugs\n'
+  && ! grep -qF 'private-repo' "$disc_args_log"; then
+  printf '[PASS] discovery: private org repos are excluded without --include-private\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] discovery: expected only public repo in checker args (exit=%s)\n%s\n' \
@@ -340,69 +339,53 @@ else
 fi
 rm -rf "$disc_tmp"
 
-printf '\n=== discovery skips non-org local clones ===\n'
-norg_tmp=""
-norg_tmp="$(mktemp -d)"
-write_test_env_file "$norg_tmp"
-mkdir -p "$norg_tmp/scan/org-repo" "$norg_tmp/scan/user-repo" "$norg_tmp/bin"
-git -C "$norg_tmp/scan/org-repo" init -q
-git -C "$norg_tmp/scan/org-repo" remote add origin "https://github.com/the-hcma/org-repo.git"
-git -C "$norg_tmp/scan/user-repo" init -q
-git -C "$norg_tmp/scan/user-repo" remote add origin "https://github.com/thehcma/user-repo.git"
+printf '\n=== discovery includes org repos without a local clone ===\n'
+nloc_tmp=""
+nloc_tmp="$(mktemp -d)"
+write_test_env_file "$nloc_tmp"
+mkdir -p "$nloc_tmp/bin" "$nloc_tmp/scratch"
+# No local clones under the workdir — only the org API list drives discovery.
+write_mock_org_gh "$nloc_tmp/bin" remote-only-repo org-repo
 
-cat >"$norg_tmp/bin/gh" <<'EOF'
-#!/usr/bin/env bash
-printf 'false\n'
-EOF
-chmod +x "$norg_tmp/bin/gh"
-
-norg_args_log="${norg_tmp}/args.out"
-cat >"$norg_tmp/github-repo-lint-checker" <<'EOF'
+nloc_args_log="${nloc_tmp}/args.out"
+cat >"$nloc_tmp/github-repo-lint-checker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"${GITHUB_REPO_LINT_ARGS_LOG:?}"
-printf 'Passed: the-hcma/org-repo\n' >&2
-printf 'all 1 repositories passed\n' >&2
+printf 'Passed: the-hcma/org-repo, the-hcma/remote-only-repo\n' >&2
+printf 'all 2 repositories passed\n' >&2
 EOF
-chmod +x "$norg_tmp/github-repo-lint-checker"
+chmod +x "$nloc_tmp/github-repo-lint-checker"
 
-norg_monitor_exit=0
+nloc_monitor_exit=0
 (
-  HOME="$norg_tmp" \
-  PATH="${norg_tmp}/bin:${PATH}" \
+  HOME="$nloc_tmp" \
+  PATH="${nloc_tmp}/bin:${PATH}" \
   REPO_HELPERS_TEST_MODE=1 \
-  GITHUB_REPO_LINT_ARGS_LOG="$norg_args_log" \
-  GITHUB_REPO_LINT_SCAN_ROOT="${norg_tmp}/scan" \
-  GITHUB_REPO_LINT_LOG="${norg_tmp}/scratch/github-repo-lint.log" \
-  GITHUB_REPO_LINT_CHECKER="${norg_tmp}/github-repo-lint-checker" \
+  GITHUB_REPO_LINT_ARGS_LOG="$nloc_args_log" \
+  GITHUB_REPO_LINT_LOG="${nloc_tmp}/scratch/github-repo-lint.log" \
+  GITHUB_REPO_LINT_CHECKER="${nloc_tmp}/github-repo-lint-checker" \
   bash "${script}"
-) >/dev/null || norg_monitor_exit=$?
+) >/dev/null || nloc_monitor_exit=$?
 
-if [[ "$norg_monitor_exit" -eq 0 ]] \
-  && grep -qF -- '--repo the-hcma/org-repo' "$norg_args_log" \
-  && ! grep -qF 'thehcma/user-repo' "$norg_args_log"; then
-  printf '[PASS] discovery: non-org local clones are skipped\n'
+if [[ "$nloc_monitor_exit" -eq 0 ]] \
+  && grep -qF -- '--repo the-hcma/remote-only-repo' "$nloc_args_log" \
+  && grep -qF -- '--repo the-hcma/org-repo' "$nloc_args_log"; then
+  printf '[PASS] discovery: org API includes repos even without a local clone\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] discovery: expected org repo only (exit=%s)\n%s\n' \
-    "$norg_monitor_exit" "$(cat "$norg_args_log" 2>/dev/null || true)"
+  printf '[FAIL] discovery: expected remote-only-repo and org-repo from API (exit=%s)\n%s\n' \
+    "$nloc_monitor_exit" "$(cat "$nloc_args_log" 2>/dev/null || true)"
   fail=$(( fail + 1 ))
 fi
-rm -rf "$norg_tmp"
+rm -rf "$nloc_tmp"
 
 printf '\n=== discovery matches org filter case-insensitively ===\n'
 case_tmp=""
 case_tmp="$(mktemp -d)"
 write_test_env_file "$case_tmp"
-mkdir -p "$case_tmp/scan/org-repo" "$case_tmp/bin"
-git -C "$case_tmp/scan/org-repo" init -q
-git -C "$case_tmp/scan/org-repo" remote add origin "https://github.com/the-hcma/org-repo.git"
-
-cat >"$case_tmp/bin/gh" <<'EOF'
-#!/usr/bin/env bash
-printf 'false\n'
-EOF
-chmod +x "$case_tmp/bin/gh"
+mkdir -p "$case_tmp/bin" "$case_tmp/scratch"
+write_mock_org_gh "$case_tmp/bin" org-repo
 
 case_args_log="${case_tmp}/args.out"
 cat >"$case_tmp/github-repo-lint-checker" <<'EOF'
@@ -421,7 +404,6 @@ case_monitor_exit=0
   REPO_HELPERS_TEST_MODE=1 \
   GITHUB_REPO_LINT_ARGS_LOG="$case_args_log" \
   GITHUB_REPO_LINT_ORG='The-HCMA' \
-  GITHUB_REPO_LINT_SCAN_ROOT="${case_tmp}/scan" \
   GITHUB_REPO_LINT_LOG="${case_tmp}/scratch/github-repo-lint.log" \
   GITHUB_REPO_LINT_CHECKER="${case_tmp}/github-repo-lint-checker" \
   bash "${script}"
@@ -437,6 +419,109 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$case_tmp"
+
+printf '\n=== include-private from env file is applied after load ===\n'
+priv_tmp=""
+priv_tmp="$(mktemp -d)"
+write_test_env_file "$priv_tmp"
+printf 'GITHUB_REPO_LINT_INCLUDE_PRIVATE=1\n' >>"${priv_tmp}/.config/github-repo-lint.env"
+mkdir -p "$priv_tmp/bin" "$priv_tmp/scratch"
+
+cat >"$priv_tmp/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'orgs/the-hcma/repos'* && "$args" == *'private == false'* ]]; then
+  printf '%s\n' 'public-only'
+  exit 0
+fi
+if [[ "$args" == *'orgs/the-hcma/repos'* ]]; then
+  printf '%s\n' 'public-only'
+  printf '%s\n' 'private-repo'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+EOF
+chmod +x "$priv_tmp/bin/gh"
+
+priv_args_log="${priv_tmp}/args.out"
+cat >"$priv_tmp/github-repo-lint-checker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${GITHUB_REPO_LINT_ARGS_LOG:?}"
+printf 'Passed: the-hcma/private-repo, the-hcma/public-only\n' >&2
+printf 'all 2 repositories passed\n' >&2
+EOF
+chmod +x "$priv_tmp/github-repo-lint-checker"
+
+priv_exit=0
+(
+  HOME="$priv_tmp" \
+  PATH="${priv_tmp}/bin:${PATH}" \
+  REPO_HELPERS_TEST_MODE=1 \
+  GITHUB_REPO_LINT_ARGS_LOG="$priv_args_log" \
+  GITHUB_REPO_LINT_LOG="${priv_tmp}/scratch/github-repo-lint.log" \
+  GITHUB_REPO_LINT_CHECKER="${priv_tmp}/github-repo-lint-checker" \
+  bash "${script}"
+) >/dev/null || priv_exit=$?
+
+if [[ "$priv_exit" -eq 0 ]] \
+  && grep -qF -- '--repo the-hcma/private-repo' "$priv_args_log" \
+  && grep -qF -- '--repo the-hcma/public-only' "$priv_args_log"; then
+  printf '[PASS] include-private: env file flag is honored after enforcer_load_required_env_file\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] include-private: expected private-repo from env file (exit=%s)\n%s\n' \
+    "$priv_exit" "$(cat "$priv_args_log" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$priv_tmp"
+
+printf '\n=== org API discovery failure is not treated as an empty org ===\n'
+fail_tmp=""
+fail_tmp="$(mktemp -d)"
+write_test_env_file "$fail_tmp"
+mkdir -p "$fail_tmp/bin" "$fail_tmp/scratch"
+
+cat >"$fail_tmp/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'orgs/'*'/repos'* ]]; then
+  printf 'gh: API error simulating discovery failure\n' >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+EOF
+chmod +x "$fail_tmp/bin/gh"
+
+fail_breadcrumb="${fail_tmp}/smtp.out"
+fail_exit=0
+(
+  HOME="$fail_tmp" \
+  PATH="${fail_tmp}/bin:${PATH}" \
+  REPO_HELPERS_TEST_MODE=1 \
+  REPO_HELPERS_SMTP_BREADCRUMB="$fail_breadcrumb" \
+  GITHUB_REPO_LINT_LOG="${fail_tmp}/scratch/github-repo-lint.log" \
+  GITHUB_REPO_LINT_CHECKER="${fail_tmp}/bin/true" \
+  bash "${script}"
+) >/dev/null || fail_exit=$?
+
+if [[ "$fail_exit" -ne 0 ]] \
+  && [[ -f "$fail_breadcrumb" ]] \
+  && grep -qF 'Command failures' "$fail_breadcrumb" \
+  && grep -qF 'repo-practices org repos' "$fail_breadcrumb" \
+  && ! grep -qF 'no GitHub repositories discovered for org' "$fail_breadcrumb"; then
+  printf '[PASS] discovery: GitHub API failure is reported distinctly from empty org\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] discovery: expected API failure report (exit=%s)\n%s\n' \
+    "$fail_exit" "$(cat "$fail_breadcrumb" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$fail_tmp"
 
 printf '\n=== print report includes run context footer ===\n'
 ctx_tmp=""
