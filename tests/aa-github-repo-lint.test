@@ -404,9 +404,10 @@ fi
 
 printf '\n=== static: cve-check template classifies JSON and files issues ===\n'
 cve_template="${templates_dir}/cve-check.yml"
+# shellcheck disable=SC2016  # grep for literal ${audit_json} / $? strings in template
 if grep -qF 'persist-credentials: false' "$cve_template" \
   && grep -qF 'issues: write' "$cve_template" \
-  && grep -qF 'uv run --no-progress --with pip-audit' "$cve_template" \
+  && grep -qF 'uv run --no-progress --with pip --with pip-audit' "$cve_template" \
   && grep -qF 'pip-audit --skip-editable' "$cve_template" \
   && grep -qF -- '--format=json' "$cve_template" \
   && grep -qF 'cve-check: classify-json-outcome' "$cve_template" \
@@ -414,6 +415,11 @@ if grep -qF 'persist-credentials: false' "$cve_template" \
   && grep -qF 'gh issue' "$cve_template" \
   && grep -qF 'ERROR: pip-audit found CVEs but failed to create security/cve issue' "$cve_template" \
   && grep -qF 'ERROR: pip-audit found CVEs but failed to comment on security/cve issue' "$cve_template" \
+  && grep -qF ')" || return 1' "$cve_template" \
+  && grep -qF 'rm -f "${audit_json}"' "$cve_template" \
+  && grep -qF 'audit_rc=$?' "$cve_template" \
+  && grep -qF 'audit_rc != 0 && audit_rc != 1' "$cve_template" \
+  && ! grep -qF '|| true)"' "$cve_template" \
   && ! grep -qF 'WARN: failed to create security/cve issue' "$cve_template" \
   && ! grep -qF 'WARN: failed to comment on security/cve issue' "$cve_template" \
   && ! grep -qF 'uses: nick-fields/retry@v4' "$cve_template"; then
@@ -562,6 +568,77 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$cve_comment_tmp"
+
+printf '\n=== functional: cve-check template fails when gh issue list fails ===\n'
+cve_list_tmp="$(mktemp -d)"
+cve_list_funcs="${cve_list_tmp}/cve-funcs.bash"
+awk '
+  /^[[:space:]]*run: \|[[:space:]]*$/ {
+    in_run = 1
+    next
+  }
+  in_run {
+    if ($0 ~ /^          /) {
+      sub(/^          /, "")
+      print
+      next
+    }
+    if ($0 ~ /^[[:space:]]*$/) {
+      print ""
+      next
+    }
+    in_run = 0
+  }
+' "$cve_template" | sed '/^while (( attempt/,$d' >"$cve_list_funcs"
+cat >"${cve_list_tmp}/audit.json" <<'AUDIT_JSON'
+{"dependencies":[{"name":"example-pkg","version":"1.0.0","vulns":[{"id":"CVE-2024-0001","fix_versions":["1.0.1"]}]}]}
+AUDIT_JSON
+mock_bin="${cve_list_tmp}/bin"
+mkdir -p "$mock_bin"
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "label" ]]; then
+  exit 0
+fi
+if [[ "${1:-}" == "issue" && "${2:-}" == "list" ]]; then
+  echo 'gh: API rate limit' >&2
+  exit 1
+fi
+if [[ "${1:-}" == "issue" && "${2:-}" == "create" ]]; then
+  echo 'ERROR: should not create on list failure' >&2
+  exit 0
+fi
+exit 0
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+cat >>"$cve_list_funcs" <<'DRIVER'
+audit_json='audit.json'
+issue_title='CVE check: pip-audit findings'
+REPOSITORY='the-hcma/example-repo'
+REPOSITORY_OWNER='the-hcma'
+GITHUB_SERVER_URL='https://github.com'
+GITHUB_RUN_ID='12345'
+set +e
+file_or_update_cve_issue
+func_exit=$?
+set -e
+exit "$func_exit"
+DRIVER
+cve_list_exit=0
+cve_list_output=""
+cve_list_output="$(cd "${cve_list_tmp}" && PATH="${mock_bin}:${PATH}" bash "$cve_list_funcs" 2>&1)" \
+  || cve_list_exit=$?
+if [[ "$cve_list_exit" -ne 0 ]] \
+  && ! grep -qF 'should not create on list failure' <<<"$cve_list_output"; then
+  printf '[PASS] cve-check template exits non-zero when gh issue list fails\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cve-check template did not fail on gh issue list (exit=%s)\n%s\n' \
+    "$cve_list_exit" "$cve_list_output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$cve_list_tmp"
 
 printf '\n=== static: cleanup-merged-branches deletes Graphite MQ branches ===\n'
 gtmq_template="${templates_dir}/cleanup-merged-branches.yml"
@@ -2407,7 +2484,14 @@ jobs:
         with:
           persist-credentials: false
       - run: uv sync --frozen
-      - run: uv run --no-progress --with pip-audit pip-audit --skip-editable --format=json
+      - run: |
+          rm -f "${audit_json}"
+          uv run --no-progress --with pip --with pip-audit pip-audit --skip-editable --format=json
+          audit_rc=$?
+          if (( audit_rc != 0 && audit_rc != 1 )); then
+            echo transient
+          fi
+          numbers="$(gh issue list --json number --jq '.[].number')" || return 1
       - run: echo cve-check: classify-json-outcome
       - run: gh issue create --label security/cve || echo 'ERROR: pip-audit found CVEs but failed to create security/cve issue'
       - run: gh issue comment || echo 'ERROR: pip-audit found CVEs but failed to comment on security/cve issue'
