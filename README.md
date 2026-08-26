@@ -102,7 +102,7 @@ scripts/github-repo-lint --all --org the-hcma --suggest
 # Repair supported settings (+ candidate workflow stack when run from the clone)
 scripts/github-repo-lint --repo OWNER/NAME --apply-fix
 
-# Daily compliance email over local clones (systemd / cron entry)
+# Daily compliance email over org repos from the GitHub API (systemd / cron entry)
 scripts/github-repo-lint --enforcer
 ```
 
@@ -243,7 +243,7 @@ compliance drift and points to the explicit `--apply-fix` remediation command.
 | Service | Script | Schedule | Purpose |
 | --- | --- | --- | --- |
 | `dep-updater.service` | `scripts/dep-updater-batch-run` | 03:00 daily | Create/update dependency PRs across a scan root and email the run report. |
-| `github-repo-lint.service` | `scripts/github-repo-lint` | 04:00 daily | Monitor local clones for the configured org (default `the-hcma`) and email the repository-practices report. |
+| `github-repo-lint.service` | `scripts/github-repo-lint` | 04:00 daily | Monitor org repos (GitHub API; default `the-hcma`) and email the repository-practices report. |
 
 `dep-updater.service` is the automation worker. It fetches every repository under
 the scan root, runs `dep-updater --batch --all`, streams the run to
@@ -251,11 +251,12 @@ the scan root, runs `dep-updater --batch --all`, streams the run to
 or timeout report by email. When updates are created, the report lists them from
 structured JSON; when none are created, it says so explicitly.
 
-`github-repo-lint.service` is the compliance monitor. It discovers local GitHub
-clones under a scan root for the configured organization (default `the-hcma`;
-other owners are skipped, matching `github-repo-lint --org the-hcma --all`), runs
-strict repository-practices checks for each one, emails the daily report, and
-exits non-zero when any repository fails. It does not apply repairs automatically.
+`github-repo-lint.service` is the compliance monitor. It discovers repositories
+from the GitHub org API (`orgs/<ORG>/repos`, default `the-hcma`; same source as
+`github-repo-lint --org the-hcma --all`), runs strict repository-practices checks
+for each one, emails the daily report, and exits non-zero when any repository
+fails. It does not apply repairs automatically. Local scan-root clones are not
+required for the audit (only for some `--apply-fix` workflow stacks).
 
 Install or inspect them from this repository:
 
@@ -273,8 +274,8 @@ scripts/show-services
 ```
 
 `github-repo-lint` (no args) reuses `~/.config/dep-updater.env` for SMTP by default.
-Use `~/.config/github-repo-lint.env` when you need a different scan root, org
-filter (`GITHUB_REPO_LINT_ORG`), or report settings.
+Use `~/.config/github-repo-lint.env` when you need a different org
+(`GITHUB_REPO_LINT_ORG`), include-private, or report settings.
 
 `scripts/show-services` prints a read-only summary of every systemd service template
 in this repo, including installed status, active/enabled state, timer next run,
