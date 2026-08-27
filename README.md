@@ -149,7 +149,8 @@ Full git history and org-wide sweeps use **TruffleHog** via `scripts/secret-audi
 (see [docs/secret-audit-trufflehog.md](docs/secret-audit-trufflehog.md)). After a
 **clean** scan, `--write-marker` records proof in `.github/secret-audit.json`;
 `github-repo-lint` checks that marker on intake / strict audits. Lint reads it from
-the default branch, so commit and push the marker after writing it. The daily timer
+the default branch, so land the marker there after writing it (an unmerged PR is not
+enough). The daily timer
 does **not** write markers — they are operator intake artifacts, not a heartbeat.
 
 ```bash

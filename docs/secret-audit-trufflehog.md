@@ -140,7 +140,8 @@ Rules:
   still reports scan outcome.
 - Refresh a marker by hand when `github-repo-lint` reports it stale
   (>`secret_audit_marker_stale_days`): run `--write-marker` against a clone, then
-  commit and push (or open a PR) so lint sees the new `scanned_at`.
+  land the change on the **default branch** (push directly, or merge a PR) so lint
+  sees the new `scanned_at`. An unmerged PR does not update the branch lint reads.
 - **Never** write or refresh `status=clean` when TruffleHog reports matching results.
 
 `--write-marker` requires a **local clone** (scan root or cwd). When an operator pairs
