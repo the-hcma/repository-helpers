@@ -41,8 +41,27 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 - Tests live in `tests/` and mirror the script name (e.g. `tests/dep-updater.test`).
 - Target **bash ≥ 5.x** (every script declares `#!/usr/bin/env bash` and uses `set -euo pipefail`).
 - External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`,
-  `rg` (ripgrep), `actionlint`, plus the ecosystem tools being managed (`pnpm`,
-  `pip`, `uv`, `poetry`) as optional callees.
+ `rg` (ripgrep), `actionlint`, plus the ecosystem tools being managed (`pnpm`,
+ `pip`, `uv`, `poetry`, `cargo` + `cargo-outdated` + the `clippy` component) as
+ optional callees. Rust is required for any repo dep-updater detects as a Cargo
+ project — it shells out to `cargo outdated` and `cargo add`, and the Rust post-bump
+ clippy recovery invariant below assumes a toolchain.
+
+ ```bash
+ cargo install cargo-outdated --locked   # same line CI uses
+ ```
+
+ Provisioning notes for the batch host:
+ - apt's Rust is too old for current `cargo-outdated` — install via rustup. On
+ Debian/Ubuntu `build-essential pkg-config libssl-dev` are also needed for
+ `openssl-sys` / `libgit2-sys`.
+ - `~/.cargo/bin` is not on a systemd/cron `PATH` by default, so a timer-run batch
+ can still report the tool missing after a successful interactive install (see
+ `tooling_path_ensure_gnu_userland` / the cron bootstraps).
+
+ A host missing one of these no longer fails the whole run: `--batch --all` skips
+ those repos and reports them under **Skipped (missing tooling)** in the email
+ (see the batch-all invariant below).
 - No Node.js helpers, no Python scripting. Keep the implementation pure Bash.
 - Test harnesses are plain Bash — no test framework installs required.
 
@@ -110,6 +129,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 - **pnpm grandfathering (cutover only).** When enabling `minimumReleaseAge` on a repo with an existing lockfile, run `scripts/grandfather-pnpm-release-age` once to write `pnpm-workspace.yaml` with `minimumReleaseAgeExclude: ["*"]` so the current lockfile keeps passing CI under pnpm 11.1.3+. No registry file or prune step—**forward** bumps are gated by dep-updater (9 days) and Dependabot cooldown (10 days).
 - **GitHub Actions pins follow their own style.** `@v6` (major-only) bumps to the latest release semver when newer—patch within the same major (`v6` → `v6.0.2`) or major jump (`v7` → `v8.1.0`), matching Dependabot. `@v1.7.12` / `@0.36.0` (full semver) is bumped on any newer release. The `v`-prefix style of the existing pin is preserved. Commit-SHA pins (`@abc1234...`) and local actions (`./path`) are never touched.
 - **Rust post-bump clippy recovery.** After `cargo add` bumps (batch or single), dep-updater runs `cargo clippy --all-targets -- -D warnings`. On failure it tries `cargo clippy --fix` (mechanical suggestions only) and re-checks. Unrecovered failures log machine-parseable `ERROR: RUST_CLIPPY_RECOVER_FAILED`, revert the Rust bump (keeping other ecosystems), and continue (repository-helpers#433).
+- **Missing host tooling is a skip in `--batch --all`, not a repo failure.** Absent ecosystem tooling is a property of the host, not the repository, so `check_ecosystem_prereqs` exits **`dep_updater_exit_missing_tooling` (3)** after logging one `ERROR: MISSING_ECOSYSTEM_TOOLING tools=<list>` line instead of `die`ing with 1. A `--batch --all` parent treats exit 3 as `[batch-all] Skipping <repo>: missing host tooling (<tools>)`: `worst_exit` is unchanged, the ephemeral clone is **removed** (the fix is `cargo install` on the host, so there is nothing in the clone to repair), and the repos appear under **Skipped (missing tooling)** in the `dep-updater-batch-run` email so the provisioning gap stays visible. **Single-repo runs still fail loudly** — an operator who pointed dep-updater at one repo wants the error, not a silent skip. Non-tooling failures keep their existing exit code, clone retention, and Failed section (repository-helpers#535).
 - **Wait timeouts must be machine-parseable.** Any long-running wait loop (CI gating, merge polling, PR number discovery, etc.) must, on timeout, emit **one** concise line starting with `ERROR: WAIT_TIMEOUT ...` and then fail. Avoid multi-line timeout chatter — batch runs (`--batch --all`) postprocess these lines into end-of-run actionable summaries.
 - **GNU userland on macOS.** Prefer Homebrew gnubin on `PATH` via
   `tooling_path_ensure_gnu_userland` / the cron and node bootstraps

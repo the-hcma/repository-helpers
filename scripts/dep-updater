@@ -56,6 +56,10 @@ dep_updater_minimum_release_age_minutes="$release_age_dep_updater_minutes"
 readonly dep_updater_minimum_release_age_minutes
 dep_graphite_command_timeout_seconds="${DEP_UPDATER_GRAPHITE_TIMEOUT_SECONDS:-20}"
 readonly dep_graphite_command_timeout_seconds
+# Distinct from die's exit 1 so a `--batch --all` parent can tell "this host lacks a
+# toolchain" apart from "work failed in this repo" (repository-helpers#535).
+dep_updater_exit_missing_tooling=3
+readonly dep_updater_exit_missing_tooling
 # shellcheck disable=SC1091
 source "${dep_script_dir}/lib/ci-check-rollup"
 # shellcheck disable=SC1091
@@ -3079,18 +3083,21 @@ check_ecosystem_prereqs() {
   local -r chk_npm="$1"
   local -r chk_py="$2"
   local -r chk_rust="${3:-0}"
-  local missing=0
+  local missing=0 missing_ids
 
   tooling_prereq_check_ecosystem_tools "$chk_npm" "$npm_tool" "$chk_py" || missing=$?
+  missing_ids="$(tooling_prereq_report_last_ids)"
 
   if [[ "$chk_rust" == '1' ]]; then
     if ! command -v cargo &>/dev/null; then
       log "ERROR: 'cargo' is required for Rust projects."
       log "       Install: https://www.rust-lang.org/tools/install"
+      missing_ids="${missing_ids:+${missing_ids} }cargo"
       missing=$(( missing + 1 ))
     elif ! cargo outdated --version &>/dev/null 2>&1; then
       log "ERROR: 'cargo outdated' is required for Rust projects."
-      log "       Install: cargo install cargo-outdated"
+      log "       Install: cargo install cargo-outdated --locked"
+      missing_ids="${missing_ids:+${missing_ids} }cargo-outdated"
       missing=$(( missing + 1 ))
     fi
   fi
@@ -3102,7 +3109,13 @@ check_ecosystem_prereqs() {
   fi
 
   if (( missing > 0 )); then
-    die "Install the missing tool(s) above and retry."
+    # Absent ecosystem tooling is a property of the host, not the repository, so a
+    # batch --all parent can skip this repo instead of counting it as a failure
+    # (repository-helpers#535). Single-repo runs still surface it as an error.
+    log "ERROR: MISSING_ECOSYSTEM_TOOLING tools=${missing_ids:-unknown}"
+    log "       Install the missing tool(s) above and retry."
+    record_first_failure "missing ecosystem tooling: ${missing_ids:-unknown}"
+    exit "$dep_updater_exit_missing_tooling"
   fi
 }
 
@@ -9242,6 +9255,18 @@ batch_all_scrape_actionable_from_log() {
   return 1
 }
 
+# batch_all_missing_tooling_from_log <child_log>
+# Prints the tool list the child reported as absent, for the skip line and the batch
+# email. Falls back to "unknown" so the message is never empty.
+batch_all_missing_tooling_from_log() {
+  local -r child_log="$1"
+  local tools
+
+  tools="$(sed -nE 's/.*ERROR: MISSING_ECOSYSTEM_TOOLING tools=(.*)$/\1/p' \
+    "$child_log" 2>/dev/null | tail -n 1 || true)"
+  printf '%s' "${tools:-unknown}"
+}
+
 # batch_all_ephemeral_clone_safe_to_remove <child_exit>
 # Ephemeral scan-root clones must outlive child worktrees when --no-wait-merge
 # leaves cleanup to the operator, or when the child failed mid-run.
@@ -9298,7 +9323,7 @@ batch_all_materialize_checkout() {
 }
 
 batch_all_dispatch() {
-  local dep_self repo child_exit worst_exit discover_file discover_rc=0
+  local dep_self repo child_exit worst_exit discover_file discover_rc=0 missing_tools
   local -a child_args repos_found
   local -a failure_summaries=()
   local -a failure_details=()
@@ -9469,6 +9494,22 @@ batch_all_dispatch() {
     fi
 
     dep_updater_batch_all_append_child_updates "$child_updates"
+
+    if [[ "$child_exit" -eq "$dep_updater_exit_missing_tooling" ]]; then
+      # Host-tooling gap, not a repo problem: skip without touching worst_exit, and
+      # let the ephemeral clone go — `cargo install` on the host is the fix, so there
+      # is nothing in the clone to repair (repository-helpers#535).
+      missing_tools="$(batch_all_missing_tooling_from_log "$child_log")"
+      TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
+        log "[batch-all] Skipping $(basename "$repo"): missing host tooling (${missing_tools})"
+      rm -f "$child_log" "$child_report" "$child_updates"
+      _batch_all_active_child_log=""
+      if (( repo_ephemeral )); then
+        run_command "batch-all rm ephemeral clone $(basename "$repo")" -- rm -rf "$repo"
+        _batch_all_pending_ephemeral_clone=0
+      fi
+      continue
+    fi
 
     if [[ "$child_exit" -ne 0 ]]; then
       TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \

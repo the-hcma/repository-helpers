@@ -4094,6 +4094,181 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== behavioural: missing host tooling exits 3, not 1 (#535) ===\n'
+# check_ecosystem_prereqs must distinguish "this host lacks a toolchain" from
+# "work failed", so a --batch --all parent can skip instead of failing the run.
+missing_tool_out=""
+missing_tool_rc=0
+set +e
+# SC2317/SC2034: stubs and script-level vars are consumed by the sourced function,
+# which shellcheck cannot see through the process substitution.
+# shellcheck disable=SC2317,SC2034
+missing_tool_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^check_ecosystem_prereqs\(\)/,/^}$/' "$script")
+  dep_updater_exit_missing_tooling=3
+  npm_tool='pnpm'
+  py_tool='uv'
+  log() { printf '%s\n' "$*"; }
+  record_first_failure() { :; }
+  tooling_prereq_check_ecosystem_tools() { return 0; }
+  tooling_prereq_report_last_ids() { printf ''; }
+  # Hide cargo so the Rust branch reports it absent.
+  command() {
+    if [[ "$1" == '-v' && "$2" == 'cargo' ]]; then
+      return 1
+    fi
+    builtin command "$@"
+  }
+  check_ecosystem_prereqs 0 '' 1
+)"
+missing_tool_rc=$?
+set -e
+if [[ "$missing_tool_rc" -eq 3 ]]; then
+  printf '[PASS] prereqs: absent cargo exits 3 (missing tooling), not 1\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] prereqs: expected exit 3, got %s\n%s\n' "$missing_tool_rc" "$missing_tool_out"
+  fail=$(( fail + 1 ))
+fi
+# Exit 3 is non-zero, so an operator who pointed dep-updater at a single repo still
+# gets a hard failure — only the --batch --all parent downgrades it to a skip.
+if [[ "$missing_tool_rc" -ne 0 ]]; then
+  printf '[PASS] prereqs: single-repo run still fails loudly on missing tooling\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] prereqs: single-repo run must not silently skip missing tooling\n'
+  fail=$(( fail + 1 ))
+fi
+if grep -qF 'ERROR: MISSING_ECOSYSTEM_TOOLING tools=cargo' <<<"$missing_tool_out"; then
+  printf '[PASS] prereqs: emits machine-parseable MISSING_ECOSYSTEM_TOOLING with tool name\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] prereqs: missing MISSING_ECOSYSTEM_TOOLING line\n%s\n' "$missing_tool_out"
+  fail=$(( fail + 1 ))
+fi
+
+# A healthy host must not trip the skip path.
+set +e
+ok_tool_rc=0
+# shellcheck disable=SC2317,SC2034
+(
+  # shellcheck disable=SC1090
+  source <(awk '/^check_ecosystem_prereqs\(\)/,/^}$/' "$script")
+  dep_updater_exit_missing_tooling=3
+  npm_tool='pnpm'
+  py_tool='uv'
+  log() { :; }
+  record_first_failure() { :; }
+  tooling_prereq_check_ecosystem_tools() { return 0; }
+  tooling_prereq_report_last_ids() { printf ''; }
+  check_ecosystem_prereqs 0 '' 0
+) >/dev/null 2>&1
+ok_tool_rc=$?
+set -e
+if [[ "$ok_tool_rc" -eq 0 ]]; then
+  printf '[PASS] prereqs: nothing missing exits 0\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] prereqs: expected exit 0 with no Rust check, got %s\n' "$ok_tool_rc"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== behavioural: batch-all names the missing tools (#535) ===\n'
+missing_log="$(mktemp)"
+printf '%s\n' \
+  'some earlier line' \
+  'ERROR: MISSING_ECOSYSTEM_TOOLING tools=cargo cargo-outdated' \
+  '       Install the missing tool(s) above and retry.' >"$missing_log"
+missing_tools_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^batch_all_missing_tooling_from_log\(\)/,/^}$/' "$script")
+  batch_all_missing_tooling_from_log "$missing_log"
+)"
+if [[ "$missing_tools_out" == 'cargo cargo-outdated' ]]; then
+  printf '[PASS] batch-all: extracts the missing tool list from the child log\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] batch-all: expected "cargo cargo-outdated", got "%s"\n' "$missing_tools_out"
+  fail=$(( fail + 1 ))
+fi
+printf '%s\n' 'no tooling line here' >"$missing_log"
+missing_tools_fallback="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^batch_all_missing_tooling_from_log\(\)/,/^}$/' "$script")
+  batch_all_missing_tooling_from_log "$missing_log"
+)"
+if [[ "$missing_tools_fallback" == 'unknown' ]]; then
+  printf '[PASS] batch-all: falls back to "unknown" so the skip line is never empty\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] batch-all: expected "unknown", got "%s"\n' "$missing_tools_fallback"
+  fail=$(( fail + 1 ))
+fi
+rm -f "$missing_log"
+
+printf '\n=== static: batch-all skips missing tooling without failing the run (#535) ===\n'
+# The skip must run before the generic failure branch, leave worst_exit alone, and
+# drop the ephemeral clone (nothing in it to repair — the fix is on the host).
+if awk '
+    /^batch_all_dispatch\(\)/ { in_fn=1 }
+    in_fn && /child_exit" -eq "\$dep_updater_exit_missing_tooling/ { found_guard=1 }
+    in_fn && found_guard && /missing host tooling/ { found_log=1 }
+    in_fn && found_guard && !seen_fail && /rm -rf "\$repo"/ { found_rm=1 }
+    in_fn && found_guard && /child_exit" -ne 0/ { seen_fail=1 }
+    END { exit (found_guard && found_log && found_rm && seen_fail) ? 0 : 1 }
+  ' "$script"; then
+  printf '[PASS] batch-all: exit 3 skips, logs, and removes the clone before the failure branch\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] batch-all: missing-tooling skip path not wired ahead of the failure branch\n'
+  fail=$(( fail + 1 ))
+fi
+# worst_exit must not be assigned inside the skip branch. Comments are ignored: the
+# block explains that it deliberately leaves worst_exit alone.
+if awk '
+    /child_exit" -eq "\$dep_updater_exit_missing_tooling/ { in_skip=1; next }
+    in_skip && /^    fi$/ { in_skip=0; next }
+    in_skip && /^[[:space:]]*#/ { next }
+    in_skip && /worst_exit[[:space:]]*=/ { bad=1 }
+    END { exit bad ? 1 : 0 }
+  ' "$script"; then
+  printf '[PASS] batch-all: missing-tooling skip leaves worst_exit unchanged\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] batch-all: missing-tooling skip must not modify worst_exit\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: Rust toolchain dependency is documented (#535) ===\n'
+agents_md="${script_dir}/../AGENTS.md"
+readme_md="${script_dir}/../README.md"
+if grep -qF 'cargo install cargo-outdated --locked' "$agents_md" \
+  && grep -qF 'cargo-outdated' "$agents_md" \
+  && grep -qF 'rustup' "$agents_md"; then
+  printf '[PASS] docs: AGENTS.md names the Rust toolchain dependency and install line\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] docs: AGENTS.md must name cargo-outdated and the rustup caveat\n'
+  fail=$(( fail + 1 ))
+fi
+if grep -qF 'cargo install cargo-outdated --locked' "$readme_md" \
+  && grep -qF 'rustup' "$readme_md"; then
+  printf '[PASS] docs: README.md names the Rust toolchain dependency and install line\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] docs: README.md must name cargo-outdated and the rustup caveat\n'
+  fail=$(( fail + 1 ))
+fi
+# shellcheck disable=SC2088  # literal doc text, not a path to expand
+if grep -qF '~/.cargo/bin' "$agents_md" && grep -qF '~/.cargo/bin' "$readme_md"; then
+  printf '[PASS] docs: both files warn that ~/.cargo/bin is absent from a cron PATH\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] docs: missing the ~/.cargo/bin cron PATH caveat\n'
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== static: org-repo-discovery cursor rule ===\n'
 org_disc_rule="${script_dir}/../.cursor/rules/org-repo-discovery.mdc"
 if [[ -f "$org_disc_rule" ]] \
