@@ -83,10 +83,13 @@ brew install trufflehog
 # Homebrew: always pass --no-update
 trufflehog --no-update git file://. --results=verified --fail
 
-# Org wrapper (preferred — pin, --no-update, marker write)
+# Org wrapper (preferred — pinned release, --no-update). Scan only; no marker write.
 scripts/secret-audit --repo OWNER/NAME
+scripts/secret-audit --all --org the-hcma --include-private
+
+# Intake / stale-marker refresh: writes .github/secret-audit.json into the clone.
+# Commit and push the result — lint reads the marker from the default branch.
 scripts/secret-audit --repo OWNER/NAME --write-marker
-scripts/secret-audit --all --org the-hcma --include-private --write-marker
 ```
 
 Override pin / install dir / parallelism:
@@ -127,19 +130,25 @@ Rules:
   marker is unparseable or stale (>90 days). Missing markers under org
   `--strict-onboarding --all` only SUGGEST (v1 roll-out grandfather until
   operators write markers). Routine audits SUGGEST remediation.
-- Periodic clean runs may refresh `scanned_at` / `git_tip` / version **in the
-  local working tree**. Lint reads the marker from the **remote default branch**
-  (Contents API). v1 does **not** auto-commit/push or open a PR for marker
-  refreshes — operators must commit and push (or open a PR) after a clean
-  intake/refresh so `github-repo-lint` sees the new `scanned_at`. Host timer
-  email still reports scan outcome even when markers stay local-only.
+- The marker is an **intake artifact written by an operator**, not a nightly
+  heartbeat. Lint reads it from the **remote default branch** (Contents API), so a
+  marker is only meaningful once it is committed and pushed.
+- The **host timer does not write markers** (`secret-audit-batch-run` omits
+  `--write-marker`). A local write never reaches the Contents API that lint reads,
+  and it leaves the primary clone dirty, which trips the `pre-pr-checks`
+  main-worktree guard on the next PR (repository-helpers#534). The nightly email
+  still reports scan outcome.
+- Refresh a marker by hand when `github-repo-lint` reports it stale
+  (>`secret_audit_marker_stale_days`): run `--write-marker` against a clone, then
+  land the change on the **default branch** (push directly, or merge a PR) so lint
+  sees the new `scanned_at`. An unmerged PR does not update the branch lint reads.
 - **Never** write or refresh `status=clean` when TruffleHog reports matching results.
 
-`--write-marker` requires a **local clone** (scan root or cwd). After a clean
-`--all` org scan, markers refresh only for clones that already exist locally.
-A verified leak found during that local refresh fails the run with exit **183**
-(batch emails FAILED); a single clone whose origin fetch fails is skipped with
-WARN so the rest of the sweep can continue.
+`--write-marker` requires a **local clone** (scan root or cwd). When an operator pairs
+it with `--all`, markers refresh only for clones that already exist locally. A verified
+leak found during that local refresh fails the run with exit **183**; a single clone
+whose origin fetch fails is skipped with WARN so the rest of the sweep can continue.
+The host timer never takes this path.
 
 ## Failure contract
 
