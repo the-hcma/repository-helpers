@@ -34,6 +34,9 @@ source "${script_dir}/lib/time-log"
 # shellcheck disable=SC1091
 source "${script_dir}/lib/run-context"
 
+# shellcheck disable=SC1091
+source "${script_dir}/lib/token-expiry"
+
 readonly dep_updater="${script_dir}/dep-updater"
 readonly subject_prefix="${DEP_UPDATER_REPORT_SUBJECT_PREFIX:-[dep-updater-batch]}"
 readonly report_separator='────────────────────────────────────────────────────────────────'
@@ -610,6 +613,19 @@ batch_report_append_repo_failure_details() {
 
 # batch_report_build <clean_log> <exit_code> <started_at> <finished_at> [updates_report]
 # Builds a notifier-style plain-text report body.
+# batch_report_credential_lines <clean_log>
+# Prints one line per credential that needs attention (expiring, expired, unmanaged, or
+# rejected). Healthy tokens are intentionally omitted so the section stays actionable.
+# Both workflows are path-filtered, so a repo can go quiet for weeks and never run the
+# CI preflight — the daily email is the backstop (repository-helpers#533).
+batch_report_credential_lines() {
+  local -r clean_log="$1"
+
+  rg --only-matching \
+    '(WARNING|ERROR): TOKEN_EXPIRY_(SOON|UNMANAGED|EXPIRED|INVALID) .*' \
+    "$clean_log" 2>/dev/null | sort -u || true
+}
+
 batch_report_build() {
   local -r clean_log="$1"
   local -r run_exit="$2"
@@ -618,7 +634,8 @@ batch_report_build() {
   local -r updates_report="${5:-}"
   local ok_count fail_count update_count entry sline repo_name joined_slugs
   local update_repo update_eco update_pkg update_from update_to update_cve update_cves update_pr u_repo
-  local run_cmd has_structured_failures=0 miss_slug
+  local run_cmd has_structured_failures=0 miss_slug cred_line
+  local -a credential_lines=()
   local -a ok_lines fail_lines update_lines summary_lines body_lines
   local -a archived_org_slugs=() clone_failed_slugs=() missing_clone_slugs=() not_in_org_slugs=()
   local -a ok_no_update=() private_org_slugs=() update_repo_order=()
@@ -783,6 +800,21 @@ batch_report_build() {
   fi
   body_lines+=("")
 
+  credential_lines=()
+  while IFS= read -r cred_line; do
+    [[ -n "$cred_line" ]] || continue
+    credential_lines+=("$cred_line")
+  done < <(batch_report_credential_lines "$clean_log")
+  body_lines+=("Expiring credentials:")
+  if [[ ${#credential_lines[@]} -gt 0 ]]; then
+    for cred_line in "${credential_lines[@]}"; do
+      body_lines+=("  ${cred_line}")
+    done
+  else
+    body_lines+=("  none")
+  fi
+  body_lines+=("")
+
   if (( update_count > 0 )); then
     body_lines+=("Updated:")
     for update_repo in "${update_repo_order[@]}"; do
@@ -920,6 +952,11 @@ batch_run_dep_updater_with_deadline "$run_log" "$updates_report" || run_exit=$?
 batch_report_strip_ansi "$run_log" >"$clean_log"
 rm -f "$run_log"
 run_log=""
+
+# The host's own gh credential backs every batch child, and both CI preflights are
+# path-filtered, so record its deadline here for the email to scrape. Never fatal:
+# a credential notice must not change the batch verdict.
+token_expiry_report_lines 'local gh credential' 'host' >>"$clean_log" 2>/dev/null || true
 
 finished_at="$(date '+%Y-%m-%d %H:%M %z %Z')"
 body="$(batch_report_build "$clean_log" "$run_exit" "$started_at" "$finished_at" "$updates_report")"

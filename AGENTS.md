@@ -18,6 +18,7 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | Secret audit batch | `scripts/secret-audit-batch-run` | Daily org TruffleHog sweep; email report (systemd timer). |
 | Merge settings | `scripts/check-merge-settings` | Thin wrapper (merge + GitHub MQ only). |
 | Lockfile drift | `scripts/check-lockfile-drift` | Compare lockfiles to registry constraints. |
+| Credentials | `scripts/check-token-expiry` | Preflight a CI environment PAT's expiry; warn before it dies. |
 | pnpm cutover | `scripts/grandfather-pnpm-release-age` | One-time `minimumReleaseAgeExclude` for existing lockfiles. |
 | Systemd | `scripts/setup-service`, `scripts/setup-github-repo-lint`, `scripts/setup-secret-audit`, `scripts/show-services` | Install timers/units; status summary. |
 | Deploy hook | `scripts/on-deploy` | Example hook; consumer repos implement their own. |

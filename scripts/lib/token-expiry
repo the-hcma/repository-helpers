@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# token-expiry — warn before a CI environment PAT expires.
+#
+# DEP_UPDATER_TOKEN expired silently and every `org dep-updater dry-run` job failed
+# with `Bad credentials (HTTP 401)` for two weeks before anyone traced the red CI back
+# to the secret (repository-helpers#525, #531, #533). GitHub returns the expiry of the
+# authenticating PAT as a response header, so a job that already holds the secret can
+# read its own deadline without any extra permission:
+#
+#   Github-Authentication-Token-Expiration: 2027-08-27 04:00:00 UTC
+#
+# The header is present for fine-grained and classic PATs. It is absent for
+# GITHUB_TOKEN and for OAuth tokens minted by `gh auth login` — itself useful
+# information, since an OAuth secret rotates out from under us unpredictably (the
+# original failure mode) rather than on a known date.
+#
+# Statuses (token_expiry_classify):
+#   ok         expiry is beyond the warning window
+#   warn       expiry is inside the warning window
+#   expired    expiry is in the past
+#   unmanaged  no expiry header — OAuth / GITHUB_TOKEN, not a managed PAT
+#   invalid    header present but unparseable, or the API rejected the credential
+#
+# Env overrides:
+#   TOKEN_EXPIRY_WARN_DAYS  warning window in days (default 14)
+#   TOKEN_EXPIRY_NOW_EPOCH  fixed "now" in epoch seconds (tests; default `date +%s`)
+
+set -euo pipefail
+
+if declare -F token_expiry_classify >/dev/null 2>&1; then
+  return 0
+fi
+
+_token_expiry_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _token_expiry_lib_dir
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_token_expiry_lib_dir}/runner-ensure"
+# shellcheck disable=SC1091  # gh api calls must go through the rate-limit waiter
+source "${_token_expiry_lib_dir}/github-api-rate-limit"
+
+token_expiry_default_warn_days=14
+readonly token_expiry_default_warn_days
+
+token_expiry_header_name='Github-Authentication-Token-Expiration'
+readonly token_expiry_header_name
+
+# token_expiry_classify <expiry-string> <now-epoch> <warn-days>
+# Prints "<status> <days-remaining>". Days are negative once expired, and 0 for
+# statuses where no deadline is known (unmanaged / invalid).
+token_expiry_classify() {
+  local -r expiry="${1:-}"
+  local -r now_epoch="${2:-0}"
+  local -r warn_days="${3:-$token_expiry_default_warn_days}"
+  local expiry_epoch remaining_s days
+
+  if [[ -z "$expiry" ]]; then
+    printf 'unmanaged 0\n'
+    return 0
+  fi
+
+  expiry_epoch="$(_token_expiry_epoch "$expiry")" || {
+    printf 'invalid 0\n'
+    return 0
+  }
+  if [[ -z "$expiry_epoch" ]]; then
+    printf 'invalid 0\n'
+    return 0
+  fi
+
+  remaining_s=$(( expiry_epoch - now_epoch ))
+  # Truncates toward zero, so a token 1.5 days out reports 1 day.
+  days=$(( remaining_s / 86400 ))
+
+  if (( remaining_s <= 0 )); then
+    printf 'expired %s\n' "$days"
+  elif (( days < warn_days )); then
+    printf 'warn %s\n' "$days"
+  else
+    printf 'ok %s\n' "$days"
+  fi
+}
+
+# token_expiry_header_for_token
+# Prints the expiry header value for the active GH_TOKEN, or nothing when the header
+# is absent. Returns non-zero only when the credential itself was rejected.
+token_expiry_header_for_token() {
+  local response value
+
+  # Only a rejected credential is an error here. An absent header is the expected
+  # shape for OAuth / GITHUB_TOKEN and must return empty with status 0, so callers
+  # can tell "unmanaged" apart from "invalid".
+  response="$(github_api_exec_with_rate_limit_retry 'token-expiry' -- gh api user --include)" \
+    || return 1
+
+  value="$(
+    printf '%s' "$response" \
+      | grep --ignore-case --max-count=1 "^${token_expiry_header_name}:" \
+      || true
+  )"
+  [[ -n "$value" ]] || return 0
+
+  printf '%s' "$value" \
+    | sed -E "s/^[^:]+:[[:space:]]*//" \
+    | tr -d '\r' \
+    | sed -E 's/[[:space:]]+$//'
+}
+
+# token_expiry_preflight <secret-name> <environment-name> [warn-days]
+# Reads the active credential's deadline and reports it. Emits GitHub Actions
+# annotations when running under Actions, plus one machine-parseable line in every
+# environment. Returns 1 only for a credential that is already unusable, so a warning
+# rides along on an otherwise green run.
+token_expiry_preflight() {
+  local -r secret_name="${1:?secret name required}"
+  local -r env_name="${2:?environment name required}"
+  local -r warn_days="${3:-${TOKEN_EXPIRY_WARN_DAYS:-$token_expiry_default_warn_days}}"
+  local expiry header_rc=0 now_epoch status days
+
+  now_epoch="$(_token_expiry_now_epoch)"
+
+  expiry="$(token_expiry_header_for_token)" || header_rc=$?
+  if (( header_rc != 0 )); then
+    _token_expiry_emit invalid 0 "$secret_name" "$env_name" ''
+    return 1
+  fi
+
+  read -r status days <<<"$(token_expiry_classify "$expiry" "$now_epoch" "$warn_days")"
+  _token_expiry_emit "$status" "$days" "$secret_name" "$env_name" "$expiry"
+
+  [[ "$status" == 'expired' || "$status" == 'invalid' ]] && return 1
+  return 0
+}
+
+# token_expiry_report_lines <secret-name> <environment-name> [warn-days]
+# Prints the machine-parseable status line only (no annotations), for batch email
+# reports that scrape their own log. Always returns 0 so a report cannot abort a run.
+token_expiry_report_lines() {
+  local -r secret_name="${1:?secret name required}"
+  local -r env_name="${2:?environment name required}"
+  local -r warn_days="${3:-${TOKEN_EXPIRY_WARN_DAYS:-$token_expiry_default_warn_days}}"
+  local expiry header_rc=0 now_epoch status days
+
+  now_epoch="$(_token_expiry_now_epoch)"
+  expiry="$(token_expiry_header_for_token)" || header_rc=$?
+  if (( header_rc != 0 )); then
+    _token_expiry_status_line invalid 0 "$secret_name" "$env_name" ''
+    return 0
+  fi
+
+  read -r status days <<<"$(token_expiry_classify "$expiry" "$now_epoch" "$warn_days")"
+  _token_expiry_status_line "$status" "$days" "$secret_name" "$env_name" "$expiry"
+  return 0
+}
+
+# _token_expiry_emit <status> <days> <secret> <env> <expiry>
+# Human message plus Actions annotation plus the machine-parseable line.
+_token_expiry_emit() {
+  local -r status="$1"
+  local -r days="$2"
+  local -r secret_name="$3"
+  local -r env_name="$4"
+  local -r expiry="$5"
+  local message annotation='' subject
+
+  subject="credential ${secret_name} (environment ${env_name})"
+  case "$status" in
+    ok)
+      message="${subject} expires ${expiry} (${days}d)."
+      ;;
+    warn)
+      message="${subject} expires in ${days}d on ${expiry}."
+      message+=" Rotate it before CI starts failing."
+      annotation='warning'
+      ;;
+    expired)
+      message="${subject} expired on ${expiry}."
+      message+=" Replace the secret on that environment."
+      annotation='error'
+      ;;
+    unmanaged)
+      message="${subject} has no expiry header, so it is an OAuth token rather than a managed"
+      message+=" PAT and will rotate unpredictably. Migrate it to a fine-grained PAT."
+      annotation='warning'
+      ;;
+    invalid)
+      message="${subject} was rejected or reports an unreadable expiry."
+      message+=" Replace the secret on that environment."
+      annotation='error'
+      ;;
+  esac
+
+  if [[ -n "$annotation" && "${GITHUB_ACTIONS:-}" == 'true' ]]; then
+    printf '::%s::%s\n' "$annotation" "$message"
+  else
+    printf '%s\n' "$message" >&2
+  fi
+  _token_expiry_status_line "$status" "$days" "$secret_name" "$env_name" "$expiry"
+}
+
+# _token_expiry_epoch <expiry-string>
+# GNU date parses the header's "YYYY-MM-DD HH:MM:SS UTC" form directly.
+_token_expiry_epoch() {
+  local -r expiry="$1"
+  local epoch
+
+  epoch="$(date --date="$expiry" +%s 2>/dev/null)" || return 1
+  [[ "$epoch" =~ ^-?[0-9]+$ ]] || return 1
+  printf '%s' "$epoch"
+}
+
+# _token_expiry_now_epoch
+_token_expiry_now_epoch() {
+  if [[ -n "${TOKEN_EXPIRY_NOW_EPOCH:-}" ]]; then
+    printf '%s' "$TOKEN_EXPIRY_NOW_EPOCH"
+    return 0
+  fi
+  date +%s
+}
+
+# _token_expiry_status_line <status> <days> <secret> <env> <expiry>
+# One grep-able line per check. Batch reports and CI logs both scrape these.
+_token_expiry_status_line() {
+  local -r status="$1"
+  local -r days="$2"
+  local -r secret_name="$3"
+  local -r env_name="$4"
+  local -r expiry="$5"
+  local prefix token
+
+  case "$status" in
+    ok) prefix='NOTE'; token='TOKEN_EXPIRY_OK' ;;
+    warn) prefix='WARNING'; token='TOKEN_EXPIRY_SOON' ;;
+    expired) prefix='ERROR'; token='TOKEN_EXPIRY_EXPIRED' ;;
+    unmanaged) prefix='WARNING'; token='TOKEN_EXPIRY_UNMANAGED' ;;
+    invalid) prefix='ERROR'; token='TOKEN_EXPIRY_INVALID' ;;
+  esac
+
+  printf '%s: %s secret=%s env=%s days=%s expires=%s\n' \
+    "$prefix" "$token" "$secret_name" "$env_name" "$days" "${expiry:-unknown}"
+}
