@@ -8938,12 +8938,30 @@ discover_batch_all_repos() {
   done
 }
 
+batch_all_ephemeral_root_retention_days=3
+readonly batch_all_ephemeral_root_retention_days
+
 _batch_all_ephemeral_root=""
 _batch_all_retained_clones=0
+# Set while an ephemeral clone is in use and its keep-or-remove decision is still
+# pending, so an interrupt at any point in that window preserves the clone.
+_batch_all_pending_ephemeral_clone=0
 _batch_all_interrupted=0
 _batch_all_active_child_pid=""
 _batch_all_active_child_fifo=""
 _batch_all_active_child_log=""
+
+# batch_all_reap_stale_ephemeral_roots <base_dir>
+# Retained clone roots from earlier runs are never removed by their own process, so
+# sweep the ones older than the retention window before starting a new batch.
+batch_all_reap_stale_ephemeral_roots() {
+  local -r base_dir="$1"
+
+  [[ -d "$base_dir" ]] || return 0
+  runner_sh "batch-all reap stale ephemeral clone roots" -- \
+    "find $(printf '%q' "$base_dir") -maxdepth 1 -type d -name 'dep-updater-batch-clones.*' \
+      -mtime +${batch_all_ephemeral_root_retention_days} -exec rm -rf {} + 2>/dev/null || true"
+}
 
 # batch_all_cleanup_ephemeral_root
 # Removes the batch-scoped directory used for depth-1 ephemeral clones. Clones kept
@@ -8965,8 +8983,8 @@ batch_all_cleanup_ephemeral_root() {
 batch_all_cleanup_on_interrupt() {
   _batch_all_interrupted=1
 
-  # A child killed mid-run may still own a worktree backed by its ephemeral clone.
-  if [[ -n "${_batch_all_active_child_pid:-}" ]]; then
+  # An ephemeral clone whose removal has not been decided yet may still back a worktree.
+  if (( _batch_all_pending_ephemeral_clone )); then
     _batch_all_retained_clones=$(( _batch_all_retained_clones + 1 ))
   fi
 
@@ -9179,6 +9197,7 @@ batch_all_dispatch() {
   fi
 
   ephemeral_base="${wt_tmpdir:-${TMPDIR:-/tmp}}"
+  batch_all_reap_stale_ephemeral_roots "$ephemeral_base"
   _batch_all_ephemeral_root=""
   _batch_all_ephemeral_root="$(runner_exec_stdout "batch-all mktemp ephemeral clone root" \
     -- mktemp -d "${ephemeral_base}/dep-updater-batch-clones.XXXXXX")"
@@ -9209,6 +9228,7 @@ batch_all_dispatch() {
       repo="$checkout_path"
     else
       repo_ephemeral=1
+      _batch_all_pending_ephemeral_clone=1
       clone_rc=0
       repo="$(batch_all_materialize_checkout "$slug" "")" || clone_rc=$?
       if (( clone_rc != 0 )); then
@@ -9455,6 +9475,7 @@ batch_all_dispatch() {
       else
         _batch_all_retained_clones=$(( _batch_all_retained_clones + 1 ))
       fi
+      _batch_all_pending_ephemeral_clone=0
     fi
   done
 
