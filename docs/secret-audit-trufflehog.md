@@ -83,7 +83,7 @@ brew install trufflehog
 # Homebrew: always pass --no-update
 trufflehog --no-update git file://. --results=verified --fail
 
-# Org wrapper (preferred — pin, --no-update, marker write)
+# Org wrapper (preferred — pinned release, --no-update). Scan only; no marker write.
 scripts/secret-audit --repo OWNER/NAME
 scripts/secret-audit --all --org the-hcma --include-private
 
@@ -143,11 +143,11 @@ Rules:
   commit and push (or open a PR) so lint sees the new `scanned_at`.
 - **Never** write or refresh `status=clean` when TruffleHog reports matching results.
 
-`--write-marker` requires a **local clone** (scan root or cwd). After a clean
-`--all` org scan, markers refresh only for clones that already exist locally.
-A verified leak found during that local refresh fails the run with exit **183**
-(batch emails FAILED); a single clone whose origin fetch fails is skipped with
-WARN so the rest of the sweep can continue.
+`--write-marker` requires a **local clone** (scan root or cwd). When an operator pairs
+it with `--all`, markers refresh only for clones that already exist locally. A verified
+leak found during that local refresh fails the run with exit **183**; a single clone
+whose origin fetch fails is skipped with WARN so the rest of the sweep can continue.
+The host timer never takes this path.
 
 ## Failure contract
 
