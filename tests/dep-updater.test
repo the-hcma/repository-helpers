@@ -1767,6 +1767,109 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== behavioural: marker-gated uv deps are discovered on a foreign platform ===\n'
+# A dep marked for another platform never installs on the batch host, so
+# uv-outdated and the >= floor scan both miss it. Discovery must fall back to
+# the universal lockfile (issue #532).
+marker_gated_tmp="$(mktemp -d)"
+cat >"${marker_gated_tmp}/pyproject.toml" <<'EOF'
+[project]
+name = "probe"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.32.0",
+]
+
+[project.optional-dependencies]
+macos = [
+    "pyobjc-core==12.2.1; sys_platform == 'darwin'",
+    "Win_Only_Pkg>=3.0; sys_platform == 'win32'",
+]
+EOF
+cat >"${marker_gated_tmp}/uv.lock" <<'EOF'
+[[package]]
+name = "pyobjc-core"
+version = "12.2.3"
+
+[[package]]
+name = "win-only-pkg"
+version = "3.4.0"
+EOF
+marker_gated_rows_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^_py_uv_marker_gated_requirements\(\)/,/^}$/' "$script")
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_lock_highest_version\(\)/,/^}$/' "$script")
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_marker_gated_rows\(\)/,/^}$/' "$script")
+  py_uv_marker_gated_rows "$marker_gated_tmp"
+)"
+# Baseline must come from the lock (12.2.3), not the declared pin (12.2.1).
+if [[ "$marker_gated_rows_out" == 'pyobjc-core 12.2.3 12.2.3
+Win_Only_Pkg 3.4.0 3.4.0' ]]; then
+  printf '[PASS] marker-gated: rows seed baselines from uv.lock for both == and >= pins\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] marker-gated: unexpected rows: %s\n' "$marker_gated_rows_out"
+  fail=$(( fail + 1 ))
+fi
+
+marker_gated_pkgs_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^_py_uv_marker_gated_requirements\(\)/,/^}$/' "$script")
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_marker_gated_pkgs\(\)/,/^}$/' "$script")
+  py_uv_marker_gated_pkgs "$marker_gated_tmp" | tr '\n' ' '
+)"
+rm -rf "$marker_gated_tmp"
+# Unmarked requests must not appear; names normalize to PEP 503 form.
+if [[ "$marker_gated_pkgs_out" == 'pyobjc-core win-only-pkg ' ]]; then
+  printf '[PASS] marker-gated: pkgs normalizes names and ignores unmarked deps\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] marker-gated: expected "pyobjc-core win-only-pkg ", got "%s"\n' \
+    "$marker_gated_pkgs_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== behavioural: py_pkg_in_list PEP 508 name equality ===\n'
+pkg_in_list_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^py_pkg_in_list\(\)/,/^}$/' "$script")
+  pkg_in_list_names='pyobjc-core
+win-only-pkg'
+  for probe in pyobjc_core PyObjC-Core Win.Only.Pkg ruff; do
+    if py_pkg_in_list "$probe" "$pkg_in_list_names"; then
+      printf 'hit:%s ' "$probe"
+    else
+      printf 'miss:%s ' "$probe"
+    fi
+  done
+)"
+if [[ "$pkg_in_list_out" == 'hit:pyobjc_core hit:PyObjC-Core hit:Win.Only.Pkg miss:ruff ' ]]; then
+  printf '[PASS] marker-gated: py_pkg_in_list treats case, dot and underscore as equal\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] marker-gated: py_pkg_in_list results: %s\n' "$pkg_in_list_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: py_outdated bypasses current-platform probe for marker-gated deps ===\n'
+# The dry-run probe is current-platform only and always rejects a dep whose
+# marker excludes this host; the lockfile filter is the real gate (issue #532).
+# shellcheck disable=SC2016  # assert on the literal source text, not expansions
+marker_gated_seed="$(awk '/^py_outdated\(\)/{f=1} f && /marker_gated_list="\$\(py_uv_marker_gated_pkgs/{ok=1} f && /^}$/{f=0} END{print ok+0}' "$script")"
+# shellcheck disable=SC2016  # assert on the literal source text, not expansions
+marker_gated_bypass="$(awk '/^py_outdated\(\)/{f=1} f && /py_pkg_in_list "\$pkg" "\$marker_gated_list"/{ok=1} f && /^}$/{f=0} END{print ok+0}' "$script")"
+if [[ "$marker_gated_seed" == '1' && "$marker_gated_bypass" == '1' ]]; then
+  printf '[PASS] marker-gated: py_outdated seeds marker rows and skips the platform probe\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] marker-gated: py_outdated wiring missing (seed=%s bypass=%s)\n' \
+    "$marker_gated_seed" "$marker_gated_bypass"
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== behavioural: py_uv_parse_verify_filter_pkg log messages ===\n'
 verify_parser_log="$(mktemp)"
 printf '%s\n' 'lock did not land django at 6.1 (highest 6.0.8)' >"$verify_parser_log"
