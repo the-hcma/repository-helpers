@@ -44,6 +44,8 @@ source "${dep_script_dir}/lib/runner"
 source "${dep_script_dir}/lib/github-api-rate-limit"
 # shellcheck source=scripts/lib/github-repo-slug
 source "${dep_script_dir}/lib/github-repo-slug"
+# shellcheck disable=SC1091
+source "${dep_script_dir}/lib/dep-updater-org-clone"
 # shellcheck disable=SC1091  # stacking-tool selects gt vs gh stack for submit/restack
 source "${dep_script_dir}/lib/stacking-tool"
 # Referenced below; assigned readonly in scripts/lib/stacking-tool.
@@ -954,12 +956,14 @@ Modes:
 Options:
   --all             With --batch: discover org repos via the GitHub API
                     (DEP_UPDATER_ORG, default the-hcma), then run batch updates
-                    for each that has a local clone under --scan-root. Prints
-                    each resolved top-level directory before running. Always skips
-                    archived GitHub repositories. Skips private GitHub repositories
-                    unless --include-private is set. Org repos with no local clone
-                    are logged as skips (not mutated). For quick runs, combine with
-                    both --no-wait-ci and --no-wait-merge.
+                    for each eligible org repository. Uses an existing checkout
+                    under --scan-root when present; otherwise materializes a
+                    depth-1 single-branch ephemeral clone under --tmpdir before
+                    processing. Prints each resolved top-level directory before
+                    running. Always skips archived GitHub repositories. Skips
+                    private GitHub repositories unless --include-private is set.
+                    For quick runs, combine with both --no-wait-ci and
+                    --no-wait-merge.
   --batch           Combine all updates into a single PR instead of one per package
   --dir <path>      Project root (default: current directory)
   --ecosystem <e>   Force: npm | python | rust | gha | auto  (default: auto)
@@ -8862,9 +8866,10 @@ discover_batch_all_org_repo_membership_tsv() {
 }
 
 # discover_batch_all_repos
-# Candidate set = org API membership; local scan roots only supply checkouts.
-# Prints absolute clone paths for org repos that exist under scan roots.
-# Logs skips for org repos with no local clone (visible in the batch email).
+# Candidate set = org API membership; scan roots supply existing checkouts.
+# Prints "OWNER/NAME<TAB>checkout_path" per eligible org repo (checkout_path
+# empty when batch-all should materialize an ephemeral shallow clone).
+# Logs skips for filtered private/archived repos and local-only clones.
 discover_batch_all_repos() {
   local org name slug slug_lc path discover_rc=0
   local membership_file slug_key private archived
@@ -8913,12 +8918,8 @@ discover_batch_all_repos() {
     fi
 
     path="${clone_by_slug_lc[$slug_lc]:-}"
-    if [[ -z "$path" ]]; then
-      log "[batch-all] Skipping ${slug}: no local clone under scan roots"
-      continue
-    fi
     matched_clone_slug_lc["$slug_lc"]=1
-    printf '%s\n' "$path"
+    printf '%s\t%s\n' "$slug" "$path"
   done <"$membership_file"
   rm -f "$membership_file"
 
@@ -8937,14 +8938,55 @@ discover_batch_all_repos() {
   done
 }
 
+batch_all_ephemeral_root_retention_days=3
+readonly batch_all_ephemeral_root_retention_days
+
+_batch_all_ephemeral_root=""
+_batch_all_retained_clones=0
+# Set while an ephemeral clone is in use and its keep-or-remove decision is still
+# pending, so an interrupt at any point in that window preserves the clone.
+_batch_all_pending_ephemeral_clone=0
 _batch_all_interrupted=0
 _batch_all_active_child_pid=""
 _batch_all_active_child_fifo=""
 _batch_all_active_child_log=""
 
+# batch_all_reap_stale_ephemeral_roots <base_dir>
+# Retained clone roots from earlier runs are never removed by their own process, so
+# sweep the ones older than the retention window before starting a new batch.
+batch_all_reap_stale_ephemeral_roots() {
+  local -r base_dir="$1"
+
+  [[ -d "$base_dir" ]] || return 0
+  runner_sh "batch-all reap stale ephemeral clone roots" -- \
+    "find $(printf '%q' "$base_dir") -maxdepth 1 -type d -name 'dep-updater-batch-clones.*' \
+      -mtime +${batch_all_ephemeral_root_retention_days} -exec rm -rf {} + 2>/dev/null || true"
+}
+
+# batch_all_cleanup_ephemeral_root
+# Removes the batch-scoped directory used for depth-1 ephemeral clones. Clones kept
+# on purpose (failed child, --no-wait-merge follow-up) must survive the sweep, so the
+# whole root is preserved and its path logged for the operator.
+batch_all_cleanup_ephemeral_root() {
+  [[ -n "${_batch_all_ephemeral_root:-}" && -d "${_batch_all_ephemeral_root}" ]] || return 0
+
+  if (( _batch_all_retained_clones > 0 )); then
+    log "[batch-all] Keeping ephemeral clones for follow-up: ${_batch_all_ephemeral_root}"
+    return 0
+  fi
+
+  run_command "batch-all rm ephemeral clone root" -- rm -rf "${_batch_all_ephemeral_root}"
+  _batch_all_ephemeral_root=""
+}
+
 # shellcheck disable=SC2317,SC2329  # invoked via INT/TERM traps during batch --all
 batch_all_cleanup_on_interrupt() {
   _batch_all_interrupted=1
+
+  # An ephemeral clone whose removal has not been decided yet may still back a worktree.
+  if (( _batch_all_pending_ephemeral_clone )); then
+    _batch_all_retained_clones=$(( _batch_all_retained_clones + 1 ))
+  fi
 
   # Best-effort cleanup: kill active child and remove temp files.
   if [[ -n "${_batch_all_active_child_pid:-}" ]]; then
@@ -8970,6 +9012,8 @@ batch_all_cleanup_on_interrupt() {
   if [[ -n "${_batch_all_active_child_log:-}" ]]; then
     rm -f "$_batch_all_active_child_log" 2>/dev/null || true
   fi
+
+  batch_all_cleanup_ephemeral_root
 
   log "[batch-all] Interrupted."
 }
@@ -9045,11 +9089,67 @@ batch_all_scrape_actionable_from_log() {
   return 1
 }
 
+# batch_all_ephemeral_clone_safe_to_remove <child_exit>
+# Ephemeral scan-root clones must outlive child worktrees when --no-wait-merge
+# leaves cleanup to the operator, or when the child failed mid-run.
+batch_all_ephemeral_clone_safe_to_remove() {
+  local -r child_exit="$1"
+
+  (( child_exit != 0 )) && return 1
+  [[ "$no_wait_merge" == '1' ]] && return 1
+  return 0
+}
+
+# batch_all_materialize_checkout <slug> <local_path>
+# Prints an absolute checkout path: reuse local_path when set, else depth-1 clone
+# under _batch_all_ephemeral_root. Returns non-zero when ephemeral clone fails.
+batch_all_materialize_checkout() {
+  local -r slug="$1"
+  local -r local_path="${2:-}"
+  local name dest clone_exit=0 resolved_dest
+
+  if [[ -n "$local_path" ]]; then
+    printf '%s\n' "$local_path"
+    return 0
+  fi
+
+  if [[ -z "${_batch_all_ephemeral_root:-}" ]]; then
+    log "[batch-all] Skipping ${slug}: ephemeral clone root is unset"
+    return 1
+  fi
+
+  name="${slug##*/}"
+  dest="${_batch_all_ephemeral_root}/${name}"
+  case "$dest" in
+    "${_batch_all_ephemeral_root}"/*) ;;
+    *)
+      log "[batch-all] Skipping ${slug}: invalid ephemeral clone destination"
+      return 1
+      ;;
+  esac
+
+  run_command "batch-all rm stale ephemeral clone ${name}" -- rm -rf "$dest"
+  log "[batch-all] Ephemeral clone (depth 1): ${slug} → ${dest}"
+  clone_exit=0
+  dep_updater_org_clone_shallow "$slug" "$dest" || clone_exit=$?
+  if (( clone_exit != 0 )); then
+    log "[batch-all] Skipping ${slug}: ephemeral clone failed (exit ${clone_exit})"
+    run_command "batch-all rm failed ephemeral clone ${name}" -- rm -rf "$dest"
+    return "$clone_exit"
+  fi
+
+  resolved_dest=""
+  resolved_dest="$(dep_updater_runner_realpath "$dest" 2>/dev/null)" || resolved_dest="$dest"
+  printf '%s\n' "$resolved_dest"
+  return 0
+}
+
 batch_all_dispatch() {
   local dep_self repo child_exit worst_exit discover_file discover_rc=0
   local -a child_args repos_found
   local -a failure_summaries=()
   local -a failure_details=()
+  local slug checkout_path repo_ephemeral=0 ephemeral_base clone_rc=0
 
   # Palette of ANSI colors cycled across repos so each project's header is visually distinct.
   # Only active when stderr is a TTY (same condition as init_prompt_style).
@@ -9092,9 +9192,18 @@ batch_all_dispatch() {
   rm -f "$discover_file"
 
   if [[ ${#repos_found[@]} -eq 0 ]]; then
-    log "[batch-all] No org repositories with local clones under scan roots."
+    log "[batch-all] No org repositories to process."
     return 0
   fi
+
+  ephemeral_base="${wt_tmpdir:-${TMPDIR:-/tmp}}"
+  batch_all_reap_stale_ephemeral_roots "$ephemeral_base"
+  _batch_all_ephemeral_root=""
+  _batch_all_ephemeral_root="$(runner_exec_stdout "batch-all mktemp ephemeral clone root" \
+    -- mktemp -d "${ephemeral_base}/dep-updater-batch-clones.XXXXXX")"
+  _batch_all_ephemeral_root="${_batch_all_ephemeral_root//$'\n'/}"
+  [[ -n "$_batch_all_ephemeral_root" && -d "$_batch_all_ephemeral_root" ]] \
+    || die "Could not create ephemeral clone directory under ${ephemeral_base}"
 
   if [[ -n "${DEP_UPDATER_UPDATES_REPORT:-}" ]]; then
     printf '[]\n' >"${DEP_UPDATER_UPDATES_REPORT}"
@@ -9102,8 +9211,38 @@ batch_all_dispatch() {
 
   worst_exit=0
 
-  for repo in "${repos_found[@]}"; do
-    [[ -z "$repo" ]] && continue
+  for repo_line in "${repos_found[@]}"; do
+    [[ -z "$repo_line" ]] && continue
+    [[ "$_batch_all_interrupted" == '1' ]] && break
+
+    slug="${repo_line%%$'\t'*}"
+    checkout_path=""
+    if [[ "$repo_line" == *$'\t'* ]]; then
+      checkout_path="${repo_line#*$'\t'}"
+    fi
+    [[ -n "$slug" ]] || continue
+
+    repo=""
+    repo_ephemeral=0
+    if [[ -n "$checkout_path" ]]; then
+      repo="$checkout_path"
+    else
+      repo_ephemeral=1
+      _batch_all_pending_ephemeral_clone=1
+      clone_rc=0
+      repo="$(batch_all_materialize_checkout "$slug" "")" || clone_rc=$?
+      if (( clone_rc != 0 )); then
+        if (( clone_rc == 130 )) || [[ "${_runner_interrupted:-0}" -eq 1 ]]; then
+          _batch_all_interrupted=1
+          break
+        fi
+        if (( worst_exit == 0 || clone_rc > worst_exit )); then
+          worst_exit="$clone_rc"
+        fi
+        continue
+      fi
+    fi
+    [[ -n "$repo" ]] || continue
     [[ "$_batch_all_interrupted" == '1' ]] && break
 
     local repo_started_ms
@@ -9330,12 +9469,24 @@ batch_all_dispatch() {
     fi
     rm -f "$child_log" "$child_report" "$child_updates"
     _batch_all_active_child_log=""
+    if (( repo_ephemeral )); then
+      if batch_all_ephemeral_clone_safe_to_remove "$child_exit"; then
+        run_command "batch-all rm ephemeral clone $(basename "$repo")" -- rm -rf "$repo"
+      else
+        _batch_all_retained_clones=$(( _batch_all_retained_clones + 1 ))
+      fi
+      _batch_all_pending_ephemeral_clone=0
+    fi
   done
 
   if [[ "$_batch_all_interrupted" == '1' ]]; then
+    batch_all_cleanup_ephemeral_root
     trap - INT TERM
     return 130
   fi
+
+  batch_all_cleanup_ephemeral_root
+  trap - INT TERM
 
   if [[ "$worst_exit" -ne 0 ]]; then
     log "[batch-all] Finished with failures (exit ${worst_exit})."
