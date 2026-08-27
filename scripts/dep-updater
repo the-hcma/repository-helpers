@@ -8939,25 +8939,36 @@ discover_batch_all_repos() {
 }
 
 _batch_all_ephemeral_root=""
+_batch_all_retained_clones=0
 _batch_all_interrupted=0
 _batch_all_active_child_pid=""
 _batch_all_active_child_fifo=""
 _batch_all_active_child_log=""
 
 # batch_all_cleanup_ephemeral_root
-# Removes the batch-scoped directory used for depth-1 ephemeral clones.
+# Removes the batch-scoped directory used for depth-1 ephemeral clones. Clones kept
+# on purpose (failed child, --no-wait-merge follow-up) must survive the sweep, so the
+# whole root is preserved and its path logged for the operator.
 batch_all_cleanup_ephemeral_root() {
-  if [[ -n "${_batch_all_ephemeral_root:-}" && -d "${_batch_all_ephemeral_root}" ]]; then
-    run_command "batch-all rm ephemeral clone root" -- rm -rf "${_batch_all_ephemeral_root}"
-    _batch_all_ephemeral_root=""
+  [[ -n "${_batch_all_ephemeral_root:-}" && -d "${_batch_all_ephemeral_root}" ]] || return 0
+
+  if (( _batch_all_retained_clones > 0 )); then
+    log "[batch-all] Keeping ephemeral clones for follow-up: ${_batch_all_ephemeral_root}"
+    return 0
   fi
+
+  run_command "batch-all rm ephemeral clone root" -- rm -rf "${_batch_all_ephemeral_root}"
+  _batch_all_ephemeral_root=""
 }
 
 # shellcheck disable=SC2317,SC2329  # invoked via INT/TERM traps during batch --all
 batch_all_cleanup_on_interrupt() {
   _batch_all_interrupted=1
 
-  batch_all_cleanup_ephemeral_root
+  # A child killed mid-run may still own a worktree backed by its ephemeral clone.
+  if [[ -n "${_batch_all_active_child_pid:-}" ]]; then
+    _batch_all_retained_clones=$(( _batch_all_retained_clones + 1 ))
+  fi
 
   # Best-effort cleanup: kill active child and remove temp files.
   if [[ -n "${_batch_all_active_child_pid:-}" ]]; then
@@ -8983,6 +8994,8 @@ batch_all_cleanup_on_interrupt() {
   if [[ -n "${_batch_all_active_child_log:-}" ]]; then
     rm -f "$_batch_all_active_child_log" 2>/dev/null || true
   fi
+
+  batch_all_cleanup_ephemeral_root
 
   log "[batch-all] Interrupted."
 }
@@ -9436,8 +9449,12 @@ batch_all_dispatch() {
     fi
     rm -f "$child_log" "$child_report" "$child_updates"
     _batch_all_active_child_log=""
-    if (( repo_ephemeral )) && batch_all_ephemeral_clone_safe_to_remove "$child_exit"; then
-      run_command "batch-all rm ephemeral clone $(basename "$repo")" -- rm -rf "$repo"
+    if (( repo_ephemeral )); then
+      if batch_all_ephemeral_clone_safe_to_remove "$child_exit"; then
+        run_command "batch-all rm ephemeral clone $(basename "$repo")" -- rm -rf "$repo"
+      else
+        _batch_all_retained_clones=$(( _batch_all_retained_clones + 1 ))
+      fi
     fi
   done
 
