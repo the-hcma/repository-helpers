@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+# Tests for scripts/lib/token-expiry and scripts/check-token-expiry (#533).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+rh_root="${script_dir}/.."
+readonly rh_root
+
+lib="${rh_root}/scripts/lib/token-expiry"
+checker="${rh_root}/scripts/check-token-expiry"
+batch_run="${rh_root}/scripts/dep-updater-batch-run"
+readonly lib checker batch_run
+
+# Fixed clock so every expiry assertion is deterministic.
+# 2026-08-27T12:00:00Z
+fixed_now_epoch=1787832000
+readonly fixed_now_epoch
+
+# shellcheck source=tests/lib/test-assert
+source "${script_dir}/lib/test-assert"
+test_init
+
+# classify_via <expiry> [warn-days]
+# Runs token_expiry_classify in a subshell against the fixed clock.
+classify_via() {
+  local -r expiry="$1"
+  local -r warn="${2:-14}"
+  # SC2034: read by the sourced token_expiry_classify (its bad-window fallback).
+  # shellcheck disable=SC2034
+  (
+    # shellcheck disable=SC1090
+    source <(awk '/^token_expiry_classify\(\)/,/^}$/' "$lib")
+    # shellcheck disable=SC1090
+    source <(awk '/^_token_expiry_epoch\(\)/,/^}$/' "$lib")
+    token_expiry_default_warn_days=14
+    token_expiry_classify "$expiry" "$fixed_now_epoch" "$warn"
+  )
+}
+
+printf '\n=== static: library and entry point exist ===\n'
+if [[ -f "$lib" ]]; then
+  pass_case 'scripts/lib/token-expiry exists'
+else
+  fail_case 'scripts/lib/token-expiry exists'
+fi
+if [[ -x "$checker" ]]; then
+  pass_case 'scripts/check-token-expiry is executable'
+else
+  fail_case 'scripts/check-token-expiry is executable'
+fi
+
+printf '\n=== behavioural: classify maps expiry to status ===\n'
+# 2027-08-27 is ~365d out from the fixed clock: comfortably beyond the window.
+assert_contains 'classify: a year out is ok' \
+  "$(classify_via '2027-08-27 04:00:00 UTC')" 'ok 364'
+
+# 5 days out sits inside the default 14-day window.
+assert_contains 'classify: inside the window warns with days remaining' \
+  "$(classify_via '2026-09-01 12:00:00 UTC')" 'warn 5'
+
+# Boundary: exactly at the window edge is not yet a warning.
+assert_contains 'classify: exactly warn-days out is still ok' \
+  "$(classify_via '2026-09-10 12:00:00 UTC')" 'ok 14'
+
+assert_contains 'classify: one second inside the window warns' \
+  "$(classify_via '2026-09-10 11:59:59 UTC')" 'warn 13'
+
+assert_contains 'classify: a past date is expired' \
+  "$(classify_via '2026-08-20 12:00:00 UTC')" 'expired -7'
+
+# The header is absent for GITHUB_TOKEN and gh auth login OAuth tokens.
+assert_contains 'classify: empty expiry is unmanaged (OAuth, not a PAT)' \
+  "$(classify_via '')" 'unmanaged 0'
+
+assert_contains 'classify: unparseable expiry is invalid' \
+  "$(classify_via 'not-a-real-date')" 'invalid 0'
+
+assert_contains 'classify: custom warn window is honoured' \
+  "$(classify_via '2026-09-20 12:00:00 UTC' 30)" 'warn 24'
+
+# A non-integer window must not be coerced by (( )) into "everything is ok": `abc`
+# evaluates as 0 and `1.5` is an arithmetic syntax error, either of which would
+# silently suppress every warning.
+assert_contains 'classify: non-numeric warn window falls back to the default' \
+  "$(classify_via '2026-09-01 12:00:00 UTC' abc 2>/dev/null)" 'warn 5'
+assert_contains 'classify: fractional warn window falls back to the default' \
+  "$(classify_via '2026-09-01 12:00:00 UTC' 1.5 2>/dev/null)" 'warn 5'
+assert_contains 'classify: a bad warn window is reported on stderr' \
+  "$(classify_via '2026-09-01 12:00:00 UTC' abc 2>&1 >/dev/null)" \
+  'ignoring unusable warn window'
+
+# 0 makes `days < warn_days` false for every future-dated token, so a secret
+# expiring in days would report ok — the same silent state as a coerced `abc`.
+assert_contains 'classify: a zero warn window falls back rather than silencing warnings' \
+  "$(classify_via '2026-09-01 12:00:00 UTC' 0 2>/dev/null)" 'warn 5'
+
+printf '\n=== behavioural: header parsing ignores other headers ===\n'
+header_tmp="$(mktemp -d)"
+mkdir -p "${header_tmp}/bin"
+cat >"${header_tmp}/bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+printf '%s\r\n' \
+  'HTTP/2.0 200 OK' \
+  'X-Ratelimit-Remaining: 4999' \
+  'Github-Authentication-Token-Expiration: 2027-08-27 04:00:00 UTC' \
+  'Content-Type: application/json'
+printf '{"login":"probe"}\n'
+MOCK_GH
+chmod +x "${header_tmp}/bin/gh"
+
+header_out="$(
+  PATH="${header_tmp}/bin:${PATH}" bash -c "
+    # shellcheck disable=SC1090
+    source '${lib}'
+    token_expiry_header_for_token
+  " 2>/dev/null
+)"
+assert_contains 'header: extracts only the expiration value' \
+  "$header_out" '2027-08-27 04:00:00 UTC'
+assert_not_contains 'header: does not leak the header name' \
+  "$header_out" 'Github-Authentication-Token-Expiration'
+assert_not_contains 'header: does not leak unrelated headers' \
+  "$header_out" 'Ratelimit'
+
+# A PAT-less credential returns no such header at all.
+cat >"${header_tmp}/bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+printf '%s\r\n' 'HTTP/2.0 200 OK' 'Content-Type: application/json'
+printf '{"login":"probe"}\n'
+MOCK_GH
+chmod +x "${header_tmp}/bin/gh"
+oauth_out="$(
+  PATH="${header_tmp}/bin:${PATH}" bash -c "
+    source '${lib}'
+    token_expiry_header_for_token
+  " 2>/dev/null
+)"
+if [[ -z "$oauth_out" ]]; then
+  pass_case 'header: missing expiration header yields empty output'
+else
+  fail_case "header: expected empty output, got '${oauth_out}'"
+fi
+rm -rf "$header_tmp"
+
+printf '\n=== functional: check-token-expiry warn / expired / unmanaged ===\n'
+# run_checker <expiry-header-line> [extra-env...]
+run_checker() {
+  local -r header_line="$1"
+  shift
+  local tmp
+  tmp="$(mktemp -d)"
+  mkdir -p "${tmp}/bin"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' "printf '%s\\r\\n' 'HTTP/2.0 200 OK'"
+    if [[ -n "$header_line" ]]; then
+      printf "printf '%%s\\\\r\\\\n' 'Github-Authentication-Token-Expiration: %s'\n" "$header_line"
+    fi
+    printf '%s\n' "printf '{\"login\":\"probe\"}\\n'"
+  } >"${tmp}/bin/gh"
+  chmod +x "${tmp}/bin/gh"
+  set +e
+  # -u GITHUB_ACTIONS so the annotation assertions are not decided by whether this
+  # suite happens to be running inside Actions; callers opt in via "$@" (which env
+  # applies after the unset).
+  env -u GITHUB_ACTIONS "$@" PATH="${tmp}/bin:${PATH}" GH_TOKEN=fake-token \
+    TOKEN_EXPIRY_NOW_EPOCH="$fixed_now_epoch" \
+    bash "$checker" --secret DEP_UPDATER_TOKEN --environment dep-updater 2>&1
+  local rc=$?
+  set -e
+  rm -rf "$tmp"
+  return "$rc"
+}
+
+set +e
+ok_out="$(run_checker '2027-08-27 04:00:00 UTC')"
+ok_rc=$?
+set -e
+assert_exit_0 'checker: healthy PAT' "$ok_out" "$ok_rc"
+assert_contains 'checker: healthy PAT emits machine-parseable OK line' \
+  "$ok_out" 'NOTE: TOKEN_EXPIRY_OK secret=DEP_UPDATER_TOKEN env=dep-updater'
+
+set +e
+warn_out="$(run_checker '2026-09-01 12:00:00 UTC')"
+warn_rc=$?
+set -e
+# A warning must not fail the run — the notice rides along on green CI.
+assert_exit_0 'checker: token inside warning window stays green' "$warn_out" "$warn_rc"
+assert_contains 'checker: warning window emits TOKEN_EXPIRY_SOON' \
+  "$warn_out" 'WARNING: TOKEN_EXPIRY_SOON secret=DEP_UPDATER_TOKEN env=dep-updater days=5'
+
+set +e
+expired_out="$(run_checker '2026-08-20 12:00:00 UTC')"
+expired_rc=$?
+set -e
+assert_exit_nonzero 'checker: expired token' "$expired_out" "$expired_rc"
+assert_contains 'checker: expired token names the secret and environment' \
+  "$expired_out" 'ERROR: TOKEN_EXPIRY_EXPIRED secret=DEP_UPDATER_TOKEN env=dep-updater'
+
+set +e
+unmanaged_out="$(run_checker '')"
+unmanaged_rc=$?
+set -e
+assert_exit_0 'checker: unmanaged OAuth secret stays green' "$unmanaged_out" "$unmanaged_rc"
+assert_contains 'checker: missing header is called out as unmanaged' \
+  "$unmanaged_out" 'WARNING: TOKEN_EXPIRY_UNMANAGED secret=DEP_UPDATER_TOKEN env=dep-updater'
+
+printf '\n=== functional: Actions annotations only under GITHUB_ACTIONS ===\n'
+set +e
+annotated_out="$(run_checker '2026-09-01 12:00:00 UTC' GITHUB_ACTIONS=true)"
+set -e
+assert_contains 'annotation: warning window emits ::warning:: under Actions' \
+  "$annotated_out" '::warning::credential DEP_UPDATER_TOKEN'
+assert_not_contains 'annotation: no ::warning:: outside Actions' \
+  "$warn_out" '::warning::'
+
+printf '\n=== functional: absent secret fails before calling the API ===\n'
+absent_tmp="$(mktemp -d)"
+mkdir -p "${absent_tmp}/bin"
+cat >"${absent_tmp}/bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+printf 'gh must not be called when no token is present\n' >&2
+exit 90
+MOCK_GH
+chmod +x "${absent_tmp}/bin/gh"
+set +e
+absent_out="$(
+  env -u GH_TOKEN -u GITHUB_TOKEN PATH="${absent_tmp}/bin:${PATH}" \
+    bash "$checker" --secret REPO_LINT_TOKEN --environment github-repo-lint 2>&1
+)"
+absent_rc=$?
+set -e
+rm -rf "$absent_tmp"
+assert_exit_nonzero 'checker: absent secret' "$absent_out" "$absent_rc"
+assert_contains 'checker: absent secret names the secret and environment' \
+  "$absent_out" 'ERROR: TOKEN_EXPIRY_ABSENT secret=REPO_LINT_TOKEN env=github-repo-lint'
+assert_not_contains 'checker: absent secret does not reach gh' \
+  "$absent_out" 'gh must not be called'
+
+printf '\n=== functional: rejected credential fails ===\n'
+reject_tmp="$(mktemp -d)"
+mkdir -p "${reject_tmp}/bin"
+cat >"${reject_tmp}/bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+printf 'gh: Bad credentials (HTTP 401)\n' >&2
+exit 1
+MOCK_GH
+chmod +x "${reject_tmp}/bin/gh"
+set +e
+reject_out="$(
+  env PATH="${reject_tmp}/bin:${PATH}" GH_TOKEN=fake-token \
+    TOKEN_EXPIRY_NOW_EPOCH="$fixed_now_epoch" \
+    bash "$checker" --secret DEP_UPDATER_TOKEN --environment dep-updater 2>&1
+)"
+reject_rc=$?
+set -e
+rm -rf "$reject_tmp"
+assert_exit_nonzero 'checker: rejected credential' "$reject_out" "$reject_rc"
+assert_contains 'checker: rejected credential reports TOKEN_EXPIRY_INVALID' \
+  "$reject_out" 'ERROR: TOKEN_EXPIRY_INVALID secret=DEP_UPDATER_TOKEN env=dep-updater'
+
+printf '\n=== functional: rate limit is transient, not a bad credential ===\n'
+# Seen for real on PR #542: an exhausted org-wide API quota was reported as
+# "credential rejected — replace the secret" and failed the job. A preflight that
+# exists to stop unrelated red CI must not become a source of it.
+rl_tmp="$(mktemp -d)"
+mkdir -p "${rl_tmp}/bin"
+cat >"${rl_tmp}/bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+printf 'gh: API rate limit exceeded for user ID 13666364. (HTTP 403)\n' >&2
+exit 1
+MOCK_GH
+chmod +x "${rl_tmp}/bin/gh"
+set +e
+rl_out="$(
+  env -u GITHUB_ACTIONS PATH="${rl_tmp}/bin:${PATH}" GH_TOKEN=fake-token \
+    GITHUB_API_RATE_LIMIT_MAX_RETRIES=1 GITHUB_API_RATE_LIMIT_MAX_WAIT_S=0 \
+    TOKEN_EXPIRY_NOW_EPOCH="$fixed_now_epoch" \
+    bash "$checker" --secret DEP_UPDATER_TOKEN --environment dep-updater 2>&1
+)"
+rl_rc=$?
+set -e
+rm -rf "$rl_tmp"
+assert_exit_0 'checker: rate-limited API does not fail the job' "$rl_out" "$rl_rc"
+assert_contains 'checker: rate limit reports TOKEN_EXPIRY_UNKNOWN' \
+  "$rl_out" 'NOTE: TOKEN_EXPIRY_UNKNOWN secret=DEP_UPDATER_TOKEN env=dep-updater'
+assert_not_contains 'checker: rate limit is not reported as a rejected credential' \
+  "$rl_out" 'TOKEN_EXPIRY_INVALID'
+assert_not_contains 'checker: rate limit does not advise replacing the secret' \
+  "$rl_out" 'Replace the secret'
+
+printf '\n=== static: usage errors ===\n'
+set +e
+usage_out="$(bash "$checker" --secret ONLY_SECRET 2>&1)"
+usage_rc=$?
+set -e
+assert_exit_nonzero 'checker: missing --environment' "$usage_out" "$usage_rc"
+assert_contains 'checker: missing --environment explains the requirement' \
+  "$usage_out" '--secret and --environment are required'
+
+set +e
+bad_warn_out="$(
+  bash "$checker" --secret S --environment E --warn-days abc 2>&1
+)"
+bad_warn_rc=$?
+set -e
+assert_exit_nonzero 'checker: non-integer --warn-days' "$bad_warn_out" "$bad_warn_rc"
+assert_contains 'checker: non-integer --warn-days is rejected, not coerced' \
+  "$bad_warn_out" '--warn-days must be a positive integer'
+
+set +e
+zero_warn_out="$(
+  bash "$checker" --secret S --environment E --warn-days 0 2>&1
+)"
+zero_warn_rc=$?
+set -e
+assert_exit_nonzero 'checker: --warn-days 0' "$zero_warn_out" "$zero_warn_rc"
+assert_contains 'checker: --warn-days 0 is rejected as an unusable window' \
+  "$zero_warn_out" '--warn-days must be a positive integer'
+
+printf '\n=== static: batch credential check is bounded and skippable ===\n'
+# One advisory call at the end of a run must not inherit the waiter's hour-long
+# budget, and the mock tests must not reach the network at all.
+if grep -qF 'DEP_UPDATER_SKIP_CREDENTIAL_CHECK' "$batch_run" \
+  && grep -qF 'GITHUB_API_RATE_LIMIT_MAX_RETRIES=1' "$batch_run" \
+  && grep -qF 'GITHUB_API_RATE_LIMIT_MAX_WAIT_S=0' "$batch_run"; then
+  pass_case 'batch credential check is bounded and has an opt-out'
+else
+  fail_case 'batch credential check must be bounded and skippable'
+fi
+if grep -qF 'DEP_UPDATER_SKIP_CREDENTIAL_CHECK=1' \
+  "${script_dir}/dep-updater-batch-run.test"; then
+  pass_case 'batch mock tests opt out of the live credential call'
+else
+  fail_case 'batch mock tests must opt out of the live credential call'
+fi
+
+printf '\n=== static: workflows preflight before the expensive install ===\n'
+dep_wf="${rh_root}/.github/workflows/dep-updater.yml"
+lint_wf="${rh_root}/.github/workflows/github-repo-lint.yml"
+if grep -qF 'scripts/check-token-expiry' "$dep_wf" \
+  && grep -qF 'DEP_UPDATER_TOKEN' "$dep_wf"; then
+  pass_case 'dep-updater.yml runs the credential preflight'
+else
+  fail_case 'dep-updater.yml runs the credential preflight'
+fi
+if grep -qF 'scripts/check-token-expiry' "$lint_wf" \
+  && grep -qF 'REPO_LINT_TOKEN' "$lint_wf"; then
+  pass_case 'github-repo-lint.yml runs the credential preflight'
+else
+  fail_case 'github-repo-lint.yml runs the credential preflight'
+fi
+
+# The preflight is only worth having if it runs before the toolchain install it guards.
+preflight_line="$(grep -n 'scripts/check-token-expiry' "$dep_wf" | head -1 | cut -d: -f1)"
+rust_line="$(grep -n 'cargo install cargo-outdated' "$dep_wf" | head -1 | cut -d: -f1)"
+if [[ -n "$preflight_line" && -n "$rust_line" ]] && (( preflight_line < rust_line )); then
+  pass_case 'dep-updater.yml preflights credentials before installing the toolchain'
+else
+  fail_case "dep-updater.yml preflight (line ${preflight_line:-none}) must precede the \
+Rust install (line ${rust_line:-none})"
+fi
+
+printf '\n=== static: batch email surfaces expiring credentials ===\n'
+if grep -qF 'Expiring credentials:' "$batch_run"; then
+  pass_case 'dep-updater-batch-run has an Expiring credentials section'
+else
+  fail_case 'dep-updater-batch-run has an Expiring credentials section'
+fi
+if grep -qF 'token_expiry_report_lines' "$batch_run"; then
+  pass_case 'dep-updater-batch-run records credential status into the scraped log'
+else
+  fail_case 'dep-updater-batch-run records credential status into the scraped log'
+fi
+
+printf '\n=== behavioural: batch email renders scraped credential lines ===\n'
+# The section must appear with content when the log carries a status line, and read
+# "none" when it does not — matching the existing Skipped (...) sections.
+cred_log="$(mktemp)"
+soon_line='WARNING: TOKEN_EXPIRY_SOON secret=DEP_UPDATER_TOKEN env=dep-updater'
+soon_line+=' days=5 expires=2026-09-01 12:00:00 UTC'
+printf '%s\n' \
+  '[batch-all] OK (demo-repo) (12s)' \
+  "$soon_line" \
+  '[batch-all] All repos completed successfully.' >"$cred_log"
+cred_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^batch_report_credential_lines\(\)/,/^}$/' "$batch_run")
+  batch_report_credential_lines "$cred_log"
+)"
+assert_contains 'batch email: scrapes the expiring-credential line' \
+  "$cred_out" 'DEP_UPDATER_TOKEN'
+assert_contains 'batch email: keeps the day count' "$cred_out" 'days=5'
+
+# Every actionable status must be scraped, not just the warning one.
+for cred_status in \
+  'WARNING:TOKEN_EXPIRY_UNMANAGED' \
+  'ERROR:TOKEN_EXPIRY_EXPIRED' \
+  'ERROR:TOKEN_EXPIRY_INVALID'; do
+  cred_prefix="${cred_status%%:*}"
+  cred_token="${cred_status##*:}"
+  printf '%s: %s secret=DEP_UPDATER_TOKEN env=dep-updater days=0 expires=unknown\n' \
+    "$cred_prefix" "$cred_token" >"$cred_log"
+  status_out="$(
+    # shellcheck disable=SC1090
+    source <(awk '/^batch_report_credential_lines\(\)/,/^}$/' "$batch_run")
+    batch_report_credential_lines "$cred_log"
+  )"
+  assert_contains "batch email: scrapes ${cred_token}" "$status_out" "$cred_token"
+done
+
+printf '%s\n' '[batch-all] OK (demo-repo) (12s)' >"$cred_log"
+clean_cred_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^batch_report_credential_lines\(\)/,/^}$/' "$batch_run")
+  batch_report_credential_lines "$cred_log"
+)"
+if [[ -z "$clean_cred_out" ]]; then
+  pass_case 'batch email: no credential lines when nothing is expiring'
+else
+  fail_case "batch email: expected no lines, got '${clean_cred_out}'"
+fi
+# An OK status is not noise worth emailing.
+ok_line='NOTE: TOKEN_EXPIRY_OK secret=DEP_UPDATER_TOKEN env=dep-updater'
+ok_line+=' days=364 expires=2027-08-27 04:00:00 UTC'
+printf '%s\n' "$ok_line" >"$cred_log"
+ok_cred_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^batch_report_credential_lines\(\)/,/^}$/' "$batch_run")
+  batch_report_credential_lines "$cred_log"
+)"
+if [[ -z "$ok_cred_out" ]]; then
+  pass_case 'batch email: a healthy token is not reported'
+else
+  fail_case "batch email: expected healthy token to be silent, got '${ok_cred_out}'"
+fi
+
+# A transient rate limit is not actionable credential news, so it stays out of the
+# email rather than nagging the operator every day the API is busy.
+unknown_line='NOTE: TOKEN_EXPIRY_UNKNOWN secret=DEP_UPDATER_TOKEN env=dep-updater'
+unknown_line+=' days=0 expires=unknown'
+printf '%s\n' "$unknown_line" >"$cred_log"
+unknown_cred_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^batch_report_credential_lines\(\)/,/^}$/' "$batch_run")
+  batch_report_credential_lines "$cred_log"
+)"
+if [[ -z "$unknown_cred_out" ]]; then
+  pass_case 'batch email: a transient unknown status is not reported'
+else
+  fail_case "batch email: expected unknown status to be silent, got '${unknown_cred_out}'"
+fi
+rm -f "$cred_log"
+
+test_summary

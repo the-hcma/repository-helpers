@@ -191,6 +191,7 @@ See [Development](#development).
 | --- | --- |
 | `scripts/check-lockfile-drift` | Compare lockfiles to registry constraints (safe throwaway worktree) |
 | `scripts/check-merge-settings` | Thin wrapper: merge + GitHub MQ checks only |
+| `scripts/check-token-expiry` | Preflight a CI environment PAT's expiry; warn before CI starts failing |
 | `scripts/grandfather-pnpm-release-age` | One-time pnpm `minimumReleaseAge` / exclude cutover for existing lockfiles |
 | `scripts/on-deploy` | Example deploy hook; consumer repos implement their own |
 | `scripts/trigger-agent-review` | Request a review from the configured agent profile |
