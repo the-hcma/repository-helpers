@@ -24,6 +24,13 @@
 #   unknown    expiry undeterminable for a transient reason (rate limit, API error);
 #              never fatal, so a quota blip cannot redden an unrelated PR
 #
+# Note on `expired`: GitHub rejects an already-expired PAT at request time with 401,
+# so in practice a past-dated header is only seen when the deadline passes between
+# reading the header and acting on it. The realistic "we missed the warning window"
+# signal is therefore `invalid`, whose message names expiry as the likely cause.
+# `expired` remains correct for the pure classify() contract and is what the warning
+# window counts down toward.
+#
 # Env overrides:
 #   TOKEN_EXPIRY_WARN_DAYS  warning window in days (default 14)
 #   TOKEN_EXPIRY_NOW_EPOCH  fixed "now" in epoch seconds (tests; default `date +%s`)
@@ -53,8 +60,17 @@ readonly token_expiry_header_name
 token_expiry_classify() {
   local -r expiry="${1:-}"
   local -r now_epoch="${2:-0}"
-  local -r warn_days="${3:-$token_expiry_default_warn_days}"
-  local expiry_epoch remaining_s days
+  local expiry_epoch remaining_s days warn_days
+
+  # A non-integer window would be coerced silently by (( )) — `abc` evaluates as 0
+  # and `1.5` is an arithmetic syntax error — and every token would classify as ok.
+  # That is the silent failure this preflight exists to prevent, so fall back loudly.
+  warn_days="${3:-$token_expiry_default_warn_days}"
+  if [[ ! "$warn_days" =~ ^[0-9]+$ ]]; then
+    printf 'token-expiry: ignoring non-integer warn window %q; using %s\n' \
+      "$warn_days" "$token_expiry_default_warn_days" >&2
+    warn_days="$token_expiry_default_warn_days"
+  fi
 
   if [[ -z "$expiry" ]]; then
     printf 'unmanaged 0\n'
@@ -99,7 +115,7 @@ token_expiry_header_for_token() {
   local response value detail err rc=0
 
   err="$(mktemp)"
-  response="$(github_api_exec_with_rate_limit_retry 'token-expiry' -- gh api user --include 2>"$err")" \
+  response="$(github_api_exec_with_rate_limit_retry 'expiry' -- gh api user --include 2>"$err")" \
     || rc=$?
   detail="$(cat "$err" 2>/dev/null || true)"
   rm -f "$err"
@@ -216,8 +232,10 @@ _token_expiry_emit() {
       annotation='warning'
       ;;
     invalid)
-      message="${subject} was rejected (bad credentials)."
-      message+=" Replace the secret on that environment."
+      # GitHub rejects an expired PAT at request time, so this is what an expiry we
+      # failed to warn about actually looks like — name that before "revoked".
+      message="${subject} was rejected (bad credentials): most likely expired or"
+      message+=" revoked. Replace the secret on that environment."
       annotation='error'
       ;;
     unknown)

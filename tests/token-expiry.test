@@ -26,11 +26,14 @@ test_init
 classify_via() {
   local -r expiry="$1"
   local -r warn="${2:-14}"
+  # SC2034: read by the sourced token_expiry_classify (its bad-window fallback).
+  # shellcheck disable=SC2034
   (
     # shellcheck disable=SC1090
     source <(awk '/^token_expiry_classify\(\)/,/^}$/' "$lib")
     # shellcheck disable=SC1090
     source <(awk '/^_token_expiry_epoch\(\)/,/^}$/' "$lib")
+    token_expiry_default_warn_days=14
     token_expiry_classify "$expiry" "$fixed_now_epoch" "$warn"
   )
 }
@@ -75,6 +78,17 @@ assert_contains 'classify: unparseable expiry is invalid' \
 
 assert_contains 'classify: custom warn window is honoured' \
   "$(classify_via '2026-09-20 12:00:00 UTC' 30)" 'warn 24'
+
+# A non-integer window must not be coerced by (( )) into "everything is ok": `abc`
+# evaluates as 0 and `1.5` is an arithmetic syntax error, either of which would
+# silently suppress every warning.
+assert_contains 'classify: non-numeric warn window falls back to the default' \
+  "$(classify_via '2026-09-01 12:00:00 UTC' abc 2>/dev/null)" 'warn 5'
+assert_contains 'classify: fractional warn window falls back to the default' \
+  "$(classify_via '2026-09-01 12:00:00 UTC' 1.5 2>/dev/null)" 'warn 5'
+assert_contains 'classify: a bad warn window is reported on stderr' \
+  "$(classify_via '2026-09-01 12:00:00 UTC' abc 2>&1 >/dev/null)" \
+  'ignoring non-integer warn window'
 
 printf '\n=== behavioural: header parsing ignores other headers ===\n'
 header_tmp="$(mktemp -d)"
@@ -279,6 +293,33 @@ set -e
 assert_exit_nonzero 'checker: missing --environment' "$usage_out" "$usage_rc"
 assert_contains 'checker: missing --environment explains the requirement' \
   "$usage_out" '--secret and --environment are required'
+
+set +e
+bad_warn_out="$(
+  bash "$checker" --secret S --environment E --warn-days abc 2>&1
+)"
+bad_warn_rc=$?
+set -e
+assert_exit_nonzero 'checker: non-integer --warn-days' "$bad_warn_out" "$bad_warn_rc"
+assert_contains 'checker: non-integer --warn-days is rejected, not coerced' \
+  "$bad_warn_out" '--warn-days must be a non-negative integer'
+
+printf '\n=== static: batch credential check is bounded and skippable ===\n'
+# One advisory call at the end of a run must not inherit the waiter's hour-long
+# budget, and the mock tests must not reach the network at all.
+if grep -qF 'DEP_UPDATER_SKIP_CREDENTIAL_CHECK' "$batch_run" \
+  && grep -qF 'GITHUB_API_RATE_LIMIT_MAX_RETRIES=1' "$batch_run" \
+  && grep -qF 'GITHUB_API_RATE_LIMIT_MAX_WAIT_S=0' "$batch_run"; then
+  pass_case 'batch credential check is bounded and has an opt-out'
+else
+  fail_case 'batch credential check must be bounded and skippable'
+fi
+if grep -qF 'DEP_UPDATER_SKIP_CREDENTIAL_CHECK=1' \
+  "${script_dir}/dep-updater-batch-run.test"; then
+  pass_case 'batch mock tests opt out of the live credential call'
+else
+  fail_case 'batch mock tests must opt out of the live credential call'
+fi
 
 printf '\n=== static: workflows preflight before the expensive install ===\n'
 dep_wf="${rh_root}/.github/workflows/dep-updater.yml"
