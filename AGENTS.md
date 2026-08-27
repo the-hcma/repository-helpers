@@ -48,8 +48,9 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
  clippy recovery invariant below assumes a toolchain.
 
  ```bash
- cargo install cargo-outdated --locked   # same line CI uses
- ```
+  rustup component add clippy             # absent under rustup's minimal profile
+  cargo install cargo-outdated --locked   # same line CI uses
+  ```
 
  Provisioning notes for the batch host:
  - apt's Rust is too old for current `cargo-outdated` — install via rustup. On

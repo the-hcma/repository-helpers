@@ -316,6 +316,7 @@ policy defaults:
   recovery):
 
   ```bash
+  rustup component add clippy
   cargo install cargo-outdated --locked
   ```
 
