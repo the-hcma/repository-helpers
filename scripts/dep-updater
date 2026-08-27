@@ -5253,9 +5253,10 @@ py_outdated() {
   local -r tool="$1"
   local -r target_dir="${2:-$dir}"
   local raw_lines pyproject installed_json ge_dep ge_pkg ge_floor ge_installed ge_lower
-  local eligible
+  local eligible marker_gated_list marker_gated_row marker_gated_installed
   local -a raw_line_arr=()
   installed_json=""
+  marker_gated_list=""
   case "$tool" in
     uv)
       raw_lines="$(dep_runner_jq_with_args "dep-updater uv outdated rows" \
@@ -5341,6 +5342,21 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
           }
         }
       ' "$pyproject" 2>/dev/null)
+
+      # Marker-gated direct deps are invisible to both scans above: the marker
+      # keeps them out of this platform's environment, so uv-outdated never
+      # lists them and the floor loop drops them as uninstalled. Seed them from
+      # the universal lockfile instead (#532).
+      marker_gated_list="$(py_uv_marker_gated_pkgs "$target_dir")"
+      while IFS= read -r marker_gated_row; do
+        [[ -z "$marker_gated_row" ]] && continue
+        if [[ -n "$raw_lines" ]]; then
+          raw_lines="${raw_lines}
+${marker_gated_row}"
+        else
+          raw_lines="$marker_gated_row"
+        fi
+      done < <(py_uv_marker_gated_rows "$target_dir")
     fi
   fi
 
@@ -5383,6 +5399,14 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
     elif ! py_version_meets_minimum_release_age "$pkg" "$new"; then
       continue
     fi
+    # Lockfile-seeded marker-gated rows start at new == cur, and the age check
+    # above passes for any lock version older than the window. Without a
+    # strictly newer release there is nothing to bump, yet the row would still
+    # reach py_uv_rewrite_version_floor and rewrite the specifier in place
+    # (== → >=), committing an empty batch PR.
+    if [[ "$new" == "$cur" ]] && py_pkg_in_list "$pkg" "$marker_gated_list"; then
+      continue
+    fi
     candidate_lines+=("$pkg $cur $new")
   done
 
@@ -5412,7 +5436,15 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
   # the surviving direct set with py_uv_filter_outdated_lines before emitting.
   for line in "${direct_candidates[@]}"; do
     read -r pkg cur new <<<"$line"
-    if py_uv_probe_transitive_upgrade "$target_dir" "$installed_json" "$pkg" "$cur" "$new"; then
+    # A marker-gated dep that is absent from this environment cannot be probed
+    # here — the current-platform dry-run rejects it unconditionally — so defer
+    # to the lockfile filter below, which resolves every marker branch (#532).
+    # When the marker *is* satisfied here the package is installed, and the
+    # normal probe still applies.
+    marker_gated_installed="$(py_pkg_installed_version "$pkg" "$installed_json")"
+    if [[ -z "$marker_gated_installed" ]] && py_pkg_in_list "$pkg" "$marker_gated_list"; then
+      direct_passing+=("$line")
+    elif py_uv_probe_transitive_upgrade "$target_dir" "$installed_json" "$pkg" "$cur" "$new"; then
       direct_passing+=("$line")
     else
       direct_failing+=("$line")
@@ -5480,6 +5512,33 @@ ${ge_pkg} ${ge_floor} ${ge_installed}"
       printf '%s\n' "$line"
     fi
   done
+}
+
+# py_pkg_in_list <pkg> <newline_separated_names>
+# PEP 508 name equality: case-insensitive with '.' and '_' equivalent to '-'.
+py_pkg_in_list() {
+  local -r pkg="$1"
+  local -r list="$2"
+  local norm
+
+  [[ -n "$pkg" && -n "$list" ]] || return 1
+  norm="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '._' '-')"
+  printf '%s\n' "$list" | grep -qxF "$norm"
+}
+
+# py_pkg_installed_version <pkg> <installed_json>
+# Prints the installed version of pkg from `uv pip list --format=json` output,
+# comparing names in PEP 503 normalized form. Empty when pkg is not installed.
+py_pkg_installed_version() {
+  local -r pkg="$1"
+  local -r installed_json="$2"
+  local norm
+
+  [[ -n "$pkg" && -n "$installed_json" ]] || return 0
+  norm="$(printf '%s' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '._' '-')"
+  # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+  dep_runner_jq_with_args "jq installed version" "$installed_json" -r --arg n "$norm" \
+    '.[] | select((.name | ascii_downcase | gsub("[._]"; "-")) == $n) | .version'
 }
 
 # py_uv_rewrite_version_floor <pyproject_path> <pkg> <new_ver>
@@ -5953,6 +6012,100 @@ py_uv_lock_upgrade_package() {
     return 1
   fi
   return 0
+}
+
+# _py_uv_marker_gated_requirements <pyproject_path>
+# Prints raw PEP 508 requirement strings from direct dependency tables that
+# carry both an environment marker (';') and a version specifier.
+# The specifier is matched only in the portion *before* the marker: markers
+# themselves contain operators (`sys_platform == 'darwin'`), so testing the
+# whole string would match unversioned marker-only deps too.
+_py_uv_marker_gated_requirements() {
+  local -r pyproject="$1"
+
+  awk '
+    BEGIN { in_direct = 0 }
+    /^\[[[:space:]]*(project|project\.[^]]*|dependency-groups)[[:space:]]*\]/ {
+      in_direct = 1
+      next
+    }
+    /^\[/ { in_direct = 0; next }
+    !in_direct { next }
+    /constraint-dependencies/ { next }
+    {
+      s = $0
+      while (match(s, /"[A-Za-z0-9][^"]*"/)) {
+        item = substr(s, RSTART + 1, RLENGTH - 2)
+        s = substr(s, RSTART + RLENGTH)
+        if (item !~ /;/) continue
+        head = item
+        sub(/;.*/, "", head)
+        if (head ~ /(>=|==|~=)/) print item
+      }
+    }
+  ' "$pyproject" 2>/dev/null
+}
+
+# py_uv_marker_gated_pkgs <target_dir>
+# Prints normalized names of direct deps carrying a PEP 508 environment marker
+# (a ';' clause) plus a version specifier, from [project], [project.*] (incl.
+# optional-dependencies) and PEP 735 [dependency-groups].
+py_uv_marker_gated_pkgs() {
+  local -r target_dir="$1"
+  local pyproject req pkg
+
+  pyproject="${target_dir}/pyproject.toml"
+  [[ -f "$pyproject" ]] || return 0
+  while IFS= read -r req; do
+    [[ -z "$req" ]] && continue
+    # Name ends at the first specifier, extras bracket, or marker separator.
+    # '[' is last in the bracket set so sed does not read '[=' as an
+    # equivalence class.
+    pkg="$(printf '%s' "$req" | sed 's/[[:space:]]*[=<>!~;[].*//')"
+    [[ "$pkg" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
+    printf '%s\n' "$pkg" | tr '[:upper:]' '[:lower:]' | tr '._' '-'
+  done < <(_py_uv_marker_gated_requirements "$pyproject") | sort -u
+}
+
+# py_uv_marker_gated_rows <target_dir>
+# Emits "pkg cur cur" rows for marker-gated direct deps so they enter the normal
+# candidate pipeline. Such deps never install on a host whose platform the
+# marker excludes (e.g. sys_platform == 'darwin' during a Linux batch run), so
+# `uv pip list --outdated` cannot see them and the >= floor scan skips them as
+# uninstalled — leaving Dependabot as the only updater (#532).
+# Baseline comes from uv.lock, which is universal and records every marker
+# branch; the declared specifier version is the fallback. The caller's PyPI walk
+# then applies the usual release-age gate.
+#
+# A `>=` floor is seeded as "pkg <declared floor> <locked version>", mirroring
+# the unmarked floor scan, so a floor below the lock still syncs upward even
+# when PyPI has nothing newer. `==` / `~=` are seeded as "pkg <lock> <lock>":
+# there is no floor to raise, so only a strictly newer release should cause the
+# operator promotion to `>=`.
+py_uv_marker_gated_rows() {
+  local -r target_dir="$1"
+  local pyproject lockfile req pkg spec declared baseline
+
+  pyproject="${target_dir}/pyproject.toml"
+  lockfile="${target_dir}/uv.lock"
+  [[ -f "$pyproject" ]] || return 0
+  while IFS= read -r req; do
+    [[ -z "$req" ]] && continue
+    pkg="$(printf '%s' "$req" | sed 's/[[:space:]]*[=<>!~;[].*//')"
+    [[ "$pkg" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
+    # Inspect only the pre-marker portion; markers carry their own operators.
+    spec="${req%%;*}"
+    declared="$(printf '%s' "$spec" \
+      | sed -n 's/.*[=<>~]=[[:space:]]*\([0-9][^,[:space:]]*\).*/\1/p')"
+    baseline="$(py_uv_lock_highest_version "$lockfile" "$pkg" 2>/dev/null || true)"
+    [[ -z "$baseline" ]] && baseline="$declared"
+    [[ -z "$baseline" ]] && continue
+    if [[ "$spec" == *'>='* && -n "$declared" ]]; then
+      printf '%s %s %s\n' "$pkg" "$declared" "$baseline"
+    else
+      printf '%s %s %s\n' "$pkg" "$baseline" "$baseline"
+    fi
+  done < <(_py_uv_marker_gated_requirements "$pyproject")
 }
 
 # py_uv_actual_lines_from_lock <worktree> <planned_lines>
