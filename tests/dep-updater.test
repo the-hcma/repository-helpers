@@ -1854,15 +1854,81 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== behavioural: marker detection ignores operators inside the marker ===\n'
+# Markers contain operators ("sys_platform == 'darwin'"), so a whole-string
+# specifier test would match deps that carry no package version at all and seed
+# spurious rows. Only the portion before ';' may be inspected (PR #537 review).
+marker_operator_tmp="$(mktemp -d)"
+cat >"${marker_operator_tmp}/pyproject.toml" <<'EOF'
+[project]
+name = "probe"
+dependencies = [
+    "unversioned-pkg; sys_platform == 'darwin'",
+    "versioned-pkg==1.0.0; sys_platform == 'darwin'",
+    "tilde-pkg~=2.0; sys_platform == 'win32'",
+    "plain-pkg>=3.0",
+]
+EOF
+marker_operator_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^_py_uv_marker_gated_requirements\(\)/,/^}$/' "$script")
+  _py_uv_marker_gated_requirements "${marker_operator_tmp}/pyproject.toml" | tr '\n' '|'
+)"
+rm -rf "$marker_operator_tmp"
+if [[ "$marker_operator_out" == "versioned-pkg==1.0.0; sys_platform == 'darwin'|tilde-pkg~=2.0; sys_platform == 'win32'|" ]]; then
+  printf '[PASS] marker-gated: unversioned marker-only deps are not seeded\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] marker-gated: requirement extraction returned: %s\n' "$marker_operator_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== behavioural: py_pkg_installed_version normalizes PEP 503 names ===\n'
+installed_version_out="$(
+  # shellcheck disable=SC2317,SC2329
+  dep_runner_jq_with_args() { local json="$2"; shift 2; jq "$@" <<<"$json"; }
+  # shellcheck disable=SC1090
+  source <(awk '/^py_pkg_installed_version\(\)/,/^}$/' "$script")
+  installed_probe_json='[{"name":"PyObjC_Core","version":"12.2.1"}]'
+  printf '%s,%s,%s' \
+    "$(py_pkg_installed_version 'pyobjc-core' "$installed_probe_json")" \
+    "$(py_pkg_installed_version 'PyObjC.Core' "$installed_probe_json")" \
+    "$(py_pkg_installed_version 'absent-pkg' "$installed_probe_json")"
+)"
+if [[ "$installed_version_out" == '12.2.1,12.2.1,' ]]; then
+  printf '[PASS] marker-gated: installed lookup matches normalized names, empty when absent\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] marker-gated: installed lookup returned: %s\n' "$installed_version_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: seeded marker rows are dropped when nothing is newer ===\n'
+# A seeded row starts at new == cur and the release-age check passes for any
+# older lock version, so without this guard the row reaches
+# py_uv_rewrite_version_floor and rewrites == to >= with no version change,
+# committing an empty batch PR (PR #537 review).
+# shellcheck disable=SC2016  # assert on the literal source text, not expansions
+marker_gated_noop_guard="$(awk '/^py_outdated\(\)/{f=1} f && /\[\[ "\$new" == "\$cur" \]\] && py_pkg_in_list "\$pkg" "\$marker_gated_list"/{ok=1} f && /^}$/{f=0} END{print ok+0}' "$script")"
+if [[ "$marker_gated_noop_guard" == '1' ]]; then
+  printf '[PASS] marker-gated: no-op seeded rows are dropped before becoming candidates\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] marker-gated: missing new==cur guard for seeded rows\n'
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== static: py_outdated bypasses current-platform probe for marker-gated deps ===\n'
 # The dry-run probe is current-platform only and always rejects a dep whose
 # marker excludes this host; the lockfile filter is the real gate (issue #532).
 # shellcheck disable=SC2016  # assert on the literal source text, not expansions
 marker_gated_seed="$(awk '/^py_outdated\(\)/{f=1} f && /marker_gated_list="\$\(py_uv_marker_gated_pkgs/{ok=1} f && /^}$/{f=0} END{print ok+0}' "$script")"
+# The bypass must be conditional on the package being absent from this
+# environment; a satisfied marker means the dep is installed and probeable.
 # shellcheck disable=SC2016  # assert on the literal source text, not expansions
-marker_gated_bypass="$(awk '/^py_outdated\(\)/{f=1} f && /py_pkg_in_list "\$pkg" "\$marker_gated_list"/{ok=1} f && /^}$/{f=0} END{print ok+0}' "$script")"
+marker_gated_bypass="$(awk '/^py_outdated\(\)/{f=1} f && /\[\[ -z "\$marker_gated_installed" \]\] && py_pkg_in_list "\$pkg" "\$marker_gated_list"/{ok=1} f && /^}$/{f=0} END{print ok+0}' "$script")"
 if [[ "$marker_gated_seed" == '1' && "$marker_gated_bypass" == '1' ]]; then
-  printf '[PASS] marker-gated: py_outdated seeds marker rows and skips the platform probe\n'
+  printf '[PASS] marker-gated: py_outdated seeds marker rows and skips the probe only when absent\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] marker-gated: py_outdated wiring missing (seed=%s bypass=%s)\n' \
