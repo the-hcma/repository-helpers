@@ -241,6 +241,36 @@ assert_exit_nonzero 'checker: rejected credential' "$reject_out" "$reject_rc"
 assert_contains 'checker: rejected credential reports TOKEN_EXPIRY_INVALID' \
   "$reject_out" 'ERROR: TOKEN_EXPIRY_INVALID secret=DEP_UPDATER_TOKEN env=dep-updater'
 
+printf '\n=== functional: rate limit is transient, not a bad credential ===\n'
+# Seen for real on PR #542: an exhausted org-wide API quota was reported as
+# "credential rejected — replace the secret" and failed the job. A preflight that
+# exists to stop unrelated red CI must not become a source of it.
+rl_tmp="$(mktemp -d)"
+mkdir -p "${rl_tmp}/bin"
+cat >"${rl_tmp}/bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+printf 'gh: API rate limit exceeded for user ID 13666364. (HTTP 403)\n' >&2
+exit 1
+MOCK_GH
+chmod +x "${rl_tmp}/bin/gh"
+set +e
+rl_out="$(
+  env -u GITHUB_ACTIONS PATH="${rl_tmp}/bin:${PATH}" GH_TOKEN=fake-token \
+    GITHUB_API_RATE_LIMIT_MAX_RETRIES=1 GITHUB_API_RATE_LIMIT_MAX_WAIT_S=0 \
+    TOKEN_EXPIRY_NOW_EPOCH="$fixed_now_epoch" \
+    bash "$checker" --secret DEP_UPDATER_TOKEN --environment dep-updater 2>&1
+)"
+rl_rc=$?
+set -e
+rm -rf "$rl_tmp"
+assert_exit_0 'checker: rate-limited API does not fail the job' "$rl_out" "$rl_rc"
+assert_contains 'checker: rate limit reports TOKEN_EXPIRY_UNKNOWN' \
+  "$rl_out" 'NOTE: TOKEN_EXPIRY_UNKNOWN secret=DEP_UPDATER_TOKEN env=dep-updater'
+assert_not_contains 'checker: rate limit is not reported as a rejected credential' \
+  "$rl_out" 'TOKEN_EXPIRY_INVALID'
+assert_not_contains 'checker: rate limit does not advise replacing the secret' \
+  "$rl_out" 'Replace the secret'
+
 printf '\n=== static: usage errors ===\n'
 set +e
 usage_out="$(bash "$checker" --secret ONLY_SECRET 2>&1)"
@@ -348,6 +378,22 @@ if [[ -z "$ok_cred_out" ]]; then
   pass_case 'batch email: a healthy token is not reported'
 else
   fail_case "batch email: expected healthy token to be silent, got '${ok_cred_out}'"
+fi
+
+# A transient rate limit is not actionable credential news, so it stays out of the
+# email rather than nagging the operator every day the API is busy.
+unknown_line='NOTE: TOKEN_EXPIRY_UNKNOWN secret=DEP_UPDATER_TOKEN env=dep-updater'
+unknown_line+=' days=0 expires=unknown'
+printf '%s\n' "$unknown_line" >"$cred_log"
+unknown_cred_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^batch_report_credential_lines\(\)/,/^}$/' "$batch_run")
+  batch_report_credential_lines "$cred_log"
+)"
+if [[ -z "$unknown_cred_out" ]]; then
+  pass_case 'batch email: a transient unknown status is not reported'
+else
+  fail_case "batch email: expected unknown status to be silent, got '${unknown_cred_out}'"
 fi
 rm -f "$cred_log"
 

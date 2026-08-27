@@ -20,7 +20,9 @@
 #   warn       expiry is inside the warning window
 #   expired    expiry is in the past
 #   unmanaged  no expiry header — OAuth / GITHUB_TOKEN, not a managed PAT
-#   invalid    header present but unparseable, or the API rejected the credential
+#   invalid    header present but unparseable, or the credential was rejected (401)
+#   unknown    expiry undeterminable for a transient reason (rate limit, API error);
+#              never fatal, so a quota blip cannot redden an unrelated PR
 #
 # Env overrides:
 #   TOKEN_EXPIRY_WARN_DAYS  warning window in days (default 14)
@@ -83,15 +85,34 @@ token_expiry_classify() {
 
 # token_expiry_header_for_token
 # Prints the expiry header value for the active GH_TOKEN, or nothing when the header
-# is absent. Returns non-zero only when the credential itself was rejected.
+# is absent (the expected shape for OAuth / GITHUB_TOKEN, so callers can tell
+# "unmanaged" apart from "invalid").
+#
+# Returns:
+#   0  expiry read, or header legitimately absent
+#   2  credential rejected (Bad credentials / HTTP 401)
+#   3  expiry undeterminable for a transient reason (rate limit, API error)
+#
+# The 2-vs-3 split matters: an exhausted API quota must not be reported as "replace
+# this secret", and must not fail a job that the preflight only exists to protect.
 token_expiry_header_for_token() {
-  local response value
+  local response value detail err rc=0
 
-  # Only a rejected credential is an error here. An absent header is the expected
-  # shape for OAuth / GITHUB_TOKEN and must return empty with status 0, so callers
-  # can tell "unmanaged" apart from "invalid".
-  response="$(github_api_exec_with_rate_limit_retry 'token-expiry' -- gh api user --include)" \
-    || return 1
+  err="$(mktemp)"
+  response="$(github_api_exec_with_rate_limit_retry 'token-expiry' -- gh api user --include 2>"$err")" \
+    || rc=$?
+  detail="$(cat "$err" 2>/dev/null || true)"
+  rm -f "$err"
+
+  if (( rc != 0 )); then
+    if github_api_detail_is_rate_limited "$detail"; then
+      return 3
+    fi
+    if [[ "$detail" == *'Bad credentials'* || "$detail" == *'HTTP 401'* ]]; then
+      return 2
+    fi
+    return 3
+  fi
 
   value="$(
     printf '%s' "$response" \
@@ -120,9 +141,16 @@ token_expiry_preflight() {
   now_epoch="$(_token_expiry_now_epoch)"
 
   expiry="$(token_expiry_header_for_token)" || header_rc=$?
-  if (( header_rc != 0 )); then
+  if (( header_rc == 2 )); then
     _token_expiry_emit invalid 0 "$secret_name" "$env_name" ''
     return 1
+  fi
+  if (( header_rc != 0 )); then
+    # Transient: say so and let the job continue. Failing here would turn an API
+    # quota blip into a red run on a PR that has nothing to do with credentials —
+    # the exact failure mode this preflight exists to prevent.
+    _token_expiry_emit unknown 0 "$secret_name" "$env_name" ''
+    return 0
   fi
 
   read -r status days <<<"$(token_expiry_classify "$expiry" "$now_epoch" "$warn_days")"
@@ -143,8 +171,12 @@ token_expiry_report_lines() {
 
   now_epoch="$(_token_expiry_now_epoch)"
   expiry="$(token_expiry_header_for_token)" || header_rc=$?
-  if (( header_rc != 0 )); then
+  if (( header_rc == 2 )); then
     _token_expiry_status_line invalid 0 "$secret_name" "$env_name" ''
+    return 0
+  fi
+  if (( header_rc != 0 )); then
+    _token_expiry_status_line unknown 0 "$secret_name" "$env_name" ''
     return 0
   fi
 
@@ -184,9 +216,13 @@ _token_expiry_emit() {
       annotation='warning'
       ;;
     invalid)
-      message="${subject} was rejected or reports an unreadable expiry."
+      message="${subject} was rejected (bad credentials)."
       message+=" Replace the secret on that environment."
       annotation='error'
+      ;;
+    unknown)
+      message="${subject} could not be checked (GitHub API unavailable or rate limited)."
+      message+=" Not treated as a credential problem."
       ;;
   esac
 
@@ -234,6 +270,9 @@ _token_expiry_status_line() {
     expired) prefix='ERROR'; token='TOKEN_EXPIRY_EXPIRED' ;;
     unmanaged) prefix='WARNING'; token='TOKEN_EXPIRY_UNMANAGED' ;;
     invalid) prefix='ERROR'; token='TOKEN_EXPIRY_INVALID' ;;
+    # Transient, so NOTE (not WARNING) and deliberately outside the batch email's
+    # actionable-credential scrape.
+    unknown) prefix='NOTE'; token='TOKEN_EXPIRY_UNKNOWN' ;;
   esac
 
   printf '%s: %s secret=%s env=%s days=%s expires=%s\n' \
