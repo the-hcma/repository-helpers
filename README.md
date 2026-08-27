@@ -148,7 +148,9 @@ now implemented as `scripts/secret-audit` (see below).
 Full git history and org-wide sweeps use **TruffleHog** via `scripts/secret-audit`
 (see [docs/secret-audit-trufflehog.md](docs/secret-audit-trufflehog.md)). After a
 **clean** scan, `--write-marker` records proof in `.github/secret-audit.json`;
-`github-repo-lint` checks that marker on intake / strict audits.
+`github-repo-lint` checks that marker on intake / strict audits. Lint reads it from
+the default branch, so commit and push the marker after writing it. The daily timer
+does **not** write markers — they are operator intake artifacts, not a heartbeat.
 
 ```bash
 scripts/secret-audit --repo OWNER/NAME
@@ -163,7 +165,8 @@ On leaks: `ERROR: SECRET_AUDIT_LEAK` — rotate credentials; never write a clean
 
 Daily timer (optional): `scripts/setup-secret-audit` installs `secret-audit.service`
 (05:00) running `scripts/secret-audit-batch-run` (org sweep + summary email; finding
-details stay on the host under `secret-audit-runs/`). Org sweeps skip archived
+details stay on the host under `secret-audit-runs/`). The sweep never writes markers,
+so it leaves local clones clean. Org sweeps skip archived
 repos; set `SECRET_AUDIT_REPORT_TO` in `~/.config/secret-audit.env` (see
 `etc/secret-audit.env.example`) or reuse `DEP_UPDATER_REPORT_TO`.
 
