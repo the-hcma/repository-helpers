@@ -27,6 +27,11 @@ source "${_ar_lib_dir}/runner-ensure"
 # shellcheck source=scripts/lib/github-api-rate-limit
 source "${_ar_lib_dir}/github-api-rate-limit"
 
+# Process-local cache: the token's login is immutable for the life of the process, so
+# resolve-thread must not re-hit GET /user (or stall on a secondary 403) for every
+# thread (repository-helpers#545).
+_agent_review_viewer_login_cache=""
+
 ar_runner_last_stdout() {
   local uuid
 
@@ -1775,37 +1780,79 @@ mutation($threadId:ID!, $body:String!) {
 }
 
 agent_review_authenticated_login() {
-  local login
-
-  login="$(ar_runner_gh_api_stream "agent-review authenticated login" user --jq '.login')"
-  if [[ -z "${login}" ]]; then
-    agent_review_die 'could not determine authenticated GitHub login (run gh auth login)'
+  if agent_review_authenticated_login_optional; then
+    printf '%s' "${_agent_review_viewer_login_cache}"
+    return 0
   fi
-  printf '%s' "${login}"
+  agent_review_die \
+    'could not determine authenticated GitHub login' \
+    '(run gh auth login, or set AGENT_REVIEW_VIEWER_LOGIN)'
 }
 
-# Like agent_review_authenticated_login but returns 1 on API/rate-limit failure (no die).
+# Resolve the viewer login without dying. Prefer (in order): AGENT_REVIEW_VIEWER_LOGIN /
+# GITHUB_LOGIN, process cache, GraphQL viewer{login} (survives REST-only 403s), REST
+# GET /user. Caches the first success in _agent_review_viewer_login_cache for the process
+# (repository-helpers#545). Callers must invoke directly — not via $(…) — so cache writes
+# persist, and must read the cache afterward. Prints nothing on success or failure so it
+# is safe to call inside functions whose stdout is captured (e.g. pending JSON builders).
 agent_review_authenticated_login_optional() {
-  local login exit_code
+  local exit_code login
+
+  login="${AGENT_REVIEW_VIEWER_LOGIN:-${GITHUB_LOGIN:-}}"
+  if [[ -z "${login}" ]]; then
+    login="${_agent_review_viewer_login_cache}"
+  fi
+  if [[ -n "${login}" ]]; then
+    _agent_review_viewer_login_cache="${login}"
+    return 0
+  fi
+
+  # GraphQL first: during REST secondary limits, {viewer{login}} often still works
+  # while GET /user returns 403 with core.remaining still full (repository-helpers#547).
+  exit_code=0
+  login="$(GITHUB_API_RATE_LIMIT_MAX_RETRIES=1 \
+    ar_runner_gh_api_stream "agent-review viewer login graphql" graphql \
+    -f query='{viewer{login}}' --jq '.data.viewer.login')" \
+    || exit_code=$?
+  if (( exit_code == 0 )) && [[ -n "${login}" ]]; then
+    _agent_review_viewer_login_cache="${login}"
+    return 0
+  fi
 
   exit_code=0
   login="$(GITHUB_API_RATE_LIMIT_MAX_RETRIES=1 \
     ar_runner_gh_api_stream "agent-review authenticated login optional" user --jq '.login')" \
     || exit_code=$?
-  if (( exit_code != 0 )) || [[ -z "${login}" ]]; then
-    return 1
+  if (( exit_code == 0 )) && [[ -n "${login}" ]]; then
+    _agent_review_viewer_login_cache="${login}"
+    return 0
   fi
-  printf '%s' "${login}"
-  return 0
+
+  return 1
 }
 
+# Exit codes:
+#   0 — the authenticated viewer has an on-thread reply (comments after the first)
+#   1 — no such reply
+#   2 — could not verify (login or GraphQL unavailable); never treat this as "no reply"
+#       (repository-helpers#545)
 agent_review_thread_has_human_reply() {
   local -r thread_id="$1"
-  local thread_json has_reply viewer_login
+  local graphql_rc=0 login_rc=0 thread_json has_reply viewer_login=''
 
-  viewer_login="$(agent_review_authenticated_login)"
+  if agent_review_authenticated_login_optional; then
+    viewer_login="${_agent_review_viewer_login_cache}"
+  else
+    login_rc=$?
+  fi
+  if (( login_rc != 0 )) || [[ -z "${viewer_login}" ]]; then
+    return 2
+  fi
+
   # shellcheck disable=SC2016  # GraphQL query uses single-quoted $variables
-  thread_json="$(ar_runner_gh_api_stream "agent-review thread human reply check" graphql -f query='
+  graphql_rc=0
+  thread_json="$(GITHUB_API_RATE_LIMIT_MAX_RETRIES=1 \
+    ar_runner_gh_api_stream "agent-review thread human reply check" graphql -f query='
 query($id:ID!) {
   node(id:$id) {
     ... on PullRequestReviewThread {
@@ -1814,19 +1861,40 @@ query($id:ID!) {
       }
     }
   }
-}' -f id="${thread_id}")"
+}' -f id="${thread_id}")" || graphql_rc=$?
+  if (( graphql_rc != 0 )) || [[ -z "${thread_json}" ]]; then
+    return 2
+  fi
+
   has_reply="$(ar_runner_jq_file "agent-review thread has human reply" "${thread_json}" \
     --arg login "${viewer_login}" \
-    -r '[.data.node.comments.nodes[1:][] | select(.author.__typename == "User" and .author.login == $login)] | length > 0')"
-  [[ "${has_reply}" == 'true' ]]
+    -r '[.data.node.comments.nodes[1:][] |
+      select(.author.__typename == "User" and .author.login == $login)] |
+      length > 0')" \
+    || return 2
+  if [[ "${has_reply}" == 'true' ]]; then
+    return 0
+  fi
+  return 1
 }
 
 agent_review_assert_thread_has_human_reply() {
   local -r thread_id="$1"
+  local rc=0
 
-  if ! agent_review_thread_has_human_reply "${thread_id}"; then
-    agent_review_die "thread ${thread_id} has no on-thread human reply — run reply-thread before resolve-thread"
-  fi
+  agent_review_thread_has_human_reply "${thread_id}" || rc=$?
+  case "${rc}" in
+    0) return 0 ;;
+    2)
+      agent_review_die \
+        "thread ${thread_id}: could not verify on-thread human reply" \
+        "(GitHub API unavailable) — retry when rate limits clear, or set AGENT_REVIEW_VIEWER_LOGIN"
+      ;;
+    *)
+      agent_review_die \
+        "thread ${thread_id} has no on-thread human reply — run reply-thread before resolve-thread"
+      ;;
+  esac
 }
 
 # shellcheck disable=SC1091  # feedback helpers sourced at runtime from scripts/lib

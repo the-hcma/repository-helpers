@@ -131,11 +131,36 @@ if grep -qF 'cmd_reply_thread' "$wait_script" \
   && grep -qF 'agent_review_assert_thread_has_human_reply' "$lib" \
   && grep -qF 'agent_review_authenticated_login' "$lib" \
   && grep -qF 'author.login ==' "$lib" \
+  && grep -qF 'could not verify on-thread human reply' "$lib" \
+  && grep -qF 'AGENT_REVIEW_VIEWER_LOGIN' "$lib" \
+  && grep -qF '_agent_review_viewer_login_cache' "$lib" \
+  && grep -qF "query='{viewer{login}}'" "$lib" \
   && grep -qF 'reply-thread requires --thread-id' "$wait_script"; then
   printf '[PASS] wait script: reply-thread GraphQL and resolve guard wired\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] wait script: missing reply-thread or resolve guard wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+# shellcheck disable=SC2016  # assert matches literal return-2 path in source
+if awk '
+  /^agent_review_thread_has_human_reply\(/ { in_fn=1 }
+  in_fn && /return 2/ { undetermined=1 }
+  in_fn && /^}/ { exit }
+  END { exit(undetermined ? 0 : 1) }
+' "$lib" \
+  && awk '
+    /^agent_review_assert_thread_has_human_reply\(/ { in_fn=1 }
+    in_fn && /case "\$\{rc\}"/ { has_case=1 }
+    in_fn && /could not verify on-thread human reply/ { has_msg=1 }
+    in_fn && /^}/ { exit }
+    END { exit(has_case && has_msg ? 0 : 1) }
+  ' "$lib"; then
+  printf '[PASS] resolve guard: API failure is undetermined (exit 2), not "no reply" (#545)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] resolve guard: missing three-way reply check for API failures (#545)\n'
   fail=$(( fail + 1 ))
 fi
 
@@ -3448,7 +3473,7 @@ printf '%s' "${cr_thread_fixture}" >"${tmp_cr_merge_497}"
 if pending_count="$(AGENT_REVIEW_AGENT=copilot AGENT_REVIEW_RESOLVED_COMMENTS_FILE="$(mktemp)" bash -c "
   source '${lib}'
   agent_review_load_agent_profile
-  agent_review_authenticated_login_optional() { printf 'thehcma'; return 0; }
+  agent_review_authenticated_login_optional() { _agent_review_viewer_login_cache='thehcma'; return 0; }
   agent_review_authenticated_login() { printf 'thehcma'; }
   agent_review_pr_issue_comments_json() { cat '${tmp_issue_with_thread}'; }
   agent_review_feedback_pending_json 'the-hcma/mock-repo' 650 \"\$(cat '${tmp_cr_merge_497}')\"
@@ -4892,6 +4917,152 @@ if grep -qF '_bugbot_jq_r' "$bugbot_profile" \
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] bugbot profile: missing runner adoption wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== behavioural: login failure is not "no human reply" (#545) ===\n'
+# An API/rate-limit failure resolving the viewer must not be reported as a
+# reply-before-resolve violation — that is the opposite of fail-safe.
+set +e
+# SC2317: stubs are invoked by the sourced assert helper.
+# shellcheck disable=SC2317
+undetermined_out="$(
+  # shellcheck disable=SC1090
+  source "$lib"
+  agent_review_authenticated_login_optional() { return 1; }
+  agent_review_die() { printf 'DIE:%s\n' "$*"; exit 1; }
+  agent_review_assert_thread_has_human_reply 'PRRT_mock'
+)"
+undetermined_rc=$?
+set -e
+if [[ "$undetermined_rc" -ne 0 ]] \
+  && grep -qF 'could not verify on-thread human reply' <<<"$undetermined_out" \
+  && ! grep -qF 'has no on-thread human reply' <<<"$undetermined_out"; then
+  printf '[PASS] assert: login failure dies with "could not verify", not "no reply"\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] assert: login failure misreported\n%s\n' "$undetermined_out"
+  fail=$(( fail + 1 ))
+fi
+
+set +e
+# shellcheck disable=SC2317
+no_reply_out="$(
+  # shellcheck disable=SC1090
+  source "$lib"
+  agent_review_authenticated_login_optional() { _agent_review_viewer_login_cache='thehcma'; return 0; }
+  ar_runner_gh_api_stream() {
+    printf '%s' \
+      '{"data":{"node":{"comments":{"nodes":[{"author":{"__typename":"Bot","login":"bot"}},{"author":{"__typename":"User","login":"other"}}]}}}}'
+  }
+  ar_runner_jq_file() {
+    shift 2
+    jq "$@" <<<"$(ar_runner_gh_api_stream unused)"
+  }
+  agent_review_die() { printf 'DIE:%s\n' "$*"; exit 1; }
+  agent_review_assert_thread_has_human_reply 'PRRT_mock'
+)"
+no_reply_rc=$?
+set -e
+if [[ "$no_reply_rc" -ne 0 ]] \
+  && grep -qF 'has no on-thread human reply' <<<"$no_reply_out"; then
+  printf '[PASS] assert: genuine missing reply still uses the reply-before-resolve message\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] assert: genuine no-reply path broken\n%s\n' "$no_reply_out"
+  fail=$(( fail + 1 ))
+fi
+
+set +e
+has_reply_rc=0
+# SC2317: stubs are invoked by the sourced assert helper.
+# shellcheck disable=SC2317
+has_reply_out="$(
+  # shellcheck disable=SC1090
+  source "$lib"
+  agent_review_authenticated_login_optional() { _agent_review_viewer_login_cache='thehcma'; return 0; }
+  ar_runner_gh_api_stream() {
+    printf '%s' \
+      '{"data":{"node":{"comments":{"nodes":[{"author":{"__typename":"Bot","login":"bot"}},{"author":{"__typename":"User","login":"thehcma"}}]}}}}'
+  }
+  ar_runner_jq_file() {
+    shift 2
+    jq "$@" <<<"$(ar_runner_gh_api_stream unused)"
+  }
+  agent_review_die() { printf 'DIE:%s\n' "$*"; exit 1; }
+  agent_review_assert_thread_has_human_reply 'PRRT_mock'
+)" || has_reply_rc=$?
+set -e
+if [[ "$has_reply_rc" -eq 0 ]]; then
+  printf '[PASS] assert: viewer reply on thread allows resolve\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] assert: viewer reply should allow resolve\n%s\n' "$has_reply_out"
+  fail=$(( fail + 1 ))
+fi
+
+# Env override must short-circuit every network probe.
+if bash -c "
+  source '${lib}'
+  AGENT_REVIEW_VIEWER_LOGIN=env-user
+  _agent_review_viewer_login_cache=''
+  ar_runner_gh_api_stream() { printf 'SHOULD_NOT_HIT\n' >&2; return 1; }
+  runner_sh_stdout() { printf 'SHOULD_NOT_HIT\n' >&2; return 1; }
+  agent_review_authenticated_login_optional || exit 1
+  [[ \"\${_agent_review_viewer_login_cache}\" == 'env-user' ]]
+"; then
+  printf '[PASS] login: AGENT_REVIEW_VIEWER_LOGIN short-circuits API probes\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] login: AGENT_REVIEW_VIEWER_LOGIN override ignored\n'
+  fail=$(( fail + 1 ))
+fi
+
+# Process cache must prevent a second GraphQL/REST hit.
+if bash -c "
+  source '${lib}'
+  unset AGENT_REVIEW_VIEWER_LOGIN GITHUB_LOGIN
+  _agent_review_viewer_login_cache='cached-user'
+  hits=0
+  ar_runner_gh_api_stream() { hits=\$((hits+1)); return 1; }
+  runner_sh_stdout() { hits=\$((hits+1)); return 1; }
+  agent_review_authenticated_login_optional || exit 1
+  [[ \"\${_agent_review_viewer_login_cache}\" == 'cached-user' ]] || exit 1
+  agent_review_authenticated_login_optional || exit 1
+  [[ \"\${_agent_review_viewer_login_cache}\" == 'cached-user' ]] || exit 1
+  (( hits == 0 ))
+"; then
+  printf '[PASS] login: process cache avoids repeated /user probes\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] login: process cache not used\n'
+  fail=$(( fail + 1 ))
+fi
+
+# First successful probe must populate the caller-shell cache (not a $(…) subshell).
+if bash -c "
+  source '${lib}'
+  unset AGENT_REVIEW_VIEWER_LOGIN GITHUB_LOGIN
+  _agent_review_viewer_login_cache=''
+  probe_file=\$(mktemp)
+  printf '0' > \"\${probe_file}\"
+  ar_runner_gh_api_stream() {
+    count=\$(cat \"\${probe_file}\")
+    count=\$((count + 1))
+    printf '%s' \"\${count}\" > \"\${probe_file}\"
+    printf 'api-user'
+    return 0
+  }
+  agent_review_authenticated_login_optional || exit 1
+  [[ \"\${_agent_review_viewer_login_cache}\" == 'api-user' ]] || exit 1
+  agent_review_authenticated_login_optional || exit 1
+  [[ \"\${_agent_review_viewer_login_cache}\" == 'api-user' ]] || exit 1
+  [[ \"\$(cat \"\${probe_file}\")\" -eq 1 ]]
+"; then
+  printf '[PASS] login: first probe caches login for caller shell reuse\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] login: cache lost across direct optional-login calls\n'
   fail=$(( fail + 1 ))
 fi
 
