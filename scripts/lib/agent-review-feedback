@@ -85,17 +85,58 @@ agent_review_feedback_mark_issue_comment_resolved() {
 agent_review_feedback_review_resolved_id() {
   local -r review_id="$1"
 
-  printf 'PRR_%s' "${review_id}"
+  printf 'PRR_%s' "$(agent_review_feedback_normalize_review_id "${review_id}")"
+}
+
+# Strip optional PRR_ prefix from --review-id / feedback ids (repository-helpers#539).
+agent_review_feedback_normalize_review_id() {
+  local id="${1:-}"
+
+  id="${id#PRR_}"
+  printf '%s' "${id}"
 }
 
 agent_review_feedback_mark_review_resolved() {
   local -r repo="$1"
   local -r pr="$2"
-  local -r review_id="$3"
+  local review_id="$3"
 
+  review_id="$(agent_review_feedback_normalize_review_id "${review_id}")"
   [[ -n "${review_id}" ]] || agent_review_die 'resolve-comment --review-id requires a review id'
   agent_review_feedback_mark_id_resolved \
     "${repo}" "${pr}" "$(agent_review_feedback_review_resolved_id "${review_id}")"
+}
+
+# Canonical HTML anchor URL for a pull-request review databaseId.
+agent_review_feedback_review_canonical_url() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r review_id="$3"
+
+  printf 'https://github.com/%s/pull/%s#pullrequestreview-%s' \
+    "${repo}" "${pr}" "$(agent_review_feedback_normalize_review_id "${review_id}")"
+}
+
+# Lookup review meta by databaseId across *all* non-PENDING reviews in the snapshot
+# (not only the current head). Empty JSON object when missing.
+agent_review_feedback_review_meta_json() {
+  local -r snapshot="$1"
+  local review_id="$2"
+
+  review_id="$(agent_review_feedback_normalize_review_id "${review_id}")"
+  ar_runner_jq_file "agent-review feedback review meta" "${snapshot}" \
+    --arg id "${review_id}" '
+      [(.data.repository.pullRequest.reviews.nodes // [])
+        | .[]
+        | select(.state != "PENDING")
+        | select((.databaseId // null) != null)
+        | select((.databaseId | tostring) == $id)
+        | {
+            review_id: (.databaseId | tostring),
+            url: (.url // ""),
+            submitted_at: (.submittedAt // "")
+          }
+      ] | first // {}'
 }
 
 agent_review_feedback_issue_comment_is_probe() {
@@ -512,20 +553,15 @@ agent_review_feedback_reviews_pending_from_parts_json() {
           )
         );
       def operator_replied_to_review($review):
-        ($review.submitted_at // "") as $after
-        | ($review.url // "") as $url
+        ($review.url // "") as $url
         | ("pullrequestreview-" + $review.review_id) as $anchor
-        | if ($after | length) == 0 then false
-          else
-            [ $comments[]
-              | select(.login == $operator)
-              | select((.created_at // "") > $after)
-              | select(
-                  (($url | length) > 0 and ((.body // "") | index("(In reply to " + $url + ")") != null))
-                  or ((.body // "") | index($anchor + ")") != null)
-                )
-            ] | length > 0
-          end;
+        | [ $comments[]
+            | select(.login == $operator)
+            | select(
+                (($url | length) > 0 and ((.body // "") | index("(In reply to " + $url + ")") != null))
+                or ((.body // "") | index($anchor + ")") != null)
+              )
+          ] | length > 0;
       [ $reviews[]
         | select(.login != $operator)
         | select(is_actionable(.body; .state; .login))
@@ -695,67 +731,77 @@ agent_review_feedback_issue_comment_has_operator_reply() {
   local -r repo="$1"
   local -r pr="$2"
   local -r comment_id="$3"
-  local comments_json operator_login
+  local comments_json operator_login result
 
   operator_login="$(agent_review_authenticated_login)"
   comments_json="$(agent_review_feedback_issue_comments_array_json "${repo}" "${pr}")"
   # Require an explicit citation of the target comment URL (reply-comment appends
   # "(In reply to <url>)"). A later unrelated operator note must not count.
-  ar_runner_jq_file "agent-review feedback issue comment has reply" "${comments_json}" \
-    --arg id "${comment_id}" \
-    --arg operator "${operator_login}" \
-    -e '
-      . as $all
-      | (first(range(0; length) | select($all[.] | .id == $id)) // null) as $idx
-      | if $idx == null then false
-        else
-          ($all[$idx].html_url // "") as $url
-          | if ($url | length) == 0 then false
-            else
-              [ range($idx + 1; length)
-                | $all[.]
-                | select(.login == $operator)
-                | select((.body // "") | index("(In reply to " + $url + ")") != null)
-              ] | length > 0
-            end
-        end'
+  # yes/no (not jq -e) avoids runner [FAIL] noise on expected misses (#539).
+  result="$(
+    ar_runner_jq_file "agent-review feedback issue comment has reply" "${comments_json}" \
+      --arg id "${comment_id}" \
+      --arg operator "${operator_login}" \
+      -r '
+        . as $all
+        | (first(range(0; length) | select($all[.] | .id == $id)) // null) as $idx
+        | if $idx == null then "no"
+          else
+            ($all[$idx].html_url // "") as $url
+            | if ($url | length) == 0 then "no"
+              else
+                [ range($idx + 1; length)
+                  | $all[.]
+                  | select(.login == $operator)
+                  | select((.body // "") | index("(In reply to " + $url + ")") != null)
+                ] | if length > 0 then "yes" else "no" end
+              end
+          end'
+  )"
+  [[ "${result}" == 'yes' ]]
 }
 
 agent_review_feedback_review_has_operator_reply() {
   local -r repo="$1"
   local -r pr="$2"
   local -r snapshot="$3"
-  local -r review_id="$4"
-  local head reviews_json submitted_at review_url comments_json operator_login anchor
+  local review_id="$4"
+  local meta review_url comments_json operator_login anchor canonical result
 
-  head="$(ar_runner_jq_file "agent-review feedback reply head" "${snapshot}" -r \
-    '.data.repository.pullRequest.headRefOid // ""')"
-  [[ -n "${head}" ]] || return 1
-  reviews_json="$(agent_review_feedback_reviews_on_head_array_json "${snapshot}" "${head}")"
-  submitted_at="$(ar_runner_jq_file "agent-review feedback review submitted at" "${reviews_json}" \
-    --arg id "${review_id}" -r \
-    'map(select(.review_id == $id)) | first | .submitted_at // ""')"
-  review_url="$(ar_runner_jq_file "agent-review feedback review url for reply" "${reviews_json}" \
-    --arg id "${review_id}" -r \
-    'map(select(.review_id == $id)) | first | .url // ""')"
-  [[ -n "${submitted_at}" ]] || return 1
+  review_id="$(agent_review_feedback_normalize_review_id "${review_id}")"
+  [[ -n "${review_id}" ]] || return 1
+
+  meta="$(agent_review_feedback_review_meta_json "${snapshot}" "${review_id}")"
+  review_url="$(ar_runner_jq_file "agent-review feedback review url for reply check" "${meta}" -r \
+    '.url // ""')"
+  canonical="$(agent_review_feedback_review_canonical_url "${repo}" "${pr}" "${review_id}")"
+  if [[ -z "${review_url}" ]]; then
+    review_url="${canonical}"
+  fi
+
   operator_login="$(agent_review_authenticated_login)"
   comments_json="$(agent_review_feedback_issue_comments_array_json "${repo}" "${pr}")"
   anchor="pullrequestreview-${review_id}"
-  ar_runner_jq_file "agent-review feedback review has targeted reply" "${comments_json}" \
-    --arg operator "${operator_login}" \
-    --arg after "${submitted_at}" \
-    --arg url "${review_url}" \
-    --arg anchor "${anchor}" \
-    -e '
-      [ .[]
-        | select(.login == $operator)
-        | select((.created_at // "") > $after)
-        | select(
-            (($url | length) > 0 and ((.body // "") | index("(In reply to " + $url + ")") != null))
-            or ((.body // "") | index($anchor + ")") != null)
-          )
-      ] | length > 0' >/dev/null
+  # Citation is SSOT — do not require created_at > submitted_at (clock skew / same-second
+  # replies) and do not require the review to still be on the current head (#539).
+  # Use yes/no (not jq -e) so expected misses do not leak runner [FAIL] diagnostics.
+  result="$(
+    ar_runner_jq_file "agent-review feedback review has targeted reply" "${comments_json}" \
+      --arg operator "${operator_login}" \
+      --arg url "${review_url}" \
+      --arg canonical "${canonical}" \
+      --arg anchor "${anchor}" \
+      -r '
+        def cites($body):
+          (($url | length) > 0 and ($body | index("(In reply to " + $url + ")") != null))
+          or (($canonical | length) > 0 and ($body | index("(In reply to " + $canonical + ")") != null))
+          or ($body | index($anchor + ")") != null);
+        [ .[]
+          | select(.login == $operator)
+          | select(cites(.body // ""))
+        ] | if length > 0 then "yes" else "no" end'
+  )"
+  [[ "${result}" == 'yes' ]]
 }
 
 # Locals use target_* / comment_* names so nested call from
@@ -827,20 +873,20 @@ agent_review_reply_pull_request_review() {
   local -r repo="$1"
   local -r pr="$2"
   local -r snapshot="$3"
-  local -r review_id="$4"
+  local review_id="$4"
   local -r body="$5"
-  local head reviews_json review_url full_body
+  local meta review_url full_body
 
   agent_review_require_cmd gh
   [[ -n "${body}" ]] || agent_review_die 'reply-comment --review-id requires --body'
-  head="$(ar_runner_jq_file "agent-review feedback reply-review head" "${snapshot}" -r \
-    '.data.repository.pullRequest.headRefOid // ""')"
-  reviews_json="$(agent_review_feedback_reviews_on_head_array_json "${snapshot}" "${head}")"
-  review_url="$(ar_runner_jq_file "agent-review feedback reply-review url" "${reviews_json}" \
-    --arg id "${review_id}" -r 'map(select(.review_id == $id)) | first | .url // ""')"
+  review_id="$(agent_review_feedback_normalize_review_id "${review_id}")"
+  [[ -n "${review_id}" ]] || agent_review_die 'reply-comment --review-id requires a review id'
+
+  meta="$(agent_review_feedback_review_meta_json "${snapshot}" "${review_id}")"
+  review_url="$(ar_runner_jq_file "agent-review feedback reply-review url" "${meta}" -r \
+    '.url // ""')"
   if [[ -z "${review_url}" ]]; then
-    # Fall back to canonical anchor when the review is not on the current head snapshot.
-    review_url="https://github.com/${repo}/pull/${pr}#pullrequestreview-${review_id}"
+    review_url="$(agent_review_feedback_review_canonical_url "${repo}" "${pr}" "${review_id}")"
   fi
   full_body="${body}
 
