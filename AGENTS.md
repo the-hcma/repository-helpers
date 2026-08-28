@@ -515,6 +515,8 @@ Service repositories install via `scripts/setup-service` and optionally implemen
   - **Workflows**: `actionlint` when helpers-style or when workflows already invoke actionlint
   - **Bash tests**: `tests/*.test` when present (sequential, isolated TMPDIR)
   - **Python** (`pyproject.toml`): prefer `.github/ci/python-static`; else `uv run` ruff check/format + pyright
+  - **Hermetic pytest**: when `.github/ci/pytest-hermetic` is present (same offline
+    subset CI uses; not live Graph tests) — planned as `pytest-hermetic`
   - **TypeScript**: `web/package.json` → pnpm install + typecheck/build; else root pnpm (only when no `web/`) → `pnpm run check` (or typecheck/lint). Both layouts: web wins; root is not also planned.
   - **Rust** (`Cargo.toml`): `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`
   - **Secret scan**: when `.github/ci/secret-scan` or `scripts/dev/secret-scan` is

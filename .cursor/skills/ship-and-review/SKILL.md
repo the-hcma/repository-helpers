@@ -37,7 +37,7 @@ scripts/dev/pre-pr-checks
 # or: scripts/dev/pre-pr-checks --fix   # PRE_PR_CHECKS_FORMAT=apply
 ```
 
-`pre-pr-checks` detects ecosystems first and runs only planned jobs (bash/shellcheck/actionlint/tests, plus Python/TS/Rust when markers are present). Fix failures before committing. **Do not bypass a failing run** with ad-hoc substitutes (`pytest` / `ruff check` alone is not a pass); use documented `PRE_PR_CHECKS_SKIP=job1,job2` only as an explicit escape hatch. **Do not** pipe the gate to `tail`/`head` — require exit 0 and `==> pre-pr-checks passed` from the full run. Do not skip hooks or push with failing gates.
+`pre-pr-checks` detects ecosystems first and runs only planned jobs (bash/shellcheck/actionlint/tests, plus Python/TS/Rust when markers are present). When `.github/ci/pytest-hermetic` exists, it also runs that hermetic pytest wrapper (same offline subset as CI — not live Graph tests). Fix failures before committing. **Do not bypass a failing run** with ad-hoc substitutes (`pytest` / `ruff check` alone is not a pass); use documented `PRE_PR_CHECKS_SKIP=job1,job2` only as an explicit escape hatch. **Do not** pipe the gate to `tail`/`head` — require exit 0 and `==> pre-pr-checks passed` from the full run. Do not skip hooks or push with failing gates.
 
 ## 2. Commit, submit, and monitor CI (required after every push)
 
