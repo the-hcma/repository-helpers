@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# pre-pr-verified-commits — fail pre-pr-checks on unverified commits in the submit range.
+#
+# Walks non-merge commits on merge-base(default)..HEAD:
+#   1. git verify-commit (local signature)
+#   2. when upstream exists and gh is available, GitHub commit.verification.verified
+#
+# Skip PRE_PR_CHECKS_SKIP=verified-commits. Bot authors ([bot] / dependabot) are skipped.
+# See repository-helpers#528.
+set -euo pipefail
+
+if declare -F pre_pr_verified_commits_run >/dev/null 2>&1; then
+  return 0
+fi
+
+_pre_pr_vc_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _pre_pr_vc_lib_dir
+# shellcheck disable=SC1091
+source "${_pre_pr_vc_lib_dir}/runner-ensure"
+# shellcheck disable=SC1091
+source "${_pre_pr_vc_lib_dir}/github-api-rate-limit"
+# shellcheck disable=SC1091
+source "${_pre_pr_vc_lib_dir}/github-repo-slug"
+
+# pre_pr_verified_commits_run <repo_root>
+pre_pr_verified_commits_run() {
+  local -r root="$1"
+  local base_ref base head sha author verified_json origin_url slug upstream_ok=0 gh_ok=0
+  local -a shas=()
+
+  head="$(runner_exec_stdout "verified-commits rev-parse HEAD" \
+    -- git -C "$root" rev-parse HEAD)" || {
+    printf 'ERROR: UNVERIFIED_COMMIT sha=unknown reason=local detail=cannot resolve HEAD\n' >&2
+    return 1
+  }
+
+  base_ref=''
+  if runner_exec "verified-commits rev-parse origin/main" --probe \
+    -- git -C "$root" rev-parse --verify --quiet origin/main; then
+    base_ref='origin/main'
+  elif runner_exec "verified-commits rev-parse main" --probe \
+    -- git -C "$root" rev-parse --verify --quiet main; then
+    base_ref='main'
+  fi
+
+  if [[ -z "$base_ref" ]]; then
+    printf '==> verified-commits: no main/origin/main; skipping range check\n' >&2
+    return 0
+  fi
+
+  base="$(runner_exec_stdout "verified-commits merge-base ${base_ref}" \
+    -- git -C "$root" merge-base "$base_ref" "$head")" || base=''
+  if [[ -z "$base" ]]; then
+    printf '==> verified-commits: merge-base failed; skipping\n' >&2
+    return 0
+  fi
+
+  # First-parent, non-merge commits only (skip sync/rebase merge commits).
+  while IFS= read -r sha || [[ -n "$sha" ]]; do
+    [[ -n "$sha" ]] || continue
+    shas+=("$sha")
+  done < <(
+    runner_exec_stdout "verified-commits rev-list ${base}..${head}" \
+      -- git -C "$root" rev-list --first-parent --no-merges "${base}..${head}" \
+      || true
+  )
+
+  if [[ "${#shas[@]}" -eq 0 ]]; then
+    printf '==> verified-commits: no commits ahead of %s\n' "$base_ref" >&2
+    return 0
+  fi
+
+  if runner_exec "verified-commits @{u}" --probe \
+    -- git -C "$root" rev-parse --abbrev-ref --symbolic-full-name '@{u}'; then
+    upstream_ok=1
+  fi
+  if command -v gh >/dev/null 2>&1; then
+    gh_ok=1
+  fi
+  if (( upstream_ok == 1 && gh_ok == 0 )); then
+    printf '==> verified-commits: gh missing; GitHub Verified check skipped (local only)\n' >&2
+  fi
+  if (( upstream_ok == 0 )); then
+    printf '==> verified-commits: no upstream; GitHub Verified check skipped until push\n' >&2
+  fi
+
+  for sha in "${shas[@]}"; do
+    author="$(
+      runner_exec_stdout "verified-commits author ${sha}" \
+        -- git -C "$root" log -1 --format='%an <%ae>' "$sha" || true
+    )"
+    if _pre_pr_verified_commits_author_is_bot "$author"; then
+      printf '==> verified-commits: skip bot commit %s (%s)\n' "$sha" "$author" >&2
+      continue
+    fi
+
+    if ! runner_exec "verified-commits git verify-commit ${sha}" --probe \
+      -- git -C "$root" verify-commit "$sha"; then
+      printf 'ERROR: UNVERIFIED_COMMIT sha=%s reason=local detail=git verify-commit failed\n' \
+        "$sha" >&2
+      return 1
+    fi
+
+    if (( upstream_ok == 1 && gh_ok == 1 )); then
+      origin_url="$(runner_exec_stdout "verified-commits remote get-url" --probe -- git -C "$root" remote get-url origin || true)"
+      slug=''
+      if [[ -n "$origin_url" ]]; then
+        slug="$(gh_slug_from_origin_url "$origin_url" || true)"
+      fi
+      verified_json=''
+      if [[ -n "$slug" ]]; then
+        # Keep waiter + `gh api` on one physical line (gh-api-waiter-count ratchet).
+        # shellcheck disable=SC2086  # not word-splitting; single argv list
+        verified_json="$(github_api_exec_with_rate_limit_retry "verified-commits commit ${sha}" --probe -- gh api "repos/${slug}/commits/${sha}" --jq '.commit.verification.verified' || true)"
+      fi
+      if [[ "$verified_json" == 'true' ]]; then
+        continue
+      fi
+      if [[ -z "$verified_json" || "$verified_json" == 'null' ]]; then
+        printf '==> verified-commits: GitHub verification unknown for %s; local ok\n' \
+          "$sha" >&2
+        continue
+      fi
+      printf 'ERROR: UNVERIFIED_COMMIT sha=%s reason=github detail=verification.verified=%s\n' \
+        "$sha" "$verified_json" >&2
+      return 1
+    fi
+  done
+
+  return 0
+}
+
+# pre_pr_verified_commits_should_plan <repo_root>
+# True when the branch has at least one non-merge commit ahead of main.
+pre_pr_verified_commits_should_plan() {
+  local -r root="$1"
+  local base_ref base head count
+
+  head="$(runner_exec_stdout "verified-commits plan rev-parse HEAD" --probe \
+    -- git -C "$root" rev-parse HEAD 2>/dev/null)" || return 1
+
+  base_ref=''
+  if runner_exec "verified-commits plan rev-parse origin/main" --probe \
+    -- git -C "$root" rev-parse --verify --quiet origin/main; then
+    base_ref='origin/main'
+  elif runner_exec "verified-commits plan rev-parse main" --probe \
+    -- git -C "$root" rev-parse --verify --quiet main; then
+    base_ref='main'
+  else
+    return 1
+  fi
+
+  base="$(runner_exec_stdout "verified-commits plan merge-base" --probe \
+    -- git -C "$root" merge-base "$base_ref" "$head" 2>/dev/null)" || return 1
+  count="$(
+    runner_exec_stdout "verified-commits plan rev-list count" --probe \
+      -- git -C "$root" rev-list --first-parent --no-merges --count "${base}..${head}" \
+      2>/dev/null || true
+  )"
+  [[ "${count:-0}" =~ ^[1-9][0-9]*$ ]]
+}
+
+_pre_pr_verified_commits_author_is_bot() {
+  local -r author="${1:-}"
+  [[ "$author" == *'[bot]'* ]] && return 0
+  [[ "$author" == *dependabot* ]] && return 0
+  return 1
+}

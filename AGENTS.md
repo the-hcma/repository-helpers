@@ -522,6 +522,9 @@ Service repositories install via `scripts/setup-service` and optionally implemen
     (branch-vs-`main` range when possible). CI `secret-scan` remains post-push
     triage; this is the submit-path gate (see also deep/org scan #509 — TruffleHog via `scripts/secret-audit` / [docs/secret-audit-trufflehog.md](./docs/secret-audit-trufflehog.md)).
     Skip with `PRE_PR_CHECKS_SKIP=secret-scan`. Manual: `scripts/dev/secret-scan`.
+  - **Verified commits**: when the branch has commits ahead of `main`/`origin/main` —
+    `git verify-commit` locally, plus GitHub `verification.verified` when an upstream
+    exists (bot authors skipped). Skip with `PRE_PR_CHECKS_SKIP=verified-commits`.
   - Escape hatch: `PRE_PR_CHECKS_SKIP=job1,job2` (documented; no silent skip). Do **not** bypass a failing run with ad-hoc substitutes.
   - Also verifies the **primary worktree** is unchanged when checks finish.
 - Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).
