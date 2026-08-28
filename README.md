@@ -312,6 +312,21 @@ policy defaults:
 - **Python / Pipenv:** supports `Pipfile.lock`, respecting intentional `==` pins.
 - **Rust / Cargo:** supports `Cargo.toml` / `Cargo.lock` using `cargo outdated`
   JSON and `cargo add`, preserving dev/build kind and workspace package targeting.
+  Requires a Rust toolchain on the host (plus the `clippy` component for post-bump
+  recovery):
+
+  ```bash
+  rustup component add clippy
+  cargo install cargo-outdated --locked
+  ```
+
+  apt's Rust is too old for current `cargo-outdated` — install via rustup, and on
+  Debian/Ubuntu add `build-essential pkg-config libssl-dev` for `openssl-sys` /
+  `libgit2-sys`. Note that `~/.cargo/bin` is not on a systemd/cron `PATH` by
+  default, so a timer-run batch can still report the tool missing after a
+  successful interactive install. A host without it no longer fails the whole run:
+  `--batch --all` skips those repos and lists them under **Skipped (missing
+  tooling)** in the batch email, while a single-repo run still fails loudly.
 - **GitHub Actions:** supports `.github/workflows/*.yml`, preserving existing `v`
   prefix style, updating major-only pins only on newer majors, and skipping SHA or
   local action pins.
