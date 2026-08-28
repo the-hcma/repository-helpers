@@ -2,12 +2,13 @@
 # shellcheck shell=bash
 # pre-pr-verified-commits — fail pre-pr-checks on unverified commits in the submit range.
 #
-# Walks non-merge commits on merge-base(default)..HEAD:
-#   1. git verify-commit (local signature)
+# Walks non-merge commits on merge-base(default)..HEAD (all parents; not first-parent-only):
+#   1. git verify-commit (local signature) — required
 #   2. when upstream exists and gh is available, GitHub commit.verification.verified
+#      for commits already reachable from @{u}; missing remote SHAs stay local-only
 #
-# Skip PRE_PR_CHECKS_SKIP=verified-commits. Bot authors ([bot] / dependabot) are skipped.
-# See repository-helpers#528.
+# Skip PRE_PR_CHECKS_SKIP=verified-commits. Bot authors (name ending in [bot], or
+# dependabot) are skipped. See repository-helpers#528.
 set -euo pipefail
 
 if declare -F pre_pr_verified_commits_run >/dev/null 2>&1; then
@@ -27,6 +28,7 @@ source "${_pre_pr_vc_lib_dir}/github-repo-slug"
 pre_pr_verified_commits_run() {
   local -r root="$1"
   local base_ref base head sha author verified_json origin_url slug upstream_ok=0 gh_ok=0
+  local rev_list_out rev_list_rc=0
   local -a shas=()
 
   head="$(runner_exec_stdout "verified-commits rev-parse HEAD" \
@@ -52,19 +54,24 @@ pre_pr_verified_commits_run() {
   base="$(runner_exec_stdout "verified-commits merge-base ${base_ref}" \
     -- git -C "$root" merge-base "$base_ref" "$head")" || base=''
   if [[ -z "$base" ]]; then
-    printf '==> verified-commits: merge-base failed; skipping\n' >&2
-    return 0
+    printf 'ERROR: UNVERIFIED_COMMIT sha=unknown reason=local detail=merge-base failed\n' >&2
+    return 1
   fi
 
-  # First-parent, non-merge commits only (skip sync/rebase merge commits).
+  # All non-merge commits in the range (not --first-parent — docs require every
+  # non-merge commit ahead of main, including those brought in via merges).
+  rev_list_out="$(
+    runner_exec_stdout "verified-commits rev-list ${base}..${head}" \
+      -- git -C "$root" rev-list --no-merges "${base}..${head}"
+  )" || rev_list_rc=$?
+  if [[ "$rev_list_rc" -ne 0 ]]; then
+    printf 'ERROR: UNVERIFIED_COMMIT sha=unknown reason=local detail=rev-list failed\n' >&2
+    return 1
+  fi
   while IFS= read -r sha || [[ -n "$sha" ]]; do
     [[ -n "$sha" ]] || continue
     shas+=("$sha")
-  done < <(
-    runner_exec_stdout "verified-commits rev-list ${base}..${head}" \
-      -- git -C "$root" rev-list --first-parent --no-merges "${base}..${head}" \
-      || true
-  )
+  done <<<"$rev_list_out"
 
   if [[ "${#shas[@]}" -eq 0 ]]; then
     printf '==> verified-commits: no commits ahead of %s\n' "$base_ref" >&2
@@ -103,6 +110,14 @@ pre_pr_verified_commits_run() {
     fi
 
     if (( upstream_ok == 1 && gh_ok == 1 )); then
+      # Only query GitHub when the SHA is already on the tracked upstream tip
+      # (pre-push commits are local-ok only; avoids fail-open on 404).
+      if ! runner_exec "verified-commits sha on upstream ${sha}" --probe \
+        -- git -C "$root" merge-base --is-ancestor "$sha" '@{u}'; then
+        printf '==> verified-commits: %s not on upstream yet; GitHub check deferred\n' \
+          "$sha" >&2
+        continue
+      fi
       origin_url="$(runner_exec_stdout "verified-commits remote get-url" --probe -- git -C "$root" remote get-url origin || true)"
       slug=''
       if [[ -n "$origin_url" ]]; then
@@ -110,17 +125,22 @@ pre_pr_verified_commits_run() {
       fi
       verified_json=''
       if [[ -n "$slug" ]]; then
+        # Cap wait: parallel pre-pr must not block for hours on secondary limits.
         # Keep waiter + `gh api` on one physical line (gh-api-waiter-count ratchet).
         # shellcheck disable=SC2086  # not word-splitting; single argv list
-        verified_json="$(github_api_exec_with_rate_limit_retry "verified-commits commit ${sha}" --probe -- gh api "repos/${slug}/commits/${sha}" --jq '.commit.verification.verified' || true)"
+        verified_json="$(
+          GITHUB_API_RATE_LIMIT_MAX_RETRIES=1 \
+          GITHUB_API_RATE_LIMIT_MAX_WAIT_S=60 \
+            github_api_exec_with_rate_limit_retry "verified-commits commit ${sha}" --probe -- gh api "repos/${slug}/commits/${sha}" --jq '.commit.verification.verified' || true
+        )"
       fi
       if [[ "$verified_json" == 'true' ]]; then
         continue
       fi
       if [[ -z "$verified_json" || "$verified_json" == 'null' ]]; then
-        printf '==> verified-commits: GitHub verification unknown for %s; local ok\n' \
+        printf 'ERROR: UNVERIFIED_COMMIT sha=%s reason=github detail=verification unknown after push\n' \
           "$sha" >&2
-        continue
+        return 1
       fi
       printf 'ERROR: UNVERIFIED_COMMIT sha=%s reason=github detail=verification.verified=%s\n' \
         "$sha" "$verified_json" >&2
@@ -155,15 +175,28 @@ pre_pr_verified_commits_should_plan() {
     -- git -C "$root" merge-base "$base_ref" "$head" 2>/dev/null)" || return 1
   count="$(
     runner_exec_stdout "verified-commits plan rev-list count" --probe \
-      -- git -C "$root" rev-list --first-parent --no-merges --count "${base}..${head}" \
+      -- git -C "$root" rev-list --no-merges --count "${base}..${head}" \
       2>/dev/null || true
   )"
   [[ "${count:-0}" =~ ^[1-9][0-9]*$ ]]
 }
 
+# Match GitHub Apps / Dependabot, not arbitrary substrings (e.g. "abot" emails).
 _pre_pr_verified_commits_author_is_bot() {
   local -r author="${1:-}"
-  [[ "$author" == *'[bot]'* ]] && return 0
-  [[ "$author" == *dependabot* ]] && return 0
+  local name email
+
+  name="${author%% <*}"
+  email=''
+  if [[ "$author" == *'<'*'>' ]]; then
+    email="${author##*<}"
+    email="${email%>}"
+  fi
+  # GitHub Apps: "Some Bot [bot] <…>"
+  [[ "$name" == *'[bot]' ]] && return 0
+  # Dependabot classic / app
+  [[ "${name,,}" == 'dependabot' || "${name,,}" == 'dependabot[bot]' ]] && return 0
+  [[ "${email,,}" == *'[bot]@'* ]] && return 0
+  [[ "${email,,}" == 'dependabot'*'@'* ]] && return 0
   return 1
 }
