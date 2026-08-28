@@ -184,6 +184,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
 | License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
 | Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` + `.cursor/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve |
+| Pre-PR checks cursor rule | yes* | — | `.cursor/rules/pre-pr-checks.mdc`: format before check + no truncated output (*missing FAILS `--new-repo` only; SUGGEST under org `--strict-onboarding` during roll-out; invalid FAILS `--new-repo` / `--strict-onboarding`) |
 | Git commit identity cursor rule | yes | — | `.cursor/rules/git-commit-identity.mdc` forbids agent/machine co-authors; agents must verify commit signing (`commit.gpgsign` / `user.signingkey`, pinentry-mac / passphrase / per-machine keys / clearsign probe) and `~/.cursor/cli-config.json` attribution, and surface setup instructions when either is missing |
 | Repo practices after config change | yes | — | `.cursor/rules/repo-practices-after-config-change.mdc` requires `github-repo-lint` after workflow/config edits; `pre-pr-checks` runs detect-first `repo-practices-lint` when the diff touches those paths |
 | Session-start read guidance | yes | — | `.cursor/rules/read-agents-and-rules.mdc` requires reading `AGENTS.md` and `.cursor/rules/` at the start of every new agent session |
@@ -522,6 +523,9 @@ Service repositories install via `scripts/setup-service` and optionally implemen
     (branch-vs-`main` range when possible). CI `secret-scan` remains post-push
     triage; this is the submit-path gate (see also deep/org scan #509 — TruffleHog via `scripts/secret-audit` / [docs/secret-audit-trufflehog.md](./docs/secret-audit-trufflehog.md)).
     Skip with `PRE_PR_CHECKS_SKIP=secret-scan`. Manual: `scripts/dev/secret-scan`.
+  - **Verified commits**: when the branch has commits ahead of `main`/`origin/main` —
+    `git verify-commit` locally, plus GitHub `verification.verified` when an upstream
+    exists (bot authors skipped). Skip with `PRE_PR_CHECKS_SKIP=verified-commits`.
   - Escape hatch: `PRE_PR_CHECKS_SKIP=job1,job2` (documented; no silent skip). Do **not** bypass a failing run with ad-hoc substitutes.
   - Also verifies the **primary worktree** is unchanged when checks finish.
 - Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).

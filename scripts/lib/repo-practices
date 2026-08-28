@@ -229,6 +229,7 @@ Audits GitHub conventions for org repositories:
     - CODEOWNERS with a repository-wide owner rule
     - .cursor/rules/git-commit-identity.mdc (no agent/machine co-authors; signing incl. pinentry/passphrase + cli-config checks)
     - .cursor/rules/pr-ship-and-review.mdc (canonical agent review loop)
+    - .cursor/rules/pre-pr-checks.mdc (format before check; no truncated output; roll-out SUGGEST)
     - .cursor/rules/read-agents-and-rules.mdc (session-start: read AGENTS.md + rules)
     - .cursor/rules/repo-practices-after-config-change.mdc (run github-repo-lint after config/workflow edits)
     - .gitignore must not ignore .cursor/rules/ (org cursor rules must be trackable)
@@ -1805,6 +1806,120 @@ rp_check_git_commit_identity() {
       rp_log_suggest \
         "${slug}: optionally document commit-identity policy in AGENTS.md (no Co-authored-by / signing + cli-config attribution)"
     fi
+  fi
+
+  return "$repo_fail"
+}
+
+readonly rp_pre_pr_checks_rule_path='.cursor/rules/pre-pr-checks.mdc'
+
+rp_pre_pr_checks_rule_template() {
+  local path
+
+  path="${rp_lib_dir}/repo-practices-cursor/pre-pr-checks.mdc"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing cursor rule template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat pre-pr-checks template" -- cat "$path"
+}
+
+rp_pre_pr_checks_rule_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_pre_pr_checks_rule_path}"
+      if [[ -f "$local_path" ]]; then
+        rp_runner_exec_stdout "repo-practices cat local pre-pr-checks" -- \
+          cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_pre_pr_checks_rule_template
+}
+
+# True when the cursor rule requires pre-pr-checks, format-before-check, and no
+# truncated pre-PR output (alwaysApply org rule).
+rp_pre_pr_checks_rule_is_valid() {
+  local -r text="$1"
+
+  if ! grep -qE '^alwaysApply:[[:space:]]*true([[:space:]]|$)' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qF 'scripts/dev/pre-pr-checks' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qF 'Apply formatters before check' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qF 'No truncated pre-PR output' <<<"$text"; then
+    return 1
+  fi
+  return 0
+}
+
+# Missing markers FAIL under --new-repo only (intake). Under --strict-onboarding
+# org --all, missing is SUGGEST-only during roll-out; invalid content FAILS.
+rp_check_pre_pr_checks_rule() {
+  local slug="$1"
+  local repo_fail=0
+  local rule_text
+  local fetch_ec=0
+
+  rule_text="$(rp_fetch_github_text_file "$slug" "$rp_pre_pr_checks_rule_path")" \
+    || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      rp_log_gh_api_fail "$slug" "could not read ${rp_pre_pr_checks_rule_path}"
+      return 1
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: retry pre-pr-checks rule check after GitHub API recovers"
+    fi
+    return 0
+  fi
+  if [[ -z "$rule_text" ]]; then
+    # Intake only: do not fail org --strict-onboarding --all on missing rules (v1 roll-out).
+    if [[ "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'pre-pr-checks cursor rule (.cursor/rules/pre-pr-checks.mdc)' \
+        "$(rp_github_url "$slug" '/new/main/.cursor/rules/pre-pr-checks.mdc')"
+    fi
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_pre_pr_checks_rule_path" \
+        "$(rp_pre_pr_checks_rule_content_for_apply_fix "$slug")" \
+        'add-pre-pr-checks-rule' \
+        'chore: add pre-pr-checks cursor rule (format before check)'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add .cursor/rules/pre-pr-checks.mdc (template: scripts/lib/repo-practices-cursor/)"
+    fi
+  elif ! rp_pre_pr_checks_rule_is_valid "$rule_text"; then
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'pre-pr-checks rule must require format-before-check and no truncated output (alwaysApply: true)' \
+        "$(rp_github_url "$slug" "/blob/main/${rp_pre_pr_checks_rule_path}")"
+    fi
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_pre_pr_checks_rule_path" \
+        "$(rp_pre_pr_checks_rule_content_for_apply_fix "$slug")" \
+        'sync-pre-pr-checks-rule' \
+        'chore: sync pre-pr-checks cursor rule (format before check)'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: sync .cursor/rules/pre-pr-checks.mdc to require format-before-check and no truncated pre-PR output"
+    fi
+  else
+    rp_log_check_ok "$slug" 'pre-pr-checks cursor rule' \
+      "$(rp_github_url "$slug" "/blob/main/${rp_pre_pr_checks_rule_path}")"
   fi
 
   return "$repo_fail"
@@ -5972,6 +6087,7 @@ rp_print_new_repo_checklist() {
       [ ] CODEOWNERS with * @OWNER so all code requires CODEOWNER review
       [ ] .cursor/rules/git-commit-identity.mdc (no agent/machine co-authors; signing incl. pinentry/passphrase + cli-config attribution; template in ${rp_THIS_REPO_NAME})
       [ ] .cursor/rules/pr-ship-and-review.mdc (agent review loop; template in ${rp_THIS_REPO_NAME})
+      [ ] .cursor/rules/pre-pr-checks.mdc (format before check; no truncated output; template in ${rp_THIS_REPO_NAME})
       [ ] .cursor/rules/read-agents-and-rules.mdc (session-start read AGENTS.md + rules; template in ${rp_THIS_REPO_NAME})
       [ ] .cursor/rules/repo-practices-after-config-change.mdc (run github-repo-lint after config/workflow edits; template in ${rp_THIS_REPO_NAME})
       [ ] .gitignore must not ignore .cursor/rules/ (un-ignore if ignoring other .cursor content)
@@ -7237,6 +7353,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_pr_ship_and_review_rule "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_pre_pr_checks_rule "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_stacking_tool "$slug"; then

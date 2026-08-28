@@ -79,6 +79,9 @@ Jobs (parallel where independent; skip with PRE_PR_CHECKS_SKIP=job1,job2):
   - secret-scan — when `.github/ci/secret-scan` or `scripts/dev/secret-scan` exists
     (gitleaks via canonical ci-secret-scan; installs under ~/.cache if needed).
     Skip with PRE_PR_CHECKS_SKIP=secret-scan
+  - verified-commits — when the branch has commits ahead of main/origin/main:
+    `git verify-commit` locally, and GitHub `verification.verified` when the branch
+    has an upstream (skip bots). Skip with PRE_PR_CHECKS_SKIP=verified-commits
 
 Also enforces:
   - Stack worktree (not the primary clone)
@@ -252,6 +255,7 @@ start_planned_parallel_checks() {
       cargo-clippy) start_parallel_job 'cargo-clippy' prec_run_cargo_clippy "$check_root" ;;
       repo-practices-lint) start_parallel_job 'repo-practices-lint' prec_run_repo_practices_lint "$check_root" ;;
       secret-scan) start_parallel_job 'secret-scan' prec_run_secret_scan "$check_root" ;;
+      verified-commits) start_parallel_job 'verified-commits' prec_run_verified_commits "$check_root" ;;
       *)
         die "Unknown planned job: ${job}"
         ;;
@@ -318,16 +322,25 @@ parse_args() {
 }
 
 warn_if_format_left_dirty() {
-  local dirty
-  dirty="$(runner_exec_stdout "git status porcelain after format apply" -- git -C "$check_root" status --porcelain || true)"
-  if [[ -n "$dirty" ]]; then
-    printf 'WARNING: format apply left uncommitted changes in %s — commit before submit:\n' \
-      "$check_root" >&2
-    printf '%s\n' "$dirty" >&2
+  local -r before_porcelain="$1"
+  local after_porcelain
+
+  # Only when a formatter actually ran — otherwise pre-existing dirty files / .venv
+  # noise would false-positive on every --fix run.
+  [[ "${prec_formatters_applied:-0}" -eq 1 ]] || return 0
+
+  after_porcelain="$(runner_exec_stdout "git status porcelain after format apply" -- git -C "$check_root" status --porcelain || true)"
+  if [[ "$after_porcelain" == "$before_porcelain" ]]; then
+    return 0
   fi
+  printf 'WARNING: format apply changed the worktree in %s — commit before submit:\n' \
+    "$check_root" >&2
+  printf '%s\n' "$after_porcelain" >&2
 }
 
 main() {
+  local before_porcelain
+
   parse_args "$@"
   trap on_exit EXIT
 
@@ -339,9 +352,10 @@ main() {
 
   prec_require_tools_for_planned
   if [[ "$prec_pr_format_apply" -eq 1 ]]; then
+    before_porcelain="$(runner_exec_stdout "git status porcelain before format apply" -- git -C "$check_root" status --porcelain || true)"
     log_step 'format apply (PRE_PR_CHECKS_FORMAT=apply / --fix)'
     prec_apply_formatters "$check_root"
-    warn_if_format_left_dirty
+    warn_if_format_left_dirty "$before_porcelain"
   fi
   start_planned_parallel_checks
   wait_parallel_checks
