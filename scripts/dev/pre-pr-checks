@@ -44,7 +44,7 @@ prec_pr_test_isolate_dir=""
 usage() {
   cat >&2 <<'USAGE'
 Usage:
-  scripts/dev/pre-pr-checks
+  scripts/dev/pre-pr-checks [--fix]
 
 Run from a stack worktree (.worktrees/<stack>-wt) of the repository you are about
 to submit. Exits non-zero if any check fails.
@@ -52,6 +52,19 @@ to submit. Exits non-zero if any check fails.
 Detect-first: inspects the check-root for Python (pyproject.toml), TypeScript
 (web/ or root pnpm), Rust (Cargo.toml), shell targets, workflows, and
 tests/*.test — then requires tools and starts jobs only for detected ecosystems.
+
+Jobs are check-only by default (e.g. `ruff format --check`, `cargo fmt -- --check`).
+Apply formatters before the gate after review-fix edits — especially string literals:
+
+  uv run ruff format .          # Python
+  cargo fmt --all               # Rust
+  scripts/dev/pre-pr-checks
+  # or one shot (mutates the worktree; commit format diffs before submit):
+  scripts/dev/pre-pr-checks --fix
+  # same as: PRE_PR_CHECKS_FORMAT=apply scripts/dev/pre-pr-checks
+
+Do not pipe this script to tail/head — require exit 0 and
+`==> pre-pr-checks passed` from the full run. pytest / ruff check alone is not a pass.
 
 Jobs (parallel where independent; skip with PRE_PR_CHECKS_SKIP=job1,job2):
   - bash-n / shellcheck -S info — helpers-style (scripts/dev/pre-pr-checks) CI globs;
@@ -75,6 +88,9 @@ Before submit-stack / ship-and-review, run this script (or use scripts/dev/submi
 Do not bypass a failing run unless using an explicit PRE_PR_CHECKS_SKIP escape hatch.
 USAGE
 }
+
+# Set by parse_args / PRE_PR_CHECKS_FORMAT=apply
+prec_pr_format_apply=0
 
 log_step() {
   printf '==> %s\n' "$*" >&2
@@ -287,11 +303,31 @@ parse_args() {
         usage
         exit 0
         ;;
+      --fix)
+        prec_pr_format_apply=1
+        shift
+        ;;
       *)
         die "Unknown argument: $1 (see --help)"
         ;;
     esac
   done
+  if [[ "${PRE_PR_CHECKS_FORMAT:-}" == 'apply' ]]; then
+    prec_pr_format_apply=1
+  fi
+}
+
+warn_if_format_left_dirty() {
+  local dirty
+  dirty="$(
+    runner_exec_stdout "git status porcelain after format apply" -- \
+      git -C "$check_root" status --porcelain || true
+  )"
+  if [[ -n "$dirty" ]]; then
+    printf 'WARNING: format apply left uncommitted changes in %s — commit before submit:\n' \
+      "$check_root" >&2
+    printf '%s\n' "$dirty" >&2
+  fi
 }
 
 main() {
@@ -305,6 +341,11 @@ main() {
   log_step "detected: $(prec_format_detected) ; jobs: $(prec_format_planned_jobs)"
 
   prec_require_tools_for_planned
+  if [[ "$prec_pr_format_apply" -eq 1 ]]; then
+    log_step 'format apply (PRE_PR_CHECKS_FORMAT=apply / --fix)'
+    prec_apply_formatters "$check_root"
+    warn_if_format_left_dirty
+  fi
   start_planned_parallel_checks
   wait_parallel_checks
 

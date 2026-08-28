@@ -509,6 +509,7 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 - Keep each branch in the stack focused on exactly one logical change. Stacks should map 1-to-1 with milestones or sub-tasks from [dep-updater.plan.md](./dep-updater.plan.md).
 - Sync via `scripts/dev/start-development` (marker-aware). For `gh-stack`, use `gh stack sync` / `gh stack rebase` as needed; for Graphite, `gt sync` / `gt restack`.
 - **Before opening/submitting a PR**, run **`scripts/dev/pre-pr-checks`** from your feature worktree (or use **`scripts/dev/submit-stack`**). Do not submit without passing pre-pr-checks first.
+- **Apply formatters before the gate** when planned jobs include format checks: `uv run ruff format .` / `cargo fmt --all`, then `scripts/dev/pre-pr-checks` (or `scripts/dev/pre-pr-checks --fix` / `PRE_PR_CHECKS_FORMAT=apply`). Commit format-only diffs before submit. Do **not** pipe pre-pr-checks to `tail`/`head`; require exit 0 and `==> pre-pr-checks passed`. `pytest` / `ruff check` alone is not a pre-PR pass.
 - `pre-pr-checks` **detects the project type first** (filesystem markers only), then requires tools and runs **only planned jobs** in parallel:
   - **Shell**: helpers-style (`scripts/dev/pre-pr-checks`) → CI globs + `bash -n` / `shellcheck -S info`; or consumer `.github/ci/shellcheck` wrapper when present. Not every repo with a `scripts/` tree.
   - **Workflows**: `actionlint` when helpers-style or when workflows already invoke actionlint
