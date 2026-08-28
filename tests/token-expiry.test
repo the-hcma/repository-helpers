@@ -205,6 +205,50 @@ set -e
 assert_exit_0 'checker: unmanaged OAuth secret stays green' "$unmanaged_out" "$unmanaged_rc"
 assert_contains 'checker: missing header is called out as unmanaged' \
   "$unmanaged_out" 'WARNING: TOKEN_EXPIRY_UNMANAGED secret=DEP_UPDATER_TOKEN env=dep-updater'
+assert_contains 'checker: CI unmanaged message asks for a fine-grained PAT' \
+  "$unmanaged_out" 'Migrate it to a fine-grained PAT'
+
+printf '\n=== functional: host OAuth unmanaged is NOTE, not WARNING ===\n'
+# The batch timer authenticates via `gh auth login`; no expiry header is expected.
+# Emitting WARNING for that case filled "Expiring credentials" with noise.
+host_unmanaged_line=""
+ci_unmanaged_line=""
+host_unmanaged_line="$(
+  bash <<EOF
+set -euo pipefail
+$(sed -n '/^_token_expiry_status_line()/,/^}/p' "$lib")
+_token_expiry_status_line unmanaged 0 'local gh credential' 'host' ''
+EOF
+)"
+ci_unmanaged_line="$(
+  bash <<EOF
+set -euo pipefail
+$(sed -n '/^_token_expiry_status_line()/,/^}/p' "$lib")
+_token_expiry_status_line unmanaged 0 'DEP_UPDATER_TOKEN' 'dep-updater' ''
+EOF
+)"
+assert_contains 'status line: host OAuth unmanaged is NOTE' \
+  "$host_unmanaged_line" \
+  'NOTE: TOKEN_EXPIRY_UNMANAGED secret=local gh credential env=host'
+assert_contains 'status line: CI unmanaged stays WARNING' \
+  "$ci_unmanaged_line" \
+  'WARNING: TOKEN_EXPIRY_UNMANAGED secret=DEP_UPDATER_TOKEN env=dep-updater'
+
+host_emit_out=""
+host_emit_out="$(
+  bash <<EOF
+set -euo pipefail
+$(sed -n '/^_token_expiry_emit()/,/^}/p' "$lib")
+$(sed -n '/^_token_expiry_status_line()/,/^}/p' "$lib")
+_token_expiry_emit unmanaged 0 'local gh credential' 'host' '' 2>&1
+EOF
+)"
+assert_contains 'emit: host unmanaged explains expected OAuth' \
+  "$host_emit_out" 'Expected on the batch host'
+assert_not_contains 'emit: host unmanaged does not demand a PAT migration' \
+  "$host_emit_out" 'Migrate it to a fine-grained PAT'
+assert_not_contains 'emit: host unmanaged does not emit Actions warning' \
+  "$host_emit_out" '::warning::'
 
 printf '\n=== functional: Actions annotations only under GITHUB_ACTIONS ===\n'
 set +e
@@ -393,9 +437,9 @@ assert_contains 'batch email: scrapes the expiring-credential line' \
   "$cred_out" 'DEP_UPDATER_TOKEN'
 assert_contains 'batch email: keeps the day count' "$cred_out" 'days=5'
 
-# Every actionable status must be scraped, not just the warning one.
+# Actionable expiry statuses only — unmanaged OAuth is not "expiring".
 for cred_status in \
-  'WARNING:TOKEN_EXPIRY_UNMANAGED' \
+  'WARNING:TOKEN_EXPIRY_SOON' \
   'ERROR:TOKEN_EXPIRY_EXPIRED' \
   'ERROR:TOKEN_EXPIRY_INVALID'; do
   cred_prefix="${cred_status%%:*}"
@@ -409,6 +453,22 @@ for cred_status in \
   )"
   assert_contains "batch email: scrapes ${cred_token}" "$status_out" "$cred_token"
 done
+
+# Host OAuth (and any UNMANAGED line) must not appear under "Expiring credentials".
+printf '%s\n' \
+  'NOTE: TOKEN_EXPIRY_UNMANAGED secret=local gh credential env=host days=0 expires=unknown' \
+  'WARNING: TOKEN_EXPIRY_UNMANAGED secret=DEP_UPDATER_TOKEN env=dep-updater days=0 expires=unknown' \
+  >"$cred_log"
+unmanaged_cred_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^batch_report_credential_lines\(\)/,/^}$/' "$batch_run")
+  batch_report_credential_lines "$cred_log"
+)"
+if [[ -z "$unmanaged_cred_out" ]]; then
+  pass_case 'batch email: unmanaged OAuth is not reported as expiring'
+else
+  fail_case "batch email: expected unmanaged to be silent, got '${unmanaged_cred_out}'"
+fi
 
 printf '%s\n' '[batch-all] OK (demo-repo) (12s)' >"$cred_log"
 clean_cred_out="$(
