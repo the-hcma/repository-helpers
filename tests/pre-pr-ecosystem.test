@@ -155,7 +155,7 @@ else
   fail_case "python-only: detected python (got ${detected})"
 fi
 if [[ "$planned" == *python-static* && "$planned" != *cargo* && "$planned" != *ts-* \
-  && "$planned" != *shellcheck* ]]; then
+  && "$planned" != *shellcheck* && "$planned" != *pytest-hermetic* ]]; then
   pass_case 'python-only: planned python-static; no shellcheck without helpers/wrapper'
 else
   fail_case "python-only: planned jobs (got ${planned})"
@@ -172,6 +172,79 @@ else
   fail_case 'python-only: no cargo/pnpm in planned tools'
 fi
 rm -rf "$py_fix"
+
+printf '\n=== detect: pytest-hermetic wrapper plans hermetic job (#555) ===\n'
+herm_fix="$(mktemp -d)"
+make_git_fixture "$herm_fix"
+printf '[project]\nname = "x"\n' >"${herm_fix}/pyproject.toml"
+mkdir -p "${herm_fix}/.github/ci"
+printf '#!/usr/bin/env bash\nset -euo pipefail\nuv run pytest -m '\''not live'\'' -q\n' \
+  >"${herm_fix}/.github/ci/pytest-hermetic"
+chmod +x "${herm_fix}/.github/ci/pytest-hermetic"
+commit_all "$herm_fix"
+unset PRE_PR_CHECKS_SKIP
+prec_detect_profile "$herm_fix"
+planned="$(prec_format_planned_jobs)"
+if [[ "$planned" == *python-static* && "$planned" == *pytest-hermetic* ]]; then
+  pass_case 'pytest-hermetic: plans python-static and pytest-hermetic when wrapper exists'
+else
+  fail_case "pytest-hermetic: expected both jobs (got ${planned})"
+fi
+# Exercise prec_require_tools_for_planned with only pytest-hermetic planned so
+# the python-static uv branch cannot mask a missing pytest-hermetic check.
+# shellcheck disable=SC2034 # array is read by prec_job_is_planned inside the gate
+prec_planned_jobs=('pytest-hermetic')
+no_uv_bin="$(mktemp -d)"
+ln -s "$(command -v bash)" "${no_uv_bin}/bash"
+require_out=""
+require_rc=0
+set +e
+require_out="$(PATH="$no_uv_bin" prec_require_tools_for_planned 2>&1)"
+require_rc=$?
+set -e
+rm -rf "$no_uv_bin"
+if [[ "$require_rc" -ne 0 ]] && grep -qF 'uv not found' <<<"$require_out"; then
+  pass_case 'pytest-hermetic: prec_require_tools_for_planned fails without uv'
+else
+  fail_case "pytest-hermetic: expect uv missing die (rc=${require_rc})\n${require_out}"
+fi
+# Absent wrapper must not plan the job (already covered by python-only above).
+rm -rf "$herm_fix"
+
+printf '\n=== behavioural: pytest-hermetic runner invokes the wrapper (#555) ===\n'
+run_fix="$(mktemp -d)"
+make_git_fixture "$run_fix"
+printf '[project]\nname = "x"\n' >"${run_fix}/pyproject.toml"
+mkdir -p "${run_fix}/.github/ci"
+printf '#!/usr/bin/env bash\nset -euo pipefail\nprintf "hermetic-ok\\n"\n' \
+  >"${run_fix}/.github/ci/pytest-hermetic"
+chmod +x "${run_fix}/.github/ci/pytest-hermetic"
+commit_all "$run_fix"
+herm_out=""
+herm_rc=0
+set +e
+herm_out="$(prec_run_pytest_hermetic "$run_fix" 2>&1)"
+herm_rc=$?
+set -e
+if [[ "$herm_rc" -eq 0 ]] && grep -qF 'hermetic-ok' <<<"$herm_out"; then
+  pass_case 'pytest-hermetic: runner executes .github/ci/pytest-hermetic'
+else
+  fail_case "pytest-hermetic: runner failed (rc=${herm_rc})\n${herm_out}"
+fi
+# Failing wrapper must fail the job.
+printf '#!/usr/bin/env bash\nset -euo pipefail\nexit 7\n' \
+  >"${run_fix}/.github/ci/pytest-hermetic"
+chmod +x "${run_fix}/.github/ci/pytest-hermetic"
+set +e
+prec_run_pytest_hermetic "$run_fix" >/dev/null 2>&1
+herm_rc=$?
+set -e
+if [[ "$herm_rc" -ne 0 ]]; then
+  pass_case 'pytest-hermetic: failing wrapper fails the pre-pr job'
+else
+  fail_case 'pytest-hermetic: failing wrapper must not exit 0'
+fi
+rm -rf "$run_fix"
 
 printf '\n=== detect: helpers-style plans shellcheck ===\n'
 hs_fix="$(mktemp -d)"
@@ -567,6 +640,7 @@ help_output="$(bash "$pre_pr_checks" --help 2>&1)" || help_exit=$?
 assert_exit_0 "ecosystem --help" "$help_output" "$help_exit"
 assert_contains "ecosystem --help detect" "$help_output" "Detect-first"
 assert_contains "ecosystem --help SKIP" "$help_output" "PRE_PR_CHECKS_SKIP"
+assert_contains "ecosystem --help pytest-hermetic" "$help_output" "pytest-hermetic"
 assert_contains "ecosystem --help --fix" "$help_output" "--fix"
 assert_contains "ecosystem --help FORMAT env" "$help_output" "PRE_PR_CHECKS_FORMAT=apply"
 
