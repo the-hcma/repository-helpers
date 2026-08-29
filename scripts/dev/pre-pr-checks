@@ -71,7 +71,9 @@ Jobs (parallel where independent; skip with PRE_PR_CHECKS_SKIP=job1,job2):
   - bash-n / shellcheck -S info — helpers-style (scripts/dev/pre-pr-checks) CI globs;
     or consumer `.github/ci/shellcheck` wrapper when present
   - actionlint — helpers-style, or when workflows already invoke actionlint
-  - tests — bash tests/*.test when present (sequential, isolated TMPDIR)
+  - tests — bash tests/*.test when present (sequential, isolated TMPDIR +
+    per-test RUNNER_SESSION_ROOT; each parallel job also gets its own runner
+    session so runner_exec_stdout cannot race siblings — #556)
   - python-static — .github/ci/python-static or uv ruff/pyright fallback
   - pytest-hermetic — when `.github/ci/pytest-hermetic` exists (same hermetic
     subset CI runs; not live / network Graph tests). Skip with
@@ -159,16 +161,26 @@ init_parallel_jobs() {
 }
 
 # Run one check in the background; writes ${job_name}.log and ${job_name}.rc under prec_pr_jobs_dir.
+# Each job gets its own RUNNER_SESSION_DIR under prec_pr_jobs_dir — parallel jobs must not
+# inherit the parent session (runner_last_id / stdout races; repository-helpers#556).
 start_parallel_job() {
   local job_name="$1"
   shift
   local log_file="${prec_pr_jobs_dir}/${job_name}.log"
   local rc_file="${prec_pr_jobs_dir}/${job_name}.rc"
+  local job_session_root="${prec_pr_jobs_dir}/runner-sessions/${job_name}"
   prec_pr_job_count=$(( prec_pr_job_count + 1 ))
   (
     set +e
+    unset RUNNER_SESSION_DIR RUNNER_SESSION_KEEP
+    # Intentional: isolate this parallel job's runner session from the parent and siblings.
+    # shellcheck disable=SC2030
+    export RUNNER_SESSION_ROOT="$job_session_root"
+    mkdir -p "$RUNNER_SESSION_ROOT"
+    runner_session_begin
     "$@" >"$log_file" 2>&1
     printf '%s\n' "$?" >"$rc_file"
+    runner_session_end
   ) &
 }
 
@@ -214,7 +226,12 @@ job_test_file() {
   rc=0
   (
     export TMPDIR="$test_tmp"
+    # Keep runner artifacts inside the isolate dir so suite children cannot race
+    # sibling parallel jobs (or each other) on ~/scratch/.../runner-sessions (#556).
+    # shellcheck disable=SC2031  # intentional per-test isolate; parent must not inherit
+    export RUNNER_SESSION_ROOT="${test_tmp}/runner-sessions"
     unset RUNNER_SESSION_DIR RUNNER_SESSION_KEEP
+    mkdir -p "$RUNNER_SESSION_ROOT"
     bash "$test_path"
   ) || rc=$?
   rm -rf "$test_tmp"
