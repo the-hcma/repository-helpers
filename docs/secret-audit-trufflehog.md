@@ -156,7 +156,8 @@ The host timer never takes this path.
 | --- | --- |
 | `ERROR: SECRET_AUDIT_LEAK …` | TruffleHog exit **183** (`--fail`) — rotate credentials; do not refresh marker |
 | `ERROR: SECRET_AUDIT_MARKER_MISSING …` | Lint: no valid marker on default branch (strict / new-repo) |
-| `ERROR: SECRET_AUDIT_SCAN_FAILED …` | Tool / install / network failure |
+| `ERROR: SECRET_AUDIT_SCAN_FAILED …` | Tool / install / network / org-scan failure |
+| `ERROR: SECRET_AUDIT_INFRA_FAILED …` | Batch exit non-zero with clean counters **and** no `ERROR: SECRET_AUDIT_SCAN_FAILED` in the transcript (teardown / runner infra; #540 / #541). A 0/0 counter line alone does not imply INFRA when the scan already failed. |
 
 Remediation: revoke and rotate, remove secrets from the tree, re-scan. History
 rewrite requires explicit human ownership — the wrapper never auto-purges git
@@ -182,9 +183,11 @@ paths. Follows timer oneshot conventions (`docs/SYSTEMD.md`): timer-only activat
 + flock.
 
 **Email privacy:** the batch report is summary-only — PASS/FAIL, org, exit/result,
-repos in scope (names from the org API), passed/failed counts, TruffleHog finding
-*counts* (verified/unverified secret matches — not “repos vetted”), scan duration,
-and the path to the host transcript. Wall-clock Started/Finished appear once in the
+optional `Primary:` / `Command failures` from the runner session (labels, exit codes,
+tool stderr hints only), repos in scope (names from the org API), passed/failed counts,
+TruffleHog finding *counts* (verified/unverified secret matches — not “repos vetted”),
+scan duration (rounded to two decimals for display), and the path to the host transcript.
+Wall-clock Started/Finished appear once in the
 run-context footer. Finding payloads are **never** emailed — full output is deposited
 under `SECRET_AUDIT_DETAIL_DIR` (default `~/scratch/repository-helpers/secret-audit-runs/`,
 mode `0600`) and also appended to the batch log. See repository-helpers#559.
