@@ -70,9 +70,10 @@ runner_session_default_root() {
 
 # runner_session_prune_stale
 # Removes session directories older than RUNNER_SESSION_MAX_AGE_DAYS (default 3).
-# Skips this process's RUNNER_SESSION_DIR and any session whose .owner_pid /
-# .active_pid still names a live process (nested begin must not wipe a quiet
-# parent — repository-helpers#527). Best-effort; never fails the caller.
+# Skips this process's RUNNER_SESSION_DIR and any session whose recorded owner
+# (or active command) still matches a live process with the same starttime
+# (nested begin must not wipe a quiet parent — repository-helpers#527).
+# Best-effort; never fails the caller.
 runner_session_prune_stale() {
   local root max_days active_dir
 
@@ -101,26 +102,68 @@ runner_session_prune_stale() {
 }
 
 # runner_session_dir_has_live_owner <session_dir>
-# True when .owner_pid or .active_pid names a still-running process.
+# True when .owner_pid(+.owner_starttime) or .active_pid names the same still-
+# running process (PID + starttime), not a recycled PID.
 runner_session_dir_has_live_owner() {
   local -r dir="$1"
-  local pid marker
+  local pid recorded_start live_start raw
 
-  for marker in .active_pid .owner_pid; do
-    [[ -f "${dir}/${marker}" ]] || continue
-    pid="$(tr -d '[:space:]' <"${dir}/${marker}" 2>/dev/null || true)"
-    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
-    if kill -0 "$pid" 2>/dev/null; then
+  if [[ -f "${dir}/.owner_pid" ]]; then
+    raw=''
+    raw="$(<"${dir}/.owner_pid")" || raw=''
+    pid="${raw//[[:space:]]/}"
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null; then
+      recorded_start=''
+      if [[ -f "${dir}/.owner_starttime" ]]; then
+        raw=''
+        raw="$(<"${dir}/.owner_starttime")" || raw=''
+        recorded_start="${raw//[[:space:]]/}"
+      fi
+      live_start="$(runner_session_proc_starttime "$pid" || true)"
+      if [[ -n "$recorded_start" && -n "$live_start" && "$recorded_start" == "$live_start" ]]; then
+        return 0
+      fi
+      # Legacy sessions without starttime: treat kill -0 as live (pre-#527).
+      if [[ -z "$recorded_start" ]]; then
+        return 0
+      fi
+    fi
+  fi
+
+  if [[ -f "${dir}/.active_pid" ]]; then
+    raw=''
+    raw="$(<"${dir}/.active_pid")" || raw=''
+    pid="${raw//[[:space:]]/}"
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null; then
       return 0
     fi
-  done
+  fi
   return 1
+}
+
+# runner_session_proc_starttime <pid>
+# Prints field 22 (starttime) from /proc/<pid>/stat, or fails if unavailable.
+runner_session_proc_starttime() {
+  local -r pid="$1"
+  local stat after_comm
+  local -a fields=()
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r "/proc/${pid}/stat" ]] || return 1
+  stat="$(<"/proc/${pid}/stat")"
+  # pid (comm) state … — comm may contain spaces/parens; strip through last ") ".
+  after_comm="${stat##*)}"
+  after_comm="${after_comm# }"
+  read -r -a fields <<<"$after_comm"
+  # Original field 22 → index 19 after removing pid+(comm) (fields 1–2).
+  [[ -n "${fields[19]:-}" ]] || return 1
+  printf '%s\n' "${fields[19]}"
 }
 
 # runner_session_begin
 # Creates RUNNER_SESSION_DIR and exports it. Idempotent when already set.
 runner_session_begin() {
-  local base
+  local base owner_pid starttime
 
   if [[ -n "${RUNNER_SESSION_DIR:-}" && -d "${RUNNER_SESSION_DIR}" ]]; then
     return 0
@@ -130,8 +173,14 @@ runner_session_begin() {
   mkdir -p "$base"
   RUNNER_SESSION_DIR="$(mktemp -d "${base}/session.XXXXXX")"
   export RUNNER_SESSION_DIR
-  # Survives idle parents so a child's prune does not rm -rf this tree (#527).
-  printf '%s\n' "$$" >"${RUNNER_SESSION_DIR}/.owner_pid"
+  # BASHPID: correct for background subshells ($$ stays the parent). Pair with
+  # starttime so prune is not fooled by PID reuse (#527).
+  owner_pid="${BASHPID:-$$}"
+  printf '%s\n' "$owner_pid" >"${RUNNER_SESSION_DIR}/.owner_pid"
+  starttime="$(runner_session_proc_starttime "$owner_pid" || true)"
+  if [[ -n "$starttime" ]]; then
+    printf '%s\n' "$starttime" >"${RUNNER_SESSION_DIR}/.owner_starttime"
+  fi
 }
 
 # runner_session_ensure — begin if needed.

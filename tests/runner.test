@@ -430,7 +430,11 @@ fi
 # Live owner must survive prune even when mtime is stale (#527 nested begin).
 live_stale="${scratch_root}/session.live-stale"
 mkdir -p "$live_stale"
-printf '%s\n' "$$" >"${live_stale}/.owner_pid"
+# Capture BASHPID outside $(...) — inside a command substitution it is the subshell.
+live_owner_pid="${BASHPID:-$$}"
+printf '%s\n' "$live_owner_pid" >"${live_stale}/.owner_pid"
+live_st="$(runner_session_proc_starttime "$live_owner_pid" || true)"
+[[ -n "$live_st" ]] && printf '%s\n' "$live_st" >"${live_stale}/.owner_starttime"
 touch -t 202001010000 "$live_stale" 2>/dev/null || true
 runner_session_prune_stale
 if [[ -d "$live_stale" ]]; then
@@ -440,7 +444,22 @@ else
   printf '[FAIL] runner_session_prune_stale deleted live-owned stale session\n'
   fail=$(( fail + 1 ))
 fi
-rm -rf "$live_stale"
+# PID reuse: live PID but wrong starttime must still be pruned.
+if [[ -d "$live_stale" ]]; then
+  printf '1\n' >"${live_stale}/.owner_starttime"
+  runner_session_prune_stale
+  if [[ ! -d "$live_stale" ]]; then
+    printf '[PASS] runner_session_prune_stale drops stale dirs on PID reuse (starttime mismatch)\n'
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] runner_session_prune_stale should prune on owner_starttime mismatch\n'
+    fail=$(( fail + 1 ))
+    rm -rf "$live_stale"
+  fi
+else
+  printf '[FAIL] runner_session_prune_stale should prune on owner_starttime mismatch (skipped; live dir missing)\n'
+  fail=$(( fail + 1 ))
+fi
 
 runner_session_begin
 if [[ "$RUNNER_SESSION_DIR" == "${scratch_root}/session."* ]]; then
@@ -451,14 +470,42 @@ else
     "$scratch_root" "$RUNNER_SESSION_DIR"
   fail=$(( fail + 1 ))
 fi
-if [[ -f "${RUNNER_SESSION_DIR}/.owner_pid" ]] \
-  && [[ "$(tr -d '[:space:]' <"${RUNNER_SESSION_DIR}/.owner_pid")" == "$$" ]]; then
-  printf '[PASS] runner_session_begin writes .owner_pid\n'
+owner_raw=''
+owner_raw="$(<"${RUNNER_SESSION_DIR}/.owner_pid")" || owner_raw=''
+if [[ "${owner_raw//[[:space:]]/}" == "${BASHPID:-$$}" ]]; then
+  printf '[PASS] runner_session_begin writes .owner_pid as BASHPID\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] runner_session_begin writes .owner_pid\n'
+  printf '[FAIL] runner_session_begin writes .owner_pid as BASHPID\n'
   fail=$(( fail + 1 ))
 fi
+if [[ -f "${RUNNER_SESSION_DIR}/.owner_starttime" ]]; then
+  printf '[PASS] runner_session_begin writes .owner_starttime\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] runner_session_begin writes .owner_starttime\n'
+  fail=$(( fail + 1 ))
+fi
+# Background subshell must record its own BASHPID, not the parent $$.
+subshell_pid_file="${scratch_root}/subshell_owner"
+(
+  unset RUNNER_SESSION_DIR
+  runner_session_begin
+  printf '%s\n' "$(<"${RUNNER_SESSION_DIR}/.owner_pid")" >"$subshell_pid_file"
+  printf '%s\n' "${BASHPID:-$$}" >"${subshell_pid_file}.bashpid"
+  runner_session_end
+) &
+wait "$!"
+if [[ -f "$subshell_pid_file" && -f "${subshell_pid_file}.bashpid" ]] \
+  && [[ "$(<"$subshell_pid_file")" == "$(<"${subshell_pid_file}.bashpid")" ]] \
+  && [[ "$(<"$subshell_pid_file")" != "$$" ]]; then
+  printf '[PASS] runner_session_begin in subshell records BASHPID not parent $$\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] runner_session_begin in subshell records BASHPID not parent $$\n'
+  fail=$(( fail + 1 ))
+fi
+rm -f "$subshell_pid_file" "${subshell_pid_file}.bashpid"
 runner_session_end 2>/dev/null || true
 unset RUNNER_SESSION_DIR RUNNER_SESSION_ROOT RUNNER_SESSION_MAX_AGE_DAYS
 rm -rf "$scratch_root"
