@@ -181,11 +181,13 @@ Reuses `~/.config/dep-updater.env` for SMTP; optional overlay
 paths. Follows timer oneshot conventions (`docs/SYSTEMD.md`): timer-only activation
 + flock.
 
-**Email privacy:** the batch report is summary-only (PASS/FAIL, org, timing, safe
-aggregate counts, result class, path to host transcript). TruffleHog finding
-payloads are **never** emailed — full output is deposited under
-`SECRET_AUDIT_DETAIL_DIR` (default `~/scratch/repository-helpers/secret-audit-runs/`,
-mode `0600`) and also appended to the batch log.
+**Email privacy:** the batch report is summary-only — PASS/FAIL, org, exit/result,
+repos in scope (names from the org API), passed/failed counts, TruffleHog finding
+*counts* (verified/unverified secret matches — not “repos vetted”), scan duration,
+and the path to the host transcript. Wall-clock Started/Finished appear once in the
+run-context footer. Finding payloads are **never** emailed — full output is deposited
+under `SECRET_AUDIT_DETAIL_DIR` (default `~/scratch/repository-helpers/secret-audit-runs/`,
+mode `0600`) and also appended to the batch log. See repository-helpers#559.
 
 ## AGPL note
 
@@ -199,5 +201,6 @@ automation does not trigger copyleft on this Bash repo.
 
 - Issue [#509](https://github.com/the-hcma/repository-helpers/issues/509)
 - Issue [#516](https://github.com/the-hcma/repository-helpers/issues/516) — exclude archived; concurrency; summary email
+- Issue [#559](https://github.com/the-hcma/repository-helpers/issues/559) — clearer batch email (repo list, findings vs pass/fail)
 - Fast gate: `scripts/dev/secret-scan` / `.github/ci/secret-scan` (gitleaks)
 - Lint check: `github-repo-lint` secret-audit intake marker (AGENTS.md / README tables)
