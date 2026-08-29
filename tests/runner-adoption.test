@@ -31,6 +31,80 @@ assert_contains 'runner-bootstrap calls runner_session_end on exit' \
   "$bootstrap_text" 'runner_session_end'
 assert_contains 'runner-bootstrap begins session' \
   "$bootstrap_text" 'runner_session_begin'
+assert_contains 'runner-bootstrap drops inherited RUNNER_SESSION_DIR (#540/#527)' \
+  "$bootstrap_text" 'unset RUNNER_SESSION_DIR'
+assert_contains 'runner-bootstrap is idempotent in one shell (#540/#527)' \
+  "$bootstrap_text" '_RUNNER_BOOTSTRAP_ACTIVE'
+assert_contains 'bootstrap EXIT preserves status even if session_end fails (#540)' \
+  "$bootstrap_text" 'runner_session_end || true'
+
+printf '\n=== behaviour: nested bootstrap does not delete parent session (#540) ===\n'
+
+nested_marker="$(
+  bash -c '
+    set -euo pipefail
+    marker="$(mktemp -d)"
+    export RUNNER_SESSION_ROOT="${marker}/sessions"
+    # shellcheck disable=SC1091
+    source "'"${repo_root}"'/scripts/lib/runner-bootstrap"
+    parent_session="${RUNNER_SESSION_DIR}"
+    printf "%s\n" "$parent_session" >"${marker}/parent_session"
+    # Simulate a nested executable that also sources runner-bootstrap.
+    bash -c "
+      set -euo pipefail
+      export RUNNER_SESSION_DIR=\"${parent_session}\"
+      export RUNNER_SESSION_ROOT=\"${marker}/sessions\"
+      # shellcheck disable=SC1091
+      source \"'"${repo_root}"'/scripts/lib/runner-bootstrap\"
+      printf \"%s\\n\" \"\${RUNNER_SESSION_DIR}\" >\"${marker}/child_session\"
+    "
+    if [[ -d "$parent_session" ]]; then
+      printf "parent_ok\n" >"${marker}/parent_alive"
+    fi
+    printf "%s" "${marker}"
+  '
+)"
+
+parent_session_path=""
+child_session_path=""
+if [[ -f "${nested_marker}/parent_session" ]]; then
+  parent_session_path="$(<"${nested_marker}/parent_session")"
+fi
+if [[ -f "${nested_marker}/child_session" ]]; then
+  child_session_path="$(<"${nested_marker}/child_session")"
+fi
+if [[ -f "${nested_marker}/parent_alive" ]] \
+  && [[ -n "$parent_session_path" && -n "$child_session_path" ]] \
+  && [[ "$parent_session_path" != "$child_session_path" ]]; then
+  pass_case 'nested runner-bootstrap keeps parent session; child uses its own'
+else
+  fail_case 'nested runner-bootstrap keeps parent session; child uses its own'
+  printf '  parent=%s child=%s alive=%s\n' \
+    "$parent_session_path" "$child_session_path" \
+    "$( [[ -f "${nested_marker}/parent_alive" ]] && echo yes || echo no )" >&2
+fi
+rm -rf "$nested_marker"
+
+printf '\n=== behaviour: session_end rm failure does not flip exit 0 (#540) ===\n'
+
+cleanup_rc=0
+cleanup_out="$(
+  bash -c '
+    set -euo pipefail
+    export RUNNER_SESSION_ROOT="$(mktemp -d)/sessions"
+    # shellcheck disable=SC1091
+    source "'"${repo_root}"'/scripts/lib/runner-bootstrap"
+    # Replace rm with a failing stub so session teardown races like #540.
+    rm() { printf "rm: cannot remove simulated\n" >&2; return 1; }
+    exit 0
+  ' 2>&1
+)" || cleanup_rc=$?
+if [[ "$cleanup_rc" -eq 0 ]] \
+  && grep -qF 'WARNING: runner_session_end: failed to remove' <<<"$cleanup_out"; then
+  pass_case 'runner_session_end rm failure warns but exit stays 0'
+else
+  fail_case "runner_session_end rm failure must not flip exit (rc=${cleanup_rc} out=${cleanup_out})"
+fi
 
 printf '\n=== static: dep-updater-notifier uses runner-bootstrap ===\n'
 

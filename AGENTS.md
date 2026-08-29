@@ -574,6 +574,7 @@ and advances the quota fallback chain instead of hanging (`repository-helpers#40
 ## Shell Script Conventions
 
 - **No `.sh` extension.** Scripts live in `scripts/` and test harnesses in `tests/`. The shebang line declares the interpreter.
+- **Nested runner sessions:** a child that sources `runner-bootstrap` must not keep the parent's `RUNNER_SESSION_DIR` (child EXIT would delete parent capture). See `.cursor/rules/runner-command-wrapper.mdc` (nested process sessions).
 - **`readonly`** must be used for every script-level variable that is assigned once and never modified. Declare and assign on separate lines to avoid SC2155:
   ```bash
   var="$(some_command)"
