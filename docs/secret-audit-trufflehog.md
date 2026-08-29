@@ -157,7 +157,7 @@ The host timer never takes this path.
 | `ERROR: SECRET_AUDIT_LEAK …` | TruffleHog exit **183** (`--fail`) — rotate credentials; do not refresh marker |
 | `ERROR: SECRET_AUDIT_MARKER_MISSING …` | Lint: no valid marker on default branch (strict / new-repo) |
 | `ERROR: SECRET_AUDIT_SCAN_FAILED …` | Tool / install / network / org-scan failure |
-| `ERROR: SECRET_AUDIT_INFRA_FAILED …` | Batch exit non-zero while TruffleHog counters are clean (teardown / runner infra; repository-helpers#540 / #541) |
+| `ERROR: SECRET_AUDIT_INFRA_FAILED …` | Batch exit non-zero with clean counters **and** no `ERROR: SECRET_AUDIT_SCAN_FAILED` in the transcript (teardown / runner infra; #540 / #541). A 0/0 counter line alone does not imply INFRA when the scan already failed. |
 
 Remediation: revoke and rotate, remove secrets from the tree, re-scan. History
 rewrite requires explicit human ownership — the wrapper never auto-purges git
