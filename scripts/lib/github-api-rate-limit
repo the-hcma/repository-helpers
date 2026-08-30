@@ -129,15 +129,20 @@ github_api_exec_with_rate_limit_retry() {
     if ! github_api_detail_is_rate_limited "$detail"; then
       return "$exit_code"
     fi
+    printf 'NOTE: GITHUB_RATE_LIMIT_HIT label=%s attempt=%s/%s detail=%s\n' \
+      "$label" "$attempt" "$max_retries" "$detail" >&2
+    # Wait on intermediate attempts always. On the final attempt, still wait when
+    # max_retries > 1 so quota-intact backoff reaches 60→120→300 with default 3
+    # (#547). max_retries=1 stays fail-closed without sleeping (#497).
+    if (( attempt < max_retries )) || (( max_retries > 1 && attempt == max_retries )); then
+      headers="$(github_api_fetch_rate_limit_headers || true)"
+      github_api_wait_for_rate_limit "$detail" "$headers" "$attempt" || return $?
+    fi
     if (( attempt >= max_retries )); then
       printf 'ERROR: GITHUB_RATE_LIMIT label=%s attempts=%s detail=%s\n' \
         "$label" "$max_retries" "$detail" >&2
       return "$exit_code"
     fi
-    printf 'NOTE: GITHUB_RATE_LIMIT_HIT label=%s attempt=%s/%s detail=%s\n' \
-      "$label" "$attempt" "$max_retries" "$detail" >&2
-    headers="$(github_api_fetch_rate_limit_headers || true)"
-    github_api_wait_for_rate_limit "$detail" "$headers" "$attempt" || return $?
     attempt=$((attempt + 1))
   done
   return "$exit_code"
@@ -355,6 +360,15 @@ github_api_wait_for_rate_limit() {
     run_command "github-api-rate-limit wait sleep" sleep "$sleep_s"
     waited=$((waited + sleep_s))
   done
+
+  # Quota-intact deadline may land exactly on max_wait; treat as clear so the
+  # outer retry can run (do not convert a completed backoff into WAIT_TIMEOUT).
+  now="$(date +%s)"
+  if (( quota_intact == 1 && deadline > 0 && now >= deadline )); then
+    printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR quota_intact_deadline_reached waited=%ss\n' \
+      "$waited" >&2
+    return 0
+  fi
 
   printf 'ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT timeout=%ss\n' "$max_wait" >&2
   return 124
