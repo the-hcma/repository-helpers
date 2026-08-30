@@ -100,6 +100,14 @@ if github_api_detail_is_rate_limited 'You have exceeded a secondary rate limit';
 else
   fail_case "missed secondary rate limit"
 fi
+if github_api_detail_is_rate_limited \
+  'You have triggered an abuse detection mechanism. Please wait a few minutes before you try again.' \
+  && github_api_detail_is_secondary_rate_limited \
+    'You have triggered an abuse detection mechanism. Please wait a few minutes before you try again.'; then
+  pass_case "detects abuse detection mechanism as secondary rate limit"
+else
+  fail_case "missed abuse detection mechanism wording"
+fi
 if github_api_detail_is_rate_limited 'HTTP 429: too many requests'; then
   pass_case "detects HTTP 429"
 else
@@ -601,6 +609,60 @@ if (( ec == 0 )) \
   pass_case "secondary wait attempt=2 escalates to 180s fallback"
 else
   fail_case "secondary attempt=2 escalation broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+# Attempt 3 / max_wait=300: secondary deadline at budget edge clears (not WAIT_TIMEOUT).
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    MOCK_DATE_STATE="$(mktemp)" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      run_command() {
+        local label="$1"
+        shift
+        if [[ "${1:-}" == "--timeout" ]]; then
+          shift 2
+        fi
+        if [[ "${1:-}" == "sleep" ]]; then
+          printf "slept\n" >>"${MOCK_DATE_STATE}"
+          return 0
+        fi
+        "$@"
+      }
+      github_api_rate_limit_max_wait_s=300
+      github_api_rate_limit_poll_s=300
+      github_api_rate_limit_retry_sleep_s=60
+      date() {
+        if [[ "${1:-}" != "+%s" ]]; then
+          command date "$@"
+          return
+        fi
+        if grep -q slept "${MOCK_DATE_STATE}" 2>/dev/null; then
+          printf "1700000300\n"
+        else
+          printf "1700000000\n"
+        fi
+      }
+      headers=$'"'"'HTTP/2.0 200\r\nX-RateLimit-Reset: 9999999999\r\n\r\n{}'"'"'
+      github_api_wait_for_rate_limit \
+        "You have exceeded a secondary rate limit. Please retry again later." \
+        "$headers" 3 2>&1
+    '
+)"
+ec=$?
+set -e
+
+if (( ec == 0 )) \
+  && grep -qF 'secondary_fallback=300s attempt=3' <<<"$out" \
+  && grep -qF 'deadline_reached' <<<"$out" \
+  && ! grep -qF 'WAIT_TIMEOUT' <<<"$out"; then
+  pass_case "secondary attempt=3 deadline at budget edge clears (not WAIT_TIMEOUT)"
+else
+  fail_case "secondary attempt=3 budget-edge clear broken (ec=${ec})"
   printf '%s\n' "$out"
 fi
 
