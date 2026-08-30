@@ -228,6 +228,7 @@ Audits GitHub conventions for org repositories:
     - copyright notice
     - CODEOWNERS with a repository-wide owner rule
     - .cursor/rules/git-commit-identity.mdc (no agent/machine co-authors; signing incl. pinentry/passphrase + cli-config checks)
+    - .cursor/rules/no-secret-exposure.mdc (never leak secrets into logs/PRs/commits; allowlist/existence inspection; roll-out SUGGEST)
     - .cursor/rules/pr-ship-and-review.mdc (canonical agent review loop)
     - .cursor/rules/pre-pr-checks.mdc (format before check; no truncated output; roll-out SUGGEST)
     - .cursor/rules/read-agents-and-rules.mdc (session-start: read AGENTS.md + rules)
@@ -1806,6 +1807,140 @@ rp_check_git_commit_identity() {
       rp_log_suggest \
         "${slug}: optionally document commit-identity policy in AGENTS.md (no Co-authored-by / signing + cli-config attribution)"
     fi
+  fi
+
+  return "$repo_fail"
+}
+
+readonly rp_no_secret_exposure_path='.cursor/rules/no-secret-exposure.mdc'
+
+rp_no_secret_exposure_template() {
+  local path
+
+  path="${rp_lib_dir}/repo-practices-cursor/no-secret-exposure.mdc"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing cursor rule template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat no-secret-exposure template" -- cat "$path"
+}
+
+rp_no_secret_exposure_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_no_secret_exposure_path}"
+      if [[ -f "$local_path" ]]; then
+        rp_runner_exec_stdout "repo-practices cat local no-secret-exposure" -- \
+          cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_no_secret_exposure_template
+}
+
+# True when the cursor rule forbids secret leakage into logs/transcripts/PRs,
+# requires allowlist or path-existence when inspecting config (not denylist-sed-only),
+# and instructs rotate-without-repeat (alwaysApply org rule).
+rp_no_secret_exposure_is_valid() {
+  local -r text="$1"
+
+  if ! grep -qE '^alwaysApply:[[:space:]]*true([[:space:]]|$)' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qiE 'never[[:space:]]+(print|paste)|leak[[:space:]]+secrets' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qiE 'logs?|transcript|\bPR\b' <<<"$text"; then
+    return 1
+  fi
+  # Require allowlist or existence guidance (reject denylist-sed-only rules).
+  if ! grep -qiE 'allowlist|existence|path-existence|test -f' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qiE 'rotate' <<<"$text"; then
+    return 1
+  fi
+  return 0
+}
+
+# Missing markers FAIL under --new-repo only (intake). Under --strict-onboarding
+# org --all, missing is SUGGEST-only during roll-out; invalid content FAILS for
+# --new-repo and --strict-onboarding. Prefer local dogfood when auditing THIS repo.
+rp_check_no_secret_exposure() {
+  local slug="$1"
+  local repo_fail=0
+  local rule_text repo_dir local_path
+  local fetch_ec=0
+
+  # Prefer the local dogfood copy when auditing this repo from a clone/worktree
+  # (new-rule PRs are not on origin/main yet; GitHub Contents would false-fail).
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_no_secret_exposure_path}"
+      if [[ -f "$local_path" ]]; then
+        rule_text="$(rp_runner_exec_stdout "repo-practices cat local no-secret-exposure check" -- \
+          cat "$local_path")"
+      fi
+    fi
+  fi
+  if [[ -z "${rule_text:-}" ]]; then
+    rule_text="$(rp_fetch_github_text_file "$slug" "$rp_no_secret_exposure_path")" \
+      || fetch_ec=$?
+  fi
+  if (( fetch_ec == 2 )); then
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      rp_log_gh_api_fail "$slug" "could not read ${rp_no_secret_exposure_path}"
+      return 1
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: retry no-secret-exposure rule check after GitHub API recovers"
+    fi
+    return 0
+  fi
+  if [[ -z "$rule_text" ]]; then
+    # Intake only: do not fail org --strict-onboarding --all on missing rules (v1 roll-out).
+    if [[ "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'no-secret-exposure cursor rule (.cursor/rules/no-secret-exposure.mdc)' \
+        "$(rp_github_url "$slug" '/new/main/.cursor/rules/no-secret-exposure.mdc')"
+    fi
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_no_secret_exposure_path" \
+        "$(rp_no_secret_exposure_content_for_apply_fix "$slug")" \
+        'add-no-secret-exposure' \
+        'chore: add no-secret-exposure cursor rule'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add .cursor/rules/no-secret-exposure.mdc (template: scripts/lib/repo-practices-cursor/)"
+    fi
+  elif ! rp_no_secret_exposure_is_valid "$rule_text"; then
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'no-secret-exposure rule must forbid leaking secrets into logs/transcripts/PRs, require allowlist or path-existence when inspecting config, and instruct rotate-without-repeat (alwaysApply: true)' \
+        "$(rp_github_url "$slug" "/blob/main/${rp_no_secret_exposure_path}")"
+    fi
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_no_secret_exposure_path" \
+        "$(rp_no_secret_exposure_content_for_apply_fix "$slug")" \
+        'sync-no-secret-exposure' \
+        'chore: sync no-secret-exposure cursor rule'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: sync .cursor/rules/no-secret-exposure.mdc to forbid secret leakage (allowlist/existence inspection; rotate if leaked)"
+    fi
+  else
+    rp_log_check_ok "$slug" 'no-secret-exposure cursor rule' \
+      "$(rp_github_url "$slug" "/blob/main/${rp_no_secret_exposure_path}")"
   fi
 
   return "$repo_fail"
@@ -6086,6 +6221,7 @@ rp_print_new_repo_checklist() {
       [ ] LICENSE with copyright notice
       [ ] CODEOWNERS with * @OWNER so all code requires CODEOWNER review
       [ ] .cursor/rules/git-commit-identity.mdc (no agent/machine co-authors; signing incl. pinentry/passphrase + cli-config attribution; template in ${rp_THIS_REPO_NAME})
+      [ ] .cursor/rules/no-secret-exposure.mdc (never leak secrets into logs/PRs/commits; allowlist/existence; rotate if leaked; template in ${rp_THIS_REPO_NAME})
       [ ] .cursor/rules/pr-ship-and-review.mdc (agent review loop; template in ${rp_THIS_REPO_NAME})
       [ ] .cursor/rules/pre-pr-checks.mdc (format before check; no truncated output; template in ${rp_THIS_REPO_NAME})
       [ ] .cursor/rules/read-agents-and-rules.mdc (session-start read AGENTS.md + rules; template in ${rp_THIS_REPO_NAME})
@@ -7350,6 +7486,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_git_commit_identity "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_no_secret_exposure "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_pr_ship_and_review_rule "$slug"; then
