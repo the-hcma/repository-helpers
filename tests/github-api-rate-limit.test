@@ -175,6 +175,17 @@ if grep -qF 'secondary_fallback' "$lib" \
 else
   fail_case "primary/secondary deadline priority wiring missing"
 fi
+
+if grep -qF 'GITHUB_REST_403_QUOTA_INTACT' "$lib" \
+  && grep -qF '_github_api_quota_intact_backoff_s' "$lib" \
+  && grep -qF '_github_api_quota_intact_suspect' "$lib" \
+  && grep -qF 'GITHUB_API_RATE_LIMIT_QUOTA_INTACT_FAIL_FAST' "$lib" \
+  && grep -qF 'final_quota_retry' "$lib" \
+  && grep -qF 'wait_ec == 124' "$lib"; then
+  pass_case "quota-intact REST 403 path (#547) wired"
+else
+  fail_case "quota-intact REST 403 path (#547) missing"
+fi
 # shellcheck disable=SC2016  # assert literal --stream-stdout absence in retry loop
 if grep -qF 'runner_read "$uuid" stdout' "$lib" \
   && ! awk '
@@ -260,7 +271,6 @@ call_count="$(wc -l <"${call_log}" | tr -d ' ')"
 if (( ec != 0 )) \
   && [[ "${call_count}" == '1' ]] \
   && grep -qF 'ERROR: GITHUB_RATE_LIMIT' <<<"$out" \
-  && ! grep -qF 'NOTE: GITHUB_RATE_LIMIT_HIT' <<<"$out" \
   && ! grep -qF 'NOTE: GITHUB_RATE_LIMIT_WAIT fake' <<<"$out"; then
   pass_case "per-call env GITHUB_API_RATE_LIMIT_MAX_RETRIES=1 caps retries without wait (#497)"
 else
@@ -314,6 +324,111 @@ if (( ec == 0 )) \
   pass_case "retries after wait and succeeds when quota returns"
 else
   fail_case "retry-success path broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+printf '\n=== behavioural: final quota-intact wait re-runs command (#547) ===\n'
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+json='{"resources":{"core":{"remaining":5000,"reset":9999999999},"graphql":{"remaining":5000,"reset":9999999999},"search":{"remaining":30,"reset":9999999999}}}'
+if [[ "$*" == *'rate_limit'* ]]; then
+  jq_expr=""
+  prev=""
+  for arg in "$@"; do
+    if [[ "$prev" == "--jq" ]]; then
+      jq_expr="$arg"
+    fi
+    prev="$arg"
+  done
+  if [[ -n "$jq_expr" ]]; then
+    printf '%s' "$json" | jq -r "$jq_expr"
+  else
+    printf '%s\n' "$json"
+  fi
+  exit 0
+fi
+state_file="${MOCK_GH_STATE:?}"
+n=0
+if [[ -f "$state_file" ]]; then
+  n="$(cat "$state_file")"
+fi
+n=$((n + 1))
+printf '%s' "$n" >"$state_file"
+if (( n <= 2 )); then
+  printf 'gh: API rate limit exceeded for user ID 9\n' >&2
+  exit 1
+fi
+printf '{"login":"ok"}\n'
+exit 0
+EOF
+chmod +x "${mock_bin}/gh"
+printf '0' >"$state"
+
+set +e
+out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" \
+    MOCK_GH_STATE="$state" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      github_api_rate_limit_max_retries=2
+      github_api_wait_for_rate_limit() {
+        printf "NOTE: GITHUB_RATE_LIMIT_WAIT fake\n" >&2
+        return 0
+      }
+      github_api_exec_with_rate_limit_retry "test-final-rerun" -- gh api user
+    ' 2>&1
+)"
+ec=$?
+set -e
+user_calls="$(cat "$state" | tr -d ' ')"
+
+if (( ec == 0 )) \
+  && [[ "${user_calls}" == '3' ]] \
+  && grep -qF 'NOTE: GITHUB_RATE_LIMIT_HIT' <<<"$out" \
+  && grep -qF '{"login":"ok"}' <<<"$out" \
+  && ! grep -qF 'ERROR: GITHUB_RATE_LIMIT' <<<"$out"; then
+  pass_case "final quota-intact wait clears then re-runs command once (#547)"
+else
+  fail_case "final quota-intact re-run broken (ec=${ec} calls=${user_calls})"
+  printf '%s\n' "$out"
+fi
+
+printf '\n=== behavioural: wait 124 returns original gh exit (#547) ===\n'
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'gh: API rate limit exceeded for user ID 9\n' >&2
+exit 42
+EOF
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      github_api_rate_limit_max_retries=2
+      github_api_wait_for_rate_limit() {
+        printf "NOTE: GITHUB_RATE_LIMIT_WAIT fake-timeout\n" >&2
+        return 124
+      }
+      github_api_exec_with_rate_limit_retry "test-wait-124" -- gh api user
+    ' 2>&1
+)"
+ec=$?
+set -e
+
+if (( ec == 42 )) \
+  && grep -qF 'ERROR: GITHUB_RATE_LIMIT' <<<"$out" \
+  && ! grep -qF 'ERROR: WAIT_TIMEOUT' <<<"$out"; then
+  pass_case "wait 124 normalizes to original gh exit (#547)"
+else
+  fail_case "wait 124 normalization broken (ec=${ec})"
   printf '%s\n' "$out"
 fi
 
@@ -502,12 +617,208 @@ ec=$?
 set -e
 
 if (( ec == 0 )) \
-  && grep -qF 'secondary_fallback=60s' <<<"$out" \
-  && grep -qF 'deadline_reached' <<<"$out" \
+  && grep -qF 'NOTE: GITHUB_REST_403_QUOTA_INTACT attempt=1 backoff=60s' <<<"$out" \
+  && grep -qF 'quota_intact_deadline_reached' <<<"$out" \
+  && ! grep -qF 'secondary_fallback=60s' <<<"$out" \
   && ! grep -qF 'remaining_ok waited=0s' <<<"$out"; then
-  pass_case "403 with remaining>0 waits secondary fallback (not remaining_ok at t=0)"
+  pass_case "403 with remaining>0 emits QUOTA_INTACT + 60s backoff (not secondary_fallback)"
 else
-  fail_case "403 remaining_ok short-circuit still present (ec=${ec})"
+  fail_case "403 QUOTA_INTACT backoff missing (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+# Attempt 2 uses 120s backoff (exponential ladder).
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    MOCK_DATE_STATE="$(mktemp)" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      run_command() {
+        local label="$1"
+        shift
+        if [[ "${1:-}" == "--timeout" ]]; then
+          shift 2
+        fi
+        if [[ "${1:-}" == "sleep" ]]; then
+          printf "slept\n" >>"${MOCK_DATE_STATE}"
+          return 0
+        fi
+        "$@"
+      }
+      github_api_rate_limit_max_wait_s=300
+      github_api_rate_limit_poll_s=120
+      github_api_rate_limit_retry_sleep_s=60
+      date() {
+        if [[ "${1:-}" != "+%s" ]]; then
+          command date "$@"
+          return
+        fi
+        if grep -q slept "${MOCK_DATE_STATE}" 2>/dev/null; then
+          printf "1700000121\n"
+        else
+          printf "1700000000\n"
+        fi
+      }
+      github_api_wait_for_rate_limit "API rate limit exceeded for user ID 1" "" 2 2>&1
+    '
+)"
+ec=$?
+set -e
+
+if (( ec == 0 )) \
+  && grep -qF 'NOTE: GITHUB_REST_403_QUOTA_INTACT attempt=2 backoff=120s' <<<"$out" \
+  && grep -qF 'quota_intact_deadline_reached' <<<"$out"; then
+  pass_case "403 QUOTA_INTACT attempt=2 uses 120s backoff"
+else
+  fail_case "403 QUOTA_INTACT attempt=2 backoff missing (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+# Fail-fast: no sleep, exit 125.
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      run_command() {
+        local label="$1"
+        shift
+        if [[ "${1:-}" == "--timeout" ]]; then
+          shift 2
+        fi
+        if [[ "${1:-}" == "sleep" ]]; then
+          printf "UNEXPECTED_SLEEP\n" >&2
+          return 0
+        fi
+        "$@"
+      }
+      GITHUB_API_RATE_LIMIT_QUOTA_INTACT_FAIL_FAST=1
+      github_api_rate_limit_max_wait_s=120
+      set +e
+      github_api_wait_for_rate_limit "API rate limit exceeded for user ID 1" "" 1 2>&1
+      printf "EC=%s\n" "$?"
+    '
+)"
+ec=$?
+set -e
+
+if grep -qF 'NOTE: GITHUB_REST_403_QUOTA_INTACT attempt=1 fail_fast=1' <<<"$out" \
+  && grep -qF 'ERROR: GITHUB_REST_403_QUOTA_INTACT attempt=1' <<<"$out" \
+  && grep -qF 'EC=125' <<<"$out" \
+  && ! grep -qF 'UNEXPECTED_SLEEP' <<<"$out"; then
+  pass_case "403 QUOTA_INTACT fail-fast returns 125 without sleeping"
+else
+  fail_case "403 QUOTA_INTACT fail-fast broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+# Attempt 3 / max_wait=300: deadline at budget edge clears (not WAIT_TIMEOUT 124).
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    MOCK_DATE_STATE="$(mktemp)" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      run_command() {
+        local label="$1"
+        shift
+        if [[ "${1:-}" == "--timeout" ]]; then
+          shift 2
+        fi
+        if [[ "${1:-}" == "sleep" ]]; then
+          printf "slept\n" >>"${MOCK_DATE_STATE}"
+          return 0
+        fi
+        "$@"
+      }
+      github_api_rate_limit_max_wait_s=300
+      github_api_rate_limit_poll_s=300
+      github_api_rate_limit_retry_sleep_s=60
+      date() {
+        if [[ "${1:-}" != "+%s" ]]; then
+          command date "$@"
+          return
+        fi
+        # After sleep, land exactly on deadline (== max_wait budget end).
+        if grep -q slept "${MOCK_DATE_STATE}" 2>/dev/null; then
+          printf "1700000300\n"
+        else
+          printf "1700000000\n"
+        fi
+      }
+      github_api_wait_for_rate_limit "API rate limit exceeded for user ID 1" "" 3 2>&1
+      printf "EC=%s\n" "$?"
+    '
+)"
+ec=$?
+set -e
+
+if grep -qF 'NOTE: GITHUB_REST_403_QUOTA_INTACT attempt=3 backoff=300s' <<<"$out" \
+  && grep -qF 'quota_intact_deadline_reached' <<<"$out" \
+  && grep -qF 'EC=0' <<<"$out" \
+  && ! grep -qF 'WAIT_TIMEOUT' <<<"$out"; then
+  pass_case "403 QUOTA_INTACT attempt=3 at max_wait clears (not WAIT_TIMEOUT)"
+else
+  fail_case "403 QUOTA_INTACT attempt=3 max_wait edge broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+# Canonical #547 body ("a few minutes") must still use the attempt ladder, not fixed 180s.
+set +e
+out="$(
+  PATH="${mock_bin}:${PATH}" \
+    MOCK_DATE_STATE="$(mktemp)" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      run_command() {
+        local label="$1"
+        shift
+        if [[ "${1:-}" == "--timeout" ]]; then
+          shift 2
+        fi
+        if [[ "${1:-}" == "sleep" ]]; then
+          printf "slept\n" >>"${MOCK_DATE_STATE}"
+          return 0
+        fi
+        "$@"
+      }
+      github_api_rate_limit_max_wait_s=120
+      github_api_rate_limit_poll_s=60
+      github_api_rate_limit_retry_sleep_s=60
+      date() {
+        if [[ "${1:-}" != "+%s" ]]; then
+          command date "$@"
+          return
+        fi
+        if grep -q slept "${MOCK_DATE_STATE}" 2>/dev/null; then
+          printf "1700000061\n"
+        else
+          printf "1700000000\n"
+        fi
+      }
+      github_api_wait_for_rate_limit \
+        "API rate limit exceeded for user ID 1. Please wait a few minutes before you try again." \
+        "" 1 2>&1
+    '
+)"
+ec=$?
+set -e
+
+if (( ec == 0 )) \
+  && grep -qF 'NOTE: GITHUB_REST_403_QUOTA_INTACT attempt=1 backoff=60s' <<<"$out" \
+  && ! grep -qF 'GITHUB_REST_403_QUOTA_INTACT attempt=1 retry_after=180s' <<<"$out"; then
+  pass_case "403 QUOTA_INTACT canonical few-minutes body uses ladder (not fixed 180s)"
+else
+  fail_case "403 QUOTA_INTACT few-minutes ladder bypass (ec=${ec})"
   printf '%s\n' "$out"
 fi
 
