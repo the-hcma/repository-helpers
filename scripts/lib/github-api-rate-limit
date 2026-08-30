@@ -81,7 +81,8 @@ github_api_detail_is_secondary_rate_limited() {
 github_api_exec_with_rate_limit_retry() {
   local label probe=0
   local -a rl_cmd=()
-  local exit_code attempt max_retries detail headers uuid should_wait
+  local exit_code attempt max_retries detail headers uuid should_wait wait_ec
+  local final_quota_retry=0
 
   label="${1:?github_api_exec_with_rate_limit_retry: label required}"
   shift
@@ -111,7 +112,7 @@ github_api_exec_with_rate_limit_retry() {
   max_retries="$(_github_api_rate_limit_effective_max_retries)"
 
   attempt=1
-  while (( attempt <= max_retries )); do
+  while (( attempt <= max_retries || final_quota_retry == 1 )); do
     exit_code=0
     if (( probe )); then
       runner_exec "$label" --probe -- "${rl_cmd[@]}" || exit_code=$?
@@ -129,6 +130,12 @@ github_api_exec_with_rate_limit_retry() {
     if ! github_api_detail_is_rate_limited "$detail"; then
       return "$exit_code"
     fi
+    # Post-ladder re-run already consumed; fail closed.
+    if (( final_quota_retry == 1 )); then
+      printf 'ERROR: GITHUB_RATE_LIMIT label=%s attempts=%s detail=%s\n' \
+        "$label" "$max_retries" "$detail" >&2
+      return "$exit_code"
+    fi
     printf 'NOTE: GITHUB_RATE_LIMIT_HIT label=%s attempt=%s/%s detail=%s\n' \
       "$label" "$attempt" "$max_retries" "$detail" >&2
     # Intermediate attempts always wait. Final-attempt wait is only for #547
@@ -144,9 +151,25 @@ github_api_exec_with_rate_limit_retry() {
     fi
     if (( should_wait )); then
       headers="$(github_api_fetch_rate_limit_headers || true)"
-      github_api_wait_for_rate_limit "$detail" "$headers" "$attempt" || return $?
+      wait_ec=0
+      github_api_wait_for_rate_limit "$detail" "$headers" "$attempt" || wait_ec=$?
+      # Normalize WAIT_TIMEOUT to the original gh exit so callers are not
+      # MAX_WAIT_S-dependent (#547). Keep fail-fast 125 distinct.
+      if (( wait_ec == 124 )); then
+        printf 'ERROR: GITHUB_RATE_LIMIT label=%s attempts=%s detail=%s\n' \
+          "$label" "$attempt" "$detail" >&2
+        return "$exit_code"
+      fi
+      if (( wait_ec != 0 )); then
+        return "$wait_ec"
+      fi
     fi
     if (( attempt >= max_retries )); then
+      if (( should_wait )); then
+        # Final rung cleared — one more command attempt (no further wait).
+        final_quota_retry=1
+        continue
+      fi
       printf 'ERROR: GITHUB_RATE_LIMIT label=%s attempts=%s detail=%s\n' \
         "$label" "$max_retries" "$detail" >&2
       return "$exit_code"
