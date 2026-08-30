@@ -98,9 +98,12 @@ agent-review / repo-practices / CI-rollup `gh` calls. On `API rate limit exceede
 secondary limits / HTTP 429, helpers print `NOTE: GITHUB_RATE_LIMIT_HIT`, fetch backoff
 from `gh api --include rate_limit` headers (`Retry-After`, `X-RateLimit-Reset`), then
 `NOTE: GITHUB_RATE_LIMIT_WAIT` / `NOTE: GITHUB_RATE_LIMIT_HEADERS` and sleep until that
-deadline. When REST returns 403 rate-limit wording while primary quota still looks full,
-helpers emit `NOTE: GITHUB_REST_403_QUOTA_INTACT` and use bounded exponential backoff
-(60s → 120s → 300s) instead of a fixed 60s `secondary_fallback` (repository-helpers#547);
+deadline. Explicit secondary/abuse limits honor `Retry-After` / body “wait N minute(s)” /
+“a few minutes”, else escalate `secondary_fallback` across attempts (**60s → 180s → 300s**;
+override with `GITHUB_API_SECONDARY_RATE_LIMIT_BACKOFF_S`, repository-helpers#569). When
+REST returns 403 rate-limit wording while primary quota still looks full, helpers emit
+`NOTE: GITHUB_REST_403_QUOTA_INTACT` and use bounded exponential backoff
+(60s → 120s → 300s) instead of a fixed 60s fallback (repository-helpers#547);
 set `GITHUB_API_RATE_LIMIT_QUOTA_INTACT_FAIL_FAST=1` to skip sleep and return 125.
 Exhausted retries emit `ERROR: GITHUB_RATE_LIMIT`; wait budget expiry emits
 `ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT`. Tune with `GITHUB_API_RATE_LIMIT_MAX_RETRIES`,
