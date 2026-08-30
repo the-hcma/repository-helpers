@@ -16,6 +16,9 @@
 #   GITHUB_API_RATE_LIMIT_QUOTA_INTACT_FAIL_FAST  when set to 1: on REST 403 with
 #     intact primary quota, emit NOTE: GITHUB_REST_403_QUOTA_INTACT and return 125
 #     without sleeping (repository-helpers#547)
+#   GITHUB_API_SECONDARY_RATE_LIMIT_BACKOFF_S  comma-separated secondary cooldown
+#     ladder by attempt (default 60,180,300). Used when Retry-After / body guidance
+#     is absent for explicit secondary/abuse limits (repository-helpers#569).
 
 set -euo pipefail
 
@@ -53,10 +56,11 @@ github_api_detail_is_rate_limited() {
   local lower
 
   lower="$(printf '%s' "$detail" | tr '[:upper:]' '[:lower:]')"
-  [[ "$lower" == *'api rate limit exceeded'* \
-    || "$lower" == *'secondary rate limit'* \
+  [[ "$lower" == *'(http 429)'* \
+    || "$lower" == *'abuse detection mechanism'* \
+    || "$lower" == *'api rate limit exceeded'* \
     || "$lower" == *'http 429'* \
-    || "$lower" == *'(http 429)'* \
+    || "$lower" == *'secondary rate limit'* \
     || "$lower" == *'was made too recently'* ]]
 }
 
@@ -68,9 +72,10 @@ github_api_detail_is_secondary_rate_limited() {
   local lower
 
   lower="$(printf '%s' "$detail" | tr '[:upper:]' '[:lower:]')"
-  [[ "$lower" == *'secondary rate limit'* \
+  [[ "$lower" == *'(http 429)'* \
+    || "$lower" == *'abuse detection mechanism'* \
     || "$lower" == *'http 429'* \
-    || "$lower" == *'(http 429)'* \
+    || "$lower" == *'secondary rate limit'* \
     || "$lower" == *'was made too recently'* ]]
 }
 
@@ -138,16 +143,18 @@ github_api_exec_with_rate_limit_retry() {
     fi
     printf 'NOTE: GITHUB_RATE_LIMIT_HIT label=%s attempt=%s/%s detail=%s\n' \
       "$label" "$attempt" "$max_retries" "$detail" >&2
-    # Intermediate attempts always wait. Final-attempt wait is only for #547
-    # quota-intact REST 403 (ladder rung 300s); ordinary primary/secondary stay
+    # Intermediate attempts always wait. Final-attempt wait also runs for
+    # secondary / quota-intact REST 403 so the escalation ladder can finish
+    # (repository-helpers#547 / #569). Ordinary primary-depleted stays
     # fail-closed on the last attempt without an extra up-to-max_wait stall.
     should_wait=0
     if (( attempt < max_retries )); then
       should_wait=1
-    elif (( max_retries > 1 && attempt == max_retries )) \
-      && ! github_api_detail_is_secondary_rate_limited "$detail" \
-      && _github_api_quota_intact_suspect; then
-      should_wait=1
+    elif (( max_retries > 1 && attempt == max_retries )); then
+      if github_api_detail_is_secondary_rate_limited "$detail" \
+        || _github_api_quota_intact_suspect; then
+        should_wait=1
+      fi
     fi
     if (( should_wait )); then
       headers="$(github_api_fetch_rate_limit_headers || true)"
@@ -253,7 +260,7 @@ github_api_wait_for_rate_limit() {
   local max_wait poll fallback_sleep
   local waited=0 sleep_s remaining reset_epoch now retry_after_s
   local secondary=0 header_reset header_retry retry_after_from_header=0
-  local deadline=0 quota_intact=0 quota_intact_backoff_s
+  local deadline=0 quota_intact=0 quota_intact_backoff_s secondary_backoff_s
 
   max_wait="${github_api_rate_limit_max_wait_s}"
   poll="${github_api_rate_limit_poll_s}"
@@ -295,8 +302,10 @@ github_api_wait_for_rate_limit() {
   now="$(date +%s)"
   # Primary: prefer X-RateLimit-Reset from the rate_limit probe over body phrases
   # like "a few minutes" (180s), which would clear long before the real window reset.
-  # Body-phrase retry_after only applies once we already know this is secondary;
-  # for unclassified REST 403 (#547) the attempt ladder wins inside the loop.
+  # Body-phrase / Retry-After apply for explicit secondary; otherwise escalate
+  # secondary_fallback across attempts (60 → 180 → 300; repository-helpers#569).
+  # For unclassified REST 403 (#547) the quota-intact attempt ladder wins inside
+  # the wait loop.
   if (( secondary == 0 )) && [[ -n "$header_reset" && "$header_reset" =~ ^[0-9]+$ ]]; then
     deadline="$header_reset"
     printf 'NOTE: GITHUB_RATE_LIMIT_HEADERS x_ratelimit_reset=%s\n' "$header_reset" >&2
@@ -311,10 +320,13 @@ github_api_wait_for_rate_limit() {
     printf 'NOTE: GITHUB_RATE_LIMIT_HEADERS retry_after=%ss source=body\n' \
       "$retry_after_s" >&2
   elif (( secondary == 1 )); then
-    # Explicit secondary/abuse wording: short fixed fallback, then outer retry.
-    deadline=$((now + fallback_sleep))
-    printf 'NOTE: GITHUB_RATE_LIMIT_HEADERS secondary_fallback=%ss\n' \
-      "$fallback_sleep" >&2
+    secondary_backoff_s="$(_github_api_secondary_backoff_s "$attempt")"
+    if (( secondary_backoff_s > max_wait )); then
+      secondary_backoff_s="$max_wait"
+    fi
+    deadline=$((now + secondary_backoff_s))
+    printf 'NOTE: GITHUB_RATE_LIMIT_HEADERS secondary_fallback=%ss attempt=%s\n' \
+      "$secondary_backoff_s" "$attempt" >&2
   fi
 
   while (( waited < max_wait )); do
@@ -404,13 +416,21 @@ github_api_wait_for_rate_limit() {
     waited=$((waited + sleep_s))
   done
 
-  # Quota-intact deadline may land exactly on max_wait; treat as clear so the
-  # outer retry can run (do not convert a completed backoff into WAIT_TIMEOUT).
+  # Quota-intact / secondary deadlines may land exactly on max_wait; treat as
+  # clear so the outer retry can run (do not convert a completed backoff into
+  # WAIT_TIMEOUT). repository-helpers#547 / #569.
   now="$(date +%s)"
-  if (( quota_intact == 1 && deadline > 0 && now >= deadline )); then
-    printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR quota_intact_deadline_reached waited=%ss\n' \
-      "$waited" >&2
-    return 0
+  if (( deadline > 0 && now >= deadline )); then
+    if (( quota_intact == 1 )); then
+      printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR quota_intact_deadline_reached waited=%ss\n' \
+        "$waited" >&2
+      return 0
+    fi
+    if (( secondary == 1 )); then
+      printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR deadline_reached waited=%ss\n' \
+        "$waited" >&2
+      return 0
+    fi
   fi
 
   printf 'ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT timeout=%ss\n' "$max_wait" >&2
@@ -519,6 +539,48 @@ _github_api_quota_intact_backoff_s() {
   case "$attempt" in
     1) printf '60' ;;
     2) printf '120' ;;
+    *) printf '300' ;;
+  esac
+}
+
+# _github_api_secondary_backoff_s <attempt>
+# Escalating secondary/abuse cooldown when Retry-After / body guidance is absent
+# (60 → 180 → 300; repository-helpers#569). Override with
+# GITHUB_API_SECONDARY_RATE_LIMIT_BACKOFF_S=60,180,300 (comma-separated, 1-indexed).
+_github_api_secondary_backoff_s() {
+  local attempt="${1:-1}"
+  local csv="${GITHUB_API_SECONDARY_RATE_LIMIT_BACKOFF_S:-}"
+  local -a parts=()
+  local idx value
+
+  if [[ ! "$attempt" =~ ^[0-9]+$ ]] || (( attempt < 1 )); then
+    attempt=1
+  fi
+  if [[ -n "$csv" ]]; then
+    IFS=',' read -r -a parts <<<"$csv"
+    idx=$((attempt - 1))
+    if (( idx < ${#parts[@]} )); then
+      value="${parts[$idx]}"
+      value="${value#"${value%%[![:space:]]*}"}"
+      value="${value%"${value##*[![:space:]]}"}"
+      if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 )); then
+        printf '%s' "$value"
+        return 0
+      fi
+    elif ((${#parts[@]} > 0)); then
+      # Portable last-element index (avoid bash-4.3+ parts[-1]).
+      value="${parts[${#parts[@]} - 1]}"
+      value="${value#"${value%%[![:space:]]*}"}"
+      value="${value%"${value##*[![:space:]]}"}"
+      if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 )); then
+        printf '%s' "$value"
+        return 0
+      fi
+    fi
+  fi
+  case "$attempt" in
+    1) printf '60' ;;
+    2) printf '180' ;;
     *) printf '300' ;;
   esac
 }
