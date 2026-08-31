@@ -2234,6 +2234,210 @@ rp_check_read_agents_and_rules() {
   return "$repo_fail"
 }
 
+readonly rp_remote_timeouts_retries_path='.cursor/rules/remote-timeouts-retries.mdc'
+
+rp_remote_timeouts_retries_template() {
+  local path
+
+  path="${rp_lib_dir}/repo-practices-cursor/remote-timeouts-retries.mdc"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing cursor rule template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat remote-timeouts-retries template" -- cat "$path"
+}
+
+rp_remote_timeouts_retries_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_remote_timeouts_retries_path}"
+      if [[ -f "$local_path" ]]; then
+        rp_runner_exec_stdout "repo-practices cat local remote-timeouts-retries" -- \
+          cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_remote_timeouts_retries_template
+}
+
+# True when the cursor rule requires explicit timeouts on remote calls, bounded
+# retries for transient failures (Retry-After / cap / budget), and documents
+# anti-patterns (alwaysApply org rule).
+rp_remote_timeouts_retries_is_valid() {
+  local -r text="$1"
+  local stripped tmp
+
+  if ! rp_text_probe_grep_iE 'repo-practices remote-timeouts alwaysApply' \
+    '^alwaysApply:[[:space:]]*true([[:space:]]|$)' "$text"; then
+    return 1
+  fi
+  # Positive timeout instruction (not bare "timeout" / "Never set a timeout").
+  # "without a timeout" is a compliant requirement phrased as a prohibition.
+  if ! rp_text_probe_grep_iE 'repo-practices remote-timeouts timeout' \
+    'explicit[[:space:]]+timeout|set[^.[:cntrl:]]{0,40}timeout|must[^.[:cntrl:]]{0,40}timeout|without[[:space:]]+(an?[[:space:]]+)?timeout|--timeout|Timeout[(]' \
+    "$text"; then
+    return 1
+  fi
+  # Negation+(set|use|require) must take timeout as near object (optional a/an).
+  # Do not allow a long gap — that false-rejects "Never use X without a timeout".
+  if rp_text_probe_grep_iE 'repo-practices remote-timeouts timeout decoy' \
+    "(never|do[[:space:]]*not|don't|must[[:space:]]+not)[[:space:][:punct:]][^.[:cntrl:]]{0,40}(set|use|require)[[:space:][:punct:]]+(an?[[:space:]]+)?timeout|(you may|you can|allowed to|permitted to|feel free to|freely)[[:space:][:punct:]][^.[:cntrl:]]{0,40}(omit|skip|avoid)[^.[:cntrl:]]{0,40}timeout" \
+    "$text"; then
+    return 1
+  fi
+  # Bounded retries: require retry guidance plus a bound signal.
+  if ! rp_text_probe_grep_iE 'repo-practices remote-timeouts retry' \
+    'retr(y|ies)' "$text"; then
+    return 1
+  fi
+  # Word-boundary bound tokens so "unbounded" does not satisfy "bound".
+  if ! rp_text_probe_grep_iE 'repo-practices remote-timeouts bound' \
+    '\bbound(ed)?\b|\bcap(ped)?\b|\bbudget\b|Retry-After|\bmax[_[:space:]-]*attempts\b|\bnum_retries\b' \
+    "$text"; then
+    return 1
+  fi
+  # Transient-only retries (or explicit 429 / 5xx / timeout retry class).
+  if ! rp_text_probe_grep_iE 'repo-practices remote-timeouts transient' \
+    'transient|429|502|503|504' "$text"; then
+    return 1
+  fi
+  # Write-retry safety: idempotency / dedupe / non-idempotent guidance.
+  if ! rp_text_probe_grep_iE 'repo-practices remote-timeouts idempotent' \
+    'idempoten|dedupe|deduplication|non-idempotent' "$text"; then
+    return 1
+  fi
+  # The non-idempotent-write clause must PROHIBIT the retry or bind it to a
+  # safety condition — token presence alone lets "retrying non-idempotent
+  # writes without dedupe is allowed" pass the check above.
+  if ! rp_text_probe_grep_iE 'repo-practices remote-timeouts idempotent binding' \
+    "(do[[:space:]]*(\\*\\*)?not(\\*\\*)?|don't|never|must[[:space:]]+not|avoid|no)[[:space:][:punct:]][^.[:cntrl:]]{0,60}retr[^.[:cntrl:]]{0,60}non-idempotent|non-idempotent[^.[:cntrl:]]{0,80}(do[[:space:]]*(\\*\\*)?not(\\*\\*)?|don't|never|must[[:space:]]+not|avoid)[^.[:cntrl:]]{0,20}retr|retr[^.[:cntrl:]]{0,40}non-idempotent[^.[:cntrl:]]{0,40}(unless|only[[:space:]]+(if|when)|when[^.[:cntrl:]]{0,20}safe|require)" \
+    "$text"; then
+    return 1
+  fi
+  # Reject phrasing that PERMITS retrying non-idempotent writes without a
+  # safeguard (strip negation-anchored mentions first, mirroring the unbounded
+  # decoy: "never say non-idempotent retries are fine" stays valid).
+  tmp="$(mktemp)"
+  printf '%s' "$text" >"$tmp"
+  stripped="$(runner_exec_stdout "repo-practices remote-timeouts strip negated nonidempotent" -- \
+    sed -E \
+    -e "s/(do[[:space:]]*(\\*\\*)?not(\\*\\*)?|don't|never|must[[:space:]]+not|avoid|forbid|may[[:space:]]+not)[[:space:][:punct:]][^.[:cntrl:]]{0,80}non-idempotent//Ig" \
+    "$tmp")"
+  rm -f "$tmp"
+  if rp_text_probe_grep_iE 'repo-practices remote-timeouts nonidempotent decoy' \
+    "(you may|you can|allowed to|permitted to|feel free to|freely|safe to)[[:space:][:punct:]][^.[:cntrl:]]{0,60}retr[^.[:cntrl:]]{0,60}non-idempotent|(retr[^.[:cntrl:]]{0,40}non-idempotent|non-idempotent[^.[:cntrl:]]{0,40}retr)[^.[:cntrl:]]{0,60}(is|are)[[:space:]]+(allowed|permitted|ok|fine|acceptable|safe)" \
+    "$stripped"; then
+    return 1
+  fi
+  # Anti-patterns: unbounded loop and/or call-without-timeout examples.
+  if ! rp_text_probe_grep_iE 'repo-practices remote-timeouts antipattern' \
+    'while[[:space:]]+True|unbounded|requests\.get|httpx\.get' "$text"; then
+    return 1
+  fi
+  # Reject rules that endorse unbounded retries (both word orders; allow-verbs;
+  # strip negation-anchored mentions so "you may not … unbounded" stays valid).
+  tmp="$(mktemp)"
+  printf '%s' "$text" >"$tmp"
+  stripped="$(runner_exec_stdout "repo-practices remote-timeouts strip negated unbounded" -- \
+    sed -E \
+    -e "s/(do[[:space:]]*(\\*\\*)?not(\\*\\*)?|don't|never|must[[:space:]]+not|forbid|may[[:space:]]+not|can[[:space:]]+not|cannot|can't)[[:space:][:punct:]][^.[:cntrl:]]{0,80}(unbounded|while[[:space:]]+True|forever)//Ig" \
+    -e "s/(unbounded|while[[:space:]]+True|forever)[^.[:cntrl:]]{0,40}(is|are)[[:space:]]+not//Ig" \
+    "$tmp")"
+  rm -f "$tmp"
+  if rp_text_probe_grep_iE 'repo-practices remote-timeouts unbounded decoy' \
+    '(you may|you can|allowed to|permitted to|feel free to|freely)[[:space:][:punct:]][^.[:cntrl:]]{0,60}((unbounded|while[[:space:]]+True|forever)[^.[:cntrl:]]{0,40}retr|retr[^.[:cntrl:]]{0,40}(unbounded|while[[:space:]]+True|forever))|(unbounded|while[[:space:]]+True|forever)[^.[:cntrl:]]{0,40}(is|are)[[:space:]]+(allowed|permitted|ok|fine|acceptable)|retr[^.[:cntrl:]]{0,40}forever[^.[:cntrl:]]{0,40}(is|are)[[:space:]]+(allowed|permitted|ok|fine|acceptable)' \
+    "$stripped"; then
+    return 1
+  fi
+  return 0
+}
+
+# Missing markers FAIL under --new-repo only (intake). Under --strict-onboarding
+# org --all, missing is SUGGEST-only during roll-out; invalid content FAILS for
+# --new-repo and --strict-onboarding. Prefer local dogfood when auditing THIS repo.
+rp_check_remote_timeouts_retries() {
+  local slug="$1"
+  local repo_fail=0
+  local rule_text repo_dir local_path
+  local fetch_ec=0
+
+  # Prefer the local dogfood copy when auditing this repo from a clone/worktree
+  # (new-rule PRs are not on origin/main yet; GitHub Contents would false-fail).
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_remote_timeouts_retries_path}"
+      if [[ -f "$local_path" ]]; then
+        rule_text="$(rp_runner_exec_stdout "repo-practices cat local remote-timeouts-retries check" -- \
+          cat "$local_path")"
+      fi
+    fi
+  fi
+  if [[ -z "${rule_text:-}" ]]; then
+    rule_text="$(rp_fetch_github_text_file "$slug" "$rp_remote_timeouts_retries_path")" \
+      || fetch_ec=$?
+  fi
+  if (( fetch_ec == 2 )); then
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      rp_log_gh_api_fail "$slug" "could not read ${rp_remote_timeouts_retries_path}"
+      return 1
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: retry remote-timeouts-retries rule check after GitHub API recovers"
+    else
+      rp_log_warn \
+        "${slug}: could not read ${rp_remote_timeouts_retries_path} (GitHub API error); skipping check"
+    fi
+    return 0
+  fi
+  if [[ -z "$rule_text" ]]; then
+    # Intake only: do not fail org --strict-onboarding --all on missing rules (v1 roll-out).
+    if [[ "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'remote-timeouts-retries cursor rule (.cursor/rules/remote-timeouts-retries.mdc)' \
+        "$(rp_github_url "$slug" '/new/main/.cursor/rules/remote-timeouts-retries.mdc')"
+    fi
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_remote_timeouts_retries_path" \
+        "$(rp_remote_timeouts_retries_content_for_apply_fix "$slug")" \
+        'add-remote-timeouts-retries' \
+        'chore: add remote-timeouts-retries cursor rule'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add .cursor/rules/remote-timeouts-retries.mdc (template: scripts/lib/repo-practices-cursor/)"
+    fi
+  elif ! rp_remote_timeouts_retries_is_valid "$rule_text"; then
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'remote-timeouts-retries rule must require explicit timeouts on remote calls, bounded retries for transient failures, and document anti-patterns (alwaysApply: true)' \
+        "$(rp_github_url "$slug" "/blob/main/${rp_remote_timeouts_retries_path}")"
+    fi
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_remote_timeouts_retries_path" \
+        "$(rp_remote_timeouts_retries_content_for_apply_fix "$slug")" \
+        'sync-remote-timeouts-retries' \
+        'chore: sync remote-timeouts-retries cursor rule'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: sync .cursor/rules/remote-timeouts-retries.mdc to require timeouts and bounded retries on remote I/O"
+    fi
+  else
+    rp_log_check_ok "$slug" 'remote-timeouts-retries cursor rule' \
+      "$(rp_github_url "$slug" "/blob/main/${rp_remote_timeouts_retries_path}")"
+  fi
+
+  return "$repo_fail"
+}
+
 readonly rp_repo_practices_after_config_change_path='.cursor/rules/repo-practices-after-config-change.mdc'
 
 rp_repo_practices_after_config_change_template() {
@@ -6285,6 +6489,7 @@ rp_print_new_repo_checklist() {
       [ ] .cursor/rules/pr-ship-and-review.mdc (agent review loop; template in ${rp_THIS_REPO_NAME})
       [ ] .cursor/rules/pre-pr-checks.mdc (format before check; no truncated output; template in ${rp_THIS_REPO_NAME})
       [ ] .cursor/rules/read-agents-and-rules.mdc (session-start read AGENTS.md + rules; template in ${rp_THIS_REPO_NAME})
+      [ ] .cursor/rules/remote-timeouts-retries.mdc (explicit timeouts + bounded retries on remote I/O; template in ${rp_THIS_REPO_NAME})
       [ ] .cursor/rules/repo-practices-after-config-change.mdc (run github-repo-lint after config/workflow edits; template in ${rp_THIS_REPO_NAME})
       [ ] .gitignore must not ignore .cursor/rules/ (un-ignore if ignoring other .cursor content)
       [ ] .github/stacking-tool (graphite|gh-stack)
@@ -7567,6 +7772,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_read_agents_and_rules "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_remote_timeouts_retries "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_repo_practices_after_config_change "$slug"; then
