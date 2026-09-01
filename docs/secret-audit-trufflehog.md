@@ -118,9 +118,10 @@ Path: **`~/scratch/repository-helpers/secret-audit-intake.json`**
 **Not a git file.** It is disposable operational state on the machine that runs the
 `secret-audit` timer and the `github-repo-lint` enforcer — a sibling of
 `secret-audit-batch.log` and `SECRET_AUDIT_DETAIL_DIR`. Lost or deleted, the next
-nightly sweep rebuilds every entry; a fresh clean full-history scan is an
-equal-or-stronger claim than what was lost, so there is nothing to back up
-(repository-helpers#573).
+nightly sweep rebuilds an entry for every repo that re-verifies cleanly (repos
+WARN-skipped during re-verification stay unrecorded until a later successful run);
+a fresh clean full-history scan is an equal-or-stronger claim than what was lost,
+so there is nothing to back up (repository-helpers#573).
 
 ```json
 { "_note": "...",
@@ -178,7 +179,8 @@ is a leftover — delete it (`dev-worktree-guard` / `start-development` say so).
 | `ERROR: SECRET_AUDIT_LEAK …` | TruffleHog exit **183** (`--fail`) — rotate credentials; do not record intake |
 | `ERROR: SECRET_AUDIT_INTAKE_MISSING …` | Lint `--new-repo`: repo has no ledger entry — run a clean deep scan |
 | `ERROR: SECRET_AUDIT_INTAKE_STALE …` | Lint strict / new-repo: ledger entry invalid or >90 days old |
-| `ERROR: SECRET_AUDIT_INTAKE_UNREADABLE …` | Lint strict / new-repo: the ledger file is present but not parseable JSON — remove it and re-run the sweep |
+| `ERROR: SECRET_AUDIT_INTAKE_UNREADABLE …` | Lint strict / new-repo: the ledger file is present but not a JSON object with an object `repos` — remove it and re-run the sweep |
+| `ERROR: SECRET_AUDIT_INTAKE_WRITE_FAILED …` | `scripts/secret-audit --write-marker`: the ledger path is unwritable (bad `SECRET_AUDIT_INTAKE_LEDGER`, disk full) — the scan was clean but the entry was not recorded |
 | `ERROR: SECRET_AUDIT_SCAN_FAILED …` | Tool / install / network / org-scan failure |
 | `ERROR: SECRET_AUDIT_INFRA_FAILED …` | Batch exit non-zero with clean counters **and** no `ERROR: SECRET_AUDIT_SCAN_FAILED` in the transcript (teardown / runner infra; #540 / #541). A 0/0 counter line alone does not imply INFRA when the scan already failed. |
 
