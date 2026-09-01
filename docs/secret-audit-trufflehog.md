@@ -100,11 +100,15 @@ Override pin / install dir / parallelism:
   omit for TruffleHog’s default worker count — org mode already overlaps clone/scan)
 
 Org sweeps always pass **`--exclude-archived`** so archived repositories are not
-cloned. Plain `--all` is one fast `trufflehog github --org` sweep. `--all
---write-marker` instead scans each `rp_discover_org_repos` entry **individually**
-(`git file://` for a local clone, `trufflehog github --repo` otherwise) and records
-intake only for repos that scan clean — an aggregate `--org` exit of 0 cannot prove
-every repo was actually reached.
+cloned. `--all` runs one fast `trufflehog github --org --fail` sweep — the
+authoritative pass/fail (fails loudly on auth/discovery errors and any verified
+finding). `--all` also fails the run up front if `rp_discover_org_repos` errors or
+returns no repos. With `--write-marker`, after a clean sweep each discovered repo
+is **re-verified individually** (`git file://` for a local clone, `trufflehog
+github --repo` otherwise) and its ledger entry upserted only on a clean result —
+so a repo the org sweep skipped on an error is never recorded clean. That refresh
+is **best-effort**: a repo that cannot be re-verified is WARN-skipped (its entry
+ages until the next good run) and does not change the run's exit.
 
 ## Intake ledger (host-local)
 
@@ -141,15 +145,18 @@ Rules:
 - An entry proves the **intake deep-history scan completed clean** — not a
   substitute for CI gitleaks or the nightly org sweep.
 - **Maintained by the nightly sweep.** `secret-audit-batch-run` passes
-  `--write-marker`, so the nightly run scans every discovered repo individually and
-  upserts an entry for each one that scans clean. The 90-day staleness check
-  therefore doubles as a "is the nightly sweep still running" canary.
+  `--write-marker`; after the aggregate sweep passes, the nightly run re-verifies
+  each repo and refreshes its entry (best-effort — see above). The 90-day
+  staleness check therefore doubles as a "is the nightly sweep still running"
+  canary; a repo that is WARN-skipped for several nights running will eventually
+  age past 90 days and get flagged.
 - **`github-repo-lint` reads the ledger locally** — no Contents API, no default
   branch. The check is meaningful only where the ledger lives:
 
   | ledger state | routine `--all` | `--strict-onboarding` | `--new-repo` |
   | --- | --- | --- | --- |
   | file absent (CI runner, cold laptop) | skip | SUGGEST | SUGGEST |
+  | ledger present but unparseable | SUGGEST | **FAIL** | **FAIL** `SECRET_AUDIT_INTAKE_UNREADABLE` |
   | no entry for the repo | SUGGEST | SUGGEST (roll-out) | **FAIL** `SECRET_AUDIT_INTAKE_MISSING` |
   | entry stale (>90d) or invalid | SUGGEST | **FAIL** | **FAIL** `SECRET_AUDIT_INTAKE_STALE` |
   | entry fresh + valid | OK | OK | OK |
@@ -171,6 +178,7 @@ is a leftover — delete it (`dev-worktree-guard` / `start-development` say so).
 | `ERROR: SECRET_AUDIT_LEAK …` | TruffleHog exit **183** (`--fail`) — rotate credentials; do not record intake |
 | `ERROR: SECRET_AUDIT_INTAKE_MISSING …` | Lint `--new-repo`: repo has no ledger entry — run a clean deep scan |
 | `ERROR: SECRET_AUDIT_INTAKE_STALE …` | Lint strict / new-repo: ledger entry invalid or >90 days old |
+| `ERROR: SECRET_AUDIT_INTAKE_UNREADABLE …` | Lint strict / new-repo: the ledger file is present but not parseable JSON — remove it and re-run the sweep |
 | `ERROR: SECRET_AUDIT_SCAN_FAILED …` | Tool / install / network / org-scan failure |
 | `ERROR: SECRET_AUDIT_INFRA_FAILED …` | Batch exit non-zero with clean counters **and** no `ERROR: SECRET_AUDIT_SCAN_FAILED` in the transcript (teardown / runner infra; #540 / #541). A 0/0 counter line alone does not imply INFRA when the scan already failed. |
 
