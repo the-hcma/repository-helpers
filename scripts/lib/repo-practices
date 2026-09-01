@@ -2292,12 +2292,12 @@ rp_agents_md_documents_cursor_rules() {
     return 1
   fi
   # Reject only a negation that lands directly on the read/load verb
-  # ("do not read .cursor/rules"). Canonical positive phrasings —
-  # "do not skip reading .cursor/rules", "never start a session without
-  # reading .cursor/rules" — put a word between the negation and the verb and
-  # must NOT trip this.
+  # ("do not read .cursor/rules", "do not **read** ..."). Only markdown emphasis
+  # (*, _, `) — not another word — may sit between the negation and the verb, so
+  # canonical positive phrasings ("do not skip reading .cursor/rules", "never
+  # start a session without reading .cursor/rules") still pass.
   if grep -qiE \
-    "(do not|don't|never|must not)[[:space:]]+([Rr]ead|[Ll]oad|consult|open)([[:space:]]+(the|every|all|any))?[[:space:]][^.]{0,25}\.cursor/rules" \
+    "(do not|don't|never|must not)[[:space:]*_\`]+([Rr]ead|[Ll]oad|consult|open)[[:space:]*_\`]*([[:space:]]+(the|every|all|any))?[[:space:]][^.]{0,25}\.cursor/rules" \
     <<<"$flat"; then
     return 1
   fi
@@ -2313,11 +2313,18 @@ rp_claude_md_shim_is_valid() {
 }
 
 # A copilot-instructions shim: points the reader at AGENTS.md and does not try to
-# be a second rules source.
+# be a second rules source. Must mention AGENTS.md AND not negate that pointer
+# ("Do not read AGENTS.md ...").
 rp_copilot_instructions_shim_is_valid() {
   local -r text="$1"
+  local flat
 
-  grep -qE 'AGENTS\.md' <<<"$text"
+  flat="$(printf '%s' "$text" | tr '\n\t' '  ' | tr -s ' ')"
+  grep -qE 'AGENTS\.md' <<<"$flat" || return 1
+  if grep -qiE "(do not|don't|never|ignore|no need to)[^.]{0,25}AGENTS\.md" <<<"$flat"; then
+    return 1
+  fi
+  return 0
 }
 
 # Is `path` a symlink that points at the **root** AGENTS.md? (Contents API returns
@@ -2325,13 +2332,45 @@ rp_copilot_instructions_shim_is_valid() {
 # own directory: `AGENTS.md` for a root file (CLAUDE.md), `../AGENTS.md` for a
 # one-deep file (.github/copilot-instructions.md). A subdirectory AGENTS.md
 # (`docs/AGENTS.md`) is a different file and is rejected — one source of truth.
+#
+# Returns 0 = valid AGENTS.md symlink; 1 = not that (missing / regular file /
+# other target); 2 = Contents API error after the retry budget. A caller must NOT
+# treat 2 as "missing" (mirrors rp_gh_path_check: never 502/503/504/429 -> missing).
 rp_agent_bootstrap_path_is_agents_symlink() {
   local -r slug="$1"
   local -r path="$2"
+  local attempt max_attempts exit_code class_ec sleep_ec
   local response type target dir depth prefix i
 
-  response="$(rp_runner_gh_api_stream "repo-practices agent-bootstrap symlink probe" --probe \
-    "repos/${slug}/contents/${path}")" || return 1
+  max_attempts="$(rp_gh_api_max_attempts)"
+  attempt=1
+  response=''
+  while (( attempt <= max_attempts )); do
+    exit_code=0
+    set +e
+    response="$(rp_runner_gh_api_stream "repo-practices agent-bootstrap symlink probe ${path}" --probe \
+      "repos/${slug}/contents/${path}")"
+    exit_code=$?
+    set -e
+    if (( exit_code == 0 )) && [[ -n "$response" ]]; then
+      break
+    fi
+    response=''
+    class_ec=0
+    rp_gh_api_classify_contents_failure "$attempt" || class_ec=$?
+    if (( class_ec == 3 )); then
+      sleep_ec=0
+      rp_gh_api_retry_sleep "$attempt" || sleep_ec=$?
+      if (( sleep_ec == 124 || sleep_ec == 125 )); then
+        return 2
+      fi
+      attempt=$(( attempt + 1 ))
+      continue
+    fi
+    return "$class_ec"  # 1 = not found (not a symlink), 2 = API error
+  done
+  [[ -n "$response" ]] || return 2
+
   type="$(rp_runner_jq_file "agent-bootstrap symlink type" "$response" -r '.type // empty')"
   [[ "$type" == 'symlink' ]] || return 1
   target="$(rp_runner_jq_file "agent-bootstrap symlink target" "$response" -r '.target // empty')"
@@ -2375,6 +2414,7 @@ rp_check_agent_bootstrap() {
   local repo_fail=0
   local agents_text claude_text copilot_text
   local fetch_ec=0
+  local sym_rc=0
 
   # 1. AGENTS.md must exist (hard check) and document the .cursor/rules startup
   #    contract (SUGGEST-during-roll-out for the contract line; --new-repo FAILs).
@@ -2421,7 +2461,15 @@ rp_check_agent_bootstrap() {
     return 0
   fi
   if [[ -z "$claude_text" ]] || ! rp_claude_md_shim_is_valid "$claude_text"; then
-    if rp_agent_bootstrap_path_is_agents_symlink "$slug" "$rp_agent_bootstrap_claude_path"; then
+    sym_rc=0
+    rp_agent_bootstrap_path_is_agents_symlink "$slug" "$rp_agent_bootstrap_claude_path" || sym_rc=$?
+    if (( sym_rc == 2 )); then
+      if rp_agent_bootstrap_api_error_is_fatal "$slug" "${rp_agent_bootstrap_claude_path} (symlink probe)"; then
+        return 1
+      fi
+      return 0
+    fi
+    if (( sym_rc == 0 )); then
       : # symlink CLAUDE.md -> AGENTS.md is fine
     else
       if [[ "$rp_new_repo" -eq 1 ]]; then
@@ -2452,7 +2500,15 @@ rp_check_agent_bootstrap() {
     return 0
   fi
   if [[ -z "$copilot_text" ]] || ! rp_copilot_instructions_shim_is_valid "$copilot_text"; then
-    if rp_agent_bootstrap_path_is_agents_symlink "$slug" "$rp_agent_bootstrap_copilot_path"; then
+    sym_rc=0
+    rp_agent_bootstrap_path_is_agents_symlink "$slug" "$rp_agent_bootstrap_copilot_path" || sym_rc=$?
+    if (( sym_rc == 2 )); then
+      if rp_agent_bootstrap_api_error_is_fatal "$slug" "${rp_agent_bootstrap_copilot_path} (symlink probe)"; then
+        return 1
+      fi
+      return 0
+    fi
+    if (( sym_rc == 0 )); then
       : # symlink .github/copilot-instructions.md -> AGENTS.md is fine (same as CLAUDE.md)
     else
       if [[ "$rp_new_repo" -eq 1 ]]; then
