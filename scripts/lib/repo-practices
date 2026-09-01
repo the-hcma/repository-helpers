@@ -236,7 +236,7 @@ Audits GitHub conventions for org repositories:
     - .gitignore must not ignore .cursor/rules/ (org cursor rules must be trackable)
     - .github/stacking-tool (graphite|gh-stack) + stacking-tool cursor rule
     - stacking docs consistency (AGENTS.md / pr-ship / GRAPHITE.md vs marker)
-    - .github/secret-audit.json (TruffleHog deep-scan intake marker; see docs/secret-audit-trufflehog.md)
+    - secret-audit intake: host-local ledger entry after a clean TruffleHog deep scan (see docs/secret-audit-trufflehog.md)
 
   Release Please (when release-please.yml exists):
     - squash-only repo settings; squash_merge_commit_message=BLANK
@@ -1166,43 +1166,41 @@ rp_stacking_tool_rule_is_valid() {
     <<<"$text"
 }
 
-# Validates .github/secret-audit.json after a clean TruffleHog deep scan (#509).
-# Missing markers FAIL under --new-repo only (intake gate). Under --strict-onboarding
-# alone they SUGGEST so org-wide audits can roll out without failing every repo
-# before operators write markers. Invalid/stale markers FAIL under --new-repo or
-# --strict-onboarding; routine audits SUGGEST.
-rp_check_secret_audit_marker() {
+# Checks the host-local secret-audit intake ledger for a clean TruffleHog deep
+# scan of this repo (#509 / #573). The ledger lives under ~/scratch — it is NOT a
+# git file and is NOT fetched from GitHub — so this check is meaningful only where
+# the ledger lives (the enforcer host / an operator who has scanned locally).
+#
+#   ledger file absent  -> SUGGEST only (CI runners, cold laptops); never a FAIL
+#   no entry for repo    -> FAIL under --new-repo; SUGGEST otherwise (roll-out)
+#   entry stale/invalid  -> FAIL under --new-repo / --strict-onboarding; else SUGGEST
+#   entry fresh + valid  -> OK
+rp_check_secret_audit_intake() {
   local slug="$1"
-  local marker_text validation_rc repo_fail=0 fetch_rc=0
+  local entry_text entry_rc validation_rc repo_fail=0 ledger
 
-  fetch_rc=0
-  marker_text="$(rp_fetch_github_text_file "$slug" "$secret_audit_marker_relpath")" || fetch_rc=$?
-  if (( fetch_rc == 2 )); then
-    # Strict/intake: FAIL. Routine audit: WARN only (do not record FAIL then return 0).
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      rp_log_gh_api_fail "$slug" "secret-audit marker fetch (${secret_audit_marker_relpath})"
-      repo_fail=1
-      rp_log_check_fail "$slug" \
-        'secret-audit marker fetch failed (GitHub API error)' \
-        "$(rp_github_url "$slug" "/blob/main/${secret_audit_marker_relpath}")"
-    else
-      rp_log_warn \
-        "${slug}: secret-audit marker fetch failed (GitHub API error); retry later"
-    fi
+  ledger="$(secret_audit_ledger_path)"
+
+  entry_rc=0
+  entry_text="$(secret_audit_ledger_entry "$slug")" || entry_rc=$?
+
+  if (( entry_rc == 1 )); then
+    # No ledger on this host — cannot evaluate. Do not fail onboarding over a
+    # missing cache file; keep it visible via SUGGEST.
     if [[ "$rp_suggest" -eq 1 ]]; then
       rp_log_suggest \
-        "${slug}: retry secret-audit marker check after GitHub API recovers"
+        "${slug}: no secret-audit intake ledger on this host (${ledger}); run scripts/secret-audit --repo ${slug} --write-marker on the enforcer host"
     fi
-    return "$repo_fail"
+    return 0
   fi
-  if [[ -z "$marker_text" || "$fetch_rc" -ne 0 ]]; then
-    # Intake only: do not fail org --strict-onboarding --all on missing markers (v1 roll-out).
+
+  if (( entry_rc == 2 )); then
     if [[ "$rp_new_repo" -eq 1 ]]; then
       repo_fail=1
       rp_log_check_fail "$slug" \
-        "secret-audit intake marker (${secret_audit_marker_relpath})" \
-        "$(rp_github_url "$slug" "/new/main/${secret_audit_marker_relpath}")"
-      printf 'ERROR: SECRET_AUDIT_MARKER_MISSING %s\n' "$slug" >&2
+        'secret-audit intake (no ledger entry — run a clean TruffleHog deep scan)' \
+        "$(rp_github_url "$slug")"
+      printf 'ERROR: SECRET_AUDIT_INTAKE_MISSING %s\n' "$slug" >&2
     fi
     if [[ "$rp_suggest" -eq 1 ]]; then
       rp_log_suggest \
@@ -1214,24 +1212,23 @@ rp_check_secret_audit_marker() {
   fi
 
   validation_rc=0
-  secret_audit_validate_marker_json "$marker_text" || validation_rc=$?
+  secret_audit_validate_intake_entry "$entry_text" || validation_rc=$?
   if (( validation_rc != 0 )); then
     if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
       repo_fail=1
       rp_log_check_fail "$slug" \
-        'secret-audit marker invalid or stale' \
-        "$(rp_github_url "$slug" "/blob/main/${secret_audit_marker_relpath}")"
-      printf 'ERROR: SECRET_AUDIT_MARKER_INVALID %s\n' "$slug" >&2
+        'secret-audit intake entry invalid or stale' \
+        "$(rp_github_url "$slug")"
+      printf 'ERROR: SECRET_AUDIT_INTAKE_STALE %s\n' "$slug" >&2
     fi
     if [[ "$rp_suggest" -eq 1 ]]; then
       rp_log_suggest \
-        "${slug}: re-run scripts/secret-audit --repo ${slug} --write-marker (marker invalid or stale)"
+        "${slug}: re-run scripts/secret-audit --repo ${slug} --write-marker (intake entry invalid or stale)"
     fi
     return "$repo_fail"
   fi
 
-  rp_log_check_ok "$slug" 'secret-audit intake marker' \
-    "$(rp_github_url "$slug" "/blob/main/${secret_audit_marker_relpath}")"
+  rp_log_check_ok "$slug" 'secret-audit intake ledger' "$ledger"
   return 0
 }
 
@@ -4546,7 +4543,6 @@ rp_candidate_fix_path_is_api_eligible() {
 
   [[ "$path" == .cursor/rules/* ]] && return 0
   [[ "$path" == '.github/stacking-tool' ]] && return 0
-  [[ "$path" == '.github/secret-audit.json' ]] && return 0
   return 1
 }
 
@@ -6493,7 +6489,7 @@ rp_print_new_repo_checklist() {
       [ ] .cursor/rules/repo-practices-after-config-change.mdc (run github-repo-lint after config/workflow edits; template in ${rp_THIS_REPO_NAME})
       [ ] .gitignore must not ignore .cursor/rules/ (un-ignore if ignoring other .cursor content)
       [ ] .github/stacking-tool (graphite|gh-stack)
-      [ ] .github/secret-audit.json after clean TruffleHog deep scan (scripts/secret-audit --write-marker; docs/secret-audit-trufflehog.md)
+      [ ] secret-audit intake ledger entry after clean TruffleHog deep scan (scripts/secret-audit --repo OWNER/NAME --write-marker; docs/secret-audit-trufflehog.md)
       [ ] .cursor/rules/stacking-tool.mdc (thin marker rule; template in ${rp_THIS_REPO_NAME})
       [ ] AGENTS.md + pr-ship submit block match the marker (no leftover Graphite-only gt/merge-it when gh-stack)
       [ ] No root GRAPHITE.md when marker is gh-stack (skill in ${rp_THIS_REPO_NAME} is SSOT)
@@ -7765,7 +7761,7 @@ rp_check_one_repo() {
     if ! rp_check_stacking_tool "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
-    if ! rp_check_secret_audit_marker "$slug"; then
+    if ! rp_check_secret_audit_intake "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_stacking_docs_consistency "$slug"; then
