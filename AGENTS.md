@@ -4,6 +4,20 @@ This file defines the non-negotiable standards for all contributors (human or AI
 
 ---
 
+## Session startup
+
+At the **start of every agent session**, before acting from assumed conventions:
+
+1. Read this `AGENTS.md` in full.
+2. Read every rule under `.cursor/rules/*.mdc` with `alwaysApply: true` in its
+   front matter, plus any rule whose `globs` match files you will touch.
+   `AGENTS.md` and `.cursor/rules/` together are the contract — neither alone is complete.
+
+`CLAUDE.md` (a `@AGENTS.md` import) and `.github/copilot-instructions.md` are thin
+shims so Claude Code and Copilot reach this same guidance — do not put rules in them.
+
+---
+
 ## Utilities overview
 
 Top-level scripts (see [README.md](./README.md) for operator-oriented summaries):
@@ -190,6 +204,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Remote timeouts and retries cursor rule | yes* | — | `.cursor/rules/remote-timeouts-retries.mdc`: explicit timeouts on every remote call; bounded retries for transient failures only (`Retry-After` / cap / budget); anti-patterns for no-timeout calls and `while True` retries (*missing FAILS `--new-repo` only; SUGGEST under org `--strict-onboarding` during roll-out; invalid FAILS `--new-repo` / `--strict-onboarding`) |
 | Repo practices after config change | yes | — | `.cursor/rules/repo-practices-after-config-change.mdc` requires `github-repo-lint` after workflow/config edits; `pre-pr-checks` runs detect-first `repo-practices-lint` when the diff touches those paths |
 | Session-start read guidance | yes | — | `.cursor/rules/read-agents-and-rules.mdc` requires reading `AGENTS.md` and `.cursor/rules/` at the start of every new agent session |
+| Agent bootstrap (agent-agnostic) | yes* | — | `AGENTS.md` at root + a session-startup line telling the agent to load `.cursor/rules/*.mdc`; `CLAUDE.md` (an `@AGENTS.md` import, or a symlink to `AGENTS.md`) and `.github/copilot-instructions.md` shims so Claude Code / Copilot reach the same guidance (templates in `scripts/lib/repo-practices-agents/`) (*missing shims / startup line SUGGEST under org `--strict-onboarding` during roll-out; FAIL `--new-repo`) |
 | Secret-audit intake ledger | yes | — | Host-local `~/scratch/repository-helpers/secret-audit-intake.json` (not a git file; nightly-maintained): no entry FAILS `--new-repo` (SUGGEST under `--strict-onboarding` during roll-out); stale/invalid FAILS `--new-repo` / `--strict-onboarding`; ledger absent (CI runner) SUGGEST-only (TruffleHog deep scan — see [docs/secret-audit-trufflehog.md](./docs/secret-audit-trufflehog.md)) |
 | Stacking-tool marker + rule | yes | — | `.github/stacking-tool` (`graphite`\|`gh-stack`) and thin `.cursor/rules/stacking-tool.mdc` (skill breadcrumbs; no copied skill bodies) |
 | Stacking docs consistency | yes | — | When marker is `gh-stack`, fail if `pr-ship-and-review.mdc` still has Graphite-only `gt create`/`gt submit`, or if root `GRAPHITE.md` remains; suggest (non-failing) if `AGENTS.md` still prescribes Graphite/`gt`/`merge-it` without `gh stack`. Graphite marker gets a soft suggest if docs are gh-stack-only. Skips this repo (dual SSOT). Cutover checklist: `.cursor/rules/stacking-tool.mdc` |

@@ -2249,6 +2249,179 @@ rp_check_read_agents_and_rules() {
   return "$repo_fail"
 }
 
+# --- agent-bootstrap: AGENTS.md is the single source of truth; CLAUDE.md and
+# --- .github/copilot-instructions.md are thin shims that point at it, so every
+# --- agent (Cursor / Claude Code / Copilot) loads the same guidance at startup.
+# --- See repository-helpers#574.
+readonly rp_agent_bootstrap_agents_path='AGENTS.md'
+readonly rp_agent_bootstrap_claude_path='CLAUDE.md'
+readonly rp_agent_bootstrap_copilot_path='.github/copilot-instructions.md'
+
+rp_agent_bootstrap_template() {
+  local -r name="$1"
+  local path
+
+  path="${rp_lib_dir}/repo-practices-agents/${name}"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing agent-bootstrap template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat agent-bootstrap ${name}" -- cat "$path"
+}
+
+# AGENTS.md must tell the agent to ALSO load the .cursor/rules/*.mdc guidance at
+# session start — otherwise an agent that reads AGENTS.md still misses the rules.
+# Positive instruction required; negated guidance rejected.
+rp_agents_md_documents_cursor_rules() {
+  local -r text="$1"
+
+  if ! grep -qiE \
+    '([Rr]ead|[Ll]oad).{0,80}\.cursor/rules|\.cursor/rules.{0,80}([Rr]ead|[Ll]oad)' \
+    <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qiE 'session start|start of (every|each|a) .*session|new agent session|before (acting|any other work)' \
+    <<<"$text"; then
+    return 1
+  fi
+  if grep -qiE \
+    '(do not|don'\''t|never|skip|no need to)[[:space:]].{0,50}([Rr]ead|[Ll]oad).{0,50}\.cursor/rules' \
+    <<<"$text"; then
+    return 1
+  fi
+  return 0
+}
+
+# A CLAUDE.md shim: a Claude Code `@AGENTS.md` import line, OR the marker text a
+# symlink check leaves (see rp_check_agent_bootstrap for the symlink path).
+rp_claude_md_shim_is_valid() {
+  local -r text="$1"
+
+  grep -qE '(^|[[:space:]])@AGENTS\.md([[:space:]]|$)' <<<"$text"
+}
+
+# A copilot-instructions shim: points the reader at AGENTS.md and does not try to
+# be a second rules source.
+rp_copilot_instructions_shim_is_valid() {
+  local -r text="$1"
+
+  grep -qE 'AGENTS\.md' <<<"$text"
+}
+
+# Is `path` a symlink whose target resolves to AGENTS.md? (Contents API returns
+# type "symlink" with the raw target.)
+rp_agent_bootstrap_path_is_agents_symlink() {
+  local -r slug="$1"
+  local -r path="$2"
+  local response type target
+
+  response="$(rp_runner_gh_api_stream "repo-practices agent-bootstrap symlink probe" --probe \
+    "repos/${slug}/contents/${path}")" || return 1
+  type="$(rp_runner_jq_file "agent-bootstrap symlink type" "$response" -r '.type // empty')"
+  [[ "$type" == 'symlink' ]] || return 1
+  target="$(rp_runner_jq_file "agent-bootstrap symlink target" "$response" -r '.target // empty')"
+  [[ "$(basename "$target")" == 'AGENTS.md' ]]
+}
+
+rp_check_agent_bootstrap() {
+  local slug="$1"
+  local repo_fail=0
+  local agents_text claude_text copilot_text
+  local fetch_ec=0
+
+  # 1. AGENTS.md must exist (hard check) and document the .cursor/rules startup
+  #    contract (SUGGEST-during-roll-out for the contract line; --new-repo FAILs).
+  fetch_ec=0
+  agents_text="$(rp_fetch_github_text_file "$slug" "$rp_agent_bootstrap_agents_path")" || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" "could not read ${rp_agent_bootstrap_agents_path}"
+    return 1
+  fi
+  if [[ -z "$agents_text" ]]; then
+    # Every org repo already has AGENTS.md; a missing one is intake-only for now
+    # (v1 roll-out — promote to a hard --strict-onboarding check once the shims
+    # are org-wide, see repository-helpers#575).
+    if [[ "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'AGENTS.md at repo root (single source of truth for agent ground rules)' \
+        "$(rp_github_url "$slug" '/new/main/AGENTS.md')"
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: add AGENTS.md at the repo root (see scripts/lib/repo-practices-agents/agents-md-startup-section.md)"
+    fi
+  elif ! rp_agents_md_documents_cursor_rules "$agents_text"; then
+    if [[ "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'AGENTS.md must instruct the agent to load .cursor/rules/*.mdc at session start' \
+        "$(rp_github_url "$slug" '/blob/main/AGENTS.md')"
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: AGENTS.md needs a session-startup line telling the agent to also load .cursor/rules/*.mdc (snippet: scripts/lib/repo-practices-agents/agents-md-startup-section.md)"
+    fi
+  fi
+
+  # 2. CLAUDE.md shim — @AGENTS.md import file, or a symlink to AGENTS.md.
+  fetch_ec=0
+  claude_text="$(rp_fetch_github_text_file "$slug" "$rp_agent_bootstrap_claude_path")" || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" "could not read ${rp_agent_bootstrap_claude_path}"
+    return 1
+  fi
+  if [[ -z "$claude_text" ]] || ! rp_claude_md_shim_is_valid "$claude_text"; then
+    if rp_agent_bootstrap_path_is_agents_symlink "$slug" "$rp_agent_bootstrap_claude_path"; then
+      : # symlink CLAUDE.md -> AGENTS.md is fine
+    else
+      if [[ "$rp_new_repo" -eq 1 ]]; then
+        repo_fail=1
+        rp_log_check_fail "$slug" \
+          'CLAUDE.md shim (a `@AGENTS.md` import, or a symlink to AGENTS.md) so Claude Code loads the ground rules' \
+          "$(rp_github_url "$slug" '/new/main/CLAUDE.md')"
+      fi
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
+        rp_queue_candidate_file_fix "$slug" "$rp_agent_bootstrap_claude_path" \
+          "$(rp_agent_bootstrap_template 'CLAUDE.md')" \
+          'add-claude-md-shim' \
+          'chore: add CLAUDE.md (@AGENTS.md import) so Claude Code loads the ground rules'
+      fi
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: add CLAUDE.md containing '@AGENTS.md' (template: scripts/lib/repo-practices-agents/CLAUDE.md)"
+      fi
+    fi
+  fi
+
+  # 3. .github/copilot-instructions.md shim — points at AGENTS.md.
+  fetch_ec=0
+  copilot_text="$(rp_fetch_github_text_file "$slug" "$rp_agent_bootstrap_copilot_path")" || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" "could not read ${rp_agent_bootstrap_copilot_path}"
+    return 1
+  fi
+  if [[ -z "$copilot_text" ]] || ! rp_copilot_instructions_shim_is_valid "$copilot_text"; then
+    if [[ "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        '.github/copilot-instructions.md shim pointing at AGENTS.md so Copilot loads the ground rules' \
+        "$(rp_github_url "$slug" '/new/main/.github/copilot-instructions.md')"
+    fi
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_agent_bootstrap_copilot_path" \
+        "$(rp_agent_bootstrap_template 'copilot-instructions.md')" \
+        'add-copilot-instructions-shim' \
+        'chore: add .github/copilot-instructions.md pointing at AGENTS.md'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: add .github/copilot-instructions.md pointing at AGENTS.md (template: scripts/lib/repo-practices-agents/copilot-instructions.md)"
+    fi
+  fi
+
+  if [[ "$repo_fail" -eq 0 ]]; then
+    rp_log_check_ok "$slug" 'agent-bootstrap (AGENTS.md + CLAUDE.md + copilot-instructions shims)' \
+      "$(rp_github_url "$slug" '/blob/main/AGENTS.md')"
+  fi
+  return "$repo_fail"
+}
+
 readonly rp_remote_timeouts_retries_path='.cursor/rules/remote-timeouts-retries.mdc'
 
 rp_remote_timeouts_retries_template() {
@@ -4561,6 +4734,8 @@ rp_candidate_fix_path_is_api_eligible() {
 
   [[ "$path" == .cursor/rules/* ]] && return 0
   [[ "$path" == '.github/stacking-tool' ]] && return 0
+  [[ "$path" == 'CLAUDE.md' ]] && return 0
+  [[ "$path" == '.github/copilot-instructions.md' ]] && return 0
   return 1
 }
 
@@ -7786,6 +7961,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_read_agents_and_rules "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_agent_bootstrap "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_remote_timeouts_retries "$slug"; then
