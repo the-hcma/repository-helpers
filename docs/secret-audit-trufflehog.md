@@ -100,8 +100,11 @@ Override pin / install dir / parallelism:
   omit for TruffleHog’s default worker count — org mode already overlaps clone/scan)
 
 Org sweeps always pass **`--exclude-archived`** so archived repositories are not
-cloned. The intake-ledger refresh after a clean org scan iterates the same
-archived-filtered `rp_discover_org_repos` list.
+cloned. Plain `--all` is one fast `trufflehog github --org` sweep. `--all
+--write-marker` instead scans each `rp_discover_org_repos` entry **individually**
+(`git file://` for a local clone, `trufflehog github --repo` otherwise) and records
+intake only for repos that scan clean — an aggregate `--org` exit of 0 cannot prove
+every repo was actually reached.
 
 ## Intake ledger (host-local)
 
@@ -138,9 +141,9 @@ Rules:
 - An entry proves the **intake deep-history scan completed clean** — not a
   substitute for CI gitleaks or the nightly org sweep.
 - **Maintained by the nightly sweep.** `secret-audit-batch-run` passes
-  `--write-marker`; after each clean `trufflehog github --org` run it upserts an
-  entry for every discovered repo. The 90-day staleness check therefore doubles as
-  a "is the nightly sweep still running" canary.
+  `--write-marker`, so the nightly run scans every discovered repo individually and
+  upserts an entry for each one that scans clean. The 90-day staleness check
+  therefore doubles as a "is the nightly sweep still running" canary.
 - **`github-repo-lint` reads the ledger locally** — no Contents API, no default
   branch. The check is meaningful only where the ledger lives:
 
