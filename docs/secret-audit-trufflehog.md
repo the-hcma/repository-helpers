@@ -158,7 +158,7 @@ Rules:
   | --- | --- | --- | --- |
   | file absent (CI runner, cold laptop) | skip | SUGGEST | SUGGEST |
   | ledger present but unparseable | SUGGEST | **FAIL** | **FAIL** `SECRET_AUDIT_INTAKE_UNREADABLE` |
-  | no entry for the repo | SUGGEST | SUGGEST (roll-out) | **FAIL** `SECRET_AUDIT_INTAKE_MISSING` |
+  | no entry for the repo | SUGGEST | **FAIL** `SECRET_AUDIT_INTAKE_MISSING` (#575) | **FAIL** `SECRET_AUDIT_INTAKE_MISSING` |
   | entry stale (>90d) or invalid | SUGGEST | **FAIL** | **FAIL** `SECRET_AUDIT_INTAKE_STALE` |
   | entry fresh + valid | OK | OK | OK |
 
@@ -177,7 +177,7 @@ is a leftover — delete it (`dev-worktree-guard` / `start-development` say so).
 | Line | Meaning |
 | --- | --- |
 | `ERROR: SECRET_AUDIT_LEAK …` | TruffleHog exit **183** (`--fail`) — rotate credentials; do not record intake |
-| `ERROR: SECRET_AUDIT_INTAKE_MISSING …` | Lint `--new-repo`: repo has no ledger entry — run a clean deep scan |
+| `ERROR: SECRET_AUDIT_INTAKE_MISSING …` | Lint strict / new-repo: repo has no ledger entry — run a clean deep scan |
 | `ERROR: SECRET_AUDIT_INTAKE_STALE …` | Lint strict / new-repo: ledger entry invalid or >90 days old |
 | `ERROR: SECRET_AUDIT_INTAKE_UNREADABLE …` | Lint strict / new-repo: the ledger file is present but not a JSON object with an object `repos` — remove it and re-run the sweep |
 | `ERROR: SECRET_AUDIT_INTAKE_WRITE_FAILED …` | `scripts/secret-audit --write-marker`: the ledger path is unwritable (bad `SECRET_AUDIT_INTAKE_LEDGER`, disk full) — the scan was clean but the entry was not recorded |
