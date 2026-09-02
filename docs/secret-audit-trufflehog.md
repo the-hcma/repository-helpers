@@ -1,8 +1,8 @@
 # TruffleHog deep secret audit (#509)
 
 This document is the SSOT for how **TruffleHog** is used in this org: what it
-locates, how `scripts/secret-audit` invokes it, the intake marker schema, and how
-that differs from the fast **gitleaks** gate.
+locates, how `scripts/secret-audit` invokes it, the host-local intake ledger, and
+how that differs from the fast **gitleaks** gate.
 
 ## Why two scanners?
 
@@ -83,12 +83,12 @@ brew install trufflehog
 # Homebrew: always pass --no-update
 trufflehog --no-update git file://. --results=verified --fail
 
-# Org wrapper (preferred — pinned release, --no-update). Scan only; no marker write.
+# Org wrapper (preferred — pinned release, --no-update). Scan only; no ledger write.
 scripts/secret-audit --repo OWNER/NAME
 scripts/secret-audit --all --org the-hcma --include-private
 
-# Intake / stale-marker refresh: writes .github/secret-audit.json into the clone.
-# Commit and push the result — lint reads the marker from the default branch.
+# Intake / stale refresh: after a clean scan, record intake in the host-local
+# ledger (~/scratch/repository-helpers/secret-audit-intake.json). No git writes.
 scripts/secret-audit --repo OWNER/NAME --write-marker
 ```
 
@@ -100,62 +100,87 @@ Override pin / install dir / parallelism:
   omit for TruffleHog’s default worker count — org mode already overlaps clone/scan)
 
 Org sweeps always pass **`--exclude-archived`** so archived repositories are not
-cloned. Marker refresh after a clean org scan uses the same archived filter via
-`rp_exclude_archived` on `rp_discover_org_repos` (local clones of archived repos
-are skipped).
+cloned. `--all` runs one fast `trufflehog github --org --fail` sweep — the
+authoritative pass/fail (fails loudly on auth/discovery errors and any verified
+finding). `--all` also fails the run up front if `rp_discover_org_repos` errors or
+returns no repos. With `--write-marker`, after a clean sweep each discovered repo
+is **re-verified individually** (`git file://` for a local clone, `trufflehog
+github --repo` otherwise) and its ledger entry upserted only on a clean result —
+so a repo the org sweep skipped on an error is never recorded clean. That refresh
+is **best-effort**: a repo that cannot be re-verified is WARN-skipped (its entry
+ages until the next good run) and does not change the run's exit.
 
-## Marker file
+## Intake ledger (host-local)
 
-Path: **`.github/secret-audit.json`**
+Path: **`~/scratch/repository-helpers/secret-audit-intake.json`**
+(override with `SECRET_AUDIT_INTAKE_LEDGER`).
 
-Written **only** after a clean scan (no matching `--results`). Never commit finding
-payloads or raw secrets into the marker.
+**Not a git file.** It is disposable operational state on the machine that runs the
+`secret-audit` timer and the `github-repo-lint` enforcer — a sibling of
+`secret-audit-batch.log` and `SECRET_AUDIT_DETAIL_DIR`. Lost or deleted, the next
+nightly sweep rebuilds an entry for every repo that re-verifies cleanly (repos
+WARN-skipped during re-verification stay unrecorded until a later successful run);
+a fresh clean full-history scan is an equal-or-stronger claim than what was lost,
+so there is nothing to back up (repository-helpers#573).
+
+```json
+{ "_note": "...",
+  "repos": {
+    "the-hcma/<name>": { "status": "clean", "scanned_at": "<iso8601Z>",
+      "scanner": "trufflehog", "scanner_version": "<semver>",
+      "results_filter": "verified", "git_tip": "<sha>" } } }
+```
 
 | Field | Meaning |
 | --- | --- |
-| `status` | Always `clean` when present (never write on leaks) |
-| `scanned_at` | ISO-8601 UTC when the deep scan finished |
-| `scanner` | `trufflehog` |
-| `scanner_version` | TruffleHog semver |
-| `git_tip` | Default-branch / HEAD SHA that was scanned |
-| `results_filter` | e.g. `verified` |
-| `tool` | `repository-helpers/secret-audit` |
+| `status` | Always `clean` when present (an entry is written **only** after a clean scan) |
+| `scanned_at` | ISO-8601 UTC when the deep scan finished — the freshness input |
+| `scanner` / `scanner_version` | `trufflehog` + semver (audit trail; re-scan trigger after detector changes) |
+| `results_filter` | e.g. `verified` — a `verified`-only clean is a weaker claim than `verified,unverified` |
+| `git_tip` | Remote default-branch SHA at scan time — **informational only**, never compared for equality, omitted when unknown |
+
+`repos` keys are ASCII-sorted for clean diffs.
 
 Rules:
 
-- Marker proves **intake (and later refresh) completed successfully** — not a
-  substitute for CI gitleaks.
-- `github-repo-lint` FAILS under `--new-repo` when the marker is missing
-  (intake gate). Under `--strict-onboarding` / `--new-repo` it FAILS when the
-  marker is unparseable or stale (>90 days). Missing markers under org
-  `--strict-onboarding --all` only SUGGEST (v1 roll-out grandfather until
-  operators write markers). Routine audits SUGGEST remediation.
-- The marker is an **intake artifact written by an operator**, not a nightly
-  heartbeat. Lint reads it from the **remote default branch** (Contents API), so a
-  marker is only meaningful once it is committed and pushed.
-- The **host timer does not write markers** (`secret-audit-batch-run` omits
-  `--write-marker`). A local write never reaches the Contents API that lint reads,
-  and it leaves the primary clone dirty, which trips the `pre-pr-checks`
-  main-worktree guard on the next PR (repository-helpers#534). The nightly email
-  still reports scan outcome.
-- Refresh a marker by hand when `github-repo-lint` reports it stale
-  (>`secret_audit_marker_stale_days`): run `--write-marker` against a clone, then
-  land the change on the **default branch** (push directly, or merge a PR) so lint
-  sees the new `scanned_at`. An unmerged PR does not update the branch lint reads.
-- **Never** write or refresh `status=clean` when TruffleHog reports matching results.
+- An entry proves the **intake deep-history scan completed clean** — not a
+  substitute for CI gitleaks or the nightly org sweep.
+- **Maintained by the nightly sweep.** `secret-audit-batch-run` passes
+  `--write-marker`; after the aggregate sweep passes, the nightly run re-verifies
+  each repo and refreshes its entry (best-effort — see above). The 90-day
+  staleness check therefore doubles as a "is the nightly sweep still running"
+  canary; a repo that is WARN-skipped for several nights running will eventually
+  age past 90 days and get flagged.
+- **`github-repo-lint` reads the ledger locally** — no Contents API, no default
+  branch. The check is meaningful only where the ledger lives:
 
-`--write-marker` requires a **local clone** (scan root or cwd). When an operator pairs
-it with `--all`, markers refresh only for clones that already exist locally. A verified
-leak found during that local refresh fails the run with exit **183**; a single clone
-whose origin fetch fails is skipped with WARN so the rest of the sweep can continue.
-The host timer never takes this path.
+  | ledger state | routine `--all` | `--strict-onboarding` | `--new-repo` |
+  | --- | --- | --- | --- |
+  | file absent (CI runner, cold laptop) | skip | SUGGEST | SUGGEST |
+  | ledger present but unparseable | SUGGEST | **FAIL** | **FAIL** `SECRET_AUDIT_INTAKE_UNREADABLE` |
+  | no entry for the repo | SUGGEST | SUGGEST (roll-out) | **FAIL** `SECRET_AUDIT_INTAKE_MISSING` |
+  | entry stale (>90d) or invalid | SUGGEST | **FAIL** | **FAIL** `SECRET_AUDIT_INTAKE_STALE` |
+  | entry fresh + valid | OK | OK | OK |
+
+  The CI `--all --strict-onboarding` audit does not check intake (no ledger on the
+  runner) — acceptable: the hard gate is operator-run `--new-repo`, and the nightly
+  sweep is the ongoing coverage.
+- **On-demand:** `scripts/secret-audit --repo OWNER/NAME --write-marker` upserts one
+  entry (scans first, records only on a clean result). No PR, no working-tree write.
+- **Never** write `status=clean` when TruffleHog reports matching results.
+
+A stray committed/untracked `.github/secret-audit.json` from the old per-repo scheme
+is a leftover — delete it (`dev-worktree-guard` / `start-development` say so).
 
 ## Failure contract
 
 | Line | Meaning |
 | --- | --- |
-| `ERROR: SECRET_AUDIT_LEAK …` | TruffleHog exit **183** (`--fail`) — rotate credentials; do not refresh marker |
-| `ERROR: SECRET_AUDIT_MARKER_MISSING …` | Lint: no valid marker on default branch (strict / new-repo) |
+| `ERROR: SECRET_AUDIT_LEAK …` | TruffleHog exit **183** (`--fail`) — rotate credentials; do not record intake |
+| `ERROR: SECRET_AUDIT_INTAKE_MISSING …` | Lint `--new-repo`: repo has no ledger entry — run a clean deep scan |
+| `ERROR: SECRET_AUDIT_INTAKE_STALE …` | Lint strict / new-repo: ledger entry invalid or >90 days old |
+| `ERROR: SECRET_AUDIT_INTAKE_UNREADABLE …` | Lint strict / new-repo: the ledger file is present but not a JSON object with an object `repos` — remove it and re-run the sweep |
+| `ERROR: SECRET_AUDIT_INTAKE_WRITE_FAILED …` | `scripts/secret-audit --write-marker`: the ledger path is unwritable (bad `SECRET_AUDIT_INTAKE_LEDGER`, disk full) — the scan was clean but the entry was not recorded |
 | `ERROR: SECRET_AUDIT_SCAN_FAILED …` | Tool / install / network / org-scan failure |
 | `ERROR: SECRET_AUDIT_INFRA_FAILED …` | Batch exit non-zero with clean counters **and** no `ERROR: SECRET_AUDIT_SCAN_FAILED` in the transcript (teardown / runner infra; #540 / #541). A 0/0 counter line alone does not imply INFRA when the scan already failed. |
 
@@ -205,5 +230,6 @@ automation does not trigger copyleft on this Bash repo.
 - Issue [#509](https://github.com/the-hcma/repository-helpers/issues/509)
 - Issue [#516](https://github.com/the-hcma/repository-helpers/issues/516) — exclude archived; concurrency; summary email
 - Issue [#559](https://github.com/the-hcma/repository-helpers/issues/559) — clearer batch email (repo list, findings vs pass/fail)
+- Issue [#573](https://github.com/the-hcma/repository-helpers/issues/573) — host-local intake ledger (replaced the per-repo `.github/secret-audit.json` marker)
 - Fast gate: `scripts/dev/secret-scan` / `.github/ci/secret-scan` (gitleaks)
-- Lint check: `github-repo-lint` secret-audit intake marker (AGENTS.md / README tables)
+- Lint check: `github-repo-lint` secret-audit intake ledger (AGENTS.md / README tables)

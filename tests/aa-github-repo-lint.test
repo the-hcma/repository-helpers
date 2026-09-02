@@ -59,7 +59,7 @@ if grep -qF 'rp_log_manual_step' "$lib" \
   && grep -qF 'rp_pr_ship_and_review_rule_is_valid' "$lib" \
   && grep -qF 'repo-practices-cursor/pr-ship-and-review.mdc' "$lib" \
   && grep -qF 'rp_check_stacking_tool' "$lib" \
-  && grep -qF 'rp_check_secret_audit_marker' "$lib" \
+  && grep -qF 'rp_check_secret_audit_intake' "$lib" \
   && grep -qF 'lib/secret-audit' "$lib" \
   && grep -qF 'rp_check_stacking_docs_consistency' "$lib" \
   && grep -qF 'rp_stacking_tool_rule_is_valid' "$lib" \
@@ -4488,24 +4488,31 @@ else
   fail=$(( fail + 1 ))
 fi
 
-printf '\n=== static: secret-audit marker API error is WARN in routine mode ===\n'
-# shellcheck disable=SC2016  # assert literals in rp_check_secret_audit_marker body
+printf '\n=== static: secret-audit intake check reads the host-local ledger (no Contents API) ===\n'
+# shellcheck disable=SC2016  # assert literals in rp_check_secret_audit_intake body
 if awk '
-  /^rp_check_secret_audit_marker\(\)/ { in_fn=1 }
-  in_fn && /fetch_rc == 2/ { saw_fetch=1 }
-  in_fn && saw_fetch && /rp_log_warn/ { saw_warn=1 }
-  in_fn && saw_fetch && /rp_strict_onboarding/ { saw_strict=1 }
+  /^rp_check_secret_audit_intake\(\)/ { in_fn=1 }
+  in_fn && /secret_audit_ledger_entry/ { saw_read=1 }
+  in_fn && /entry_rc == 1/ { saw_absent=1 }
+  in_fn && /entry_rc == 2/ { saw_missing=1 }
+  in_fn && /entry_rc == 3/ { saw_corrupt=1 }
+  in_fn && /SECRET_AUDIT_INTAKE_MISSING/ { saw_missing_err=1 }
+  in_fn && /SECRET_AUDIT_INTAKE_STALE/ { saw_stale_err=1 }
+  in_fn && /SECRET_AUDIT_INTAKE_UNREADABLE/ { saw_corrupt_err=1 }
+  in_fn && /rp_fetch_github_text_file/ { saw_fetch=1 }
   in_fn && /^}/ { exit }
-  END { exit(saw_fetch && saw_warn && saw_strict ? 0 : 1) }
-' "$lib"; then
-  printf '[PASS] secret-audit marker: API fetch_rc=2 uses WARN in routine mode\n'
+  END { exit(saw_read && saw_absent && saw_missing && saw_corrupt && saw_missing_err && saw_stale_err && saw_corrupt_err && !saw_fetch ? 0 : 1) }
+' "$lib" \
+  && grep -qF 'rp_check_secret_audit_intake "$slug"' "$lib" \
+  && ! grep -qF 'rp_check_secret_audit_marker' "$lib"; then
+  printf '[PASS] secret-audit intake: reads local ledger; absent/missing/stale branches; wired into dispatch\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] secret-audit marker: routine API error should rp_log_warn (not FAIL+return 0)\n'
+  printf '[FAIL] secret-audit intake: still fetches from GitHub, or missing a ledger branch / dispatch wiring\n'
   fail=$(( fail + 1 ))
 fi
 
-printf '\n=== unit: secret-audit marker API error WARN routine / FAIL strict ===\n'
+printf '\n=== unit: secret-audit intake ledger matrix (absent / missing / stale / fresh) ===\n'
 sa_api_dir="$(mktemp -d)"
 export RUNNER_SESSION_ROOT="${sa_api_dir}/runner-sessions"
 sa_api_out="$(
@@ -4515,53 +4522,73 @@ sa_api_out="$(
     source "$1"
     # shellcheck disable=SC1091
     source "$2"
-    rp_fetch_github_text_file() { return 2; }
-    rp_log_gh_api_fail() { printf "API_FAIL\n" >&2; }
-    rp_log_warn() { printf "WARN\n" >&2; }
-    rp_log_check_fail() { printf "CHECK_FAIL\n" >&2; }
-    rp_log_suggest() { :; }
-    rp_github_url() { printf "https://example.invalid/%s\n" "$*"; }
-    rp_suggest=0
+    rp_log_check_fail() { printf "CHECK_FAIL:%s\n" "$2" >&2; }
+    rp_log_check_ok() { printf "CHECK_OK\n" >&2; }
+    rp_log_suggest() { printf "SUGGEST\n" >&2; }
+    rp_log_manual_step() { :; }
+    rp_github_url() { printf "https://example.invalid/%s\n" "$1"; }
+    rp_compact=0
+    rp_suggest=1
     rp_strict_onboarding=0
     rp_new_repo=0
-    set +e
-    routine_out="$(rp_check_secret_audit_marker the-hcma/example-repo 2>&1)"
-    routine_rc=$?
-    set -e
-    if [[ "$routine_rc" -ne 0 ]] || ! grep -qF WARN <<<"$routine_out" \
-      || grep -qF API_FAIL <<<"$routine_out"; then
-      printf "routine rc=%s out=%s\n" "$routine_rc" "$routine_out"
-      exit 1
-    fi
-    rp_strict_onboarding=1
-    set +e
-    strict_out="$(rp_check_secret_audit_marker the-hcma/example-repo 2>&1)"
-    strict_rc=$?
-    set -e
-    if [[ "$strict_rc" -eq 0 ]] || ! grep -qF API_FAIL <<<"$strict_out"; then
-      printf "strict rc=%s out=%s\n" "$strict_rc" "$strict_out"
-      exit 1
-    fi
-    rp_strict_onboarding=0
+
+    dir="$3"
+    fresh="${dir}/fresh.json"
+    stale="${dir}/stale.json"
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    entry() { jq -nc --arg s "$1" "{repos:{\"the-hcma/example-repo\":{status:\"clean\",scanned_at:\$s,scanner:\"trufflehog\",scanner_version:\"3.97.0\",results_filter:\"verified\"}}}"; }
+    entry "$now" > "$fresh"
+    entry "2020-01-01T00:00:00Z" > "$stale"
+
+    run() { # $1 ledger-path-or-empty
+      if [[ -n "$1" ]]; then export SECRET_AUDIT_INTAKE_LEDGER="$1"; else export SECRET_AUDIT_INTAKE_LEDGER="${dir}/none.json"; fi
+      local rc=0 out
+      out="$(rp_check_secret_audit_intake the-hcma/example-repo 2>&1)" || rc=$?
+      printf "%s|%s" "$rc" "$out"
+    }
+
+    # absent ledger: never fail, SUGGEST under any mode
     rp_new_repo=1
-    set +e
-    intake_out="$(rp_check_secret_audit_marker the-hcma/example-repo 2>&1)"
-    intake_rc=$?
-    set -e
-    if [[ "$intake_rc" -eq 0 ]] || ! grep -qF API_FAIL <<<"$intake_out"; then
-      printf "intake rc=%s out=%s\n" "$intake_rc" "$intake_out"
-      exit 1
-    fi
+    r="$(run "")"; [[ "${r%%|*}" == 0 ]] && grep -qF SUGGEST <<<"$r" || { echo "absent/new: $r"; exit 1; }
+    rp_new_repo=0
+
+    # ledger present, no entry for repo
+    rm -f "${dir}/empty.json"; jq -n "{repos:{}}" > "${dir}/empty.json"
+    rp_new_repo=1
+    r="$(run "${dir}/empty.json")"; [[ "${r%%|*}" != 0 ]] && grep -qF SECRET_AUDIT_INTAKE_MISSING <<<"$r" || { echo "missing/new: $r"; exit 1; }
+    rp_new_repo=0
+    r="$(run "${dir}/empty.json")"; [[ "${r%%|*}" == 0 ]] && grep -qF SUGGEST <<<"$r" || { echo "missing/routine: $r"; exit 1; }
+
+    # stale entry
+    rp_strict_onboarding=1
+    r="$(run "$stale")"; [[ "${r%%|*}" != 0 ]] && grep -qF SECRET_AUDIT_INTAKE_STALE <<<"$r" || { echo "stale/strict: $r"; exit 1; }
+    rp_strict_onboarding=0
+    r="$(run "$stale")"; [[ "${r%%|*}" == 0 ]] && grep -qF SUGGEST <<<"$r" || { echo "stale/routine: $r"; exit 1; }
+
+    # corrupt / non-object-repos ledger: FAIL strict/new-repo (UNREADABLE), SUGGEST otherwise
+    printf "not json {{{" > "${dir}/corrupt.json"
+    printf "%s" "{\"repos\":[]}" > "${dir}/reposarray.json"
+    for bad in corrupt reposarray; do
+      rp_strict_onboarding=1
+      r="$(run "${dir}/${bad}.json")"; [[ "${r%%|*}" != 0 ]] && grep -qF SECRET_AUDIT_INTAKE_UNREADABLE <<<"$r" || { echo "${bad}/strict: $r"; exit 1; }
+      rp_strict_onboarding=0
+      r="$(run "${dir}/${bad}.json")"; [[ "${r%%|*}" == 0 ]] && grep -qF SUGGEST <<<"$r" || { echo "${bad}/routine: $r"; exit 1; }
+    done
+
+    # fresh entry: OK everywhere
+    rp_new_repo=1
+    r="$(run "$fresh")"; [[ "${r%%|*}" == 0 ]] && grep -qF CHECK_OK <<<"$r" || { echo "fresh/new: $r"; exit 1; }
+
     printf "ok\n"
-  ' bash "$runner_bootstrap" "$lib"
+  ' bash "$runner_bootstrap" "$lib" "$sa_api_dir"
 )" || sa_api_out="fail:${sa_api_out}"
 rm -rf "$sa_api_dir"
 unset RUNNER_SESSION_ROOT
 if [[ "$sa_api_out" == 'ok' ]]; then
-  printf '[PASS] secret-audit marker: API fetch_rc=2 WARN routine / FAIL strict+intake\n'
+  printf '[PASS] secret-audit intake: absent=SUGGEST, no-entry/stale/corrupt FAIL strict/new-repo, fresh OK\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] secret-audit marker: API error behavior (%s)\n' "$sa_api_out"
+  printf '[FAIL] secret-audit intake: ledger matrix (%s)\n' "$sa_api_out"
   fail=$(( fail + 1 ))
 fi
 
