@@ -879,6 +879,155 @@ else
   fail_case 'bot author skip matching too broad or too narrow'
 fi
 
+printf '\n=== static: verified-commits attribution wiring (repository-helpers#587) ===\n'
+# shellcheck disable=SC2016
+if grep -qF '_pre_pr_verified_commits_message_violation' \
+    "${rh_root}/scripts/lib/pre-pr-verified-commits" \
+  && grep -qF 'reason=trailer' "${rh_root}/scripts/lib/pre-pr-verified-commits" \
+  && grep -qF 'PRE_PR_CHECKS_ALLOW_COAUTHOR' "${rh_root}/scripts/lib/pre-pr-verified-commits" \
+  && grep -qF 'PRE_PR_CHECKS_ALLOW_COAUTHOR' "$pre_pr_checks" \
+  && grep -qF 'reason=trailer' "${rh_root}/.cursor/rules/git-commit-identity.mdc" \
+  && diff -q "${rh_root}/.cursor/rules/git-commit-identity.mdc" \
+    "${rh_root}/scripts/lib/repo-practices-cursor/git-commit-identity.mdc" >/dev/null; then
+  pass_case 'attribution check wired into lib/docs; cursor rule copies stay in sync'
+else
+  fail_case 'attribution check wiring incomplete, or rule copies drifted'
+fi
+
+printf '\n=== functional: co-author trailer allowlist ===\n'
+if _pre_pr_verified_commits_allowed_coauthor_email 'ok@example.com' 2>/dev/null; then
+  fail_case 'allowlist: empty PRE_PR_CHECKS_ALLOW_COAUTHOR should not allow anything'
+else
+  pass_case 'allowlist: empty PRE_PR_CHECKS_ALLOW_COAUTHOR allows nothing'
+fi
+export PRE_PR_CHECKS_ALLOW_COAUTHOR='Ok@Example.com, other@example.com'
+if _pre_pr_verified_commits_allowed_coauthor_email 'ok@example.com' \
+  && _pre_pr_verified_commits_allowed_coauthor_email 'OTHER@example.com' \
+  && ! _pre_pr_verified_commits_allowed_coauthor_email 'stranger@example.com'; then
+  pass_case 'allowlist: comma-separated emails match case-insensitively'
+else
+  fail_case 'allowlist: comma-separated emails did not match as expected'
+fi
+unset PRE_PR_CHECKS_ALLOW_COAUTHOR
+
+printf '\n=== functional: agent no-reply email pattern ===\n'
+if _pre_pr_verified_commits_email_is_agent_pattern 'opencode@users.noreply.github.com' 'human@example.com' \
+  && _pre_pr_verified_commits_email_is_agent_pattern 'cursoragent@cursor.sh' 'human@example.com' \
+  && _pre_pr_verified_commits_email_is_agent_pattern 'noreply@claude.ai' 'human@example.com' \
+  && _pre_pr_verified_commits_email_is_agent_pattern '123+octocat@users.noreply.github.com' 'human@example.com' \
+  && ! _pre_pr_verified_commits_email_is_agent_pattern 'human@example.com' 'human@example.com' \
+  && ! _pre_pr_verified_commits_email_is_agent_pattern 'human@example.com' 'HUMAN@example.com' \
+  && ! _pre_pr_verified_commits_email_is_agent_pattern 'teammate@example.com' 'human@example.com'; then
+  pass_case 'agent email pattern matches known agents/noreply, not the committer or an unrelated address'
+else
+  fail_case 'agent email pattern matching incorrect'
+fi
+
+printf '\n=== functional: message_violation detects trailers and agent authorship ===\n'
+mv_fix="$(mktemp -d "${TMPDIR:-/tmp}/prec-mv.XXXXXX")"
+make_git_fixture "$mv_fix"
+(
+  cd "$mv_fix"
+  printf 'a\n' >file.txt
+  git add file.txt
+  git commit -q -m 'clean commit'
+)
+clean_sha="$(cd "$mv_fix" && git rev-parse HEAD)"
+if _pre_pr_verified_commits_message_violation "$mv_fix" "$clean_sha" >/dev/null; then
+  pass_case 'message_violation: clean commit passes'
+else
+  fail_case 'message_violation: clean commit unexpectedly flagged'
+fi
+
+(
+  cd "$mv_fix"
+  printf 'b\n' >>file.txt
+  git add file.txt
+  git commit -q -m $'fix: thing\n\nCo-authored-by: opencode <opencode@users.noreply.github.com>'
+)
+coauthor_sha="$(cd "$mv_fix" && git rev-parse HEAD)"
+mv_out=''
+mv_rc=0
+mv_out="$(_pre_pr_verified_commits_message_violation "$mv_fix" "$coauthor_sha")" || mv_rc=$?
+if [[ "$mv_rc" -ne 0 ]] && grep -qF 'Co-authored-by' <<<"$mv_out"; then
+  pass_case 'message_violation: Co-authored-by trailer flagged'
+else
+  fail_case "message_violation: expected Co-authored-by flag (rc=${mv_rc}): ${mv_out}"
+fi
+
+export PRE_PR_CHECKS_ALLOW_COAUTHOR='opencode@users.noreply.github.com'
+if _pre_pr_verified_commits_message_violation "$mv_fix" "$coauthor_sha" >/dev/null; then
+  pass_case 'message_violation: allowlisted co-author email passes'
+else
+  fail_case 'message_violation: allowlisted co-author email unexpectedly flagged'
+fi
+unset PRE_PR_CHECKS_ALLOW_COAUTHOR
+
+(
+  cd "$mv_fix"
+  printf 'c\n' >>file.txt
+  git add file.txt
+  git commit -q -m $'feat: thing\n\nMade-with: Cursor'
+)
+madewith_sha="$(cd "$mv_fix" && git rev-parse HEAD)"
+mv_out=''
+mv_rc=0
+mv_out="$(_pre_pr_verified_commits_message_violation "$mv_fix" "$madewith_sha")" || mv_rc=$?
+if [[ "$mv_rc" -ne 0 ]] && grep -qF 'Made-with' <<<"$mv_out"; then
+  pass_case 'message_violation: Made-with trailer flagged'
+else
+  fail_case "message_violation: expected Made-with flag (rc=${mv_rc}): ${mv_out}"
+fi
+
+(
+  cd "$mv_fix"
+  printf 'd\n' >>file.txt
+  git add file.txt
+  GIT_AUTHOR_NAME='Claude' GIT_AUTHOR_EMAIL='noreply@claude.ai' \
+    git commit -q -m 'chore: agent-authored'
+)
+agent_author_sha="$(cd "$mv_fix" && git rev-parse HEAD)"
+mv_out=''
+mv_rc=0
+mv_out="$(_pre_pr_verified_commits_message_violation "$mv_fix" "$agent_author_sha")" || mv_rc=$?
+if [[ "$mv_rc" -ne 0 ]] && grep -qF 'agent pattern' <<<"$mv_out"; then
+  pass_case 'message_violation: agent no-reply author email flagged'
+else
+  fail_case "message_violation: expected agent author flag (rc=${mv_rc}): ${mv_out}"
+fi
+
+(
+  cd "$mv_fix"
+  printf 'e\n' >>file.txt
+  git add file.txt
+  git commit -q -m $'fix: thing\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)'
+)
+footer_sha="$(cd "$mv_fix" && git rev-parse HEAD)"
+mv_out=''
+mv_rc=0
+mv_out="$(_pre_pr_verified_commits_message_violation "$mv_fix" "$footer_sha")" || mv_rc=$?
+if [[ "$mv_rc" -ne 0 ]] && grep -qF 'forbidden phrase' <<<"$mv_out"; then
+  pass_case 'message_violation: robot-emoji "Generated with [" footer flagged'
+else
+  fail_case "message_violation: expected footer flag (rc=${mv_rc}): ${mv_out}"
+fi
+
+# Regression (#587 dogfood): prose that merely *discusses* the phrase, wrapped
+# onto its own line, must not be flagged — only the actual footer shape.
+(
+  cd "$mv_fix"
+  printf 'f\n' >>file.txt
+  git add file.txt
+  git commit -q -m $'docs: explain the checker\n\nFails a commit with a Generated with\nphrase in its body.'
+)
+prose_sha="$(cd "$mv_fix" && git rev-parse HEAD)"
+if _pre_pr_verified_commits_message_violation "$mv_fix" "$prose_sha" >/dev/null; then
+  pass_case 'message_violation: prose mentioning "Generated with" (no link/emoji) passes'
+else
+  fail_case 'message_violation: prose mentioning the phrase was wrongly flagged'
+fi
+rm -rf "$mv_fix"
+
 printf '\n=== summary ===\n'
 printf 'passed: %d  failed: %d\n' "$pass" "$fail"
 # assert_* helpers use the same pass/fail counters (test_init / pass_case / fail_case).
