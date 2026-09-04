@@ -1,14 +1,34 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# pre-pr-verified-commits — fail pre-pr-checks on unverified commits in the submit range.
+# pre-pr-verified-commits — fail pre-pr-checks on unverified or misattributed commits
+# in the submit range.
 #
 # Walks non-merge commits on merge-base(default)..HEAD (all parents; not first-parent-only):
-#   1. git verify-commit (local signature) — required
-#   2. when upstream exists and gh is available, GitHub commit.verification.verified
+#   1. git verify-commit (local signature) — required (reason=local)
+#   2. commit message body / author identity carries no forbidden agent attribution
+#      (reason=trailer) — see below
+#   3. when upstream exists and gh is available, GitHub commit.verification.verified
 #      for commits already reachable from @{u}; missing remote SHAs stay local-only
+#      (reason=github)
+#
+# Attribution check (2) fails a commit whose body contains a `Co-authored-by:`,
+# `Made-with:`, or non-committer `Signed-off-by:` trailer (matched
+# case-insensitively), or a whole-line "[🤖 ]Generated with [Name](url)" footer
+# (anchored to that exact shape, not prose that merely discusses the phrase
+# elsewhere in the body); or whose author email matches a known agent identity
+# (opencode's address; the `claude`/`cursoragent`/`devin` localparts and their
+# known domains, bounded so real human names don't collide; or any
+# `@users.noreply.github.com` address that differs from the committer's own —
+# a fully agent-authored-and-committed commit is still caught since the
+# specific agent patterns are not exempted just because author == committer).
+# An email the operator explicitly wants treated as a real human identity (a
+# `Co-authored-by:` trailer, or an author email from a rebased/cherry-picked
+# commit) can be allowlisted via PRE_PR_CHECKS_ALLOW_COAUTHOR (comma-separated
+# emails). See repository-helpers#587.
 #
 # Skip PRE_PR_CHECKS_SKIP=verified-commits. Bot authors (name ending in [bot], or
-# dependabot) are skipped. See repository-helpers#528.
+# dependabot) are skipped entirely (no signature or attribution check). See
+# repository-helpers#528.
 set -euo pipefail
 
 if declare -F pre_pr_verified_commits_run >/dev/null 2>&1; then
@@ -28,7 +48,7 @@ source "${_pre_pr_vc_lib_dir}/github-repo-slug"
 pre_pr_verified_commits_run() {
   local -r root="$1"
   local base_ref base head sha author verified_json origin_url slug upstream_ok=0 gh_ok=0
-  local rev_list_out rev_list_rc=0
+  local rev_list_out rev_list_rc=0 violation
   local -a shas=()
 
   head="$(runner_exec_stdout "verified-commits rev-parse HEAD" \
@@ -109,6 +129,14 @@ pre_pr_verified_commits_run() {
       return 1
     fi
 
+    if violation="$(_pre_pr_verified_commits_message_violation "$root" "$sha")"; then
+      :
+    else
+      printf 'ERROR: UNVERIFIED_COMMIT sha=%s reason=trailer detail=%s\n' \
+        "$sha" "$violation" >&2
+      return 1
+    fi
+
     if (( upstream_ok == 1 && gh_ok == 1 )); then
       # Only query GitHub when the SHA is already on the tracked upstream tip
       # (pre-push commits are local-ok only; avoids fail-open on 404).
@@ -181,6 +209,26 @@ pre_pr_verified_commits_should_plan() {
   [[ "${count:-0}" =~ ^[1-9][0-9]*$ ]]
 }
 
+# True when PRE_PR_CHECKS_ALLOW_COAUTHOR (comma-separated emails) lists this
+# email as an operator-approved real human identity — consulted for both a
+# Co-authored-by: trailer email and an author email that would otherwise match
+# the agent no-reply pattern (e.g. a rebased/cherry-picked teammate commit).
+_pre_pr_verified_commits_allowed_identity_email() {
+  local -r email="${1,,}"
+  local -r allowlist="${PRE_PR_CHECKS_ALLOW_COAUTHOR:-}"
+  local entry
+  local -a entries=()
+
+  [[ -n "$email" && -n "$allowlist" ]] || return 1
+  IFS=',' read -ra entries <<<"$allowlist"
+  for entry in "${entries[@]}"; do
+    entry="${entry,,}"
+    entry="${entry//[[:space:]]/}"
+    [[ -n "$entry" && "$entry" == "$email" ]] && return 0
+  done
+  return 1
+}
+
 # Match GitHub Apps / Dependabot, not arbitrary substrings (e.g. "abot" emails).
 _pre_pr_verified_commits_author_is_bot() {
   local -r author="${1:-}"
@@ -199,4 +247,95 @@ _pre_pr_verified_commits_author_is_bot() {
   [[ "${email,,}" == *'[bot]@'* ]] && return 0
   [[ "${email,,}" == 'dependabot'*'@'* ]] && return 0
   return 1
+}
+
+# True when $1 (an author email) looks like a coding-agent identity rather than
+# a real human's own address. Specific known agent localparts/domains are
+# flagged even when they equal the committer email (a commit fully authored
+# *and* committed under an agent identity is exactly the case to catch, not
+# exempt) — they are bounded to the localpart or domain, not bare substrings,
+# so real human names like "claudette" or "devine" do not match. The generic
+# users.noreply.github.com catch-all only fires when it differs from the
+# committer's own address (a human's own private GitHub noreply email used for
+# both is fine).
+_pre_pr_verified_commits_email_is_agent_pattern() {
+  local -r email="${1,,}" committer_email="${2,,}"
+  local localpart="${email%%@*}" domain="${email#*@}"
+
+  [[ -n "$email" ]] || return 1
+  case "$email" in
+    'opencode@users.noreply.github.com') return 0 ;;
+  esac
+  case "$localpart" in
+    cursoragent | claude | devin | devin-*) return 0 ;;
+  esac
+  case "$domain" in
+    *'anthropic.com' | *'claude.ai' | *'cognition.ai' | *'cursor.sh') return 0 ;;
+  esac
+  [[ "$domain" == 'users.noreply.github.com' && "$email" != "$committer_email" ]] && return 0
+  return 1
+}
+
+# _pre_pr_verified_commits_message_violation <repo_root> <sha>
+# Prints a one-line detail and fails (returns 1) when the commit body carries a
+# forbidden attribution trailer/phrase, or the author identity matches a known
+# agent no-reply pattern. Prints nothing and returns 0 when clean.
+_pre_pr_verified_commits_message_violation() {
+  local -r root="$1" sha="$2"
+  local body author_email committer_email line line_lc trailer_email
+
+  body="$(runner_exec_stdout "verified-commits body ${sha}" \
+    -- git -C "$root" log -1 --format='%B' "$sha")"
+  author_email="$(runner_exec_stdout "verified-commits author-email ${sha}" \
+    -- git -C "$root" log -1 --format='%ae' "$sha")"
+  committer_email="$(runner_exec_stdout "verified-commits committer-email ${sha}" \
+    -- git -C "$root" log -1 --format='%ce' "$sha")"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_lc="${line,,}"
+    if [[ "$line_lc" =~ ^co-authored-by:[[:space:]]*(.*)$ ]]; then
+      trailer_email="${BASH_REMATCH[1]}"
+      if [[ "$trailer_email" == *'<'*'>' ]]; then
+        trailer_email="${trailer_email##*<}"
+        trailer_email="${trailer_email%>}"
+      fi
+      if ! _pre_pr_verified_commits_allowed_identity_email "$trailer_email"; then
+        printf 'body contains forbidden trailer: %s' "$line"
+        return 1
+      fi
+      continue
+    fi
+    if [[ "$line_lc" == 'made-with:'* ]]; then
+      printf 'body contains forbidden trailer: %s' "$line"
+      return 1
+    fi
+    if [[ "$line_lc" =~ ^signed-off-by:[[:space:]]*(.*)$ ]]; then
+      trailer_email="${BASH_REMATCH[1]}"
+      if [[ "$trailer_email" == *'<'*'>' ]]; then
+        trailer_email="${trailer_email##*<}"
+        trailer_email="${trailer_email%>}"
+      fi
+      if [[ "${trailer_email,,}" != "${committer_email,,}" ]]; then
+        printf 'body contains Signed-off-by from non-committer: %s' "$line"
+        return 1
+      fi
+      continue
+    fi
+    # Anchored to the whole-line footer shape a tool actually emits (optional
+    # leading robot emoji, then "generated with [Name](url)" as the entire
+    # line) — not a bare substring — so prose that merely discusses or quotes
+    # the phrase/emoji elsewhere in the body is not flagged.
+    if [[ "$line_lc" =~ ^[[:space:]]*(🤖[[:space:]]*)?generated[[:space:]]with[[:space:]]\[.+\]\(.+\)[[:space:]]*$ ]]; then
+      printf 'body contains forbidden phrase: %s' "$line"
+      return 1
+    fi
+  done <<<"$body"
+
+  if _pre_pr_verified_commits_email_is_agent_pattern "$author_email" "$committer_email" \
+    && ! _pre_pr_verified_commits_allowed_identity_email "$author_email"; then
+    printf 'author email matches agent pattern: %s' "$author_email"
+    return 1
+  fi
+
+  return 0
 }
