@@ -8417,15 +8417,24 @@ rp_check_github_security_settings() {
     rp_log_gh_api_fail "$slug" 'could not read private vulnerability reporting state'
     repo_fail=1
   elif [[ "$pvr_enabled" != 'true' ]]; then
-    if [[ "$strict" -eq 1 ]]; then
-      rp_log_fail "${slug}: private vulnerability reporting is disabled"
-      repo_fail=1
+    if [[ "$private" == 'false' ]]; then
+      if [[ "$strict" -eq 1 ]]; then
+        rp_log_fail "${slug}: private vulnerability reporting is disabled"
+        repo_fail=1
+      elif [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: enable private vulnerability reporting"
+      fi
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
+        rp_apply_repo_put_toggle "$slug" 'private-vulnerability-reporting' \
+          'private vulnerability reporting'
+      fi
     elif [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest "${slug}: enable private vulnerability reporting"
-    fi
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_apply_repo_put_toggle "$slug" 'private-vulnerability-reporting' \
-        'private vulnerability reporting'
+      # Verified live (repository-helpers#591 review): the endpoint 404s for
+      # at least some private repos on this plan, so it is not universally
+      # available the way Dependabot alerts/security-updates are — advisory
+      # only, same as secret scanning on private repos above.
+      rp_log_suggest \
+        "${slug}: private vulnerability reporting is off (private repo — may require a plan/GHAS upgrade)"
     fi
   fi
 
@@ -8590,8 +8599,8 @@ rp_check_actions_workflow_pinning() {
   local slug="$1"
   local repo_fail=0
   local strict=0
-  local -a names=()
-  local name text fetch_ec ref
+  local -a names=() publish_details=()
+  local name text fetch_ec ref detail
   local any_unpinned=0 publish_unpinned=0
 
   if [[ "$rp_new_repo" -eq 1 ]]; then
@@ -8617,19 +8626,29 @@ rp_check_actions_workflow_pinning() {
       rp_uses_ref_is_sha_pinned "$ref" && continue
       if rp_workflow_is_publish_like "$name" "$text"; then
         publish_unpinned=1
-        rp_log_fail_detail "${name}: ${ref} (release/publish workflow — pin to a full commit SHA)"
+        publish_details+=("${name}: ${ref} (release/publish workflow — pin to a full commit SHA)")
       else
         any_unpinned=1
       fi
     done < <(rp_workflow_uses_refs "$text")
   done
 
+  # Detail lines print after the FAIL/SUGGEST they explain (not inline in the
+  # scan loop above) — reversed order confused readers, and a routine audit
+  # without --suggest emitted orphaned detail lines with no parent message
+  # (repository-helpers#591 review).
   if (( publish_unpinned == 1 )); then
     if [[ "$strict" -eq 1 ]]; then
       rp_log_fail "${slug}: release/publish workflow(s) use non-SHA-pinned actions (OIDC/write tokens)"
       repo_fail=1
+      for detail in "${publish_details[@]}"; do
+        rp_log_fail_detail "$detail"
+      done
     elif [[ "$rp_suggest" -eq 1 ]]; then
       rp_log_suggest "${slug}: pin release/publish workflow actions to a full commit SHA"
+      for detail in "${publish_details[@]}"; do
+        rp_log_fail_detail "$detail"
+      done
     fi
   fi
   if (( any_unpinned == 1 )) && [[ "$rp_suggest" -eq 1 ]]; then
@@ -8656,21 +8675,59 @@ rp_check_actions_workflow_pinning() {
 # ---------------------------------------------------------------------------
 
 # rp_workflow_environment_names <workflow_text>
+# Extracts job-level `environment:` values in both the scalar form
+# (`environment: pypi`, quoted, or with a trailing comment) and the mapping
+# form (`environment:` alone, followed by a `name:` line). Best-effort static
+# scan, like the rest of this file's grep/sed workflow parsing — not a real
+# YAML parser.
 rp_workflow_environment_names() {
   local -r text="$1"
-  grep -oE '^[[:space:]]*environment:[[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*$' <<<"$text" \
-    | sed -E 's/^[[:space:]]*environment:[[:space:]]*//; s/[[:space:]]+$//' || true
+  local line trimmed value in_block=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="${line%%#*}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ "$trimmed" =~ ^[[:space:]]*environment:[[:space:]]*(.*)$ ]]; then
+      value="${BASH_REMATCH[1]}"
+      if [[ -z "$value" ]]; then
+        in_block=1
+        continue
+      fi
+      in_block=0
+      value="${value#[\'\"]}"
+      value="${value%[\'\"]}"
+      [[ -n "$value" ]] && printf '%s\n' "$value"
+      continue
+    fi
+    if [[ "$in_block" -eq 1 ]]; then
+      if [[ -z "${trimmed//[[:space:]]/}" ]]; then
+        continue
+      fi
+      if [[ "$trimmed" =~ ^[[:space:]]*name:[[:space:]]*(.*)$ ]]; then
+        value="${BASH_REMATCH[1]}"
+        value="${value#[\'\"]}"
+        value="${value%[\'\"]}"
+        [[ -n "$value" ]] && printf '%s\n' "$value"
+      fi
+      in_block=0
+    fi
+  done <<<"$text"
 }
 
 # rp_fetch_environment_protection <slug> <env_name>
 # Prints JSON. Exit 1 = environment not found. Exit 2 = GitHub API error.
 rp_fetch_environment_protection() {
   local slug="$1" env="$2"
-  local exit_code=0 detail
+  local exit_code=0 detail encoded_env
 
+  # Environment names can contain spaces/slashes; percent-encode before
+  # interpolating into the API path (repository-helpers#591 review).
+  encoded_env="$(rp_runner_jq_n 'repo-practices url-encode environment name' \
+    -r --arg v "$env" '$v | @uri')"
+  encoded_env="${encoded_env//$'\n'/}"
   set +e
   rp_runner_gh_api_stream "repo-practices gh environment ${env}" --probe \
-    "repos/${slug}/environments/${env}"
+    "repos/${slug}/environments/${encoded_env}"
   exit_code=$?
   set -e
   if (( exit_code == 0 )); then
@@ -8700,7 +8757,7 @@ rp_check_deployment_env_protection() {
   local repo_fail=0
   local strict=0
   local -a names=() envs=()
-  local name text fetch_ec env env_json env_ec
+  local name text fetch_ec env env_json env_ec envs_joined quoted_envs_joined
 
   if [[ "$rp_new_repo" -eq 1 ]]; then
     strict=1
@@ -8729,7 +8786,10 @@ rp_check_deployment_env_protection() {
   if [[ "${#envs[@]}" -eq 0 ]]; then
     return "$repo_fail"
   fi
-  mapfile -t envs < <(printf '%s\n' "${envs[@]}" | sort -u)
+  envs_joined="$(printf '%s\n' "${envs[@]}")"
+  quoted_envs_joined="$(printf '%q' "$envs_joined")"
+  mapfile -t envs < <(runner_sh_stdout "repo-practices sort unique environments" -- \
+    "printf '%s' ${quoted_envs_joined} | sort -u")
 
   for env in "${envs[@]}"; do
     env_ec=0

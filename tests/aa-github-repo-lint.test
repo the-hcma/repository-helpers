@@ -6370,8 +6370,6 @@ else
 fi
 rm -rf "$mock_dir"
 
-printf '\n=== summary ===\n'
-printf '%s passed, %s failed\n' "$pass" "$fail"
 printf '\n=== static: org cursor-rule rollout apply-fix helpers ===\n'
 if grep -qF 'rp_helpers_primary_checkout_dir' "$lib" \
   && grep -qF 'rp_index_scan_root_clones' "$lib" \
@@ -6528,6 +6526,17 @@ env_out="$(
     names="$(rp_workflow_environment_names "$wf")"
     [[ "$names" == "pypi" ]] || { printf "env names: %s\n" "$names"; exit 1; }
 
+    # Regression (review #591): scalar form with quotes and a trailing comment.
+    wf_quoted=$'"'"'jobs:\n  deploy:\n    environment: "pypi" # prod\n'"'"'
+    names="$(rp_workflow_environment_names "$wf_quoted")"
+    [[ "$names" == "pypi" ]] || { printf "quoted+comment env names: %s\n" "$names"; exit 1; }
+
+    # Regression (review #591): the mapping form (environment: on its own
+    # line, followed by name:) was previously dropped entirely.
+    wf_mapping=$'"'"'jobs:\n  publish:\n    environment:\n      name: pypi\n      url: https://pypi.org/p/example\n    steps: []\n'"'"'
+    names="$(rp_workflow_environment_names "$wf_mapping")"
+    [[ "$names" == "pypi" ]] || { printf "mapping-form env names: %s\n" "$names"; exit 1; }
+
     rp_environment_has_protection '"'"'{"protection_rules":[{"type":"required_reviewers"}]}'"'"' \
       || { printf "protection_rules should count as protected\n"; exit 1; }
     rp_environment_has_protection '"'"'{"protection_rules":[],"deployment_branch_policy":{"protected_branches":true}}'"'"' \
@@ -6545,6 +6554,70 @@ if [[ "$env_out" == 'ok' ]]; then
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] deployment environment helpers (%s)\n' "$env_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_fetch_environment_protection URL-encodes the environment name ===\n'
+# Regression (review #591): the jq @uri encoding step needs -r (raw output),
+# or the encoded value comes back JSON-quoted (`"dep-updater"`) and the
+# request 404s against a real, protected environment — a false "not
+# protected" finding that stubbing rp_fetch_environment_protection in the
+# other unit tests here cannot catch. Uses a real gh mock so the actual
+# requested path is observable.
+urlenc_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${urlenc_dir}/runner-sessions"
+urlenc_bin="${urlenc_dir}/bin"
+mkdir -p "$urlenc_bin"
+cat >"${urlenc_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+  case "$arg" in
+    repos/*/environments/*)
+      printf '%s\n' "$arg" >>"${MOCK_GH_CAPTURE}"
+      printf '{"protection_rules":[{"type":"required_reviewers"}]}\n'
+      exit 0
+      ;;
+  esac
+done
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 1
+MOCK_GH
+chmod +x "${urlenc_bin}/gh"
+capture_file="${urlenc_dir}/captured-path"
+: >"$capture_file"
+urlenc_out="$(
+  MOCK_GH_CAPTURE="$capture_file" PATH="${urlenc_bin}:${PATH}" bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+
+    rc=0
+    json="$(rp_fetch_environment_protection the-hcma/example-repo "dep-updater")" || rc=$?
+    [[ "$rc" -eq 0 ]] || { printf "plain-name fetch failed: rc=%s\n" "$rc"; exit 1; }
+    rp_environment_has_protection "$json" \
+      || { printf "plain-name should be reported protected\n"; exit 1; }
+
+    rc=0
+    json="$(rp_fetch_environment_protection the-hcma/example-repo "my env")" || rc=$?
+    [[ "$rc" -eq 0 ]] || { printf "spaced-name fetch failed: rc=%s\n" "$rc"; exit 1; }
+
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib"
+)" || urlenc_out="fail:${urlenc_out}"
+captured="$(cat "$capture_file")"
+rm -rf "$urlenc_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$urlenc_out" == 'ok' ]] \
+  && grep -qF 'repos/the-hcma/example-repo/environments/dep-updater' <<<"$captured" \
+  && grep -qF 'repos/the-hcma/example-repo/environments/my%20env' <<<"$captured"; then
+  printf '[PASS] rp_fetch_environment_protection requests the raw (unquoted) percent-encoded path\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rp_fetch_environment_protection URL-encoding (%s) (captured: %s)\n' \
+    "$urlenc_out" "$captured"
   fail=$(( fail + 1 ))
 fi
 
@@ -6603,6 +6676,26 @@ ghsec_out="$(
     { [[ "$rc" == 0 ]] \
       && grep -qF "SUGGEST: the-hcma/example-repo: secret scanning is off (private repo" <<<"$out"; } \
       || { printf "new-repo-private-off: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    rp_new_repo=0
+
+    # Regression (review #591, verified live against a real private org repo):
+    # private-vulnerability-reporting can 404 for a private repo even when
+    # unrelated to Dependabot alerts state — advisory-only there, same as
+    # secret scanning, never a FAIL even under --new-repo.
+    rp_fetch_repo_security_settings() {
+      printf %s "{\"private\":true,\"security_and_analysis\":{\"secret_scanning\":{\"status\":\"enabled\"},\"secret_scanning_push_protection\":{\"status\":\"enabled\"}}}"
+    }
+    rp_fetch_repo_toggle_state() { return 0; }
+    rp_fetch_repo_enabled_field() {
+      [[ "$2" == "private-vulnerability-reporting" ]] && { printf false; return 0; }
+      printf true; return 0
+    }
+    rp_new_repo=1
+    rc=0; out="$(rp_check_github_security_settings the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "SUGGEST: the-hcma/example-repo: private vulnerability reporting is off (private repo" <<<"$out" \
+      && ! grep -qF "FAIL:" <<<"$out"; } \
+      || { printf "new-repo-private-pvr-off: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
     rp_new_repo=0
 
     applied=""
@@ -6758,6 +6851,13 @@ pinchk_out="$(
     { [[ "$rc" != 0 ]] \
       && grep -qF "FAIL: the-hcma/example-repo: release/publish workflow(s) use non-SHA-pinned actions" <<<"$out"; } \
       || { printf "new-repo-publish-unpinned: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    # Regression (review #591): the per-reference detail line must come after
+    # the FAIL line it explains, not before it.
+    fail_line_num="$(grep -n "^FAIL: the-hcma/example-repo: release/publish" <<<"$out" | cut -d: -f1)"
+    detail_line_num="$(grep -n "pypa/gh-action-pypi-publish@release/v1" <<<"$out" | cut -d: -f1)"
+    { [[ -n "$fail_line_num" && -n "$detail_line_num" && "$detail_line_num" -gt "$fail_line_num" ]]; } \
+      || { printf "detail-after-fail: fail_line=%s detail_line=%s out=%s\n" \
+        "$fail_line_num" "$detail_line_num" "$out"; exit 1; }
     rp_new_repo=0
 
     rp_fetch_github_text_file() {
@@ -6941,6 +7041,9 @@ else
   printf '[FAIL] rp_check_protection_mechanism_consistency (%s)\n' "$pmc_out"
   fail=$(( fail + 1 ))
 fi
+
+printf '\n=== summary ===\n'
+printf '%s passed, %s failed\n' "$pass" "$fail"
 
 if [[ "$fail" -gt 0 ]]; then
   exit 1
