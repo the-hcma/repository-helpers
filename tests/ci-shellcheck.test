@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# Tests for scripts/lib/ci-shellcheck (pinned shellcheck install + run).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+rh_root="${script_dir}/.."
+readonly rh_root
+
+lib="${rh_root}/scripts/lib/ci-shellcheck"
+pre_pr="${rh_root}/scripts/dev/pre-pr-checks"
+ci_yml="${rh_root}/.github/workflows/ci.yml"
+readonly lib pre_pr ci_yml
+
+pass=0
+fail=0
+
+make_stub_bin() {
+  local dir="$1"
+  local name="$2"
+  local body="$3"
+  mkdir -p "$dir"
+  printf '%s\n' "#!/usr/bin/env bash" "set -euo pipefail" "$body" >"${dir}/${name}"
+  chmod +x "${dir}/${name}"
+}
+
+printf '\n=== static: canonical library exists ===\n'
+if [[ -f "$lib" ]]; then
+  printf '[PASS] scripts/lib/ci-shellcheck exists\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] missing scripts/lib/ci-shellcheck\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: hardened install contract ===\n'
+# shellcheck disable=SC2016  # assert literal ${version}/${os}/${arch} in source URL template
+if grep -qF "ci_shellcheck_version='0.11.0'" "$lib" \
+  && grep -qF 'ci_shellcheck_download_retries=3' "$lib" \
+  && grep -qF 'curl -fSL' "$lib" \
+  && grep -qF 'ERROR: shellcheck download failed' "$lib" \
+  && grep -qF 'file -b' "$lib" \
+  && grep -qF 'tar -tJf' "$lib" \
+  && grep -qF 'ci_shellcheck_release_os' "$lib" \
+  && grep -qF 'ci_shellcheck_release_arch' "$lib" \
+  && grep -qF 'shellcheck-v${version}.${os}.${arch}.tar.xz' "$lib" \
+  && ! grep -qF 'releases/latest' "$lib"; then
+  printf '[PASS] install uses pinned version, curl -f, retries, OS/arch asset, pre-extract validation\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected hardened shellcheck install contract in ci-shellcheck\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: supply-chain hardening (SHA-256 + post-install verify) ===\n'
+# shellcheck disable=SC2016  # assert literal source text
+if grep -qF 'declare -rA ci_shellcheck_sha256=(' "$lib" \
+  && grep -qE "^\s*\[linux\.x86_64\]='[0-9a-f]{62,64}'" "$lib" \
+  && grep -qE "^\s*\[darwin\.aarch64\]='[0-9a-f]{62,64}'" "$lib" \
+  && grep -qF 'ci_shellcheck_verify_checksum' "$lib" \
+  && grep -qF 'checksum mismatch' "$lib" \
+  && grep -qF 'PATH still resolves' "$lib" \
+  && grep -qF 'skipping checksum verification' "$lib"; then
+  printf '[PASS] pinned tarball is SHA-256-verified; ensure re-checks the resolved binary\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected SHA-256 map + verify + post-install resolution check\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: pre-pr-checks no longer hard-dies on missing shellcheck ===\n'
+eco_lib="${rh_root}/scripts/lib/pre-pr-ecosystem"
+if ! grep -qF 'shellcheck not found on PATH (required for planned shellcheck job)' "$eco_lib" \
+  && ! grep -qF 'need_shellcheck' "$eco_lib"; then
+  printf '[PASS] job_shellcheck bootstraps its own binary; require gate dropped\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] prec_require_tools_for_planned still gates on shellcheck presence\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: github-repo-lint warns on a stale shellcheck pin ===\n'
+rp_lib="${rh_root}/scripts/lib/repo-practices"
+policy_lib="${rh_root}/scripts/lib/ci-shellcheck-policy"
+if [[ -f "$policy_lib" ]] \
+  && grep -qF 'rp_check_ci_shellcheck_pin' "$rp_lib" \
+  && grep -qF 'ci_shellcheck_policy_pick_eligible_version' "$rp_lib" \
+  && grep -qF 'ci-shellcheck-policy' "$rp_lib" \
+  && grep -qF 'koalaman/shellcheck' "$policy_lib"; then
+  printf '[PASS] rp_check_ci_shellcheck_pin wired (mirrors the gitleaks-pin check)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected a shellcheck-pin freshness check in github-repo-lint\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: SHELLCHECK_VERSION override documented and honored ===\n'
+# shellcheck disable=SC2016  # assert literal ${SHELLCHECK_VERSION:-...} in source
+if grep -qF 'SHELLCHECK_VERSION' "$lib" \
+  && grep -qF '${SHELLCHECK_VERSION:-$ci_shellcheck_version}' "$lib" \
+  && grep -qF 'CI_SHELLCHECK_BIN_DIR' "$lib"; then
+  printf '[PASS] SHELLCHECK_VERSION / CI_SHELLCHECK_BIN_DIR overrides present\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected SHELLCHECK_VERSION / CI_SHELLCHECK_BIN_DIR override handling\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: install rejects non-xz download ===\n'
+tmp="$(mktemp -d)"
+stub_bin="${tmp}/stub-bin"
+# shellcheck disable=SC2016  # stub body is literal bash, not an expand-here string
+make_stub_bin "$stub_bin" curl '
+  outfile=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o) outfile="$2"; shift 2 ;;
+      -w) shift 2 ;;
+      --retry | --retry-delay) shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  printf "not xz\n" >"$outfile"
+  printf "200"
+'
+make_stub_bin "$stub_bin" file 'printf "ASCII text\n"'
+make_stub_bin "$stub_bin" tar 'exit 1'
+make_stub_bin "$stub_bin" sudo 'exit 1'
+
+reject_out=""
+reject_rc=0
+reject_out="$(
+  PATH="${stub_bin}:${PATH}" CI_SHELLCHECK_BIN_DIR="${tmp}/bin" bash -c '
+    # shellcheck source=/dev/null
+    source "'"$lib"'"
+    ci_shellcheck_install
+  ' 2>&1
+)" || reject_rc=$?
+if [[ "$reject_rc" -ne 0 ]] \
+  && grep -qF 'ERROR: shellcheck download failed' <<<"$reject_out"; then
+  printf '[PASS] non-xz download fails with actionable error\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected download failure message (rc=%s)\n%s\n' "$reject_rc" "$reject_out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$tmp"
+
+# build_fake_tarball <dir> <version> — writes <dir>/shellcheck.tar.xz whose one
+# member is "shellcheck-v<version>/shellcheck" (a stub printing the version line),
+# then prints the tarball's SHA-256.
+build_fake_tarball() {
+  local dir="$1" version="$2" member_dir
+  member_dir="${dir}/build/shellcheck-v${version}"
+  mkdir -p "$member_dir"
+  printf '#!/bin/sh\necho "version: %s"\n' "$version" >"${member_dir}/shellcheck"
+  chmod +x "${member_dir}/shellcheck"
+  tar -cJf "${dir}/shellcheck.tar.xz" -C "${dir}/build" "shellcheck-v${version}/shellcheck"
+  sha256sum "${dir}/shellcheck.tar.xz" | awk '{ print $1 }'
+}
+
+# make_curl_stub_serving <stub_bin_dir> <tarball_path>
+make_curl_stub_serving() {
+  local stub_bin="$1" tarball="$2"
+  # shellcheck disable=SC2016  # deliberately keep $1/$2 literal for the stub runtime
+  make_stub_bin "$stub_bin" curl '
+    outfile=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -o) outfile="$2"; shift 2 ;;
+        -w) shift 2 ;;
+        --retry | --retry-delay) shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    cp '"'${tarball}'"' "$outfile"
+    printf "200"
+  '
+  make_stub_bin "$stub_bin" file 'printf "XZ compressed data\n"'
+  make_stub_bin "$stub_bin" tar '/usr/bin/tar "$@"'
+}
+
+printf '\n=== functional: valid tarball installs (checksum skipped for override) ===\n'
+tmp="$(mktemp -d)"
+build_fake_tarball "$tmp" '9.9.9' >/dev/null
+stub_bin="${tmp}/stub-bin"
+make_curl_stub_serving "$stub_bin" "${tmp}/shellcheck.tar.xz"
+
+ok_out=""
+ok_rc=0
+ok_out="$(
+  PATH="${stub_bin}:${PATH}" SHELLCHECK_VERSION='9.9.9' CI_SHELLCHECK_BIN_DIR="${tmp}/bin" bash -c '
+    # shellcheck source=/dev/null
+    source "'"$lib"'"
+    ci_shellcheck_install
+  ' 2>&1
+)" || ok_rc=$?
+if [[ "$ok_rc" -eq 0 ]] && [[ -x "${tmp}/bin/shellcheck" ]] \
+  && grep -qF 'skipping checksum verification' <<<"$ok_out"; then
+  printf '[PASS] override version installs and warns that checksum is skipped\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected successful override install with skip warning (rc=%s)\n%s\n' "$ok_rc" "$ok_out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$tmp"
+
+printf '\n=== functional: checksum mismatch aborts the install (supply chain) ===\n'
+tmp="$(mktemp -d)"
+# Pinned version, but the served tarball is not the real one → digest mismatch.
+build_fake_tarball "$tmp" '0.11.0' >/dev/null
+stub_bin="${tmp}/stub-bin"
+make_curl_stub_serving "$stub_bin" "${tmp}/shellcheck.tar.xz"
+
+mm_out=""
+mm_rc=0
+mm_out="$(
+  PATH="${stub_bin}:${PATH}" CI_SHELLCHECK_BIN_DIR="${tmp}/bin" bash -c '
+    # shellcheck source=/dev/null
+    source "'"$lib"'"
+    ci_shellcheck_install
+  ' 2>&1
+)" || mm_rc=$?
+if [[ "$mm_rc" -ne 0 ]] \
+  && grep -qF 'checksum mismatch' <<<"$mm_out" \
+  && [[ ! -e "${tmp}/bin/shellcheck" ]]; then
+  printf '[PASS] a tampered tarball fails the SHA-256 check and installs nothing\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected checksum-mismatch abort (rc=%s)\n%s\n' "$mm_rc" "$mm_out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$tmp"
+
+printf '\n=== functional: ensure fails loudly when a stale shellcheck shadows the install ===\n'
+tmp="$(mktemp -d)"
+build_fake_tarball "$tmp" '0.11.0-fake' >/dev/null
+stub_bin="${tmp}/stub-bin"
+make_curl_stub_serving "$stub_bin" "${tmp}/shellcheck.tar.xz"
+# A stale shellcheck earlier on PATH keeps winning resolution; the sudo install to
+# /usr/local/bin (default dir, no PATH prepend) is emulated as a no-op so the
+# freshly "installed" binary never becomes resolvable.
+make_stub_bin "$stub_bin" shellcheck 'printf "ShellCheck - shell script analysis tool\nversion: 0.9.0\n"'
+make_stub_bin "$stub_bin" sudo 'exit 0'
+
+shadow_out=""
+shadow_rc=0
+shadow_out="$(
+  PATH="${stub_bin}:${PATH}" SHELLCHECK_VERSION='0.11.0-fake' bash -c '
+    # shellcheck source=/dev/null
+    source "'"$lib"'"
+    ci_shellcheck_ensure
+  ' 2>&1
+)" || shadow_rc=$?
+if [[ "$shadow_rc" -ne 0 ]] \
+  && grep -qF 'PATH still resolves' <<<"$shadow_out"; then
+  printf '[PASS] ensure errors when the pinned binary is not the one that resolves\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] ensure must fail when a stale shellcheck shadows the pin (rc=%s)\n%s\n' "$shadow_rc" "$shadow_out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$tmp"
+
+printf '\n=== functional: SHELLCHECK_VERSION changes the download URL ===\n'
+tmp="$(mktemp -d)"
+stub_bin="${tmp}/stub-bin"
+# shellcheck disable=SC2016  # stub body is literal bash
+make_stub_bin "$stub_bin" curl '
+  for a in "$@"; do
+    case "$a" in
+      https://*) printf "%s\n" "$a" >>"'"${tmp}"'/urls" ;;
+    esac
+  done
+  outfile=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o) outfile="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  printf "bad\n" >"${outfile:-/dev/null}"
+  printf "500"
+'
+make_stub_bin "$stub_bin" file 'printf "data\n"'
+make_stub_bin "$stub_bin" tar 'exit 1'
+PATH="${stub_bin}:${PATH}" SHELLCHECK_VERSION='9.9.9' CI_SHELLCHECK_BIN_DIR="${tmp}/bin" bash -c '
+  # shellcheck source=/dev/null
+  source "'"$lib"'"
+  ci_shellcheck_install || true
+' >/dev/null 2>&1 || true
+if grep -qF 'shellcheck-v9.9.9.' "${tmp}/urls" 2>/dev/null; then
+  printf '[PASS] SHELLCHECK_VERSION override is used in the release URL\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected v9.9.9 in the requested URL\n%s\n' "$(cat "${tmp}/urls" 2>/dev/null || printf '<none>')"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$tmp"
+
+printf '\n=== functional: ensure is a no-op when the pinned version is present ===\n'
+tmp="$(mktemp -d)"
+stub_bin="${tmp}/stub-bin"
+make_stub_bin "$stub_bin" shellcheck 'printf "ShellCheck - shell script analysis tool\nversion: 0.11.0\n"'
+make_stub_bin "$stub_bin" curl 'printf "install attempted\n" >&2; exit 1'
+noop_out=""
+noop_rc=0
+noop_out="$(
+  PATH="${stub_bin}:${PATH}" bash -c '
+    # shellcheck source=/dev/null
+    source "'"$lib"'"
+    ci_shellcheck_ensure
+  ' 2>&1
+)" || noop_rc=$?
+if [[ "$noop_rc" -eq 0 ]] && ! grep -qF 'install attempted' <<<"$noop_out"; then
+  printf '[PASS] ensure does not re-download when shellcheck already reports 0.11.0\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] ensure should no-op on a matching version (rc=%s)\n%s\n' "$noop_rc" "$noop_out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$tmp"
+
+printf '\n=== static: pre-pr-checks pins shellcheck via ci-shellcheck ===\n'
+# shellcheck disable=SC2016  # assert literal source text
+if grep -qF 'lib/ci-shellcheck' "$pre_pr" \
+  && grep -qF 'ci_shellcheck_ensure' "$pre_pr"; then
+  printf '[PASS] job_shellcheck resolves shellcheck through the pinned lib\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] pre-pr-checks job_shellcheck must source ci-shellcheck and call ci_shellcheck_ensure\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: CI workflow pins shellcheck via ci-shellcheck ===\n'
+if grep -qF 'source scripts/lib/ci-shellcheck' "$ci_yml" \
+  && grep -qF 'ci_shellcheck_ensure' "$ci_yml" \
+  && grep -qF 'ci_shellcheck_run' "$ci_yml"; then
+  printf '[PASS] .github/workflows/ci.yml Shellcheck step uses the pinned lib\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] ci.yml Shellcheck step must use ci_shellcheck_ensure / ci_shellcheck_run\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: runner-adoption ratchet skips the copy-verbatim lib ===\n'
+if grep -qF 'scripts/lib/ci-shellcheck' "${rh_root}/tests/lib/runner-adoption-count"; then
+  printf '[PASS] ci-shellcheck is on the runner-adoption skip list (like ci-secret-scan)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] add scripts/lib/ci-shellcheck to rp_runner_adoption_skip_file\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: ci-shellcheck-policy reads the pin and compares semvers ===\n'
+# shellcheck disable=SC1090,SC1091  # repo-practices pulls in the policy lib + deps
+source "${rh_root}/scripts/lib/repo-practices"
+policy_pinned="$(ci_shellcheck_policy_read_pinned_version "$lib")"
+if [[ "$policy_pinned" == '0.11.0' ]] \
+  && ci_shellcheck_policy_version_is_older_than '0.10.0' '0.11.0' \
+  && ! ci_shellcheck_policy_version_is_older_than '0.11.0' '0.11.0' \
+  && ! ci_shellcheck_policy_version_is_older_than '0.12.0' '0.11.0'; then
+  printf '[PASS] policy reads ci_shellcheck_version and orders releases\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] policy pinned read / semver comparison failed (pinned=%s)\n' "$policy_pinned"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: ci-shellcheck-policy picks the newest release past the age gate ===\n'
+policy_mock_dir="$(mktemp -d)"
+policy_mock_bin="${policy_mock_dir}/bin"
+mkdir -p "$policy_mock_bin"
+cat >"${policy_mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'auth status'* ]]; then exit 0; fi
+if [[ "$args" == *'repos/koalaman/shellcheck/releases --paginate'* ]]; then
+  printf '%s\n' 'v0.12.0' 'v0.11.0'
+  exit 0
+fi
+if [[ "$args" == *'releases/tags/v0.12.0'* ]]; then
+  if [[ "$args" == *'published_at'* ]]; then date -u -d '1 day ago' +%Y-%m-%dT%H:%M:%SZ
+  elif [[ "$args" == *'assets[].name'* ]]; then printf 'shellcheck-v0.12.0.linux.x86_64.tar.xz\n'; fi
+  exit 0
+fi
+if [[ "$args" == *'releases/tags/v0.11.0'* ]]; then
+  if [[ "$args" == *'published_at'* ]]; then date -u -d '60 days ago' +%Y-%m-%dT%H:%M:%SZ
+  elif [[ "$args" == *'assets[].name'* ]]; then printf 'shellcheck-v0.11.0.linux.x86_64.tar.xz\n'; fi
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${policy_mock_bin}/gh"
+
+policy_eligible="$(
+  PATH="${policy_mock_bin}:${PATH}" ci_shellcheck_policy_pick_eligible_version 2>/dev/null || true
+)"
+rm -rf "$policy_mock_dir"
+if [[ "$policy_eligible" == '0.11.0' ]]; then
+  printf '[PASS] policy skips the too-new 0.12.0 and returns 0.11.0\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected eligible=0.11.0, got %s\n' "$policy_eligible"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== results: %d passed, %d failed ===\n' "$pass" "$fail"
+[[ "$fail" -eq 0 ]]

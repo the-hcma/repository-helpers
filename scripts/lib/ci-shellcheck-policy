@@ -1,0 +1,160 @@
+# shellcheck shell=bash
+# ci-shellcheck-policy — shellcheck pin bump detection for repository-helpers lint.
+#
+# Sourced by scripts/lib/repo-practices. Requires release-age-defaults variables and
+# time-log. Not copied to consumer repositories. Mirrors ci-secret-scan-policy.
+
+ci_shellcheck_policy_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly ci_shellcheck_policy_lib_dir
+
+# shellcheck disable=SC1091  # time-log is sourced at runtime from repo-practices
+# shellcheck source=scripts/lib/time-log
+source "${ci_shellcheck_policy_lib_dir}/time-log"
+
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${ci_shellcheck_policy_lib_dir}/runner-ensure"
+# shellcheck source=scripts/lib/github-api-rate-limit
+source "${ci_shellcheck_policy_lib_dir}/github-api-rate-limit"
+
+# cshp_runner_gh_api_stream <label> [gh-api-args…]
+# Waits and retries when GitHub returns a primary/secondary API rate limit.
+cshp_runner_gh_api_stream() {
+  local -r label="$1"
+  shift
+
+  github_api_exec_with_rate_limit_retry "$label" -- gh api "$@"
+}
+
+ci_shellcheck_policy_repo='koalaman/shellcheck'
+
+# ci_shellcheck_policy_read_pinned_version [script_path]
+ci_shellcheck_policy_read_pinned_version() {
+  local script_path="${1:-${ci_shellcheck_policy_lib_dir}/ci-shellcheck}"
+  local line version
+
+  if [[ ! -f "$script_path" ]]; then
+    return 1
+  fi
+  line="$(grep -E "^ci_shellcheck_version='[0-9.]+'" "$script_path" | head -n 1 || true)"
+  if [[ -z "$line" ]]; then
+    return 1
+  fi
+  version="${line#ci_shellcheck_version=\'}"
+  version="${version%\'}"
+  version="${version%% *}"
+  printf '%s\n' "$version"
+}
+
+ci_shellcheck_policy_iso8601_to_epoch() {
+  local iso="$1"
+  local epoch
+
+  if epoch="$(date -u -d "$iso" +%s 2>/dev/null)"; then
+    printf '%s' "$epoch"
+    return 0
+  fi
+  return 1
+}
+
+# ci_shellcheck_policy_release_published_epoch <version>
+ci_shellcheck_policy_release_published_epoch() {
+  local version="$1"
+  local published_iso published_epoch
+
+  if [[ "${GITHUB_REPO_LINT_SKIP_SHELLCHECK_REGISTRY:-0}" == '1' ]]; then
+    return 1
+  fi
+
+  published_iso="$(github_api_exec_with_rate_limit_retry "ci-shellcheck-policy release" -- gh api \
+    "repos/${ci_shellcheck_policy_repo}/releases/tags/v${version}" \
+      --jq '.published_at // empty' 2>/dev/null || true)"
+  if [[ -z "$published_iso" || "$published_iso" == 'null' ]]; then
+    return 1
+  fi
+  published_epoch="$(ci_shellcheck_policy_iso8601_to_epoch "$published_iso" || true)"
+  if [[ -z "$published_epoch" ]]; then
+    return 1
+  fi
+  printf '%s' "$published_epoch"
+}
+
+# ci_shellcheck_policy_version_meets_release_age <version>
+# Exit 0 when the release is at least release_age_dep_updater_minutes old.
+ci_shellcheck_policy_version_meets_release_age() {
+  local version="$1"
+  local published_epoch now_epoch age_minutes
+
+  if [[ "${GITHUB_REPO_LINT_SKIP_SHELLCHECK_REGISTRY:-0}" == '1' ]]; then
+    return 0
+  fi
+
+  published_epoch="$(ci_shellcheck_policy_release_published_epoch "$version" || true)"
+  if [[ -z "$published_epoch" ]]; then
+    return 0
+  fi
+  now_epoch="$(time_log_now_utc_epoch)"
+  age_minutes=$(( (now_epoch - published_epoch) / 60 ))
+  # shellcheck disable=SC2154  # release_age_dep_updater_minutes from release-age-defaults
+  if (( age_minutes < release_age_dep_updater_minutes )); then
+    return 1
+  fi
+  return 0
+}
+
+# ci_shellcheck_policy_linux_x86_64_asset_exists <version>
+ci_shellcheck_policy_linux_x86_64_asset_exists() {
+  local version="$1"
+  local asset_name
+
+  if [[ "${GITHUB_REPO_LINT_SKIP_SHELLCHECK_REGISTRY:-0}" == '1' ]]; then
+    return 0
+  fi
+
+  asset_name="shellcheck-v${version}.linux.x86_64.tar.xz"
+  cshp_runner_gh_api_stream "ci-shellcheck-policy release assets" \
+    "repos/${ci_shellcheck_policy_repo}/releases/tags/v${version}" \
+    --jq '.assets[].name' 2>/dev/null | grep -qxF "$asset_name"
+}
+
+# ci_shellcheck_policy_pick_eligible_version
+# Prints the newest shellcheck semver that passes release-age and has a linux.x86_64 asset.
+ci_shellcheck_policy_pick_eligible_version() {
+  local tags version
+
+  if [[ "${GITHUB_REPO_LINT_SKIP_SHELLCHECK_REGISTRY:-0}" == '1' ]]; then
+    return 1
+  fi
+
+  mapfile -t tags < <(
+    cshp_runner_gh_api_stream "ci-shellcheck-policy releases list" \
+      "repos/${ci_shellcheck_policy_repo}/releases" --paginate \
+      --jq '.[] | select(.prerelease | not) | .tag_name' 2>/dev/null \
+      | sed 's/^v//' \
+      | sort -V -r
+  )
+  for version in "${tags[@]}"; do
+    [[ -n "$version" ]] || continue
+    if ! ci_shellcheck_policy_linux_x86_64_asset_exists "$version"; then
+      continue
+    fi
+    if ci_shellcheck_policy_version_meets_release_age "$version"; then
+      printf '%s\n' "$version"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ci_shellcheck_policy_version_is_older_than <left> <right>
+# Exit 0 when left is strictly older than right.
+ci_shellcheck_policy_version_is_older_than() {
+  local left="$1"
+  local right="$2"
+  local newer
+
+  if [[ "$left" == "$right" ]]; then
+    return 1
+  fi
+  newer="$(printf '%s\n%s\n' "$left" "$right" | sort -V | tail -n 1)"
+  [[ "$newer" == "$right" ]]
+}

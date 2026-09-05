@@ -391,6 +391,7 @@ also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
 | pnpm release age | yes | — | `minimumReleaseAge` in `pnpm-workspace.yaml` when present |
 | pnpm Corepack CI | yes | — | Exact `packageManager: pnpm@X.Y.Z` when lockfile exists; no `pnpm/action-setup` / `setup-node` `cache: pnpm`; use org composite [`actions/setup-pnpm-corepack`](actions/setup-pnpm-corepack/README.md) (pin SHA on `main`) |
 | `ci-secret-scan` gitleaks pin | yes* | — | Warn when `scripts/lib/ci-secret-scan` pins gitleaks behind the release-age-eligible version (*this repo only) |
+| `ci-shellcheck` pin | yes* | — | Warn when `scripts/lib/ci-shellcheck` pins shellcheck (`ci_shellcheck_version` / `ci_shellcheck_sha256`) behind the release-age-eligible version (*this repo only) |
 | GitHub-native security settings | yes* | — | Dependabot alerts, Dependabot security updates, secret scanning + push protection (free on public repos, GHAS-gated on private — advisory only there), private vulnerability reporting; `--apply-fix` toggles each via the GitHub API (*enforceable (public-repo-available) settings FAIL under `--new-repo` and `--strict-onboarding`; private-repo advisory-only settings (secret scanning, private vulnerability reporting when GHAS-gated) always SUGGEST, never FAIL; routine `--all` / `--suggest` SUGGESTs throughout — org-wide rollout complete, repository-helpers#588) |
 | Actions hardening | yes* | — | `default_workflow_permissions: read` and `can_approve_pull_request_reviews: false` (`--apply-fix` sets both); `allowed_actions` and `sha_pinning_required` are SUGGEST-only always (no safe default to auto-apply) (*`default_workflow_permissions` / `can_approve_pull_request_reviews` FAIL under `--new-repo` and `--strict-onboarding`; SUGGEST in routine `--all` / `--suggest` — org-wide rollout complete, repository-helpers#588) |
 | Actions workflow `uses:` pinning | yes* | — | Third-party `uses:` refs pinned to a full commit SHA; a release/publish workflow (holds OIDC / write tokens) with a non-SHA pin is promoted past a generic suggestion (*generic non-SHA pins are SUGGEST always; release/publish workflow pins FAIL under `--new-repo` and `--strict-onboarding` — org-wide rollout complete, repository-helpers#588) |
@@ -516,6 +517,25 @@ bash tests/aa-github-repo-lint.test
 bash tests/a-github-repo-lint-enforcer.test
 bash tests/setup-service.test
 ```
+
+### shellcheck version
+
+`shellcheck` is **pinned** (currently `0.11.0`) so a local run and CI never
+disagree on lint findings (e.g. `SC2329`). Both `.github/workflows/ci.yml` and
+`scripts/dev/pre-pr-checks` resolve `shellcheck` through
+`scripts/lib/ci-shellcheck`, which downloads the pinned release binary
+(Linux/macOS, x86_64/aarch64) when the pinned version is not already resolvable —
+locally into `~/.cache/repository-helpers/bin`, in CI into `/usr/local/bin`. The
+download is verified against a hardcoded SHA-256 and the installed binary is
+re-checked so a stale `shellcheck` earlier on `PATH` can't silently win. Override
+the version for local experiments with `SHELLCHECK_VERSION` (checksum check is
+then skipped).
+
+`scripts/github-repo-lint` warns when `ci_shellcheck_version` /
+`ci_shellcheck_sha256` in `scripts/lib/ci-shellcheck` fall behind the newest
+shellcheck release that clears the dep-updater release-age gate (same mechanism
+as the `ci-secret-scan` gitleaks pin). On a bump, update the version **and** all
+four checksums, then re-sync any consumer `.github/ci/shellcheck`.
 
 ## License
 
