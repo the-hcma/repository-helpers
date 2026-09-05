@@ -97,7 +97,18 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 
 ## Linting
 
-- **`shellcheck`** is mandatory. CI runs `shellcheck -S info dep-updater dep-updater.test` on every push.
+- **`shellcheck`** is mandatory. CI and `scripts/dev/pre-pr-checks` both run
+  `shellcheck -S info` over the full `scripts/**` + `tests/**` globs, at a **pinned
+  version** resolved through `scripts/lib/ci-shellcheck` (currently `0.11.0`) so a
+  developer's local shellcheck can never diverge from CI (repository-helpers#594).
+  The `shellcheck` job downloads the pinned release binary (SHA-256-verified,
+  HTTPS) when the pinned version is not already resolvable — locally into
+  `~/.cache/repository-helpers/bin`, in CI into `/usr/local/bin` — so a machine
+  with no shellcheck, or the wrong version, still passes. Override the version for
+  local experiments with `SHELLCHECK_VERSION` (checksum check is skipped then).
+  `scripts/github-repo-lint` warns when `ci_shellcheck_version` /
+  `ci_shellcheck_sha256` fall behind the newest release-age-eligible shellcheck
+  (same gate as the gitleaks pin); bump both together and re-sync consumers.
 - Zero findings at the `info` level is the bar. No `# shellcheck disable=` suppressions unless absolutely unavoidable; every suppression must have a comment explaining why.
 - Key rules that are always errors:
   - **SC2155** — never combine `local`/`readonly` with a command substitution assignment; declare separately to preserve the exit code.
@@ -217,6 +228,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | pnpm release age | yes | — | `minimumReleaseAge` in `pnpm-workspace.yaml` when present |
 | pnpm Corepack CI | yes | — | Exact `packageManager: pnpm@X.Y.Z` when lockfile exists; no `pnpm/action-setup` / `setup-node` `cache: pnpm`; use org composite `actions/setup-pnpm-corepack` (pin SHA on `main`; see section below) |
 | `ci-secret-scan` gitleaks pin | yes* | — | Warn when `scripts/lib/ci-secret-scan` pins gitleaks behind the release-age-eligible version (*this repo only) |
+| `ci-shellcheck` pin | yes* | — | Warn when `scripts/lib/ci-shellcheck` pins shellcheck (`ci_shellcheck_version` / `ci_shellcheck_sha256`) behind the release-age-eligible version (*this repo only) |
 | GitHub-native security settings | yes* | — | Dependabot alerts, Dependabot security updates, secret scanning + push protection (free on public repos, GHAS-gated on private — advisory only there), private vulnerability reporting; `--apply-fix` toggles each via the GitHub API (*enforceable (public-repo-available) settings FAIL under `--new-repo` and `--strict-onboarding`; private-repo advisory-only settings (secret scanning, private vulnerability reporting when GHAS-gated) always SUGGEST, never FAIL; routine `--all` / `--suggest` SUGGESTs throughout — org-wide rollout complete, repository-helpers#588) |
 | Actions hardening | yes* | — | `default_workflow_permissions: read` and `can_approve_pull_request_reviews: false` (`--apply-fix` sets both); `allowed_actions` and `sha_pinning_required` are SUGGEST-only always (no safe default to auto-apply) (*`default_workflow_permissions` / `can_approve_pull_request_reviews` FAIL under `--new-repo` and `--strict-onboarding`; SUGGEST in routine `--all` / `--suggest` — org-wide rollout complete, repository-helpers#588) |
 | Actions workflow `uses:` pinning | yes* | — | Third-party `uses:` refs pinned to a full commit SHA; a release/publish workflow (holds OIDC / write tokens) with a non-SHA pin is promoted past a generic suggestion (*generic non-SHA pins are SUGGEST always; release/publish workflow pins FAIL under `--new-repo` and `--strict-onboarding` — org-wide rollout complete, repository-helpers#588) |

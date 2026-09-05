@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# ci-shellcheck — install a pinned shellcheck and run it over the repo's shell files.
+#
+# Copy this file to .github/ci/shellcheck in consumer repositories. The body is the
+# org-wide canonical implementation; sync via scripts/github-repo-lint. Bump
+# ci_shellcheck_version AND ci_shellcheck_sha256 together when a newer shellcheck
+# release passes the same release-age gate as gitleaks — `scripts/github-repo-lint`
+# warns when this pin falls behind (rp_check_ci_shellcheck_pin).
+#
+# CI (.github/workflows/ci.yml) and scripts/dev/pre-pr-checks both resolve shellcheck
+# through this file so a developer's local shellcheck version can never diverge from
+# the version CI enforces (repository-helpers#594).
+#
+# Supply chain: the version is pinned (never `latest`), the download is HTTPS from
+# github.com release assets, and the extracted tarball is checked against a hardcoded
+# SHA-256 before install — a swapped or tampered asset fails loudly. A
+# SHELLCHECK_VERSION override has no known digest, so checksum verification is
+# skipped for it with a warning (use it only for local experiments).
+#
+# Environment:
+#   SHELLCHECK_VERSION      Pin override (default: 0.11.0; skips checksum verification)
+#   CI_SHELLCHECK_BIN_DIR   Install directory (default: /usr/local/bin; no sudo when set)
+
+set -euo pipefail
+
+ci_shellcheck_version='0.11.0'
+readonly ci_shellcheck_version
+
+ci_shellcheck_download_retries=3
+readonly ci_shellcheck_download_retries
+
+# SHA-256 of shellcheck-v${ci_shellcheck_version}.<os>.<arch>.tar.xz, keyed <os>.<arch>.
+# Regenerate on a version bump:
+#   for a in linux.x86_64 linux.aarch64 darwin.x86_64 darwin.aarch64; do
+#     curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/v<VER>/shellcheck-v<VER>.$a.tar.xz" \
+#       | sha256sum | sed "s/-/$a/"
+#   done
+declare -rA ci_shellcheck_sha256=(
+  [linux.x86_64]='8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198'
+  [linux.aarch64]='12b331c1d2db6b9eb13cfca64306b1b157a86eb69db83023e261eaa7e7c14588'
+  [darwin.x86_64]='3c89db4edcab7cf1c27bff178882e0f6f27f7afdf54e859fa041fca10febe4c6'
+  [darwin.aarch64]='56affdd8de5527894dca6dc3d7e0a99a873b0f004d7aabc30ae407d3f48b0a79'
+)
+
+ci_shellcheck_repo_dir() {
+  # csc_* locals: consumer wrappers may have a script-level readonly script_dir.
+  local csc_script_dir
+  csc_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  cd "${csc_script_dir}/../.." && pwd
+}
+
+# Arch token for shellcheck release assets: x86_64 | aarch64
+ci_shellcheck_release_arch() {
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64 | amd64) printf '%s\n' 'x86_64' ;;
+    aarch64 | arm64) printf '%s\n' 'aarch64' ;;
+    *)
+      printf 'ERROR: unsupported architecture for shellcheck: %s\n' "$arch" >&2
+      return 1
+      ;;
+  esac
+}
+
+# OS token for shellcheck release assets: linux | darwin
+ci_shellcheck_release_os() {
+  local os
+  os="$(uname -s)"
+  case "$os" in
+    Linux) printf '%s\n' 'linux' ;;
+    Darwin) printf '%s\n' 'darwin' ;;
+    *)
+      printf 'ERROR: unsupported OS for shellcheck: %s\n' "$os" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Prints the SHA-256 of a file using whichever tool is present (GNU or BSD).
+ci_shellcheck_sha256_of() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{ print $1 }'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{ print $1 }'
+  else
+    printf 'ERROR: neither sha256sum nor shasum found for checksum verification\n' >&2
+    return 1
+  fi
+}
+
+# Prints the installed shellcheck's "version:" line value, or nothing when absent.
+ci_shellcheck_installed_version() {
+  command -v shellcheck >/dev/null 2>&1 || return 0
+  shellcheck --version 2>/dev/null | awk '/^version:/ { print $2 }'
+}
+
+# Verify a downloaded tarball against the hardcoded digest for this platform.
+# No-op (with a warning) when SHELLCHECK_VERSION overrides the pinned version or
+# no digest is recorded for the platform.
+ci_shellcheck_verify_checksum() {
+  local tarball="$1" os="$2" arch="$3" version="$4"
+  local want got
+
+  if [[ "$version" != "$ci_shellcheck_version" ]]; then
+    printf 'WARNING: SHELLCHECK_VERSION=%s overrides the pin; skipping checksum verification\n' \
+      "$version" >&2
+    return 0
+  fi
+  want="${ci_shellcheck_sha256[${os}.${arch}]:-}"
+  if [[ -z "$want" ]]; then
+    printf 'WARNING: no recorded SHA-256 for shellcheck %s.%s; skipping checksum verification\n' \
+      "$os" "$arch" >&2
+    return 0
+  fi
+  got="$(ci_shellcheck_sha256_of "$tarball")" || return 1
+  if [[ "$got" != "$want" ]]; then
+    printf 'ERROR: shellcheck tarball checksum mismatch (%s.%s v%s)\n  expected %s\n  got      %s\n' \
+      "$os" "$arch" "$version" "$want" "$got" >&2
+    return 1
+  fi
+  return 0
+}
+
+ci_shellcheck_install() {
+  local arch os version url tmpdir tarball member dest_dir attempt http_code
+  os="$(ci_shellcheck_release_os)"
+  arch="$(ci_shellcheck_release_arch)"
+  version="${SHELLCHECK_VERSION:-$ci_shellcheck_version}"
+  url="https://github.com/koalaman/shellcheck/releases/download/v${version}/shellcheck-v${version}.${os}.${arch}.tar.xz"
+  member="shellcheck-v${version}/shellcheck"
+  tmpdir="$(mktemp -d)"
+  tarball="${tmpdir}/shellcheck.tar.xz"
+  dest_dir="${CI_SHELLCHECK_BIN_DIR:-/usr/local/bin}"
+
+  for attempt in $(seq 1 "$ci_shellcheck_download_retries"); do
+    http_code=''
+    http_code="$(curl -fSL --retry 2 --retry-delay 1 -o "$tarball" -w '%{http_code}' "$url" 2>/dev/null || true)"
+    if [[ "$http_code" == '200' ]] \
+      && [[ -s "$tarball" ]] \
+      && file -b "$tarball" | grep -qi 'xz'; then
+      # A checksum mismatch is not transient — fail immediately, do not retry.
+      if ! ci_shellcheck_verify_checksum "$tarball" "$os" "$arch" "$version"; then
+        rm -rf "$tmpdir"
+        return 1
+      fi
+      if tar -tJf "$tarball" "$member" >/dev/null 2>&1; then
+        tar -xJf "$tarball" -C "$tmpdir" "$member"
+        if [[ "$dest_dir" == '/usr/local/bin' ]]; then
+          sudo install -m 0755 "${tmpdir}/${member}" "${dest_dir}/shellcheck"
+        else
+          mkdir -p "$dest_dir"
+          install -m 0755 "${tmpdir}/${member}" "${dest_dir}/shellcheck"
+          PATH="${dest_dir}:${PATH}"
+          export PATH
+        fi
+        rm -rf "$tmpdir"
+        return 0
+      fi
+    fi
+    rm -f "$tarball"
+    if (( attempt < ci_shellcheck_download_retries )); then
+      sleep $((attempt * 2))
+    fi
+  done
+
+  rm -rf "$tmpdir"
+  printf 'ERROR: shellcheck download failed after %s attempts (url=%s)\n' \
+    "$ci_shellcheck_download_retries" "$url" >&2
+  return 1
+}
+
+# Ensure the pinned shellcheck is the one that WILL run. No-op when it already
+# resolves to the pinned version; installs it otherwise and re-verifies that the
+# freshly installed binary is the one on PATH (an older shellcheck earlier on
+# PATH than the install dir would otherwise silently defeat the pin — #594).
+ci_shellcheck_ensure() {
+  local want installed
+  want="${SHELLCHECK_VERSION:-$ci_shellcheck_version}"
+  installed="$(ci_shellcheck_installed_version)"
+  if [[ "$installed" == "$want" ]]; then
+    return 0
+  fi
+  ci_shellcheck_install
+  hash -r 2>/dev/null || true
+  installed="$(ci_shellcheck_installed_version)"
+  if [[ "$installed" != "$want" ]]; then
+    printf 'ERROR: installed shellcheck %s but PATH still resolves %s\n' \
+      "$want" "${installed:-<none>}" >&2
+    printf 'ERROR: put CI_SHELLCHECK_BIN_DIR (or the install dir) ahead of the stale shellcheck on PATH\n' >&2
+    return 1
+  fi
+  return 0
+}
+
+# Run shellcheck -S info over the same file set CI lints (repository-helpers#594).
+ci_shellcheck_run() {
+  local repo_dir f
+  local -a files=()
+  repo_dir="${1:-$(ci_shellcheck_repo_dir)}"
+
+  for f in "$repo_dir"/scripts/* "$repo_dir"/scripts/dev/* "$repo_dir"/scripts/lib/* \
+    "$repo_dir"/tests/* "$repo_dir"/tests/lib/*; do
+    [[ -f "$f" ]] || continue
+    files+=("$f")
+  done
+  [[ "${#files[@]}" -gt 0 ]] || return 0
+  shellcheck -S info "${files[@]}"
+}
+
+ci_shellcheck_main() {
+  local repo_dir
+  repo_dir="$(ci_shellcheck_repo_dir)"
+  ci_shellcheck_ensure
+  ci_shellcheck_run "$repo_dir"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  ci_shellcheck_main
+fi
