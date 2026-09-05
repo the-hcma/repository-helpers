@@ -114,18 +114,39 @@ git_current_branch() {
   printf '%s\n' "$branch"
 }
 
+# ensure_branch_is_pushed — confirm origin has this branch at the current HEAD.
+#
+# Query origin directly rather than trusting `@{u}`: local upstream-tracking
+# config only proves a tracking ref was once configured, not that HEAD was
+# pushed, and `gh stack submit` / `git push` without `-u` never set it at all
+# even though origin has an in-sync branch and an open PR (#596). One `ls-remote`
+# is negligible next to the `gh` API calls that follow.
 ensure_branch_is_pushed() {
-  local upstream exit_code
+  local -r branch="$1"
+  local remote_ref remote_sha local_sha exit_code
 
   exit_code=0
-  upstream="$(runner_exec_stdout "git rev-parse upstream" -- git -C "$repo_dir" rev-parse --abbrev-ref '@{u}')" \
+  remote_ref="$(runner_exec_stdout "git ls-remote origin branch" --probe --timeout 20 -- git -C "$repo_dir" ls-remote --heads origin "$branch")" \
     || exit_code=$?
   if (( exit_code != 0 )); then
-    upstream=""
+    die "Could not query origin for branch ${branch} (network error?)"
   fi
-  if [[ -z "$upstream" ]]; then
-    die "Branch has no upstream configured (push it or run scripts/dev/submit-stack)"
+  remote_sha="${remote_ref%%[[:space:]]*}"
+  if [[ -z "$remote_sha" ]]; then
+    die "Branch ${branch} is not on origin (push it or run scripts/dev/submit-stack)"
   fi
+
+  exit_code=0
+  local_sha="$(runner_exec_stdout "git rev-parse HEAD" --probe -- git -C "$repo_dir" rev-parse HEAD)" \
+    || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$local_sha" ]]; then
+    die "Could not resolve local HEAD for branch ${branch}"
+  fi
+
+  if [[ "$remote_sha" != "$local_sha" ]]; then
+    die "origin/${branch} (${remote_sha:0:12}) is out of sync with local HEAD (${local_sha:0:12}) — push again or run scripts/dev/submit-stack"
+  fi
+  log_step "Branch ${branch} is present on origin at HEAD"
 }
 
 discover_pr_number_for_branch() {
@@ -349,9 +370,13 @@ main() {
 
   branch="$(git_current_branch)"
   [[ -n "$branch" ]] || die "Not on a branch (detached HEAD)"
-  ensure_branch_is_pushed
 
   if [[ -z "$pr_number" ]]; then
+    # Auto-discovery: the PR is found from the current branch, so it must be
+    # pushed and at HEAD. With explicit --pr N the PR is identified by number and
+    # the local checkout is irrelevant — don't gate on it (it may be a stale
+    # `main`, or another repo's worktree via an absolute-path invocation, #590).
+    ensure_branch_is_pushed "$branch"
     pr_number="$(discover_pr_number_for_branch "$branch" || true)"
     [[ -n "$pr_number" ]] || die "No open PR found for branch: ${branch}"
   fi
