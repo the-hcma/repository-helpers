@@ -46,6 +46,14 @@ if [[ "$*" == *'rev-parse --abbrev-ref @{u}'* ]]; then
   printf '%s\n' 'origin/my-branch'
   exit 0
 fi
+if [[ "$*" == *'ls-remote --heads origin my-branch'* ]]; then
+  printf '%s\trefs/heads/my-branch\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  exit 0
+fi
+if [[ "$*" == *'rev-parse HEAD'* ]]; then
+  printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  exit 0
+fi
 printf 'unexpected git call: %s\n' "$*" >&2
 exit 1
 MOCK_GIT
@@ -122,6 +130,14 @@ if [[ "$*" == *'rev-parse --abbrev-ref @{u}'* ]]; then
   printf '%s\n' 'origin/my-branch'
   exit 0
 fi
+if [[ "$*" == *'ls-remote --heads origin my-branch'* ]]; then
+  printf '%s\trefs/heads/my-branch\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  exit 0
+fi
+if [[ "$*" == *'rev-parse HEAD'* ]]; then
+  printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  exit 0
+fi
 printf 'unexpected git call: %s\n' "$*" >&2
 exit 1
 MOCK_GIT
@@ -194,6 +210,14 @@ if [[ "$*" == *'branch --show-current'* ]]; then
 fi
 if [[ "$*" == *'rev-parse --abbrev-ref @{u}'* ]]; then
   printf '%s\n' 'origin/my-branch'
+  exit 0
+fi
+if [[ "$*" == *'ls-remote --heads origin my-branch'* ]]; then
+  printf '%s\trefs/heads/my-branch\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  exit 0
+fi
+if [[ "$*" == *'rev-parse HEAD'* ]]; then
+  printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
   exit 0
 fi
 printf 'unexpected git call: %s\n' "$*" >&2
@@ -335,6 +359,14 @@ if [[ "$*" == *'rev-parse --abbrev-ref @{u}'* ]]; then
   printf '%s\n' 'origin/my-branch'
   exit 0
 fi
+if [[ "$*" == *'ls-remote --heads origin my-branch'* ]]; then
+  printf '%s\trefs/heads/my-branch\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  exit 0
+fi
+if [[ "$*" == *'rev-parse HEAD'* ]]; then
+  printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  exit 0
+fi
 printf 'unexpected git call: %s\n' "$*" >&2
 exit 1
 MOCK_GIT
@@ -431,6 +463,14 @@ if [[ "$*" == *'rev-parse --abbrev-ref @{u}'* ]]; then
   printf '%s\n' 'origin/my-branch'
   exit 0
 fi
+if [[ "$*" == *'ls-remote --heads origin my-branch'* ]]; then
+  printf '%s\trefs/heads/my-branch\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  exit 0
+fi
+if [[ "$*" == *'rev-parse HEAD'* ]]; then
+  printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  exit 0
+fi
 printf 'unexpected git call: %s\n' "$*" >&2
 exit 1
 MOCK_GIT
@@ -515,11 +555,10 @@ caller_branch="test-590-caller-branch"
   git init -q --bare "$remote_dir"
   git remote add origin "$remote_dir"
   git checkout -q -b "$caller_branch"
-  # Local-only upstream tracking (no push): satisfies git rev-parse --abbrev-ref
-  # @{u} without a real git operation against remote state (coding guideline).
-  git update-ref "refs/remotes/origin/${caller_branch}" HEAD
-  git config "branch.${caller_branch}.remote" origin
-  git config "branch.${caller_branch}.merge" "refs/heads/${caller_branch}"
+  # Push HEAD to the throwaway local bare repo so ensure_branch_is_pushed's
+  # `git ls-remote --heads origin <branch>` finds it at HEAD. This is a tmpdir
+  # bare repo, not real remote/GitHub state (coding guideline is about the latter).
+  git push -q origin "HEAD:refs/heads/${caller_branch}"
 )
 
 mock_bin="$(mktemp -d)"
@@ -569,6 +608,169 @@ else
   fail_case "expected gh pr list --head ${caller_branch}, captured: $(cat "$captured" 2>/dev/null || printf '<none>')"
 fi
 rm -rf "$tmp_repo" "$remote_dir" "$mock_bin"
+
+# ppc_push_check_case <label> <ls_remote_stdout> <ls_remote_exit> <head_sha> \
+#                     <expect_exit_zero:0|1> <needle> [upstream_configured:0|1] [pr_arg]
+# Runs post-pr-submission-checks --no-wait with a scripted `git ls-remote --heads
+# origin <branch>` result, then asserts the exit status and an output substring.
+# upstream_configured toggles whether `@{u}` resolves — the sync check must run
+# and fail on an out-of-sync remote *regardless* of local tracking config (#596).
+# pr_arg, when set, passes `--pr <n>`: the push check must then be skipped
+# entirely (the PR is identified by number; the checkout is irrelevant).
+ppc_push_check_case() {
+  local -r label="$1"
+  local -r ls_remote_stdout="$2"
+  local -r ls_remote_exit="$3"
+  local -r head_sha="$4"
+  local -r expect_exit_zero="$5"
+  local -r needle="$6"
+  local -r upstream_configured="${7:-0}"
+  local -r pr_arg="${8:-}"
+  local case_tmp case_bin case_out case_exit at_u_block
+  local -a run_args=(--no-wait)
+  [[ -n "$pr_arg" ]] && run_args+=(--pr "$pr_arg")
+
+  case_tmp="$(mktemp -d)"
+  case_bin="${case_tmp}/bin"
+  mkdir -p "$case_bin"
+
+  if [[ "$upstream_configured" == '1' ]]; then
+    at_u_block="printf '%s\\n' 'origin/my-branch'; exit 0"
+  else
+    at_u_block="printf 'fatal: no upstream configured\\n' >&2; exit 128"
+  fi
+
+  cat >"${case_bin}/git" <<MOCK_GIT
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\$*" == *'rev-parse --show-toplevel'* ]]; then
+  printf '%s\n' '/mock/repo'
+  exit 0
+fi
+if [[ "\$*" == *'branch --show-current'* ]]; then
+  printf '%s\n' 'my-branch'
+  exit 0
+fi
+if [[ "\$*" == *'rev-parse --abbrev-ref @{u}'* ]]; then
+  ${at_u_block}
+fi
+if [[ "\$*" == *'ls-remote --heads origin my-branch'* ]]; then
+  printf '%s' '${ls_remote_stdout}'
+  exit ${ls_remote_exit}
+fi
+if [[ "\$*" == *'rev-parse HEAD'* ]]; then
+  printf '%s\n' '${head_sha}'
+  exit 0
+fi
+printf 'unexpected git call: %s\n' "\$*" >&2
+exit 1
+MOCK_GIT
+  chmod +x "${case_bin}/git"
+
+  cat >"${case_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+  chmod +x "${case_bin}/jq"
+
+  cat >"${case_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'repo view'* && "$args" == *'nameWithOwner'* ]]; then
+  printf 'the-hcma/mock-repo\n'
+  exit 0
+fi
+if [[ "$args" == *'pr list'* ]]; then
+  printf '42\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json state'* ]]; then
+  printf 'OPEN\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json isDraft'* ]]; then
+  printf 'false\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json body'* ]]; then
+  printf '%s\n' $'## Summary\n- ok\n\n## Test plan\n- ok\n'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+  chmod +x "${case_bin}/gh"
+
+  set +e
+  case_out="$(PATH="${case_bin}:${PATH}" bash "$script" "${run_args[@]}" 2>&1)"
+  case_exit=$?
+  set -e
+
+  if [[ "$expect_exit_zero" == '0' ]]; then
+    assert_exit_0 "$label" "$case_out" "$case_exit"
+  else
+    assert_exit_nonzero "$label" "$case_out" "$case_exit"
+  fi
+  assert_contains "$label" "$case_out" "$needle"
+  rm -rf "$case_tmp"
+}
+
+printf '\n=== functional: branch pushed without upstream tracking (#596) ===\n'
+ppc_push_check_case 'pushed, no @{u}, remote in sync passes' \
+  $'1111111111111111111111111111111111111111\trefs/heads/my-branch\n' 0 \
+  '1111111111111111111111111111111111111111' 0 \
+  'is present on origin at HEAD' 0
+
+printf '\n=== functional: branch never pushed still fails (#596) ===\n'
+ppc_push_check_case 'no @{u}, no remote branch fails' \
+  '' 0 '1111111111111111111111111111111111111111' 1 \
+  'is not on origin' 0
+
+printf '\n=== functional: remote branch out of sync fails (#596) ===\n'
+ppc_push_check_case 'no @{u}, remote sha differs fails' \
+  $'2222222222222222222222222222222222222222\trefs/heads/my-branch\n' 0 \
+  '1111111111111111111111111111111111111111' 1 \
+  'out of sync with local HEAD' 0
+
+printf '\n=== functional: configured @{u} does not skip the remote-sync check (#596) ===\n'
+# CodeRabbit: `@{u}` proves only that a tracking ref exists, not that HEAD was
+# pushed — so a configured upstream with an out-of-sync remote tip must still fail.
+ppc_push_check_case 'configured @{u}, remote sha differs still fails' \
+  $'2222222222222222222222222222222222222222\trefs/heads/my-branch\n' 0 \
+  '1111111111111111111111111111111111111111' 1 \
+  'out of sync with local HEAD' 1
+
+printf '\n=== functional: explicit --pr skips the local push check (#596 review) ===\n'
+# mergestorm-vortex: with --pr N the PR is identified by number, so an out-of-sync
+# (or stale-main) checkout must not hard-fail before any PR state is read.
+ppc_push_check_case 'explicit --pr with out-of-sync checkout still proceeds' \
+  $'2222222222222222222222222222222222222222\trefs/heads/my-branch\n' 0 \
+  '1111111111111111111111111111111111111111' 0 \
+  'PR: #42' 1 42
+
+printf '\n=== static: push check verifies the remote tip, not just @{u} (#596) ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text
+# ensure_branch_is_pushed must sit inside the auto-discovery block (between the
+# `-z "$pr_number"` guard and the discovery call) so explicit --pr N skips it.
+# shellcheck disable=SC2016  # literal source patterns, not shell expansions
+push_check_line="$(grep -n 'ensure_branch_is_pushed "\$branch"' "$script" | head -1 | cut -d: -f1)"
+# shellcheck disable=SC2016
+guard_line="$(grep -n 'if \[\[ -z "\$pr_number" \]\]; then' "$script" | head -1 | cut -d: -f1)"
+# shellcheck disable=SC2016
+discover_line="$(grep -n 'discover_pr_number_for_branch "\$branch"' "$script" | head -1 | cut -d: -f1)"
+if grep -qF 'ls-remote --heads origin' "$script" \
+  && grep -qF 'is present on origin at HEAD' "$script" \
+  && grep -qF 'out of sync with local HEAD' "$script" \
+  && [[ -n "$push_check_line" && -n "$guard_line" && -n "$discover_line" ]] \
+  && (( guard_line < push_check_line && push_check_line < discover_line )) \
+  && ! grep -qF "rev-parse --abbrev-ref '@{u}'" "$script"; then
+  printf '[PASS] post-pr-submission-checks: HEAD-vs-origin check gated to auto-discovery, no @{u} shortcut\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] post-pr-submission-checks: push check must verify remote tip and be --pr-gated\n'
+  fail=$(( fail + 1 ))
+fi
 
 test_summary
 
