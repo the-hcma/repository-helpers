@@ -6835,13 +6835,47 @@ _gha_pick_eligible_new_ref() {
   return 1
 }
 
-# Query GitHub Actions pins and compare to eligible releases. Returns lines of:
-#   owner/repo  current_ref  new_ref
+# _gha_resolve_tag_commit_sha <action> <tag>
+# Resolves a release/tag ref to the commit SHA it points at (handles annotated
+# tag objects, which need one extra hop past .object.sha to reach the commit).
+# Prints the commit SHA, or nothing on failure. Used to keep a SHA-pinned
+# action SHA-pinned across a bump instead of degrading it to a floating tag
+# (repository-helpers#599): an immutable SHA can't be silently retargeted the
+# way a mutable tag can, which is the whole point of SHA-pinning for supply
+# chain security.
+_gha_resolve_tag_commit_sha() {
+  local -r action="$1"
+  local -r tag="$2"
+  local obj_sha obj_type
+
+  obj_sha="$(dep_runner_gh_api_jq "gha resolve tag sha ${action}@${tag}" --probe \
+    "repos/${action}/git/ref/tags/${tag}" '.object.sha // empty' 2>/dev/null || true)"
+  [[ -n "$obj_sha" ]] || return 1
+  obj_type="$(dep_runner_gh_api_jq "gha resolve tag type ${action}@${tag}" --probe \
+    "repos/${action}/git/ref/tags/${tag}" '.object.type // empty' 2>/dev/null || true)"
+
+  if [[ "$obj_type" == 'tag' ]]; then
+    obj_sha="$(dep_runner_gh_api_jq "gha annotated tag commit ${action}@${tag}" --probe \
+      "repos/${action}/git/tags/${obj_sha}" '.object.sha // empty' 2>/dev/null || true)"
+    [[ -n "$obj_sha" ]] || return 1
+  fi
+  printf '%s' "$obj_sha"
+}
+
+# Query GitHub Actions pins and compare to eligible releases. Returns
+# tab-separated lines of:
+#   owner/repo<TAB>current_ref<TAB>new_ref
+# (tab-delimited, not space-delimited: a SHA-pinned ref's current_ref/new_ref
+# below embeds a literal " # vX.Y.Z" comment, which would otherwise be
+# misparsed by callers' `IFS=' ' read -r action cur_ref new_ref` — see
+# repository-helpers#599.)
 #
 # Pin-style semantics:
-#   Major-only  (@v6)         — bump to newest eligible release semver (v6.0.2, v8.1.0, …)
-#   Full semver (@v1.7.12)    — bump to newest eligible newer release
-#   Commit SHA  (@abc123...)  — skipped (not managed here)
+#   Major-only  (@v6)               — bump to newest eligible release semver (v6.0.2, v8.1.0, …)
+#   Full semver (@v1.7.12)          — bump to newest eligible newer release
+#   Commit SHA, no version comment  — skipped (no baseline to compare against)
+#   Commit SHA + "# vX.Y.Z" comment — bump by resolving the newer eligible tag
+#                                     to ITS commit SHA, keeping the pin SHA-anchored
 #
 # Optional $1: repository root containing .github/workflows (defaults to $dir).
 #
@@ -6852,7 +6886,9 @@ gha_outdated() {
   local -r scan_root="${1:-$dir}"
   local -a action_order=()
   local -A oldest_ref_by_action=()
-  local line action ref new_ref oldest_ref sortable_ref sortable_oldest
+  local -A oldest_sha_by_action=()
+  local line action action_verbatim ref pin_comment is_sha_pin sha_candidate new_ref new_sha
+  local oldest_ref sortable_ref sortable_oldest
 
   while IFS= read -r line; do
     # Extract the value after `uses:`, strip surrounding quotes/whitespace.
@@ -6863,16 +6899,56 @@ gha_outdated() {
     [[ "$action" == ./* ]] && continue
     # Skip entries without an @ ref.
     [[ "$action" != *@* ]] && continue
+
+    # Split off a trailing YAML inline comment (e.g. "# v7.0.1") before parsing
+    # the ref. Without this, a SHA-pinned action's ref includes the comment
+    # text, which breaks the 40-hex-char SHA-pin check below and — if left in
+    # a value later used for sed find/replace — corrupts the pin
+    # (repository-helpers#599).
+    # action_verbatim keeps the untouched text (exact original whitespace) for
+    # the SHA-pin case below: it becomes the sed search key later, which must
+    # match the file byte-for-byte regardless of how many spaces the original
+    # pin used around "#" — a canonicalized/trimmed value would silently fail
+    # to match and no-op the bump (repository-helpers#599 review).
+    # Trim ALL leading/trailing whitespace (not just one space) on each side of
+    # the split for classification purposes — a pin with two-or-more spaces
+    # before "#" (or none at all) must still classify correctly; stripping
+    # only one space left a trailing space on the SHA, which failed the
+    # 40-hex check and silently fell through to the floating-ref bump path
+    # (repository-helpers#599 review).
+    action_verbatim="$action"
+    pin_comment=""
+    if [[ "$action" == *'#'* ]]; then
+      pin_comment="${action#*#}"
+      pin_comment="${pin_comment#"${pin_comment%%[![:space:]]*}"}"
+      action="${action%%#*}"
+      action="${action%"${action##*[![:space:]]}"}"
+    fi
+
     ref="${action##*@}"
     action="${action%%@*}"
-    # Skip commit-SHA pins (exactly 40 hex chars).
+    is_sha_pin=0
+    sha_candidate=""
+
     if [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
-      continue
+      # SHA-pinned. Only actionable when the comment is a bare "vX.Y.Z"-shaped
+      # version we can compare for eligibility and re-resolve to a new SHA —
+      # otherwise there is no safe baseline, so leave it untouched (matches
+      # the documented "commit-SHA pins are never touched" default).
+      if [[ ! "$pin_comment" =~ ^v?[0-9]+([.][0-9]+){0,2}$ ]]; then
+        continue
+      fi
+      is_sha_pin=1
+      sha_candidate="${action_verbatim##*@}"
+      ref="$pin_comment"
     fi
 
     if [[ -z "${oldest_ref_by_action[$action]+x}" ]]; then
       action_order+=("$action")
       oldest_ref_by_action[$action]="$ref"
+      if (( is_sha_pin )); then
+        oldest_sha_by_action[$action]="$sha_candidate"
+      fi
       continue
     fi
 
@@ -6883,6 +6959,11 @@ gha_outdated() {
       && "$(printf '%s\n%s\n' "$sortable_ref" "$sortable_oldest" | sort -V | head -1)" \
         == "$sortable_ref" ]]; then
       oldest_ref_by_action[$action]="$ref"
+      if (( is_sha_pin )); then
+        oldest_sha_by_action[$action]="$sha_candidate"
+      else
+        unset 'oldest_sha_by_action[$action]'
+      fi
     fi
   done < <(grep -rh --include='*.yml' --include='*.yaml' \
     'uses:' "${scan_root}/.github/workflows/" 2>/dev/null)
@@ -6896,7 +6977,18 @@ gha_outdated() {
       fi
       continue
     fi
-    printf '%s %s %s\n' "$action" "$oldest_ref" "$new_ref"
+
+    if [[ -n "${oldest_sha_by_action[$action]:-}" ]]; then
+      new_sha="$(_gha_resolve_tag_commit_sha "$action" "$new_ref" 2>/dev/null || true)"
+      if [[ -z "$new_sha" ]]; then
+        log "[github-actions] Could not resolve ${action}@${new_ref} to a commit SHA — skipping."
+        continue
+      fi
+      printf '%s\t%s\t%s # %s\n' \
+        "$action" "${oldest_sha_by_action[$action]}" "$new_sha" "$new_ref"
+    else
+      printf '%s\t%s\t%s\n' "$action" "$oldest_ref" "$new_ref"
+    fi
   done
 }
 
@@ -7526,7 +7618,7 @@ batch_update_all() {
   if [[ "$has_gha" == '1' && -n "$gha_lines_arg" && "$security_only" == '0' ]]; then
     local gnu_sed_bin
     gnu_sed_bin="$(tooling_prereq_gnu_sed_path)"
-    while IFS=' ' read -r action cur_ref new_ref; do
+    while IFS=$'\t' read -r action cur_ref new_ref; do
       [[ -z "$action" ]] && continue
       log "[github-actions] Batch update: ${action} ${cur_ref} → ${new_ref}"
       find "${worktree_path}/.github/workflows" -maxdepth 1 \
@@ -7651,7 +7743,7 @@ batch_update_all() {
         done <<< "$rust_lines_arg"
       fi
       if [[ "$any_gha" == '1' && -n "$gha_lines_arg" ]]; then
-        while IFS=' ' read -r action cur_ref new_ref; do
+        while IFS=$'\t' read -r action cur_ref new_ref; do
           [[ -z "$action" ]] && continue
           printf "| github-actions | \`%s\` | \`%s\` | \`%s\` | no | - |\n" "$action" "$cur_ref" "$new_ref"
         done <<< "$gha_lines_arg"
@@ -7715,7 +7807,7 @@ batch_update_all() {
         printf '## GitHub Actions updates\n\n'
         printf '| Action | From | To |\n'
         printf '|---|---|---|\n'
-        while IFS=' ' read -r action cur_ref new_ref; do
+        while IFS=$'\t' read -r action cur_ref new_ref; do
           [[ -z "$action" ]] && continue
           printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$action" "$cur_ref" "$new_ref"
         done <<< "$gha_lines_arg"
@@ -7765,7 +7857,7 @@ batch_update_all() {
     done <<< "${rust_lines_arg:-}"
   fi
   if [[ "$any_gha" == '1' ]]; then
-    while IFS=' ' read -r action cur_ref new_ref; do
+    while IFS=$'\t' read -r action cur_ref new_ref; do
       [[ -z "$action" ]] && continue
       add_summary_line "github-actions" "$action" "$cur_ref" "$new_ref" "$branch" "$pr_num" "no" "-"
     done <<< "${gha_lines_arg:-}"
@@ -8899,7 +8991,7 @@ _emit_report_json() {
     done <<< "$py_lines"
   fi
   if [[ -n "$gha_lines" ]]; then
-    while IFS=' ' read -r action cur_ref new_ref; do
+    while IFS=$'\t' read -r action cur_ref new_ref; do
       [[ -z "$action" ]] && continue
       # shellcheck disable=SC2016  # jq row accumulator uses jq variables, not shell expansion
       updates_json="$(dep_runner_jq_with_args "dep-updater report-json gha update row" "$updates_json" \
@@ -9949,7 +10041,7 @@ if [[ "$dry_run" == '1' ]]; then
     done <<< "$rust_lines"
   fi
   if [[ -n "$gha_lines" ]]; then
-    while IFS=' ' read -r action cur_ref new_ref; do
+    while IFS=$'\t' read -r action cur_ref new_ref; do
       [[ -z "$action" ]] && continue
       all_rows+=("github-actions|$action|$cur_ref|$new_ref")
     done <<< "$gha_lines"
@@ -10082,7 +10174,7 @@ if [[ "$dry_run" == '1' ]]; then
     fi
 
     if [[ -n "$gha_lines" ]]; then
-      while IFS=' ' read -r action cur_ref new_ref; do
+      while IFS=$'\t' read -r action cur_ref new_ref; do
         [[ -z "$action" ]] && continue
         local safe_gha gha_branch gha_commit
         safe_gha="$(sanitize_branch_name "$action")"
@@ -10256,7 +10348,7 @@ else
 
   # Process GitHub Actions
   if [[ -n "$gha_lines" ]]; then
-    while IFS=' ' read -r action cur_ref new_ref; do
+    while IFS=$'\t' read -r action cur_ref new_ref; do
       [[ -z "$action" ]] && continue
       gha_update_one "$action" "$cur_ref" "$new_ref"
     done <<< "$gha_lines"
