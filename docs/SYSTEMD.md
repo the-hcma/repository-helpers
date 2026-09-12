@@ -47,6 +47,18 @@ run on one designated machine even when `~/.config/systemd/user/` is on NFS.
 Re-run `setup-service` after changing the service host so installed units pick up
 fresh guard lines.
 
+### Opting out (repos with their own systemd convention)
+
+`setup-service` auto-adopts any `<repo>/etc/systemd/*.service` it finds as a generic,
+single-service, user-scope unit. A repo that manages a **different** systemd deployment
+convention using that same directory (system-scope units, its own placeholder set, a
+host-guard library, etc.) opts out simply by shipping its own executable
+`scripts/setup-service` — its presence (as a file distinct from this one) is
+self-documenting signal that the repo owns its systemd lifecycle, so
+`discover_unit_basenames` skips adoption entirely and `start-development --refresh` /
+`setup-service` become no-ops for that repo (repository-helpers#630). No new marker file
+or config key is needed.
+
 ### Service host (single-machine guard)
 
 Units are pinned with **two** `ConditionHost=` lines after `[Unit]`:
