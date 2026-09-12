@@ -690,20 +690,63 @@ assert_contains     "own setup-service opts out" "$ownsvc_output" "manages its o
 assert_not_contains "own setup-service opts out" "$ownsvc_output" "Setting up"
 
 # ---------------------------------------------------------------------------
-# Static: repo_manages_own_setup_service compares realpaths, not just
-# executable-bit presence — a repo's own scripts/setup-service that IS this
-# same file (e.g. a symlink into a repository-helpers clone) must not be
-# treated as an opt-out; only a genuinely different implementation should be.
+# Behaviour: repo_manages_own_setup_service compares file content, not path
+# identity. Two worktrees of repository-helpers itself have distinct paths
+# for scripts/setup-service but identical (committed) content; running one
+# worktree's copy with repo_dir pointing at the *other* worktree must not be
+# mistaken for a foreign implementation (repository-helpers#630 review) — a
+# path/realpath-based identity check would silently skip on-deploy,
+# lockfile-drift remediation, and the restart for that worktree's own
+# start-development --refresh.
 # ---------------------------------------------------------------------------
 
-printf '\n=== static: own-setup-service check compares realpaths ===\n'
-# shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars
-if awk '/^repo_manages_own_setup_service\(\)/,/^}/' "$script" | grep -qF 'realpath' \
-  && awk '/^repo_manages_own_setup_service\(\)/,/^}/' "$script" | grep -qF '"$own_real" != "$this_real"'; then
-  printf '[PASS] own-setup-service-realpath: compares resolved paths before opting a repo out\n'
+printf '\n=== behaviour: cross-worktree copy of this script is not an opt-out ===\n'
+tmp_worktree_a=""
+tmp_worktree_b=""
+tmp_worktree_a="$(mktemp -d)"
+tmp_worktree_b="$(mktemp -d)"
+mkdir -p "$tmp_worktree_a/scripts" "$tmp_worktree_b/scripts"
+cp "$script" "$tmp_worktree_a/scripts/setup-service"
+cp "$script" "$tmp_worktree_b/scripts/setup-service"
+chmod +x "$tmp_worktree_a/scripts/setup-service" "$tmp_worktree_b/scripts/setup-service"
+
+func_body=""
+func_body="$(awk '/^repo_manages_own_setup_service\(\)/,/^}/' "$script")"
+cross_worktree_output=""
+cross_worktree_exit=0
+cross_worktree_output="$(
+  bash -c '
+    set -euo pipefail
+    repo_dir="'"$tmp_worktree_b"'"
+    script_dir="'"$tmp_worktree_a"'/scripts"
+    '"$func_body"'
+    if repo_manages_own_setup_service; then
+      echo "OPTED_OUT"
+    else
+      echo "NOT_OPTED_OUT"
+    fi
+  '
+)" || cross_worktree_exit=$?
+rm -rf "$tmp_worktree_a" "$tmp_worktree_b"
+
+assert_exit_0   "cross-worktree copy is not an opt-out" "$cross_worktree_output" "$cross_worktree_exit"
+assert_contains "cross-worktree copy is not an opt-out" "$cross_worktree_output" "NOT_OPTED_OUT"
+
+# ---------------------------------------------------------------------------
+# Static: repo_manages_own_setup_service uses content comparison (cmp), which
+# needs no PATH-availability fallback the way realpath would (macOS's base
+# userland ships no realpath binary) and is exempt from the runner-wrapper
+# ratchet, so it cannot regress into a silent-adopt failure mode when a
+# required external tool is missing from PATH.
+# ---------------------------------------------------------------------------
+
+printf '\n=== static: own-setup-service check uses cmp, not realpath ===\n'
+if awk '/^repo_manages_own_setup_service\(\)/,/^}/' "$script" | grep -qF 'cmp -s' \
+  && ! awk '/^repo_manages_own_setup_service\(\)/,/^}/' "$script" | grep -qF 'realpath'; then
+  printf '[PASS] own-setup-service-cmp: uses cmp -s content comparison, not realpath\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] own-setup-service-realpath: expected a realpath-based inequality check\n'
+  printf '[FAIL] own-setup-service-cmp: expected a cmp -s content check with no realpath dependency\n'
   fail=$(( fail + 1 ))
 fi
 
