@@ -700,11 +700,16 @@ assert_not_contains "own setup-service opts out" "$ownsvc_output" "Setting up"
 # start-development --refresh.
 # ---------------------------------------------------------------------------
 
+runner_bootstrap="${script_dir}/../scripts/lib/runner-bootstrap"
+readonly runner_bootstrap
+
 printf '\n=== behaviour: cross-worktree copy of this script is not an opt-out ===\n'
 tmp_worktree_a=""
 tmp_worktree_b=""
+tmp_runner_root=""
 tmp_worktree_a="$(mktemp -d)"
 tmp_worktree_b="$(mktemp -d)"
+tmp_runner_root="$(mktemp -d)"
 mkdir -p "$tmp_worktree_a/scripts" "$tmp_worktree_b/scripts"
 cp "$script" "$tmp_worktree_a/scripts/setup-service"
 cp "$script" "$tmp_worktree_b/scripts/setup-service"
@@ -715,8 +720,10 @@ func_body="$(awk '/^repo_manages_own_setup_service\(\)/,/^}/' "$script")"
 cross_worktree_output=""
 cross_worktree_exit=0
 cross_worktree_output="$(
-  bash -c '
+  RUNNER_SESSION_ROOT="${tmp_runner_root}/runner-sessions" bash -c '
     set -euo pipefail
+    # shellcheck disable=SC1091  # runner-bootstrap sourced by absolute path at runtime
+    source "'"$runner_bootstrap"'"
     repo_dir="'"$tmp_worktree_b"'"
     script_dir="'"$tmp_worktree_a"'/scripts"
     '"$func_body"'
@@ -727,26 +734,90 @@ cross_worktree_output="$(
     fi
   '
 )" || cross_worktree_exit=$?
-rm -rf "$tmp_worktree_a" "$tmp_worktree_b"
+rm -rf "$tmp_worktree_a" "$tmp_worktree_b" "$tmp_runner_root"
 
 assert_exit_0   "cross-worktree copy is not an opt-out" "$cross_worktree_output" "$cross_worktree_exit"
 assert_contains "cross-worktree copy is not an opt-out" "$cross_worktree_output" "NOT_OPTED_OUT"
 
 # ---------------------------------------------------------------------------
-# Static: repo_manages_own_setup_service uses content comparison (cmp), which
-# needs no PATH-availability fallback the way realpath would (macOS's base
-# userland ships no realpath binary) and is exempt from the runner-wrapper
-# ratchet, so it cannot regress into a silent-adopt failure mode when a
-# required external tool is missing from PATH.
+# Static: repo_manages_own_setup_service uses content comparison (cmp) routed
+# through runner_exec --probe, not bare realpath. `cmp` needs no
+# PATH-availability fallback the way realpath would (macOS's base userland
+# ships no realpath binary); --probe means a non-zero "files differ" result
+# is an expected outcome, not a failure to log (runner-command-wrapper.mdc).
 # ---------------------------------------------------------------------------
 
-printf '\n=== static: own-setup-service check uses cmp, not realpath ===\n'
-if awk '/^repo_manages_own_setup_service\(\)/,/^}/' "$script" | grep -qF 'cmp -s' \
+printf '\n=== static: own-setup-service check routes cmp through runner_exec --probe ===\n'
+if awk '/^repo_manages_own_setup_service\(\)/,/^}/' "$script" | grep -qF 'runner_exec' \
+  && awk '/^repo_manages_own_setup_service\(\)/,/^}/' "$script" | grep -qF -- '--probe' \
+  && awk '/^repo_manages_own_setup_service\(\)/,/^}/' "$script" | grep -qF 'cmp -s' \
   && ! awk '/^repo_manages_own_setup_service\(\)/,/^}/' "$script" | grep -qF 'realpath'; then
-  printf '[PASS] own-setup-service-cmp: uses cmp -s content comparison, not realpath\n'
+  printf '[PASS] own-setup-service-cmp: cmp -s runs via runner_exec --probe, not bare realpath\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] own-setup-service-cmp: expected a cmp -s content check with no realpath dependency\n'
+  printf '[FAIL] own-setup-service-cmp: expected cmp -s routed through runner_exec --probe, no realpath\n'
+  fail=$(( fail + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+# Behaviour: the own-setup-service opt-out is checked ahead of the
+# GITHUB_REPO_LINT_SERVICE_UNIT wrapper override, so an opted-out repo's
+# generic-install path is unreachable even under that override
+# (CodeRabbit review on #631).
+# ---------------------------------------------------------------------------
+
+printf '\n=== behaviour: own-setup-service opt-out overrides GITHUB_REPO_LINT_SERVICE_UNIT ===\n'
+tmp_repo=""
+tmp_runner_root=""
+tmp_repo="$(mktemp -d)"
+tmp_runner_root="$(mktemp -d)"
+mkdir -p "$tmp_repo/scripts"
+cat > "$tmp_repo/scripts/setup-service" <<'EOF'
+#!/usr/bin/env bash
+# Stand-in for a repo's own, unrelated systemd deployment tool.
+echo "own setup-service ran"
+EOF
+chmod +x "$tmp_repo/scripts/setup-service"
+
+own_check_body=""
+own_check_body="$(awk '/^repo_manages_own_setup_service\(\)/,/^}/' "$script")"
+discover_body=""
+discover_body="$(awk '/^discover_unit_basenames\(\)/,/^}/' "$script")"
+lint_override_output=""
+lint_override_exit=0
+lint_override_output="$(
+  RUNNER_SESSION_ROOT="${tmp_runner_root}/runner-sessions" \
+  GITHUB_REPO_LINT_SERVICE_UNIT=github-repo-lint bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091  # runner-bootstrap sourced by absolute path at runtime
+    source "'"$runner_bootstrap"'"
+    repo_dir="'"$tmp_repo"'"
+    script_dir="'"$(dirname "$script")"'"
+    '"$own_check_body"'
+    '"$discover_body"'
+    discover_unit_basenames
+  '
+)" || lint_override_exit=$?
+rm -rf "$tmp_repo" "$tmp_runner_root"
+
+assert_exit_0       "own-setup-service opt-out beats GITHUB_REPO_LINT_SERVICE_UNIT" \
+  "$lint_override_output" "$lint_override_exit"
+assert_not_contains "own-setup-service opt-out beats GITHUB_REPO_LINT_SERVICE_UNIT" \
+  "$lint_override_output" "github-repo-lint"
+
+# ---------------------------------------------------------------------------
+# Static: discover_unit_basenames checks repo_manages_own_setup_service
+# before the GITHUB_REPO_LINT_SERVICE_UNIT override.
+# ---------------------------------------------------------------------------
+
+printf '\n=== static: own-setup-service check precedes GITHUB_REPO_LINT_SERVICE_UNIT override ===\n'
+own_check_line="$(grep -n 'if repo_manages_own_setup_service; then' "$script" | head -1 | cut -d: -f1)"
+override_line="$(grep -n 'GITHUB_REPO_LINT_SERVICE_UNIT:-' "$script" | head -1 | cut -d: -f1)"
+if [[ -n "$own_check_line" && -n "$override_line" && "$own_check_line" -lt "$override_line" ]]; then
+  printf '[PASS] discover-order: own-setup-service check precedes the github-repo-lint override\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] discover-order: own-setup-service check must precede the github-repo-lint override\n'
   fail=$(( fail + 1 ))
 fi
 
