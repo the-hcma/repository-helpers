@@ -437,6 +437,7 @@ if grep -qF 'persist-credentials: false' "$cve_template" \
   && grep -qF -- '--format=json' "$cve_template" \
   && grep -qF 'cve-check: classify-json-outcome' "$cve_template" \
   && grep -qF 'type == "object" and (.dependencies | type == "array")' "$cve_template" \
+  && grep -qF 'has("vulns") and (.vulns | type == "array")' "$cve_template" \
   && grep -qE 'uses: astral-sh/setup-uv@[0-9a-f]{40}' "$cve_template" \
   && grep -qF 'security/cve' "$cve_template" \
   && grep -qF 'gh issue' "$cve_template" \
@@ -709,6 +710,48 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$cve_shape_tmp"
+
+printf '\n=== functional: cve-check template treats renamed per-dependency vulns field as transient ===\n'
+cve_renamed_tmp="$(mktemp -d)"
+cve_renamed_funcs="${cve_renamed_tmp}/cve-funcs.bash"
+awk '
+  /^[[:space:]]*run: \|[[:space:]]*$/ {
+    in_run = 1
+    next
+  }
+  in_run {
+    if ($0 ~ /^          /) {
+      sub(/^          /, "")
+      print
+      next
+    }
+    if ($0 ~ /^[[:space:]]*$/) {
+      print ""
+      next
+    }
+    in_run = 0
+  }
+' "$cve_template" | sed '/^while (( attempt/,$d' >"$cve_renamed_funcs"
+# .dependencies is a well-formed array (passes the top-level guard above), but
+# pip-audit renamed the per-dependency vulns field — .vulns // [] in the CVE
+# filter would silently default to "no vulns", classifying real CVEs "clean".
+cat >"${cve_renamed_tmp}/audit.json" <<'AUDIT_JSON'
+{"dependencies":[{"name":"example-pkg","version":"1.0.0","vulnerabilities":[{"id":"CVE-2024-0001"}]}]}
+AUDIT_JSON
+cat >>"$cve_renamed_funcs" <<'DRIVER'
+classify_audit_json 'audit.json'
+DRIVER
+cve_renamed_output=""
+cve_renamed_output="$(cd "${cve_renamed_tmp}" && bash "$cve_renamed_funcs" 2>&1)"
+if [[ "$cve_renamed_output" == 'transient' ]]; then
+  printf '[PASS] cve-check template classifies renamed per-dependency vulns field as transient, not clean\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cve-check template classified renamed vulns field as %s (expected transient)\n' \
+    "$cve_renamed_output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$cve_renamed_tmp"
 
 printf '\n=== static: cleanup-merged-branches deletes Graphite MQ branches ===\n'
 gtmq_template="${templates_dir}/cleanup-merged-branches.yml"
@@ -2963,6 +3006,7 @@ jobs:
           numbers="$(gh issue list --json number --jq '.[].number')" || return 1
       - run: echo cve-check: classify-json-outcome
       - run: jq -e 'type == "object" and (.dependencies | type == "array")'
+      - run: jq -e 'has("vulns") and (.vulns | type == "array")'
       - run: gh issue create --label security/cve || echo 'ERROR: pip-audit found CVEs but failed to create security/cve issue'
       - run: gh issue comment || echo 'ERROR: pip-audit found CVEs but failed to comment on security/cve issue'
 CVE
