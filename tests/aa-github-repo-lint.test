@@ -436,6 +436,8 @@ if grep -qF 'persist-credentials: false' "$cve_template" \
   && grep -qF 'pip-audit --skip-editable' "$cve_template" \
   && grep -qF -- '--format=json' "$cve_template" \
   && grep -qF 'cve-check: classify-json-outcome' "$cve_template" \
+  && grep -qF 'type == "object" and (.dependencies | type == "array")' "$cve_template" \
+  && grep -qE 'uses: astral-sh/setup-uv@[0-9a-f]{40}' "$cve_template" \
   && grep -qF 'security/cve' "$cve_template" \
   && grep -qF 'gh issue' "$cve_template" \
   && grep -qF 'ERROR: pip-audit found CVEs but failed to create security/cve issue' "$cve_template" \
@@ -664,6 +666,49 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$cve_list_tmp"
+
+printf '\n=== functional: cve-check template treats unexpected JSON shape as transient, not clean ===\n'
+cve_shape_tmp="$(mktemp -d)"
+cve_shape_funcs="${cve_shape_tmp}/cve-funcs.bash"
+awk '
+  /^[[:space:]]*run: \|[[:space:]]*$/ {
+    in_run = 1
+    next
+  }
+  in_run {
+    if ($0 ~ /^          /) {
+      sub(/^          /, "")
+      print
+      next
+    }
+    if ($0 ~ /^[[:space:]]*$/) {
+      print ""
+      next
+    }
+    in_run = 0
+  }
+' "$cve_template" | sed '/^while (( attempt/,$d' >"$cve_shape_funcs"
+# pip-audit's JSON output is not a versioned contract — a well-formed but
+# unexpected top-level shape (here: an empty object, missing .dependencies)
+# must not be classified "clean" (which would silently close open
+# security/cve issues via close_resolved_cve_issues).
+cat >"${cve_shape_tmp}/audit.json" <<'AUDIT_JSON'
+{}
+AUDIT_JSON
+cat >>"$cve_shape_funcs" <<'DRIVER'
+classify_audit_json 'audit.json'
+DRIVER
+cve_shape_output=""
+cve_shape_output="$(cd "${cve_shape_tmp}" && bash "$cve_shape_funcs" 2>&1)"
+if [[ "$cve_shape_output" == 'transient' ]]; then
+  printf '[PASS] cve-check template classifies unexpected JSON shape as transient, not clean\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cve-check template classified unexpected JSON shape as %s (expected transient)\n' \
+    "$cve_shape_output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$cve_shape_tmp"
 
 printf '\n=== static: cleanup-merged-branches deletes Graphite MQ branches ===\n'
 gtmq_template="${templates_dir}/cleanup-merged-branches.yml"
@@ -2906,6 +2951,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - run: uv sync --frozen
       - run: |
           rm -f "${audit_json}"
@@ -2916,6 +2962,7 @@ jobs:
           fi
           numbers="$(gh issue list --json number --jq '.[].number')" || return 1
       - run: echo cve-check: classify-json-outcome
+      - run: jq -e 'type == "object" and (.dependencies | type == "array")'
       - run: gh issue create --label security/cve || echo 'ERROR: pip-audit found CVEs but failed to create security/cve issue'
       - run: gh issue comment || echo 'ERROR: pip-audit found CVEs but failed to comment on security/cve issue'
 CVE
