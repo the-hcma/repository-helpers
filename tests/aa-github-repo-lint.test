@@ -437,7 +437,11 @@ if grep -qF 'persist-credentials: false' "$cve_template" \
   && grep -qF -- '--format=json' "$cve_template" \
   && grep -qF 'cve-check: classify-json-outcome' "$cve_template" \
   && grep -qF 'type == "object" and (.dependencies | type == "array")' "$cve_template" \
+  && grep -qF '.dependencies | length > 0' "$cve_template" \
+  && grep -qF 'has("skip_reason")' "$cve_template" \
+  && grep -qF 'has("vulns") and (.vulns | type == "array")' "$cve_template" \
   && grep -qE 'uses: astral-sh/setup-uv@[0-9a-f]{40}' "$cve_template" \
+  && grep -qE 'uses: actions/checkout@[0-9a-f]{40}' "$cve_template" \
   && grep -qF 'security/cve' "$cve_template" \
   && grep -qF 'gh issue' "$cve_template" \
   && grep -qF 'ERROR: pip-audit found CVEs but failed to create security/cve issue' "$cve_template" \
@@ -709,6 +713,139 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$cve_shape_tmp"
+
+printf '\n=== functional: cve-check template treats renamed per-dependency vulns field as transient ===\n'
+cve_renamed_tmp="$(mktemp -d)"
+cve_renamed_funcs="${cve_renamed_tmp}/cve-funcs.bash"
+awk '
+  /^[[:space:]]*run: \|[[:space:]]*$/ {
+    in_run = 1
+    next
+  }
+  in_run {
+    if ($0 ~ /^          /) {
+      sub(/^          /, "")
+      print
+      next
+    }
+    if ($0 ~ /^[[:space:]]*$/) {
+      print ""
+      next
+    }
+    in_run = 0
+  }
+' "$cve_template" | sed '/^while (( attempt/,$d' >"$cve_renamed_funcs"
+# .dependencies is a well-formed array (passes the top-level guard above), but
+# pip-audit renamed the per-dependency vulns field — .vulns // [] in the CVE
+# filter would silently default to "no vulns", classifying real CVEs "clean".
+cat >"${cve_renamed_tmp}/audit.json" <<'AUDIT_JSON'
+{"dependencies":[{"name":"example-pkg","version":"1.0.0","vulnerabilities":[{"id":"CVE-2024-0001"}]}]}
+AUDIT_JSON
+cat >>"$cve_renamed_funcs" <<'DRIVER'
+classify_audit_json 'audit.json'
+DRIVER
+cve_renamed_output=""
+cve_renamed_output="$(cd "${cve_renamed_tmp}" && bash "$cve_renamed_funcs" 2>&1)"
+if [[ "$cve_renamed_output" == 'transient' ]]; then
+  printf '[PASS] cve-check template classifies renamed per-dependency vulns field as transient, not clean\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cve-check template classified renamed vulns field as %s (expected transient)\n' \
+    "$cve_renamed_output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$cve_renamed_tmp"
+
+printf '\n=== functional: cve-check template treats empty dependencies list as transient ===\n'
+cve_empty_tmp="$(mktemp -d)"
+cve_empty_funcs="${cve_empty_tmp}/cve-funcs.bash"
+awk '
+  /^[[:space:]]*run: \|[[:space:]]*$/ {
+    in_run = 1
+    next
+  }
+  in_run {
+    if ($0 ~ /^          /) {
+      sub(/^          /, "")
+      print
+      next
+    }
+    if ($0 ~ /^[[:space:]]*$/) {
+      print ""
+      next
+    }
+    in_run = 0
+  }
+' "$cve_template" | sed '/^while (( attempt/,$d' >"$cve_empty_funcs"
+# jq's all() over a zero-length stream is true, so {"dependencies": []} passed
+# the earlier guards and the CVE filter (length > 0) was then false — the
+# exact fall-through the guard was added to prevent. A uv+pyproject repo
+# always has real dependencies, so a truly empty scan means the environment
+# broke (failed sync, --skip-editable filtering everything), not "clean".
+cat >"${cve_empty_tmp}/audit.json" <<'AUDIT_JSON'
+{"dependencies":[]}
+AUDIT_JSON
+cat >>"$cve_empty_funcs" <<'DRIVER'
+classify_audit_json 'audit.json'
+DRIVER
+cve_empty_output=""
+cve_empty_output="$(cd "${cve_empty_tmp}" && bash "$cve_empty_funcs" 2>&1)"
+if [[ "$cve_empty_output" == 'transient' ]]; then
+  printf '[PASS] cve-check template classifies empty dependencies list as transient, not clean\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cve-check template classified empty dependencies list as %s (expected transient)\n' \
+    "$cve_empty_output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$cve_empty_tmp"
+
+printf '\n=== functional: cve-check template tolerates a real pip-audit --skip-editable shape ===\n'
+cve_skip_tmp="$(mktemp -d)"
+cve_skip_funcs="${cve_skip_tmp}/cve-funcs.bash"
+awk '
+  /^[[:space:]]*run: \|[[:space:]]*$/ {
+    in_run = 1
+    next
+  }
+  in_run {
+    if ($0 ~ /^          /) {
+      sub(/^          /, "")
+      print
+      next
+    }
+    if ($0 ~ /^[[:space:]]*$/) {
+      print ""
+      next
+    }
+    in_run = 0
+  }
+' "$cve_template" | sed '/^while (( attempt/,$d' >"$cve_skip_funcs"
+# pip-audit --skip-editable still reports the project's own editable install
+# in .dependencies[], with no vulns key at all — e.g.
+# {"name":"home-warden","skip_reason":"distribution marked as editable"}
+# (verified against a real `pip-audit --skip-editable --format=json` run on a
+# uv project). The has("vulns") guard added above must not treat this
+# skip_reason shape as a tool error, or every real CVE-check run would
+# classify transient and fail after 3 retries — a regression caught by
+# review before this landed (repository-helpers#636).
+cat >"${cve_skip_tmp}/audit.json" <<'AUDIT_JSON'
+{"dependencies":[{"name":"home-warden","skip_reason":"distribution marked as editable"},{"name":"example-pkg","version":"1.0.0","vulns":[]}]}
+AUDIT_JSON
+cat >>"$cve_skip_funcs" <<'DRIVER'
+classify_audit_json 'audit.json'
+DRIVER
+cve_skip_output=""
+cve_skip_output="$(cd "${cve_skip_tmp}" && bash "$cve_skip_funcs" 2>&1)"
+if [[ "$cve_skip_output" == 'clean' ]]; then
+  printf '[PASS] cve-check template tolerates a real pip-audit --skip-editable shape\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cve-check template rejected a real pip-audit --skip-editable shape as %s (expected clean)\n' \
+    "$cve_skip_output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$cve_skip_tmp"
 
 printf '\n=== static: cleanup-merged-branches deletes Graphite MQ branches ===\n'
 gtmq_template="${templates_dir}/cleanup-merged-branches.yml"
@@ -2948,7 +3085,7 @@ jobs:
   cve:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
@@ -2963,6 +3100,9 @@ jobs:
           numbers="$(gh issue list --json number --jq '.[].number')" || return 1
       - run: echo cve-check: classify-json-outcome
       - run: jq -e 'type == "object" and (.dependencies | type == "array")'
+      - run: jq -e '.dependencies | length > 0'
+      - run: jq -e 'has("skip_reason")'
+      - run: jq -e 'has("vulns") and (.vulns | type == "array")'
       - run: gh issue create --label security/cve || echo 'ERROR: pip-audit found CVEs but failed to create security/cve issue'
       - run: gh issue comment || echo 'ERROR: pip-audit found CVEs but failed to comment on security/cve issue'
 CVE
