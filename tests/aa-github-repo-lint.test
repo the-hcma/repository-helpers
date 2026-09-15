@@ -438,6 +438,7 @@ if grep -qF 'persist-credentials: false' "$cve_template" \
   && grep -qF 'cve-check: classify-json-outcome' "$cve_template" \
   && grep -qF 'type == "object" and (.dependencies | type == "array")' "$cve_template" \
   && grep -qF '.dependencies | length > 0' "$cve_template" \
+  && grep -qF 'has("skip_reason")' "$cve_template" \
   && grep -qF 'has("vulns") and (.vulns | type == "array")' "$cve_template" \
   && grep -qE 'uses: astral-sh/setup-uv@[0-9a-f]{40}' "$cve_template" \
   && grep -qE 'uses: actions/checkout@[0-9a-f]{40}' "$cve_template" \
@@ -798,6 +799,53 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$cve_empty_tmp"
+
+printf '\n=== functional: cve-check template tolerates a real pip-audit --skip-editable shape ===\n'
+cve_skip_tmp="$(mktemp -d)"
+cve_skip_funcs="${cve_skip_tmp}/cve-funcs.bash"
+awk '
+  /^[[:space:]]*run: \|[[:space:]]*$/ {
+    in_run = 1
+    next
+  }
+  in_run {
+    if ($0 ~ /^          /) {
+      sub(/^          /, "")
+      print
+      next
+    }
+    if ($0 ~ /^[[:space:]]*$/) {
+      print ""
+      next
+    }
+    in_run = 0
+  }
+' "$cve_template" | sed '/^while (( attempt/,$d' >"$cve_skip_funcs"
+# pip-audit --skip-editable still reports the project's own editable install
+# in .dependencies[], with no vulns key at all — e.g.
+# {"name":"home-warden","skip_reason":"distribution marked as editable"}
+# (verified against a real `pip-audit --skip-editable --format=json` run on a
+# uv project). The has("vulns") guard added above must not treat this
+# skip_reason shape as a tool error, or every real CVE-check run would
+# classify transient and fail after 3 retries — a regression caught by
+# review before this landed (repository-helpers#636).
+cat >"${cve_skip_tmp}/audit.json" <<'AUDIT_JSON'
+{"dependencies":[{"name":"home-warden","skip_reason":"distribution marked as editable"},{"name":"example-pkg","version":"1.0.0","vulns":[]}]}
+AUDIT_JSON
+cat >>"$cve_skip_funcs" <<'DRIVER'
+classify_audit_json 'audit.json'
+DRIVER
+cve_skip_output=""
+cve_skip_output="$(cd "${cve_skip_tmp}" && bash "$cve_skip_funcs" 2>&1)"
+if [[ "$cve_skip_output" == 'clean' ]]; then
+  printf '[PASS] cve-check template tolerates a real pip-audit --skip-editable shape\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cve-check template rejected a real pip-audit --skip-editable shape as %s (expected clean)\n' \
+    "$cve_skip_output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$cve_skip_tmp"
 
 printf '\n=== static: cleanup-merged-branches deletes Graphite MQ branches ===\n'
 gtmq_template="${templates_dir}/cleanup-merged-branches.yml"
@@ -3053,6 +3101,7 @@ jobs:
       - run: echo cve-check: classify-json-outcome
       - run: jq -e 'type == "object" and (.dependencies | type == "array")'
       - run: jq -e '.dependencies | length > 0'
+      - run: jq -e 'has("skip_reason")'
       - run: jq -e 'has("vulns") and (.vulns | type == "array")'
       - run: gh issue create --label security/cve || echo 'ERROR: pip-audit found CVEs but failed to create security/cve issue'
       - run: gh issue comment || echo 'ERROR: pip-audit found CVEs but failed to comment on security/cve issue'
