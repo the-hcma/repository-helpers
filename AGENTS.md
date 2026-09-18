@@ -495,10 +495,12 @@ worktree's code — this is the primary mechanism for testing feature branches l
 
 **Opt-out:** a repo that manages its own systemd deployment convention (its own
 placeholder set, system-scope units, a host-guard library, etc.) opts out of this
-generic adoption simply by shipping its own executable `scripts/setup-service` —
-`discover_unit_basenames` treats that as self-documenting signal and skips adoption
-entirely, even if the repo also has `etc/systemd/*.service` files for its own
-convention. See [docs/SYSTEMD.md](docs/SYSTEMD.md#opting-out-repos-with-their-own-systemd-convention).
+generic adoption by shipping an executable `scripts/setup-service` whose content
+differs from this repo's generic helper (`cmp -s`; a byte-identical copy is not
+an opt-out) — `discover_unit_basenames` treats that as self-documenting signal and
+skips adoption entirely, even if the repo also has `etc/systemd/*.service` files
+for its own convention. See
+[docs/SYSTEMD.md](docs/SYSTEMD.md#opting-out-repos-with-their-own-systemd-convention).
 
 - **`DEPLOYED_COMMIT`:** `setup-service` injects `Environment=DEPLOYED_COMMIT=<HEAD>` into the generated systemd unit (no template change required). The running commit is read from the service process environment, not `git HEAD` at the process cwd. If `DEPLOYED_COMMIT` is missing on the running process, missing from the installed unit, or differs from the current checkout, treat the deploy as stale: run `on-deploy` and restart conservatively.
 - **Service name** is derived from the git remote URL (not the directory name), so it is stable across all worktrees.

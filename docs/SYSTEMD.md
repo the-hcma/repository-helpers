@@ -52,12 +52,13 @@ fresh guard lines.
 `setup-service` auto-adopts any `<repo>/etc/systemd/*.service` it finds as a generic,
 single-service, user-scope unit. A repo that manages a **different** systemd deployment
 convention using that same directory (system-scope units, its own placeholder set, a
-host-guard library, etc.) opts out simply by shipping its own executable
-`scripts/setup-service` — its presence (as a file distinct from this one) is
-self-documenting signal that the repo owns its systemd lifecycle, so
-`discover_unit_basenames` skips adoption entirely and `start-development --refresh` /
-`setup-service` become no-ops for that repo (repository-helpers#630). No new marker file
-or config key is needed.
+host-guard library, etc.) opts out by shipping its own executable
+`scripts/setup-service` whose **content differs** from this generic helper
+(`cmp -s` — a byte-identical copy, such as another worktree of repository-helpers,
+is not an opt-out). Differing content is self-documenting signal that the repo owns
+its systemd lifecycle, so `discover_unit_basenames` skips adoption entirely and
+`start-development --refresh` / `setup-service` become no-ops for that repo
+(repository-helpers#630). No new marker file or config key is needed.
 
 ### Service host (single-machine guard)
 
@@ -313,8 +314,16 @@ local clones for workflow candidate stacks; it does not gate the daily audit.
 ```
 
 The wrapper uses `setup-service` with the `github-repo-lint` unit
-template. It does not run from `scripts/dev/start-development`; installation is
-explicit.
+template (`GITHUB_REPO_LINT_SERVICE_UNIT=github-repo-lint`). It does not run from
+`scripts/dev/start-development`; installation is explicit.
+
+That override only selects which unit basename to install for **this** repo's
+generic path: the content-diff opt-out is evaluated **before**
+`GITHUB_REPO_LINT_SERVICE_UNIT` is read. A consumer checkout whose
+`scripts/setup-service` differs from this helper still opts out of generic
+adoption entirely (see **Opting out** above) —
+`setup-github-repo-lint` / `GITHUB_REPO_LINT_SERVICE_UNIT` cannot force-install
+user-scope copies of a foreign convention (repository-helpers#630 / #632).
 
 The service unit has **no `[Install]` section** — only `github-repo-lint.timer`
 starts it (`OnCalendar=04:00`). Re-run `./scripts/setup-github-repo-lint` after
