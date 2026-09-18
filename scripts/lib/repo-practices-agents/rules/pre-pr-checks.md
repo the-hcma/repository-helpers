@@ -23,8 +23,9 @@ Before submitting a PR:
 1. Run **`"${rh}/scripts/dev/pre-pr-checks"`** from this repo's feature worktree
    (must exit 0), then submit from the same worktree with the marker-aware bare
    command: **`gh stack submit --auto`** when `.github/stacking-tool` is
-   `gh-stack`, or **`gt submit --publish --no-interactive`** when it is
-   `graphite`. Do **not** use `"${rh}/scripts/dev/submit-stack"` from here.
+   `gh-stack`. When the marker is `graphite`, follow `.agents/rules/stacking-tool.md`
+   / the Graphite skill (do not paste a Graphite-only submit into this rule).
+   Do **not** use `"${rh}/scripts/dev/submit-stack"` from here.
 
 2. Do **not** submit if pre-pr-checks failed or was skipped. A skipped job is
    allowed **only** when the user has approved it for this PR: pass

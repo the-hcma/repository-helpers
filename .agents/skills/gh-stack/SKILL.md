@@ -54,8 +54,10 @@ When switching a consumer repo to `gh-stack` via `.github/stacking-tool`:
 
 1. Update `AGENTS.md` stacking/merge docs (`gh stack` + `gh pr merge --auto --squash`; no `merge-it`).
 2. Align `.agents/rules/pr-ship-and-review.md` submit block with the marker-aware template
-   in repository-helpers `scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md`
-   (plus thin `.cursor/rules/pr-ship-and-review.mdc` shim).
+   (copy via `github-repo-lint --apply-fix`, or from
+   `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md`
+   / https://github.com/the-hcma/repository-helpers/blob/main/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md;
+   plus thin `.cursor/rules/pr-ship-and-review.mdc` shim).
 3. Delete root `GRAPHITE.md` (this skill is SSOT).
 4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) in sync with the consumer template.
 5. Run `scripts/github-repo-lint --repo OWNER/NAME --suggest --strict-onboarding`.

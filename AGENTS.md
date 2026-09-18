@@ -256,13 +256,16 @@ When flipping `.github/stacking-tool` (or landing an MQ / `gh-stack` cutover PR)
 1. Update `AGENTS.md` stacking and merge guidance to match the marker (GitHub auto-merge:
    `gh pr merge --auto --squash` — not `merge-it`).
 2. Rewrite `.agents/rules/pr-ship-and-review.md` submit block to the marker-aware template
-   in `scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md` (or document both
-   backends gated on the marker — never leave a Graphite-only `gt create` / `gt submit`
-   snippet when the marker is `gh-stack`; keep a thin `.cursor/rules/pr-ship-and-review.mdc`
-   shim).
+   (copy via `github-repo-lint --apply-fix`, or from
+   `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md`
+   / https://github.com/the-hcma/repository-helpers/blob/main/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md;
+   or document both backends gated on the marker — never leave a Graphite-only
+   `gt create` / `gt submit` snippet when the marker is `gh-stack`; keep a thin
+   `.cursor/rules/pr-ship-and-review.mdc` shim).
 3. Delete root `GRAPHITE.md` when switching to `gh-stack` (canonical skills live here).
 4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) aligned with
-   `scripts/lib/repo-practices-agents/rules/stacking-tool.md`.
+   `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/stacking-tool.md`
+   (same blob URL under `repository-helpers` `main`).
 5. Run `scripts/github-repo-lint --repo OWNER/NAME --suggest --strict-onboarding` and clear
    stacking-docs consistency findings (`--apply-fix` can rewrite pr-ship; AGENTS /
    `GRAPHITE.md` are usually human-driven).

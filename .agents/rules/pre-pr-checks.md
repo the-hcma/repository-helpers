@@ -8,9 +8,8 @@ alwaysApply: true
 Before **`scripts/dev/submit-stack`** or opening a PR in this repository:
 
 1. Run **`scripts/dev/pre-pr-checks`** from the feature worktree (must exit 0).
-   - Prefer **`scripts/dev/submit-stack`** (marker-aware; runs checks, then
-     `gh stack submit` / `gt submit` per `.github/stacking-tool`) instead of a bare
-     submit command alone.
+   - Prefer **`scripts/dev/submit-stack`** (marker-aware submit via
+     `.github/stacking-tool`) instead of a bare submit command alone.
 
 2. Do **not** submit if pre-pr-checks failed or was skipped (including missing `shellcheck`,
    `rg`, failing `tests/*.test`, or a failing **secret-scan** when that job is planned).

@@ -94,10 +94,14 @@ scripts/wait-for-agent-review complete --pr <number>   # when complete_ready
 
 Until merge-ready:
 
-1. Triage agent / Bugbot comments — fix valid issues, push with `gt modify`.
+1. Triage agent / Bugbot comments — fix valid issues, then push (`git commit` +
+   `gh stack submit --auto` when the marker is `gh-stack`, or `gt modify` when it is
+   `graphite`).
 2. Re-run `scripts/dev/pre-pr-checks` after fixes.
 3. Re-run `scripts/dev/post-pr-submission-checks --pr <number>` and fix any CI failures surfaced in the agent log report.
-4. Resolve merge conflicts if base moved (`gt sync` / `gt restack` or `scripts/wait-for-agent-review restack`).
+4. Resolve merge conflicts if base moved (`gh stack rebase` / `gh stack sync` when
+   `gh-stack`; `gt sync` / `gt restack` when `graphite`; or
+   `scripts/wait-for-agent-review restack`).
 
 Do not merge manually; org default is GitHub merge queue (Enable auto-merge /
 `gh pr merge --auto --squash`). Do not use `merge-it` to land PRs.
