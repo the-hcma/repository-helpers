@@ -1,0 +1,127 @@
+---
+description: Pilot-then-org rollout for new org-enforced agent rules/skills
+globs:
+  - .agents/rules/**
+  - .agents/skills/**
+  - .cursor/rules/**
+  - scripts/lib/repo-practices
+  - scripts/lib/repo-practices-agents/**
+  - scripts/lib/repo-practices-cursor/**
+alwaysApply: false
+---
+
+# Org cursor-rule rollout (repository-helpers)
+
+**Layout (repository-helpers#637):** canonical rule bodies live under
+`.agents/rules/*.md`. `.cursor/rules/*.mdc` are thin Cursor injection shims
+(frontmatter + pointer). Skills live under `.agents/skills/<name>/SKILL.md` only
+(no `.cursor/skills/` — Cursor loads `.agents/skills/` directly).
+
+When you add or tighten an **org-enforced** Cursor rule in `scripts/lib/repo-practices`
+(`rp_check_*` + template under `scripts/lib/repo-practices-cursor/` + tests in
+`tests/aa-github-repo-lint.test`), the nightly `github-repo-lint --enforcer` run and
+org-wide audits will fail consumers that lack a valid rule — unless the check uses a
+**SUGGEST-during-roll-out** ratchet (see below).
+
+The same process applies to a new **non-cursor-rule** enforced check that expects
+files in every consumer (e.g. `agent-bootstrap`: `CLAUDE.md` / `.github/copilot-instructions.md`
+shims, templates under `scripts/lib/repo-practices-agents/`) — land helpers with the
+ratchet, pilot one consumer, roll org-wide, merge helpers last.
+
+A **breadcrumb-only** rule (consumer copy is a thin pointer + canonical URL, not a
+copied body — `stacking-tool`, `github-api-throttle`) follows the same process; the
+`rp_*_is_valid` consumer branch checks for the breadcrumb URL, not the full text.
+
+## Operator / agent process (required)
+
+Drive rollout in this order. Do **not** fire-and-forget org-wide PRs.
+
+### 1. Land in repository-helpers first
+
+Open/land work in a **repository-helpers** PR (template + `rp_check_*` + tests +
+dogfood under `.agents/rules/` + `.cursor/rules/` shims). Drive that PR through **agent review**
+(`scripts/dev/ship-and-review` / `scripts/wait-for-agent-review`) until agent-clear.
+
+**Merge sequencing caution:** do **not** merge enforcement that would fail the org
+enforcer until the pilot path is ready. Prefer one of:
+
+- Merge helpers **after** the pilot consumer is green, **or**
+- Merge helpers with **SUGGEST-only missing** under `--strict-onboarding` during
+  roll-out (same ratchet as `no-secret-exposure` / `pre-pr-checks`: missing FAILS
+  `--new-repo` only; invalid FAILS `--new-repo` and `--strict-onboarding`).
+
+### 2. Pilot ONE other active org repo
+
+Pick one active consumer (for a rule already present there, verify lint passes /
+sync if stale; otherwise open an adoption PR). Drive that PR through **full agent
+review to merge** — not draft-and-abandon.
+
+### 3. Iterate pilot + helpers in lockstep
+
+If pilot (or helpers) review finds a substantive problem in the template,
+`rp_check_*`, or the validator → fix in **repository-helpers**, re-ship the
+helpers PR, and re-run agent review on **both** PRs. The pilot and helpers PRs
+must be **agent-accepted at their current heads at the same time** — a stale
+approval on an earlier head does not count. Re-pilot until both are stable.
+
+**Acceptance gate (every PR in this rollout).** Not merely CI green: the
+configured review agent (MergeStorm `mergestorm-vortex` on this org) must post an
+**Approve** on the **current** head, every review thread must have a human/agent
+reply before `resolve-thread`, and `scripts/wait-for-agent-review check` must
+report `complete_ready: true`.
+
+### 4. Org-wide propagation (only after pilot + helpers are accepted)
+
+1. Queue an adoption PR for **every** remaining active consumer:
+
+   ```bash
+   org="$(git remote get-url origin | sed -E 's#.*github.com[:/]([^/]+)/.*#\1#')"
+   scripts/github-repo-lint --org "$org" --all --strict-onboarding --apply-fix --compact
+   ```
+
+   - Cursor-rule and `.github/stacking-tool` fixes can land via the GitHub Contents API
+     when no local consumer clone exists.
+   - Workflow stacks still need a local clone under `GITHUB_REPO_LINT_SCAN_ROOT`
+     (default: parent of repository-helpers) or run `--apply-fix` from each target repo.
+   - Tailor the copied template to each repo's real remote surface (shared HTTP
+     client, config knob, default timeout). A too-generic copy still passes the
+     validator but is weaker guidance — see `blumkin` for a product-specific copy.
+
+2. Drive **each** consumer PR to the acceptance gate above (not fire-and-forget),
+   then enable auto-merge (`gh pr merge --auto --squash` — never `merge-it`).
+
+3. **Merge order.** All consumer PRs land **first**. Merge the repository-helpers
+   enforcement PR **last**, once every consumer — the pilot included, plus any repo
+   that already carried the rule (re-verify it still validates) — is merged. This
+   keeps the nightly `github-repo-lint --enforcer` green at every step.
+
+### 5. Checklist (every new enforced rule)
+
+- [ ] Canonical template in `scripts/lib/repo-practices-agents/rules/<name>.md` + shim in `scripts/lib/repo-practices-cursor/<name>.mdc`
+- [ ] `rp_check_*` + `rp_*_is_valid` + `--apply-fix` queue wiring in `scripts/lib/repo-practices`
+- [ ] Tests in `tests/aa-github-repo-lint.test` (static + functional)
+- [ ] Local copies in `.agents/rules/` + `.cursor/rules/` shim when this repo should dogfood the rule
+- [ ] Pilot consumer + helpers agent-accepted in lockstep (step 3) before org-wide
+- [ ] Every consumer PR agent-accepted + auto-merged before the helpers PR
+- [ ] Helpers PR merged **last** (step 4)
+- [ ] CI: when the helpers PR touches `.cursor/rules/**` / `repo-practices*`,
+  environment `github-repo-lint` may WAIT — approve on the operator's behalf
+  (`scripts/dev/approve-pending-deployments --pr <n>`; `gh` is the operator)
+
+## Before merge (PR test plan)
+
+1. **Confirm the check is intentional** — optional docs-only rules (e.g. lexicographic
+   guidance copied manually) do not belong in `repo-practices` unless you intend to
+   enforce them org-wide.
+
+2. **Note pilot + rollout status** — which consumer was piloted, whether helpers
+   used SUGGEST-during-roll-out, and whether org-wide PRs are open / deferred.
+
+3. **CI** — `.github/workflows/github-repo-lint.yml` runs the full
+   `--all --strict-onboarding --compact` org audit only when the PR changes
+   `.cursor/rules/**`, `.github/workflows/github-repo-lint.yml`,
+   `scripts/github-repo-lint`, `scripts/lib/repo-practices-cursor/**`, or
+   `scripts/lib/repo-practices`. Unrelated PRs skip the workflow. When it does run,
+   approve environment `github-repo-lint` on the operator's behalf to unlock
+   `REPO_LINT_TOKEN`. With SUGGEST-during-roll-out missing rules, the audit can
+   stay green while consumers adopt; invalid rules still fail.

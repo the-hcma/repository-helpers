@@ -2,9 +2,9 @@
 
 > Full coding standards, conventions, and CI requirements are in [AGENTS.md](../AGENTS.md).
 > Stacking tool: [`.cursor/rules/stacking-tool.mdc`](../.cursor/rules/stacking-tool.mdc) (read `.github/stacking-tool`).
-> Graphite skill: [`.cursor/skills/graphite/SKILL.md`](../.cursor/skills/graphite/SKILL.md).
-> gh-stack skill: [`.cursor/skills/gh-stack/SKILL.md`](../.cursor/skills/gh-stack/SKILL.md).
-> PR ship and agent review loop: [`.cursor/skills/ship-and-review/SKILL.md`](../.cursor/skills/ship-and-review/SKILL.md)
+> Graphite skill: [`.agents/skills/graphite/SKILL.md`](../.agents/skills/graphite/SKILL.md).
+> gh-stack skill: [`.agents/skills/gh-stack/SKILL.md`](../.agents/skills/gh-stack/SKILL.md).
+> PR ship and agent review loop: [`.agents/skills/ship-and-review/SKILL.md`](../.agents/skills/ship-and-review/SKILL.md)
 > (thin contract: [`.cursor/rules/pr-ship-and-review.mdc`](../.cursor/rules/pr-ship-and-review.mdc)).
 
 ## Starting New Work
@@ -53,6 +53,6 @@ scripts/wait-for-agent-review loop --pr <n>    # when CI is green
 
 After every later push, re-run `scripts/dev/post-pr-submission-checks --pr <n>` before agent review.
 
-Read **`.cursor/skills/ship-and-review/SKILL.md`** before the agent review loop. The loop uses
+Read **`.agents/skills/ship-and-review/SKILL.md`** before the agent review loop. The loop uses
 **early-complete** when nothing is outstanding and a **12h** PR non-convergence cap. Reply
 on-thread before resolving agent threads (exit **3** if missing). See `etc/agent-review.env.example`.

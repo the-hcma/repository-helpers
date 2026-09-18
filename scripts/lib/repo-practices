@@ -240,15 +240,10 @@ Audits GitHub conventions for org repositories:
     - top-level license file
     - copyright notice
     - CODEOWNERS with a repository-wide owner rule
-    - .cursor/rules/git-commit-identity.mdc (no agent/machine co-authors; signing incl. pinentry/passphrase + cli-config checks)
-    - .cursor/rules/no-secret-exposure.mdc (never leak secrets into logs/PRs/commits; allowlist/existence inspection)
-    - .cursor/rules/pr-ship-and-review.mdc (canonical agent review loop)
-    - .cursor/rules/pre-pr-checks.mdc (format before check; no truncated output)
-    - .cursor/rules/read-agents-and-rules.mdc (session-start: read AGENTS.md + rules)
-    - .cursor/rules/repo-practices-after-config-change.mdc (run github-repo-lint after config/workflow edits)
+    - .agents/rules/*.md + .cursor/rules/*.mdc shims (git-commit-identity, no-secret-exposure, pr-ship, pre-pr-checks, read-agents-and-rules, remote-timeouts-retries, repo-practices-after-config-change, github-api-throttle, stacking-tool)
     - agent-bootstrap: AGENTS.md at repo root + CLAUDE.md (@AGENTS.md import or symlink) + .github/copilot-instructions.md shim
-    - .gitignore must not ignore .cursor/rules/ or the agent-bootstrap shims (org config must be trackable)
-    - .github/stacking-tool (graphite|gh-stack) + stacking-tool cursor rule
+    - .gitignore must not ignore .cursor/rules/, .agents/rules/, .agents/skills/, or the agent-bootstrap shims
+    - .github/stacking-tool (graphite|gh-stack) + stacking-tool agents rule + Cursor shim
     - stacking docs consistency (AGENTS.md / pr-ship / GRAPHITE.md vs marker)
     - secret-audit intake: host-local ledger entry after a clean TruffleHog deep scan (see docs/secret-audit-trufflehog.md)
 
@@ -894,12 +889,230 @@ rp_codeowners_has_global_owner_rule() {
   grep -Eq '^[[:space:]]*\*[[:space:]]+@[-A-Za-z0-9_]+' <<<"$text"
 }
 
+
+# Dual-path org rules: canonical `.agents/rules/<name>.md` + Cursor shim
+# `.cursor/rules/<name>.mdc` (repository-helpers#637 option B).
+
+rp_agents_rule_canonical_relpath() {
+  printf '.agents/rules/%s.md' "$1"
+}
+
+rp_agents_rule_shim_relpath() {
+  printf '.cursor/rules/%s.mdc' "$1"
+}
+
+# True when shim text is a Cursor injection shim for NAME (frontmatter +
+# agents-rule-shim marker + `.agents/rules/NAME.md` pointer).
+rp_cursor_rule_shim_is_valid() {
+  local -r text="$1"
+  local -r name="$2"
+
+  if ! grep -qE '^alwaysApply:[[:space:]]*(true|false)([[:space:]]|$)' <<<"$text" \
+    && ! grep -qE '^globs:' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qF "<!-- agents-rule-shim: ${name} -->" <<<"$text"; then
+    return 1
+  fi
+  grep -qF ".agents/rules/${name}.md" <<<"$text"
+}
+
+# True when text looks like a pre-#637 full-body `.mdc` (frontmatter present,
+# no agents-rule-shim marker, markdown H1 in the body).
+rp_cursor_rule_looks_like_legacy_full_body() {
+  local -r text="$1"
+
+  if grep -qF '<!-- agents-rule-shim:' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qE '^alwaysApply:[[:space:]]*(true|false)([[:space:]]|$)' <<<"$text" \
+    && ! grep -qE '^globs:' <<<"$text"; then
+    return 1
+  fi
+  grep -qE '^#[[:space:]]+' <<<"$text"
+}
+
+# Prefer local dogfood for this-repo; else GitHub Contents.
+# Namerefs: text_var, ec_var (0=ok/non-empty, 1=missing, 2=API error).
+rp_fetch_org_rule_text() {
+  local slug="$1"
+  local path="$2"
+  local label="$3"
+  local -n _rp_fetch_text="$4"
+  local -n _rp_fetch_ec="$5"
+  local repo_dir local_path
+
+  _rp_fetch_text=''
+  _rp_fetch_ec=0
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${path}"
+      if [[ -f "$local_path" ]]; then
+        _rp_fetch_text="$(rp_runner_exec_stdout "repo-practices cat local ${label}" -- \
+          cat "$local_path")"
+        return 0
+      fi
+    fi
+  fi
+  _rp_fetch_text="$(rp_fetch_github_text_file "$slug" "$path")" || _rp_fetch_ec=$?
+  return 0
+}
+
+# Queue both canonical agents rule and Cursor shim for --apply-fix.
+rp_queue_org_agents_rule_pair() {
+  local slug="$1"
+  local agents_path="$2"
+  local shim_path="$3"
+  local agents_content="$4"
+  local shim_content="$5"
+  local branch_suffix="$6"
+  local message="$7"
+
+  rp_queue_candidate_file_fix "$slug" "$agents_path" "$agents_content" \
+    "${branch_suffix}-agents" "$message"
+  rp_queue_candidate_file_fix "$slug" "$shim_path" "$shim_content" \
+    "${branch_suffix}-shim" "$message"
+}
+
+# Dual-path outcome for one org rule (repository-helpers#637).
+# Exit status is repo_fail (0 or 1). soft_api_error=1 skips routine API failures.
+#
+# content_fn / shim_content_fn are function names invoked as: fn "$slug"
+rp_org_agents_rule_dual_path_outcome() {
+  local slug="$1"
+  local name="$2"
+  local agents_path="$3"
+  local shim_path="$4"
+  local agents_text="$5"
+  local shim_text="$6"
+  local agents_ec="$7"
+  local shim_ec="$8"
+  local agents_ok="$9"
+  local soft_api_error="${10}"
+  local invalid_msg="${11}"
+  local content_fn="${12}"
+  local shim_content_fn="${13}"
+  local branch_base="${14}"
+  local commit_subject="${15}"
+  local repo_fail=0
+  local legacy=0
+  local shim_ok=0
+  local agents_content shim_content
+
+  if (( agents_ec == 2 || shim_ec == 2 )); then
+    if [[ "$soft_api_error" -eq 1 ]]; then
+      if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+        rp_log_gh_api_fail "$slug" "could not read ${agents_path} or ${shim_path}"
+        return 1
+      fi
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest "${slug}: retry ${name} rule check after GitHub API recovers"
+      else
+        rp_log_warn \
+          "${slug}: could not read ${name} rule paths (GitHub API error); skipping check"
+      fi
+      return 0
+    fi
+    rp_log_gh_api_fail "$slug" "could not read ${agents_path} or ${shim_path}"
+    return 1
+  fi
+
+  if [[ -n "$shim_text" ]] && rp_cursor_rule_looks_like_legacy_full_body "$shim_text"; then
+    legacy=1
+  fi
+  if [[ -n "$shim_text" ]] && rp_cursor_rule_shim_is_valid "$shim_text" "$name"; then
+    shim_ok=1
+  fi
+
+  if [[ -z "$agents_text" ]]; then
+    if [[ "$legacy" -eq 1 ]]; then
+      # SUGGEST-during-rollout: do not fail --strict-onboarding for legacy mdc.
+      if [[ "$rp_new_repo" -eq 1 ]]; then
+        repo_fail=1
+        rp_log_check_fail "$slug" \
+          "${name} agents rule (.agents/rules/${name}.md) — migrate from legacy .mdc" \
+          "$(rp_github_url "$slug" "/new/main/${agents_path}")"
+      fi
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: migrate ${shim_path} full body to ${agents_path} + thin Cursor shim (repository-helpers#637)"
+      fi
+    else
+      if [[ "$rp_new_repo" -eq 1 ]]; then
+        repo_fail=1
+        rp_log_check_fail "$slug" \
+          "${name} agents rule (.agents/rules/${name}.md)" \
+          "$(rp_github_url "$slug" "/new/main/${agents_path}")"
+      fi
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: add ${agents_path} + ${shim_path} (templates: scripts/lib/repo-practices-agents/rules/ + repo-practices-cursor/)"
+      fi
+    fi
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      agents_content="$("$content_fn" "$slug")"
+      shim_content="$("$shim_content_fn" "$slug")"
+      rp_queue_org_agents_rule_pair "$slug" "$agents_path" "$shim_path" \
+        "$agents_content" "$shim_content" \
+        "add-${branch_base}" "chore: add ${commit_subject}"
+    fi
+    return "$repo_fail"
+  fi
+
+  if [[ "$agents_ok" -ne 1 ]]; then
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" "$invalid_msg" \
+        "$(rp_github_url "$slug" "/blob/main/${agents_path}")"
+    fi
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      agents_content="$("$content_fn" "$slug")"
+      shim_content="$("$shim_content_fn" "$slug")"
+      rp_queue_org_agents_rule_pair "$slug" "$agents_path" "$shim_path" \
+        "$agents_content" "$shim_content" \
+        "sync-${branch_base}" "chore: sync ${commit_subject}"
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: sync ${agents_path} (+ ${shim_path} shim)"
+    fi
+    return "$repo_fail"
+  fi
+
+  if [[ "$shim_ok" -ne 1 ]]; then
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        "${name} Cursor shim (.cursor/rules/${name}.mdc) must preserve frontmatter and point at .agents/rules/${name}.md" \
+        "$(rp_github_url "$slug" "/blob/main/${shim_path}")"
+    fi
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      agents_content="$("$content_fn" "$slug")"
+      shim_content="$("$shim_content_fn" "$slug")"
+      rp_queue_org_agents_rule_pair "$slug" "$agents_path" "$shim_path" \
+        "$agents_content" "$shim_content" \
+        "sync-${branch_base}" "chore: sync ${commit_subject}"
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add/sync thin Cursor shim ${shim_path} pointing at ${agents_path} (repository-helpers#637)"
+    fi
+    return "$repo_fail"
+  fi
+
+  rp_log_check_ok "$slug" "${name} agents rule + Cursor shim" \
+    "$(rp_github_url "$slug" "/blob/main/${agents_path}")"
+  return 0
+}
+
+readonly rp_pr_ship_and_review_agents_path='.agents/rules/pr-ship-and-review.md'
 readonly rp_pr_ship_and_review_rule_path='.cursor/rules/pr-ship-and-review.mdc'
-readonly rp_pr_ship_and_review_skill_path='.cursor/skills/ship-and-review/SKILL.md'
+readonly rp_pr_ship_and_review_skill_path='.agents/skills/ship-and-review/SKILL.md'
 
 rp_pr_ship_and_review_canonical_rule_url() {
   rp_github_url "${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}" \
-    "/blob/main/${rp_pr_ship_and_review_rule_path}"
+    "/blob/main/${rp_pr_ship_and_review_agents_path}"
 }
 
 rp_pr_ship_and_review_canonical_skill_url() {
@@ -910,14 +1123,24 @@ rp_pr_ship_and_review_canonical_skill_url() {
 rp_pr_ship_and_review_rule_template() {
   local path rule_url skill_url
 
-  path="${rp_lib_dir}/repo-practices-cursor/pr-ship-and-review.mdc"
+  path="${rp_lib_dir}/repo-practices-agents/rules/pr-ship-and-review.md"
   rule_url="$(rp_pr_ship_and_review_canonical_rule_url)"
   skill_url="$(rp_pr_ship_and_review_canonical_skill_url)"
 
   if [[ ! -f "$path" ]]; then
-    rp_die "internal error: missing cursor rule template: ${path}"
+    rp_die "internal error: missing agents rule template: ${path}"
   fi
   runner_exec_stdout "repo-practices pr-ship template urls" -- sed -e "s|@@PR_SHIP_CANONICAL_RULE_URL@@|${rule_url}|g" -e "s|@@PR_SHIP_CANONICAL_SKILL_URL@@|${skill_url}|g" "$path"
+}
+
+rp_pr_ship_and_review_shim_template() {
+  local path
+
+  path="${rp_lib_dir}/repo-practices-cursor/pr-ship-and-review.mdc"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing cursor shim template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat pr-ship shim template" -- cat "$path"
 }
 
 # Render the consumer pr-ship template with the active submit backend matching
@@ -987,7 +1210,7 @@ rp_pr_ship_and_review_rule_content_for_apply_fix() {
   if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
     repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
     if [[ -n "$repo_dir" ]]; then
-      local_path="${repo_dir}/${rp_pr_ship_and_review_rule_path}"
+      local_path="${repo_dir}/${rp_pr_ship_and_review_agents_path}"
       if [[ -f "$local_path" ]]; then
         cat "$local_path"
         return 0
@@ -1004,7 +1227,24 @@ rp_pr_ship_and_review_rule_content_for_apply_fix() {
   rp_pr_ship_and_review_rule_template_for_marker "$marker"
 }
 
-# True when the cursor rule references the canonical wait-for-agent-review flow
+rp_pr_ship_and_review_shim_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_pr_ship_and_review_rule_path}"
+      if [[ -f "$local_path" ]]; then
+        cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_pr_ship_and_review_shim_template
+}
+
+# True when the agents rule references the canonical wait-for-agent-review flow
 # and states reply-before-resolve (not only a defer link to repository-helpers).
 rp_pr_ship_and_review_rule_is_valid() {
   local -r text="$1"
@@ -1024,86 +1264,67 @@ rp_pr_ship_and_review_rule_is_valid() {
   fi
   if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
     grep -qF 'scripts/wait-for-agent-review' <<<"$text" \
-      && grep -qF '.cursor/skills/ship-and-review/SKILL.md' <<<"$text"
+      && grep -qF '.agents/skills/ship-and-review/SKILL.md' <<<"$text"
     return $?
   fi
   if ! grep -qE 'REPOSITORY_HELPERS_DIR|repository-helpers.*/scripts/wait-for-agent-review' <<<"$text"; then
     return 1
   fi
   grep -qE \
-    'pr-ship-canonical-skill:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.cursor/skills/ship-and-review/SKILL\.md' \
+    'pr-ship-canonical-skill:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.agents/skills/ship-and-review/SKILL\.md' \
     <<<"$text"
 }
 
 rp_check_pr_ship_and_review_rule() {
   local slug="$1"
-  local repo_fail=0
-  local rule_text
+  local agents_text shim_text
+  local agents_ec=0 shim_ec=0
+  local agents_ok=0
+  local invalid_msg
 
-  rule_text="$(rp_fetch_github_text_file "$slug" "$rp_pr_ship_and_review_rule_path" || true)"
-  if [[ -z "$rule_text" ]]; then
-    repo_fail=1
-    rp_log_check_fail "$slug" \
-      'pr-ship-and-review cursor rule (.cursor/rules/pr-ship-and-review.mdc)' \
-      "$(rp_github_url "$slug" '/new/main/.cursor/rules/pr-ship-and-review.mdc')"
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_pr_ship_and_review_rule_path" \
-        "$(rp_pr_ship_and_review_rule_content_for_apply_fix "$slug")" \
-        'add-pr-ship-and-review' \
-        'chore: add agent review cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: add .cursor/rules/pr-ship-and-review.mdc (template: scripts/lib/repo-practices-cursor/)"
-    fi
-  elif ! rp_pr_ship_and_review_rule_is_valid "$rule_text" "$slug"; then
-    repo_fail=1
-    if grep -qF 'wait-for-copilot-review' <<<"$rule_text"; then
-      rp_log_check_fail "$slug" \
-        'pr-ship-and-review rule must reference wait-for-agent-review (not legacy wait-for-copilot-review)' \
-        "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_rule_path}")"
-    elif ! grep -qF 'wait-for-agent-review' <<<"$rule_text"; then
-      rp_log_check_fail "$slug" \
-        'pr-ship-and-review rule must reference scripts/wait-for-agent-review' \
-        "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_rule_path}")"
-    elif [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]] \
-      && ! grep -qF '.cursor/skills/ship-and-review/SKILL.md' <<<"$rule_text"; then
-      rp_log_check_fail "$slug" \
-        'pr-ship-and-review rule must reference .cursor/skills/ship-and-review/SKILL.md' \
-        "$(rp_pr_ship_and_review_canonical_skill_url)"
-    elif [[ "$(rp_repo_short_name "$slug")" != "$rp_THIS_REPO_NAME" ]] \
-      && ! grep -qE \
-        'pr-ship-canonical-skill:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.cursor/skills/ship-and-review/SKILL\.md' \
-        <<<"$rule_text"; then
-      rp_log_check_fail "$slug" \
-        'pr-ship-and-review rule must link to the canonical playbook (pr-ship-canonical-skill breadcrumb)' \
-        "$(rp_pr_ship_and_review_canonical_skill_url)"
-    else
-      rp_log_check_fail "$slug" \
-        'pr-ship-and-review rule must document reply on-thread before resolve-thread' \
-        "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_rule_path}")"
-    fi
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_pr_ship_and_review_rule_path" \
-        "$(rp_pr_ship_and_review_rule_content_for_apply_fix "$slug")" \
-        'sync-pr-ship-and-review' \
-        'chore: sync agent review cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: sync .cursor/rules/pr-ship-and-review.mdc to the canonical agent review flow (include pr-ship-canonical-skill breadcrumb and reply on-thread before resolve)"
-    fi
-  else
-    rp_log_check_ok "$slug" 'pr-ship-and-review cursor rule' \
-      "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_rule_path}")"
+  rp_fetch_org_rule_text "$slug" "$rp_pr_ship_and_review_agents_path" \
+    'pr-ship-and-review agents' agents_text agents_ec
+  rp_fetch_org_rule_text "$slug" "$rp_pr_ship_and_review_rule_path" \
+    'pr-ship-and-review shim' shim_text shim_ec
+
+  if [[ -n "$agents_text" ]] && rp_pr_ship_and_review_rule_is_valid "$agents_text" "$slug"; then
+    agents_ok=1
   fi
 
-  return "$repo_fail"
+  if [[ -n "$agents_text" && "$agents_ok" -eq 0 ]]; then
+    if grep -qF 'wait-for-copilot-review' <<<"$agents_text"; then
+      invalid_msg='pr-ship-and-review rule must reference wait-for-agent-review (not legacy wait-for-copilot-review)'
+    elif ! grep -qF 'wait-for-agent-review' <<<"$agents_text"; then
+      invalid_msg='pr-ship-and-review rule must reference scripts/wait-for-agent-review'
+    elif [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]] \
+      && ! grep -qF '.agents/skills/ship-and-review/SKILL.md' <<<"$agents_text"; then
+      invalid_msg='pr-ship-and-review rule must reference .agents/skills/ship-and-review/SKILL.md'
+    elif [[ "$(rp_repo_short_name "$slug")" != "$rp_THIS_REPO_NAME" ]] \
+      && ! grep -qE \
+        'pr-ship-canonical-skill:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.agents/skills/ship-and-review/SKILL\.md' \
+        <<<"$agents_text"; then
+      invalid_msg='pr-ship-and-review rule must link to the canonical playbook (pr-ship-canonical-skill breadcrumb)'
+    else
+      invalid_msg='pr-ship-and-review rule must document reply on-thread before resolve-thread'
+    fi
+  else
+    invalid_msg='pr-ship-and-review agents rule must reference wait-for-agent-review and reply-before-resolve'
+  fi
+
+  rp_org_agents_rule_dual_path_outcome \
+    "$slug" 'pr-ship-and-review' \
+    "$rp_pr_ship_and_review_agents_path" "$rp_pr_ship_and_review_rule_path" \
+    "$agents_text" "$shim_text" "$agents_ec" "$shim_ec" \
+    "$agents_ok" 0 "$invalid_msg" \
+    rp_pr_ship_and_review_rule_content_for_apply_fix \
+    rp_pr_ship_and_review_shim_content_for_apply_fix \
+    'pr-ship-and-review' 'pr-ship-and-review agents rule + Cursor shim'
 }
 
+readonly rp_stacking_tool_agents_path='.agents/rules/stacking-tool.md'
 readonly rp_stacking_tool_rule_path='.cursor/rules/stacking-tool.mdc'
-readonly rp_stacking_tool_graphite_skill_path='.cursor/skills/graphite/SKILL.md'
-readonly rp_stacking_tool_gh_stack_skill_path='.cursor/skills/gh-stack/SKILL.md'
+readonly rp_stacking_tool_graphite_skill_path='.agents/skills/graphite/SKILL.md'
+readonly rp_stacking_tool_gh_stack_skill_path='.agents/skills/gh-stack/SKILL.md'
 
 rp_stacking_tool_graphite_skill_url() {
   rp_github_url "${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}" \
@@ -1118,17 +1339,44 @@ rp_stacking_tool_gh_stack_skill_url() {
 rp_stacking_tool_rule_template() {
   local path graphite_url gh_stack_url
 
-  path="${rp_lib_dir}/repo-practices-cursor/stacking-tool.mdc"
+  path="${rp_lib_dir}/repo-practices-agents/rules/stacking-tool.md"
   graphite_url="$(rp_stacking_tool_graphite_skill_url)"
   gh_stack_url="$(rp_stacking_tool_gh_stack_skill_url)"
 
   if [[ ! -f "$path" ]]; then
-    rp_die "internal error: missing cursor rule template: ${path}"
+    rp_die "internal error: missing agents rule template: ${path}"
   fi
   runner_exec_stdout "repo-practices stacking-tool template urls" -- sed -e "s|@@STACKING_TOOL_GRAPHITE_SKILL_URL@@|${graphite_url}|g" -e "s|@@STACKING_TOOL_GH_STACK_SKILL_URL@@|${gh_stack_url}|g" "$path"
 }
 
+rp_stacking_tool_shim_template() {
+  local path
+
+  path="${rp_lib_dir}/repo-practices-cursor/stacking-tool.mdc"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing cursor shim template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat stacking-tool shim template" -- cat "$path"
+}
+
 rp_stacking_tool_rule_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_stacking_tool_agents_path}"
+      if [[ -f "$local_path" ]]; then
+        cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_stacking_tool_rule_template
+}
+
+rp_stacking_tool_shim_content_for_apply_fix() {
   local slug="$1"
   local repo_dir local_path
 
@@ -1142,7 +1390,7 @@ rp_stacking_tool_rule_content_for_apply_fix() {
       fi
     fi
   fi
-  rp_stacking_tool_rule_template
+  rp_stacking_tool_shim_template
 }
 
 # GitHub marker is authoritative (same resolver as pr-ship apply-fix).
@@ -1157,7 +1405,7 @@ rp_stacking_tool_marker_content_for_apply_fix() {
   printf '%s' "$marker"
 }
 
-# True when the stacking-tool cursor rule references the marker and both
+# True when the stacking-tool agents rule references the marker and both
 # backends. This repo may cite local skill paths; consumers need breadcrumb
 # comments or github blob URLs to the canonical skills.
 rp_stacking_tool_rule_is_valid() {
@@ -1179,12 +1427,12 @@ rp_stacking_tool_rule_is_valid() {
     return $?
   fi
   if ! grep -qE \
-    'stacking-tool-canonical-graphite-skill:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.cursor/skills/graphite/SKILL\.md' \
+    'stacking-tool-canonical-graphite-skill:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.agents/skills/graphite/SKILL\.md' \
     <<<"$text"; then
     return 1
   fi
   grep -qE \
-    'stacking-tool-canonical-gh-stack-skill:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.cursor/skills/gh-stack/SKILL\.md' \
+    'stacking-tool-canonical-gh-stack-skill:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.agents/skills/gh-stack/SKILL\.md' \
     <<<"$text"
 }
 
@@ -1275,7 +1523,12 @@ rp_check_secret_audit_intake() {
 rp_check_stacking_tool() {
   local slug="$1"
   local repo_fail=0
-  local marker_text rule_text marker_value
+  local marker_text marker_value
+  local agents_text shim_text
+  local agents_ec=0 shim_ec=0
+  local agents_ok=0
+  local rule_fail=0
+  local invalid_msg
 
   marker_text="$(rp_fetch_github_text_file "$slug" "$stacking_tool_marker_relpath" || true)"
   if [[ -z "$marker_text" ]]; then
@@ -1316,46 +1569,37 @@ rp_check_stacking_tool() {
     fi
   fi
 
-  rule_text="$(rp_fetch_github_text_file "$slug" "$rp_stacking_tool_rule_path" || true)"
-  if [[ -z "$rule_text" ]]; then
-    repo_fail=1
-    rp_log_check_fail "$slug" \
-      'stacking-tool cursor rule (.cursor/rules/stacking-tool.mdc)' \
-      "$(rp_github_url "$slug" '/new/main/.cursor/rules/stacking-tool.mdc')"
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_stacking_tool_rule_path" \
-        "$(rp_stacking_tool_rule_content_for_apply_fix "$slug")" \
-        'add-stacking-tool-rule' \
-        'chore: add stacking-tool cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: add .cursor/rules/stacking-tool.mdc (template: scripts/lib/repo-practices-cursor/)"
-    fi
-  elif ! rp_stacking_tool_rule_is_valid "$rule_text" "$slug"; then
-    repo_fail=1
-    if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
-      rp_log_check_fail "$slug" \
-        'stacking-tool rule must reference marker and local graphite/gh-stack skills' \
-        "$(rp_github_url "$slug" "/blob/main/${rp_stacking_tool_rule_path}")"
-    else
-      rp_log_check_fail "$slug" \
-        'stacking-tool rule must link to canonical graphite/gh-stack skills (breadcrumb URLs)' \
-        "$(rp_stacking_tool_graphite_skill_url)"
-    fi
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_stacking_tool_rule_path" \
-        "$(rp_stacking_tool_rule_content_for_apply_fix "$slug")" \
-        'sync-stacking-tool-rule' \
-        'chore: sync stacking-tool cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: sync .cursor/rules/stacking-tool.mdc to the marker-aware stacking-tool template (include skill breadcrumbs)"
-    fi
+  agents_text=''
+  shim_text=''
+  agents_ec=0
+  shim_ec=0
+  agents_ok=0
+  rule_fail=0
+  invalid_msg=''
+
+  rp_fetch_org_rule_text "$slug" "$rp_stacking_tool_agents_path"     'stacking-tool agents' agents_text agents_ec
+  rp_fetch_org_rule_text "$slug" "$rp_stacking_tool_rule_path"     'stacking-tool shim' shim_text shim_ec
+
+  if [[ -n "$agents_text" ]] && rp_stacking_tool_rule_is_valid "$agents_text" "$slug"; then
+    agents_ok=1
+  fi
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    invalid_msg='stacking-tool rule must reference marker and local graphite/gh-stack skills'
   else
-    rp_log_check_ok "$slug" 'stacking-tool cursor rule' \
-      "$(rp_github_url "$slug" "/blob/main/${rp_stacking_tool_rule_path}")"
+    invalid_msg='stacking-tool rule must link to canonical graphite/gh-stack skills (breadcrumb URLs)'
+  fi
+
+  rule_fail=0
+  rp_org_agents_rule_dual_path_outcome \
+    "$slug" 'stacking-tool' \
+    "$rp_stacking_tool_agents_path" "$rp_stacking_tool_rule_path" \
+    "$agents_text" "$shim_text" "$agents_ec" "$shim_ec" \
+    "$agents_ok" 0 "$invalid_msg" \
+    rp_stacking_tool_rule_content_for_apply_fix \
+    rp_stacking_tool_shim_content_for_apply_fix \
+    'stacking-tool-rule' 'stacking-tool agents rule + Cursor shim' || rule_fail=$?
+  if (( rule_fail != 0 )); then
+    repo_fail=1
   fi
 
   return "$repo_fail"
@@ -1480,10 +1724,10 @@ rp_check_stacking_docs_consistency() {
   fi
 
   fetch_ec=0
-  pr_ship_text="$(rp_fetch_github_text_file "$slug" "$rp_pr_ship_and_review_rule_path")" \
+  pr_ship_text="$(rp_fetch_github_text_file "$slug" "$rp_pr_ship_and_review_agents_path")" \
     || fetch_ec=$?
   if (( fetch_ec == 2 )); then
-    rp_log_gh_api_fail "$slug" "could not read ${rp_pr_ship_and_review_rule_path}"
+    rp_log_gh_api_fail "$slug" "could not read ${rp_pr_ship_and_review_agents_path}"
     return 1
   fi
   fetch_ec=0
@@ -1506,20 +1750,22 @@ rp_check_stacking_docs_consistency() {
       repo_fail=1
       rp_log_check_fail "$slug" \
         'pr-ship-and-review still has Graphite-only gt create/gt submit (marker is gh-stack)' \
-        "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_rule_path}")"
+        "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_agents_path}")"
       if [[ "$rp_apply_fix" -eq 1 ]]; then
-        rp_queue_candidate_file_fix "$slug" "$rp_pr_ship_and_review_rule_path" \
+        rp_queue_org_agents_rule_pair "$slug" \
+          "$rp_pr_ship_and_review_agents_path" "$rp_pr_ship_and_review_rule_path" \
           "$(rp_pr_ship_and_review_rule_content_for_apply_fix "$slug" "$marker_value")" \
+          "$(rp_pr_ship_and_review_shim_content_for_apply_fix "$slug")" \
           'sync-pr-ship-stacking-docs' \
           'chore: replace pr-ship rule with marker-aware template'
       fi
       if [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest \
-          "${slug}: replace .cursor/rules/pr-ship-and-review.mdc with the marker-aware template (full file; scripts/lib/repo-practices-cursor/pr-ship-and-review.mdc) — repo-specific edits outside the submit block are overwritten"
+          "${slug}: replace .agents/rules/pr-ship-and-review.md with the marker-aware template (scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md) + Cursor shim — repo-specific edits outside the submit block are overwritten"
       fi
     elif [[ -n "$pr_ship_text" ]]; then
       rp_log_check_ok "$slug" 'pr-ship stacking docs match gh-stack marker' \
-        "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_rule_path}")"
+        "$(rp_github_url "$slug" "/blob/main/${rp_pr_ship_and_review_agents_path}")"
     fi
 
     if [[ -n "$agents_text" ]] \
@@ -1544,7 +1790,7 @@ rp_check_stacking_docs_consistency() {
         "$(rp_github_url "$slug" "/blob/main/${rp_graphite_md_path}")"
       if [[ "$rp_suggest" -eq 1 ]]; then
         rp_log_suggest \
-          "${slug}: delete GRAPHITE.md and point agents at .cursor/rules/stacking-tool.mdc + repository-helpers gh-stack skill"
+          "${slug}: delete GRAPHITE.md and point agents at .agents/rules/stacking-tool.md + .cursor/rules shim + repository-helpers gh-stack skill"
       fi
     else
       rp_log_check_ok "$slug" 'no root GRAPHITE.md (gh-stack)' \
@@ -1572,16 +1818,27 @@ rp_check_stacking_docs_consistency() {
   return "$repo_fail"
 }
 
+readonly rp_git_commit_identity_agents_path='.agents/rules/git-commit-identity.md'
 readonly rp_git_commit_identity_path='.cursor/rules/git-commit-identity.mdc'
 
 rp_git_commit_identity_template() {
   local path
 
+  path="${rp_lib_dir}/repo-practices-agents/rules/git-commit-identity.md"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing agents rule template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat git-commit-identity agents template" -- cat "$path"
+}
+
+rp_git_commit_identity_shim_template() {
+  local path
+
   path="${rp_lib_dir}/repo-practices-cursor/git-commit-identity.mdc"
   if [[ ! -f "$path" ]]; then
-    rp_die "internal error: missing cursor rule template: ${path}"
+    rp_die "internal error: missing cursor shim template: ${path}"
   fi
-  rp_runner_exec_stdout "repo-practices cat git-commit-identity template" -- cat "$path"
+  rp_runner_exec_stdout "repo-practices cat git-commit-identity shim template" -- cat "$path"
 }
 
 rp_git_commit_identity_content_for_apply_fix() {
@@ -1591,9 +1848,9 @@ rp_git_commit_identity_content_for_apply_fix() {
   if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
     repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
     if [[ -n "$repo_dir" ]]; then
-      local_path="${repo_dir}/${rp_git_commit_identity_path}"
+      local_path="${repo_dir}/${rp_git_commit_identity_agents_path}"
       if [[ -f "$local_path" ]]; then
-        rp_runner_exec_stdout "repo-practices cat local git-commit-identity" -- \
+        rp_runner_exec_stdout "repo-practices cat local git-commit-identity agents" -- \
           cat "$local_path"
         return 0
       fi
@@ -1602,8 +1859,24 @@ rp_git_commit_identity_content_for_apply_fix() {
   rp_git_commit_identity_template
 }
 
-# True when AGENTS.md already documents commit-identity / no-co-author policy
-# (soft suggest only — absence does not fail the audit).
+rp_git_commit_identity_shim_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_git_commit_identity_path}"
+      if [[ -f "$local_path" ]]; then
+        rp_runner_exec_stdout "repo-practices cat local git-commit-identity shim" -- \
+          cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_git_commit_identity_shim_template
+}
+
 rp_agents_md_mentions_git_commit_identity() {
   local -r text="$1"
 
@@ -1612,13 +1885,6 @@ rp_agents_md_mentions_git_commit_identity() {
     <<<"$text"
 }
 
-# True when the cursor rule forbids agent/machine co-authors, requires git
-# user.name/user.email, commit.gpgsign / user.signingkey survey (including
-# pinentry-mac / passphrase / per-machine key / clearsign probe guidance), and
-# instructs agents to verify ~/.cursor/cli-config.json with attribution disabled.
-# Keyword presence alone is not enough: require positive prohibitions / false
-# attribution flags, signing setup survey + setup instructions, and reject
-# permissive wording.
 rp_git_commit_identity_is_valid() {
   local -r text="$1"
   local cli_config_needle gpg_agent_conf_needle tilde
@@ -1770,80 +2036,45 @@ rp_git_commit_identity_is_valid() {
 rp_check_git_commit_identity() {
   local slug="$1"
   local repo_fail=0
-  local rule_text agents_text repo_dir local_path
-  local fetch_ec=0
-  local agents_ec=0
+  local agents_text shim_text
+  local agents_ec=0 shim_ec=0
+  local agents_ok=0
+  local agents_md_text agents_md_ec=0 repo_dir
 
-  # Prefer the local dogfood copy when auditing this repo from a clone/worktree
-  # (new-rule PRs are not on origin/main yet; GitHub Contents would false-fail).
-  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
-    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
-    if [[ -n "$repo_dir" ]]; then
-      local_path="${repo_dir}/${rp_git_commit_identity_path}"
-      if [[ -f "$local_path" ]]; then
-        rule_text="$(rp_runner_exec_stdout "repo-practices cat local git-commit-identity check" -- \
-          cat "$local_path")"
-      fi
-    fi
+  rp_fetch_org_rule_text "$slug" "${rp_git_commit_identity_agents_path}" \
+    'git-commit-identity agents' agents_text agents_ec
+  rp_fetch_org_rule_text "$slug" "${rp_git_commit_identity_path}" \
+    'git-commit-identity shim' shim_text shim_ec
+
+  if [[ -n "$agents_text" ]] && rp_git_commit_identity_is_valid "$agents_text"; then
+    agents_ok=1
   fi
-  if [[ -z "${rule_text:-}" ]]; then
-    rule_text="$(rp_fetch_github_text_file "$slug" "$rp_git_commit_identity_path")" \
-      || fetch_ec=$?
-  fi
-  if (( fetch_ec == 2 )); then
-    rp_log_gh_api_fail "$slug" "could not read ${rp_git_commit_identity_path}"
-    return 1
-  fi
-  if [[ -z "$rule_text" ]]; then
-    repo_fail=1
-    rp_log_check_fail "$slug" \
-      'git-commit-identity cursor rule (.cursor/rules/git-commit-identity.mdc)' \
-      "$(rp_github_url "$slug" '/new/main/.cursor/rules/git-commit-identity.mdc')"
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_git_commit_identity_path" \
-        "$(rp_git_commit_identity_content_for_apply_fix "$slug")" \
-        'add-git-commit-identity' \
-        'chore: add git-commit-identity cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: add .cursor/rules/git-commit-identity.mdc (template: scripts/lib/repo-practices-cursor/)"
-    fi
-  elif ! rp_git_commit_identity_is_valid "$rule_text"; then
-    repo_fail=1
-    rp_log_check_fail "$slug" \
-      'git-commit-identity rule must forbid Co-authored-by / Made-with: Cursor / --trailer / --no-gpg-sign, require git user.name/user.email + GIT_AUTHOR_IDENT/GIT_COMMITTER_IDENT + commit.gpgsign/user.signingkey survey (pinentry-mac, passphrase, per-machine keys, clearsign, openpgp, verify-commit, read:gpg_key) with setup instructions, and require checking ~/.cursor/cli-config.json attribution (alwaysApply: true)' \
-      "$(rp_github_url "$slug" "/blob/main/${rp_git_commit_identity_path}")"
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_git_commit_identity_path" \
-        "$(rp_git_commit_identity_content_for_apply_fix "$slug")" \
-        'sync-git-commit-identity' \
-        'chore: sync git-commit-identity cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: sync .cursor/rules/git-commit-identity.mdc to forbid agent/machine co-authors and require signing (pinentry/passphrase/per-machine) + cli-config attribution checks"
-    fi
-  else
-    rp_log_check_ok "$slug" 'git-commit-identity cursor rule' \
-      "$(rp_github_url "$slug" "/blob/main/${rp_git_commit_identity_path}")"
-  fi
+
+  rp_org_agents_rule_dual_path_outcome \
+    "$slug" 'git-commit-identity' \
+    "${rp_git_commit_identity_agents_path}" "${rp_git_commit_identity_path}" \
+    "$agents_text" "$shim_text" "$agents_ec" "$shim_ec" \
+    "$agents_ok" 0 'git-commit-identity rule must forbid Co-authored-by / Made-with: Cursor / --trailer / --no-gpg-sign, require git user.name/user.email + GIT_AUTHOR_IDENT/GIT_COMMITTER_IDENT + commit.gpgsign/user.signingkey survey (pinentry-mac, passphrase, per-machine keys, clearsign, openpgp, verify-commit, read:gpg_key) with setup instructions, and require checking ~/.cursor/cli-config.json attribution (alwaysApply: true)' \
+    rp_git_commit_identity_content_for_apply_fix \
+    rp_git_commit_identity_shim_content_for_apply_fix \
+    'git-commit-identity' 'git-commit-identity agents rule + Cursor shim' || repo_fail=$?
 
   # Soft suggest only: document policy in AGENTS.md when present (never fail).
   if [[ "$rp_suggest" -eq 1 ]]; then
-    agents_text=""
+    agents_md_text=""
+    agents_md_ec=0
     if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
       repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
       if [[ -n "$repo_dir" && -f "${repo_dir}/${rp_agents_md_path}" ]]; then
-        agents_text="$(rp_runner_exec_stdout "repo-practices cat local AGENTS.md" -- \
+        agents_md_text="$(rp_runner_exec_stdout "repo-practices cat local AGENTS.md" -- \
           cat "${repo_dir}/${rp_agents_md_path}")"
       fi
     fi
-    if [[ -z "$agents_text" ]]; then
-      agents_text="$(rp_fetch_github_text_file "$slug" "$rp_agents_md_path")" || agents_ec=$?
+    if [[ -z "$agents_md_text" ]]; then
+      agents_md_text="$(rp_fetch_github_text_file "$slug" "$rp_agents_md_path")" || agents_md_ec=$?
     fi
-    if (( agents_ec != 2 )) && [[ -n "$agents_text" ]] \
-      && ! rp_agents_md_mentions_git_commit_identity "$agents_text"; then
+    if (( agents_md_ec != 2 )) && [[ -n "$agents_md_text" ]] \
+      && ! rp_agents_md_mentions_git_commit_identity "$agents_md_text"; then
       rp_log_suggest \
         "${slug}: optionally document commit-identity policy in AGENTS.md (no Co-authored-by / signing + cli-config attribution)"
     fi
@@ -1852,16 +2083,27 @@ rp_check_git_commit_identity() {
   return "$repo_fail"
 }
 
+readonly rp_no_secret_exposure_agents_path='.agents/rules/no-secret-exposure.md'
 readonly rp_no_secret_exposure_path='.cursor/rules/no-secret-exposure.mdc'
 
 rp_no_secret_exposure_template() {
   local path
 
+  path="${rp_lib_dir}/repo-practices-agents/rules/no-secret-exposure.md"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing agents rule template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat no-secret-exposure agents template" -- cat "$path"
+}
+
+rp_no_secret_exposure_shim_template() {
+  local path
+
   path="${rp_lib_dir}/repo-practices-cursor/no-secret-exposure.mdc"
   if [[ ! -f "$path" ]]; then
-    rp_die "internal error: missing cursor rule template: ${path}"
+    rp_die "internal error: missing cursor shim template: ${path}"
   fi
-  rp_runner_exec_stdout "repo-practices cat no-secret-exposure template" -- cat "$path"
+  rp_runner_exec_stdout "repo-practices cat no-secret-exposure shim template" -- cat "$path"
 }
 
 rp_no_secret_exposure_content_for_apply_fix() {
@@ -1871,9 +2113,9 @@ rp_no_secret_exposure_content_for_apply_fix() {
   if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
     repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
     if [[ -n "$repo_dir" ]]; then
-      local_path="${repo_dir}/${rp_no_secret_exposure_path}"
+      local_path="${repo_dir}/${rp_no_secret_exposure_agents_path}"
       if [[ -f "$local_path" ]]; then
-        rp_runner_exec_stdout "repo-practices cat local no-secret-exposure" -- \
+        rp_runner_exec_stdout "repo-practices cat local no-secret-exposure agents" -- \
           cat "$local_path"
         return 0
       fi
@@ -1882,9 +2124,24 @@ rp_no_secret_exposure_content_for_apply_fix() {
   rp_no_secret_exposure_template
 }
 
-# True when the cursor rule forbids secret leakage into logs/transcripts/PRs,
-# requires allowlist or path-existence when inspecting config (not denylist-sed-only),
-# and instructs rotate-without-repeat (alwaysApply org rule).
+rp_no_secret_exposure_shim_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_no_secret_exposure_path}"
+      if [[ -f "$local_path" ]]; then
+        rp_runner_exec_stdout "repo-practices cat local no-secret-exposure shim" -- \
+          cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_no_secret_exposure_shim_template
+}
+
 rp_no_secret_exposure_is_valid() {
   local -r text="$1"
   # Shared forbid-action verbs (keep ASCII-sorted; mirrors git-commit-identity).
@@ -1961,98 +2218,55 @@ rp_no_secret_exposure_is_valid() {
   return 0
 }
 
-# Missing or invalid markers FAIL under --new-repo and --strict-onboarding (#575 —
-# the org roll-out is complete, so the daily enforcer's strict run stays green).
-# A plain --all / --suggest run (no --strict-onboarding) still only SUGGESTs.
-# Prefer local dogfood when auditing THIS repo.
 rp_check_no_secret_exposure() {
   local slug="$1"
   local repo_fail=0
-  local rule_text repo_dir local_path
-  local fetch_ec=0
+  local agents_text shim_text
+  local agents_ec=0 shim_ec=0
+  local agents_ok=0
 
-  # Prefer the local dogfood copy when auditing this repo from a clone/worktree
-  # (new-rule PRs are not on origin/main yet; GitHub Contents would false-fail).
-  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
-    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
-    if [[ -n "$repo_dir" ]]; then
-      local_path="${repo_dir}/${rp_no_secret_exposure_path}"
-      if [[ -f "$local_path" ]]; then
-        rule_text="$(rp_runner_exec_stdout "repo-practices cat local no-secret-exposure check" -- \
-          cat "$local_path")"
-      fi
-    fi
+  rp_fetch_org_rule_text "$slug" "${rp_no_secret_exposure_agents_path}" \
+    'no-secret-exposure agents' agents_text agents_ec
+  rp_fetch_org_rule_text "$slug" "${rp_no_secret_exposure_path}" \
+    'no-secret-exposure shim' shim_text shim_ec
+
+  if [[ -n "$agents_text" ]] && rp_no_secret_exposure_is_valid "$agents_text"; then
+    agents_ok=1
   fi
-  if [[ -z "${rule_text:-}" ]]; then
-    rule_text="$(rp_fetch_github_text_file "$slug" "$rp_no_secret_exposure_path")" \
-      || fetch_ec=$?
-  fi
-  if (( fetch_ec == 2 )); then
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      rp_log_gh_api_fail "$slug" "could not read ${rp_no_secret_exposure_path}"
-      return 1
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: retry no-secret-exposure rule check after GitHub API recovers"
-    else
-      rp_log_warn \
-        "${slug}: could not read ${rp_no_secret_exposure_path} (GitHub API error); skipping check"
-    fi
-    return 0
-  fi
-  if [[ -z "$rule_text" ]]; then
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      repo_fail=1
-      rp_log_check_fail "$slug" \
-        'no-secret-exposure cursor rule (.cursor/rules/no-secret-exposure.mdc)' \
-        "$(rp_github_url "$slug" '/new/main/.cursor/rules/no-secret-exposure.mdc')"
-    fi
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_no_secret_exposure_path" \
-        "$(rp_no_secret_exposure_content_for_apply_fix "$slug")" \
-        'add-no-secret-exposure' \
-        'chore: add no-secret-exposure cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: add .cursor/rules/no-secret-exposure.mdc (template: scripts/lib/repo-practices-cursor/)"
-    fi
-  elif ! rp_no_secret_exposure_is_valid "$rule_text"; then
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      repo_fail=1
-      rp_log_check_fail "$slug" \
-        'no-secret-exposure rule must forbid leaking secrets into logs/transcripts/PRs, require allowlist or path-existence when inspecting config, and instruct rotate-without-repeat (alwaysApply: true)' \
-        "$(rp_github_url "$slug" "/blob/main/${rp_no_secret_exposure_path}")"
-    fi
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_no_secret_exposure_path" \
-        "$(rp_no_secret_exposure_content_for_apply_fix "$slug")" \
-        'sync-no-secret-exposure' \
-        'chore: sync no-secret-exposure cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: sync .cursor/rules/no-secret-exposure.mdc to forbid secret leakage (allowlist/existence inspection; rotate if leaked)"
-    fi
-  else
-    rp_log_check_ok "$slug" 'no-secret-exposure cursor rule' \
-      "$(rp_github_url "$slug" "/blob/main/${rp_no_secret_exposure_path}")"
-  fi
+
+  rp_org_agents_rule_dual_path_outcome \
+    "$slug" 'no-secret-exposure' \
+    "${rp_no_secret_exposure_agents_path}" "${rp_no_secret_exposure_path}" \
+    "$agents_text" "$shim_text" "$agents_ec" "$shim_ec" \
+    "$agents_ok" 1 'no-secret-exposure rule must forbid leaking secrets into logs/transcripts/PRs, require allowlist or path-existence when inspecting config, and instruct rotate-without-repeat (alwaysApply: true)' \
+    rp_no_secret_exposure_content_for_apply_fix \
+    rp_no_secret_exposure_shim_content_for_apply_fix \
+    'no-secret-exposure' 'no-secret-exposure agents rule + Cursor shim' || repo_fail=$?
 
   return "$repo_fail"
 }
 
+readonly rp_pre_pr_checks_rule_agents_path='.agents/rules/pre-pr-checks.md'
 readonly rp_pre_pr_checks_rule_path='.cursor/rules/pre-pr-checks.mdc'
 
 rp_pre_pr_checks_rule_template() {
   local path
 
+  path="${rp_lib_dir}/repo-practices-agents/rules/pre-pr-checks.md"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing agents rule template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat pre-pr-checks agents template" -- cat "$path"
+}
+
+rp_pre_pr_checks_rule_shim_template() {
+  local path
+
   path="${rp_lib_dir}/repo-practices-cursor/pre-pr-checks.mdc"
   if [[ ! -f "$path" ]]; then
-    rp_die "internal error: missing cursor rule template: ${path}"
+    rp_die "internal error: missing cursor shim template: ${path}"
   fi
-  rp_runner_exec_stdout "repo-practices cat pre-pr-checks template" -- cat "$path"
+  rp_runner_exec_stdout "repo-practices cat pre-pr-checks shim template" -- cat "$path"
 }
 
 rp_pre_pr_checks_rule_content_for_apply_fix() {
@@ -2062,9 +2276,9 @@ rp_pre_pr_checks_rule_content_for_apply_fix() {
   if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
     repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
     if [[ -n "$repo_dir" ]]; then
-      local_path="${repo_dir}/${rp_pre_pr_checks_rule_path}"
+      local_path="${repo_dir}/${rp_pre_pr_checks_rule_agents_path}"
       if [[ -f "$local_path" ]]; then
-        rp_runner_exec_stdout "repo-practices cat local pre-pr-checks" -- \
+        rp_runner_exec_stdout "repo-practices cat local pre-pr-checks agents" -- \
           cat "$local_path"
         return 0
       fi
@@ -2073,8 +2287,24 @@ rp_pre_pr_checks_rule_content_for_apply_fix() {
   rp_pre_pr_checks_rule_template
 }
 
-# True when the cursor rule requires pre-pr-checks, format-before-check, and no
-# truncated pre-PR output (alwaysApply org rule).
+rp_pre_pr_checks_rule_shim_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_pre_pr_checks_rule_path}"
+      if [[ -f "$local_path" ]]; then
+        rp_runner_exec_stdout "repo-practices cat local pre-pr-checks shim" -- \
+          cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_pre_pr_checks_rule_shim_template
+}
+
 rp_pre_pr_checks_rule_is_valid() {
   local -r text="$1"
 
@@ -2111,110 +2341,71 @@ rp_pre_pr_checks_rule_resolves_helper_paths() {
     <<<"$text"
 }
 
-# Missing or invalid markers FAIL under --new-repo and --strict-onboarding (#575).
-# A plain --all / --suggest run (no --strict-onboarding) still only SUGGESTs.
-# The consumer-helper-path sub-check (a valid rule that still carries bare
-# scripts/dev/ paths) FAILs strict/new-repo too now that the org has been
-# re-synced (repository-helpers#579).
+# Missing agents: SUGGEST-during-rollout (#637). Invalid agents / bad shim FAIL
+# under --new-repo / --strict-onboarding. Consumer bare scripts/dev/ paths also
+# FAIL strict/new-repo (repository-helpers#579).
 rp_check_pre_pr_checks_rule() {
   local slug="$1"
   local repo_fail=0
-  local rule_text
-  local fetch_ec=0
+  local agents_text shim_text
+  local agents_ec=0 shim_ec=0
+  local agents_ok=0
   local is_consumer=1
+  local invalid_msg
 
   [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]] && is_consumer=0
 
-  rule_text="$(rp_fetch_github_text_file "$slug" "$rp_pre_pr_checks_rule_path")" \
-    || fetch_ec=$?
-  if (( fetch_ec == 2 )); then
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      rp_log_gh_api_fail "$slug" "could not read ${rp_pre_pr_checks_rule_path}"
-      return 1
+  rp_fetch_org_rule_text "$slug" "$rp_pre_pr_checks_rule_agents_path" \
+    'pre-pr-checks agents' agents_text agents_ec
+  rp_fetch_org_rule_text "$slug" "$rp_pre_pr_checks_rule_path" \
+    'pre-pr-checks shim' shim_text shim_ec
+
+  invalid_msg='pre-pr-checks rule must require format-before-check and no truncated output (alwaysApply: true)'
+  if [[ -n "$agents_text" ]]; then
+    if rp_pre_pr_checks_rule_is_valid "$agents_text"; then
+      if [[ "$is_consumer" -eq 1 ]] \
+        && ! rp_pre_pr_checks_rule_resolves_helper_paths "$agents_text"; then
+        agents_ok=0
+        invalid_msg='pre-pr-checks rule must resolve scripts/dev/ via the repository-helpers clone (${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}), not a bare repo-relative path'
+      else
+        agents_ok=1
+      fi
     fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: retry pre-pr-checks rule check after GitHub API recovers"
-    fi
-    return 0
   fi
-  if [[ -z "$rule_text" ]]; then
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      repo_fail=1
-      rp_log_check_fail "$slug" \
-        'pre-pr-checks cursor rule (.cursor/rules/pre-pr-checks.mdc)' \
-        "$(rp_github_url "$slug" '/new/main/.cursor/rules/pre-pr-checks.mdc')"
-    fi
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_pre_pr_checks_rule_path" \
-        "$(rp_pre_pr_checks_rule_content_for_apply_fix "$slug")" \
-        'add-pre-pr-checks-rule' \
-        'chore: add pre-pr-checks cursor rule (format before check)'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: add .cursor/rules/pre-pr-checks.mdc (template: scripts/lib/repo-practices-cursor/)"
-    fi
-  elif ! rp_pre_pr_checks_rule_is_valid "$rule_text"; then
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      repo_fail=1
-      rp_log_check_fail "$slug" \
-        'pre-pr-checks rule must require format-before-check and no truncated output (alwaysApply: true)' \
-        "$(rp_github_url "$slug" "/blob/main/${rp_pre_pr_checks_rule_path}")"
-    fi
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_pre_pr_checks_rule_path" \
-        "$(rp_pre_pr_checks_rule_content_for_apply_fix "$slug")" \
-        'sync-pre-pr-checks-rule' \
-        'chore: sync pre-pr-checks cursor rule (format before check)'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: sync .cursor/rules/pre-pr-checks.mdc to require format-before-check and no truncated pre-PR output"
-    fi
-  elif [[ "$is_consumer" -eq 1 ]] \
-    && ! rp_pre_pr_checks_rule_resolves_helper_paths "$rule_text"; then
-    # A consumer rule with the right sections but bare `scripts/dev/` paths still
-    # resolves to nothing in that repo. The org has been re-synced (#579), so this
-    # now FAILs strict/new-repo like any other invalid content.
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      repo_fail=1
-      rp_log_check_fail "$slug" \
-        'pre-pr-checks rule must resolve scripts/dev/ via the repository-helpers clone (${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}), not a bare repo-relative path' \
-        "$(rp_github_url "$slug" "/blob/main/${rp_pre_pr_checks_rule_path}")"
-    fi
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_pre_pr_checks_rule_path" \
-        "$(rp_pre_pr_checks_rule_content_for_apply_fix "$slug")" \
-        'sync-pre-pr-checks-rule' \
-        'chore: sync pre-pr-checks cursor rule (resolve scripts/dev via helpers clone)'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: sync .cursor/rules/pre-pr-checks.mdc — it must resolve scripts/dev/ via \${REPOSITORY_HELPERS_DIR:-\$HOME/work/ai/repository-helpers}, not a bare repo-relative path (repository-helpers#579)"
-    fi
-    if [[ "$repo_fail" -eq 0 ]]; then
-      rp_log_check_ok "$slug" 'pre-pr-checks cursor rule (bare scripts/dev/ paths — sync suggested)' \
-        "$(rp_github_url "$slug" "/blob/main/${rp_pre_pr_checks_rule_path}")"
-    fi
-  else
-    rp_log_check_ok "$slug" 'pre-pr-checks cursor rule' \
-      "$(rp_github_url "$slug" "/blob/main/${rp_pre_pr_checks_rule_path}")"
-  fi
+
+  rp_org_agents_rule_dual_path_outcome \
+    "$slug" 'pre-pr-checks' \
+    "$rp_pre_pr_checks_rule_agents_path" "$rp_pre_pr_checks_rule_path" \
+    "$agents_text" "$shim_text" "$agents_ec" "$shim_ec" \
+    "$agents_ok" 1 "$invalid_msg" \
+    rp_pre_pr_checks_rule_content_for_apply_fix \
+    rp_pre_pr_checks_rule_shim_content_for_apply_fix \
+    'pre-pr-checks-rule' 'pre-pr-checks agents rule + Cursor shim' || repo_fail=$?
 
   return "$repo_fail"
 }
 
+readonly rp_read_agents_and_rules_agents_path='.agents/rules/read-agents-and-rules.md'
 readonly rp_read_agents_and_rules_path='.cursor/rules/read-agents-and-rules.mdc'
 
 rp_read_agents_and_rules_template() {
   local path
 
+  path="${rp_lib_dir}/repo-practices-agents/rules/read-agents-and-rules.md"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing agents rule template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat read-agents-and-rules agents template" -- cat "$path"
+}
+
+rp_read_agents_and_rules_shim_template() {
+  local path
+
   path="${rp_lib_dir}/repo-practices-cursor/read-agents-and-rules.mdc"
   if [[ ! -f "$path" ]]; then
-    rp_die "internal error: missing cursor rule template: ${path}"
+    rp_die "internal error: missing cursor shim template: ${path}"
   fi
-  rp_runner_exec_stdout "repo-practices cat read-agents-and-rules template" -- cat "$path"
+  rp_runner_exec_stdout "repo-practices cat read-agents-and-rules shim template" -- cat "$path"
 }
 
 rp_read_agents_and_rules_content_for_apply_fix() {
@@ -2224,9 +2415,9 @@ rp_read_agents_and_rules_content_for_apply_fix() {
   if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
     repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
     if [[ -n "$repo_dir" ]]; then
-      local_path="${repo_dir}/${rp_read_agents_and_rules_path}"
+      local_path="${repo_dir}/${rp_read_agents_and_rules_agents_path}"
       if [[ -f "$local_path" ]]; then
-        rp_runner_exec_stdout "repo-practices cat local read-agents-and-rules" -- \
+        rp_runner_exec_stdout "repo-practices cat local read-agents-and-rules agents" -- \
           cat "$local_path"
         return 0
       fi
@@ -2235,9 +2426,24 @@ rp_read_agents_and_rules_content_for_apply_fix() {
   rp_read_agents_and_rules_template
 }
 
-# True when the cursor rule requires reading AGENTS.md and .cursor/rules at
-# session start (alwaysApply org rule). Keywords alone are not enough: require
-# positive "read" instructions and reject negated guidance.
+rp_read_agents_and_rules_shim_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_read_agents_and_rules_path}"
+      if [[ -f "$local_path" ]]; then
+        rp_runner_exec_stdout "repo-practices cat local read-agents-and-rules shim" -- \
+          cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_read_agents_and_rules_shim_template
+}
+
 rp_read_agents_and_rules_is_valid() {
   local -r text="$1"
 
@@ -2252,7 +2458,7 @@ rp_read_agents_and_rules_is_valid() {
     return 1
   fi
   if ! grep -qiE \
-    '\b(re-?)?(read|load).{0,60}\.cursor/rules|\.cursor/rules.{0,60}\b(re-?)?(read|load)' \
+    '\b(re-?)?(read|load).{0,60}\.agents/rules|\.agents/rules.{0,60}\b(re-?)?(read|load)' \
     <<<"$text"; then
     return 1
   fi
@@ -2265,7 +2471,7 @@ rp_read_agents_and_rules_is_valid() {
     return 1
   fi
   if grep -qiE \
-    '(do not|don'\''t|never|skip)[[:space:]].{0,40}\b(re-?)?(read|load).{0,40}\.cursor/rules' \
+    '(do not|don'\''t|never|skip)[[:space:]].{0,40}\b(re-?)?(read|load).{0,40}\.agents/rules' \
     <<<"$text"; then
     return 1
   fi
@@ -2275,49 +2481,27 @@ rp_read_agents_and_rules_is_valid() {
 rp_check_read_agents_and_rules() {
   local slug="$1"
   local repo_fail=0
-  local rule_text
-  local fetch_ec=0
+  local agents_text shim_text
+  local agents_ec=0 shim_ec=0
+  local agents_ok=0
 
-  rule_text="$(rp_fetch_github_text_file "$slug" "$rp_read_agents_and_rules_path")" \
-    || fetch_ec=$?
-  if (( fetch_ec == 2 )); then
-    rp_log_gh_api_fail "$slug" "could not read ${rp_read_agents_and_rules_path}"
-    return 1
+  rp_fetch_org_rule_text "$slug" "${rp_read_agents_and_rules_agents_path}" \
+    'read-agents-and-rules agents' agents_text agents_ec
+  rp_fetch_org_rule_text "$slug" "${rp_read_agents_and_rules_path}" \
+    'read-agents-and-rules shim' shim_text shim_ec
+
+  if [[ -n "$agents_text" ]] && rp_read_agents_and_rules_is_valid "$agents_text"; then
+    agents_ok=1
   fi
-  if [[ -z "$rule_text" ]]; then
-    repo_fail=1
-    rp_log_check_fail "$slug" \
-      'read-agents-and-rules cursor rule (.cursor/rules/read-agents-and-rules.mdc)' \
-      "$(rp_github_url "$slug" '/new/main/.cursor/rules/read-agents-and-rules.mdc')"
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_read_agents_and_rules_path" \
-        "$(rp_read_agents_and_rules_content_for_apply_fix "$slug")" \
-        'add-read-agents-and-rules' \
-        'chore: add session-start read-agents-and-rules cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: add .cursor/rules/read-agents-and-rules.mdc (template: scripts/lib/repo-practices-cursor/)"
-    fi
-  elif ! rp_read_agents_and_rules_is_valid "$rule_text"; then
-    repo_fail=1
-    rp_log_check_fail "$slug" \
-      'read-agents-and-rules rule must require reading AGENTS.md and .cursor/rules at session start (alwaysApply: true)' \
-      "$(rp_github_url "$slug" "/blob/main/${rp_read_agents_and_rules_path}")"
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_read_agents_and_rules_path" \
-        "$(rp_read_agents_and_rules_content_for_apply_fix "$slug")" \
-        'sync-read-agents-and-rules' \
-        'chore: sync session-start read-agents-and-rules cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: sync .cursor/rules/read-agents-and-rules.mdc to require reading AGENTS.md and .cursor/rules at session start"
-    fi
-  else
-    rp_log_check_ok "$slug" 'read-agents-and-rules cursor rule' \
-      "$(rp_github_url "$slug" "/blob/main/${rp_read_agents_and_rules_path}")"
-  fi
+
+  rp_org_agents_rule_dual_path_outcome \
+    "$slug" 'read-agents-and-rules' \
+    "${rp_read_agents_and_rules_agents_path}" "${rp_read_agents_and_rules_path}" \
+    "$agents_text" "$shim_text" "$agents_ec" "$shim_ec" \
+    "$agents_ok" 0 'read-agents-and-rules rule must require reading AGENTS.md and .agents/rules at session start (alwaysApply: true)' \
+    rp_read_agents_and_rules_content_for_apply_fix \
+    rp_read_agents_and_rules_shim_content_for_apply_fix \
+    'read-agents-and-rules' 'read-agents-and-rules agents rule + Cursor shim' || repo_fail=$?
 
   return "$repo_fail"
 }
@@ -2341,46 +2525,50 @@ rp_agent_bootstrap_template() {
   rp_runner_exec_stdout "repo-practices cat agent-bootstrap ${name}" -- cat "$path"
 }
 
-# AGENTS.md must tell the agent to ALSO load the .cursor/rules/*.mdc guidance —
-# otherwise an agent that reads AGENTS.md still misses the rules. A positive
-# read/load instruction tied to .cursor/rules is required; negated guidance
-# ("do not read .cursor/rules") is rejected.
-#
-# We deliberately do NOT probe for a "session start" trigger phrase: compliant
-# repos phrase it too many ways ("at session start", "before starting any work",
-# "when you begin", "first thing", ...) and every added phrasing invited another
-# false negative (see repository-helpers#577). The startup context is carried by
-# the check's own copy and the templates, not by a brittle phrase match.
-rp_agents_md_documents_cursor_rules() {
+# Flatten AGENTS.md for the session-startup read/load probes.
+rp_agents_md_flatten_for_startup_probe() {
   local -r text="$1"
-  local flat plain
+  local flat
 
-  # Collapse whitespace so a line-wrapped instruction still matches the
-  # "within N chars" probes, then strip markdown emphasis so "_read_" /
-  # "**load**" read as bare verbs.
   flat="$(printf '%s' "$text" | tr '\n\t' '  ' | tr -s ' ')"
-  plain="$(printf '%s' "$flat" | tr -d '*_`')"
+  printf '%s' "$flat" | tr -d '*_`'
+}
+
+# True when AGENTS.md has a positive read/load instruction for PATH_FRAGMENT
+# (e.g. `.agents/rules` or `.cursor/rules`) and no direct negation of that verb.
+rp_agents_md_documents_rules_path() {
+  local -r text="$1"
+  local -r path_fragment="$2"
+  local plain
+
+  plain="$(rp_agents_md_flatten_for_startup_probe "$text")"
 
   # \b(re-?)? before read/load: "reading"/"loads"/"reread"/"reload" count, but
-  # "thread"/"upload"/"download"/"payload" (verb prefixed by another word char)
-  # near a .cursor/rules mention do not falsely satisfy this, either direction
-  # (repository-helpers#580).
+  # "thread"/"upload"/"download"/"payload" near a rules-path mention do not
+  # (repository-helpers#580 / #637).
   if ! grep -qiE \
-    '\b(re-?)?(read|load).{0,80}\.cursor/rules|\.cursor/rules.{0,80}\b(re-?)?(read|load)' \
+    "\\b(re-?)?(read|load).{0,80}${path_fragment}|${path_fragment}.{0,80}\\b(re-?)?(read|load)" \
     <<<"$plain"; then
     return 1
   fi
-  # Reject a negation that lands directly on the read/load verb ("do not read
-  # .cursor/rules"). A determiner ("the"/"every"/...) may sit between, but not
-  # another verb — so "do not skip reading .cursor/rules" / "never start a
-  # session without reading .cursor/rules" still pass. Same \b anchor as above so
-  # "never upload .cursor/rules to a fork" is not read as a negation.
+  # Reject a negation that lands directly on the read/load verb.
   if grep -qiE \
-    "(do not|don't|never|must not)[[:space:]]+((the|every|all|any)[[:space:]]+)?\b(re-?)?(read|load|consult|open)[^.]{0,25}\.cursor/rules" \
+    "(do not|don't|never|must not)[[:space:]]+((the|every|all|any)[[:space:]]+)?\\b(re-?)?(read|load|consult|open)[^.]{0,25}${path_fragment}" \
     <<<"$plain"; then
     return 1
   fi
   return 0
+}
+
+# Canonical #637 probe: AGENTS.md must tell the agent to load `.agents/rules`.
+# (Name kept for call-site stability; previously probed `.cursor/rules`.)
+rp_agents_md_documents_cursor_rules() {
+  rp_agents_md_documents_rules_path "$1" '\.agents/rules'
+}
+
+# Pre-#637 AGENTS.md still documents `.cursor/rules` — accepted during rollout.
+rp_agents_md_documents_legacy_cursor_rules() {
+  rp_agents_md_documents_rules_path "$1" '\.cursor/rules'
 }
 
 # A CLAUDE.md shim: a Claude Code `@AGENTS.md` import line, OR the marker text a
@@ -2491,7 +2679,7 @@ rp_check_agent_bootstrap() {
   local fetch_ec=0
   local sym_rc=0
 
-  # 1. AGENTS.md must exist and document the .cursor/rules startup contract; both
+  # 1. AGENTS.md must exist and document the .agents/rules startup contract; both
   #    a missing file and a missing contract line FAIL strict/new-repo (#575/#579).
   fetch_ec=0
   agents_text="$(rp_fetch_github_text_file "$slug" "$rp_agent_bootstrap_agents_path")" || fetch_ec=$?
@@ -2512,18 +2700,30 @@ rp_check_agent_bootstrap() {
     if [[ "$rp_suggest" -eq 1 ]]; then
       rp_log_suggest "${slug}: add AGENTS.md at the repo root (see scripts/lib/repo-practices-agents/agents-md-startup-section.md)"
     fi
-  elif ! rp_agents_md_documents_cursor_rules "$agents_text"; then
-    # Every org repo's AGENTS.md now carries the session-startup .cursor/rules
-    # line (#580 tightened this probe; the last loosely-worded ones were re-synced),
-    # so a missing one FAILs strict/new-repo like the shim checks (repository-helpers#579).
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+  elif rp_agents_md_documents_cursor_rules "$agents_text"; then
+    : # canonical .agents/rules startup line present
+  elif rp_agents_md_documents_legacy_cursor_rules "$agents_text"; then
+    # #637 SUGGEST-during-rollout: legacy .cursor/rules startup still satisfies
+    # the pre-migration contract under --strict-onboarding; FAIL only --new-repo.
+    if [[ "$rp_new_repo" -eq 1 ]]; then
       repo_fail=1
       rp_log_check_fail "$slug" \
-        'AGENTS.md must instruct the agent to load .cursor/rules/*.mdc at session start' \
+        'AGENTS.md must instruct the agent to load .agents/rules/*.md at session start' \
         "$(rp_github_url "$slug" '/blob/main/AGENTS.md')"
     fi
     if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest "${slug}: AGENTS.md needs a session-startup line telling the agent to also load .cursor/rules/*.mdc (snippet: scripts/lib/repo-practices-agents/agents-md-startup-section.md)"
+      rp_log_suggest "${slug}: migrate AGENTS.md session-startup from .cursor/rules to .agents/rules/*.md (snippet: scripts/lib/repo-practices-agents/agents-md-startup-section.md; repository-helpers#637)"
+    fi
+  else
+    # No positive read/load of either rules path — FAIL strict/new-repo (#575/#579).
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'AGENTS.md must instruct the agent to load .agents/rules/*.md at session start' \
+        "$(rp_github_url "$slug" '/blob/main/AGENTS.md')"
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: AGENTS.md needs a session-startup line telling the agent to also load .agents/rules/*.md (snippet: scripts/lib/repo-practices-agents/agents-md-startup-section.md)"
     fi
   fi
 
@@ -2612,16 +2812,27 @@ rp_check_agent_bootstrap() {
   return "$repo_fail"
 }
 
+readonly rp_remote_timeouts_retries_agents_path='.agents/rules/remote-timeouts-retries.md'
 readonly rp_remote_timeouts_retries_path='.cursor/rules/remote-timeouts-retries.mdc'
 
 rp_remote_timeouts_retries_template() {
   local path
 
+  path="${rp_lib_dir}/repo-practices-agents/rules/remote-timeouts-retries.md"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing agents rule template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat remote-timeouts-retries agents template" -- cat "$path"
+}
+
+rp_remote_timeouts_retries_shim_template() {
+  local path
+
   path="${rp_lib_dir}/repo-practices-cursor/remote-timeouts-retries.mdc"
   if [[ ! -f "$path" ]]; then
-    rp_die "internal error: missing cursor rule template: ${path}"
+    rp_die "internal error: missing cursor shim template: ${path}"
   fi
-  rp_runner_exec_stdout "repo-practices cat remote-timeouts-retries template" -- cat "$path"
+  rp_runner_exec_stdout "repo-practices cat remote-timeouts-retries shim template" -- cat "$path"
 }
 
 rp_remote_timeouts_retries_content_for_apply_fix() {
@@ -2631,9 +2842,9 @@ rp_remote_timeouts_retries_content_for_apply_fix() {
   if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
     repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
     if [[ -n "$repo_dir" ]]; then
-      local_path="${repo_dir}/${rp_remote_timeouts_retries_path}"
+      local_path="${repo_dir}/${rp_remote_timeouts_retries_agents_path}"
       if [[ -f "$local_path" ]]; then
-        rp_runner_exec_stdout "repo-practices cat local remote-timeouts-retries" -- \
+        rp_runner_exec_stdout "repo-practices cat local remote-timeouts-retries agents" -- \
           cat "$local_path"
         return 0
       fi
@@ -2642,9 +2853,24 @@ rp_remote_timeouts_retries_content_for_apply_fix() {
   rp_remote_timeouts_retries_template
 }
 
-# True when the cursor rule requires explicit timeouts on remote calls, bounded
-# retries for transient failures (Retry-After / cap / budget), and documents
-# anti-patterns (alwaysApply org rule).
+rp_remote_timeouts_retries_shim_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_remote_timeouts_retries_path}"
+      if [[ -f "$local_path" ]]; then
+        rp_runner_exec_stdout "repo-practices cat local remote-timeouts-retries shim" -- \
+          cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_remote_timeouts_retries_shim_template
+}
+
 rp_remote_timeouts_retries_is_valid() {
   local -r text="$1"
   local stripped tmp
@@ -2734,124 +2960,102 @@ rp_remote_timeouts_retries_is_valid() {
   return 0
 }
 
-# Missing or invalid markers FAIL under --new-repo and --strict-onboarding — the
-# org roll-out (#570/#572) is complete, so the daily enforcer's strict run stays
-# green. A plain --all / --suggest run (no --strict-onboarding) still only SUGGESTs.
-# Prefer local dogfood when auditing THIS repo.
 rp_check_remote_timeouts_retries() {
   local slug="$1"
   local repo_fail=0
-  local rule_text repo_dir local_path
-  local fetch_ec=0
+  local agents_text shim_text
+  local agents_ec=0 shim_ec=0
+  local agents_ok=0
 
-  # Prefer the local dogfood copy when auditing this repo from a clone/worktree
-  # (new-rule PRs are not on origin/main yet; GitHub Contents would false-fail).
-  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
-    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
-    if [[ -n "$repo_dir" ]]; then
-      local_path="${repo_dir}/${rp_remote_timeouts_retries_path}"
-      if [[ -f "$local_path" ]]; then
-        rule_text="$(rp_runner_exec_stdout "repo-practices cat local remote-timeouts-retries check" -- \
-          cat "$local_path")"
-      fi
-    fi
+  rp_fetch_org_rule_text "$slug" "${rp_remote_timeouts_retries_agents_path}" \
+    'remote-timeouts-retries agents' agents_text agents_ec
+  rp_fetch_org_rule_text "$slug" "${rp_remote_timeouts_retries_path}" \
+    'remote-timeouts-retries shim' shim_text shim_ec
+
+  if [[ -n "$agents_text" ]] && rp_remote_timeouts_retries_is_valid "$agents_text"; then
+    agents_ok=1
   fi
-  if [[ -z "${rule_text:-}" ]]; then
-    rule_text="$(rp_fetch_github_text_file "$slug" "$rp_remote_timeouts_retries_path")" \
-      || fetch_ec=$?
-  fi
-  if (( fetch_ec == 2 )); then
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      rp_log_gh_api_fail "$slug" "could not read ${rp_remote_timeouts_retries_path}"
-      return 1
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: retry remote-timeouts-retries rule check after GitHub API recovers"
-    else
-      rp_log_warn \
-        "${slug}: could not read ${rp_remote_timeouts_retries_path} (GitHub API error); skipping check"
-    fi
-    return 0
-  fi
-  if [[ -z "$rule_text" ]]; then
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      repo_fail=1
-      rp_log_check_fail "$slug" \
-        'remote-timeouts-retries cursor rule (.cursor/rules/remote-timeouts-retries.mdc)' \
-        "$(rp_github_url "$slug" '/new/main/.cursor/rules/remote-timeouts-retries.mdc')"
-    fi
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_remote_timeouts_retries_path" \
-        "$(rp_remote_timeouts_retries_content_for_apply_fix "$slug")" \
-        'add-remote-timeouts-retries' \
-        'chore: add remote-timeouts-retries cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: add .cursor/rules/remote-timeouts-retries.mdc (template: scripts/lib/repo-practices-cursor/)"
-    fi
-  elif ! rp_remote_timeouts_retries_is_valid "$rule_text"; then
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      repo_fail=1
-      rp_log_check_fail "$slug" \
-        'remote-timeouts-retries rule must require explicit timeouts on remote calls, bounded retries for transient failures, and document anti-patterns (alwaysApply: true)' \
-        "$(rp_github_url "$slug" "/blob/main/${rp_remote_timeouts_retries_path}")"
-    fi
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_remote_timeouts_retries_path" \
-        "$(rp_remote_timeouts_retries_content_for_apply_fix "$slug")" \
-        'sync-remote-timeouts-retries' \
-        'chore: sync remote-timeouts-retries cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: sync .cursor/rules/remote-timeouts-retries.mdc to require timeouts and bounded retries on remote I/O"
-    fi
-  else
-    rp_log_check_ok "$slug" 'remote-timeouts-retries cursor rule' \
-      "$(rp_github_url "$slug" "/blob/main/${rp_remote_timeouts_retries_path}")"
-  fi
+
+  rp_org_agents_rule_dual_path_outcome \
+    "$slug" 'remote-timeouts-retries' \
+    "${rp_remote_timeouts_retries_agents_path}" "${rp_remote_timeouts_retries_path}" \
+    "$agents_text" "$shim_text" "$agents_ec" "$shim_ec" \
+    "$agents_ok" 1 'remote-timeouts-retries rule must require explicit timeouts on remote calls, bounded retries for transient failures, and document anti-patterns (alwaysApply: true)' \
+    rp_remote_timeouts_retries_content_for_apply_fix \
+    rp_remote_timeouts_retries_shim_content_for_apply_fix \
+    'remote-timeouts-retries' 'remote-timeouts-retries agents rule + Cursor shim' || repo_fail=$?
 
   return "$repo_fail"
 }
 
+readonly rp_github_api_throttle_agents_path='.agents/rules/github-api-throttle.md'
 readonly rp_github_api_throttle_rule_path='.cursor/rules/github-api-throttle.mdc'
 
 rp_github_api_throttle_rule_url() {
   rp_github_url "${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}" \
-    "/blob/main/${rp_github_api_throttle_rule_path}"
+    "/blob/main/${rp_github_api_throttle_agents_path}"
 }
 
-# The razor-thin `gh`-only cursor rule (repository-helpers#608): agent flows that
-# shell out to `gh` route it through scripts/gh-api so primary/secondary
-# rate-limit backoff is automatic. Consumers carry a breadcrumb copy (URL to the
-# canonical rule), not the copied body — same shape as stacking-tool.mdc.
+# Canonical agents template (URL-substituted). Consumers get the breadcrumb body;
+# this-repo dogfood prefers the local `.agents/rules/` copy.
 rp_github_api_throttle_rule_template() {
   local path url
 
-  path="${rp_lib_dir}/repo-practices-cursor/github-api-throttle.mdc"
+  path="${rp_lib_dir}/repo-practices-agents/rules/github-api-throttle.md"
   url="$(rp_github_api_throttle_rule_url)"
   if [[ ! -f "$path" ]]; then
-    rp_die "internal error: missing cursor rule template: ${path}"
+    rp_die "internal error: missing agents rule template: ${path}"
   fi
   runner_exec_stdout "repo-practices github-api-throttle template url" -- \
     sed -e "s|@@GH_API_THROTTLE_RULE_URL@@|${url}|g" "$path"
 }
 
-# Always the breadcrumb template (URL-substituted). Unlike the fuller rules, the
-# repository-helpers dogfood copy is *not* the consumer artifact — consumers get
-# the thin pointer — so there is no "prefer local copy" branch here. Takes the
-# slug for call-site symmetry with the other *_content_for_apply_fix helpers.
+rp_github_api_throttle_shim_template() {
+  local path
+
+  path="${rp_lib_dir}/repo-practices-cursor/github-api-throttle.mdc"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing cursor shim template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat github-api-throttle shim template" -- cat "$path"
+}
+
 rp_github_api_throttle_rule_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_github_api_throttle_agents_path}"
+      if [[ -f "$local_path" ]]; then
+        rp_runner_exec_stdout "repo-practices cat local github-api-throttle agents" -- \
+          cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
   rp_github_api_throttle_rule_template
 }
 
-# True when the rule is alwaysApply, names scripts/gh-api reached via
-# REPOSITORY_HELPERS_DIR, mandates routing `gh` through the wrapper (does not
-# merely permit it or forbid it), and (for consumers) carries the canonical
-# breadcrumb URL. Prose checks run on newline-flattened text so a permissive
-# sentence cannot hide from `grep -E` on a separate physical line.
+rp_github_api_throttle_shim_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_github_api_throttle_rule_path}"
+      if [[ -f "$local_path" ]]; then
+        rp_runner_exec_stdout "repo-practices cat local github-api-throttle shim" -- \
+          cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_github_api_throttle_shim_template
+}
+
 rp_github_api_throttle_rule_is_valid() {
   local -r text="$1"
   local -r slug="${2:-}"
@@ -2906,104 +3110,62 @@ rp_github_api_throttle_rule_is_valid() {
   fi
   # Consumers: breadcrumb comment or a github blob URL to the canonical rule.
   grep -qE \
-    'github-api-throttle-canonical:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.cursor/rules/github-api-throttle\.mdc' \
+    'github-api-throttle-canonical:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.agents/rules/github-api-throttle\.md' \
     <<<"$text"
 }
 
-# repository-helpers#608 roll-out complete (Part A #614; Part B — all 12 org repos
-# carry the breadcrumb). Now FAILs under --strict-onboarding / --new-repo like the
-# #570 / #588 ratchet endpoints: a missing or stale rule is a hard failure for
-# onboarding / new repos. A routine --all / --suggest run (no strict flag) still
-# only SUGGESTs, so the guidance keeps landing softly on any repo that drifts.
+# repository-helpers#608 + #637 dual-path: SUGGEST-during-rollout for missing
+# agents file; invalid content / bad shim FAIL under --new-repo / --strict.
 rp_check_github_api_throttle() {
   local slug="$1"
   local repo_fail=0
-  local rule_text fetch_ec=0 repo_dir local_path
+  local agents_text shim_text
+  local agents_ec=0 shim_ec=0
+  local agents_ok=0
 
-  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
-    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
-    if [[ -n "$repo_dir" ]]; then
-      local_path="${repo_dir}/${rp_github_api_throttle_rule_path}"
-      if [[ -f "$local_path" ]]; then
-        rule_text="$(rp_runner_exec_stdout "repo-practices cat local github-api-throttle" -- \
-          cat "$local_path")"
-      fi
-    fi
-  fi
-  if [[ -z "${rule_text:-}" ]]; then
-    rule_text="$(rp_fetch_github_text_file "$slug" "$rp_github_api_throttle_rule_path")" \
-      || fetch_ec=$?
-  fi
-  if (( fetch_ec == 2 )); then
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      rp_log_gh_api_fail "$slug" "could not read ${rp_github_api_throttle_rule_path}"
-      return 1
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: retry github-api-throttle rule check after GitHub API recovers"
-    else
-      rp_log_warn \
-        "${slug}: could not read ${rp_github_api_throttle_rule_path} (GitHub API error); skipping check"
-    fi
-    return 0
+  rp_fetch_org_rule_text "$slug" "$rp_github_api_throttle_agents_path" \
+    'github-api-throttle agents' agents_text agents_ec
+  rp_fetch_org_rule_text "$slug" "$rp_github_api_throttle_rule_path" \
+    'github-api-throttle shim' shim_text shim_ec
+
+  if [[ -n "$agents_text" ]] && rp_github_api_throttle_rule_is_valid "$agents_text" "$slug"; then
+    agents_ok=1
   fi
 
-  if [[ -z "$rule_text" ]]; then
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      repo_fail=1
-      rp_log_check_fail "$slug" \
-        'github-api-throttle cursor rule (.cursor/rules/github-api-throttle.mdc)' \
-        "$(rp_github_url "$slug" '/new/main/.cursor/rules/github-api-throttle.mdc')"
-    fi
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_github_api_throttle_rule_path" \
-        "$(rp_github_api_throttle_rule_content_for_apply_fix "$slug")" \
-        'add-github-api-throttle-rule' \
-        'chore: add github-api-throttle cursor rule (repository-helpers#608)'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: add .cursor/rules/github-api-throttle.mdc — route agent gh calls through scripts/gh-api (repository-helpers#608; template: scripts/lib/repo-practices-cursor/)"
-    fi
-    return "$repo_fail"
-  fi
+  rp_org_agents_rule_dual_path_outcome \
+    "$slug" 'github-api-throttle' \
+    "$rp_github_api_throttle_agents_path" "$rp_github_api_throttle_rule_path" \
+    "$agents_text" "$shim_text" "$agents_ec" "$shim_ec" \
+    "$agents_ok" 1 \
+    'github-api-throttle rule must be alwaysApply and route agent gh calls through scripts/gh-api via REPOSITORY_HELPERS_DIR (consumers: canonical breadcrumb URL)' \
+    rp_github_api_throttle_rule_content_for_apply_fix \
+    rp_github_api_throttle_shim_content_for_apply_fix \
+    'github-api-throttle-rule' 'github-api-throttle agents rule + Cursor shim' || repo_fail=$?
 
-  if ! rp_github_api_throttle_rule_is_valid "$rule_text" "$slug"; then
-    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
-      repo_fail=1
-      rp_log_check_fail "$slug" \
-        'github-api-throttle rule must be alwaysApply and route agent gh calls through scripts/gh-api via REPOSITORY_HELPERS_DIR (consumers: canonical breadcrumb URL)' \
-        "$(rp_github_url "$slug" "/blob/main/${rp_github_api_throttle_rule_path}")"
-    fi
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_github_api_throttle_rule_path" \
-        "$(rp_github_api_throttle_rule_content_for_apply_fix "$slug")" \
-        'sync-github-api-throttle-rule' \
-        'chore: sync github-api-throttle cursor rule (repository-helpers#608)'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: sync .cursor/rules/github-api-throttle.mdc to the breadcrumb template (alwaysApply; scripts/gh-api via REPOSITORY_HELPERS_DIR; canonical URL)"
-    fi
-    return "$repo_fail"
-  fi
-
-  rp_log_check_ok "$slug" 'github-api-throttle cursor rule' \
-    "$(rp_github_url "$slug" "/blob/main/${rp_github_api_throttle_rule_path}")"
-  return 0
+  return "$repo_fail"
 }
 
+readonly rp_repo_practices_after_config_change_agents_path='.agents/rules/repo-practices-after-config-change.md'
 readonly rp_repo_practices_after_config_change_path='.cursor/rules/repo-practices-after-config-change.mdc'
 
 rp_repo_practices_after_config_change_template() {
   local path
 
+  path="${rp_lib_dir}/repo-practices-agents/rules/repo-practices-after-config-change.md"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing agents rule template: ${path}"
+  fi
+  rp_runner_exec_stdout "repo-practices cat repo-practices-after-config-change agents template" -- cat "$path"
+}
+
+rp_repo_practices_after_config_change_shim_template() {
+  local path
+
   path="${rp_lib_dir}/repo-practices-cursor/repo-practices-after-config-change.mdc"
   if [[ ! -f "$path" ]]; then
-    rp_die "internal error: missing cursor rule template: ${path}"
+    rp_die "internal error: missing cursor shim template: ${path}"
   fi
-  rp_runner_exec_stdout "repo-practices cat repo-practices-after-config-change template" -- cat "$path"
+  rp_runner_exec_stdout "repo-practices cat repo-practices-after-config-change shim template" -- cat "$path"
 }
 
 rp_repo_practices_after_config_change_content_for_apply_fix() {
@@ -3013,9 +3175,10 @@ rp_repo_practices_after_config_change_content_for_apply_fix() {
   if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
     repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
     if [[ -n "$repo_dir" ]]; then
-      local_path="${repo_dir}/${rp_repo_practices_after_config_change_path}"
+      local_path="${repo_dir}/${rp_repo_practices_after_config_change_agents_path}"
       if [[ -f "$local_path" ]]; then
-        cat "$local_path"
+        rp_runner_exec_stdout "repo-practices cat local repo-practices-after-config-change agents" -- \
+          cat "$local_path"
         return 0
       fi
     fi
@@ -3023,7 +3186,24 @@ rp_repo_practices_after_config_change_content_for_apply_fix() {
   rp_repo_practices_after_config_change_template
 }
 
-# True when the cursor rule documents github-repo-lint after config/workflow edits.
+rp_repo_practices_after_config_change_shim_content_for_apply_fix() {
+  local slug="$1"
+  local repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_repo_practices_after_config_change_path}"
+      if [[ -f "$local_path" ]]; then
+        rp_runner_exec_stdout "repo-practices cat local repo-practices-after-config-change shim" -- \
+          cat "$local_path"
+        return 0
+      fi
+    fi
+  fi
+  rp_repo_practices_after_config_change_shim_template
+}
+
 rp_repo_practices_after_config_change_is_valid() {
   local -r text="$1"
 
@@ -3045,49 +3225,27 @@ rp_repo_practices_after_config_change_is_valid() {
 rp_check_repo_practices_after_config_change() {
   local slug="$1"
   local repo_fail=0
-  local rule_text
-  local fetch_ec=0
+  local agents_text shim_text
+  local agents_ec=0 shim_ec=0
+  local agents_ok=0
 
-  rule_text="$(rp_fetch_github_text_file "$slug" "$rp_repo_practices_after_config_change_path")" \
-    || fetch_ec=$?
-  if (( fetch_ec == 2 )); then
-    rp_log_gh_api_fail "$slug" "could not read ${rp_repo_practices_after_config_change_path}"
-    return 1
+  rp_fetch_org_rule_text "$slug" "${rp_repo_practices_after_config_change_agents_path}" \
+    'repo-practices-after-config-change agents' agents_text agents_ec
+  rp_fetch_org_rule_text "$slug" "${rp_repo_practices_after_config_change_path}" \
+    'repo-practices-after-config-change shim' shim_text shim_ec
+
+  if [[ -n "$agents_text" ]] && rp_repo_practices_after_config_change_is_valid "$agents_text"; then
+    agents_ok=1
   fi
-  if [[ -z "$rule_text" ]]; then
-    repo_fail=1
-    rp_log_check_fail "$slug" \
-      'repo-practices-after-config-change cursor rule (.cursor/rules/repo-practices-after-config-change.mdc)' \
-      "$(rp_github_url "$slug" '/new/main/.cursor/rules/repo-practices-after-config-change.mdc')"
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_repo_practices_after_config_change_path" \
-        "$(rp_repo_practices_after_config_change_content_for_apply_fix "$slug")" \
-        'add-repo-practices-after-config-change' \
-        'chore: add repo-practices-after-config-change cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: add .cursor/rules/repo-practices-after-config-change.mdc (template: scripts/lib/repo-practices-cursor/)"
-    fi
-  elif ! rp_repo_practices_after_config_change_is_valid "$rule_text"; then
-    repo_fail=1
-    rp_log_check_fail "$slug" \
-      'repo-practices-after-config-change rule must be a scoped rule (alwaysApply: false, globs) documenting github-repo-lint --strict-onboarding, --apply-fix, web/pnpm-workspace.yaml, .cursor/rules/**, and uv.lock @.name.value jsonpath' \
-      "$(rp_github_url "$slug" "/blob/main/${rp_repo_practices_after_config_change_path}")"
-    if [[ "$rp_apply_fix" -eq 1 ]]; then
-      rp_queue_candidate_file_fix "$slug" "$rp_repo_practices_after_config_change_path" \
-        "$(rp_repo_practices_after_config_change_content_for_apply_fix "$slug")" \
-        'sync-repo-practices-after-config-change' \
-        'chore: sync repo-practices-after-config-change cursor rule'
-    fi
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: sync .cursor/rules/repo-practices-after-config-change.mdc to document github-repo-lint after config/workflow edits"
-    fi
-  else
-    rp_log_check_ok "$slug" 'repo-practices-after-config-change cursor rule' \
-      "$(rp_github_url "$slug" "/blob/main/${rp_repo_practices_after_config_change_path}")"
-  fi
+
+  rp_org_agents_rule_dual_path_outcome \
+    "$slug" 'repo-practices-after-config-change' \
+    "${rp_repo_practices_after_config_change_agents_path}" "${rp_repo_practices_after_config_change_path}" \
+    "$agents_text" "$shim_text" "$agents_ec" "$shim_ec" \
+    "$agents_ok" 0 'repo-practices-after-config-change rule must be a scoped rule (alwaysApply: false, globs) documenting github-repo-lint --strict-onboarding, --apply-fix, web/pnpm-workspace.yaml, .cursor/rules/**, and uv.lock @.name.value jsonpath' \
+    rp_repo_practices_after_config_change_content_for_apply_fix \
+    rp_repo_practices_after_config_change_shim_content_for_apply_fix \
+    'repo-practices-after-config-change' 'repo-practices-after-config-change agents rule + Cursor shim' || repo_fail=$?
 
   return "$repo_fail"
 }
@@ -5117,6 +5275,8 @@ rp_resolve_local_repo_dir() {
 rp_candidate_fix_path_is_api_eligible() {
   local -r path="$1"
 
+  [[ "$path" == .agents/rules/* ]] && return 0
+  [[ "$path" == .agents/skills/* ]] && return 0
   [[ "$path" == .cursor/rules/* ]] && return 0
   [[ "$path" == '.github/stacking-tool' ]] && return 0
   [[ "$path" == 'CLAUDE.md' ]] && return 0
@@ -5322,46 +5482,102 @@ EOF
   return 1
 }
 
+readonly rp_agents_rules_gitignore_probe_path='.agents/rules/pr-ship-and-review.md'
+readonly rp_agents_skills_gitignore_probe_path='.agents/skills/ship-and-review/SKILL.md'
 readonly rp_cursor_rules_gitignore_probe_path='.cursor/rules/pr-ship-and-review.mdc'
 
-# True when gitignore text would ignore .cursor/rules/ without !.cursor/rules/ and !.cursor/rules/**.
-rp_gitignore_text_blocks_cursor_rules() {
+# True when gitignore text would ignore DIR (e.g. .cursor/rules) without
+# !DIR/ and !DIR/** un-ignores. DIR is like '.cursor/rules' or '.agents/rules'.
+rp_gitignore_text_blocks_dir() {
   local text="$1"
+  local -r dir="$2"
+  local parent dir_re parent_re
 
   [[ -n "$text" ]] || return 1
-  if grep -qE '^/?\.cursor/rules(/|\*|$)|^/?\.cursor/rules/\*\*' <<<"$text"; then
+  # Escape '.' for ERE so '.cursor/rules' matches literally.
+  dir_re="${dir//./\.}"
+  if grep -qE "^/?${dir_re}(/|\*|$)|^/?${dir_re}/\*\*" <<<"$text"; then
     return 0
   fi
-  if ! grep -qE '^/?\.cursor(/$|/\*$|$)' <<<"$text"; then
+  parent="${dir%/*}"
+  if [[ "$parent" == "$dir" ]]; then
     return 1
   fi
-  if grep -qF '!.cursor/rules/' <<<"$text" && grep -qF '!.cursor/rules/**' <<<"$text"; then
+  parent_re="${parent//./\.}"
+  if ! grep -qE "^/?${parent_re}(/$|/\*$|$)" <<<"$text"; then
+    return 1
+  fi
+  if grep -qF "!${dir}/" <<<"$text" && grep -qF "!${dir}/**" <<<"$text"; then
     return 1
   fi
   return 0
+}
+
+# True when gitignore text would ignore .cursor/rules/ without !.cursor/rules/ and !.cursor/rules/**.
+rp_gitignore_text_blocks_cursor_rules() {
+  rp_gitignore_text_blocks_dir "$1" '.cursor/rules'
+}
+
+rp_gitignore_text_blocks_agents_rules() {
+  rp_gitignore_text_blocks_dir "$1" '.agents/rules'
+}
+
+rp_gitignore_text_blocks_agents_skills() {
+  rp_gitignore_text_blocks_dir "$1" '.agents/skills'
+}
+
+# Fail when a probe path is ignored; used by rp_check_cursor_rules_gitignore.
+rp_gitignore_probe_path_fail() {
+  local slug="$1"
+  local label="$2"
+  local suggest="$3"
+
+  rp_log_check_fail "$slug" \
+    ".gitignore must not ignore ${label} (org agent rules/skills must be trackable)" \
+    "$(rp_github_url "$slug" '/blob/main/.gitignore')"
+  if [[ "$rp_suggest" -eq 1 ]]; then
+    rp_log_suggest "${slug}: ${suggest}"
+  fi
 }
 
 rp_check_cursor_rules_gitignore() {
   local slug="$1"
   local repo_fail=0
   local repo_dir gitignore_text
+  local ignore_exit_code=0
+  local blocked=0
 
   if repo_dir="$(rp_resolve_local_repo_dir "$slug" 2>/dev/null)"; then
-    local ignore_exit_code=0
+    ignore_exit_code=0
     runner_exec "repo-practices git check-ignore cursor rules" --probe \
       -- git -C "$repo_dir" check-ignore --no-index -q "$rp_cursor_rules_gitignore_probe_path" \
       || ignore_exit_code=$?
     if (( ignore_exit_code == 0 )); then
       repo_fail=1
-      rp_log_check_fail "$slug" \
-        '.gitignore must not ignore .cursor/rules/ (org cursor rules must be trackable)' \
-        "$(rp_github_url "$slug" '/blob/main/.gitignore')"
-      if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_suggest \
-          "${slug}: un-ignore .cursor/rules/ in .gitignore (e.g. .cursor/* with !.cursor/rules/ and !.cursor/rules/**)"
-      fi
-    else
-      rp_log_check_ok "$slug" '.cursor/rules/ is trackable in .gitignore' \
+      rp_gitignore_probe_path_fail "$slug" '.cursor/rules/' \
+        "un-ignore .cursor/rules/ in .gitignore (e.g. .cursor/* with !.cursor/rules/ and !.cursor/rules/**)"
+    fi
+    ignore_exit_code=0
+    runner_exec "repo-practices git check-ignore agents rules" --probe \
+      -- git -C "$repo_dir" check-ignore --no-index -q "$rp_agents_rules_gitignore_probe_path" \
+      || ignore_exit_code=$?
+    if (( ignore_exit_code == 0 )); then
+      repo_fail=1
+      rp_gitignore_probe_path_fail "$slug" '.agents/rules/' \
+        "un-ignore .agents/rules/ in .gitignore (e.g. .agents/* with !.agents/rules/ and !.agents/rules/**)"
+    fi
+    ignore_exit_code=0
+    runner_exec "repo-practices git check-ignore agents skills" --probe \
+      -- git -C "$repo_dir" check-ignore --no-index -q "$rp_agents_skills_gitignore_probe_path" \
+      || ignore_exit_code=$?
+    if (( ignore_exit_code == 0 )); then
+      repo_fail=1
+      rp_gitignore_probe_path_fail "$slug" '.agents/skills/' \
+        "un-ignore .agents/skills/ in .gitignore (e.g. .agents/* with !.agents/skills/ and !.agents/skills/**)"
+    fi
+    if [[ "$repo_fail" -eq 0 ]]; then
+      rp_log_check_ok "$slug" \
+        '.cursor/rules/ + .agents/rules/ + .agents/skills/ are trackable in .gitignore' \
         "$(rp_github_url "$slug" '/blob/main/.gitignore')"
     fi
     return "$repo_fail"
@@ -5369,21 +5585,32 @@ rp_check_cursor_rules_gitignore() {
 
   gitignore_text="$(rp_fetch_github_text_file "$slug" ".gitignore" || true)"
   if [[ -z "$gitignore_text" ]]; then
-    rp_log_check_ok "$slug" '.cursor/rules/ is trackable (.gitignore absent or no block)' \
+    rp_log_check_ok "$slug" \
+      '.cursor/rules/ + .agents/rules/ + .agents/skills/ are trackable (.gitignore absent or no block)' \
       "$(rp_github_url "$slug" '/blob/main/.gitignore')"
     return 0
   fi
+  blocked=0
   if rp_gitignore_text_blocks_cursor_rules "$gitignore_text"; then
+    blocked=1
+    rp_gitignore_probe_path_fail "$slug" '.cursor/rules/' \
+      "un-ignore .cursor/rules/ in .gitignore (e.g. .cursor/* with !.cursor/rules/ and !.cursor/rules/**)"
+  fi
+  if rp_gitignore_text_blocks_agents_rules "$gitignore_text"; then
+    blocked=1
+    rp_gitignore_probe_path_fail "$slug" '.agents/rules/' \
+      "un-ignore .agents/rules/ in .gitignore (e.g. .agents/* with !.agents/rules/ and !.agents/rules/**)"
+  fi
+  if rp_gitignore_text_blocks_agents_skills "$gitignore_text"; then
+    blocked=1
+    rp_gitignore_probe_path_fail "$slug" '.agents/skills/' \
+      "un-ignore .agents/skills/ in .gitignore (e.g. .agents/* with !.agents/skills/ and !.agents/skills/**)"
+  fi
+  if [[ "$blocked" -eq 1 ]]; then
     repo_fail=1
-    rp_log_check_fail "$slug" \
-      '.gitignore must not ignore .cursor/rules/ (org cursor rules must be trackable)' \
-      "$(rp_github_url "$slug" '/blob/main/.gitignore')"
-    if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: un-ignore .cursor/rules/ in .gitignore (e.g. .cursor/* with !.cursor/rules/ and !.cursor/rules/**)"
-    fi
   else
-    rp_log_check_ok "$slug" '.cursor/rules/ is trackable in .gitignore' \
+    rp_log_check_ok "$slug" \
+      '.cursor/rules/ + .agents/rules/ + .agents/skills/ are trackable in .gitignore' \
       "$(rp_github_url "$slug" '/blob/main/.gitignore')"
   fi
 
@@ -7250,17 +7477,18 @@ rp_print_new_repo_checklist() {
     Docs in the service repo:
       [ ] LICENSE with copyright notice
       [ ] CODEOWNERS with * @OWNER so all code requires CODEOWNER review
-      [ ] .cursor/rules/git-commit-identity.mdc (no agent/machine co-authors; signing incl. pinentry/passphrase + cli-config attribution; template in ${rp_THIS_REPO_NAME})
-      [ ] .cursor/rules/no-secret-exposure.mdc (never leak secrets into logs/PRs/commits; allowlist/existence; rotate if leaked; template in ${rp_THIS_REPO_NAME})
-      [ ] .cursor/rules/pr-ship-and-review.mdc (agent review loop; template in ${rp_THIS_REPO_NAME})
-      [ ] .cursor/rules/pre-pr-checks.mdc (format before check; no truncated output; template in ${rp_THIS_REPO_NAME})
-      [ ] .cursor/rules/read-agents-and-rules.mdc (session-start read AGENTS.md + rules; template in ${rp_THIS_REPO_NAME})
-      [ ] .cursor/rules/remote-timeouts-retries.mdc (explicit timeouts + bounded retries on remote I/O; template in ${rp_THIS_REPO_NAME})
-      [ ] .cursor/rules/repo-practices-after-config-change.mdc (run github-repo-lint after config/workflow edits; template in ${rp_THIS_REPO_NAME})
-      [ ] .gitignore must not ignore .cursor/rules/ (un-ignore if ignoring other .cursor content)
+      [ ] .agents/rules/git-commit-identity.md + .cursor/rules shim (no agent/machine co-authors; signing + cli-config; templates in ${rp_THIS_REPO_NAME})
+      [ ] .agents/rules/no-secret-exposure.md + .cursor/rules shim (never leak secrets; allowlist/existence; rotate if leaked)
+      [ ] .agents/rules/pr-ship-and-review.md + .cursor/rules shim (agent review loop)
+      [ ] .agents/rules/pre-pr-checks.md + .cursor/rules shim (format before check; no truncated output)
+      [ ] .agents/rules/read-agents-and-rules.md + .cursor/rules shim (session-start read AGENTS.md + .agents/rules)
+      [ ] .agents/rules/remote-timeouts-retries.md + .cursor/rules shim (timeouts + bounded retries)
+      [ ] .agents/rules/repo-practices-after-config-change.md + .cursor/rules shim (github-repo-lint after config edits)
+      [ ] .agents/rules/github-api-throttle.md + .cursor/rules shim (route agent gh via scripts/gh-api)
+      [ ] .gitignore must not ignore .cursor/rules/, .agents/rules/, or .agents/skills/
       [ ] .github/stacking-tool (graphite|gh-stack)
       [ ] secret-audit intake ledger entry after clean TruffleHog deep scan (scripts/secret-audit --repo OWNER/NAME --write-marker; docs/secret-audit-trufflehog.md)
-      [ ] .cursor/rules/stacking-tool.mdc (thin marker rule; template in ${rp_THIS_REPO_NAME})
+      [ ] .agents/rules/stacking-tool.md + .cursor/rules shim (marker-aware stacking rule)
       [ ] AGENTS.md + pr-ship submit block match the marker (no leftover Graphite-only gt/merge-it when gh-stack)
       [ ] No root GRAPHITE.md when marker is gh-stack (skill in ${rp_THIS_REPO_NAME} is SSOT)
       [ ] GitHub merge queue / auto-merge flow (AGENTS.md — use gh pr merge --auto --squash, not merge-it)

@@ -395,7 +395,7 @@ also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
 | Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |
 | Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
 | License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
-| Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` + `.cursor/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve |
+| Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` + `.agents/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve |
 | Pre-PR checks cursor rule | yes* | — | `.cursor/rules/pre-pr-checks.mdc`: format before check + no truncated output; consumer repos resolve `scripts/dev/` via the repository-helpers clone (#579) (*missing, invalid, or bare-path FAILS `--new-repo` / `--strict-onboarding` (#575/#579); routine `--all` / `--suggest` emits SUGGEST and succeeds) |
 | Git commit identity cursor rule | yes | — | `.cursor/rules/git-commit-identity.mdc` forbids agent/machine co-authors; agents must verify commit signing (`commit.gpgsign` / `user.signingkey`, pinentry-mac / passphrase / per-machine keys / clearsign probe) and `~/.cursor/cli-config.json` attribution, and surface setup instructions when either is missing |
 | No secret exposure cursor rule | yes* | — | `.cursor/rules/no-secret-exposure.mdc`: never leak secrets into logs/transcripts/PRs/commits; allowlist or path-existence when inspecting config; rotate if leaked (*missing or invalid FAILS `--new-repo` / `--strict-onboarding` (#575); routine `--all` / enforcer SUGGEST-only) |
@@ -534,8 +534,8 @@ non-convergence cap).
 
 See [AGENTS.md](AGENTS.md) for coding conventions, utility index, and agent-review
 details; [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc) for
-backend selection; [`.cursor/skills/ship-and-review/SKILL.md`](.cursor/skills/ship-and-review/SKILL.md)
-for the full review playbook; skills under `.cursor/skills/{graphite,gh-stack}/`.
+backend selection; [`.agents/skills/ship-and-review/SKILL.md`](.agents/skills/ship-and-review/SKILL.md)
+for the full review playbook; skills under `.agents/skills/{graphite,gh-stack}/`.
 
 ## Testing
 
