@@ -65,7 +65,9 @@ Do not start the agent review loop or treat the PR as merge-ready while CI is re
 
 ## 5. Agent review loop
 
-Follow **`.cursor/rules/pr-ship-and-review.mdc`** (also summarized in [AGENTS.md](../../AGENTS.md#agent-review-after-submit)).
+Follow **`.agents/rules/pr-ship-and-review.md`** (also summarized in
+[AGENTS.md](../../AGENTS.md#agent-review-after-submit); Cursor shim
+`.cursor/rules/pr-ship-and-review.mdc`).
 
 Prefer the built-in loop over manual `wait` / `check` iteration:
 

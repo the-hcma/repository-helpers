@@ -186,7 +186,7 @@ scripts/github-repo-lint --all --org the-hcma               # every repo in the 
 scripts/github-repo-lint --apply-fix --repo OWNER/NAME      # patch settings + candidate workflow PRs
 ```
 
-CI (`.github/workflows/github-repo-lint.yml`) runs the same `--all --strict-onboarding --compact` audit only when a PR changes `.cursor/rules/**`, `.github/workflows/github-repo-lint.yml`, `scripts/github-repo-lint`, `scripts/lib/repo-practices-cursor/**`, or `scripts/lib/repo-practices`. Path filters skip the workflow (and the approval prompt) otherwise. When it does run, environment **`github-repo-lint`** waits to unlock **`REPO_LINT_TOKEN`**.
+CI (`.github/workflows/github-repo-lint.yml`) runs the same `--all --strict-onboarding --compact` audit only when a PR changes `.agents/rules/**`, `.agents/skills/**`, `.cursor/rules/**`, `.github/workflows/github-repo-lint.yml`, `scripts/github-repo-lint`, `scripts/lib/repo-practices-agents/**`, `scripts/lib/repo-practices-cursor/**`, or `scripts/lib/repo-practices`. Path filters skip the workflow (and the approval prompt) otherwise. When it does run, environment **`github-repo-lint`** waits to unlock **`REPO_LINT_TOKEN`**.
 
 CI (`.github/workflows/dep-updater.yml`) runs `scripts/dep-updater-ci-org-dry-run` (clone org repos, then `dep-updater --batch --all --dry-run --include-private`) only when a PR changes `.github/workflows/dep-updater.yml`, `scripts/dep-updater`, `scripts/dep-updater-batch-run`, `scripts/dep-updater-ci-org-dry-run`, `scripts/dep-updater-notifier`, or `scripts/lib/release-age-defaults`. Path filters skip the workflow (and the approval prompt) otherwise. When it does run, environment **`dep-updater`** waits to unlock **`DEP_UPDATER_TOKEN`** (same access as local `gh`; set from `gh auth token`).
 
@@ -255,13 +255,14 @@ When flipping `.github/stacking-tool` (or landing an MQ / `gh-stack` cutover PR)
 
 1. Update `AGENTS.md` stacking and merge guidance to match the marker (GitHub auto-merge:
    `gh pr merge --auto --squash` — not `merge-it`).
-2. Rewrite `.cursor/rules/pr-ship-and-review.mdc` submit block to the marker-aware template
-   in `scripts/lib/repo-practices-cursor/pr-ship-and-review.mdc` (or document both backends
-   gated on the marker — never leave a Graphite-only `gt create` / `gt submit` snippet when
-   the marker is `gh-stack`).
+2. Rewrite `.agents/rules/pr-ship-and-review.md` submit block to the marker-aware template
+   in `scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md` (or document both
+   backends gated on the marker — never leave a Graphite-only `gt create` / `gt submit`
+   snippet when the marker is `gh-stack`; keep a thin `.cursor/rules/pr-ship-and-review.mdc`
+   shim).
 3. Delete root `GRAPHITE.md` when switching to `gh-stack` (canonical skills live here).
-4. Keep `.cursor/rules/stacking-tool.mdc` aligned with
-   `scripts/lib/repo-practices-cursor/stacking-tool.mdc`.
+4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) aligned with
+   `scripts/lib/repo-practices-agents/rules/stacking-tool.md`.
 5. Run `scripts/github-repo-lint --repo OWNER/NAME --suggest --strict-onboarding` and clear
    stacking-docs consistency findings (`--apply-fix` can rewrite pr-ship; AGENTS /
    `GRAPHITE.md` are usually human-driven).

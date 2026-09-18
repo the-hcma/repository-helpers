@@ -5,10 +5,12 @@ alwaysApply: true
 
 # Pre-PR checks (required)
 
-Before **`gt submit`** or opening a PR in this repository:
+Before **`scripts/dev/submit-stack`** or opening a PR in this repository:
 
 1. Run **`scripts/dev/pre-pr-checks`** from the feature worktree (must exit 0).
-   - Prefer **`scripts/dev/submit-stack`** instead of bare `gt submit` (runs checks, then `gt submit --publish --no-interactive`).
+   - Prefer **`scripts/dev/submit-stack`** (marker-aware; runs checks, then
+     `gh stack submit` / `gt submit` per `.github/stacking-tool`) instead of a bare
+     submit command alone.
 
 2. Do **not** submit if pre-pr-checks failed or was skipped (including missing `shellcheck`,
    `rg`, failing `tests/*.test`, or a failing **secret-scan** when that job is planned).
@@ -18,7 +20,7 @@ Before **`gt submit`** or opening a PR in this repository:
 
 4. Scripts must not leave changes on the **primary (main) worktree**; pre-pr-checks verifies that automatically.
 
-Bare `gt submit` without a successful pre-pr-checks run is not acceptable unless the user explicitly overrides.
+Bare submit without a successful pre-pr-checks run is not acceptable unless the user explicitly overrides.
 
 ## Apply formatters before check (required)
 

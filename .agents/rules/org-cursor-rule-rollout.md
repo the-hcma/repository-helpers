@@ -119,9 +119,10 @@ report `complete_ready: true`.
 
 3. **CI** — `.github/workflows/github-repo-lint.yml` runs the full
    `--all --strict-onboarding --compact` org audit only when the PR changes
-   `.cursor/rules/**`, `.github/workflows/github-repo-lint.yml`,
-   `scripts/github-repo-lint`, `scripts/lib/repo-practices-cursor/**`, or
-   `scripts/lib/repo-practices`. Unrelated PRs skip the workflow. When it does run,
+   `.agents/rules/**`, `.agents/skills/**`, `.cursor/rules/**`,
+   `.github/workflows/github-repo-lint.yml`, `scripts/github-repo-lint`,
+   `scripts/lib/repo-practices-agents/**`, `scripts/lib/repo-practices-cursor/**`,
+   or `scripts/lib/repo-practices`. Unrelated PRs skip the workflow. When it does run,
    approve environment `github-repo-lint` on the operator's behalf to unlock
    `REPO_LINT_TOKEN`. With SUGGEST-during-roll-out missing rules, the audit can
    stay green while consumers adopt; invalid rules still fail.

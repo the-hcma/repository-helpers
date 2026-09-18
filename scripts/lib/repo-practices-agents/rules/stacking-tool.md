@@ -41,16 +41,19 @@ When flipping `.github/stacking-tool` (or landing an MQ/`gh-stack` cutover PR):
 
 1. Update `AGENTS.md` stacking/merge guidance to match the new marker (and GitHub
    auto-merge: `gh pr merge --auto --squash` — not `merge-it`).
-2. Rewrite `.cursor/rules/pr-ship-and-review.mdc` submit block to the marker-aware
-   template (or ensure it documents both backends gated on the marker).
+2. Rewrite `.agents/rules/pr-ship-and-review.md` submit block to the marker-aware
+   template in `scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md`
+   (or ensure it documents both backends gated on the marker; keep a thin
+   `.cursor/rules/pr-ship-and-review.mdc` shim).
 3. Delete root `GRAPHITE.md` when switching to `gh-stack` (canonical skill lives in
    repository-helpers).
-4. Keep `.cursor/rules/stacking-tool.mdc` in sync with the consumer template.
+4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) in sync with the consumer
+   template.
 5. Re-run `scripts/github-repo-lint --repo OWNER/NAME --suggest --strict-onboarding`
    and fix stacking-docs consistency findings.
 
 ## Unchanged regardless of marker
 
 Agent review, CI wait, and reply-before-resolve still follow
-`.cursor/rules/pr-ship-and-review.mdc` and the canonical ship-and-review skill in
+`.agents/rules/pr-ship-and-review.md` and the canonical ship-and-review skill in
 repository-helpers.
