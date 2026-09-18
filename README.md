@@ -441,12 +441,15 @@ readable copy under `~/.config/share/systemd-units/` for `scripts/show-services`
 
 **Opt-out:** a repo that manages its own systemd convention (system-scope units, a
 different placeholder set, a host-guard library, etc.) ships its own executable
-`scripts/setup-service`. That file is self-documenting signal to skip generic
+`scripts/setup-service` whose **content differs** from this repo's generic helper
+(`cmp -s`). A byte-identical copy (e.g. another worktree of repository-helpers)
+is not an opt-out. Differing content is self-documenting signal to skip generic
 user-scope adoption — `start-development --refresh` and this repo's
 `scripts/setup-service` become no-ops for that checkout (repository-helpers#630).
-Same rule applies when a wrapper sets `GITHUB_REPO_LINT_SERVICE_UNIT` (e.g.
-`scripts/setup-github-repo-lint`): a foreign `scripts/setup-service` still wins.
-Details: [docs/SYSTEMD.md](docs/SYSTEMD.md#opting-out-repos-with-their-own-systemd-convention).
+`GITHUB_REPO_LINT_SERVICE_UNIT` (e.g. `scripts/setup-github-repo-lint`) only
+selects a unit basename on the generic path; the content-diff opt-out is checked
+first and still wins. Details:
+[docs/SYSTEMD.md](docs/SYSTEMD.md#opting-out-repos-with-their-own-systemd-convention).
 
 For service repositories, provide an executable `scripts/on-deploy` hook:
 
