@@ -313,8 +313,15 @@ local clones for workflow candidate stacks; it does not gate the daily audit.
 ```
 
 The wrapper uses `setup-service` with the `github-repo-lint` unit
-template. It does not run from `scripts/dev/start-development`; installation is
-explicit.
+template (`GITHUB_REPO_LINT_SERVICE_UNIT=github-repo-lint`). It does not run from
+`scripts/dev/start-development`; installation is explicit.
+
+That override only selects which unit basename to install for **this** repo's
+generic path. A consumer checkout that ships its own executable
+`scripts/setup-service` still opts out of generic adoption entirely (see
+**Opting out** above) — `setup-github-repo-lint` / `GITHUB_REPO_LINT_SERVICE_UNIT`
+cannot force-install user-scope copies of a foreign convention
+(repository-helpers#630 / #632).
 
 The service unit has **no `[Install]` section** — only `github-repo-lint.timer`
 starts it (`OnCalendar=04:00`). Re-run `./scripts/setup-github-repo-lint` after
