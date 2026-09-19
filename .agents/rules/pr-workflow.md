@@ -1,0 +1,111 @@
+---
+description: End-to-end PR workflow — worktree, checks, Copilot, babysit
+alwaysApply: true
+---
+
+# PR workflow (repository-helpers)
+
+**Stacking tool:** read `.github/stacking-tool` first (see `.cursor/rules/stacking-tool.mdc`).
+This repo trials **`gh-stack`**; use `gh stack` / `.agents/skills/gh-stack/SKILL.md` instead of
+`gt create` when the marker is `gh-stack`. Prefer `scripts/dev/submit-stack` either way.
+
+Follow this sequence for every PR unless the user explicitly overrides.
+
+## 1. Worktree and branch
+
+From the **repository root** (not the primary clone for edits):
+
+```bash
+scripts/dev/start-development --worktree <stack-name> --no-interactive
+cd .worktrees/<stack-name>-wt
+# graphite (org default — use when .github/stacking-tool is graphite):
+gt create <stack-name>/<topic> -m 'feat: …'
+# gh-stack (when .github/stacking-tool is gh-stack):
+# gh stack init <stack-name>/<topic>
+```
+
+Never implement on the main worktree (see `main-worktree-off-limits.mdc`).
+
+## 2. Implement and verify locally
+
+```bash
+scripts/dev/pre-pr-checks
+```
+
+Must exit 0 before submit. Note the `==> pre-pr-checks passed` line for the PR Test plan.
+
+## 3. Submit
+
+Prefer:
+
+```bash
+scripts/dev/submit-stack
+```
+
+Not bare `gt submit` without pre-pr-checks.
+
+## 4. Post-submit CI (monitor after every push)
+
+```bash
+scripts/dev/post-pr-submission-checks --pr <number>
+```
+
+**Required for coding agents:** wait until required checks on the **current PR head** are green. On failure, the script prints **`==> CI failure details for coding agent`** with filtered log lines — fix those in the worktree, re-run `pre-pr-checks`, push, and repeat until CI passes.
+
+When a check is **WAITING** on a protected environment (`github-repo-lint`,
+`dep-updater`), **approve it on the operator's behalf** — `gh` is the operator.
+`post-pr-submission-checks` calls `scripts/dev/approve-pending-deployments`.
+Do not wait for a human to click Approve in the Actions UI.
+If that prints **`ERROR: ENVIRONMENT_APPROVAL_FAILED`**, raise it to the operator
+immediately — do not keep waiting.
+
+`scripts/dev/submit-stack` runs this automatically (waits by default). Use `--no-wait-ci` only when monitoring separately.
+
+Do not start the agent review loop or treat the PR as merge-ready while CI is red.
+
+## 5. Agent review loop
+
+Follow **`.agents/rules/pr-ship-and-review.md`** (also summarized in
+[AGENTS.md](../../AGENTS.md#agent-review-after-submit); Cursor shim
+`.cursor/rules/pr-ship-and-review.mdc`).
+
+Prefer the built-in loop over manual `wait` / `check` iteration:
+
+```bash
+scripts/wait-for-agent-review loop --pr <number>
+```
+
+Or end-to-end from submit:
+
+```bash
+scripts/dev/ship-and-review
+```
+
+Manual steps when triaging exit **3** (threads lack a human reply):
+
+```bash
+scripts/trigger-agent-review --pr <number>
+scripts/wait-for-agent-review wait --pr <number> --timeout 300
+scripts/wait-for-agent-review check --pr <number>
+scripts/wait-for-agent-review complete --pr <number>   # when complete_ready
+```
+
+## 6. Babysit until merge-ready
+
+Until merge-ready:
+
+1. Triage agent / Bugbot comments — fix valid issues, then push (`git commit` +
+   `gh stack submit --auto` when the marker is `gh-stack`, or `gt modify` when it is
+   `graphite`).
+2. Re-run `scripts/dev/pre-pr-checks` after fixes.
+3. Re-run `scripts/dev/post-pr-submission-checks --pr <number>` and fix any CI failures surfaced in the agent log report.
+4. Resolve merge conflicts if base moved (`gh stack rebase` / `gh stack sync` when
+   `gh-stack`; `gt sync` / `gt restack` when `graphite`; or
+   `scripts/wait-for-agent-review restack`).
+
+Do not merge manually; org default is GitHub merge queue (Enable auto-merge /
+`gh pr merge --auto --squash`). Do not use `merge-it` to land PRs.
+
+## 7. Notify user
+
+When the PR is green and review feedback is addressed, summarize for the user: PR URL, what changed, CI status, and any remaining manual steps (e.g. deploy on a host).

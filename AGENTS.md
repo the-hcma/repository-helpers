@@ -9,12 +9,18 @@ This file defines the non-negotiable standards for all contributors (human or AI
 At the **start of every agent session**, before acting from assumed conventions:
 
 1. Read this `AGENTS.md` in full.
-2. Read every rule under `.cursor/rules/*.mdc` with `alwaysApply: true` in its
+2. Read every rule under `.agents/rules/*.md` with `alwaysApply: true` in its
    front matter, plus any rule whose `globs` match files you will touch.
-   `AGENTS.md` and `.cursor/rules/` together are the contract — neither alone is complete.
+   `AGENTS.md` and `.agents/rules/` together are the contract — neither alone is
+   complete. `.cursor/rules/*.mdc` files are Cursor injection shims only (frontmatter
+   + pointer to the matching `.agents/rules/` file); do not treat the shim body as
+   the rule.
 
 `CLAUDE.md` (a `@AGENTS.md` import) and `.github/copilot-instructions.md` are thin
 shims so Claude Code and Copilot reach this same guidance — do not put rules in them.
+
+Skills live under `.agents/skills/<name>/SKILL.md` (Cursor and other harnesses that
+follow [agentskills.io](https://agentskills.io) discover that path).
 
 ---
 
@@ -180,7 +186,7 @@ scripts/github-repo-lint --all --org the-hcma               # every repo in the 
 scripts/github-repo-lint --apply-fix --repo OWNER/NAME      # patch settings + candidate workflow PRs
 ```
 
-CI (`.github/workflows/github-repo-lint.yml`) runs the same `--all --strict-onboarding --compact` audit only when a PR changes `.cursor/rules/**`, `.github/workflows/github-repo-lint.yml`, `scripts/github-repo-lint`, `scripts/lib/repo-practices-cursor/**`, or `scripts/lib/repo-practices`. Path filters skip the workflow (and the approval prompt) otherwise. When it does run, environment **`github-repo-lint`** waits to unlock **`REPO_LINT_TOKEN`**.
+CI (`.github/workflows/github-repo-lint.yml`) runs the same `--all --strict-onboarding --compact` audit only when a PR changes `.agents/rules/**`, `.agents/skills/**`, `.cursor/rules/**`, `.github/stacking-tool`, `.github/workflows/github-repo-lint.yml`, `scripts/github-repo-lint`, `scripts/lib/repo-practices-agents/**`, `scripts/lib/repo-practices-cursor/**`, or `scripts/lib/repo-practices`. Path filters skip the workflow (and the approval prompt) otherwise. When it does run, environment **`github-repo-lint`** waits to unlock **`REPO_LINT_TOKEN`**.
 
 CI (`.github/workflows/dep-updater.yml`) runs `scripts/dep-updater-ci-org-dry-run` (clone org repos, then `dep-updater --batch --all --dry-run --include-private`) only when a PR changes `.github/workflows/dep-updater.yml`, `scripts/dep-updater`, `scripts/dep-updater-batch-run`, `scripts/dep-updater-ci-org-dry-run`, `scripts/dep-updater-notifier`, or `scripts/lib/release-age-defaults`. Path filters skip the workflow (and the approval prompt) otherwise. When it does run, environment **`dep-updater`** waits to unlock **`DEP_UPDATER_TOKEN`** (same access as local `gh`; set from `gh auth token`).
 
@@ -210,23 +216,23 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |
 | Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
 | License / copyright / CODEOWNERS | yes | — | Top-level LICENSE with copyright notice; `.github/CODEOWNERS` with org owner |
-| Agent review cursor rule | yes | — | `.cursor/rules/pr-ship-and-review.mdc` + `.cursor/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve |
-| Pre-PR checks cursor rule | yes* | — | `.cursor/rules/pre-pr-checks.mdc`: format before check + no truncated output; **consumer** repos must resolve `scripts/dev/` through the repository-helpers clone (`${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}`), not a bare repo-relative path (#579) (*missing, invalid, or bare-path FAILS `--new-repo` / `--strict-onboarding` (#575/#579); routine `--all` / `--suggest` emits SUGGEST and succeeds) |
-| Git commit identity cursor rule | yes | — | `.cursor/rules/git-commit-identity.mdc` forbids agent/machine co-authors; agents must verify commit signing (`commit.gpgsign` / `user.signingkey`, pinentry-mac / passphrase / per-machine keys / clearsign probe) and `~/.cursor/cli-config.json` attribution, and surface setup instructions when either is missing |
-| No secret exposure cursor rule | yes* | — | `.cursor/rules/no-secret-exposure.mdc`: never leak secrets into logs/transcripts/PRs/commits; allowlist or path-existence when inspecting config; rotate if leaked (*missing or invalid FAILS `--new-repo` / `--strict-onboarding` (#575); routine `--all` / enforcer SUGGEST-only) |
-| Remote timeouts and retries cursor rule | yes* | — | `.cursor/rules/remote-timeouts-retries.mdc`: explicit timeouts on every remote call; bounded retries for transient failures only (`Retry-After` / cap / budget); anti-patterns for no-timeout calls and `while True` retries (*missing or invalid FAILS `--new-repo` / `--strict-onboarding`; routine `--all` / `--suggest` emits SUGGEST and succeeds) |
-| GitHub API throttle rule | yes* | — | `.cursor/rules/github-api-throttle.mdc`: agent flows that shell out to `gh` run it via `"${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/gh-api"` so primary/secondary rate-limit backoff is automatic; consumers carry a **breadcrumb + canonical URL**, not a copied body (same shape as `stacking-tool.mdc`) (*missing or invalid FAILS `--new-repo` / `--strict-onboarding` (repository-helpers#608, org-wide rollout complete); routine `--all` / `--suggest` emits SUGGEST and succeeds) |
-| Repo practices after config change | yes | — | `.cursor/rules/repo-practices-after-config-change.mdc` requires `github-repo-lint` after workflow/config edits; `pre-pr-checks` runs detect-first `repo-practices-lint` when the diff touches those paths |
-| Session-start read guidance | yes | — | `.cursor/rules/read-agents-and-rules.mdc` requires reading `AGENTS.md` and `.cursor/rules/` at the start of every new agent session |
-| Agent bootstrap (agent-agnostic) | yes* | — | `AGENTS.md` at root + a session-startup line telling the agent to load `.cursor/rules/*.mdc`; `CLAUDE.md` (an `@AGENTS.md` import, or a symlink to `AGENTS.md`) and `.github/copilot-instructions.md` shims so Claude Code / Copilot reach the same guidance (templates in `scripts/lib/repo-practices-agents/`) (*missing `AGENTS.md` / startup line / `CLAUDE.md` / copilot shim FAILS `--new-repo` / `--strict-onboarding` (#575/#579); routine `--all` / `--suggest` emits SUGGEST and succeeds) |
+| Agent review agents rule | yes* | — | `.agents/rules/pr-ship-and-review.md` + thin `.cursor/rules/*.mdc` shim + `.agents/skills/ship-and-review/SKILL.md` reference `wait-for-agent-review` and reply-before-resolve (*missing agents layout FAILS only `--new-repo` during #637 rollout / SUGGEST under `--strict-onboarding`; invalid agents body or invalid shim FAILS `--new-repo` / `--strict-onboarding`; legacy full-body `.mdc` with no `.agents/rules/<name>.md` SUGGEST migrate under `--strict-onboarding` / FAILS `--new-repo`; when the canonical agents rule exists but the `.mdc` is still a full body, the invalid-shim FAIL applies) |
+| Pre-PR checks agents rule | yes* | — | `.agents/rules/pre-pr-checks.md` (+ Cursor shim): format before check + no truncated output; **consumer** repos must resolve `scripts/dev/` through the repository-helpers clone (`${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}`), not a bare repo-relative path (#579) (*same #637 dual-path severity as agent-review; bare-path FAILS `--new-repo` / `--strict-onboarding` (#575/#579); routine `--all` / `--suggest` emits SUGGEST and succeeds) |
+| Git commit identity agents rule | yes* | — | `.agents/rules/git-commit-identity.md` (+ Cursor shim) forbids agent/machine co-authors; agents must verify commit signing (`commit.gpgsign` / `user.signingkey`, pinentry-mac / passphrase / per-machine keys / clearsign probe) and `~/.cursor/cli-config.json` attribution (*#637 dual-path severity) |
+| No secret exposure agents rule | yes* | — | `.agents/rules/no-secret-exposure.md` (+ Cursor shim): never leak secrets into logs/transcripts/PRs/commits; allowlist or path-existence when inspecting config; rotate if leaked (*#637 dual-path + #575) |
+| Remote timeouts and retries agents rule | yes* | — | `.agents/rules/remote-timeouts-retries.md` (+ Cursor shim): explicit timeouts on every remote call; bounded retries for transient failures only (*#637 dual-path severity) |
+| GitHub API throttle rule | yes* | — | `.agents/rules/github-api-throttle.md` (+ Cursor shim): agent flows that shell out to `gh` run it via `"${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/gh-api"`; consumers carry a **breadcrumb + canonical URL**, not a copied body (*#637 dual-path; repository-helpers#608) |
+| Repo practices after config change | yes* | — | `.agents/rules/repo-practices-after-config-change.md` (+ Cursor shim) requires `github-repo-lint` after workflow/config edits; `pre-pr-checks` runs detect-first `repo-practices-lint` when the diff touches those paths (*#637 dual-path) |
+| Session-start read guidance | yes* | — | `.agents/rules/read-agents-and-rules.md` (+ Cursor shim) requires reading `AGENTS.md` and `.agents/rules/` at the start of every new agent session (*#637 dual-path) |
+| Agent bootstrap (agent-agnostic) | yes* | — | `AGENTS.md` at root + a session-startup line telling the agent to load `.agents/rules/*.md`; `CLAUDE.md` (an `@AGENTS.md` import, or a symlink to `AGENTS.md`) and `.github/copilot-instructions.md` shims so Claude Code / Copilot reach the same guidance (templates in `scripts/lib/repo-practices-agents/`) (*missing `AGENTS.md` / startup line / `CLAUDE.md` / copilot shim FAILS `--new-repo` / `--strict-onboarding` (#575/#579); routine `--all` / `--suggest` emits SUGGEST and succeeds) |
 | Agent-bootstrap shims trackable | yes | — | `.gitignore` must not ignore `CLAUDE.md` or `.github/copilot-instructions.md` (mirrors the `.cursor/rules/` guard) (#575) |
 | Secret-audit intake ledger | yes | — | Host-local `~/scratch/repository-helpers/secret-audit-intake.json` (not a git file; nightly-maintained): no entry FAILS `--new-repo` / `--strict-onboarding` (#575); stale/invalid/corrupt FAILS `--new-repo` / `--strict-onboarding`; ledger absent (CI runner) SUGGEST-only (TruffleHog deep scan — see [docs/secret-audit-trufflehog.md](./docs/secret-audit-trufflehog.md)) |
-| Stacking-tool marker + rule | yes | — | `.github/stacking-tool` (`graphite`\|`gh-stack`) and thin `.cursor/rules/stacking-tool.mdc` (skill breadcrumbs; no copied skill bodies) |
+| Stacking-tool marker + rule | yes* | — | `.github/stacking-tool` (`graphite`\|`gh-stack`) and `.agents/rules/stacking-tool.md` + thin Cursor shim (skill breadcrumbs under `.agents/skills/`; no copied skill bodies) (*#637 dual-path) |
 | Stacking docs consistency | yes | — | When marker is `gh-stack`, fail if `pr-ship-and-review.mdc` still has Graphite-only `gt create`/`gt submit`, or if root `GRAPHITE.md` remains; suggest (non-failing) if `AGENTS.md` still prescribes Graphite/`gt`/`merge-it` without `gh stack`. Graphite marker gets a soft suggest if docs are gh-stack-only. Skips this repo (dual SSOT). Cutover checklist: `.cursor/rules/stacking-tool.mdc` |
 | UV Python CVE check | yes | — | `uv.lock` + `pyproject.toml` repos require canonical `.github/workflows/cve-check.yml` |
 | UV + Release Please lock sync | yes | — | uv + `release-please.yml` repos require `release-please-config` `extra-files` bumping `uv.lock` via `@.name.value` jsonpath ([release-please#2561](https://github.com/googleapis/release-please/issues/2561)) |
 | Python static CI job | yes | — | Python (`pyproject.toml` + ruff) repos run ruff check/format + typecheck in one `Python lint & format checks` job via `.github/ci/python-static`; no split `Ruff`/`Pyright`/`Mypy`/`Backend Lint` jobs in **any** `.github/workflows/*`; cutover aliases must gate on `needs.python-static.result == 'success'` (or share conclusion via `aliases:` / `steps.*.outcome`) — see `.cursor/rules/python-static-ci-job.mdc` |
-| `.cursor/rules` gitignore | yes | — | `.gitignore` must not block `.cursor/rules/` |
+| `.cursor/rules` / `.agents/rules` / `.agents/skills` gitignore | yes | — | `.gitignore` must not block `.cursor/rules/`, `.agents/rules/`, or `.agents/skills/` |
 | Dependabot release age | yes | — | `cooldown` on every `dependabot.yml` updates entry (`release-age-defaults`) |
 | pnpm release age | yes | — | `minimumReleaseAge` in `pnpm-workspace.yaml` when present |
 | pnpm Corepack CI | yes | — | Exact `packageManager: pnpm@X.Y.Z` when lockfile exists; no `pnpm/action-setup` / `setup-node` `cache: pnpm`; use org composite `actions/setup-pnpm-corepack` (pin SHA on `main`; see section below) |
@@ -240,7 +246,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 
 `--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via the stacking backend selected by `.github/stacking-tool` (`graphite` or `gh-stack`; org default `graphite` when the marker is missing) in the target repo clone.
 
-See [`.cursor/skills/graphite/SKILL.md`](.cursor/skills/graphite/SKILL.md) for Graphite **stacking** (`gt`) when `.github/stacking-tool` is `graphite`. This repo trials **`gh-stack`** — see [`.cursor/skills/gh-stack/SKILL.md`](.cursor/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc). Stacking is separate from merge enqueue (GitHub MQ).
+See [`.agents/skills/graphite/SKILL.md`](.agents/skills/graphite/SKILL.md) for Graphite **stacking** (`gt`) when `.github/stacking-tool` is `graphite`. This repo trials **`gh-stack`** — see [`.agents/skills/gh-stack/SKILL.md`](.agents/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc). Stacking is separate from merge enqueue (GitHub MQ).
 
 ### Stacking-tool marker cutover checklist
 
@@ -249,28 +255,33 @@ When flipping `.github/stacking-tool` (or landing an MQ / `gh-stack` cutover PR)
 
 1. Update `AGENTS.md` stacking and merge guidance to match the marker (GitHub auto-merge:
    `gh pr merge --auto --squash` — not `merge-it`).
-2. Rewrite `.cursor/rules/pr-ship-and-review.mdc` submit block to the marker-aware template
-   in `scripts/lib/repo-practices-cursor/pr-ship-and-review.mdc` (or document both backends
-   gated on the marker — never leave a Graphite-only `gt create` / `gt submit` snippet when
-   the marker is `gh-stack`).
+2. Rewrite `.agents/rules/pr-ship-and-review.md` submit block to the marker-aware template
+   (copy via `github-repo-lint --apply-fix`, or from
+   `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md`
+   / https://github.com/the-hcma/repository-helpers/blob/main/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md;
+   or document both backends gated on the marker — never leave a Graphite-only
+   `gt create` / `gt submit` snippet when the marker is `gh-stack`; keep a thin
+   `.cursor/rules/pr-ship-and-review.mdc` shim).
 3. Delete root `GRAPHITE.md` when switching to `gh-stack` (canonical skills live here).
-4. Keep `.cursor/rules/stacking-tool.mdc` aligned with
-   `scripts/lib/repo-practices-cursor/stacking-tool.mdc`.
+4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) aligned with
+   `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/stacking-tool.md`
+   (same blob URL under `repository-helpers` `main`).
 5. Run `scripts/github-repo-lint --repo OWNER/NAME --suggest --strict-onboarding` and clear
    stacking-docs consistency findings (`--apply-fix` can rewrite pr-ship; AGENTS /
    `GRAPHITE.md` are usually human-driven).
 
 ### Lexicographic code organization (org Cursor rule)
 
-Canonical rule: [`.cursor/rules/lexicographic-code-organization.mdc`](.cursor/rules/lexicographic-code-organization.mdc)
+Canonical rule: [`.agents/rules/lexicographic-code-organization.md`](.agents/rules/lexicographic-code-organization.md)
 (public block then private `_` block; ASCII sort within each; sorted closed-set literals such as
 `frozenset` / enum members).
 
-Consumer repos should **copy** that file into their `.cursor/rules/` (or symlink it from a local
-`repository-helpers` clone). Ensure `.gitignore` does not ignore `.cursor/rules/` (same policy as
-other org cursor rules). Prefer `github-repo-lint --apply-fix` (uses
-`scripts/lib/repo-practices-cursor/repo-practices-after-config-change.mdc`) or copy
-that template into `.cursor/rules/`.
+Consumer repos should **copy** that file into their `.agents/rules/` (plus a thin
+`.cursor/rules/*.mdc` shim) or symlink from a local `repository-helpers` clone. Ensure
+`.gitignore` does not ignore `.agents/rules/` or `.cursor/rules/` (same policy as other
+org agent rules). Prefer `github-repo-lint --apply-fix` (uses
+`scripts/lib/repo-practices-agents/rules/` + `scripts/lib/repo-practices-cursor/` shims)
+or copy those templates.
 
 ### `protect-main` ruleset (required)
 
@@ -561,7 +572,7 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 
 ## Commits, Stacking & Pull Requests
 
-> See [`.cursor/skills/graphite/SKILL.md`](.cursor/skills/graphite/SKILL.md) for the full Graphite workflow reference when `.github/stacking-tool` is `graphite` (branch naming, stack creation, navigation, submission, troubleshooting, and advanced rebasing). For this repo (`gh-stack`), see [`.cursor/skills/gh-stack/SKILL.md`](.cursor/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc).
+> See [`.agents/skills/graphite/SKILL.md`](.agents/skills/graphite/SKILL.md) for the full Graphite workflow reference when `.github/stacking-tool` is `graphite` (branch naming, stack creation, navigation, submission, troubleshooting, and advanced rebasing). For this repo (`gh-stack`), see [`.agents/skills/gh-stack/SKILL.md`](.agents/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc).
 
 - Stacking backend is selected by `.github/stacking-tool` (`graphite` or `gh-stack`). Prefer **`scripts/dev/submit-stack`** (dispatches via `scripts/lib/stacking-tool`).
 - Never work directly on `main`. Create stack layers with `gh stack init` / `gh stack add` when the marker is `gh-stack`, or `gt create` when it is `graphite`.
@@ -602,7 +613,7 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 
 After every push, **`scripts/dev/post-pr-submission-checks --pr <n>`** must pass (CI green on the PR head). `scripts/dev/submit-stack` and `scripts/dev/ship-and-review` invoke this by default.
 
-When CI is green, follow **`.cursor/skills/ship-and-review/SKILL.md`** (deep playbook) and the thin contract **`.cursor/rules/pr-ship-and-review.mdc`**:
+When CI is green, follow **`.agents/skills/ship-and-review/SKILL.md`** (deep playbook) and the thin contract **`.cursor/rules/pr-ship-and-review.mdc`**:
 
 1. Prefer **`./scripts/wait-for-agent-review loop --pr <n>`** (or `scripts/dev/ship-and-review` from submit).
 2. On exit **3**, triage feedback: fix → **`reply-thread`** / **`reply-comment`** → **`resolve-thread`** / **`resolve-comment`** — never resolve without replying first.
