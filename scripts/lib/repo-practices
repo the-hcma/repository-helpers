@@ -9259,13 +9259,14 @@ rp_check_github_security_settings() {
 }
 
 # ---------------------------------------------------------------------------
-# Actions hardening (repository-helpers#588): default_workflow_permissions
+# Actions hardening (repository-helpers#588 / #640): default_workflow_permissions
 # and can_approve_pull_request_reviews FAIL under --new-repo and
 # --strict-onboarding (SUGGEST-only in routine --all / --suggest); org-wide
 # rollout is complete (see .cursor/rules/org-cursor-rule-rollout.mdc).
-# allowed_actions and sha_pinning_required are SUGGEST-only always — there is
-# no safe default to auto-apply (an allowlist or SHA-pin requirement can
-# break existing workflows), so they are never promoted to FAIL.
+# allowed_actions stays SUGGEST-only always (no safe default allowlist).
+# sha_pinning_required stays SUGGEST-only for FAIL severity, but --apply-fix
+# enables it when every third-party workflow uses: is already SHA-pinned
+# (repository-helpers#640) — never blindly, so tag-pinned repos stay unbroken.
 # ---------------------------------------------------------------------------
 
 rp_fetch_actions_permissions() {
@@ -9278,6 +9279,32 @@ rp_fetch_actions_permissions_workflow() {
   local slug="$1"
   rp_gh_api_get_json "repo-practices gh actions permissions workflow" \
     "repos/${slug}/actions/permissions/workflow"
+}
+
+# rp_apply_actions_sha_pinning_required <slug>
+# PUT Actions permissions with sha_pinning_required=true, preserving enabled
+# and allowed_actions from the current settings.
+rp_apply_actions_sha_pinning_required() {
+  local slug="$1"
+  local perms_json payload
+  local fetch_ec=0 exit_code=0
+
+  perms_json="$(rp_fetch_actions_permissions "$slug")" || fetch_ec=$?
+  if (( fetch_ec != 0 )); then
+    rp_log_gh_api_fail "$slug" 'could not read Actions permissions before sha_pinning_required apply'
+    return 1
+  fi
+  payload="$(rp_runner_jq_file 'repo-practices actions sha_pinning_required payload' \
+    "$perms_json" \
+    '{
+      enabled: (.enabled // true),
+      allowed_actions: (.allowed_actions // "all"),
+      sha_pinning_required: true
+    }')"
+  rp_log_warn "${slug}: setting Actions sha_pinning_required=true"
+  rp_runner_gh_api_input "repo-practices gh put actions permissions sha_pinning" "$payload" \
+    -X PUT "repos/${slug}/actions/permissions" >/dev/null || exit_code=$?
+  (( exit_code == 0 ))
 }
 
 rp_apply_actions_workflow_permissions() {
@@ -9298,6 +9325,7 @@ rp_check_actions_hardening() {
   local strict=0
   local perms_json wf_json fetch_ec=0
   local allowed_actions sha_pin_required default_perms can_approve
+  local pin_ec=0
 
   if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
     strict=1
@@ -9356,8 +9384,23 @@ rp_check_actions_hardening() {
     rp_log_suggest \
       "${slug}: restrict Actions to github_owned_plus_verified or an explicit allowlist (currently: all)"
   fi
-  if [[ "$sha_pin_required" != 'true' && "$rp_suggest" -eq 1 ]]; then
-    rp_log_suggest "${slug}: consider requiring SHA pinning for Actions (sha_pinning_required)"
+  if [[ "$sha_pin_required" != 'true' ]]; then
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: consider requiring SHA pinning for Actions (sha_pinning_required)"
+    fi
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      pin_ec=0
+      rp_actions_workflows_all_uses_sha_pinned "$slug" || pin_ec=$?
+      if (( pin_ec == 0 )); then
+        rp_apply_actions_sha_pinning_required "$slug"
+      elif (( pin_ec == 2 )); then
+        rp_log_gh_api_fail "$slug" \
+          'could not verify workflow uses: pins before sha_pinning_required apply'
+      elif [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: skip sha_pinning_required until all third-party workflow uses: are SHA-pinned"
+      fi
+    fi
   fi
 
   if [[ "$repo_fail" -eq 0 ]]; then
@@ -9391,6 +9434,34 @@ rp_workflow_uses_refs() {
 rp_uses_ref_is_sha_pinned() {
   local -r ref="$1"
   [[ "$ref" =~ @[0-9a-f]{40}$ ]]
+}
+
+# rp_actions_workflows_all_uses_sha_pinned <slug>
+# Exit 0 when every third-party uses: is a full 40-char SHA (or there are none).
+# Exit 1 when any non-SHA pin remains. Exit 2 on workflow API read failure.
+rp_actions_workflows_all_uses_sha_pinned() {
+  local slug="$1"
+  local -a names=()
+  local name text fetch_ec ref
+
+  mapfile -t names < <(rp_fetch_workflow_file_names "$slug")
+  if [[ "${#names[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  for name in "${names[@]}"; do
+    fetch_ec=0
+    text="$(rp_fetch_github_text_file "$slug" ".github/workflows/${name}")" || fetch_ec=$?
+    if (( fetch_ec == 2 )); then
+      return 2
+    fi
+    [[ -n "$text" ]] || continue
+    while IFS= read -r ref; do
+      [[ -n "$ref" ]] || continue
+      rp_uses_ref_is_sha_pinned "$ref" || return 1
+    done < <(rp_workflow_uses_refs "$text")
+  done
+  return 0
 }
 
 # rp_workflow_is_publish_like <filename> <text>
