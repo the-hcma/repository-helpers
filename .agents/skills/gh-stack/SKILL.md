@@ -353,6 +353,25 @@ gh stack view --json
 
 If `sync` hits a conflict during this process, it restores all branches to their pre-rebase state and exits with code 3. See [Handle rebase conflicts](#handle-rebase-conflicts-agent-workflow) for the resolution workflow.
 
+### Merge queue and merged layers
+
+Working a multi-PR stack through GitHub's merge queue has sharp edges the rest of this skill does not cover. Prefer these patterns (repository-helpers#645):
+
+1. **Queue ejection cascades.** If the merge queue drops PR N (transient CI flake, etc.), PRs N+1 and up are often left open even when their own merge-group runs had passed. The dropped PR may show as `CLOSED`. Re-enqueue or recreate from the bottom of the remaining stack after fixing CI — do not assume upstack PRs will land on their own.
+2. **Closed PR whose base branch was deleted cannot be reopened.** `gh stack sync` may still print `PR #N … — Open` while the PR is frozen (`mergeStateStatus: DIRTY`, base = deleted branch). Recreate, do not reopen:
+   ```bash
+   gh stack submit --auto --open --remote origin
+   ```
+   That opens a fresh PR for the branch against `main` (or the current parent).
+3. **Prefer `gh stack sync` after any merge** before further rebases. A later `gh stack rebase --upstack` from a bottom branch can replay already-squash-merged commits (stale recorded base) and conflict. If that happens:
+   ```bash
+   gh stack rebase --abort
+   # Then move each remaining branch explicitly, bottom to top:
+   git rebase --onto <new-parent> <old-parent-tip> <branch>
+   ```
+4. **Lower-layer fixes rewrite every upstack SHA.** Review replies and PR bodies that cite commit SHAs go stale. Prefer citing the commit subject, or do one SHA-sync pass at the end.
+5. **Force-pushes cancel in-flight CI.** Status rollups may show old `CANCELLED` entries next to current runs. When polling, take the **latest run per check name** (not the first FAILURE/CANCELLED in the list).
+
 ### Handle rebase conflicts (agent workflow)
 
 ```bash
