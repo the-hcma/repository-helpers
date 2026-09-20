@@ -134,12 +134,14 @@ bash .github/ci/secret-scan
 The gitleaks tarball download is verified against a hardcoded SHA-256
 (`ci_secret_scan_sha256`, one per platform, from the release's
 `gitleaks_<ver>_checksums.txt`) before extraction — a swapped or tampered asset
-fails loudly. On a version bump, refresh the version **and** all four digests;
+fails loudly. On a version bump, refresh the version **and** all
+`ci_secret_scan_sha256` platform entries (linux/darwin/windows × x64/arm64);
 `github-repo-lint` flags a stale pin.
 
 Optional env: `GITLEAKS_BASE` / `GITLEAKS_HEAD` for a PR-diff scan,
 `GITLEAKS_VERSION` to override the pinned version (checksum check is then
-skipped), `CI_SECRET_SCAN_BIN_DIR` for a non-sudo install path. On a leak, the
+skipped), `CI_SECRET_SCAN_BIN_DIR` for a custom install path (defaults to
+`/usr/local/bin` on Unix, `~/.cache/repository-helpers/bin` on Windows). On a leak, the
 helper prints `ERROR: SECRET_SCAN_LEAK` with rotate / branch-quarantine guidance
 — do not push and hope CI catches it.
 
