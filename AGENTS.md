@@ -375,6 +375,14 @@ Pin by SHA for supply-chain integrity (repository-helpers may be public; treat t
 org composite action, not a “private action”). Dependabot does not always bump composite
 action SHAs automatically — plan periodic pin updates when the helper changes.
 
+**Nested `uses:` in composites (coding agents):** GitHub evaluates nested steps (e.g.
+`actions/cache` inside `setup-pnpm-corepack`) against the **consumer** repo’s
+`sha_pinning_required` setting. Tag pins like `@v6.1.0` inside the composite fail CI even
+when the consumer workflow only references this action by SHA. Always SHA-pin nested
+third-party `uses:` in `actions/*/action.yml`, and after fixing them bump every consumer’s
+`setup-pnpm-corepack@…` pin to the new `main` merge commit. Failure text looks like
+`The action actions/cache@… is not allowed … must be pinned to a full-length commit SHA`.
+
 **Path-filter gotcha:** CI path filters / “deps changed” gates that only watch
 `package.json` and `pnpm-lock.yaml` will **skip** pnpm install/check jobs on
 workflow-only adoption PRs (seen on [fpdf#464](https://github.com/the-hcma/fpdf/pull/464)).
