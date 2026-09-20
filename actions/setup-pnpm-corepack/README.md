@@ -24,6 +24,19 @@ Example (current `main` tip as of the merge of
 Dependabot may not auto-bump this composite SHA; refresh the pin periodically when the
 helper changes.
 
+### Nested `uses:` (agents / maintainers)
+
+Composite actions run nested `uses:` **in the calling repo's permission context**. When a
+consumer enables `sha_pinning_required`, GitHub rejects tag/branch refs inside this
+composite (e.g. `actions/cache@v6.1.0`) even if the consumer's own workflows are fully
+SHA-pinned. Keep every third-party `uses:` in `action.yml` on a **full-length commit SHA**
+(with a `# vX.Y.Z` comment). After changing nested pins here, bump consumer composite pins
+to a new `main` merge SHA — stale pins keep the old unpinned nested step.
+
+Symptom: CI fails early with
+`The action actions/cache@… is not allowed … must be pinned to a full-length commit SHA`
+on jobs that call `setup-pnpm-corepack`.
+
 ## Inputs
 
 | Input | Default | Description |
