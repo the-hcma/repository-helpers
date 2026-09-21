@@ -239,7 +239,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | `ci-secret-scan` gitleaks pin | yes* | — | Warn when `scripts/lib/ci-secret-scan` pins gitleaks (`ci_secret_scan_version` / `ci_secret_scan_sha256`) behind the release-age-eligible version (*this repo only) |
 | `ci-shellcheck` pin | yes* | — | Warn when `scripts/lib/ci-shellcheck` pins shellcheck (`ci_shellcheck_version` / `ci_shellcheck_sha256`) behind the release-age-eligible version (*this repo only) |
 | GitHub-native security settings | yes* | — | Dependabot alerts, Dependabot security updates, secret scanning + push protection (free on public repos, GHAS-gated on private — advisory only there), private vulnerability reporting; `--apply-fix` toggles each via the GitHub API (*enforceable (public-repo-available) settings FAIL under `--new-repo` and `--strict-onboarding`; private-repo advisory-only settings (secret scanning, private vulnerability reporting when GHAS-gated) always SUGGEST, never FAIL; routine `--all` / `--suggest` SUGGESTs throughout — org-wide rollout complete, repository-helpers#588) |
-| Actions hardening | yes* | — | `default_workflow_permissions: read` and `can_approve_pull_request_reviews: false` (`--apply-fix` sets both); `sha_pinning_required: true` when every third-party workflow `uses:` is already SHA-pinned (`--apply-fix` enables it under that gate — repository-helpers#640); `allowed_actions` is SUGGEST-only always (*workflow perms FAIL under `--new-repo` / `--strict-onboarding`; `sha_pinning_required` FAILs under those modes only when uses: are already SHA-pinned, else SUGGEST; routine `--all` / `--suggest` SUGGESTs — repository-helpers#588) |
+| Actions hardening | yes* | — | `default_workflow_permissions: read` and `can_approve_pull_request_reviews: false` (`--apply-fix` sets both); `sha_pinning_required: true` when every third-party workflow `uses:` is already SHA-pinned and any `setup-pnpm-corepack` pins have nested third-party `uses:` SHA-pinned too (`--apply-fix` enables it under that gate — repository-helpers#640 / #646); `allowed_actions` is SUGGEST-only always (*workflow perms FAIL under `--new-repo` / `--strict-onboarding`; `sha_pinning_required` FAILs under those modes only when uses: (and nested composite pins) are already SHA-pinned, else SUGGEST; routine `--all` / `--suggest` SUGGESTs — repository-helpers#588) |
 | Actions workflow `uses:` pinning | yes* | — | Third-party `uses:` refs pinned to a full commit SHA; a release/publish workflow (holds OIDC / write tokens) with a non-SHA pin is promoted past a generic suggestion (*generic non-SHA pins are SUGGEST always; release/publish workflow pins FAIL under `--new-repo` and `--strict-onboarding` — org-wide rollout complete, repository-helpers#588) |
 | Deployment environment protection | yes* | — | Any environment a workflow deploys to must have a protection rule (required reviewer) or a `deployment_branch_policy` (*missing FAILS `--new-repo` and `--strict-onboarding`; SUGGESTs in routine `--all` / `--suggest` — org-wide rollout complete, repository-helpers#588) |
 | Protection-mechanism consistency | yes | — | Advisory only: flags a genuine disagreement between classic `main` protection and the `protect-main` ruleset — this org runs both by design, so their coexistence is never itself flagged. `require_code_owner_reviews` is now enforced on both sides (repository-helpers#626), so this check is normally quiet (repository-helpers#588) |
@@ -367,9 +367,9 @@ Repos with `pnpm-lock.yaml` (root or `web/`) must:
 
 **Pin policy:** pin with a **full commit SHA that is on `main`** (a merge commit of this
 repo), not a PR branch tip or other unmerged SHA. Example (current `main` tip as of the
-merge of [#363](https://github.com/the-hcma/repository-helpers/pull/363)):
+merge of [#646](https://github.com/the-hcma/repository-helpers/pull/646)):
 
-`cde3063aa1e030fcac59bbf215131a3bd25d7908`
+`999844287d1b2684baa91c3e8a5b62eda9f4915e`
 
 Pin by SHA for supply-chain integrity (repository-helpers may be public; treat this as an
 org composite action, not a “private action”). Dependabot does not always bump composite
@@ -398,7 +398,7 @@ Root app:
 - uses: actions/setup-node@v6.4.0
   with:
     node-version: '24'
-- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@cde3063aa1e030fcac59bbf215131a3bd25d7908
+- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@999844287d1b2684baa91c3e8a5b62eda9f4915e
 - run: pnpm install --frozen-lockfile
 ```
 
@@ -409,7 +409,7 @@ Nested app (`packageManager` under `web/`):
 - uses: actions/setup-node@v6.4.0
   with:
     node-version: '24'
-- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@cde3063aa1e030fcac59bbf215131a3bd25d7908
+- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@999844287d1b2684baa91c3e8a5b62eda9f4915e
   with:
     working-directory: web
 - run: pnpm install --frozen-lockfile
