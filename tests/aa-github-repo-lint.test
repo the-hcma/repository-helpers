@@ -1067,11 +1067,36 @@ if [[ -f "$action_yml" ]] \
   && grep -q '^rp_validate_pnpm_ci_corepack()' "$lib" \
   && grep -qF 'rp_check_pnpm_corepack_ci' "$lib" \
   && grep -qF 'corepack prepare' "$action_yml" \
-  && grep -qE '^[[:space:]]*uses:[[:space:]]*actions/cache@[0-9a-f]{40}([[:space:]]|#|$)' "$action_yml"; then
+  && grep -qE '^[[:space:]]*uses:[[:space:]]*actions/cache@[0-9a-f]{40}([[:space:]]|#|$)' "$action_yml" \
+  && grep -q '^rp_helpers_setup_pnpm_corepack_nested_uses_sha_pinned()' "$lib" \
+  && grep -q '^rp_actions_workflows_setup_pnpm_nested_uses_sha_pinned()' "$lib"; then
   printf '[PASS] setup-pnpm-corepack action + repo-practices Corepack checks present\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] expected setup-pnpm-corepack action (SHA-pinned actions/cache) and rp_check_pnpm_corepack_ci wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: org composite actions nest only SHA-pinned third-party uses: ===\n'
+composite_pin_ok=1
+while IFS= read -r -d '' composite_yml; do
+  while IFS= read -r uses_line; do
+    [[ -z "$uses_line" ]] && continue
+    uses_ref="${uses_line#*uses:}"
+    uses_ref="${uses_ref#"${uses_ref%%[![:space:]]*}"}"
+    uses_ref="${uses_ref%%[[:space:]]*}"
+    uses_ref="${uses_ref%%#*}"
+    [[ "$uses_ref" == ./* || "$uses_ref" == docker://* ]] && continue
+    if [[ ! "$uses_ref" =~ @[0-9a-f]{40}$ ]]; then
+      printf '[FAIL] %s nested uses: not SHA-pinned: %s\n' "$composite_yml" "$uses_ref"
+      composite_pin_ok=0
+    fi
+  done < <(grep -E '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]#]+' "$composite_yml" || true)
+done < <(find "${rh_root}/actions" -name 'action.yml' -print0 2>/dev/null)
+if [[ "$composite_pin_ok" -eq 1 ]]; then
+  printf '[PASS] every third-party uses: in actions/*/action.yml is a full 40-char SHA\n'
+  pass=$(( pass + 1 ))
+else
   fail=$(( fail + 1 ))
 fi
 
@@ -1162,6 +1187,39 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -f "$pred_script"
+
+printf '\n=== unit: composite nested uses: SHA-pin predicates ===\n'
+nested_pred_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${nested_pred_dir}/runner-sessions"
+nested_pred_script="${nested_pred_dir}/nested-pred"
+# Fresh bash process (not a same-shell source) so release-age-defaults readonly
+# vars from earlier sections in this suite do not collide.
+cat >"$nested_pred_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck disable=SC1091
+source '${runner_bootstrap}'
+# shellcheck disable=SC1091
+source '${lib}'
+sha='55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
+pinned=\$'runs:\\n  using: composite\\n  steps:\\n    - uses: actions/cache@'\${sha}\$' # v6.1.0\\n'
+tag=\$'runs:\\n  using: composite\\n  steps:\\n    - uses: actions/cache@v6.1.0\\n'
+local_only=\$'runs:\\n  using: composite\\n  steps:\\n    - uses: ./local-helper\\n'
+rp_composite_action_all_nested_uses_sha_pinned "\$pinned"
+! rp_composite_action_all_nested_uses_sha_pinned "\$tag"
+rp_composite_action_all_nested_uses_sha_pinned "\$local_only"
+printf 'ok\\n'
+EOF
+nested_pred_out="$(bash "$nested_pred_script")" || nested_pred_out="fail:${nested_pred_out}"
+rm -rf "$nested_pred_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$nested_pred_out" == 'ok' ]]; then
+  printf '[PASS] composite nested uses: SHA-pin predicates (production helpers)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] composite nested uses: SHA-pin predicates (%s)\n' "$nested_pred_out"
+  fail=$(( fail + 1 ))
+fi
 
 printf '\n=== unit: helpers sha-on-main cache skips transient failures ===\n'
 sha_cache_script="$(mktemp)"
@@ -8158,6 +8216,7 @@ acth_out="$(
     # Ready-when-pinned gate: treat example-repo as fully SHA-pinned unless a
     # case overrides this mock.
     rp_actions_workflows_all_uses_sha_pinned() { return 0; }
+    rp_actions_workflows_setup_pnpm_nested_uses_sha_pinned() { return 0; }
 
     rc=0; out="$(rp_check_actions_hardening the-hcma/example-repo 2>&1)" || rc=$?
     { [[ "$rc" == 0 ]] \
@@ -8225,6 +8284,20 @@ acth_out="$(
     rp_apply_fix=0
     rp_suggest=1
     rp_actions_workflows_all_uses_sha_pinned() { return 0; }
+
+    # Stale setup-pnpm-corepack nested tags must not enable sha_pinning_required.
+    sha_applied=0
+    rp_actions_workflows_setup_pnpm_nested_uses_sha_pinned() { return 1; }
+    rp_apply_fix=1
+    out="$(
+      rp_check_actions_hardening the-hcma/example-repo 2>&1 || true
+      printf "SHA_APPLIED=%s\n" "$sha_applied"
+    )"
+    { grep -qF "SHA_APPLIED=0" <<<"$out" \
+      && grep -qF "SUGGEST: the-hcma/example-repo: skip sha_pinning_required until setup-pnpm-corepack nested" <<<"$out"; } \
+      || { printf "nested-skip: out=%s\n" "$out"; exit 1; }
+    rp_apply_fix=0
+    rp_actions_workflows_setup_pnpm_nested_uses_sha_pinned() { return 0; }
 
     rp_fetch_actions_permissions() {
       printf %s "{\"allowed_actions\":\"selected\",\"sha_pinning_required\":true}"

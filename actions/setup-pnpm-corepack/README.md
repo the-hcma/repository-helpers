@@ -15,10 +15,10 @@ Consumers must pin a **full commit SHA that is on `main`** of
 SHA. Pin by SHA for supply-chain integrity even when this repository is public.
 
 Example (current `main` tip as of the merge of
-[#363](https://github.com/the-hcma/repository-helpers/pull/363)):
+[#646](https://github.com/the-hcma/repository-helpers/pull/646)):
 
 ```yaml
-- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@cde3063aa1e030fcac59bbf215131a3bd25d7908
+- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@999844287d1b2684baa91c3e8a5b62eda9f4915e
 ```
 
 Dependabot may not auto-bump this composite SHA; refresh the pin periodically when the
@@ -54,7 +54,7 @@ Root app (`package.json` / lockfile at repo root):
 - uses: actions/setup-node@v6.4.0
   with:
     node-version: '24'
-- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@cde3063aa1e030fcac59bbf215131a3bd25d7908
+- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@999844287d1b2684baa91c3e8a5b62eda9f4915e
 - run: pnpm install --frozen-lockfile
 ```
 
@@ -66,7 +66,7 @@ same directory as the action input:
 - uses: actions/setup-node@v6.4.0
   with:
     node-version: '24'
-- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@cde3063aa1e030fcac59bbf215131a3bd25d7908
+- uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@999844287d1b2684baa91c3e8a5b62eda9f4915e
   with:
     working-directory: web
 - run: pnpm install --frozen-lockfile
