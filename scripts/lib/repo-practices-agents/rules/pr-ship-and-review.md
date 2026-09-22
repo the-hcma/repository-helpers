@@ -79,10 +79,12 @@ nor commits are Conventional Commits).
 
 Patch title/body if stale. For multi-paragraph bodies use `--body-file` (see
 `${rh}/.agents/rules/github-content-formatting.md`); lint first with
-`"${rh}/scripts/lint-github-markdown" <path>`.
+`"${rh}/scripts/lint-github-markdown" <path>`. Issues: `"${rh}/scripts/gh-issue"
+create|edit` (lint before API). Do not hand-wrap paragraphs across short lines.
 
 ```bash
 "${rh}/scripts/gh-api" pr edit <n> --title 'feat: …' --body-file /tmp/pr-body.md
+"${rh}/scripts/gh-issue" create --title '…' --body-file /tmp/issue.md
 ```
 
 ## 3. Agent review loop
