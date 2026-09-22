@@ -61,7 +61,9 @@ the most releasable commit subject (`feat` > `fix` > other) when possible.
 
 Multi-paragraph issue/PR bodies and comments: write a temp file, lint, then
 `--body-file` — see `.agents/rules/github-content-formatting.md` and
-`scripts/lint-github-markdown`.
+`scripts/lint-github-markdown`. For issues use `scripts/gh-issue create|edit`
+(lint runs before the API call). Do not hand-wrap paragraphs across short
+physical lines — GitHub’s issue/PR UI hard-breaks on a lone newline.
 
 ## Agent review essentials
 

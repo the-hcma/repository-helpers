@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# scripts/gh-issue — agent-facing `gh issue create|edit` with Markdown pre-flight.
+#
+# Lints `--body-file` (or refuses multi-line inline `--body`) via
+# scripts/lib/github-markdown before calling `gh issue` through the rate-limit
+# waiter. Use this instead of bare `gh issue create` / `gh issue edit` so
+# hand-wrapped paragraphs and other body mangling cannot ship (repository-helpers#653).
+#
+# Usage:
+#   scripts/gh-issue create --title '…' --body-file /tmp/issue.md
+#   scripts/gh-issue edit <n> --body-file /tmp/issue.md
+#   scripts/gh-issue create --title '…' --body 'single-line body only'
+#   scripts/gh-issue --help
+#
+# Other `gh issue` verbs pass through with rate-limit retry only (no body lint).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/runner-bootstrap"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/github-api-rate-limit"
+# shellcheck disable=SC1091
+source "${script_dir}/lib/github-markdown"
+
+usage() {
+  printf '%s\n' \
+    'Usage: scripts/gh-issue create|edit …' \
+    '' \
+    'Agent wrapper for gh issue. For create/edit with a body:' \
+    '  - Prefer --body-file <path>; the file is linted before the API call.' \
+    '  - Inline --body is only allowed for a single physical line (no newlines).' \
+    '' \
+    'Lint: scripts/lint-github-markdown (hand-wrap, blank lines, fences, …).' \
+    'See .agents/rules/github-content-formatting.md and repository-helpers#653.'
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+# gh_issue_extract_body_file <argv…>
+# Prints the path after --body-file / --body-file=PATH, or empty if absent.
+gh_issue_extract_body_file() {
+  local arg next=''
+  while (( $# > 0 )); do
+    arg="$1"
+    shift
+    case "$arg" in
+      --body-file)
+        next="${1:-}"
+        [[ -n "$next" ]] || die '--body-file requires a path'
+        printf '%s' "$next"
+        return 0
+        ;;
+      --body-file=*)
+        printf '%s' "${arg#--body-file=}"
+        return 0
+        ;;
+    esac
+  done
+  return 0
+}
+
+# gh_issue_extract_body <argv…>
+# Prints the value after --body / --body=VALUE, or empty if absent.
+gh_issue_extract_body() {
+  local arg next=''
+  while (( $# > 0 )); do
+    arg="$1"
+    shift
+    case "$arg" in
+      --body)
+        next="${1:-}"
+        [[ -n "$next" ]] || die '--body requires a value'
+        printf '%s' "$next"
+        return 0
+        ;;
+      --body=*)
+        printf '%s' "${arg#--body=}"
+        return 0
+        ;;
+    esac
+  done
+  return 0
+}
+
+# gh_issue_preflight_body <verb> <argv…>
+# Lint body-file or reject multi-line --body for create/edit.
+gh_issue_preflight_body() {
+  local -r verb="$1"
+  shift
+  local body_file='' body=''
+
+  case "$verb" in
+    create | edit) ;;
+    *) return 0 ;;
+  esac
+
+  body_file="$(gh_issue_extract_body_file "$@")"
+  body="$(gh_issue_extract_body "$@")"
+
+  if [[ -n "$body_file" && -n "$body" ]]; then
+    die 'pass only one of --body-file or --body'
+  fi
+
+  if [[ -n "$body_file" ]]; then
+    if [[ "$body_file" == '-' ]]; then
+      die 'scripts/gh-issue: --body-file - is not supported; write a temp file and lint it'
+    fi
+    ghm_lint_file "$body_file" || die "GITHUB_MARKDOWN_LINT failed for --body-file ${body_file}"
+    return 0
+  fi
+
+  if [[ -n "$body" ]]; then
+    if [[ "$body" == *$'\n'* ]]; then
+      die 'inline --body must be a single line; write a temp file and use --body-file'
+    fi
+    if [[ "$body" == *'\n'* ]]; then
+      die 'inline --body contains literal \\n escapes; use --body-file with real newlines'
+    fi
+  fi
+}
+
+main() {
+  local verb label
+
+  if [[ $# -eq 0 ]] || [[ "${1:-}" == '--help' ]] || [[ "${1:-}" == '-h' ]]; then
+    usage
+    if [[ $# -eq 0 ]]; then
+      exit 1
+    fi
+    exit 0
+  fi
+
+  verb="$1"
+  gh_issue_preflight_body "$@"
+  label="gh-issue:${verb}"
+  # Keep `gh` on this line (runner-adoption ratchet).
+  github_api_exec_with_rate_limit_retry "$label" -- gh issue "$@"
+}
+
+main "$@"

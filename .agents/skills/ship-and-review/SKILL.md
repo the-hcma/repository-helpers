@@ -79,6 +79,8 @@ branch name. When squash uses `PR_TITLE` + `BLANK`, run
 `post-pr-submission-checks` and `wait-for-agent-review complete`) so release-please
 sees a `feat:`/`fix:`/… header. Multi-paragraph bodies: `--body-file` +
 `scripts/lint-github-markdown` (see `.agents/rules/github-content-formatting.md`).
+Issues: `scripts/gh-issue create|edit` (lint before API). Do not hand-wrap
+paragraphs — GitHub’s issue/PR UI hard-breaks on a lone newline.
 
 On CI failure it prints:
 

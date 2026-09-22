@@ -2,9 +2,13 @@
 # shellcheck shell=bash
 # github-markdown — lightweight lint for agent-authored GitHub Markdown bodies.
 #
-# Catches CommonMark soft-break mangling that collapses paragraphs/lists when
-# bodies are assembled with single \\n instead of blank lines, or posted via
-# inline --body with escaped newlines. See repository-helpers#651.
+# Catches two GitHub-body failure modes (repository-helpers#651 / #653):
+#   1. Assemblies with literal \\n escapes or missing blank lines (collapsed
+#      lists/headings/fences).
+#   2. Hand-wrapped paragraphs: consecutive prose lines joined by a single
+#      newline. GitHub's issue/PR/comment renderer treats that lone \\n as a
+#      visible hard break (unlike the file/blob CommonMark soft-break-as-space
+#      rule), so ~80-column wraps render as a column of short lines.
 #
 # Non-goals: full Markdown linter/formatter dependency.
 set -euo pipefail
@@ -56,6 +60,46 @@ ghm_fence_parse() {
   return 1
 }
 
+# ghm_line_is_prose <raw-line>
+# True when the line is ordinary paragraph text (not a list/heading/quote/
+# table/HTML/thematic break, and not an indented continuation). Used to detect
+# hand-wrapped paragraphs: two consecutive prose lines without a blank line.
+ghm_line_is_prose() {
+  local -r raw="$1"
+  local trimmed
+
+  trimmed="${raw#"${raw%%[![:space:]]*}"}"
+  [[ -n "$trimmed" ]] || return 1
+
+  # Indented lines are list/blockquote continuations or indented code.
+  if [[ "$raw" =~ ^[[:space:]] ]]; then
+    return 1
+  fi
+
+  if [[ "$trimmed" =~ ^#{1,6}[[:space:]] ]]; then
+    return 1
+  fi
+  if [[ "$trimmed" =~ ^([-*+]|[[:digit:]]+\.)[[:space:]] ]]; then
+    return 1
+  fi
+  if [[ "$trimmed" == '>'* ]]; then
+    return 1
+  fi
+  if [[ "$trimmed" == '|'* ]]; then
+    return 1
+  fi
+  if [[ "$trimmed" == '<'* ]]; then
+    return 1
+  fi
+  if [[ "$trimmed" =~ ^\[.+\]:[[:space:]] ]]; then
+    return 1
+  fi
+  if [[ "$trimmed" =~ ^(-{3,}|\*{3,}|_{3,})[[:space:]]*$ ]]; then
+    return 1
+  fi
+  return 0
+}
+
 # ghm_lint_file <path>
 # Lint a Markdown file. Prints findings to stderr; exit 1 when dirty.
 ghm_lint_file() {
@@ -90,6 +134,7 @@ ghm_lint_text() {
   local trimmed list_joined_re fence_info
   local fence_char='' fence_len=0 need_blank_after_fence=0
   local parsed_char parsed_len parsed_kind rest_info
+  local prev_prose=0
 
   # Joined list items produce two markers on one line (e.g. "- a - b").
   # A single "item 1. below" or "diff - it works" is ordinary prose.
@@ -117,6 +162,7 @@ ghm_lint_text() {
         fence_len=$parsed_len
         need_blank_after_fence=0
         prev_blank=0
+        prev_prose=0
         continue
       fi
 
@@ -129,6 +175,7 @@ ghm_lint_text() {
         fence_len=0
         need_blank_after_fence=1
         prev_blank=0
+        prev_prose=0
         continue
       fi
     fi
@@ -142,6 +189,7 @@ ghm_lint_text() {
 
     if (( in_fence )); then
       prev_blank=0
+      prev_prose=0
       continue
     fi
 
@@ -155,6 +203,7 @@ ghm_lint_text() {
     if [[ -z "$trimmed" ]]; then
       prev_blank=1
       need_blank_after_fence=0
+      prev_prose=0
       continue
     fi
 
@@ -176,6 +225,19 @@ ghm_lint_text() {
     if [[ "$line" =~ $list_joined_re ]]; then
       printf 'line:%d: list marker appears mid-line (items may have been joined)\n' "$lineno"
       findings=$((findings + 1))
+    fi
+
+    # Hand-wrapped paragraph: two consecutive prose lines with no blank line.
+    # GitHub issue/PR/comment UI hard-breaks on the lone newline (#653).
+    if ghm_line_is_prose "$line"; then
+      if (( prev_prose )); then
+        printf 'line:%d: hand-wrapped paragraph (join into one line, or blank-line-separate paragraphs)\n' \
+          "$lineno"
+        findings=$((findings + 1))
+      fi
+      prev_prose=1
+    else
+      prev_prose=0
     fi
 
     prev_blank=0
