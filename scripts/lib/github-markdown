@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# github-markdown — lightweight lint for agent-authored GitHub Markdown bodies.
+#
+# Catches CommonMark soft-break mangling that collapses paragraphs/lists when
+# bodies are assembled with single \\n instead of blank lines, or posted via
+# inline --body with escaped newlines. See repository-helpers#651.
+#
+# Non-goals: full Markdown linter/formatter dependency.
+set -euo pipefail
+
+if declare -F ghm_lint_file >/dev/null 2>&1; then
+  return 0
+fi
+
+# Fence markers as single-quoted literals (backticks in unquoted =~ are
+# command substitution).
+_ghm_fence_tick='```'
+_ghm_fence_tilde='~~~'
+readonly _ghm_fence_tick _ghm_fence_tilde
+
+# ghm_fence_parse <trimmed-line>
+# Prints "char|len|kind" when the line is a fence (kind=open|close).
+# open: optional language tag; close: no info string after the markers.
+ghm_fence_parse() {
+  local -r trimmed="$1"
+  local char='' rest='' len=0 i c
+
+  if [[ -z "$trimmed" ]]; then
+    return 1
+  fi
+  c="${trimmed:0:1}"
+  if [[ "$c" != '`' && "$c" != '~' ]]; then
+    return 1
+  fi
+  char="$c"
+  i=0
+  while (( i < ${#trimmed} )) && [[ "${trimmed:i:1}" == "$char" ]]; do
+    i=$((i + 1))
+  done
+  len=$i
+  if (( len < 3 )); then
+    return 1
+  fi
+  rest="${trimmed:len}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  rest="${rest%"${rest##*[![:space:]]}"}"
+  if [[ -z "$rest" ]]; then
+    printf '%s|%s|close\n' "$char" "$len"
+    return 0
+  fi
+  if [[ "$rest" =~ ^[a-zA-Z0-9_+-]+$ ]]; then
+    printf '%s|%s|open\n' "$char" "$len"
+    return 0
+  fi
+  return 1
+}
+
+# ghm_lint_file <path>
+# Lint a Markdown file. Prints findings to stderr; exit 1 when dirty.
+ghm_lint_file() {
+  local -r path="$1"
+  local out rc
+
+  [[ -n "$path" ]] || {
+    printf 'ERROR: ghm_lint_file requires a path\n' >&2
+    return 1
+  }
+  [[ -f "$path" ]] || {
+    printf 'ERROR: ghm_lint_file: not a file: %s\n' "$path" >&2
+    return 1
+  }
+
+  out=''
+  rc=0
+  out="$(ghm_lint_text <"$path")" || rc=$?
+  if (( rc != 0 )); then
+    printf 'ERROR: GITHUB_MARKDOWN_LINT path=%s\n' "$path" >&2
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  return 0
+}
+
+# ghm_lint_text
+# Reads Markdown on stdin. Prints "line:N: message" findings to stdout.
+# Exit 0 when clean; 1 when any finding.
+ghm_lint_text() {
+  local line prev_blank=1 in_fence=0 lineno=0 findings=0
+  local trimmed list_joined_re fence_info
+  local fence_char='' fence_len=0 need_blank_after_fence=0
+  local parsed_char parsed_len parsed_kind rest_info
+
+  # Joined list items produce two markers on one line (e.g. "- a - b").
+  # A single "item 1. below" or "diff - it works" is ordinary prose.
+  list_joined_re='(^|[[:space:]])(-|\*|[[:digit:]]+\.)[[:space:]].+([[:space:]](-|\*|[[:digit:]]+\.)[[:space:]])'
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+
+    fence_info=''
+    if fence_info="$(ghm_fence_parse "$trimmed")"; then
+      parsed_char="${fence_info%%|*}"
+      rest_info="${fence_info#*|}"
+      parsed_len="${rest_info%%|*}"
+      parsed_kind="${rest_info#*|}"
+
+      if (( in_fence == 0 )); then
+        # Any fence line opens (``` / ```bash / ~~~~).
+        if (( prev_blank == 0 )) && (( lineno > 1 )); then
+          printf 'line:%d: fenced code block should be preceded by a blank line\n' "$lineno"
+          findings=$((findings + 1))
+        fi
+        in_fence=1
+        fence_char="$parsed_char"
+        fence_len=$parsed_len
+        need_blank_after_fence=0
+        prev_blank=0
+        continue
+      fi
+
+      # Close only with same marker family, length >= opening, no info string.
+      if [[ "$parsed_char" == "$fence_char" ]] \
+        && (( parsed_len >= fence_len )) \
+        && [[ "$parsed_kind" == 'close' ]]; then
+        in_fence=0
+        fence_char=''
+        fence_len=0
+        need_blank_after_fence=1
+        prev_blank=0
+        continue
+      fi
+    fi
+
+    # Fence marker present but not a clean fence line (e.g. joined onto prose).
+    if (( in_fence == 0 )) \
+      && { [[ "$line" == *" ${_ghm_fence_tick}"* ]] || [[ "$line" == *" ${_ghm_fence_tilde}"* ]]; }; then
+      printf 'line:%d: fenced code marker is not at line start\n' "$lineno"
+      findings=$((findings + 1))
+    fi
+
+    if (( in_fence )); then
+      prev_blank=0
+      continue
+    fi
+
+    # Literal \n sequences outside fences (escaped-newline mangling). Inside
+    # fences, \n is ordinary program text (printf, sed, …).
+    if [[ "$line" == *'\n'* ]]; then
+      printf 'line:%d: literal \\n escape in body (use a real newline / --body-file)\n' "$lineno"
+      findings=$((findings + 1))
+    fi
+
+    if [[ -z "$trimmed" ]]; then
+      prev_blank=1
+      need_blank_after_fence=0
+      continue
+    fi
+
+    if (( need_blank_after_fence )); then
+      printf 'line:%d: content after fenced code block should be preceded by a blank line\n' "$lineno"
+      findings=$((findings + 1))
+      need_blank_after_fence=0
+    fi
+
+    # Heading not preceded by blank line (except first line).
+    if [[ "$trimmed" =~ ^#{1,6}[[:space:]] ]]; then
+      if (( prev_blank == 0 )) && (( lineno > 1 )); then
+        printf 'line:%d: heading should be preceded by a blank line\n' "$lineno"
+        findings=$((findings + 1))
+      fi
+    fi
+
+    # Joined list items (two markers on one line).
+    if [[ "$line" =~ $list_joined_re ]]; then
+      printf 'line:%d: list marker appears mid-line (items may have been joined)\n' "$lineno"
+      findings=$((findings + 1))
+    fi
+
+    prev_blank=0
+  done
+
+  if (( findings > 0 )); then
+    return 1
+  fi
+  return 0
+}
