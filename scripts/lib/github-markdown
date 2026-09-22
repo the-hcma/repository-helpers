@@ -19,26 +19,41 @@ _ghm_fence_tick='```'
 _ghm_fence_tilde='~~~'
 readonly _ghm_fence_tick _ghm_fence_tilde
 
-# ghm_line_is_fence <trimmed-line>
-# Exit 0 when the line is a fence opener/closer (optional language tag).
-ghm_line_is_fence() {
+# ghm_fence_parse <trimmed-line>
+# Prints "char|len|kind" when the line is a fence (kind=open|close).
+# open: optional language tag; close: no info string after the markers.
+ghm_fence_parse() {
   local -r trimmed="$1"
-  local rest
+  local char='' rest='' len=0 i c
 
-  if [[ "$trimmed" == "${_ghm_fence_tick}"* ]]; then
-    rest="${trimmed#"${_ghm_fence_tick}"}"
-  elif [[ "$trimmed" == "${_ghm_fence_tilde}"* ]]; then
-    rest="${trimmed#"${_ghm_fence_tilde}"}"
-  else
+  if [[ -z "$trimmed" ]]; then
     return 1
   fi
-  # Trim leading/trailing whitespace from the remainder.
+  c="${trimmed:0:1}"
+  if [[ "$c" != '`' && "$c" != '~' ]]; then
+    return 1
+  fi
+  char="$c"
+  i=0
+  while (( i < ${#trimmed} )) && [[ "${trimmed:i:1}" == "$char" ]]; do
+    i=$((i + 1))
+  done
+  len=$i
+  if (( len < 3 )); then
+    return 1
+  fi
+  rest="${trimmed:len}"
   rest="${rest#"${rest%%[![:space:]]*}"}"
   rest="${rest%"${rest##*[![:space:]]}"}"
   if [[ -z "$rest" ]]; then
+    printf '%s|%s|close\n' "$char" "$len"
     return 0
   fi
-  [[ "$rest" =~ ^[a-zA-Z0-9_+-]+$ ]]
+  if [[ "$rest" =~ ^[a-zA-Z0-9_+-]+$ ]]; then
+    printf '%s|%s|open\n' "$char" "$len"
+    return 0
+  fi
+  return 1
 }
 
 # ghm_lint_file <path>
@@ -72,26 +87,56 @@ ghm_lint_file() {
 # Exit 0 when clean; 1 when any finding.
 ghm_lint_text() {
   local line prev_blank=1 in_fence=0 lineno=0 findings=0
-  local trimmed list_mid_re
+  local trimmed list_joined_re fence_info
+  local fence_char='' fence_len=0 need_blank_after_fence=0
+  local parsed_char parsed_len parsed_kind rest_info
 
-  list_mid_re='[[:alnum:])][[:space:]]+(-|\*|[[:digit:]]+\.)[[:space:]]'
+  # Joined list items produce two markers on one line (e.g. "- a - b").
+  # A single "item 1. below" or "diff - it works" is ordinary prose.
+  list_joined_re='(^|[[:space:]])(-|\*|[[:digit:]]+\.)[[:space:]].+([[:space:]](-|\*|[[:digit:]]+\.)[[:space:]])'
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     lineno=$((lineno + 1))
     trimmed="${line#"${line%%[![:space:]]*}"}"
 
-    if ghm_line_is_fence "$trimmed"; then
+    # Literal \n sequences in a "single line" body (escaped-newline mangling).
+    if [[ "$line" == *'\n'* ]]; then
+      printf 'line:%d: literal \\n escape in body (use a real newline / --body-file)\n' "$lineno"
+      findings=$((findings + 1))
+    fi
+
+    fence_info=''
+    if fence_info="$(ghm_fence_parse "$trimmed")"; then
+      parsed_char="${fence_info%%|*}"
+      rest_info="${fence_info#*|}"
+      parsed_len="${rest_info%%|*}"
+      parsed_kind="${rest_info#*|}"
+
       if (( in_fence == 0 )); then
+        # Any fence line opens (``` / ```bash / ~~~~).
         if (( prev_blank == 0 )) && (( lineno > 1 )); then
           printf 'line:%d: fenced code block should be preceded by a blank line\n' "$lineno"
           findings=$((findings + 1))
         fi
         in_fence=1
-      else
-        in_fence=0
+        fence_char="$parsed_char"
+        fence_len=$parsed_len
+        need_blank_after_fence=0
+        prev_blank=0
+        continue
       fi
-      prev_blank=0
-      continue
+
+      # Close only with same marker family, length >= opening, no info string.
+      if [[ "$parsed_char" == "$fence_char" ]] \
+        && (( parsed_len >= fence_len )) \
+        && [[ "$parsed_kind" == 'close' ]]; then
+        in_fence=0
+        fence_char=''
+        fence_len=0
+        need_blank_after_fence=1
+        prev_blank=0
+        continue
+      fi
     fi
 
     # Fence marker present but not a clean fence line (e.g. joined onto prose).
@@ -108,7 +153,14 @@ ghm_lint_text() {
 
     if [[ -z "$trimmed" ]]; then
       prev_blank=1
+      need_blank_after_fence=0
       continue
+    fi
+
+    if (( need_blank_after_fence )); then
+      printf 'line:%d: content after fenced code block should be preceded by a blank line\n' "$lineno"
+      findings=$((findings + 1))
+      need_blank_after_fence=0
     fi
 
     # Heading not preceded by blank line (except first line).
@@ -119,9 +171,8 @@ ghm_lint_text() {
       fi
     fi
 
-    # List markers appearing mid-line (joined list items).
-    # Pattern is in a variable so ')' inside the character class does not end [[.
-    if [[ "$line" =~ $list_mid_re ]]; then
+    # Joined list items (two markers on one line).
+    if [[ "$line" =~ $list_joined_re ]]; then
       printf 'line:%d: list marker appears mid-line (items may have been joined)\n' "$lineno"
       findings=$((findings + 1))
     fi

@@ -70,7 +70,7 @@ squash-merge config makes the PR title the release-please signal
 
 ```bash
 "${rh}/scripts/ensure-pr-conventional-title" --pr <n>
-# or: gh pr edit <n> --title 'feat: …'
+# or: "${rh}/scripts/gh-api" pr edit <n> --title 'feat: …'
 ```
 
 `post-pr-submission-checks` and `wait-for-agent-review complete` run this check
@@ -78,11 +78,11 @@ automatically (auto-derive from commits when possible; fail when neither the tit
 nor commits are Conventional Commits).
 
 Patch title/body if stale. For multi-paragraph bodies use `--body-file` (see
-`.agents/rules/github-content-formatting.md`); lint first with
+`${rh}/.agents/rules/github-content-formatting.md`); lint first with
 `"${rh}/scripts/lint-github-markdown" <path>`.
 
 ```bash
-gh pr edit <n> --title 'feat: …' --body-file /tmp/pr-body.md
+"${rh}/scripts/gh-api" pr edit <n> --title 'feat: …' --body-file /tmp/pr-body.md
 ```
 
 ## 3. Agent review loop

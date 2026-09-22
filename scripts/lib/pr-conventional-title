@@ -56,11 +56,12 @@ pr_cc_derive_title_from_subjects() {
 #   NOTE: PR_CC_TITLE_OK title=...
 #   NOTE: PR_CC_TITLE_UPDATED from=... to=...
 #   ERROR: PR_CC_TITLE_NONCOMPLIANT ...
+#   ERROR: PR_CC_TITLE_SETTINGS_FAILED ...
 pr_cc_ensure_pr_title() {
   local -r slug="$1"
   local -r pr="$2"
   local dry_run=0
-  local title derived subjects
+  local title derived subjects settings_rc=0
 
   shift 2
   while [[ $# -gt 0 ]]; do
@@ -74,7 +75,12 @@ pr_cc_ensure_pr_title() {
     shift
   done
 
-  if ! pr_cc_repo_squash_title_is_release_signal "$slug"; then
+  pr_cc_repo_squash_title_is_release_signal "$slug" || settings_rc=$?
+  if (( settings_rc == 2 )); then
+    printf 'ERROR: PR_CC_TITLE_SETTINGS_FAILED repo=%s pr=%s\n' "$slug" "$pr" >&2
+    return 1
+  fi
+  if (( settings_rc != 0 )); then
     printf 'NOTE: PR_CC_TITLE_SKIPPED repo=%s pr=%s reason=squash_title_not_release_signal\n' \
       "$slug" "$pr" >&2
     return 0
@@ -99,7 +105,7 @@ pr_cc_ensure_pr_title() {
   if ! derived="$(pr_cc_derive_title_from_subjects <<<"$subjects")"; then
     printf 'ERROR: PR_CC_TITLE_NONCOMPLIANT repo=%s pr=%s title=%s\n' \
       "$slug" "$pr" "$title" >&2
-    printf 'ERROR: PR_CC_TITLE_NONCOMPLIANT hint=set a Conventional Commits title: gh pr edit %s --repo %s --title '\''feat: …'\''\n' \
+    printf 'ERROR: PR_CC_TITLE_NONCOMPLIANT hint=set a Conventional Commits title via scripts/gh-api pr edit %s --repo %s --title '\''feat: …'\''\n' \
       "$pr" "$slug" >&2
     printf 'ERROR: PR_CC_TITLE_NONCOMPLIANT hint=or add a feat:/fix:/… commit subject so the title can be derived\n' >&2
     return 1
@@ -170,8 +176,8 @@ pr_cc_pr_commit_subjects() {
   local -r slug="$1"
   local -r pr="$2"
 
-  # Keep gh on the same line as runner_exec_stdout (runner-adoption ratchet).
-  runner_exec_stdout "pr-cc pr commit subjects ${slug}#${pr}" --timeout 30 -- gh pr view "$pr" --repo "$slug" --json commits --jq '.commits[].messageHeadline // empty'
+  # Keep gh on the same line as the waiter (runner + rate-limit ratchets).
+  github_api_exec_with_rate_limit_retry "pr-cc pr commit subjects ${slug}#${pr}" -- gh pr view "$pr" --repo "$slug" --json commits --jq '.commits[].messageHeadline // empty'
 }
 
 # pr_cc_pr_current_title <owner/name> <pr>
@@ -179,7 +185,7 @@ pr_cc_pr_current_title() {
   local -r slug="$1"
   local -r pr="$2"
 
-  runner_exec_stdout "pr-cc pr title ${slug}#${pr}" --timeout 30 -- gh pr view "$pr" --repo "$slug" --json title --jq '.title // empty'
+  github_api_exec_with_rate_limit_retry "pr-cc pr title ${slug}#${pr}" -- gh pr view "$pr" --repo "$slug" --json title --jq '.title // empty'
 }
 
 # pr_cc_pr_set_title <owner/name> <pr> <title>
@@ -188,27 +194,29 @@ pr_cc_pr_set_title() {
   local -r pr="$2"
   local -r title="$3"
 
-  runner_exec "pr-cc pr edit title ${slug}#${pr}" --timeout 30 -- gh pr edit "$pr" --repo "$slug" --title "$title" >/dev/null
+  github_api_exec_with_rate_limit_retry "pr-cc pr edit title ${slug}#${pr}" -- gh pr edit "$pr" --repo "$slug" --title "$title" >/dev/null
 }
 
 # pr_cc_repo_squash_title_is_release_signal <owner/name>
 # Exit 0 when squash is allowed and squash commit uses PR_TITLE + BLANK so the
 # PR title is the sole release-please signal. Exit 1 to skip enforcement.
+# Exit 2 when the settings fetch/parse fails (caller must fail, not skip).
 pr_cc_repo_squash_title_is_release_signal() {
   local -r slug="$1"
   local json title msg squash_allowed
 
-  [[ -n "$slug" ]] || return 1
+  [[ -n "$slug" ]] || return 2
+  # REST repos GET uses allow_squash_merge (not GraphQL squash_merge_allowed).
   json="$(pr_cc_gh_api "pr-cc repo squash settings ${slug}" \
-    "repos/${slug}" --jq '{squash_merge_allowed, squash_merge_commit_title, squash_merge_commit_message}')" \
-    || return 1
+    "repos/${slug}" --jq '{allow_squash_merge, squash_merge_commit_title, squash_merge_commit_message}')" \
+    || return 2
 
-  squash_allowed="$(pr_cc_jq_r "pr-cc jq squash_merge_allowed" "$json" '.squash_merge_allowed // false')" \
-    || return 1
+  squash_allowed="$(pr_cc_jq_r "pr-cc jq allow_squash_merge" "$json" '.allow_squash_merge // false')" \
+    || return 2
   title="$(pr_cc_jq_r "pr-cc jq squash_merge_commit_title" "$json" '.squash_merge_commit_title // empty')" \
-    || return 1
+    || return 2
   msg="$(pr_cc_jq_r "pr-cc jq squash_merge_commit_message" "$json" '.squash_merge_commit_message // empty')" \
-    || return 1
+    || return 2
 
   [[ "$squash_allowed" == 'true' ]] || return 1
   [[ "$title" == 'PR_TITLE' ]] || return 1

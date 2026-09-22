@@ -50,7 +50,7 @@ Before the review loop or merge:
 
 ```bash
 scripts/ensure-pr-conventional-title --pr <n>
-# or: gh pr edit <n> --title 'feat: …'
+# or: scripts/gh-api pr edit <n> --title 'feat: …'
 ```
 
 `post-pr-submission-checks` runs this after submit (before CI wait). `wait-for-agent-review
