@@ -39,6 +39,30 @@ scripts/dev/submit-stack                       # includes post-pr-submission-che
 
 After every later push, re-run **`scripts/dev/post-pr-submission-checks --pr <n>`** before agent review or merge. Do not skip CI wait unless the user opts out. On `NOTE: GITHUB_RATE_LIMIT_*` from `gh` wrappers, wait for reset/retry (see ship-and-review Skill) — do not treat an in-progress rate-limit wait as a hard failure.
 
+### Conventional Commits PR titles (squash / release-please)
+
+`gh stack submit --auto` / `gt submit --publish` may set the PR title from the **branch
+name**, not Conventional Commits. When the repo squash-merges with
+`squash_merge_commit_title=PR_TITLE` and `squash_merge_commit_message=BLANK`, that
+title becomes the entire squash commit message and release-please’s signal.
+
+Before the review loop or merge:
+
+```bash
+scripts/ensure-pr-conventional-title --pr <n>
+# or: gh pr edit <n> --title 'feat: …'
+```
+
+`post-pr-submission-checks` runs this after submit (before CI wait). `wait-for-agent-review
+complete` re-checks before the operator email. Non-compliant titles are auto-derived from
+the most releasable commit subject (`feat` > `fix` > other) when possible.
+
+### GitHub body formatting
+
+Multi-paragraph issue/PR bodies and comments: write a temp file, lint, then
+`--body-file` — see `.agents/rules/github-content-formatting.md` and
+`scripts/lint-github-markdown`.
+
 ## Agent review essentials
 
 > **Reply before resolve (required):** Post an on-thread human reply via **`reply-thread`** (or `reply-comment`) **before** **`resolve-thread`**. Exit **3** means threads lack a human reply. Pending feedback also includes operator-authored PR conversation comments until an explicit URL-citing reply + **`resolve-comment`**.

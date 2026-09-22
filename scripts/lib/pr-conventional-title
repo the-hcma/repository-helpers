@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# pr-conventional-title — enforce Conventional Commits PR titles when squash
+# merge uses PR_TITLE + BLANK (release-please signal). See repository-helpers#651.
+#
+# Sourced by post-pr-submission-checks and wait-for-agent-review. Pure helpers
+# (compliance / derive) are unit-testable without network; ensure_* talks to gh.
+set -euo pipefail
+
+if declare -F pr_cc_title_is_compliant >/dev/null 2>&1; then
+  return 0
+fi
+
+_pr_cc_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _pr_cc_lib_dir
+# shellcheck disable=SC1091
+source "${_pr_cc_lib_dir}/runner-ensure"
+# shellcheck disable=SC1091
+source "${_pr_cc_lib_dir}/github-api-rate-limit"
+
+# Conventional Commits types release-please / org agents accept on PR titles.
+readonly pr_cc_title_type_re='feat|fix|chore|docs|test|refactor|perf|build|ci|revert'
+
+# pr_cc_derive_title_from_subjects
+# Reads newline-separated commit subjects on stdin. Prints the most releasable
+# Conventional Commits subject, or exits 1 when none qualify.
+pr_cc_derive_title_from_subjects() {
+  local subject line best_rank=-1 best_subject='' parsed rank
+
+  while IFS= read -r subject || [[ -n "$subject" ]]; do
+    [[ -n "$subject" ]] || continue
+    line=''
+    if ! line="$(pr_cc_parse_subject "$subject")"; then
+      continue
+    fi
+    rank="${line%%|*}"
+    parsed="${line#*|}"
+    if (( rank > best_rank )); then
+      best_rank=$rank
+      best_subject="$parsed"
+    fi
+  done
+
+  if [[ -z "$best_subject" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$best_subject"
+}
+
+# pr_cc_ensure_pr_title <owner/name> <pr> [--dry-run]
+# When the repo's squash config makes the PR title the release-please signal:
+# validate the title; if non-compliant, derive from commits and apply (unless
+# --dry-run). Skips quietly when squash config does not require it.
+# Prints machine-readable lines on stderr:
+#   NOTE: PR_CC_TITLE_SKIPPED reason=...
+#   NOTE: PR_CC_TITLE_OK title=...
+#   NOTE: PR_CC_TITLE_UPDATED from=... to=...
+#   ERROR: PR_CC_TITLE_NONCOMPLIANT ...
+pr_cc_ensure_pr_title() {
+  local -r slug="$1"
+  local -r pr="$2"
+  local dry_run=0
+  local title derived subjects
+
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1 ;;
+      *)
+        printf 'ERROR: PR_CC_TITLE_USAGE unknown flag %s\n' "$1" >&2
+        return 1
+        ;;
+    esac
+    shift
+  done
+
+  if ! pr_cc_repo_squash_title_is_release_signal "$slug"; then
+    printf 'NOTE: PR_CC_TITLE_SKIPPED repo=%s pr=%s reason=squash_title_not_release_signal\n' \
+      "$slug" "$pr" >&2
+    return 0
+  fi
+
+  title="$(pr_cc_pr_current_title "$slug" "$pr")" || {
+    printf 'ERROR: PR_CC_TITLE_FETCH_FAILED repo=%s pr=%s\n' "$slug" "$pr" >&2
+    return 1
+  }
+
+  if pr_cc_title_is_compliant "$title"; then
+    printf 'NOTE: PR_CC_TITLE_OK repo=%s pr=%s title=%s\n' "$slug" "$pr" "$title" >&2
+    return 0
+  fi
+
+  subjects="$(pr_cc_pr_commit_subjects "$slug" "$pr")" || {
+    printf 'ERROR: PR_CC_TITLE_COMMITS_FAILED repo=%s pr=%s\n' "$slug" "$pr" >&2
+    return 1
+  }
+
+  derived=''
+  if ! derived="$(pr_cc_derive_title_from_subjects <<<"$subjects")"; then
+    printf 'ERROR: PR_CC_TITLE_NONCOMPLIANT repo=%s pr=%s title=%s\n' \
+      "$slug" "$pr" "$title" >&2
+    printf 'ERROR: PR_CC_TITLE_NONCOMPLIANT hint=set a Conventional Commits title: gh pr edit %s --repo %s --title '\''feat: …'\''\n' \
+      "$pr" "$slug" >&2
+    printf 'ERROR: PR_CC_TITLE_NONCOMPLIANT hint=or add a feat:/fix:/… commit subject so the title can be derived\n' >&2
+    return 1
+  fi
+
+  if (( dry_run )); then
+    printf 'NOTE: PR_CC_TITLE_WOULD_UPDATE repo=%s pr=%s from=%s to=%s\n' \
+      "$slug" "$pr" "$title" "$derived" >&2
+    return 0
+  fi
+
+  pr_cc_pr_set_title "$slug" "$pr" "$derived" || {
+    printf 'ERROR: PR_CC_TITLE_EDIT_FAILED repo=%s pr=%s to=%s\n' \
+      "$slug" "$pr" "$derived" >&2
+    return 1
+  }
+  printf 'NOTE: PR_CC_TITLE_UPDATED repo=%s pr=%s from=%s to=%s\n' \
+    "$slug" "$pr" "$title" "$derived" >&2
+  return 0
+}
+
+# pr_cc_parse_subject <subject>
+# Prints "rank|subject" when subject is a Conventional Commits header; else 1.
+pr_cc_parse_subject() {
+  local -r subject="${1:-}"
+  local -r re="^(${pr_cc_title_type_re})(\\([^)]*\\))?(!)?: (.+)$"
+  local type breaking=0 rank
+
+  [[ -n "$subject" ]] || return 1
+  [[ "$subject" =~ $re ]] || return 1
+  type="${BASH_REMATCH[1]}"
+  if [[ -n "${BASH_REMATCH[3]:-}" ]]; then
+    breaking=1
+  fi
+  rank="$(pr_cc_type_rank "$type" "$breaking")"
+  printf '%s|%s\n' "$rank" "$subject"
+}
+
+# pr_cc_pr_commit_subjects <owner/name> <pr>
+# Prints messageHeadline for each commit on the PR (API order).
+pr_cc_pr_commit_subjects() {
+  local -r slug="$1"
+  local -r pr="$2"
+
+  runner_exec_stdout "pr-cc pr commit subjects ${slug}#${pr}" --timeout 30 -- \
+    gh pr view "$pr" --repo "$slug" --json commits \
+    --jq '.commits[].messageHeadline // empty'
+}
+
+# pr_cc_pr_current_title <owner/name> <pr>
+pr_cc_pr_current_title() {
+  local -r slug="$1"
+  local -r pr="$2"
+
+  runner_exec_stdout "pr-cc pr title ${slug}#${pr}" --timeout 30 -- \
+    gh pr view "$pr" --repo "$slug" --json title --jq '.title // empty'
+}
+
+# pr_cc_pr_set_title <owner/name> <pr> <title>
+pr_cc_pr_set_title() {
+  local -r slug="$1"
+  local -r pr="$2"
+  local -r title="$3"
+
+  runner_exec "pr-cc pr edit title ${slug}#${pr}" --timeout 30 -- \
+    gh pr edit "$pr" --repo "$slug" --title "$title" >/dev/null
+}
+
+# pr_cc_repo_squash_title_is_release_signal <owner/name>
+# Exit 0 when squash is allowed and squash commit uses PR_TITLE + BLANK so the
+# PR title is the sole release-please signal. Exit 1 to skip enforcement.
+pr_cc_repo_squash_title_is_release_signal() {
+  local -r slug="$1"
+  local json title msg squash_allowed
+
+  [[ -n "$slug" ]] || return 1
+  json="$(
+    runner_exec_stdout "pr-cc repo squash settings ${slug}" --timeout 30 -- \
+      gh api "repos/${slug}" \
+      --jq '{squash_merge_allowed, squash_merge_commit_title, squash_merge_commit_message}'
+  )" || return 1
+
+  # Local jq on already-fetched JSON (no network); keep out of runner.
+  squash_allowed="$(jq -r '.squash_merge_allowed // false' <<<"$json")"
+  title="$(jq -r '.squash_merge_commit_title // empty' <<<"$json")"
+  msg="$(jq -r '.squash_merge_commit_message // empty' <<<"$json")"
+
+  [[ "$squash_allowed" == 'true' ]] || return 1
+  [[ "$title" == 'PR_TITLE' ]] || return 1
+  [[ "$msg" == 'BLANK' ]] || return 1
+  return 0
+}
+
+# pr_cc_title_is_compliant <title>
+# Exit 0 when title matches ^(type)(scope)?!?: .+
+pr_cc_title_is_compliant() {
+  local -r title="${1:-}"
+  local -r re="^(${pr_cc_title_type_re})(\\([^)]*\\))?!?: .+"
+
+  [[ -n "$title" ]] || return 1
+  [[ "$title" =~ $re ]]
+}
+
+# pr_cc_type_rank <type> <breaking 0|1>
+# Higher = more releasable (feat! > fix! > feat > fix > other).
+pr_cc_type_rank() {
+  local -r type="${1:-}"
+  local -r breaking="${2:-0}"
+  local rank=10
+
+  case "$type" in
+    feat) rank=80 ;;
+    fix) rank=70 ;;
+    *) rank=10 ;;
+  esac
+  if [[ "$breaking" == '1' ]]; then
+    rank=$((rank + 20))
+  fi
+  printf '%s\n' "$rank"
+}

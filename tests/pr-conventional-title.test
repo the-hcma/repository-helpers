@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# Tests for scripts/lib/pr-conventional-title and scripts/ensure-pr-conventional-title.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+lib="${script_dir}/../scripts/lib/pr-conventional-title"
+cli="${script_dir}/../scripts/ensure-pr-conventional-title"
+readonly lib cli
+
+# shellcheck disable=SC1091
+source "$lib"
+
+assert_str_eq() {
+  local -r label="$1"
+  local -r expected="$2"
+  local -r actual="$3"
+  if [[ "$expected" == "$actual" ]]; then
+    pass_case "$label"
+  else
+    printf '[FAIL] %s: expected %q, got %q\n' "$label" "$expected" "$actual" >&2
+    fail_case "$label"
+  fi
+}
+
+printf '\n=== pure: pr_cc_title_is_compliant ===\n'
+if pr_cc_title_is_compliant 'feat: add calendar sequencing'; then
+  pass_case 'accepts feat: title'
+else
+  fail_case 'accepts feat: title'
+fi
+if pr_cc_title_is_compliant 'fix(api)!: break auth'; then
+  pass_case 'accepts fix(scope)!: title'
+else
+  fail_case 'accepts fix(scope)!: title'
+fi
+if pr_cc_title_is_compliant 'chore: bump deps'; then
+  pass_case 'accepts chore: title'
+else
+  fail_case 'accepts chore: title'
+fi
+if pr_cc_title_is_compliant 'calendar sequencing wt'; then
+  fail_case 'rejects branch-name title'
+else
+  pass_case 'rejects branch-name title'
+fi
+if pr_cc_title_is_compliant 'feat:'; then
+  fail_case 'rejects empty description'
+else
+  pass_case 'rejects empty description'
+fi
+if pr_cc_title_is_compliant ''; then
+  fail_case 'rejects empty title'
+else
+  pass_case 'rejects empty title'
+fi
+
+printf '\n=== pure: pr_cc_derive_title_from_subjects ===\n'
+derived=''
+derived="$(printf '%s\n' 'chore: tidy' 'feat: add foam' 'fix: typo' | pr_cc_derive_title_from_subjects)" \
+  || true
+assert_str_eq 'picks feat over fix and chore' 'feat: add foam' "$derived"
+
+derived=''
+derived="$(printf '%s\n' 'fix: a' 'feat!: breaking' | pr_cc_derive_title_from_subjects)" \
+  || true
+assert_str_eq 'picks feat! over fix' 'feat!: breaking' "$derived"
+
+derived=''
+derive_rc=0
+derived="$(printf '%s\n' 'WIP' 'not conventional' | pr_cc_derive_title_from_subjects)" \
+  || derive_rc=$?
+assert_exit_nonzero 'no conventional subjects fails' "$derived" "$derive_rc"
+
+printf '\n=== --help ===\n'
+help_out=''
+help_exit=0
+help_out="$(bash "$cli" --help 2>&1)" || help_exit=$?
+assert_exit_0 '--help' "$help_out" "$help_exit"
+assert_contains '--help mentions Conventional Commits' "$help_out" 'Conventional Commits'
+
+printf '\n=== functional: ensure skips non-squash-title repos ===\n'
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'api repos/the-hcma/merge-commits'* ]]; then
+  printf '%s\n' '{"squash_merge_allowed":false,"squash_merge_commit_title":"COMMIT_OR_PR_TITLE","squash_merge_commit_message":"COMMIT_MESSAGES"}'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+# shellcheck disable=SC1091
+source "${script_dir}/../scripts/lib/runner-bootstrap"
+skip_out=''
+skip_rc=0
+skip_out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" \
+    pr_cc_ensure_pr_title 'the-hcma/merge-commits' '99' 2>&1
+)" || skip_rc=$?
+assert_exit_0 'skip non-release-signal repo' "$skip_out" "$skip_rc"
+assert_contains 'skip note' "$skip_out" 'PR_CC_TITLE_SKIPPED'
+assert_contains 'skip reason' "$skip_out" 'squash_title_not_release_signal'
+
+printf '\n=== functional: ensure passes compliant title unchanged ===\n'
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'api repos/the-hcma/squash-repo'* ]]; then
+  printf '%s\n' '{"squash_merge_allowed":true,"squash_merge_commit_title":"PR_TITLE","squash_merge_commit_message":"BLANK"}'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json title'* ]]; then
+  # gh --jq '.title // empty' final stdout
+  printf '%s\n' 'feat: already good'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+ok_out=''
+ok_rc=0
+ok_out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" \
+    pr_cc_ensure_pr_title 'the-hcma/squash-repo' '42' 2>&1
+)" || ok_rc=$?
+assert_exit_0 'compliant title ok' "$ok_out" "$ok_rc"
+assert_contains 'ok note' "$ok_out" 'PR_CC_TITLE_OK'
+assert_contains 'ok title' "$ok_out" 'feat: already good'
+
+printf '\n=== functional: ensure derives and updates non-compliant title ===\n'
+edit_log="${tmp}/edit.log"
+: >"$edit_log"
+cat >"${mock_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+if [[ "\$args" == *'api repos/the-hcma/squash-repo'* ]]; then
+  printf '%s\n' '{"squash_merge_allowed":true,"squash_merge_commit_title":"PR_TITLE","squash_merge_commit_message":"BLANK"}'
+  exit 0
+fi
+if [[ "\$args" == *'pr view 371'* && "\$args" == *'--json title'* ]]; then
+  printf '%s\n' 'calendar sequencing wt'
+  exit 0
+fi
+if [[ "\$args" == *'pr view 371'* && "\$args" == *'--json commits'* ]]; then
+  printf '%s\n' 'chore: scaffolding'
+  printf '%s\n' 'feat: calendar sequencing'
+  exit 0
+fi
+if [[ "\$args" == *'pr edit 371'* && "\$args" == *'--title'* ]]; then
+  printf '%s\n' "\$*" >>'${edit_log}'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+upd_out=''
+upd_rc=0
+upd_out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" \
+    pr_cc_ensure_pr_title 'the-hcma/squash-repo' '371' 2>&1
+)" || upd_rc=$?
+assert_exit_0 'updates non-compliant title' "$upd_out" "$upd_rc"
+assert_contains 'updated note' "$upd_out" 'PR_CC_TITLE_UPDATED'
+assert_contains 'updated to feat' "$upd_out" 'to=feat: calendar sequencing'
+if grep -q -- '--title feat: calendar sequencing' "$edit_log"; then
+  pass_case 'gh pr edit received derived title'
+else
+  fail_case 'gh pr edit received derived title'
+  printf 'edit log: %s\n' "$(cat "$edit_log")" >&2
+fi
+
+printf '\n=== functional: ensure fails when title and commits are non-conventional ===\n'
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'api repos/the-hcma/squash-repo'* ]]; then
+  printf '%s\n' '{"squash_merge_allowed":true,"squash_merge_commit_title":"PR_TITLE","squash_merge_commit_message":"BLANK"}'
+  exit 0
+fi
+if [[ "$args" == *'pr view 7'* && "$args" == *'--json title'* ]]; then
+  printf '%s\n' 'wip stuff'
+  exit 0
+fi
+if [[ "$args" == *'pr view 7'* && "$args" == *'--json commits'* ]]; then
+  printf '%s\n' 'WIP'
+  printf '%s\n' 'more wip'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+fail_out=''
+fail_rc=0
+fail_out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" \
+    pr_cc_ensure_pr_title 'the-hcma/squash-repo' '7' 2>&1
+)" || fail_rc=$?
+assert_exit_nonzero 'fails without derivable title' "$fail_out" "$fail_rc"
+assert_contains 'noncompliant error' "$fail_out" 'PR_CC_TITLE_NONCOMPLIANT'
+
+printf '\n=== functional: dry-run does not edit ===\n'
+: >"$edit_log"
+cat >"${mock_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+if [[ "\$args" == *'api repos/the-hcma/squash-repo'* ]]; then
+  printf '%s\n' '{"squash_merge_allowed":true,"squash_merge_commit_title":"PR_TITLE","squash_merge_commit_message":"BLANK"}'
+  exit 0
+fi
+if [[ "\$args" == *'pr view 8'* && "\$args" == *'--json title'* ]]; then
+  printf '%s\n' 'branch name wt'
+  exit 0
+fi
+if [[ "\$args" == *'pr view 8'* && "\$args" == *'--json commits'* ]]; then
+  printf '%s\n' 'fix: the bug'
+  exit 0
+fi
+if [[ "\$args" == *'pr edit'* ]]; then
+  printf '%s\n' "\$*" >>'${edit_log}'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+dry_out=''
+dry_rc=0
+dry_out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" \
+    pr_cc_ensure_pr_title 'the-hcma/squash-repo' '8' --dry-run 2>&1
+)" || dry_rc=$?
+assert_exit_0 'dry-run succeeds' "$dry_out" "$dry_rc"
+assert_contains 'would update' "$dry_out" 'PR_CC_TITLE_WOULD_UPDATE'
+if [[ ! -s "$edit_log" ]]; then
+  pass_case 'dry-run did not call gh pr edit'
+else
+  fail_case 'dry-run did not call gh pr edit'
+fi
+
+rm -rf "$tmp"
+
+printf '\n=== static: no org sibling repo hardcodes ===\n'
+hardcodes=''
+hardcodes="$(grep -nE 'the-hcma/[a-z0-9-]+' "$lib" || true)"
+if [[ -z "$hardcodes" ]]; then
+  pass_case 'pr-conventional-title has no the-hcma/slug literals'
+else
+  printf '%s\n' "$hardcodes" >&2
+  fail_case 'pr-conventional-title has no the-hcma/slug literals'
+fi
+
+test_summary

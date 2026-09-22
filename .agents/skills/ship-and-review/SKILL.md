@@ -73,6 +73,13 @@ exits. **Raise that to the operator immediately** — do not keep polling or tre
 CI as still pending. The operator must approve the environment or grant this
 `gh` identity reviewer access.
 
+**Conventional Commits PR titles:** `--auto` / publish may title the PR from the
+branch name. When squash uses `PR_TITLE` + `BLANK`, run
+`scripts/ensure-pr-conventional-title --pr <n>` (also invoked by
+`post-pr-submission-checks` and `wait-for-agent-review complete`) so release-please
+sees a `feat:`/`fix:`/… header. Multi-paragraph bodies: `--body-file` +
+`scripts/lint-github-markdown` (see `.agents/rules/github-content-formatting.md`).
+
 On CI failure it prints:
 
 1. Failed check names + URLs (`ERROR: CI failures for PR #…`)
