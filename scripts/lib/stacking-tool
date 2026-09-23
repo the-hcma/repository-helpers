@@ -14,6 +14,10 @@ _stacking_tool_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly _stacking_tool_lib_dir
 # shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
 source "${_stacking_tool_lib_dir}/runner-ensure"
+# shellcheck disable=SC1091
+source "${_stacking_tool_lib_dir}/pr-conventional-title"
+# shellcheck disable=SC1091
+source "${_stacking_tool_lib_dir}/github-repo-slug"
 
 # Relative path of the preference file inside a repository clone.
 # shellcheck disable=SC2034  # sourced by scripts/tests/lint
@@ -213,6 +217,57 @@ stacking_tool_require_cli() {
   esac
 }
 
+# stacking_tool_ensure_stack_conventional_titles <repo_dir>
+# After `gh stack submit --auto`, ensure every PR currently in the gh-stack has
+# a Conventional Commits title when the repo's squash config makes the PR
+# title the release-please signal (scripts/lib/pr-conventional-title). A
+# multi-layer stack opens several PRs at once — only the current branch's PR
+# was checked before this, leaving sibling layers unverified
+# (repository-helpers#651). A title pr_cc_ensure_pr_title cannot auto-derive
+# fails the submit. No-op when origin cannot be resolved to OWNER/NAME.
+stacking_tool_ensure_stack_conventional_titles() {
+  local -r st_dir="$1"
+  local origin_url slug view_json prs_str rc
+  local -a prs=()
+
+  origin_url="$(runner_exec_stdout "stacking-tool git remote origin (stack titles)" \
+    --probe -- git -C "$st_dir" remote get-url origin)" || {
+    printf 'stacking-tool: NOTE: could not resolve origin — skipping stack title check\n' >&2
+    return 0
+  }
+  slug=""
+  slug="$(gh_slug_from_origin_url "$origin_url")" || slug=""
+  if [[ -z "$slug" ]]; then
+    printf 'stacking-tool: NOTE: could not parse OWNER/NAME from origin — skipping stack title check\n' >&2
+    return 0
+  fi
+
+  view_json=""
+  # Keep gh on the same line as the waiter (runner + rate-limit ratchets).
+  view_json="$(cd "$st_dir" && github_api_exec_with_rate_limit_retry "stacking-tool gh stack view ${slug}" -- gh stack view --json)" || {
+    printf 'stacking-tool: NOTE: gh stack view failed — skipping stack title check\n' >&2
+    return 0
+  }
+
+  prs_str=""
+  prs_str="$(pr_cc_jq_r "stacking-tool jq stack pr numbers" "$view_json" '.branches[].pr.number // empty')" || {
+    printf 'stacking-tool: NOTE: could not parse gh stack view output — skipping stack title check\n' >&2
+    return 0
+  }
+  if [[ -n "$prs_str" ]]; then
+    while IFS= read -r pr; do
+      [[ -n "$pr" ]] && prs+=("$pr")
+    done <<<"$prs_str"
+  fi
+
+  rc=0
+  pr_cc_ensure_stack_titles "$slug" "${prs[@]+"${prs[@]}"}" || rc=$?
+  if (( rc != 0 )); then
+    stacking_tool_die \
+      'one or more stack PR titles are not Conventional Commits headers (see ERROR: PR_CC_TITLE_* above) — fix with scripts/ensure-pr-conventional-title --pr <n>'
+  fi
+}
+
 # stacking_tool_submit_as <tool> <repo_dir> [extra args…]
 # Submits using an explicit backend (graphite|gh-stack). Used when the marker is
 # not yet on disk (e.g. repo-practices --apply-fix creating the marker).
@@ -249,6 +304,7 @@ stacking_tool_submit_as() {
           "${extras[*]}" >&2
       fi
       runner_sh "stacking-tool gh stack submit" "cd ${quoted_repo} && gh stack submit --auto --open --remote origin"
+      stacking_tool_ensure_stack_conventional_titles "$st_dir"
       ;;
   esac
 }

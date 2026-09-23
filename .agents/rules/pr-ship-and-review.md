@@ -57,6 +57,13 @@ scripts/ensure-pr-conventional-title --pr <n>
 complete` re-checks before the operator email. Non-compliant titles are auto-derived from
 the most releasable commit subject (`feat` > `fix` > other) when possible.
 
+**Multi-layer stacks (`gh-stack`):** `gh stack submit --auto` opens a PR per branch in one
+call. `stacking_tool_submit` (used by `scripts/dev/submit-stack`) automatically checks
+**every** PR currently in the stack after that submit — not just the branch you happened to
+submit from — via `scripts/lib/stacking-tool`'s `stacking_tool_ensure_stack_conventional_titles`.
+A non-compliant title on any layer that cannot be auto-derived fails the submit. Fix one
+layer by hand with `scripts/ensure-pr-conventional-title --pr <n>`.
+
 ### GitHub body formatting
 
 Multi-paragraph issue/PR bodies and comments: write a temp file, lint, then
