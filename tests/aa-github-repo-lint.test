@@ -41,6 +41,8 @@ export GRL_PRE_PR_CHECKS_SHIM_B64="${grl_mock_pre_pr_checks_shim_b64}"
 export GRL_RP_AFTER_CONFIG_SHIM_B64="${grl_mock_repo_practices_after_config_shim_b64}"
 export GRL_GITHUB_API_THROTTLE_B64="${grl_mock_github_api_throttle_b64}"
 export GRL_GITHUB_API_THROTTLE_SHIM_B64="${grl_mock_github_api_throttle_shim_b64}"
+export GRL_GITHUB_CONTENT_FORMATTING_B64="${grl_mock_github_content_formatting_b64}"
+export GRL_GITHUB_CONTENT_FORMATTING_SHIM_B64="${grl_mock_github_content_formatting_shim_b64}"
 
 pass=0
 fail=0
@@ -5278,7 +5280,7 @@ promote_out="$(
     fails=""
     # Dual-path org rules (#637): missing agents is SUGGEST under routine and
     # --strict-onboarding; FAIL only under --new-repo.
-    for fn in rp_check_no_secret_exposure rp_check_pre_pr_checks_rule rp_check_remote_timeouts_retries rp_check_github_api_throttle; do
+    for fn in rp_check_no_secret_exposure rp_check_pre_pr_checks_rule rp_check_remote_timeouts_retries rp_check_github_api_throttle rp_check_github_content_formatting; do
       rp_strict_onboarding=0; rp_new_repo=0
       [[ "$(rc "$fn" the-hcma/example-repo)" == 0 ]] || fails="$fails ${fn}:routine-should-pass"
       rp_strict_onboarding=1; rp_new_repo=0
@@ -6540,6 +6542,138 @@ if [[ -f "$gat_agents_tmpl" ]] && [[ -f "$gat_shim_tmpl" ]] \
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] consumer github-api-throttle template: missing, over-copied, or not a breadcrumb\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: github-content-formatting check and apply-fix wiring (repository-helpers#657) ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'rp_check_github_content_formatting' "$lib" \
+  && grep -qF "'github-content-formatting-rule' 'github-content-formatting agents rule + Cursor shim'" "$lib" \
+  && grep -qF 'rp_queue_org_agents_rule_pair' "$lib" \
+  && grep -qF 'rp_github_content_formatting_rule_template' "$lib" \
+  && grep -qF 'rp_github_content_formatting_rule_content_for_apply_fix' "$lib" \
+  && grep -qF 'rp_github_content_formatting_rule_is_valid' "$lib" \
+  && grep -qF '@@GH_CONTENT_FORMATTING_RULE_URL@@' "$lib" \
+  && grep -qF 'repo-practices-cursor/github-content-formatting.mdc' "$lib" \
+  && grep -qF 'if ! rp_check_github_content_formatting "$slug"; then' "$lib"; then
+  printf '[PASS] github-content-formatting: lint check, apply-fix wiring, and dispatch present\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] github-content-formatting: missing lint/apply-fix/dispatch wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: github-content-formatting rule validator ===\n'
+gcf_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    body() { printf -- "---\nalwaysApply: true\n---\n%s\n" "$1"; }
+    usage="post with --body-file and lint with scripts/lint-github-markdown; separate paragraphs with a blank line"
+
+    template="$(rp_github_content_formatting_rule_template)"
+    if ! rp_github_content_formatting_rule_is_valid "$template" "the-hcma/some-consumer"; then
+      printf "template_invalid\n"; exit 1
+    fi
+    dogfood="$(cat "$2")"
+    if ! rp_github_content_formatting_rule_is_valid "$dogfood" "the-hcma/repository-helpers"; then
+      printf "dogfood_invalid\n"; exit 1
+    fi
+
+    crumb="github-content-formatting-canonical: http://x"
+    if rp_github_content_formatting_rule_is_valid "$(printf -- "---\nalwaysApply: false\n---\n%s\n%s\n" "$usage" "$crumb")" "the-hcma/x"; then
+      printf "not_alwaysapply_accepted\n"; exit 1
+    fi
+    if rp_github_content_formatting_rule_is_valid "$(body "Write good issues.")" "the-hcma/x"; then
+      printf "bare_mention_accepted\n"; exit 1
+    fi
+    if rp_github_content_formatting_rule_is_valid "$(printf -- "---\nalwaysApply: true\n---\nUse --body-file and a blank line. %s\n" "$crumb")" "the-hcma/x"; then
+      printf "missing_linter_accepted\n"; exit 1
+    fi
+    if rp_github_content_formatting_rule_is_valid "$(body "${usage}")" "the-hcma/consumer-x"; then
+      printf "consumer_missing_breadcrumb_accepted\n"; exit 1
+    fi
+    if ! rp_github_content_formatting_rule_is_valid "$(printf -- "---\nalwaysApply: true\n---\n%s\n%s\n" "$usage" "$crumb")" "the-hcma/consumer-x"; then
+      printf "consumer_with_breadcrumb_rejected\n"; exit 1
+    fi
+    printf "ok\n"
+  ' bash "$lib" "${rh_root}/.agents/rules/github-content-formatting.md"
+)" || gcf_out="fail:${gcf_out}"
+if [[ "$gcf_out" == 'ok' ]]; then
+  printf '[PASS] github-content-formatting: validator accepts template + dogfood + consumer-with-breadcrumb; rejects not-alwaysApply / bare mention / missing linter / consumer missing breadcrumb\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] github-content-formatting: validator wrong (%s)\n' "$gcf_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: github-content-formatting rule — routine SUGGESTs, strict/new-repo FAILs ===\n'
+gcf_suggest="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    rp_apply_fix=0
+    rp_repo_short_name() { printf "some-consumer\n"; }
+    rp_log_check_fail() { printf "CHECK_FAIL:%s\n" "$2" >&2; }
+    rp_log_check_ok() { :; }
+    rp_log_suggest() { printf "SUGGEST:%s\n" "$1" >&2; }
+    rp_log_warn() { :; }
+    rp_github_url() { printf "u\n"; }
+    invalid="$(printf -- "---\nalwaysApply: true\n---\nno formatting guidance here\n")"
+
+    run() { local e=0; rp_check_github_content_formatting "the-hcma/some-consumer" 2>&1 || e=$?; printf "rc=%s\n" "$e"; }
+
+    printf -- "--- routine (no strict), missing ---\n"
+    rp_suggest=1; rp_strict_onboarding=0; rp_new_repo=0
+    rp_fetch_github_text_file() { return 1; }
+    run
+    printf -- "--- strict, missing ---\n"
+    rp_strict_onboarding=1; rp_new_repo=0
+    run
+    printf -- "--- new-repo, missing ---\n"
+    rp_strict_onboarding=0; rp_new_repo=1
+    run
+    printf -- "--- strict, invalid rule ---\n"
+    rp_strict_onboarding=1; rp_new_repo=0
+    eval "rp_fetch_github_text_file() { printf %s \"\$invalid\"; }"
+    run
+  ' bash "$lib"
+)"
+if [[ "$(grep -c 'rc=0' <<<"$gcf_suggest")" == 2 ]] \
+  && [[ "$(grep -c 'rc=1' <<<"$gcf_suggest")" == 2 ]] \
+  && grep -qF 'SUGGEST:the-hcma/some-consumer: add .agents/rules/github-content-formatting.md + .cursor/rules/github-content-formatting.mdc' <<<"$gcf_suggest" \
+  && grep -qF 'CHECK_FAIL:github-content-formatting agents rule (.agents/rules/github-content-formatting.md)' <<<"$gcf_suggest" \
+  && grep -qF 'CHECK_FAIL:github-content-formatting rule must be alwaysApply' <<<"$gcf_suggest"; then
+  printf '[PASS] github-content-formatting: routine/strict missing SUGGEST-only (rc 0); --new-repo missing + strict invalid FAIL (rc 1)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] github-content-formatting: rollout ratchet wrong\n%s\n' "$gcf_suggest"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: consumer github-content-formatting agents template is a thin breadcrumb ===\n'
+gcf_agents_tmpl="${rh_root}/scripts/lib/repo-practices-agents/rules/github-content-formatting.md"
+gcf_shim_tmpl="${rh_root}/scripts/lib/repo-practices-cursor/github-content-formatting.mdc"
+gcf_local_agents="${rh_root}/.agents/rules/github-content-formatting.md"
+gcf_local_shim="${rh_root}/.cursor/rules/github-content-formatting.mdc"
+if [[ -f "$gcf_agents_tmpl" ]] && [[ -f "$gcf_shim_tmpl" ]] \
+  && [[ -f "$gcf_local_agents" ]] && [[ -f "$gcf_local_shim" ]] \
+  && grep -qiE 'alwaysApply:[[:space:]]*true' "$gcf_agents_tmpl" \
+  && grep -qiF 'body-file' "$gcf_agents_tmpl" \
+  && grep -qF 'lint-github-markdown' "$gcf_agents_tmpl" \
+  && grep -qF '@@GH_CONTENT_FORMATTING_RULE_URL@@' "$gcf_agents_tmpl" \
+  && grep -qF 'github-content-formatting-canonical:' "$gcf_agents_tmpl" \
+  && ! grep -qF '@@GH_CONTENT_FORMATTING_RULE_URL@@' "$gcf_local_agents" \
+  && grep -qF 'github.com/the-hcma/repository-helpers/blob/main/.agents/rules/github-content-formatting.md' "$gcf_local_agents" \
+  && [[ "$(grep -cve '^[[:space:]]*$' "$gcf_agents_tmpl")" -le 24 ]] \
+  && grep -qF 'agents-rule-shim: github-content-formatting' "$gcf_shim_tmpl" \
+  && grep -qF 'agents-rule-shim: github-content-formatting' "$gcf_local_shim"; then
+  printf '[PASS] consumer github-content-formatting template: thin breadcrumb agents body + Cursor shim\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] consumer github-content-formatting template: missing, over-copied, or not a breadcrumb\n'
   fail=$(( fail + 1 ))
 fi
 
