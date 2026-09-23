@@ -218,13 +218,16 @@ stacking_tool_require_cli() {
 }
 
 # stacking_tool_ensure_stack_conventional_titles <repo_dir>
-# After `gh stack submit --auto`, ensure every PR currently in the gh-stack has
-# a Conventional Commits title when the repo's squash config makes the PR
-# title the release-please signal (scripts/lib/pr-conventional-title). A
-# multi-layer stack opens several PRs at once — only the current branch's PR
-# was checked before this, leaving sibling layers unverified
-# (repository-helpers#651). A title pr_cc_ensure_pr_title cannot auto-derive
-# fails the submit. No-op when origin cannot be resolved to OWNER/NAME.
+# After a gh-stack `gh stack submit --auto` (submit or restack fallback),
+# ensure every OPEN PR currently in the gh-stack has a Conventional Commits
+# title when the repo's squash config makes the PR title the release-please
+# signal (scripts/lib/pr-conventional-title). A multi-layer stack opens
+# several PRs at once — only the current branch's PR was checked before this,
+# leaving sibling layers unverified (repository-helpers#651). Returns
+# non-zero (does not exit) on any real failure — stack-view/parse failure, or
+# a title pr_cc_ensure_pr_title cannot auto-derive — so callers decide
+# whether to die or propagate. Returns 0 and skips quietly only when origin
+# cannot be resolved to OWNER/NAME (not a repo this check applies to).
 stacking_tool_ensure_stack_conventional_titles() {
   local -r st_dir="$1"
   local origin_url slug view_json prs_str rc
@@ -245,14 +248,16 @@ stacking_tool_ensure_stack_conventional_titles() {
   view_json=""
   # Keep gh on the same line as the waiter (runner + rate-limit ratchets).
   view_json="$(cd "$st_dir" && github_api_exec_with_rate_limit_retry "stacking-tool gh stack view ${slug}" -- gh stack view --json)" || {
-    printf 'stacking-tool: NOTE: gh stack view failed — skipping stack title check\n' >&2
-    return 0
+    printf 'stacking-tool: ERROR: gh stack view --json failed for %s — cannot verify stack PR titles\n' "$slug" >&2
+    return 1
   }
 
   prs_str=""
-  prs_str="$(pr_cc_jq_r "stacking-tool jq stack pr numbers" "$view_json" '.branches[].pr.number // empty')" || {
-    printf 'stacking-tool: NOTE: could not parse gh stack view output — skipping stack title check\n' >&2
-    return 0
+  # Exclude merged branches — an already-merged PR has no title left to fix.
+  prs_str="$(pr_cc_jq_r "stacking-tool jq stack pr numbers" "$view_json" \
+    '.branches[] | select(.isMerged != true) | .pr.number // empty')" || {
+    printf 'stacking-tool: ERROR: could not parse gh stack view output for %s — cannot verify stack PR titles\n' "$slug" >&2
+    return 1
   }
   if [[ -n "$prs_str" ]]; then
     while IFS= read -r pr; do
@@ -262,10 +267,7 @@ stacking_tool_ensure_stack_conventional_titles() {
 
   rc=0
   pr_cc_ensure_stack_titles "$slug" "${prs[@]+"${prs[@]}"}" || rc=$?
-  if (( rc != 0 )); then
-    stacking_tool_die \
-      'one or more stack PR titles are not Conventional Commits headers (see ERROR: PR_CC_TITLE_* above) — fix with scripts/ensure-pr-conventional-title --pr <n>'
-  fi
+  return "$rc"
 }
 
 # stacking_tool_submit_as <tool> <repo_dir> [extra args…]
@@ -304,7 +306,8 @@ stacking_tool_submit_as() {
           "${extras[*]}" >&2
       fi
       runner_sh "stacking-tool gh stack submit" "cd ${quoted_repo} && gh stack submit --auto --open --remote origin"
-      stacking_tool_ensure_stack_conventional_titles "$st_dir"
+      stacking_tool_ensure_stack_conventional_titles "$st_dir" \
+        || stacking_tool_die 'one or more stack PR titles are not Conventional Commits headers (see ERROR: PR_CC_TITLE_* above) — fix with scripts/ensure-pr-conventional-title --pr <n>'
       ;;
   esac
 }
@@ -352,6 +355,7 @@ stacking_tool_restack_as() {
       if ! runner_sh "stacking-tool gh stack sync" --timeout 20 -- "cd ${quoted_repo} && exec gh stack sync --remote origin"; then
         runner_sh "stacking-tool gh stack rebase" --timeout 20 -- "cd ${quoted_repo} && exec gh stack rebase --remote origin" || return 1
         runner_sh "stacking-tool gh stack submit after rebase" --timeout 120 -- "cd ${quoted_repo} && exec gh stack submit --auto --open --remote origin" || return 1
+        stacking_tool_ensure_stack_conventional_titles "$st_dir" || return 1
       fi
       ;;
   esac
