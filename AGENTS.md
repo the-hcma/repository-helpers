@@ -166,12 +166,15 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 - **Wait timeouts must be machine-parseable.** Any long-running wait loop (CI gating, merge polling, PR number discovery, etc.) must, on timeout, emit **one** concise line starting with `ERROR: WAIT_TIMEOUT ...` and then fail. Avoid multi-line timeout chatter — batch runs (`--batch --all`) postprocess these lines into end-of-run actionable summaries.
 - **GNU userland on macOS.** Prefer Homebrew gnubin on `PATH` via
   `tooling_path_ensure_gnu_userland` / the cron and node bootstraps
-  (`brew install coreutils gnu-sed grep util-linux`) so scripts can assume GNU
-  `sed`, `grep -P`, `date -Is`, `timeout`, and `flock`. On Darwin, missing or BSD
-  tools fail early with an install hint — do not rely on silent fallback.
-  Do not add BSD vs GNU branches at call sites. `dep-updater` in-place
-  edits still resolve GNU sed explicitly (`gsed` /
-  `tooling_prereq_gnu_sed_path`) as an additional hard prerequisite.
+  (`brew install coreutils gnu-sed grep util-linux findutils`) so scripts can
+  assume GNU `sed`, `grep -P`, `date -Is`, `timeout`, `flock`, and `find`. On
+  Darwin, missing or BSD tools fail early with an install hint — do not rely on
+  silent fallback. Do not add BSD vs GNU branches at call sites. `dep-updater`
+  in-place edits still resolve GNU sed explicitly (`gsed` /
+  `tooling_prereq_gnu_sed_path`) as an additional hard prerequisite. Prefer
+  portable bash constructs (`[[ -x ]]`, `[[ -f ]]`, glob loops) over GNU-only
+  `find` primaries in new scripts — the prereq check is a safety net, not a
+  reason to reach for `find` when a portable alternative exists.
 
 ---
 
