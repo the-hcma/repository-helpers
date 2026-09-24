@@ -8,7 +8,7 @@ alwaysApply: true
 Agent-authored issue bodies, PR descriptions, and PR/review comments must render
 correctly on GitHub.
 
-Two failure modes show up as “line breaks are messed up”:
+Three failure modes show up here:
 
 1. **Missing blank lines / literal `\n` escapes** — assembling bodies as inline
    `--body "line one\nline two"` (or joining with a single `\n` instead of `\n\n`)
@@ -20,6 +20,19 @@ Two failure modes show up as “line breaks are messed up”:
    file/blob renderer’s soft-break-as-space). The body looks like a column of
    disconnected short lines. Prefer one long line per paragraph, or separate
    paragraphs with a blank line.
+3. **Unlinked closing keywords** — writing a closing intent as natural prose
+   (`"This closes that gap (#651's remaining scope…)"`) instead of GitHub's
+   required adjacent form. GitHub only auto-links/closes an issue when a
+   keyword (`close(s|d)`, `fix(es|ed)`, `resolve(s|d)`) sits **immediately**
+   next to the reference — `Fixes #651.` — with nothing else in between,
+   including a stray word like "in" (`Fixed in #651` does **not** link).
+   GitHub also requires its own keyword before **each** reference: `Fixes
+   #651, #652.` only closes #651 — write `Fixes #651, fixes #652.` to close
+   both. This only closes an issue from a **PR description targeting the
+   default branch, or a commit message** — the same phrasing in an issue body
+   is just a reference, not a closing action. When a PR description is meant
+   to close another issue, write it as its own sentence: `Fixes #651.` /
+   `Closes #651.` (repository-helpers#660).
 
 ## Authoring
 
@@ -69,8 +82,9 @@ or `reply-thread` / `reply-comment`.
 
 The linter flags mid-line list markers, headings lacking a preceding blank line,
 fence markers that are not alone on their line, literal `\n` escapes outside
-fences, and consecutive prose lines (hand-wrapped paragraphs). Fix findings
-before posting.
+fences, consecutive prose lines (hand-wrapped paragraphs), and a closing
+keyword that is near an issue reference but not immediately adjacent to it.
+Fix findings before posting.
 
 ## Scope
 
