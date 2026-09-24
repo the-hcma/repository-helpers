@@ -2,13 +2,17 @@
 # shellcheck shell=bash
 # github-markdown — lightweight lint for agent-authored GitHub Markdown bodies.
 #
-# Catches two GitHub-body failure modes (repository-helpers#651 / #653):
+# Catches three GitHub-body failure modes (repository-helpers#651 / #653 / #660):
 #   1. Assemblies with literal \\n escapes or missing blank lines (collapsed
 #      lists/headings/fences).
 #   2. Hand-wrapped paragraphs: consecutive prose lines joined by a single
 #      newline. GitHub's issue/PR/comment renderer treats that lone \\n as a
 #      visible hard break (unlike the file/blob CommonMark soft-break-as-space
 #      rule), so ~80-column wraps render as a column of short lines.
+#   3. Closing keywords (fix/close/resolve, any tense) that sit near an issue
+#      reference but are not immediately adjacent to it — natural-language
+#      phrasing that reads as intentional but never triggers GitHub's
+#      auto-link/auto-close.
 #
 # Non-goals: full Markdown linter/formatter dependency.
 set -euo pipefail
@@ -22,6 +26,13 @@ fi
 _ghm_fence_tick='```'
 _ghm_fence_tilde='~~~'
 readonly _ghm_fence_tick _ghm_fence_tilde
+
+# GitHub closing keywords (any tense) and the issue-reference shape (#NNN or
+# OWNER/REPO#NNN) it must sit directly next to — with nothing else in
+# between — to auto-link/auto-close (repository-helpers#660).
+_ghm_closing_keyword_re='(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)'
+_ghm_issue_ref_re='([a-z0-9_.-]+/[a-z0-9_.-]+)?#[0-9]+'
+readonly _ghm_closing_keyword_re _ghm_issue_ref_re
 
 # ghm_fence_parse <trimmed-line>
 # Prints "char|len|kind" when the line is a fence (kind=open|close).
@@ -58,6 +69,26 @@ ghm_fence_parse() {
     return 0
   fi
   return 1
+}
+
+# ghm_line_has_unlinked_closing_keyword <raw-line>
+# True when the line uses a GitHub closing keyword (fix/close/resolve, any
+# tense) together with an issue reference (#NNN or OWNER/REPO#NNN), but not in
+# the exact adjacent form GitHub requires to auto-link/close ("fixes #123"
+# with nothing else in between). Catches natural-language phrasing like "this
+# closes that gap (#651's remaining scope…)" that reads as intentional but
+# never links (repository-helpers#660). Line-scoped heuristic: a keyword and
+# reference split across two hand-wrapped lines are not caught here (the
+# hand-wrap itself is already flagged separately).
+ghm_line_has_unlinked_closing_keyword() {
+  local -r padded=" ${1,,} "
+  local -r has_keyword_re='[^a-z]'"${_ghm_closing_keyword_re}"'[^a-z]'
+  local -r valid_pair_re='[^a-z]'"${_ghm_closing_keyword_re}"'[:]?[[:space:]]*'"${_ghm_issue_ref_re}"
+
+  [[ "$padded" =~ $has_keyword_re ]] || return 1
+  [[ "$padded" =~ $_ghm_issue_ref_re ]] || return 1
+  [[ "$padded" =~ $valid_pair_re ]] && return 1
+  return 0
 }
 
 # ghm_line_is_prose <raw-line>
@@ -232,6 +263,14 @@ ghm_lint_text() {
     # Joined list items (two markers on one line).
     if [[ "$line" =~ $list_joined_re ]]; then
       printf 'line:%d: list marker appears mid-line (items may have been joined)\n' "$lineno"
+      findings=$((findings + 1))
+    fi
+
+    # Closing keyword near an issue reference but not adjacent to it — GitHub
+    # only auto-links/closes on "fixes #123" with nothing in between (#660).
+    if ghm_line_has_unlinked_closing_keyword "$line"; then
+      printf 'line:%d: closing keyword near an issue reference but not immediately next to it (GitHub only auto-closes on e.g. "fixes #123", not "fixes … #123")\n' \
+        "$lineno"
       findings=$((findings + 1))
     fi
 
