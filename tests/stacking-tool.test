@@ -299,6 +299,243 @@ else
 fi
 rm -rf "$fake_bin"
 
+printf '\n=== functional: stacking_tool_ensure_stack_conventional_titles ===\n'
+stack_repo="$(mktemp -d)"
+git -C "$stack_repo" -c user.name=test -c user.email=test@example.com init -q
+git -C "$stack_repo" remote add origin 'https://github.com/the-hcma/squash-repo.git'
+
+stack_fake_bin="$(mktemp -d)"
+stack_edit_log="${stack_fake_bin}/edit.log"
+: >"$stack_edit_log"
+cat >"${stack_fake_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+if [[ "\$args" == *'stack view --json'* ]]; then
+  printf '%s\n' '{"trunk":"main","currentBranch":"b2","branches":[{"name":"b1","pr":{"number":701}},{"name":"b2","pr":{"number":702}}]}'
+  exit 0
+fi
+if [[ "\$args" == *'api repos/the-hcma/squash-repo'* ]]; then
+  printf '%s\n' '{"allow_squash_merge":true,"squash_merge_commit_title":"PR_TITLE","squash_merge_commit_message":"BLANK"}'
+  exit 0
+fi
+if [[ "\$args" == *'pr view 701'* && "\$args" == *'--json title'* ]]; then
+  printf '%s\n' 'feat: already good'
+  exit 0
+fi
+if [[ "\$args" == *'pr view 702'* && "\$args" == *'--json title'* ]]; then
+  printf '%s\n' 'branch name wt'
+  exit 0
+fi
+if [[ "\$args" == *'pr view 702'* && "\$args" == *'--json commits'* ]]; then
+  printf '%s\n' 'fix: the bug'
+  exit 0
+fi
+if [[ "\$args" == *'pr edit 702'* && "\$args" == *'--title'* ]]; then
+  printf '%s\n' "\$*" >>'${stack_edit_log}'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${stack_fake_bin}/gh"
+
+ensure_stack_rc=0
+ensure_stack_out=''
+ensure_stack_out="$(
+  PATH="${stack_fake_bin}:/usr/bin:/bin" \
+    stacking_tool_ensure_stack_conventional_titles "$stack_repo" 2>&1
+)" || ensure_stack_rc=$?
+assert_exit_0 'ensure_stack_conventional_titles fixes every PR in the stack' "$ensure_stack_out" "$ensure_stack_rc"
+assert_contains 'checks pr 701' "$ensure_stack_out" 'pr=701'
+assert_contains 'derives pr 702 title' "$ensure_stack_out" 'to=fix: the bug'
+if grep -q -- '--title fix: the bug' "$stack_edit_log"; then
+  pass_case 'gh pr edit received derived title (via stacking-tool)'
+else
+  fail_case 'gh pr edit received derived title (via stacking-tool)'
+fi
+
+printf '\n=== functional: stacking_tool_ensure_stack_conventional_titles fails on unfixable title ===\n'
+cat >"${stack_fake_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+if [[ "\$args" == *'stack view --json'* ]]; then
+  printf '%s\n' '{"trunk":"main","currentBranch":"b1","branches":[{"name":"b1","pr":{"number":703}}]}'
+  exit 0
+fi
+if [[ "\$args" == *'api repos/the-hcma/squash-repo'* ]]; then
+  printf '%s\n' '{"allow_squash_merge":true,"squash_merge_commit_title":"PR_TITLE","squash_merge_commit_message":"BLANK"}'
+  exit 0
+fi
+if [[ "\$args" == *'pr view 703'* && "\$args" == *'--json title'* ]]; then
+  printf '%s\n' 'wip stuff'
+  exit 0
+fi
+if [[ "\$args" == *'pr view 703'* && "\$args" == *'--json commits'* ]]; then
+  printf '%s\n' 'WIP'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${stack_fake_bin}/gh"
+
+fail_stack_rc=0
+fail_stack_out=''
+fail_stack_out="$(
+  PATH="${stack_fake_bin}:/usr/bin:/bin" \
+    stacking_tool_ensure_stack_conventional_titles "$stack_repo" 2>&1
+)" || fail_stack_rc=$?
+assert_exit_nonzero 'ensure_stack_conventional_titles fails on unfixable title' "$fail_stack_out" "$fail_stack_rc"
+assert_contains 'reports noncompliant PR' "$fail_stack_out" 'PR_CC_TITLE_NONCOMPLIANT'
+
+printf '\n=== functional: stacking_tool_ensure_stack_conventional_titles excludes merged branches ===\n'
+cat >"${stack_fake_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+if [[ "\$args" == *'stack view --json'* ]]; then
+  printf '%s\n' '{"trunk":"main","currentBranch":"b2","branches":[{"name":"b1","isMerged":true,"pr":{"number":704}},{"name":"b2","isMerged":false,"pr":{"number":705}}]}'
+  exit 0
+fi
+if [[ "\$args" == *'api repos/the-hcma/squash-repo'* ]]; then
+  printf '%s\n' '{"allow_squash_merge":true,"squash_merge_commit_title":"PR_TITLE","squash_merge_commit_message":"BLANK"}'
+  exit 0
+fi
+if [[ "\$args" == *'pr view 705'* && "\$args" == *'--json title'* ]]; then
+  printf '%s\n' 'feat: fine'
+  exit 0
+fi
+if [[ "\$args" == *'pr view 704'* ]]; then
+  printf 'unexpected gh call on merged PR 704: %s\n' "\$args" >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${stack_fake_bin}/gh"
+
+merged_rc=0
+merged_out=''
+merged_out="$(
+  PATH="${stack_fake_bin}:/usr/bin:/bin" \
+    stacking_tool_ensure_stack_conventional_titles "$stack_repo" 2>&1
+)" || merged_rc=$?
+assert_exit_0 'excludes merged branches from the title check' "$merged_out" "$merged_rc"
+assert_contains 'checks the open PR' "$merged_out" 'pr=705'
+if grep -qF 'pr=704' <<<"$merged_out"; then
+  fail_case 'merged PR 704 was not checked'
+else
+  pass_case 'merged PR 704 was not checked'
+fi
+
+printf '\n=== functional: stacking_tool_ensure_stack_conventional_titles fails closed on stack-view failure ===\n'
+cat >"${stack_fake_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'gh: some transient error\n' >&2
+exit 1
+MOCK_GH
+chmod +x "${stack_fake_bin}/gh"
+
+view_fail_rc=0
+view_fail_out=''
+view_fail_out="$(
+  PATH="${stack_fake_bin}:/usr/bin:/bin" \
+    stacking_tool_ensure_stack_conventional_titles "$stack_repo" 2>&1
+)" || view_fail_rc=$?
+assert_exit_nonzero 'fails closed when gh stack view fails' "$view_fail_out" "$view_fail_rc"
+assert_contains 'reports the stack-view failure' "$view_fail_out" 'ERROR: gh stack view --json failed'
+
+printf '\n=== functional: stacking_tool_ensure_stack_conventional_titles fails closed on unparseable stack view output ===\n'
+cat >"${stack_fake_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'stack view --json'* ]]; then
+  printf 'not json\n'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${stack_fake_bin}/gh"
+
+parse_fail_rc=0
+parse_fail_out=''
+parse_fail_out="$(
+  PATH="${stack_fake_bin}:/usr/bin:/bin" \
+    stacking_tool_ensure_stack_conventional_titles "$stack_repo" 2>&1
+)" || parse_fail_rc=$?
+assert_exit_nonzero 'fails closed on unparseable stack view output' "$parse_fail_out" "$parse_fail_rc"
+assert_contains 'reports the parse failure' "$parse_fail_out" 'ERROR: could not parse gh stack view output'
+
+printf '\n=== functional: stacking_tool_ensure_stack_conventional_titles skips without origin ===\n'
+no_origin_repo="$(mktemp -d)"
+git -C "$no_origin_repo" -c user.name=test -c user.email=test@example.com init -q
+no_origin_rc=0
+no_origin_out=''
+no_origin_out="$(stacking_tool_ensure_stack_conventional_titles "$no_origin_repo" 2>&1)" || no_origin_rc=$?
+assert_exit_0 'skips quietly with no origin remote' "$no_origin_out" "$no_origin_rc"
+assert_contains 'skip note' "$no_origin_out" 'could not resolve origin'
+
+rm -rf "$stack_repo" "$stack_fake_bin" "$no_origin_repo"
+
+printf '\n=== functional: stacking_tool_restack_as gh-stack fallback checks stack titles ===\n'
+restack_repo="$(mktemp -d)"
+git -C "$restack_repo" -c user.name=test -c user.email=test@example.com init -q
+git -C "$restack_repo" remote add origin 'https://github.com/the-hcma/squash-repo.git'
+
+restack_fake_bin="$(mktemp -d)"
+cat >"${restack_fake_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'stack --help'* ]]; then
+  exit 0
+fi
+if [[ "$args" == *'stack sync --remote origin'* ]]; then
+  exit 1
+fi
+if [[ "$args" == *'stack rebase --remote origin'* ]]; then
+  exit 0
+fi
+if [[ "$args" == *'stack submit --auto --open --remote origin'* ]]; then
+  exit 0
+fi
+if [[ "$args" == *'stack view --json'* ]]; then
+  printf '%s\n' '{"trunk":"main","currentBranch":"b1","branches":[{"name":"b1","pr":{"number":706}}]}'
+  exit 0
+fi
+if [[ "$args" == *'api repos/the-hcma/squash-repo'* ]]; then
+  printf '%s\n' '{"allow_squash_merge":true,"squash_merge_commit_title":"PR_TITLE","squash_merge_commit_message":"BLANK"}'
+  exit 0
+fi
+if [[ "$args" == *'pr view 706'* && "$args" == *'--json title'* ]]; then
+  printf '%s\n' 'feat: fine'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${restack_fake_bin}/gh"
+
+restack_rc=0
+restack_out=''
+restack_out="$(
+  PATH="${restack_fake_bin}:${PATH}" \
+    stacking_tool_restack_as 'gh-stack' "$restack_repo" 2>&1
+)" || restack_rc=$?
+if [[ "$restack_rc" -eq 0 ]] && grep -qF 'pr=706' <<<"$restack_out"; then
+  pass_case 'restack gh-stack fallback also checks stack PR titles'
+else
+  fail_case "restack gh-stack fallback also checks stack PR titles (rc=${restack_rc})"
+  printf '%s\n' "$restack_out" >&2
+fi
+
+rm -rf "$restack_repo" "$restack_fake_bin"
+
 printf '\n=== functional: session_sync_as skips gt sync when Graphite unusable ===\n'
 fake_bin="$(mktemp -d)"
 gt_log="${fake_bin}/gt.log"
