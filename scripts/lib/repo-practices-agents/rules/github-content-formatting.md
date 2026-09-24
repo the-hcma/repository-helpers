@@ -15,8 +15,8 @@ Write multi-paragraph or multi-line-list bodies to a temp file and post with
 `--body-file <path>`, never an inline `--body "..."` string with embedded `\n`
 escapes. Lint before posting:
 
-```
-scripts/lint-github-markdown <path>
+```bash
+"${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/lint-github-markdown" <path>
 ```
 
 Full authoring rules, the pre-flight linter, and `scripts/gh-issue` — the canonical
