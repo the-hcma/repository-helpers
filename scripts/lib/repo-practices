@@ -5647,6 +5647,8 @@ rp_apply_candidate_fixes_via_api() {
     branch_name="repo-practices/${branch_suffix}"
     title="$message"
     body="$(cat <<EOF
+$(rp_candidate_pr_rollout_notice)
+
 ## Summary
 - Repository-practices remediation for \`${path}\`.
 
@@ -6047,11 +6049,25 @@ rp_prepare_candidate_worktree() {
   printf '%s\n' "$worktree_path"
 }
 
+# rp_candidate_pr_rollout_notice
+# Leading callout for every github-repo-lint --apply-fix candidate PR (rule
+# rollout or workflow-template addition): flags that it still needs the full
+# agent-review acceptance gate before merge, not the immediate auto-merge an
+# ordinary PR would get. Without this, an agent (or human) looking only at
+# the PR has no signal to hold off — that gap let home-warden#119/#120 land
+# unreviewed via merge queue (repository-helpers#661).
+rp_candidate_pr_rollout_notice() {
+  printf '%s' '**Org rollout candidate — do not enable auto-merge until this PR is agent-review-accepted.**'
+  printf ' See `.agents/rules/org-cursor-rule-rollout.md` step 4.2 in repository-helpers.'
+  printf '\n'
+}
+
 rp_apply_candidate_fix_stack() {
   local slug="$1"
   local repo_dir default_branch worktree_path key key_slug path content branch_suffix message
   local branch parent_branch parent_ref created_any has_candidate path_dir status
   local stacking_tool show_ref_exit_code diff_exit_code quoted_wt quoted_branches
+  local branch_pr_number branch_pr_list_exit_code branch_pr_edit_exit_code branch_pr_body
   local -a created_branches=()
 
   if [[ "$rp_apply_fix" -ne 1 ]]; then
@@ -6165,6 +6181,43 @@ rp_apply_candidate_fix_stack() {
   if [[ -n "$status" ]]; then
     rp_die "candidate fix worktree is dirty after submit: ${worktree_path}"
   fi
+
+  # `gh stack submit` / `gt submit` generate their own minimal PR body (just a
+  # tool footer) — neither reads the commit message body. Overwrite each
+  # created branch's PR body directly so the rollout notice actually reaches
+  # the PR, not just the commit history.
+  for branch in "${created_branches[@]}"; do
+    branch_pr_number=''
+    branch_pr_list_exit_code=0
+    branch_pr_number="$(rp_runner_exec_stdout "repo-practices gh pr list candidate stack branch" \
+      -- gh pr list --repo "$slug" --head "$branch" --state open --json number \
+        --jq '.[0].number // empty')" \
+      || branch_pr_list_exit_code=$?
+    branch_pr_number="${branch_pr_number//$'\n'/}"
+    if (( branch_pr_list_exit_code != 0 )) || [[ -z "$branch_pr_number" ]]; then
+      rp_log_warn "${slug}: could not resolve PR number for candidate branch ${branch} — skipping rollout-notice body edit"
+      continue
+    fi
+
+    branch_pr_body="$(cat <<EOF
+$(rp_candidate_pr_rollout_notice)
+
+## Summary
+- Repository-practices remediation queued by \`github-repo-lint --apply-fix\` (branch \`${branch}\`).
+
+## Test plan
+- Org cursor-rule / practices template sync only.
+EOF
+)"
+    branch_pr_edit_exit_code=0
+    runner_exec "repo-practices gh pr edit candidate stack rollout notice" \
+      -- gh pr edit "$branch_pr_number" --repo "$slug" --body "$branch_pr_body" \
+      || branch_pr_edit_exit_code=$?
+    if (( branch_pr_edit_exit_code != 0 )); then
+      rp_log_warn "${slug}: failed to set rollout-notice body on PR #${branch_pr_number} (${branch})"
+    fi
+  done
+
   rp_log_warn "${slug}: submitted candidate workflow fix stack from ${worktree_path}"
 }
 
