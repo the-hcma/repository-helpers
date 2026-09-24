@@ -25,9 +25,14 @@ Three failure modes show up here:
    required adjacent form. GitHub only auto-links/closes an issue when a
    keyword (`close(s|d)`, `fix(es|ed)`, `resolve(s|d)`) sits **immediately**
    next to the reference — `Fixes #651.` — with nothing else in between,
-   including a stray word like "in" (`Fixed in #651` does **not** link). When
-   a PR/issue body is meant to close another issue, write it as its own
-   sentence: `Fixes #651.` / `Closes #651.` (repository-helpers#660).
+   including a stray word like "in" (`Fixed in #651` does **not** link).
+   GitHub also requires its own keyword before **each** reference: `Fixes
+   #651, #652.` only closes #651 — write `Fixes #651, fixes #652.` to close
+   both. This only closes an issue from a **PR description targeting the
+   default branch, or a commit message** — the same phrasing in an issue body
+   is just a reference, not a closing action. When a PR description is meant
+   to close another issue, write it as its own sentence: `Fixes #651.` /
+   `Closes #651.` (repository-helpers#660).
 
 ## Authoring
 

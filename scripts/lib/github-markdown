@@ -71,24 +71,84 @@ ghm_fence_parse() {
   return 1
 }
 
+# ghm_strip_inline_code_spans <raw-line>
+# Removes backtick-delimited inline code spans so a keyword or reference
+# quoted for illustration (`` `fix` ``, `` `#651` ``) is not mistaken for real
+# closing-keyword usage. Multi-line fenced code blocks are tracked separately
+# by the fence-parsing loop in ghm_lint_text; this only handles a single
+# line's inline spans. An unmatched trailing backtick is left as-is (fail
+# open: keep the text rather than silently dropping it).
+ghm_strip_inline_code_spans() {
+  local line="$1" out='' before after
+
+  while [[ "$line" == *'`'* ]]; do
+    before="${line%%\`*}"
+    after="${line#*\`}"
+    if [[ "$after" != *'`'* ]]; then
+      out+="${before}"'`'"${after}"
+      line=''
+      break
+    fi
+    out+="$before"
+    line="${after#*\`}"
+  done
+  out+="$line"
+  printf '%s' "$out"
+}
+
 # ghm_line_has_unlinked_closing_keyword <raw-line>
 # True when the line uses a GitHub closing keyword (fix/close/resolve, any
-# tense) together with an issue reference (#NNN or OWNER/REPO#NNN), but not in
-# the exact adjacent form GitHub requires to auto-link/close ("fixes #123"
-# with nothing else in between). Catches natural-language phrasing like "this
-# closes that gap (#651's remaining scope…)" that reads as intentional but
-# never links (repository-helpers#660). Line-scoped heuristic: a keyword and
-# reference split across two hand-wrapped lines are not caught here (the
-# hand-wrap itself is already flagged separately).
+# tense) together with an issue reference (#NNN or OWNER/REPO#NNN), but at
+# least one such reference is not in the exact adjacent form GitHub requires
+# to auto-link/close ("fixes #123" with nothing else in between). GitHub
+# requires its own keyword before *each* reference ("resolves #10, resolves
+# #11", not "resolves #10, #11"), so every reference on the line is checked
+# individually. Catches natural-language phrasing like "this closes that gap
+# (#651's remaining scope…)" that reads as intentional but never links
+# (repository-helpers#660). Inline code spans are stripped first so
+# illustrative text quoting the keyword or a reference in backticks is not
+# mistaken for real usage. A bare "#" not preceded by a word boundary (e.g.
+# "C#8") is not treated as an issue reference. Line-scoped heuristic: a
+# keyword and reference split across two hand-wrapped lines are not caught
+# here (the hand-wrap itself is already flagged separately).
 ghm_line_has_unlinked_closing_keyword() {
-  local -r padded=" ${1,,} "
   local -r has_keyword_re='[^a-z]'"${_ghm_closing_keyword_re}"'[^a-z]'
-  local -r valid_pair_re='[^a-z]'"${_ghm_closing_keyword_re}"'[:]?[[:space:]]*'"${_ghm_issue_ref_re}"
+  local -r adjacent_re='(^|[^a-z])'"${_ghm_closing_keyword_re}"'[:]?[[:space:]]*$'
+  local stripped padded remaining prefix matched before boundary_char
+  local -i consumed=0 match_start=0 found_ref=0
 
+  stripped="$(ghm_strip_inline_code_spans "$1")"
+  padded=" ${stripped,,} "
   [[ "$padded" =~ $has_keyword_re ]] || return 1
-  [[ "$padded" =~ $_ghm_issue_ref_re ]] || return 1
-  [[ "$padded" =~ $valid_pair_re ]] && return 1
-  return 0
+
+  remaining="$padded"
+  while [[ "$remaining" =~ $_ghm_issue_ref_re ]]; do
+    matched="${BASH_REMATCH[0]}"
+    before="${remaining%%"$matched"*}"
+    match_start=$(( consumed + ${#before} ))
+
+    boundary_char=''
+    if (( match_start > 0 )); then
+      boundary_char="${padded:match_start-1:1}"
+    fi
+    if [[ "$boundary_char" =~ [a-z0-9_./-] ]]; then
+      # Not a real reference (e.g. the "#8" in "C#8") — skip past it.
+      consumed=$(( match_start + ${#matched} ))
+      remaining="${padded:consumed}"
+      continue
+    fi
+
+    found_ref=1
+    prefix="${padded:0:match_start}"
+    if [[ ! "$prefix" =~ $adjacent_re ]]; then
+      return 0
+    fi
+    consumed=$(( match_start + ${#matched} ))
+    remaining="${padded:consumed}"
+  done
+
+  (( found_ref == 1 )) || return 1
+  return 1
 }
 
 # ghm_line_is_prose <raw-line>
