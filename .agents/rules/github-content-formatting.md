@@ -77,3 +77,6 @@ before posting.
 Applies to issue bodies, PR descriptions, and PR/review comments or replies
 posted by an agent — same “validate before it ships” principle as Conventional
 Commits PR titles (see `.agents/rules/pr-ship-and-review.md`).
+
+<!-- github-content-formatting-canonical: https://github.com/the-hcma/repository-helpers/blob/main/.agents/rules/github-content-formatting.md -->
+Canonical rule: https://github.com/the-hcma/repository-helpers/blob/main/.agents/rules/github-content-formatting.md
