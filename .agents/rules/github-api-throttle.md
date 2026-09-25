@@ -1,5 +1,5 @@
 ---
-description: Every gh call site, agent or first-party code, must go through the throttled wrapper
+description: Every gh call site, agent or first-party code, must run through scripts/gh-api
 alwaysApply: true
 ---
 
