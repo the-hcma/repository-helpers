@@ -5591,27 +5591,68 @@ py_pkg_installed_version() {
     '.[] | select((.name | ascii_downcase | gsub("[._]"; "-")) == $n) | .version'
 }
 
+# py_uv_extract_compound_cap <pyproject_path> <pkg>
+# Prints the upper-bound version from an existing compound-cap specifier
+# ("pkg>=1.0.0,<2.0.0") for a direct [project]/[project.*]/[dependency-groups]
+# dependency, or empty when the specifier has no such cap. A compound cap is
+# often an intentional compatibility pin against a known-broken release range,
+# not leftover boilerplate (repository-helpers#665) — py_uv_rewrite_version_floor
+# uses this to decide whether a floor bump can keep the cap.
+py_uv_extract_compound_cap() {
+  local -r path="$1"
+  local -r pkg="$2"
+  local sed_pkg cap
+
+  [[ -f "$path" ]] || return 0
+  sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
+  cap="$(grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?(~=|>=|==)[0-9][0-9a-zA-Z.]*,[[:space:]]*<[0-9][0-9a-zA-Z.]*" \
+      "$path" 2>/dev/null \
+    | grep -oE '<[0-9][0-9a-zA-Z.]*$' | head -1)"
+  if [[ -z "$cap" ]]; then
+    cap="$(grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?\"[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*[[:space:]]*,[[:space:]]*<[0-9][0-9a-zA-Z.]*" \
+        "$path" 2>/dev/null \
+      | grep -oE '<[0-9][0-9a-zA-Z.]*$' | head -1)"
+  fi
+  printf '%s' "${cap#<}"
+}
+
 # py_uv_rewrite_version_floor <pyproject_path> <pkg> <new_ver>
 # Rewrites a PEP 508 dependency floor in [project].dependencies-style entries:
 #   "pkg>=1.0.0" / "pkg[extra]>=1.0.0" (bundled) or "pkg[extra]" >= 1.0.0 / "pkg" >= 1.0.0
-# Compound caps such as "pkg>=1.0.0,<2" are rewritten to "pkg>=2.0.0" (drops the upper
-# bound — not an intentional freeze). A trailing PEP 508 environment marker is kept.
-# Two sed passes (bundled before split). Converts
-# == and ~= to >=. Returns 1 when sed fails or the constraint line did not change.
+# Compound caps such as "pkg>=1.0.0,<2.0.0" are preserved when the new floor still
+# satisfies them (rewritten to "pkg>=1.5.0,<2.0.0", say) — the cap is treated as an
+# intentional compatibility pin, not leftover boilerplate (repository-helpers#665).
+# When the new floor would itself violate the cap (new_ver >= cap), the rewrite is
+# skipped entirely (specifier left untouched) and a WARNING is logged plus recorded
+# as an ecosystem failure so the run surfaces it for manual review, rather than
+# silently dropping the cap. A trailing PEP 508 environment marker is kept.
+# Two sed passes (bundled before split). Converts == and ~= to >=. Returns 1 when
+# sed fails or the constraint line did not change; returns 2 when the rewrite was
+# skipped because the new floor would violate an existing compound cap.
 py_uv_rewrite_version_floor() {
   local -r path="$1"
   local -r pkg="$2"
   local -r new_ver="$3"
-  local sed_pkg sed_new_ver before
+  local sed_pkg sed_new_ver before existing_cap
+
+  existing_cap="$(py_uv_extract_compound_cap "$path" "$pkg")"
+  if [[ -n "$existing_cap" ]] && py_uv_version_at_least "$new_ver" "$existing_cap"; then
+    log "[python/uv] WARNING: ${pkg} floor bump to ${new_ver} would violate its existing" \
+      "cap <${existing_cap}; leaving the specifier untouched (needs manual review)."
+    dep_updater_append_ecosystem_failure \
+      "python|${pkg}: floor bump to ${new_ver} would violate existing cap <${existing_cap}; skipped (manual review)"
+    return 2
+  fi
 
   before="$(mktemp)"
   cp "$path" "$before"
   sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
   sed_new_ver="$(printf '%s' "$new_ver" | sed 's/[\\&#]/\\&/g')"
-  # Bundled: version + optional ,<cap; keep a trailing ;environment-marker.
+  # Bundled: version + optional ,<cap (kept verbatim when present); keep a
+  # trailing ;environment-marker.
   gnu_sed_inplace -E "$path" \
-    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?)(~=|>=|==)[0-9][0-9a-zA-Z.]*(,[[:space:]]*<[0-9][0-9a-zA-Z.]*)?(;[^\\\"]*)?\\\"#\\1>=${sed_new_ver}\\5\\\"#" \
-    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?\")[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*([[:space:]]*,[[:space:]]*<[0-9][0-9a-zA-Z.]*)?#\\1 >= ${sed_new_ver}#" \
+    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?)(~=|>=|==)[0-9][0-9a-zA-Z.]*(,[[:space:]]*<[0-9][0-9a-zA-Z.]*)?(;[^\\\"]*)?\\\"#\\1>=${sed_new_ver}\\4\\5\\\"#" \
+    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?\")[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*([[:space:]]*,[[:space:]]*<[0-9][0-9a-zA-Z.]*)?#\\1 >= ${sed_new_ver}\\4#" \
     || {
       cp "$before" "$path"
       rm -f "$before"
