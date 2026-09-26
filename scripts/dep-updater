@@ -4837,11 +4837,16 @@ npm_audit() {
 }
 
 # Write the PR body for a combined security update PR.
-# Args: ecosystem  audit_lines  body_file
+# Args: ecosystem  audit_lines  body_file  [cap_crossing_lines]
+# cap_crossing_lines (uv only; empty for npm) is newline-separated
+# "pkg|existing_cap|fix_ver" records from py_uv_flag_cve_security_cap_crossing
+# — rendered as a callout so a reviewer sees a crossed compatibility pin in
+# the PR body itself, not only in run logs (repository-helpers#669 review).
 write_security_pr_body() {
   local -r eco="$1"
   local -r audit_lines="$2"
   local -r body_file="$3"
+  local -r cap_crossing_lines="${4:-}"
   {
     printf '## Security: CVE fixes\n\n'
     printf "Automated security updates via \`dep-updater\`.\n\n"
@@ -4854,7 +4859,9 @@ write_security_pr_body() {
       printf "| \`%s\` | \`%s\` | \`%s\` | %s |\n" \
         "$pkg" "$current" "$fix" "${cves/,/, }"
     done <<< "$audit_lines"
-    printf '\n- **Ecosystem:** %s\n' "$eco"
+    printf '\n'
+    py_uv_render_cve_cap_crossings_section "$cap_crossing_lines"
+    printf -- '- **Ecosystem:** %s\n' "$eco"
   } > "$body_file"
 }
 
@@ -5012,6 +5019,8 @@ py_security_update() {
 
   local files_changed=""
   local sec_lock_bak="" sec_pyproject_bak=""
+  local sec_cap_crossing
+  local -a sec_cap_crossings=()
   if [[ "$tool" == "uv" ]]; then
     if [[ -f "${worktree_path}/pyproject.toml" ]]; then
       sec_pyproject_bak="$(mktemp)"
@@ -5027,6 +5036,8 @@ py_security_update() {
     log "[python/${tool}] Security: bumping ${pkg} to ${fix}…"
     case "$tool" in
       uv)
+        sec_cap_crossing="$(py_uv_flag_cve_security_cap_crossing "${worktree_path}/pyproject.toml" "$pkg" "$fix")"
+        [[ -n "$sec_cap_crossing" ]] && sec_cap_crossings+=("$sec_cap_crossing")
         dep_runner_uv_dir "uv security add" "$worktree_path" -- add "${pkg}==${fix}"
         files_changed="pyproject.toml + uv.lock"
         ;;
@@ -5102,7 +5113,8 @@ py_security_update() {
   pr_num="$(wait_for_pr_number_for_new_branch "$branch" || true)"
   [[ -z "$pr_num" ]] && die "Could not determine PR number for branch '${branch}'"
 
-  write_security_pr_body "python/${tool}" "$audit_lines" "$body_file"
+  write_security_pr_body "python/${tool}" "$audit_lines" "$body_file" \
+    "$(printf '%s\n' "${sec_cap_crossings[@]}")"
   dep_runner_gh_stdout "gh pr" -- pr edit "$pr_num" \
     --repo "${repo_owner}/${repo_name}" \
     --title "$commit_msg" \
@@ -5617,16 +5629,82 @@ py_uv_extract_compound_cap() {
   # (possibly empty) output was already produced. "No cap found" is a normal
   # outcome here, not an error — || true matches this file's existing
   # convention (e.g. py_uv_parse_verify_filter_pkg) for exactly this reason.
+  # <=? accepts both an exclusive cap (,<Y) and an inclusive one (,<=Y); the
+  # bundled/split "bare upper bound, no floor" patterns (pkg<Y / pkg<=Y with
+  # no >=/~=/== at all) are a valid PEP 508 shape py_uv_rewrite_version_floor
+  # never has to rewrite (it requires a floor operator to match at all), but
+  # the CVE guard (py_uv_flag_cve_security_cap_crossing) must still detect it
+  # — otherwise that cap silently disappears with no warning either
+  # (repository-helpers#669 review).
   caps="$(
     {
-      grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?(~=|>=|==)[0-9][0-9a-zA-Z.]*,[[:space:]]*<[0-9][0-9a-zA-Z.]*" \
+      grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?(~=|>=|==)[0-9][0-9a-zA-Z.]*,[[:space:]]*<=?[0-9][0-9a-zA-Z.]*" \
         "$path" 2>/dev/null
-      grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?\"[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*[[:space:]]*,[[:space:]]*<[0-9][0-9a-zA-Z.]*" \
+      grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?\"[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*[[:space:]]*,[[:space:]]*<=?[0-9][0-9a-zA-Z.]*" \
         "$path" 2>/dev/null
-    } | grep -oE '<[0-9][0-9a-zA-Z.]*$' | tr -d '<' || true
+      grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?[[:space:]]*<=?[0-9][0-9a-zA-Z.]*" \
+        "$path" 2>/dev/null
+      grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?\"[[:space:]]*<=?[[:space:]]*[0-9][0-9a-zA-Z.]*" \
+        "$path" 2>/dev/null
+    } | grep -oE '<=?[[:space:]]*[0-9][0-9a-zA-Z.]*$' | sed -E 's/^<=?[[:space:]]*//' || true
   )"
   [[ -z "$caps" ]] && return 0
   printf '%s\n' "$caps" | sort -V | head -1
+}
+
+# py_uv_flag_cve_security_cap_crossing <pyproject_path> <pkg> <fix_ver>
+# The CVE/security path (`uv add pkg==fix`, in py_security_update and the batch
+# security loop) rewrites the whole specifier itself, so unlike
+# py_uv_rewrite_version_floor it cannot preserve an existing compound cap. A
+# security fix must still land regardless of an existing pin, but losing it
+# without a trace carries the same risk as py_uv_rewrite_version_floor guards
+# against (repository-helpers#665). When fix_ver crosses (reaches or exceeds)
+# an existing cap, logs a WARNING, records an ecosystem failure, and prints
+# "pkg|existing_cap|fix_ver" on stdout (empty otherwise) so the caller can
+# collect crossings and relay them into the generated security PR body — a
+# log line alone is easy to miss; the PR a reviewer actually reads should say
+# a CVE-induced bump might break something (repository-helpers#669 review).
+# Never blocks the caller: always returns 0.
+py_uv_flag_cve_security_cap_crossing() {
+  local -r path="$1"
+  local -r pkg="$2"
+  local -r fix_ver="$3"
+  local existing_cap
+
+  existing_cap="$(py_uv_extract_compound_cap "$path" "$pkg")"
+  if [[ -n "$existing_cap" ]] && py_uv_version_at_least "$fix_ver" "$existing_cap"; then
+    log "[python/uv] WARNING: CVE fix for ${pkg} to ${fix_ver} crosses its existing compatibility" \
+      "cap <${existing_cap} (repository-helpers#665) — proceeding since the security fix" \
+      "must land, but the pin is now gone; verify compatibility manually."
+    dep_updater_append_ecosystem_failure \
+      "python|${pkg}: CVE fix to ${fix_ver} crossed existing cap <${existing_cap}; pin removed by uv add (verify compatibility)"
+    printf '%s|%s|%s\n' "$pkg" "$existing_cap" "$fix_ver"
+  fi
+  return 0
+}
+
+# py_uv_render_cve_cap_crossings_section <crossing_lines>
+# Renders a "## ⚠️ Compatibility caps crossed" Markdown section from
+# newline-separated "pkg|existing_cap|fix_ver" records (see
+# py_uv_flag_cve_security_cap_crossing), or nothing when crossing_lines is
+# empty. Shared by the single-PR and batch security PR body writers so the
+# warning is visible in the PR a reviewer actually reads, not just run logs.
+py_uv_render_cve_cap_crossings_section() {
+  local -r crossing_lines="$1"
+  local pkg existing_cap fix_ver
+
+  [[ -z "$crossing_lines" ]] && return 0
+  printf '## ⚠️ Compatibility caps crossed\n\n'
+  printf 'These packages had an existing upper-bound constraint that this CVE fix crosses. '
+  # shellcheck disable=SC2016  # backticks are literal Markdown code formatting, not command substitution
+  printf '`uv add` replaces the whole specifier and cannot preserve it — verify compatibility manually before merging.\n\n'
+  printf '| Package | Existing cap | Fixed |\n'
+  printf '|---|---|---|\n'
+  while IFS='|' read -r pkg existing_cap fix_ver; do
+    [[ -z "$pkg" ]] && continue
+    printf "| \`%s\` | \`<%s\` | \`%s\` |\n" "$pkg" "$existing_cap" "$fix_ver"
+  done <<< "$crossing_lines"
+  printf '\n'
 }
 
 # py_uv_rewrite_version_floor <pyproject_path> <pkg> <new_ver>
@@ -7178,6 +7256,8 @@ batch_update_all() {
   local -a cargo_add_args=()
   local lock_actual_lines seen_py_pkgs pkg_norm lock_bak
   local pkg old_ver new_ver
+  local sec_cap_crossing
+  local -a sec_cap_crossings=()
 
   dep_updater_ensure_eco_fail_file
 
@@ -7352,7 +7432,11 @@ batch_update_all() {
         [[ -z "$pkg" ]] && continue
         log "[python/${py_tool}] Security: ${pkg} → ${fix}"
         case "$py_tool" in
-          uv)      dep_runner_uv_dir "uv batch security add" "$worktree_path" -- add "${pkg}==${fix}" ;;
+          uv)
+            sec_cap_crossing="$(py_uv_flag_cve_security_cap_crossing "${worktree_path}/pyproject.toml" "$pkg" "$fix")"
+            [[ -n "$sec_cap_crossing" ]] && sec_cap_crossings+=("$sec_cap_crossing")
+            dep_runner_uv_dir "uv batch security add" "$worktree_path" -- add "${pkg}==${fix}"
+            ;;
           poetry)  run_in_worktree poetry add "${pkg}@${fix}" ;;
           pipenv)  run_in_worktree pipenv install "${pkg}==${fix}" ;;
           pip|pip3) "$py_tool" install "${pkg}==${fix}" ;;
@@ -7784,6 +7868,7 @@ batch_update_all() {
         printf "| \`%s\` | \`%s\` | \`%s\` | %s |\n" "$pkg" "$current" "$fix" "${cves/,/, }"
       done <<< "$py_audit_lines_arg"
       printf '\n'
+      py_uv_render_cve_cap_crossings_section "$(printf '%s\n' "${sec_cap_crossings[@]}")"
     fi
     if [[ "$security_only" == '0' ]]; then
       printf '## Dependency update summary\n\n'

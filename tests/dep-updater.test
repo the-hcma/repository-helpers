@@ -3648,6 +3648,162 @@ else
   fail=$(( fail + 1 ))
 fi
 
+# `uv add` (the CVE-fix path) rewrites the whole specifier itself -- unlike
+# py_uv_rewrite_version_floor it cannot preserve a compound cap, so an existing
+# pin still gets silently dropped when a security fix crosses it.
+# py_uv_flag_cve_security_cap_crossing is the shared guard both the single-PR
+# and batch security paths call before `uv add` (repository-helpers#665
+# follow-up). Exercise it behaviorally rather than just grepping source text,
+# so a regression that drops the warning or ecosystem-failure side effect
+# would actually fail this test.
+cve_cap_tmp="$(mktemp -d)"
+cve_cap_pyproject="${cve_cap_tmp}/pyproject.toml"
+cat >"$cve_cap_pyproject" <<'EOF'
+[project]
+dependencies = ["cve-pkg>=1.0.0,<2.0.0", "uncapped-pkg>=1.0.0"]
+EOF
+cve_cap_log="${cve_cap_tmp}/log"
+cve_cap_eco="${cve_cap_tmp}/eco"
+cve_cap_rc_file="${cve_cap_tmp}/rc"
+cve_cap_out_file="${cve_cap_tmp}/out"
+(
+  # shellcheck disable=SC2317,SC2329
+  log() { printf '%s\n' "$*" >>"$cve_cap_log"; }
+  # shellcheck disable=SC2317,SC2329
+  dep_updater_append_ecosystem_failure() { printf '%s\n' "$*" >>"$cve_cap_eco"; }
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_extract_compound_cap\(\)/,/^}$/' "$script")
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_version_at_least\(\)/,/^}$/' "$script")
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_flag_cve_security_cap_crossing\(\)/,/^}$/' "$script")
+  rc=0
+  crossing_out=''
+  # Below the cap: no warning, no flag, no stdout record.
+  crossing_out="$(py_uv_flag_cve_security_cap_crossing "$cve_cap_pyproject" "cve-pkg" "1.5.0")" || rc=$?
+  printf 'below:%s\n' "$rc" >>"$cve_cap_rc_file"
+  printf 'below:[%s]\n' "$crossing_out" >>"$cve_cap_out_file"
+  # Exactly at the cap: crosses it (range would become empty) -- flag + record.
+  crossing_out="$(py_uv_flag_cve_security_cap_crossing "$cve_cap_pyproject" "cve-pkg" "2.0.0")" || rc=$?
+  printf 'at:%s\n' "$rc" >>"$cve_cap_rc_file"
+  printf 'at:[%s]\n' "$crossing_out" >>"$cve_cap_out_file"
+  # Above the cap: flag + record.
+  crossing_out="$(py_uv_flag_cve_security_cap_crossing "$cve_cap_pyproject" "cve-pkg" "3.0.0")" || rc=$?
+  printf 'above:%s\n' "$rc" >>"$cve_cap_rc_file"
+  printf 'above:[%s]\n' "$crossing_out" >>"$cve_cap_out_file"
+  # No existing cap at all: no warning, no flag, no stdout record.
+  crossing_out="$(py_uv_flag_cve_security_cap_crossing "$cve_cap_pyproject" "uncapped-pkg" "9.0.0")" || rc=$?
+  printf 'uncapped:%s\n' "$rc" >>"$cve_cap_rc_file"
+  printf 'uncapped:[%s]\n' "$crossing_out" >>"$cve_cap_out_file"
+)
+cve_cap_rcs="$(cat "$cve_cap_rc_file")"
+cve_cap_log_content="$(cat "$cve_cap_log" 2>/dev/null || true)"
+cve_cap_eco_content="$(cat "$cve_cap_eco" 2>/dev/null || true)"
+cve_cap_out_content="$(cat "$cve_cap_out_file" 2>/dev/null || true)"
+if [[ "$cve_cap_rcs" == $'below:0\nat:0\nabove:0\nuncapped:0' ]] \
+  && [[ "$cve_cap_out_content" == $'below:[]\nat:[cve-pkg|2.0.0|2.0.0]\nabove:[cve-pkg|2.0.0|3.0.0]\nuncapped:[]' ]] \
+  && [[ "$(grep -c 'WARNING' <<<"$cve_cap_log_content")" == "2" ]] \
+  && [[ "$(grep -c 'cve-pkg' <<<"$cve_cap_eco_content")" == "2" ]] \
+  && ! grep -q 'below\|uncapped' <<<"$cve_cap_log_content"; then
+  printf '[PASS] py-uv-compound: py_uv_flag_cve_security_cap_crossing warns+flags+records only when the fix reaches/exceeds an existing cap, and never blocks (rc=0 always)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: py_uv_flag_cve_security_cap_crossing behavior mismatch: rcs=%s out=%s log=%s eco=%s\n' \
+    "$cve_cap_rcs" "$cve_cap_out_content" "$cve_cap_log_content" "$cve_cap_eco_content"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$cve_cap_tmp"
+
+# repository-helpers#669 review: cap detection must also catch an inclusive
+# cap (,<=Y) and a bare upper-bound-only specifier (pkg<Y / pkg<=Y, no floor
+# operator at all) -- py_uv_rewrite_version_floor never has to rewrite the
+# latter shape (it requires a floor operator to match), but the CVE guard
+# must still see it, or that cap disappears with no warning either.
+bare_cap_tmp="$(mktemp -d)"
+bare_cap_pyproject="${bare_cap_tmp}/pyproject.toml"
+cat >"$bare_cap_pyproject" <<'EOF'
+[project]
+dependencies = [
+  "eq-cap-pkg>=1.0.0,<=2.0.0",
+  "bare-cap-pkg<2.0.0",
+  "bare-eq-cap-pkg<=2.0.0",
+  "split-bare-pkg" < 2.0.0,
+  "spaced-bare-pkg <2.0.0",
+]
+EOF
+bare_cap_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_extract_compound_cap\(\)/,/^}$/' "$script")
+  for bare_pkg in eq-cap-pkg bare-cap-pkg bare-eq-cap-pkg split-bare-pkg spaced-bare-pkg; do
+    printf '%s=%s\n' "$bare_pkg" "$(py_uv_extract_compound_cap "$bare_cap_pyproject" "$bare_pkg")"
+  done
+)"
+rm -rf "$bare_cap_tmp"
+if [[ "$bare_cap_out" == $'eq-cap-pkg=2.0.0\nbare-cap-pkg=2.0.0\nbare-eq-cap-pkg=2.0.0\nsplit-bare-pkg=2.0.0\nspaced-bare-pkg=2.0.0' ]]; then
+  printf '[PASS] py-uv-compound: py_uv_extract_compound_cap detects <= caps and bare upper-bound-only specifiers\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: py_uv_extract_compound_cap must detect <= and bare-upper-bound caps, got: %s\n' "$bare_cap_out"
+  fail=$(( fail + 1 ))
+fi
+
+# py_uv_render_cve_cap_crossings_section renders the Markdown callout shared by
+# write_security_pr_body and the batch combined PR body -- empty input must
+# render nothing (no empty heading in a PR with no crossings).
+render_empty_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_render_cve_cap_crossings_section\(\)/,/^}$/' "$script")
+  py_uv_render_cve_cap_crossings_section ""
+)"
+render_nonempty_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_render_cve_cap_crossings_section\(\)/,/^}$/' "$script")
+  py_uv_render_cve_cap_crossings_section "$(printf 'cve-pkg|2.0.0|2.5.0\nother-pkg|1.0.0|1.5.0\n')"
+)"
+# shellcheck disable=SC2016  # assert on literal rendered Markdown, not expansions
+if [[ -z "$render_empty_out" ]] \
+  && grep -qF '## ⚠️ Compatibility caps crossed' <<<"$render_nonempty_out" \
+  && grep -qF '| `cve-pkg` | `<2.0.0` | `2.5.0` |' <<<"$render_nonempty_out" \
+  && grep -qF '| `other-pkg` | `<1.0.0` | `1.5.0` |' <<<"$render_nonempty_out"; then
+  printf '[PASS] py-uv-compound: py_uv_render_cve_cap_crossings_section renders a table for crossings and nothing when empty\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: py_uv_render_cve_cap_crossings_section output mismatch: empty=[%s] nonempty=[%s]\n' \
+    "$render_empty_out" "$render_nonempty_out"
+  fail=$(( fail + 1 ))
+fi
+
+# shellcheck disable=SC2016  # assert on the literal source text, not expansions
+if grep -qF 'py_uv_flag_cve_security_cap_crossing "${worktree_path}/pyproject.toml" "$pkg" "$fix"' \
+    <<<"$(awk '/^py_security_update\(\)/,/^}$/' "$script")" \
+  && grep -qF 'py_uv_flag_cve_security_cap_crossing "${worktree_path}/pyproject.toml" "$pkg" "$fix"' \
+    <<<"$(awk '/^batch_update_all\(\)/,/^}$/' "$script")"; then
+  printf '[PASS] py-uv-compound: both single-PR and batch security paths call the cap-crossing guard before uv add\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: both security paths must call py_uv_flag_cve_security_cap_crossing before uv add\n'
+  fail=$(( fail + 1 ))
+fi
+
+# repository-helpers#669 review: a WARNING log line alone is easy to miss --
+# the crossing must also reach the PR body a reviewer actually reads.
+# shellcheck disable=SC2016  # assert on the literal source text, not expansions
+if grep -qF 'py_uv_render_cve_cap_crossings_section "$cap_crossing_lines"' \
+    <<<"$(awk '/^write_security_pr_body\(\)/,/^}$/' "$script")" \
+  && grep -qF 'sec_cap_crossings+=("$sec_cap_crossing")' \
+    <<<"$(awk '/^py_security_update\(\)/,/^}$/' "$script")" \
+  && grep -qF 'write_security_pr_body "python/${tool}" "$audit_lines" "$body_file"' "$script" \
+  && grep -qF 'sec_cap_crossings+=("$sec_cap_crossing")' \
+    <<<"$(awk '/^batch_update_all\(\)/,/^}$/' "$script")" \
+  && grep -qF 'py_uv_render_cve_cap_crossings_section "$(printf' \
+    <<<"$(awk '/^batch_update_all\(\)/,/^}$/' "$script")"; then
+  printf '[PASS] py-uv-compound: cap crossings collected by both security paths reach the generated PR body\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: cap crossings must be collected and relayed into the generated PR body\n'
+  fail=$(( fail + 1 ))
+fi
+
 # shellcheck disable=SC2016  # assert batch PR body gates Python CVEs on any_py
 if grep -qF 'py_audit_lines_arg" && "$any_py" == '\''1'\''' \
     <<<"$(awk '/^batch_update_all\(\)/,/^}$/' "$script")" \
