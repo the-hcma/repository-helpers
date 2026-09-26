@@ -1921,40 +1921,173 @@ cat >"$compound_pyproject" <<'EOF'
 name = "demo"
 version = "0.1.0"
 dependencies = [
-  "demo-pkg>=1.0.0,<2",
-  "demo-pkg[extra]>=1.0.0,<2",
-  "marker-pkg>=1.0.0,<2; sys_platform == 'win32'",
+  "demo-pkg>=1.0.0,<2.0.0",
+  "demo-pkg[extra]>=1.0.0,<2.0.0",
+  "marker-pkg>=1.0.0,<2.0.0; sys_platform == 'win32'",
   "plain-marker>=1.0.0; python_version < '3.11'",
-  "split-pkg" >= 1.0.0, <2,
+  "split-pkg" >= 1.0.0, <2.0.0,
+  "capped-pkg>=1.0.0,<2.0.0",
 ]
 EOF
+# repository-helpers#665: a compound cap ("pkg>=X,<Y") is often an intentional
+# compatibility pin, not leftover boilerplate. A floor bump that still satisfies
+# the cap must keep it; log/eco-failure hooks are stubbed since only the file
+# rewrite is under test here (the violation path is covered separately below).
 (
   # shellcheck disable=SC1091
   source "${script_dir}/../scripts/lib/gnu-sed"
+  # shellcheck disable=SC2317,SC2329
+  log() { :; }
+  # shellcheck disable=SC2317,SC2329
+  dep_updater_append_ecosystem_failure() { :; }
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_extract_compound_cap\(\)/,/^}$/' "$script")
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_version_at_least\(\)/,/^}$/' "$script")
   # shellcheck disable=SC1090
   source <(awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script")
-  py_uv_rewrite_version_floor "$compound_pyproject" "demo-pkg" "2.0.0"
-  py_uv_rewrite_version_floor "$compound_pyproject" "marker-pkg" "2.0.0"
+  py_uv_rewrite_version_floor "$compound_pyproject" "demo-pkg" "1.5.0"
+  py_uv_rewrite_version_floor "$compound_pyproject" "marker-pkg" "1.5.0"
   py_uv_rewrite_version_floor "$compound_pyproject" "plain-marker" "2.0.0"
-  py_uv_rewrite_version_floor "$compound_pyproject" "split-pkg" "2.0.0"
+  py_uv_rewrite_version_floor "$compound_pyproject" "split-pkg" "1.5.0"
 )
-if grep -qF '"demo-pkg>=2.0.0"' "$compound_pyproject" \
-  && grep -qF '"demo-pkg[extra]>=2.0.0"' "$compound_pyproject" \
-  && grep -qF 'marker-pkg>=2.0.0; sys_platform' "$compound_pyproject" \
+if grep -qF '"demo-pkg>=1.5.0,<2.0.0"' "$compound_pyproject" \
+  && grep -qF '"demo-pkg[extra]>=1.5.0,<2.0.0"' "$compound_pyproject" \
+  && grep -qF 'marker-pkg>=1.5.0,<2.0.0; sys_platform' "$compound_pyproject" \
   && grep -qF 'plain-marker>=2.0.0; python_version' "$compound_pyproject" \
-  && grep -qF '"split-pkg" >= 2.0.0' "$compound_pyproject" \
-  && ! grep -qF ',<' "$compound_pyproject"; then
-  printf '[PASS] py-uv-compound: bundled, extras, and split caps rewrite to >= floor\n'
+  && grep -qF '"split-pkg" >= 1.5.0, <2.0.0' "$compound_pyproject"; then
+  printf '[PASS] py-uv-compound: a floor bump that still satisfies an existing cap keeps it\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] py-uv-compound: compound specifier rewrite failed\n'
+  printf '[FAIL] py-uv-compound: compatible floor bump must preserve the existing cap\n'
   cat "$compound_pyproject" >&2
+  fail=$(( fail + 1 ))
+fi
+# A floor bump that would violate (reach or exceed) the existing cap must not
+# silently drop it — the specifier is left untouched and the rewrite reports
+# failure via a distinct exit code (2) so the caller's verify/filter logic
+# excludes the package instead of resolving past the pin.
+violation_log="${compound_rewrite_tmp}/violation.log"
+violation_eco="${compound_rewrite_tmp}/violation.eco"
+(
+  # shellcheck disable=SC1091
+  source "${script_dir}/../scripts/lib/gnu-sed"
+  # shellcheck disable=SC2317,SC2329
+  log() { printf '%s\n' "$*" >>"$violation_log"; }
+  # shellcheck disable=SC2317,SC2329
+  dep_updater_append_ecosystem_failure() { printf '%s\n' "$*" >>"$violation_eco"; }
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_extract_compound_cap\(\)/,/^}$/' "$script")
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_version_at_least\(\)/,/^}$/' "$script")
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script")
+  rc=0
+  py_uv_rewrite_version_floor "$compound_pyproject" "capped-pkg" "2.0.0" || rc=$?
+  printf '%s' "$rc" >"${compound_rewrite_tmp}/violation.rc"
+)
+violation_rc="$(cat "${compound_rewrite_tmp}/violation.rc")"
+if grep -qF '"capped-pkg>=1.0.0,<2.0.0"' "$compound_pyproject" \
+  && [[ "$violation_rc" == "2" ]] \
+  && grep -qF 'WARNING' "$violation_log" \
+  && grep -qF 'capped-pkg' "$violation_eco"; then
+  printf '[PASS] py-uv-compound: a floor bump that would violate an existing cap is skipped and flagged\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: cap-violating floor bump must be left untouched, return 2, and be flagged\n'
+  cat "$compound_pyproject" >&2
+  fail=$(( fail + 1 ))
+fi
+# A package can appear on more than one line (e.g. main deps + an extra/group
+# with its own, tighter cap). py_uv_rewrite_version_floor's sed passes rewrite
+# every matching line, so the guard must use the tightest cap across all of
+# them — not just the first one found — or a bump that clears a looser cap can
+# still corrupt a stricter cap on another line into an unsatisfiable range
+# (repository-helpers#668 review).
+multi_cap_pyproject="${compound_rewrite_tmp}/multi-cap-pyproject.toml"
+cat >"$multi_cap_pyproject" <<'EOF'
+[project]
+name = "demo"
+version = "0.1.0"
+dependencies = ["multi-cap-pkg>=1.0.0,<3.0.0"]
+
+[project.optional-dependencies]
+extra = ["multi-cap-pkg[extra]>=1.0.0,<2.0.0"]
+EOF
+multi_cap_log="${compound_rewrite_tmp}/multi-cap.log"
+multi_cap_eco="${compound_rewrite_tmp}/multi-cap.eco"
+(
+  # shellcheck disable=SC1091
+  source "${script_dir}/../scripts/lib/gnu-sed"
+  # shellcheck disable=SC2317,SC2329
+  log() { printf '%s\n' "$*" >>"$multi_cap_log"; }
+  # shellcheck disable=SC2317,SC2329
+  dep_updater_append_ecosystem_failure() { printf '%s\n' "$*" >>"$multi_cap_eco"; }
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_extract_compound_cap\(\)/,/^}$/' "$script")
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_version_at_least\(\)/,/^}$/' "$script")
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script")
+  rc=0
+  py_uv_rewrite_version_floor "$multi_cap_pyproject" "multi-cap-pkg" "2.5.0" || rc=$?
+  printf '%s' "$rc" >"${compound_rewrite_tmp}/multi-cap.rc"
+)
+multi_cap_rc="$(cat "${compound_rewrite_tmp}/multi-cap.rc")"
+if grep -qF '"multi-cap-pkg>=1.0.0,<3.0.0"' "$multi_cap_pyproject" \
+  && grep -qF '"multi-cap-pkg[extra]>=1.0.0,<2.0.0"' "$multi_cap_pyproject" \
+  && [[ "$multi_cap_rc" == "2" ]] \
+  && grep -qF 'WARNING' "$multi_cap_log" \
+  && grep -qF 'multi-cap-pkg' "$multi_cap_eco"; then
+  printf '[PASS] py-uv-compound: guard uses the tightest cap across multiple lines for the same package\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: a looser cap on one line must not let a stricter cap on another line be corrupted\n'
+  cat "$multi_cap_pyproject" >&2
+  fail=$(( fail + 1 ))
+fi
+# dep-updater runs under set -euo pipefail. A grep stage with no match (the
+# common case: a plain bundled cap with no split-form duplicate, or no cap at
+# all) must not make the whole pipeline report failure via pipefail, or a bare
+# `existing_cap="$(py_uv_extract_compound_cap ...)"` assignment run outside an
+# errexit-suppressed context (if/||) silently aborts the whole script before
+# ever reaching the guard (repository-helpers#668 review).
+pipefail_cap_out_file="$(mktemp)"
+pipefail_cap_rc=0
+(
+  set -euo pipefail
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_extract_compound_cap\(\)/,/^}$/' "$script")
+  # No errexit-suppressing wrapper (no if/||) around this call on purpose --
+  # that is exactly the unprotected context the bug can hit.
+  existing_cap="$(py_uv_extract_compound_cap "$compound_pyproject" "demo-pkg")"
+  printf '%s' "$existing_cap"
+  # Also exercise the no-cap-at-all path (plain-marker has no compound cap).
+  no_cap="$(py_uv_extract_compound_cap "$compound_pyproject" "plain-marker")"
+  printf '|%s' "$no_cap"
+) >"$pipefail_cap_out_file" 2>&1 || pipefail_cap_rc=$?
+pipefail_cap_out="$(cat "$pipefail_cap_out_file")"
+rm -f "$pipefail_cap_out_file"
+if [[ "$pipefail_cap_rc" -eq 0 ]] && [[ "$pipefail_cap_out" == '2.0.0|' ]]; then
+  printf '[PASS] py-uv-compound: py_uv_extract_compound_cap survives set -euo pipefail without an errexit-suppressing wrapper\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: py_uv_extract_compound_cap must not abort the script under pipefail, rc=%s out=%s\n' \
+    "$pipefail_cap_rc" "$pipefail_cap_out"
   fail=$(( fail + 1 ))
 fi
 # No-op when the package line is absent.
 if (
   # shellcheck disable=SC1091
   source "${script_dir}/../scripts/lib/gnu-sed"
+  # shellcheck disable=SC2317,SC2329
+  log() { :; }
+  # shellcheck disable=SC2317,SC2329
+  dep_updater_append_ecosystem_failure() { :; }
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_extract_compound_cap\(\)/,/^}$/' "$script")
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_version_at_least\(\)/,/^}$/' "$script")
   # shellcheck disable=SC1090
   source <(awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script")
   ! py_uv_rewrite_version_floor "$compound_pyproject" "missing-pkg" "9.9.9"
@@ -2288,6 +2421,10 @@ cat >"${mock_uv_bin}/uv" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1:-}" == 'lock' ]]; then
+  if ! grep -qF 'dependencies = ["idna>=3.10,<3.11"]' pyproject.toml; then
+    printf 'mock uv: idna constraint was not rewritten compatibly\n' >&2
+    exit 1
+  fi
   cat >uv.lock <<'LOCK'
 version = 1
 requires-python = ">=3.11"
@@ -2308,7 +2445,7 @@ cat >"${compound_filter_tmp}/pyproject.toml" <<'EOF'
 name = "compound-filter-demo"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["idna>=3.0,<3.1"]
+dependencies = ["idna>=3.0,<3.11"]
 EOF
 cat >"${compound_filter_tmp}/uv.lock" <<'EOF'
 version = 1
@@ -2330,6 +2467,7 @@ compound_filter_rc=0
     awk '/^py_constraint_op\(\)/,/^}$/' "$script"
     awk '/^py_uv_version_at_least\(\)/,/^}$/' "$script"
     awk '/^py_uv_lock_highest_version\(\)/,/^}$/' "$script"
+    awk '/^py_uv_extract_compound_cap\(\)/,/^}$/' "$script"
     awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script"
     awk '/^py_uv_parse_verify_filter_pkg\(\)/,/^}$/' "$script"
     awk '/^py_uv_parse_blame_direct_dep\(\)/,/^}$/' "$script"
@@ -2338,6 +2476,8 @@ compound_filter_rc=0
   )
   # shellcheck disable=SC2317,SC2329
   log() { :; }
+  # shellcheck disable=SC2317,SC2329
+  dep_updater_append_ecosystem_failure() { :; }
   # shellcheck disable=SC2317,SC2329
   dep_runner_uv_dir_capture() {
     local _label="$1"
@@ -2418,6 +2558,7 @@ noop_filter_rc=0
     awk '/^py_constraint_op\(\)/,/^}$/' "$script"
     awk '/^py_uv_version_at_least\(\)/,/^}$/' "$script"
     awk '/^py_uv_lock_highest_version\(\)/,/^}$/' "$script"
+    awk '/^py_uv_extract_compound_cap\(\)/,/^}$/' "$script"
     awk '/^py_uv_rewrite_version_floor\(\)/,/^}$/' "$script"
     awk '/^py_uv_parse_verify_filter_pkg\(\)/,/^}$/' "$script"
     awk '/^py_uv_parse_blame_direct_dep\(\)/,/^}$/' "$script"
@@ -2426,6 +2567,8 @@ noop_filter_rc=0
   )
   # shellcheck disable=SC2317,SC2329
   log() { :; }
+  # shellcheck disable=SC2317,SC2329
+  dep_updater_append_ecosystem_failure() { :; }
   # shellcheck disable=SC2317,SC2329
   dep_runner_uv_dir_capture() {
     local _label="$1"
