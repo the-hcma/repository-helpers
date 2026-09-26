@@ -3660,6 +3660,30 @@ else
   fail=$(( fail + 1 ))
 fi
 
+# GNU sort -V is not stable for version-equal-but-differently-formatted
+# strings (e.g. "2.0" vs "2.0.0") -- it applies its own deterministic
+# tie-break independent of argument order, so a naive "tail -1 of the two
+# lines" trick reports "greater" for either ordering of an equal pair.
+# py_uv_version_greater_than must use dotted-numeric comparison instead
+# (repository-helpers#669 review).
+version_gt_out="$(
+  # shellcheck disable=SC1090
+  source <(awk '/^py_uv_version_greater_than\(\)/,/^}$/' "$script")
+  for pair in "2.0.0 2.0" "2.0 2.0.0" "2.0.1 2.0" "1.9.0 2.0" "2.0.0 2.0.0" "2.0.10 2.0.2" "2 2.0.0"; do
+    # shellcheck disable=SC2086  # intentional word-splitting of the "a b" pair
+    set -- $pair
+    if py_uv_version_greater_than "$1" "$2"; then r=gt; else r=not-gt; fi
+    printf '%s|%s=%s\n' "$1" "$2" "$r"
+  done
+)"
+if [[ "$version_gt_out" == $'2.0.0|2.0=not-gt\n2.0|2.0.0=not-gt\n2.0.1|2.0=gt\n1.9.0|2.0=not-gt\n2.0.0|2.0.0=not-gt\n2.0.10|2.0.2=gt\n2|2.0.0=not-gt' ]]; then
+  printf '[PASS] py-uv-compound: py_uv_version_greater_than treats "2.0" and "2.0.0" as equal (not sort -V tie-break dependent)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-uv-compound: py_uv_version_greater_than must use dotted-numeric comparison, got: %s\n' "$version_gt_out"
+  fail=$(( fail + 1 ))
+fi
+
 # `uv add` (the CVE-fix path) rewrites the whole specifier itself -- unlike
 # py_uv_rewrite_version_floor it cannot preserve a compound cap, so an existing
 # pin still gets silently dropped when a security fix crosses it.
@@ -3675,6 +3699,7 @@ cat >"$cve_cap_pyproject" <<'EOF'
 dependencies = [
   "cve-pkg>=1.0.0,<2.0.0",
   "incl-cve-pkg>=1.0.0,<=2.0.0",
+  "short-incl-cve-pkg>=1.0.0,<=2.0",
   "uncapped-pkg>=1.0.0",
 ]
 EOF
@@ -3687,8 +3712,6 @@ cve_cap_out_file="${cve_cap_tmp}/out"
   log() { printf '%s\n' "$*" >>"$cve_cap_log"; }
   # shellcheck disable=SC2317,SC2329
   dep_updater_append_ecosystem_failure() { printf '%s\n' "$*" >>"$cve_cap_eco"; }
-  # shellcheck disable=SC1090
-  source <(awk '/^_py_uv_extract_compound_cap_markers\(\)/,/^}$/' "$script")
   # shellcheck disable=SC1090
   source <(awk '/^_py_uv_extract_compound_cap_markers\(\)/,/^}$/' "$script")
   # shellcheck disable=SC1090
@@ -3723,6 +3746,11 @@ cve_cap_out_file="${cve_cap_tmp}/out"
   crossing_out="$(py_uv_flag_cve_security_cap_crossing "$cve_cap_pyproject" "incl-cve-pkg" "2.0.1")" || rc=$?
   printf 'incl-above:%s\n' "$rc" >>"$cve_cap_rc_file"
   printf 'incl-above:[%s]\n' "$crossing_out" >>"$cve_cap_out_file"
+  # An inclusive cap written with fewer segments ("<=2.0") than the fix
+  # version ("2.0.0") is still PEP 440-equal -- no crossing (repository-helpers#669 review).
+  crossing_out="$(py_uv_flag_cve_security_cap_crossing "$cve_cap_pyproject" "short-incl-cve-pkg" "2.0.0")" || rc=$?
+  printf 'short-incl-at:%s\n' "$rc" >>"$cve_cap_rc_file"
+  printf 'short-incl-at:[%s]\n' "$crossing_out" >>"$cve_cap_out_file"
   # No existing cap at all: no warning, no flag, no stdout record.
   crossing_out="$(py_uv_flag_cve_security_cap_crossing "$cve_cap_pyproject" "uncapped-pkg" "9.0.0")" || rc=$?
   printf 'uncapped:%s\n' "$rc" >>"$cve_cap_rc_file"
@@ -3732,11 +3760,11 @@ cve_cap_rcs="$(cat "$cve_cap_rc_file")"
 cve_cap_log_content="$(cat "$cve_cap_log" 2>/dev/null || true)"
 cve_cap_eco_content="$(cat "$cve_cap_eco" 2>/dev/null || true)"
 cve_cap_out_content="$(cat "$cve_cap_out_file" 2>/dev/null || true)"
-if [[ "$cve_cap_rcs" == $'below:0\nat:0\nabove:0\nincl-at:0\nincl-above:0\nuncapped:0' ]] \
-  && [[ "$cve_cap_out_content" == $'below:[]\nat:[cve-pkg|<2.0.0|2.0.0]\nabove:[cve-pkg|<2.0.0|3.0.0]\nincl-at:[]\nincl-above:[incl-cve-pkg|<=2.0.0|2.0.1]\nuncapped:[]' ]] \
+if [[ "$cve_cap_rcs" == $'below:0\nat:0\nabove:0\nincl-at:0\nincl-above:0\nshort-incl-at:0\nuncapped:0' ]] \
+  && [[ "$cve_cap_out_content" == $'below:[]\nat:[cve-pkg|<2.0.0|2.0.0]\nabove:[cve-pkg|<2.0.0|3.0.0]\nincl-at:[]\nincl-above:[incl-cve-pkg|<=2.0.0|2.0.1]\nshort-incl-at:[]\nuncapped:[]' ]] \
   && [[ "$(grep -c 'WARNING' <<<"$cve_cap_log_content")" == "3" ]] \
   && [[ "$(grep -c 'cve-pkg' <<<"$cve_cap_eco_content")" == "3" ]] \
-  && ! grep -q 'below\|incl-at\|uncapped' <<<"$cve_cap_log_content"; then
+  && ! grep -q 'below\|incl-at\|short-incl-at\|uncapped' <<<"$cve_cap_log_content"; then
   printf '[PASS] py-uv-compound: py_uv_flag_cve_security_cap_crossing warns+flags+records only when the fix crosses an existing cap (inclusive-aware), and never blocks (rc=0 always)\n'
   pass=$(( pass + 1 ))
 else
@@ -3761,6 +3789,8 @@ dependencies = [
   "bare-eq-cap-pkg<=2.0.0",
   "split-bare-pkg" < 2.0.0,
   "spaced-bare-pkg <2.0.0",
+  "bundled-floor-ws-pkg>=1.0.0,<= 2.0.0",
+  "bundled-bare-ws-pkg<= 2.0.0",
 ]
 EOF
 bare_cap_out="$(
@@ -3768,12 +3798,13 @@ bare_cap_out="$(
   source <(awk '/^_py_uv_extract_compound_cap_markers\(\)/,/^}$/' "$script")
   # shellcheck disable=SC1090
   source <(awk '/^py_uv_extract_compound_cap\(\)/,/^}$/' "$script")
-  for bare_pkg in eq-cap-pkg bare-cap-pkg bare-eq-cap-pkg split-bare-pkg spaced-bare-pkg; do
+  for bare_pkg in eq-cap-pkg bare-cap-pkg bare-eq-cap-pkg split-bare-pkg spaced-bare-pkg \
+      bundled-floor-ws-pkg bundled-bare-ws-pkg; do
     printf '%s=%s\n' "$bare_pkg" "$(py_uv_extract_compound_cap "$bare_cap_pyproject" "$bare_pkg")"
   done
 )"
 rm -rf "$bare_cap_tmp"
-if [[ "$bare_cap_out" == $'eq-cap-pkg=2.0.0\nbare-cap-pkg=2.0.0\nbare-eq-cap-pkg=2.0.0\nsplit-bare-pkg=2.0.0\nspaced-bare-pkg=2.0.0' ]]; then
+if [[ "$bare_cap_out" == $'eq-cap-pkg=2.0.0\nbare-cap-pkg=2.0.0\nbare-eq-cap-pkg=2.0.0\nsplit-bare-pkg=2.0.0\nspaced-bare-pkg=2.0.0\nbundled-floor-ws-pkg=2.0.0\nbundled-bare-ws-pkg=2.0.0' ]]; then
   printf '[PASS] py-uv-compound: py_uv_extract_compound_cap detects <= caps and bare upper-bound-only specifiers\n'
   pass=$(( pass + 1 ))
 else
