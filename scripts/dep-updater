@@ -5012,6 +5012,7 @@ py_security_update() {
 
   local files_changed=""
   local sec_lock_bak="" sec_pyproject_bak=""
+  local sec_existing_cap
   if [[ "$tool" == "uv" ]]; then
     if [[ -f "${worktree_path}/pyproject.toml" ]]; then
       sec_pyproject_bak="$(mktemp)"
@@ -5027,6 +5028,21 @@ py_security_update() {
     log "[python/${tool}] Security: bumping ${pkg} to ${fix}…"
     case "$tool" in
       uv)
+        # CVE fixes must land regardless of an existing compound cap (unlike
+        # the routine floor-bump path, py_uv_rewrite_version_floor is not
+        # involved here — `uv add` rewrites the whole specifier itself), but
+        # silently losing a compatibility pin is exactly the risk this file
+        # already guards against for routine bumps (repository-helpers#665).
+        # Log + flag it so an unexpected version jump surfaces during CVE
+        # triage instead of disappearing into the diff.
+        sec_existing_cap="$(py_uv_extract_compound_cap "${worktree_path}/pyproject.toml" "$pkg")"
+        if [[ -n "$sec_existing_cap" ]] && py_uv_version_at_least "$fix" "$sec_existing_cap"; then
+          log "[python/uv] WARNING: CVE fix for ${pkg} to ${fix} crosses its existing compatibility" \
+            "cap <${sec_existing_cap} (repository-helpers#665) — proceeding since the security fix" \
+            "must land, but the pin is now gone; verify compatibility manually."
+          dep_updater_append_ecosystem_failure \
+            "python|${pkg}: CVE fix to ${fix} crossed existing cap <${sec_existing_cap}; pin removed by uv add (verify compatibility)"
+        fi
         dep_runner_uv_dir "uv security add" "$worktree_path" -- add "${pkg}==${fix}"
         files_changed="pyproject.toml + uv.lock"
         ;;
@@ -7178,6 +7194,7 @@ batch_update_all() {
   local -a cargo_add_args=()
   local lock_actual_lines seen_py_pkgs pkg_norm lock_bak
   local pkg old_ver new_ver
+  local sec_existing_cap
 
   dep_updater_ensure_eco_fail_file
 
@@ -7352,7 +7369,20 @@ batch_update_all() {
         [[ -z "$pkg" ]] && continue
         log "[python/${py_tool}] Security: ${pkg} → ${fix}"
         case "$py_tool" in
-          uv)      dep_runner_uv_dir "uv batch security add" "$worktree_path" -- add "${pkg}==${fix}" ;;
+          uv)
+            # See py_security_update: `uv add` rewrites the whole specifier,
+            # so an existing compound cap is not preserved here either — the
+            # CVE fix must still land, but flag the crossing (repository-helpers#665).
+            sec_existing_cap="$(py_uv_extract_compound_cap "${worktree_path}/pyproject.toml" "$pkg")"
+            if [[ -n "$sec_existing_cap" ]] && py_uv_version_at_least "$fix" "$sec_existing_cap"; then
+              log "[python/uv] WARNING: CVE fix for ${pkg} to ${fix} crosses its existing compatibility" \
+                "cap <${sec_existing_cap} (repository-helpers#665) — proceeding since the security fix" \
+                "must land, but the pin is now gone; verify compatibility manually."
+              dep_updater_append_ecosystem_failure \
+                "python|${pkg}: CVE fix to ${fix} crossed existing cap <${sec_existing_cap}; pin removed by uv add (verify compatibility)"
+            fi
+            dep_runner_uv_dir "uv batch security add" "$worktree_path" -- add "${pkg}==${fix}"
+            ;;
           poetry)  run_in_worktree poetry add "${pkg}@${fix}" ;;
           pipenv)  run_in_worktree pipenv install "${pkg}==${fix}" ;;
           pip|pip3) "$py_tool" install "${pkg}==${fix}" ;;
