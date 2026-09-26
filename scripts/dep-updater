@@ -5603,23 +5603,18 @@ py_pkg_installed_version() {
     '.[] | select((.name | ascii_downcase | gsub("[._]"; "-")) == $n) | .version'
 }
 
-# py_uv_extract_compound_cap <pyproject_path> <pkg>
-# Prints the tightest (lowest) upper-bound version across every existing
-# compound-cap specifier ("pkg>=1.0.0,<2.0.0") for a direct
-# [project]/[project.*]/[dependency-groups] dependency, or empty when no
-# matching line has such a cap. A compound cap is often an intentional
-# compatibility pin against a known-broken release range, not leftover
-# boilerplate (repository-helpers#665) — py_uv_rewrite_version_floor uses this
-# to decide whether a floor bump can keep the cap. The rewrite's sed passes
-# touch every line matching the package name (bundled, extras,
-# optional-dependencies, marker-split duplicates), so a single first-found cap
-# is not enough: the tightest cap across all matches is the real violation
-# threshold, otherwise a bump that passes a looser cap could still corrupt a
-# stricter cap on another line into an unsatisfiable range.
-py_uv_extract_compound_cap() {
+# _py_uv_extract_compound_cap_markers <pyproject_path> <pkg>
+# Prints "value|marker" pairs (marker is "=" for an inclusive <=cap, empty for
+# an exclusive <cap) for every compound-cap or bare-upper-bound match across
+# the four supported specifier shapes: bundled/split, each with or without a
+# floor operator. Shared by py_uv_extract_compound_cap (which reports only
+# the tightest value) and py_uv_extract_compound_cap_is_inclusive (which
+# reports whether the winning value's occurrence(s) were inclusive) so both
+# stay consistent without duplicating the extraction patterns.
+_py_uv_extract_compound_cap_markers() {
   local -r path="$1"
   local -r pkg="$2"
-  local sed_pkg caps
+  local sed_pkg
 
   [[ -f "$path" ]] || return 0
   sed_pkg="$(printf '%s' "$pkg" | sed 's/[.]/\\./g')"
@@ -5636,20 +5631,65 @@ py_uv_extract_compound_cap() {
   # the CVE guard (py_uv_flag_cve_security_cap_crossing) must still detect it
   # — otherwise that cap silently disappears with no warning either
   # (repository-helpers#669 review).
-  caps="$(
-    {
-      grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?(~=|>=|==)[0-9][0-9a-zA-Z.]*,[[:space:]]*<=?[0-9][0-9a-zA-Z.]*" \
-        "$path" 2>/dev/null
-      grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?\"[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*[[:space:]]*,[[:space:]]*<=?[0-9][0-9a-zA-Z.]*" \
-        "$path" 2>/dev/null
-      grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?[[:space:]]*<=?[0-9][0-9a-zA-Z.]*" \
-        "$path" 2>/dev/null
-      grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?\"[[:space:]]*<=?[[:space:]]*[0-9][0-9a-zA-Z.]*" \
-        "$path" 2>/dev/null
-    } | grep -oE '<=?[[:space:]]*[0-9][0-9a-zA-Z.]*$' | sed -E 's/^<=?[[:space:]]*//' || true
-  )"
-  [[ -z "$caps" ]] && return 0
-  printf '%s\n' "$caps" | sort -V | head -1
+  {
+    grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?(~=|>=|==)[0-9][0-9a-zA-Z.]*,[[:space:]]*<=?[0-9][0-9a-zA-Z.]*" \
+      "$path" 2>/dev/null
+    grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?\"[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*[[:space:]]*,[[:space:]]*<=?[0-9][0-9a-zA-Z.]*" \
+      "$path" 2>/dev/null
+    grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?[[:space:]]*<=?[0-9][0-9a-zA-Z.]*" \
+      "$path" 2>/dev/null
+    grep -oE "\"${sed_pkg}(\[[a-zA-Z0-9,_=.-]+\])?\"[[:space:]]*<=?[[:space:]]*[0-9][0-9a-zA-Z.]*" \
+      "$path" 2>/dev/null
+  } | grep -oE '<=?[[:space:]]*[0-9][0-9a-zA-Z.]*$' \
+    | sed -E 's/^<(=?)[[:space:]]*([0-9][0-9a-zA-Z.]*)$/\2|\1/' || true
+}
+
+# py_uv_extract_compound_cap <pyproject_path> <pkg>
+# Prints the tightest (lowest) upper-bound version across every existing
+# compound-cap specifier ("pkg>=1.0.0,<2.0.0") for a direct
+# [project]/[project.*]/[dependency-groups] dependency, or empty when no
+# matching line has such a cap. A compound cap is often an intentional
+# compatibility pin against a known-broken release range, not leftover
+# boilerplate (repository-helpers#665) — py_uv_rewrite_version_floor uses this
+# to decide whether a floor bump can keep the cap. The rewrite's sed passes
+# touch every line matching the package name (bundled, extras,
+# optional-dependencies, marker-split duplicates), so a single first-found cap
+# is not enough: the tightest cap across all matches is the real violation
+# threshold, otherwise a bump that passes a looser cap could still corrupt a
+# stricter cap on another line into an unsatisfiable range. On a tie between
+# an exclusive and an inclusive occurrence of the same value, sorts the
+# exclusive (empty marker) one first — the safer reading (see
+# py_uv_extract_compound_cap_is_inclusive).
+py_uv_extract_compound_cap() {
+  local -r path="$1"
+  local -r pkg="$2"
+  local markers
+
+  markers="$(_py_uv_extract_compound_cap_markers "$path" "$pkg")"
+  [[ -z "$markers" ]] && return 0
+  printf '%s\n' "$markers" | sort -t'|' -k1,1V -k2,2 | head -1 | cut -d'|' -f1
+}
+
+# py_uv_extract_compound_cap_is_inclusive <pyproject_path> <pkg> <cap_value>
+# True when the winning cap_value (from py_uv_extract_compound_cap) for pkg
+# was written with an inclusive "<=" operator rather than an exclusive "<" --
+# an inclusive cap's valid range includes cap_value itself, so a fix version
+# exactly equal to it is not a crossing the way it would be for an exclusive
+# cap (repository-helpers#669 review). If both an exclusive and an inclusive
+# occurrence of the exact same value exist across different lines, treated
+# as exclusive: the safer reading, since it still flags a genuine crossing
+# rather than silently accepting the boundary.
+py_uv_extract_compound_cap_is_inclusive() {
+  local -r path="$1"
+  local -r pkg="$2"
+  local -r cap_value="$3"
+  local markers
+
+  [[ -n "$cap_value" ]] || return 1
+  markers="$(_py_uv_extract_compound_cap_markers "$path" "$pkg")"
+  [[ -z "$markers" ]] && return 1
+  grep -qxF "${cap_value}|" <<<"$markers" && return 1
+  grep -qxF "${cap_value}|=" <<<"$markers"
 }
 
 # py_uv_flag_cve_security_cap_crossing <pyproject_path> <pkg> <fix_ver>
@@ -5658,40 +5698,54 @@ py_uv_extract_compound_cap() {
 # py_uv_rewrite_version_floor it cannot preserve an existing compound cap. A
 # security fix must still land regardless of an existing pin, but losing it
 # without a trace carries the same risk as py_uv_rewrite_version_floor guards
-# against (repository-helpers#665). When fix_ver crosses (reaches or exceeds)
-# an existing cap, logs a WARNING, records an ecosystem failure, and prints
-# "pkg|existing_cap|fix_ver" on stdout (empty otherwise) so the caller can
-# collect crossings and relay them into the generated security PR body — a
-# log line alone is easy to miss; the PR a reviewer actually reads should say
-# a CVE-induced bump might break something (repository-helpers#669 review).
-# Never blocks the caller: always returns 0.
+# against (repository-helpers#665). Crossing an exclusive cap (<Y) means
+# fix_ver >= Y; crossing an inclusive cap (<=Y) means fix_ver > Y -- fix_ver
+# == Y satisfies an inclusive cap, so it is not itself a crossing
+# (repository-helpers#669 review). When fix_ver crosses the cap, logs a
+# WARNING, records an ecosystem failure, and prints "pkg|cap_display|fix_ver"
+# on stdout (empty otherwise, where cap_display already carries its "<" or
+# "<=") so the caller can collect crossings and relay them into the generated
+# security PR body — a log line alone is easy to miss; the PR a reviewer
+# actually reads should say a CVE-induced bump might break something. Never
+# blocks the caller: always returns 0.
 py_uv_flag_cve_security_cap_crossing() {
   local -r path="$1"
   local -r pkg="$2"
   local -r fix_ver="$3"
-  local existing_cap
+  local existing_cap cap_op crosses
 
   existing_cap="$(py_uv_extract_compound_cap "$path" "$pkg")"
-  if [[ -n "$existing_cap" ]] && py_uv_version_at_least "$fix_ver" "$existing_cap"; then
+  [[ -z "$existing_cap" ]] && return 0
+
+  crosses=0
+  if py_uv_extract_compound_cap_is_inclusive "$path" "$pkg" "$existing_cap"; then
+    cap_op='<='
+    py_uv_version_greater_than "$fix_ver" "$existing_cap" && crosses=1
+  else
+    cap_op='<'
+    py_uv_version_at_least "$fix_ver" "$existing_cap" && crosses=1
+  fi
+  if [[ "$crosses" == 1 ]]; then
     log "[python/uv] WARNING: CVE fix for ${pkg} to ${fix_ver} crosses its existing compatibility" \
-      "cap <${existing_cap} (repository-helpers#665) — proceeding since the security fix" \
+      "cap ${cap_op}${existing_cap} (repository-helpers#665) — proceeding since the security fix" \
       "must land, but the pin is now gone; verify compatibility manually."
     dep_updater_append_ecosystem_failure \
-      "python|${pkg}: CVE fix to ${fix_ver} crossed existing cap <${existing_cap}; pin removed by uv add (verify compatibility)"
-    printf '%s|%s|%s\n' "$pkg" "$existing_cap" "$fix_ver"
+      "python|${pkg}: CVE fix to ${fix_ver} crossed existing cap ${cap_op}${existing_cap}; pin removed by uv add (verify compatibility)"
+    printf '%s|%s%s|%s\n' "$pkg" "$cap_op" "$existing_cap" "$fix_ver"
   fi
   return 0
 }
 
 # py_uv_render_cve_cap_crossings_section <crossing_lines>
 # Renders a "## ⚠️ Compatibility caps crossed" Markdown section from
-# newline-separated "pkg|existing_cap|fix_ver" records (see
-# py_uv_flag_cve_security_cap_crossing), or nothing when crossing_lines is
-# empty. Shared by the single-PR and batch security PR body writers so the
-# warning is visible in the PR a reviewer actually reads, not just run logs.
+# newline-separated "pkg|cap_display|fix_ver" records (see
+# py_uv_flag_cve_security_cap_crossing; cap_display already carries its "<"
+# or "<="), or nothing when crossing_lines is empty. Shared by the single-PR
+# and batch security PR body writers so the warning is visible in the PR a
+# reviewer actually reads, not just run logs.
 py_uv_render_cve_cap_crossings_section() {
   local -r crossing_lines="$1"
-  local pkg existing_cap fix_ver
+  local pkg cap_display fix_ver
 
   [[ -z "$crossing_lines" ]] && return 0
   printf '## ⚠️ Compatibility caps crossed\n\n'
@@ -5700,9 +5754,9 @@ py_uv_render_cve_cap_crossings_section() {
   printf '`uv add` replaces the whole specifier and cannot preserve it — verify compatibility manually before merging.\n\n'
   printf '| Package | Existing cap | Fixed |\n'
   printf '|---|---|---|\n'
-  while IFS='|' read -r pkg existing_cap fix_ver; do
+  while IFS='|' read -r pkg cap_display fix_ver; do
     [[ -z "$pkg" ]] && continue
-    printf "| \`%s\` | \`<%s\` | \`%s\` |\n" "$pkg" "$existing_cap" "$fix_ver"
+    printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$pkg" "$cap_display" "$fix_ver"
   done <<< "$crossing_lines"
   printf '\n'
 }
@@ -6129,6 +6183,24 @@ py_uv_version_at_least() {
 
   [[ -n "$ver" && -n "$minimum" ]] || return 1
   [[ "$(printf '%s\n' "$minimum" "$ver" | sort -V | head -1)" == "$minimum" ]]
+}
+
+# py_uv_version_greater_than <a> <b>
+# Returns 0 when a is strictly semantically greater than b (sort -V). An
+# exact-string match is never "greater". sort -V is stable, so for a
+# differently-formatted-but-equal pair (e.g. "2.0" vs "2.0.0") the second
+# argument (b) sorts last among equal-ranked keys, so this still correctly
+# reports "not greater" rather than misreading the tie either way. Used by
+# py_uv_flag_cve_security_cap_crossing to test an inclusive (<=) cap, where
+# equality is not itself a crossing (unlike py_uv_version_at_least's use for
+# an exclusive cap, where equality is a crossing).
+py_uv_version_greater_than() {
+  local -r a="$1"
+  local -r b="$2"
+
+  [[ -n "$a" && -n "$b" ]] || return 1
+  [[ "$a" == "$b" ]] && return 1
+  [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -1)" == "$a" ]]
 }
 
 # py_uv_lock_highest_version <lockfile> <pkg>
