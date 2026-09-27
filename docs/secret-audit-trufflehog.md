@@ -17,7 +17,7 @@ TruffleHog does **not** replace gitleaks in CI or pre-pr-checks. Keep both.
 
 ## What TruffleHog locates
 
-TruffleHog ships **800+ detectors** for credential-like material, including (non- exhaustive):
+TruffleHog ships **800+ detectors** for credential-like material, including (non-exhaustive):
 
 | Category | Examples |
 | --- | --- |
