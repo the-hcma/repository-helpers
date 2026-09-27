@@ -5,9 +5,7 @@ alwaysApply: true
 
 # PR workflow (repository-helpers)
 
-**Stacking tool:** read `.github/stacking-tool` first (see `.cursor/rules/stacking-tool.mdc`).
-This repo trials **`gh-stack`**; use `gh stack` / `.agents/skills/gh-stack/SKILL.md` instead of
-`gt create` when the marker is `gh-stack`. Prefer `scripts/dev/submit-stack` either way.
+**Stacking tool:** read `.github/stacking-tool` first (see `.cursor/rules/stacking-tool.mdc`). This repo trials **`gh-stack`**; use `gh stack` / `.agents/skills/gh-stack/SKILL.md` instead of `gt create` when the marker is `gh-stack`. Prefer `scripts/dev/submit-stack` either way.
 
 Follow this sequence for every PR unless the user explicitly overrides.
 
@@ -52,12 +50,7 @@ scripts/dev/post-pr-submission-checks --pr <number>
 
 **Required for coding agents:** wait until required checks on the **current PR head** are green. On failure, the script prints **`==> CI failure details for coding agent`** with filtered log lines — fix those in the worktree, re-run `pre-pr-checks`, push, and repeat until CI passes.
 
-When a check is **WAITING** on a protected environment (`github-repo-lint`,
-`dep-updater`), **approve it on the operator's behalf** — `gh` is the operator.
-`post-pr-submission-checks` calls `scripts/dev/approve-pending-deployments`.
-Do not wait for a human to click Approve in the Actions UI.
-If that prints **`ERROR: ENVIRONMENT_APPROVAL_FAILED`**, raise it to the operator
-immediately — do not keep waiting.
+When a check is **WAITING** on a protected environment (`github-repo-lint`, `dep-updater`), **approve it on the operator's behalf** — `gh` is the operator. `post-pr-submission-checks` calls `scripts/dev/approve-pending-deployments`. Do not wait for a human to click Approve in the Actions UI. If that prints **`ERROR: ENVIRONMENT_APPROVAL_FAILED`**, raise it to the operator immediately — do not keep waiting.
 
 `scripts/dev/submit-stack` runs this automatically (waits by default). Use `--no-wait-ci` only when monitoring separately.
 
@@ -65,9 +58,7 @@ Do not start the agent review loop or treat the PR as merge-ready while CI is re
 
 ## 5. Agent review loop
 
-Follow **`.agents/rules/pr-ship-and-review.md`** (also summarized in
-[AGENTS.md](../../AGENTS.md#agent-review-after-submit); Cursor shim
-`.cursor/rules/pr-ship-and-review.mdc`).
+Follow **`.agents/rules/pr-ship-and-review.md`** (also summarized in [AGENTS.md](../../AGENTS.md#agent-review-after-submit); Cursor shim `.cursor/rules/pr-ship-and-review.mdc`).
 
 Prefer the built-in loop over manual `wait` / `check` iteration:
 
@@ -94,17 +85,12 @@ scripts/wait-for-agent-review complete --pr <number>   # when complete_ready
 
 Until merge-ready:
 
-1. Triage agent / Bugbot comments — fix valid issues, then push (`git commit` +
-   `gh stack submit --auto` when the marker is `gh-stack`, or `gt modify` when it is
-   `graphite`).
+1. Triage agent / Bugbot comments — fix valid issues, then push (`git commit` + `gh stack submit --auto` when the marker is `gh-stack`, or `gt modify` when it is `graphite`).
 2. Re-run `scripts/dev/pre-pr-checks` after fixes.
 3. Re-run `scripts/dev/post-pr-submission-checks --pr <number>` and fix any CI failures surfaced in the agent log report.
-4. Resolve merge conflicts if base moved (`gh stack rebase` / `gh stack sync` when
-   `gh-stack`; `gt sync` / `gt restack` when `graphite`; or
-   `scripts/wait-for-agent-review restack`).
+4. Resolve merge conflicts if base moved (`gh stack rebase` / `gh stack sync` when `gh-stack`; `gt sync` / `gt restack` when `graphite`; or `scripts/wait-for-agent-review restack`).
 
-Do not merge manually; org default is GitHub merge queue (Enable auto-merge /
-`gh pr merge --auto --squash`). Do not use `merge-it` to land PRs.
+Do not merge manually; org default is GitHub merge queue (Enable auto-merge / `gh pr merge --auto --squash`). Do not use `merge-it` to land PRs.
 
 ## 7. Notify user
 

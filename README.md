@@ -1,22 +1,14 @@
 # repository-helpers
 
-[![CI](https://github.com/the-hcma/repository-helpers/actions/workflows/ci.yml/badge.svg)](https://github.com/the-hcma/repository-helpers/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Bash 5.x](https://img.shields.io/badge/bash-5.x-4EAA25?logo=gnu-bash&logoColor=white)
+[![CI](https://github.com/the-hcma/repository-helpers/actions/workflows/ci.yml/badge.svg)](https://github.com/the-hcma/repository-helpers/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![Bash 5.x](https://img.shields.io/badge/bash-5.x-4EAA25?logo=gnu-bash&logoColor=white)
 
-Pure Bash helpers for keeping repositories maintained: dependency update PRs,
-repository practice audits, agent review automation, systemd user services, and
-stacked PR workflow support (`gh-stack` or Graphite, selected per repo).
+Pure Bash helpers for keeping repositories maintained: dependency update PRs, repository practice audits, agent review automation, systemd user services, and stacked PR workflow support (`gh-stack` or Graphite, selected per repo).
 
-Headline tools: **`dep-updater`** (stacked dependency PRs), **`github-repo-lint`**
-(org repo practices audit), **secret scanning** (gitleaks via
-`scripts/dev/secret-scan` / CI), and **secret audit** (TruffleHog deep history via
-`scripts/secret-audit` — see [docs/secret-audit-trufflehog.md](docs/secret-audit-trufflehog.md)).
+Headline tools: **`dep-updater`** (stacked dependency PRs), **`github-repo-lint`** (org repo practices audit), **secret scanning** (gitleaks via `scripts/dev/secret-scan` / CI), and **secret audit** (TruffleHog deep history via `scripts/secret-audit` — see [docs/secret-audit-trufflehog.md](docs/secret-audit-trufflehog.md)).
 
 ## Command-line tools
 
-Run scripts from a clone of this repo (paths below are relative to the repo root).
-Most entry points accept `--help`.
+Run scripts from a clone of this repo (paths below are relative to the repo root). Most entry points accept `--help`.
 
 | Tool | What it does |
 | --- | --- |
@@ -32,14 +24,7 @@ Most entry points accept `--help`.
 
 ### `dep-updater`
 
-Creates **stacked dependency update PRs** for a single repository (or, with
-`--batch --all`, org repos from the GitHub API that have a local clone under
-configured scan roots). Supported ecosystems:
-npm/pnpm, Python (`pip`, `uv`, `poetry`, `pipenv`), Rust/Cargo, and GitHub Actions.
-Stacking follows the target repo’s `.github/stacking-tool` marker (`gh-stack` when
-absent; explicit `graphite` keeps Graphite). npm, PyPI, and GitHub Actions releases
-newer than **9 days** are skipped unless the bump fixes a CVE. Work runs in a
-throwaway worktree under `--tmpdir` — the primary clone is not used for stack submit.
+Creates **stacked dependency update PRs** for a single repository (or, with `--batch --all`, org repos from the GitHub API that have a local clone under configured scan roots). Supported ecosystems: npm/pnpm, Python (`pip`, `uv`, `poetry`, `pipenv`), Rust/Cargo, and GitHub Actions. Stacking follows the target repo’s `.github/stacking-tool` marker (`gh-stack` when absent; explicit `graphite` keeps Graphite). npm, PyPI, and GitHub Actions releases newer than **9 days** are skipped unless the bump fixes a CVE. Work runs in a throwaway worktree under `--tmpdir` — the primary clone is not used for stack submit.
 
 ```bash
 # Preview the plan (no git / worktree changes)
@@ -59,16 +44,11 @@ scripts/dep-updater --security-only --dir /path/to/repo
 scripts/dep-updater --batch --all --no-wait-ci --no-wait-merge
 ```
 
-Useful flags: `--ecosystem npm|python|rust|gha|auto`, `--report-json` (implies
-`--dry-run --quiet`), `--merge-via gh|merge-queue`, `--cleanup`, `--rebase`.
-See [Dependency Updates](#dependency-updates) for ecosystem policy details.
+Useful flags: `--ecosystem npm|python|rust|gha|auto`, `--report-json` (implies `--dry-run --quiet`), `--merge-via gh|merge-queue`, `--cleanup`, `--rebase`. See [Dependency Updates](#dependency-updates) for ecosystem policy details.
 
 ### `dep-updater-batch-run`
 
-In service mode, this entry point runs `git fetch`, then `dep-updater --batch --all`,
-and sends an SMTP report. `--print` writes the report to stdout instead; it skips
-SMTP and the batch run. Configure `~/.config/dep-updater.env` from
-`etc/dep-updater.env.example`.
+In service mode, this entry point runs `git fetch`, then `dep-updater --batch --all`, and sends an SMTP report. `--print` writes the report to stdout instead; it skips SMTP and the batch run. Configure `~/.config/dep-updater.env` from `etc/dep-updater.env.example`.
 
 ```bash
 # Report-only (no batch, no SMTP)
@@ -81,12 +61,7 @@ tail --follow=name --retry ~/scratch/repository-helpers/dep-updater-batch.log
 
 ### `github-repo-lint`
 
-Audits GitHub repositories against org conventions: `protect-main` + classic
-`main` protection, GitHub merge queue wiring, branch cleanup workflows,
-release-age policy (Dependabot cooldown / pnpm `minimumReleaseAge`), license /
-CODEOWNERS / cursor rules, stacking-tool marker, uv CVE workflow, and more.
-`--suggest` prints remediation hints; `--apply-fix` repairs supported GitHub
-settings and can queue candidate workflow PRs from the target clone.
+Audits GitHub repositories against org conventions: `protect-main` + classic `main` protection, GitHub merge queue wiring, branch cleanup workflows, release-age policy (Dependabot cooldown / pnpm `minimumReleaseAge`), license / CODEOWNERS / cursor rules, stacking-tool marker, uv CVE workflow, and more. `--suggest` prints remediation hints; `--apply-fix` repairs supported GitHub settings and can queue candidate workflow PRs from the target clone.
 
 ```bash
 # Current clone (when run inside a git repo with a GitHub origin)
@@ -108,19 +83,13 @@ scripts/github-repo-lint --repo OWNER/NAME --apply-fix
 scripts/github-repo-lint --enforcer
 ```
 
-Requires an authenticated `gh` CLI and `jq`. Merge-queue-only subset:
-`scripts/check-merge-settings` (same flags, `--merge-only` behavior). Full check
-table: [github-repo-lint checks](#github-repo-lint-checks).
+Requires an authenticated `gh` CLI and `jq`. Merge-queue-only subset: `scripts/check-merge-settings` (same flags, `--merge-only` behavior). Full check table: [github-repo-lint checks](#github-repo-lint-checks).
 
 ### Secret scanning
 
-Org secret detection is **gitleaks**, wrapped by the canonical library
-`scripts/lib/ci-secret-scan` (copied into consumer repos as `.github/ci/secret-scan`
-and synced via `github-repo-lint`). CI runs it on every PR as a post-push triage
-job; it is **not** currently a required merge-queue status check.
+Org secret detection is **gitleaks**, wrapped by the canonical library `scripts/lib/ci-secret-scan` (copied into consumer repos as `.github/ci/secret-scan` and synced via `github-repo-lint`). CI runs it on every PR as a post-push triage job; it is **not** currently a required merge-queue status check.
 
-Run the same logic locally before you push (installs gitleaks under
-`~/.cache/repository-helpers/bin` when needed):
+Run the same logic locally before you push (installs gitleaks under `~/.cache/repository-helpers/bin` when needed):
 
 ```bash
 # This repo (or pass another clone path as the first argument)
@@ -131,37 +100,15 @@ scripts/dev/secret-scan /path/to/other-repo
 bash .github/ci/secret-scan
 ```
 
-The gitleaks tarball download is verified against a hardcoded SHA-256
-(`ci_secret_scan_sha256`, one per platform, from the release's
-`gitleaks_<ver>_checksums.txt`) before extraction — a swapped or tampered asset
-fails loudly. On a version bump, refresh the version **and** all
-`ci_secret_scan_sha256` platform entries (linux/darwin/windows × x64/arm64);
-`github-repo-lint` flags a stale pin.
+The gitleaks tarball download is verified against a hardcoded SHA-256 (`ci_secret_scan_sha256`, one per platform, from the release's `gitleaks_<ver>_checksums.txt`) before extraction — a swapped or tampered asset fails loudly. On a version bump, refresh the version **and** all `ci_secret_scan_sha256` platform entries (linux/darwin/windows × x64/arm64); `github-repo-lint` flags a stale pin.
 
-Optional env: `GITLEAKS_BASE` / `GITLEAKS_HEAD` for a PR-diff scan,
-`GITLEAKS_VERSION` to override the pinned version (checksum check is then
-skipped), `CI_SECRET_SCAN_BIN_DIR` for a custom install path (defaults to
-`/usr/local/bin` on Unix, `~/.cache/repository-helpers/bin` on Windows). On a leak, the
-helper prints `ERROR: SECRET_SCAN_LEAK` with rotate / branch-quarantine guidance
-— do not push and hope CI catches it.
+Optional env: `GITLEAKS_BASE` / `GITLEAKS_HEAD` for a PR-diff scan, `GITLEAKS_VERSION` to override the pinned version (checksum check is then skipped), `CI_SECRET_SCAN_BIN_DIR` for a custom install path (defaults to `/usr/local/bin` on Unix, `~/.cache/repository-helpers/bin` on Windows). On a leak, the helper prints `ERROR: SECRET_SCAN_LEAK` with rotate / branch-quarantine guidance — do not push and hope CI catches it.
 
-`pre-pr-checks` / `submit-stack` / `ship-and-review` run this scan as a planned
-job when `.github/ci/secret-scan` or `scripts/dev/secret-scan` exists (escape
-hatch: `PRE_PR_CHECKS_SKIP=secret-scan`). CI `secret-scan` still runs after push
-for triage. Full-history / intake / periodic deep scans (TruffleHog) are
-[#509](https://github.com/the-hcma/repository-helpers/issues/509) —
-now implemented as `scripts/secret-audit` (see below).
+`pre-pr-checks` / `submit-stack` / `ship-and-review` run this scan as a planned job when `.github/ci/secret-scan` or `scripts/dev/secret-scan` exists (escape hatch: `PRE_PR_CHECKS_SKIP=secret-scan`). CI `secret-scan` still runs after push for triage. Full-history / intake / periodic deep scans (TruffleHog) are [#509](https://github.com/the-hcma/repository-helpers/issues/509) — now implemented as `scripts/secret-audit` (see below).
 
 ### Secret audit (deep scan)
 
-Full git history and org-wide sweeps use **TruffleHog** via `scripts/secret-audit`
-(see [docs/secret-audit-trufflehog.md](docs/secret-audit-trufflehog.md)). After a
-**clean** scan, `--write-marker` records intake in a **host-local ledger**
-(`~/scratch/repository-helpers/secret-audit-intake.json` — not a git file;
-disposable, regenerated by the nightly sweep). `github-repo-lint` reads that ledger
-locally: a missing, stale, or corrupt entry FAILs `--new-repo` / `--strict-onboarding`
-(#575); CI runs (no ledger on the runner) skip the check. The daily timer **does**
-maintain the ledger.
+Full git history and org-wide sweeps use **TruffleHog** via `scripts/secret-audit` (see [docs/secret-audit-trufflehog.md](docs/secret-audit-trufflehog.md)). After a **clean** scan, `--write-marker` records intake in a **host-local ledger** (`~/scratch/repository-helpers/secret-audit-intake.json` — not a git file; disposable, regenerated by the nightly sweep). `github-repo-lint` reads that ledger locally: a missing, stale, or corrupt entry FAILs `--new-repo` / `--strict-onboarding` (#575); CI runs (no ledger on the runner) skip the check. The daily timer **does** maintain the ledger.
 
 ```bash
 scripts/secret-audit --repo OWNER/NAME
@@ -169,17 +116,9 @@ scripts/secret-audit --repo OWNER/NAME --write-marker
 scripts/secret-audit --all --org the-hcma --include-private
 ```
 
-Automation always passes `--no-update` to TruffleHog. Installs must match the
-pinned release (`3.97.0`); a mismatched on-PATH binary is replaced from GitHub
-releases after checksum verification.
-On leaks: `ERROR: SECRET_AUDIT_LEAK` — rotate credentials; never record a clean intake.
+Automation always passes `--no-update` to TruffleHog. Installs must match the pinned release (`3.97.0`); a mismatched on-PATH binary is replaced from GitHub releases after checksum verification. On leaks: `ERROR: SECRET_AUDIT_LEAK` — rotate credentials; never record a clean intake.
 
-Daily timer (optional): `scripts/setup-secret-audit` installs `secret-audit.service`
-(05:00) running `scripts/secret-audit-batch-run` (org sweep + summary email; finding
-details stay on the host under `secret-audit-runs/`). The sweep never writes markers,
-so it leaves local clones clean. Org sweeps skip archived
-repos; set `SECRET_AUDIT_REPORT_TO` in `~/.config/secret-audit.env` (see
-`etc/secret-audit.env.example`) or reuse `DEP_UPDATER_REPORT_TO`.
+Daily timer (optional): `scripts/setup-secret-audit` installs `secret-audit.service` (05:00) running `scripts/secret-audit-batch-run` (org sweep + summary email; finding details stay on the host under `secret-audit-runs/`). The sweep never writes markers, so it leaves local clones clean. Org sweeps skip archived repos; set `SECRET_AUDIT_REPORT_TO` in `~/.config/secret-audit.env` (see `etc/secret-audit.env.example`) or reuse `DEP_UPDATER_REPORT_TO`.
 
 
 ### Development workflow
@@ -192,8 +131,7 @@ repos; set `SECRET_AUDIT_REPORT_TO` in `~/.config/secret-audit.env` (see
 | `scripts/dev/start-development` | Prune/sync; create or resume a stack worktree | `scripts/dev/start-development --worktree my-change --no-interactive` |
 | `scripts/dev/submit-stack` | `pre-pr-checks` → stack submit → CI wait | `scripts/dev/submit-stack` |
 
-Never implement on the primary clone — always `cd` into the stack worktree first.
-See [Development](#development).
+Never implement on the primary clone — always `cd` into the stack worktree first. See [Development](#development).
 
 ### Other helpers
 
@@ -207,20 +145,9 @@ See [Development](#development).
 | `scripts/on-deploy` | Example deploy hook; consumer repos implement their own |
 | `scripts/trigger-agent-review` | Request a review from the configured agent profile |
 
-Shared libraries live under `scripts/lib/` (`agent-review`, `ci-secret-scan`,
-`on-deploy-deps`, `release-age-defaults`, `repo-practices`, `runner`, …).
+Shared libraries live under `scripts/lib/` (`agent-review`, `ci-secret-scan`, `on-deploy-deps`, `release-age-defaults`, `repo-practices`, `runner`, …).
 
-**`scripts/gh-api`** wraps a one-off `gh` call in the shared GitHub rate-limit
-backoff (`scripts/lib/github-api-rate-limit`): it reads `Retry-After` /
-`X-RateLimit-Reset`, sleeps until reset, and emits `NOTE: GITHUB_RATE_LIMIT_*`
-breadcrumbs — the same logic `wait-for-agent-review` / `github-repo-lint` use
-internally, so ad-hoc agent calls (`gh api`, `gh pr view`, posting a reply)
-survive a tripped secondary limiter instead of 403'ing. Args, stdin, stdout, and
-the exit code (including `125` for quota-intact fail-fast) pass straight through.
-Interactive `gh` (`auth`, prompts, `--web`) is rejected; `scripts/gh-api -- …`
-opts a non-listed subcommand in. Tune with `GITHUB_API_RATE_LIMIT_MAX_RETRIES`,
-`GITHUB_API_RATE_LIMIT_MAX_WAIT_S`, `GITHUB_API_RATE_LIMIT_QUOTA_INTACT_FAIL_FAST`,
-`GITHUB_API_SECONDARY_RATE_LIMIT_BACKOFF_S` (`scripts/gh-api --help`).
+**`scripts/gh-api`** wraps a one-off `gh` call in the shared GitHub rate-limit backoff (`scripts/lib/github-api-rate-limit`): it reads `Retry-After` / `X-RateLimit-Reset`, sleeps until reset, and emits `NOTE: GITHUB_RATE_LIMIT_*` breadcrumbs — the same logic `wait-for-agent-review` / `github-repo-lint` use internally, so ad-hoc agent calls (`gh api`, `gh pr view`, posting a reply) survive a tripped secondary limiter instead of 403'ing. Args, stdin, stdout, and the exit code (including `125` for quota-intact fail-fast) pass straight through. Interactive `gh` (`auth`, prompts, `--web`) is rejected; `scripts/gh-api -- …` opts a non-listed subcommand in. Tune with `GITHUB_API_RATE_LIMIT_MAX_RETRIES`, `GITHUB_API_RATE_LIMIT_MAX_WAIT_S`, `GITHUB_API_RATE_LIMIT_QUOTA_INTACT_FAIL_FAST`, `GITHUB_API_SECONDARY_RATE_LIMIT_BACKOFF_S` (`scripts/gh-api --help`).
 
 ### Systemd / services
 
@@ -246,11 +173,7 @@ Tracked work that extends the tools above (not shipped yet):
 
 ### `wait-for-agent-review` / `ship-and-review`
 
-After CI is green, `wait-for-agent-review` drives the PR review loop (CodeRabbit,
-Copilot, Bugbot, humans): reply-before-resolve triage, quota fallback, early
-complete when nothing is outstanding, and operator email. It does **not**
-self-approve. Configure `~/.config/agent-review.env` from
-`etc/agent-review.env.example`.
+After CI is green, `wait-for-agent-review` drives the PR review loop (CodeRabbit, Copilot, Bugbot, humans): reply-before-resolve triage, quota fallback, early complete when nothing is outstanding, and operator email. It does **not** self-approve. Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`.
 
 ```bash
 scripts/wait-for-agent-review loop --pr <n>
@@ -258,9 +181,7 @@ scripts/wait-for-agent-review check --pr <n>
 scripts/wait-for-agent-review complete --pr <n>   # emails operator when complete_ready
 ```
 
-`scripts/dev/ship-and-review` runs the full ship path: `pre-pr-checks` → stack
-submit → CI wait (approves WAITING environments on the operator’s behalf) →
-`wait-for-agent-review loop`.
+`scripts/dev/ship-and-review` runs the full ship path: `pre-pr-checks` → stack submit → CI wait (approves WAITING environments on the operator’s behalf) → `wait-for-agent-review loop`.
 
 ```bash
 scripts/dev/ship-and-review
@@ -269,29 +190,16 @@ scripts/dev/ship-and-review --no-submit --pr <n>   # PR already open
 
 ## Daily Services
 
-This repo ships two optional systemd user services. They are separate on purpose:
-dependency updates can create PRs, while repository-practices monitoring only reports
-compliance drift and points to the explicit `--apply-fix` remediation command.
+This repo ships two optional systemd user services. They are separate on purpose: dependency updates can create PRs, while repository-practices monitoring only reports compliance drift and points to the explicit `--apply-fix` remediation command.
 
 | Service | Script | Schedule | Purpose |
 | --- | --- | --- | --- |
 | `dep-updater.service` | `scripts/dep-updater-batch-run` | 03:00 daily | Create/update dependency PRs for org repos with local clones and email the run report. |
 | `github-repo-lint.service` | `scripts/github-repo-lint` | 04:00 daily | Monitor org repos (GitHub API; default `the-hcma`) and email the repository-practices report. |
 
-`dep-updater.service` is the automation worker. It fetches every local clone under
-the scan root, runs `dep-updater --batch --all` (org API membership + local
-checkouts), streams the run to
-`~/scratch/repository-helpers/dep-updater-batch.log`, and sends a success, failure,
-or timeout report by email. When updates are created, the report lists them from
-structured JSON; when none are created, it says so explicitly. Org repos with no
-local clone appear under **Skipped (no local clone)**.
+`dep-updater.service` is the automation worker. It fetches every local clone under the scan root, runs `dep-updater --batch --all` (org API membership + local checkouts), streams the run to `~/scratch/repository-helpers/dep-updater-batch.log`, and sends a success, failure, or timeout report by email. When updates are created, the report lists them from structured JSON; when none are created, it says so explicitly. Org repos with no local clone appear under **Skipped (no local clone)**.
 
-`github-repo-lint.service` is the compliance monitor. It discovers repositories
-from the GitHub org API (`orgs/<ORG>/repos`, default `the-hcma`; same source as
-`github-repo-lint --org the-hcma --all`), runs strict repository-practices checks
-for each one, emails the daily report, and exits non-zero when any repository
-fails. It does not apply repairs automatically. Local scan-root clones are not
-required for the audit (only for some `--apply-fix` workflow stacks).
+`github-repo-lint.service` is the compliance monitor. It discovers repositories from the GitHub org API (`orgs/<ORG>/repos`, default `the-hcma`; same source as `github-repo-lint --org the-hcma --all`), runs strict repository-practices checks for each one, emails the daily report, and exits non-zero when any repository fails. It does not apply repairs automatically. Local scan-root clones are not required for the audit (only for some `--apply-fix` workflow stacks).
 
 Install or inspect them from this repository:
 
@@ -308,82 +216,44 @@ scripts/setup-github-repo-lint --status
 scripts/show-services
 ```
 
-`github-repo-lint` (no args) reuses `~/.config/dep-updater.env` for SMTP by default.
-Use `~/.config/github-repo-lint.env` when you need a different org
-(`GITHUB_REPO_LINT_ORG`), include-private, or report settings.
+`github-repo-lint` (no args) reuses `~/.config/dep-updater.env` for SMTP by default. Use `~/.config/github-repo-lint.env` when you need a different org (`GITHUB_REPO_LINT_ORG`), include-private, or report settings.
 
-`scripts/show-services` prints a read-only summary of every systemd service template
-in this repo, including installed status, active/enabled state, timer next run,
-configuration files, log tail commands, and setup command.
+`scripts/show-services` prints a read-only summary of every systemd service template in this repo, including installed status, active/enabled state, timer next run, configuration files, log tail commands, and setup command.
 
-See [docs/SYSTEMD.md](docs/SYSTEMD.md) for service configuration, logs, timers, and
-manual trial runs.
+See [docs/SYSTEMD.md](docs/SYSTEMD.md) for service configuration, logs, timers, and manual trial runs.
 
 ## Dependency Updates
 
-Invocation and flags: [`dep-updater`](#dep-updater) /
-[`dep-updater-batch-run`](#dep-updater-batch-run). Supported ecosystems and
-policy defaults:
+Invocation and flags: [`dep-updater`](#dep-updater) / [`dep-updater-batch-run`](#dep-updater-batch-run). Supported ecosystems and policy defaults:
 
-- **npm / pnpm:** reads `package.json`, lockfiles, and workspace config. Exact pins
-  are updated in place; workspace, local, file, link, and git refs are skipped.
-- **Python / pip:** supports `requirements.txt` and `pyproject.toml`, writes `>=`
-  floor constraints, and respects intentional `==` pins.
-- **Python / uv:** supports `uv.lock`; `==` pins are updated and promoted to `>=`,
-  with dry-run install checks guarding transitive constraints.
+- **npm / pnpm:** reads `package.json`, lockfiles, and workspace config. Exact pins are updated in place; workspace, local, file, link, and git refs are skipped.
+- **Python / pip:** supports `requirements.txt` and `pyproject.toml`, writes `>=` floor constraints, and respects intentional `==` pins.
+- **Python / uv:** supports `uv.lock`; `==` pins are updated and promoted to `>=`, with dry-run install checks guarding transitive constraints.
 - **Python / Poetry:** supports `poetry.lock`, respecting intentional `==` pins.
 - **Python / Pipenv:** supports `Pipfile.lock`, respecting intentional `==` pins.
-- **Rust / Cargo:** supports `Cargo.toml` / `Cargo.lock` using `cargo outdated`
-  JSON and `cargo add`, preserving dev/build kind and workspace package targeting.
-  Requires a Rust toolchain on the host (plus the `clippy` component for post-bump
-  recovery):
+- **Rust / Cargo:** supports `Cargo.toml` / `Cargo.lock` using `cargo outdated` JSON and `cargo add`, preserving dev/build kind and workspace package targeting. Requires a Rust toolchain on the host (plus the `clippy` component for post-bump recovery):
 
   ```bash
   rustup component add clippy
   cargo install cargo-outdated --locked
   ```
 
-  apt's Rust is too old for current `cargo-outdated` — install via rustup, and on
-  Debian/Ubuntu add `build-essential pkg-config libssl-dev` for `openssl-sys` /
-  `libgit2-sys`. Note that `~/.cargo/bin` is not on a systemd/cron `PATH` by
-  default, so a timer-run batch can still report the tool missing after a
-  successful interactive install. A host without it no longer fails the whole run:
-  `--batch --all` skips those repos and lists them under **Skipped (missing
-  tooling)** in the batch email, while a single-repo run still fails loudly.
-- **GitHub Actions:** supports `.github/workflows/*.yml`, preserving existing `v`
-  prefix style, updating major-only pins only on newer majors, and skipping SHA or
-  local action pins.
+  apt's Rust is too old for current `cargo-outdated` — install via rustup, and on Debian/Ubuntu add `build-essential pkg-config libssl-dev` for `openssl-sys` / `libgit2-sys`. Note that `~/.cargo/bin` is not on a systemd/cron `PATH` by default, so a timer-run batch can still report the tool missing after a successful interactive install. A host without it no longer fails the whole run: `--batch --all` skips those repos and lists them under **Skipped (missing tooling)** in the batch email, while a single-repo run still fails loudly.
+- **GitHub Actions:** supports `.github/workflows/*.yml`, preserving existing `v` prefix style, updating major-only pins only on newer majors, and skipping SHA or local action pins.
 
-For npm, PyPI, and GitHub Actions, registry releases newer than 9 days are skipped
-unless the bump fixes a CVE.
+For npm, PyPI, and GitHub Actions, registry releases newer than 9 days are skipped unless the bump fixes a CVE.
 
-See [dep-updater.plan.md](dep-updater.plan.md) for implementation details and
-[dep-updater-hybrid-architecture.plan.md](dep-updater-hybrid-architecture.plan.md)
-for the Bash + Python extraction proposal.
+See [dep-updater.plan.md](dep-updater.plan.md) for implementation details and [dep-updater-hybrid-architecture.plan.md](dep-updater-hybrid-architecture.plan.md) for the Bash + Python extraction proposal.
 
 ## Repository Practices
 
-Invocation and flags: [`github-repo-lint`](#github-repo-lint). The audit covers
-GitHub native merge queue wiring (org default), `protect-main`, classic branch
-protection, branch cleanup workflows, release-age policy, license/CODEOWNERS
-metadata, cursor rules, and uv Python CVE checks.
+Invocation and flags: [`github-repo-lint`](#github-repo-lint). The audit covers GitHub native merge queue wiring (org default), `protect-main`, classic branch protection, branch cleanup workflows, release-age policy, license/CODEOWNERS metadata, cursor rules, and uv Python CVE checks.
 
-`--apply-fix` can repair supported GitHub settings such as Release Please squash
-settings, the `protect-main` ruleset (squash-only + `merge_queue` SQUASH +
-`required_signatures` + `require_code_owner_review` with an `OrganizationAdmin`
-bypass), and classic `main` branch protection (GitHub MQ profile). When run from the target
-repository clone, it also prepares candidate workflow fixes in a dedicated
-`.worktrees/repo-practices-candidate-fixes-wt` worktree and submits them as a
-stack for review (`gt track` / `gt submit` when the marker is `graphite`, or
-`gh stack submit` when the marker is `gh-stack`). Candidate workflow templates live under
-`scripts/lib/repo-practices-workflows/` so they can be reviewed and linted
-directly. Disable org repos in Graphite’s merge-queue UI so Graphite does not
-also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
+`--apply-fix` can repair supported GitHub settings such as Release Please squash settings, the `protect-main` ruleset (squash-only + `merge_queue` SQUASH + `required_signatures` + `require_code_owner_review` with an `OrganizationAdmin` bypass), and classic `main` branch protection (GitHub MQ profile). When run from the target repository clone, it also prepares candidate workflow fixes in a dedicated `.worktrees/repo-practices-candidate-fixes-wt` worktree and submits them as a stack for review (`gt track` / `gt submit` when the marker is `graphite`, or `gh stack submit` when the marker is `gh-stack`). Candidate workflow templates live under `scripts/lib/repo-practices-workflows/` so they can be reviewed and linted directly. Disable org repos in Graphite’s merge-queue UI so Graphite does not also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
 
 ### `github-repo-lint` checks
 
-`scripts/lib/repo-practices` implements the audit. Use `--merge-only` (via
-`scripts/check-merge-settings`) to run only the merge-queue subset.
+`scripts/lib/repo-practices` implements the audit. Use `--merge-only` (via `scripts/check-merge-settings`) to run only the merge-queue subset.
 
 | Check | Full audit | Merge-only | What it validates |
 | --- | --- | --- | --- |
@@ -426,33 +296,15 @@ also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
 | Deployment environment protection | yes* | — | Any environment a workflow deploys to must have a protection rule (required reviewer) or a `deployment_branch_policy` (*missing FAILS `--new-repo` and `--strict-onboarding`; SUGGESTs in routine `--all` / `--suggest` — org-wide rollout complete, repository-helpers#588) |
 | Protection-mechanism consistency | yes | — | Advisory only: flags a genuine disagreement between classic `main` protection and the `protect-main` ruleset — this org runs both by design, so their coexistence is never itself flagged. `require_code_owner_reviews` is now enforced on both sides (repository-helpers#626), so this check is normally quiet (repository-helpers#588) |
 
-`--suggest` prints remediation lines; `--apply-fix` queues candidate
-workflow/cursor-rule PRs via the stacking backend selected by
-`.github/stacking-tool` (`graphite` → `gt track` / `gt submit`; `gh-stack` →
-`gh stack init` / `gh stack submit`).
+`--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via the stacking backend selected by `.github/stacking-tool` (`graphite` → `gt track` / `gt submit`; `gh-stack` → `gh stack init` / `gh stack submit`).
 
-Further detail (protect-main rules, branch hygiene, CVE workflow template):
-[AGENTS.md](AGENTS.md#repository-practices-new-and-existing-repos).
+Further detail (protect-main rules, branch hygiene, CVE workflow template): [AGENTS.md](AGENTS.md#repository-practices-new-and-existing-repos).
 
 ## Systemd Service Setup
 
-`scripts/setup-service` reads unit templates from `etc/systemd/<unit>.service`
-in the invoking repository, substitutes `@@REPO_DIR@@`, injects `DEPLOYED_COMMIT`
-and `ConditionHost=|<machine-id>` guards, installs under `~/.config/systemd/user/`, and keeps a
-readable copy under `~/.config/share/systemd-units/` for `scripts/show-services`. Enables companion timers when
-`etc/systemd/<unit>.timer` exists.
+`scripts/setup-service` reads unit templates from `etc/systemd/<unit>.service` in the invoking repository, substitutes `@@REPO_DIR@@`, injects `DEPLOYED_COMMIT` and `ConditionHost=|<machine-id>` guards, installs under `~/.config/systemd/user/`, and keeps a readable copy under `~/.config/share/systemd-units/` for `scripts/show-services`. Enables companion timers when `etc/systemd/<unit>.timer` exists.
 
-**Opt-out:** a repo that manages its own systemd convention (system-scope units, a
-different placeholder set, a host-guard library, etc.) ships its own executable
-`scripts/setup-service` whose **content differs** from this repo's generic helper
-(`cmp -s`). A byte-identical copy (e.g. another worktree of repository-helpers)
-is not an opt-out. Differing content is self-documenting signal to skip generic
-user-scope adoption — `start-development --refresh` and this repo's
-`scripts/setup-service` become no-ops for that checkout (repository-helpers#630).
-`GITHUB_REPO_LINT_SERVICE_UNIT` (e.g. `scripts/setup-github-repo-lint`) only
-selects a unit basename on the generic path; the content-diff opt-out is checked
-first and still wins. Details:
-[docs/SYSTEMD.md](docs/SYSTEMD.md#opting-out-repos-with-their-own-systemd-convention).
+**Opt-out:** a repo that manages its own systemd convention (system-scope units, a different placeholder set, a host-guard library, etc.) ships its own executable `scripts/setup-service` whose **content differs** from this repo's generic helper (`cmp -s`). A byte-identical copy (e.g. another worktree of repository-helpers) is not an opt-out. Differing content is self-documenting signal to skip generic user-scope adoption — `start-development --refresh` and this repo's `scripts/setup-service` become no-ops for that checkout (repository-helpers#630). `GITHUB_REPO_LINT_SERVICE_UNIT` (e.g. `scripts/setup-github-repo-lint`) only selects a unit basename on the generic path; the content-diff opt-out is checked first and still wins. Details: [docs/SYSTEMD.md](docs/SYSTEMD.md#opting-out-repos-with-their-own-systemd-convention).
 
 For service repositories, provide an executable `scripts/on-deploy` hook:
 
@@ -462,15 +314,11 @@ For service repositories, provide an executable `scripts/on-deploy` hook:
 | `1` | Nothing changed; restart may be skipped. |
 | `2+` | Failure; setup aborts. |
 
-Use `scripts/lib/on-deploy-deps` from this repo for Python and pnpm dependency
-staleness checks. See [AGENTS.md](AGENTS.md#on-deploy-hooks) and
-[docs/on-deploy-deps-load.snippet](docs/on-deploy-deps-load.snippet).
+Use `scripts/lib/on-deploy-deps` from this repo for Python and pnpm dependency staleness checks. See [AGENTS.md](AGENTS.md#on-deploy-hooks) and [docs/on-deploy-deps-load.snippet](docs/on-deploy-deps-load.snippet).
 
 ## Development
 
-Stacking backend is selected by `.github/stacking-tool` (`gh-stack` or `graphite`).
-**This repo trials `gh-stack`.** Never edit the primary clone directly — work in a
-stack worktree.
+Stacking backend is selected by `.github/stacking-tool` (`gh-stack` or `graphite`). **This repo trials `gh-stack`.** Never edit the primary clone directly — work in a stack worktree.
 
 ```bash
 scripts/dev/start-development --worktree my-change --no-interactive
@@ -493,11 +341,7 @@ scripts/dev/secret-scan            # optional: same gitleaks path without full p
 scripts/dev/submit-stack           # pre-pr-checks + stack submit + CI wait
 ```
 
-`pre-pr-checks` plans a **secret-scan** job when `.github/ci/secret-scan` or
-`scripts/dev/secret-scan` exists. That is the submit-path gate; CI
-`secret-scan` still runs after push for triage. Skip only with
-`PRE_PR_CHECKS_SKIP=secret-scan`. Org-wide / historical deep scans are tracked
-separately (repository-helpers#509).
+`pre-pr-checks` plans a **secret-scan** job when `.github/ci/secret-scan` or `scripts/dev/secret-scan` exists. That is the submit-path gate; CI `secret-scan` still runs after push for triage. Skip only with `PRE_PR_CHECKS_SKIP=secret-scan`. Org-wide / historical deep scans are tracked separately (repository-helpers#509).
 
 End-to-end ship (submit + CI + agent review loop):
 
@@ -513,8 +357,7 @@ After every push, wait for CI on the PR head (included in `submit-stack` by defa
 scripts/dev/post-pr-submission-checks --pr <n>
 ```
 
-When CI is green, run the agent review loop. **Reply on-thread before resolving**
-(exit code 3 means feedback still needs a human reply):
+When CI is green, run the agent review loop. **Reply on-thread before resolving** (exit code 3 means feedback still needs a human reply):
 
 ```bash
 scripts/wait-for-agent-review loop --pr <n>
@@ -526,19 +369,11 @@ When `check` reports `complete_ready: true` (agent sign-off on the current head)
 scripts/wait-for-agent-review complete --pr <n>   # emails the operator; does not self-approve
 ```
 
-**Merging (org default):** use GitHub’s merge queue (`gh pr merge --auto --squash` /
-Enable auto-merge). Do **not** use the `merge-it` label to land PRs — leftover
-labels are ignored. Graphite stacking (`gt`) remains available via
-`.github/stacking-tool`; disable Graphite’s merge-queue UI for org repos.
+**Merging (org default):** use GitHub’s merge queue (`gh pr merge --auto --squash` / Enable auto-merge). Do **not** use the `merge-it` label to land PRs — leftover labels are ignored. Graphite stacking (`gt`) remains available via `.github/stacking-tool`; disable Graphite’s merge-queue UI for org repos.
 
-Configure `~/.config/agent-review.env` from `etc/agent-review.env.example` (SMTP,
-`AGENT_REVIEW_REPORT_TO`, early-complete when nothing outstanding, **12h** PR
-non-convergence cap).
+Configure `~/.config/agent-review.env` from `etc/agent-review.env.example` (SMTP, `AGENT_REVIEW_REPORT_TO`, early-complete when nothing outstanding, **12h** PR non-convergence cap).
 
-See [AGENTS.md](AGENTS.md) for coding conventions, utility index, and agent-review
-details; [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc) for
-backend selection; [`.agents/skills/ship-and-review/SKILL.md`](.agents/skills/ship-and-review/SKILL.md)
-for the full review playbook; skills under `.agents/skills/{graphite,gh-stack}/`.
+See [AGENTS.md](AGENTS.md) for coding conventions, utility index, and agent-review details; [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc) for backend selection; [`.agents/skills/ship-and-review/SKILL.md`](.agents/skills/ship-and-review/SKILL.md) for the full review playbook; skills under `.agents/skills/{graphite,gh-stack}/`.
 
 ## Testing
 
@@ -560,22 +395,9 @@ bash tests/setup-service.test
 
 ### shellcheck version
 
-`shellcheck` is **pinned** (currently `0.11.0`) so a local run and CI never
-disagree on lint findings (e.g. `SC2329`). Both `.github/workflows/ci.yml` and
-`scripts/dev/pre-pr-checks` resolve `shellcheck` through
-`scripts/lib/ci-shellcheck`, which downloads the pinned release binary
-(Linux/macOS, x86_64/aarch64) when the pinned version is not already resolvable —
-locally into `~/.cache/repository-helpers/bin`, in CI into `/usr/local/bin`. The
-download is verified against a hardcoded SHA-256 and the installed binary is
-re-checked so a stale `shellcheck` earlier on `PATH` can't silently win. Override
-the version for local experiments with `SHELLCHECK_VERSION` (checksum check is
-then skipped).
+`shellcheck` is **pinned** (currently `0.11.0`) so a local run and CI never disagree on lint findings (e.g. `SC2329`). Both `.github/workflows/ci.yml` and `scripts/dev/pre-pr-checks` resolve `shellcheck` through `scripts/lib/ci-shellcheck`, which downloads the pinned release binary (Linux/macOS, x86_64/aarch64) when the pinned version is not already resolvable — locally into `~/.cache/repository-helpers/bin`, in CI into `/usr/local/bin`. The download is verified against a hardcoded SHA-256 and the installed binary is re-checked so a stale `shellcheck` earlier on `PATH` can't silently win. Override the version for local experiments with `SHELLCHECK_VERSION` (checksum check is then skipped).
 
-`scripts/github-repo-lint` warns when `ci_shellcheck_version` /
-`ci_shellcheck_sha256` in `scripts/lib/ci-shellcheck` fall behind the newest
-shellcheck release that clears the dep-updater release-age gate (same mechanism
-as the `ci-secret-scan` gitleaks pin). On a bump, update the version **and** all
-four checksums, then re-sync any consumer `.github/ci/shellcheck`.
+`scripts/github-repo-lint` warns when `ci_shellcheck_version` / `ci_shellcheck_sha256` in `scripts/lib/ci-shellcheck` fall behind the newest shellcheck release that clears the dep-updater release-age gate (same mechanism as the `ci-secret-scan` gitleaks pin). On a bump, update the version **and** all four checksums, then re-sync any consumer `.github/ci/shellcheck`.
 
 ## License
 

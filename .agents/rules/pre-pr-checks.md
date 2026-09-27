@@ -8,12 +8,9 @@ alwaysApply: true
 Before **`scripts/dev/submit-stack`** or opening a PR in this repository:
 
 1. Run **`scripts/dev/pre-pr-checks`** from the feature worktree (must exit 0).
-   - Prefer **`scripts/dev/submit-stack`** (marker-aware submit via
-     `.github/stacking-tool`) instead of a bare submit command alone.
+   - Prefer **`scripts/dev/submit-stack`** (marker-aware submit via `.github/stacking-tool`) instead of a bare submit command alone.
 
-2. Do **not** submit if pre-pr-checks failed or was skipped (including missing `shellcheck`,
-   `rg`, failing `tests/*.test`, or a failing **secret-scan** when that job is planned).
-   Escape hatch only: `PRE_PR_CHECKS_SKIP=job1,job2` (e.g. `secret-scan`).
+2. Do **not** submit if pre-pr-checks failed or was skipped (including missing `shellcheck`, `rg`, failing `tests/*.test`, or a failing **secret-scan** when that job is planned). Escape hatch only: `PRE_PR_CHECKS_SKIP=job1,job2` (e.g. `secret-scan`).
 
 3. In the PR **Test plan**, note that `scripts/dev/pre-pr-checks` passed (or paste the final `==> pre-pr-checks passed` line).
 
@@ -23,8 +20,7 @@ Bare submit without a successful pre-pr-checks run is not acceptable unless the 
 
 ## Apply formatters before check (required)
 
-`pre-pr-checks` is **check-only** by default (e.g. `ruff format --check`, `cargo fmt -- --check`).
-After review-fix edits — especially string literals — **apply** formatters first, then run the gate:
+`pre-pr-checks` is **check-only** by default (e.g. `ruff format --check`, `cargo fmt -- --check`). After review-fix edits — especially string literals — **apply** formatters first, then run the gate:
 
 ```bash
 # Python (match CI paths; adjust for the repo)
@@ -37,13 +33,11 @@ scripts/dev/pre-pr-checks
 scripts/dev/pre-pr-checks --fix
 ```
 
-Commit any format-only diff before `submit-stack`. Do **not** treat a green `pytest` /
-`ruff check` / partial job as a pre-PR pass.
+Commit any format-only diff before `submit-stack`. Do **not** treat a green `pytest` / `ruff check` / partial job as a pre-PR pass.
 
 ## No truncated pre-PR output
 
-Do **not** pipe `pre-pr-checks` to `tail` / `head`. Require exit **0** and the final
-`==> pre-pr-checks passed` line from the full run.
+Do **not** pipe `pre-pr-checks` to `tail` / `head`. Require exit **0** and the final `==> pre-pr-checks passed` line from the full run.
 
 ```bash
 # ❌ Truncated — hides failures above the last few lines
@@ -57,8 +51,7 @@ scripts/dev/pre-pr-checks
 
 CI runs **`shellcheck -S info`** on **all** of:
 
-- `scripts/*`, `scripts/dev/*`, `scripts/lib/*`, `scripts/lib/*/*` (nested libs like
-  `agent-review-profiles/`; non-script suffixes such as `.snippet` / `.yml` filtered out)
+- `scripts/*`, `scripts/dev/*`, `scripts/lib/*`, `scripts/lib/*/*` (nested libs like `agent-review-profiles/`; non-script suffixes such as `.snippet` / `.yml` filtered out)
 - `tests/*`, `tests/lib/*` — including `tests/*.test` harness files
 
 Do **not** treat “I shellchecked the script I edited” as a substitute for `pre-pr-checks`. A green `shellcheck scripts/dep-updater` does **not** cover test-file findings (e.g. SC2016 in `tests/dep-updater.test`).

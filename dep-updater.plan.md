@@ -54,8 +54,7 @@ All CLI tools are invoked with **JSON output** where available, parsed with `jq`
 | Python/pipenv | `pipenv run pip list --outdated --format=json` | same as pip |
 | Python/poetry | `poetry show --outdated` | no stable JSON; parsed with `awk` |
 
-> **Note:** `pnpm outdated` exits with code 1 when outdated packages are found. The script
-> handles this with `set +e` / `set -e` around the call rather than triggering `set -euo pipefail`.
+> **Note:** `pnpm outdated` exits with code 1 when outdated packages are found. The script handles this with `set +e` / `set -e` around the call rather than triggering `set -euo pipefail`.
 
 ---
 
@@ -152,8 +151,7 @@ check_ecosystem_prereqs() {
 }
 ```
 
-> All missing tools are **collected and reported together** before exiting — the user sees the
-> full list in one shot, not one error per run.
+> All missing tools are **collected and reported together** before exiting — the user sees the full list in one shot, not one error per run.
 
 ---
 
@@ -170,8 +168,7 @@ worktree_path="$(dirname "$project_root")/${worktree_name}"
 git -C "$project_root" worktree add "$worktree_path" main
 ```
 
-All subsequent `git`, `gt`, `pnpm`, `pip`/`uv`/`poetry` commands run **within `$worktree_path`**.
-On rerun, if `.dep-updater-state` points to an existing worktree, that worktree is reused instead of creating another one.
+All subsequent `git`, `gt`, `pnpm`, `pip`/`uv`/`poetry` commands run **within `$worktree_path`**. On rerun, if `.dep-updater-state` points to an existing worktree, that worktree is reused instead of creating another one.
 
 ### State File
 
@@ -196,17 +193,9 @@ Read with `rg "^key=" | cut -d= -f2-`; updated with `sed -i`.
 
 ## Batch-all child run report (`DEP_UPDATER_RUN_REPORT`)
 
-When `dep-updater` runs as **`--batch --all`**, the parent process spawns one child per
-repository. The parent sets **`DEP_UPDATER_RUN_REPORT`** to an absolute path of a fresh
-empty file for that child only (via the child’s environment on the exec line — the
-parent’s shell does not retain the variable).
+When `dep-updater` runs as **`--batch --all`**, the parent process spawns one child per repository. The parent sets **`DEP_UPDATER_RUN_REPORT`** to an absolute path of a fresh empty file for that child only (via the child’s environment on the exec line — the parent’s shell does not retain the variable).
 
-On **non-zero exit**, the child’s **`EXIT` trap** (`_on_exit`) writes **one JSON object**
-to that path (single write, no partial-file protocol — the parent only reads the file
-after `wait`). The parent then loads **`primary`** and **`details`** with **`jq`** for
-`[batch-all] Root cause:` and the failure summary. If the file is missing or invalid
-(e.g. crash before the trap), the parent falls back to the **last line** of the
-ANSI-stripped log copy.
+On **non-zero exit**, the child’s **`EXIT` trap** (`_on_exit`) writes **one JSON object** to that path (single write, no partial-file protocol — the parent only reads the file after `wait`). The parent then loads **`primary`** and **`details`** with **`jq`** for `[batch-all] Root cause:` and the failure summary. If the file is missing or invalid (e.g. crash before the trap), the parent falls back to the **last line** of the ANSI-stripped log copy.
 
 **Object shape (stable keys, no version field):**
 
@@ -217,8 +206,7 @@ ANSI-stripped log copy.
 | `primary` | string | One-line headline (first recorded failure, else first ecosystem failure line, else generic) |
 | `details` | string[] | Lines from `DEP_UPDATER_ECO_FAIL_FILE` when present (ecosystem soft-failures) |
 
-Interactive runs and non-batch-all children never set this variable, so behavior is
-unchanged.
+Interactive runs and non-batch-all children never set this variable, so behavior is unchanged.
 
 ---
 
@@ -228,22 +216,15 @@ Bugs that were found in production and fixed. Recorded here so the same mistakes
 
 ### 1. `git update-ref` leaves the working tree stale (PR #18)
 
-**Symptom:** After a dep-updater run, `$dir` (the source repo) has uncommitted changes to
-`pyproject.toml`, `uv.lock`, `package.json`, `pnpm-lock.yaml`, etc. — even though dep-updater
-ran all its writes inside a separate worktree at `$worktree_path`.
+**Symptom:** After a dep-updater run, `$dir` (the source repo) has uncommitted changes to `pyproject.toml`, `uv.lock`, `package.json`, `pnpm-lock.yaml`, etc. — even though dep-updater ran all its writes inside a separate worktree at `$worktree_path`.
 
 **Root cause:** `create_worktree` calls:
 ```bash
 git -C "$dir" update-ref refs/heads/main "$main_sha"
 ```
-to fast-forward the local `main` branch so `gt submit` does not abort with "trunk branch is
-out of date". `update-ref` moves the branch pointer but does **not** update the working tree.
-If `origin/main` had new merged commits since the last `git pull`, the working tree now differs
-from `HEAD`, and every file changed by those commits shows up as "modified".
+to fast-forward the local `main` branch so `gt submit` does not abort with "trunk branch is out of date". `update-ref` moves the branch pointer but does **not** update the working tree. If `origin/main` had new merged commits since the last `git pull`, the working tree now differs from `HEAD`, and every file changed by those commits shows up as "modified".
 
-**Fix:** After `update-ref`, if `main` is the currently checked-out branch and the working tree
-is clean, run `git -C "$dir" reset --hard "$main_sha"` to also advance the working tree.
-Skip the reset if a different branch is checked out or if there are uncommitted changes.
+**Fix:** After `update-ref`, if `main` is the currently checked-out branch and the working tree is clean, run `git -C "$dir" reset --hard "$main_sha"` to also advance the working tree. Skip the reset if a different branch is checked out or if there are uncommitted changes.
 
 **Test:** `=== static: create_worktree fast-forwards working tree after update-ref ===`
 
@@ -253,15 +234,9 @@ Skip the reset if a different branch is checked out or if there are uncommitted 
 
 **Symptom:** `uv.lock` in the source repo is modified after a dep-updater run.
 
-**Root cause:** `py_audit` called `uv run --with pip-audit pip-audit --format=json` without
-`--frozen`. In update mode, `py_audit` runs against `$dir`. `uv run` syncs the project
-environment before running (resolving and rewriting `uv.lock`) even though the goal is
-just to read vulnerability data.
+**Root cause:** `py_audit` called `uv run --with pip-audit pip-audit --format=json` without `--frozen`. In update mode, `py_audit` runs against `$dir`. `uv run` syncs the project environment before running (resolving and rewriting `uv.lock`) even though the goal is just to read vulnerability data.
 
-**Fix:** Pass `--frozen` → `uv run --frozen --with pip-audit ...`. With `--frozen`, uv uses
-the existing lockfile as-is and skips the sync step. If `uv.lock` is genuinely stale, the
-command fails silently (py_audit has `set +e`) and returns no audit results — an acceptable
-tradeoff since dep-updater must never touch source-repo tracked files.
+**Fix:** Pass `--frozen` → `uv run --frozen --with pip-audit ...`. With `--frozen`, uv uses the existing lockfile as-is and skips the sync step. If `uv.lock` is genuinely stale, the command fails silently (py_audit has `set +e`) and returns no audit results — an acceptable tradeoff since dep-updater must never touch source-repo tracked files.
 
 **Test:** `=== static: py_audit runs uv with --frozen ===`
 
@@ -269,16 +244,11 @@ tradeoff since dep-updater must never touch source-repo tracked files.
 
 ### 3. PR body-file leakage and name mismatch (PR #18)
 
-**Symptom:** `/tmp/dep-updat*-pr-*.md` files accumulate and are never cleaned up.
-`gh pr edit` in `npm_update_group` silently uses the wrong body file (file not found).
+**Symptom:** `/tmp/dep-updat*-pr-*.md` files accumulate and are never cleaned up. `gh pr edit` in `npm_update_group` silently uses the wrong body file (file not found).
 
-**Root cause:** Five call sites hardcoded `/tmp/dep-updat(e|er)-pr-${key}.md` paths that
-were never removed. `write_npm_pr_body` wrote to `dep-updater-pr-${safe_key}.md` but
-`npm_update_group` passed `dep-update-pr-${safe_key}.md` (missing trailing `r`) to `gh pr edit`.
+**Root cause:** Five call sites hardcoded `/tmp/dep-updat(e|er)-pr-${key}.md` paths that were never removed. `write_npm_pr_body` wrote to `dep-updater-pr-${safe_key}.md` but `npm_update_group` passed `dep-update-pr-${safe_key}.md` (missing trailing `r`) to `gh pr edit`.
 
-**Fix:** All five sites replaced with `mktemp` + `rm -f` after use. `write_npm_pr_body` and
-`write_pr_body` accept the body file path as a parameter (5th and 7th arg respectively)
-rather than deriving it internally.
+**Fix:** All five sites replaced with `mktemp` + `rm -f` after use. `write_npm_pr_body` and `write_pr_body` accept the body file path as a parameter (5th and 7th arg respectively) rather than deriving it internally.
 
 **Test:** `=== static: no hardcoded /tmp/ PR body-file paths ===`
 
@@ -290,8 +260,7 @@ rather than deriving it internally.
 ```bash
 npm install --prefix "$dir" --prefer-offline
 ```
-This is not frozen and can write or update `package-lock.json` in `$dir`. Only triggered
-for bare-npm projects (not pnpm/yarn). Not yet fixed.
+This is not frozen and can write or update `package-lock.json` in `$dir`. Only triggered for bare-npm projects (not pnpm/yarn). Not yet fixed.
 
 ### Cleanup
 
