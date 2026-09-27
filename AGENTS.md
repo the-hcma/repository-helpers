@@ -689,7 +689,7 @@ and advances the quota fallback chain instead of hanging (`repository-helpers#40
 - Do not log, store, or transmit credential tokens beyond what is needed to invoke `gh`/`gt`.
 - Agents must follow `.cursor/rules/no-secret-exposure.mdc` (never print/paste secrets into logs, transcripts, PRs, or commits). Complements CI secret-scan: prevention vs detection.
 - Agents must follow `.cursor/rules/remote-timeouts-retries.mdc` (explicit timeouts and bounded retries on every remote/network call).
-- Agents must follow `.cursor/rules/github-api-throttle.mdc` (run every `gh` call site through `scripts/gh-api` so primary/secondary rate-limit backoff is automatic).
+- Agents must follow `.cursor/rules/github-api-throttle.mdc` (run every `gh` call site through `scripts/gh-api`, or `github_api_exec_with_rate_limit_retry` inside first-party bash libraries, so primary/secondary rate-limit backoff is automatic).
 
 ---
 
