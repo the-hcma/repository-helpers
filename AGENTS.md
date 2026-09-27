@@ -224,7 +224,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Git commit identity agents rule | yes* | — | `.agents/rules/git-commit-identity.md` (+ Cursor shim) forbids agent/machine co-authors; agents must verify commit signing (`commit.gpgsign` / `user.signingkey`, pinentry-mac / passphrase / per-machine keys / clearsign probe) and `~/.cursor/cli-config.json` attribution (*#637 dual-path severity) |
 | No secret exposure agents rule | yes* | — | `.agents/rules/no-secret-exposure.md` (+ Cursor shim): never leak secrets into logs/transcripts/PRs/commits; allowlist or path-existence when inspecting config; rotate if leaked (*#637 dual-path + #575) |
 | Remote timeouts and retries agents rule | yes* | — | `.agents/rules/remote-timeouts-retries.md` (+ Cursor shim): explicit timeouts on every remote call; bounded retries for transient failures only (*#637 dual-path severity) |
-| GitHub API throttle rule | yes* | — | `.agents/rules/github-api-throttle.md` (+ Cursor shim): agent flows that shell out to `gh` run it via `"${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/gh-api"`; consumers carry a **breadcrumb + canonical URL**, not a copied body (*#637 dual-path; repository-helpers#608) |
+| GitHub API throttle rule | yes* | — | `.agents/rules/github-api-throttle.md` (+ Cursor shim): every `gh` call site (agent or first-party code) runs via `"${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/gh-api"` or, inside first-party bash libraries, `github_api_exec_with_rate_limit_retry`; consumers carry a **breadcrumb + canonical URL**, not a copied body (*#637 dual-path; repository-helpers#608) |
 | GitHub content formatting rule | yes* | — | `.agents/rules/github-content-formatting.md` (+ Cursor shim): agent-authored issue/PR bodies and comments require `--body-file` + `scripts/lint-github-markdown` for multi-paragraph content; consumers carry a **breadcrumb + canonical URL**, not a copied body (*#637 dual-path; repository-helpers#657) |
 | Repo practices after config change | yes* | — | `.agents/rules/repo-practices-after-config-change.md` (+ Cursor shim) requires `github-repo-lint` after workflow/config edits; `pre-pr-checks` runs detect-first `repo-practices-lint` when the diff touches those paths (*#637 dual-path) |
 | Session-start read guidance | yes* | — | `.agents/rules/read-agents-and-rules.md` (+ Cursor shim) requires reading `AGENTS.md` and `.agents/rules/` at the start of every new agent session (*#637 dual-path) |
@@ -689,7 +689,7 @@ and advances the quota fallback chain instead of hanging (`repository-helpers#40
 - Do not log, store, or transmit credential tokens beyond what is needed to invoke `gh`/`gt`.
 - Agents must follow `.cursor/rules/no-secret-exposure.mdc` (never print/paste secrets into logs, transcripts, PRs, or commits). Complements CI secret-scan: prevention vs detection.
 - Agents must follow `.cursor/rules/remote-timeouts-retries.mdc` (explicit timeouts and bounded retries on every remote/network call).
-- Agents must follow `.cursor/rules/github-api-throttle.mdc` (run ad-hoc `gh` calls through `scripts/gh-api` so primary/secondary rate-limit backoff is automatic).
+- Agents must follow `.cursor/rules/github-api-throttle.mdc` (run every `gh` call site through `scripts/gh-api`, or `github_api_exec_with_rate_limit_retry` inside first-party bash libraries, so primary/secondary rate-limit backoff is automatic).
 
 ---
 
