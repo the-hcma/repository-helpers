@@ -391,12 +391,16 @@ ghm_unwrap_file() {
     printf 'ERROR: ghm_unwrap_file: not a file: %s\n' "$path" >&2
     return 1
   fi
-  original="$(<"$path")"
-  unwrapped="$(ghm_unwrap_text fix <"$path")"
+  # read -d '' keeps trailing blank lines that $(...) would strip.
+  IFS= read -r -d '' original <"$path" || :
+  IFS= read -r -d '' unwrapped < <(ghm_unwrap_text fix <"$path") || :
+  if [[ -n "$original" && "$original" != *$'\n' ]]; then
+    unwrapped="${unwrapped%$'\n'}"
+  fi
   if [[ "$unwrapped" == "$original" ]]; then
     return 0
   fi
-  printf '%s\n' "$unwrapped" >"$path"
+  printf '%s' "$unwrapped" >"$path"
 }
 
 # ghm_unwrap_text <fix|lint>
@@ -408,9 +412,11 @@ ghm_unwrap_file() {
 #   lint — print "line:N: ..." for each continuation line; exit 1 when any.
 # Never joins YAML front matter, fenced or indented code, HTML blocks
 # (including multi-line comments), tables, headings, thematic breaks, link
-# reference definitions, lines after a hard break, lazy blockquote lines, or
-# any line that starts a new block. Joining a soft break with a space leaves
-# the rendered HTML unchanged apart from whitespace.
+# reference definitions, GitHub alert markers (> [!NOTE]), lines after a hard
+# break (also with CRLF endings), lazy blockquote lines, or any line that
+# starts a new block. Leading tabs count to the next multiple-of-4 column.
+# Joining a soft break with a space leaves the rendered HTML unchanged apart
+# from whitespace.
 ghm_unwrap_text() {
   local -r mode="$1"
   local -r quote_re='^[[:space:]]*>[[:space:]]?(.*)$'
@@ -418,6 +424,7 @@ ghm_unwrap_text() {
   local -r heading_re='^#{1,6}([[:space:]]|$)'
   local -r link_ref_re='^\[[^]]+\]:'
   local -r list_re='^([-*+]|[0-9]{1,9}[.)])(([[:space:]]+)(.*))?$'
+  local -r alert_re='^\[![A-Za-z]+\][[:space:]]*$'
   local -a lines=() out=()
   local line rest trimmed next prev run info marker spaces content fence_char=''
   local -i n=0 i=0 last=0 depth=0 indent=0 findings=0 threshold=0
@@ -438,14 +445,14 @@ ghm_unwrap_text() {
   for (( i = 0; i < n; i++ )); do
     line="${lines[i]}"
 
-    if (( i == 0 )) && [[ "$line" == '---' ]]; then
+    if (( i == 0 )) && [[ "${line%$'\r'}" == '---' ]]; then
       in_front=1
       out+=("$line")
       continue
     fi
     if (( in_front )); then
       out+=("$line")
-      if [[ "$line" == '---' || "$line" == '...' ]]; then
+      if [[ "${line%$'\r'}" == '---' || "${line%$'\r'}" == '...' ]]; then
         in_front=0
       fi
       continue
@@ -458,7 +465,7 @@ ghm_unwrap_text() {
       depth+=1
     done
     trimmed="${rest#"${rest%%[![:space:]]*}"}"
-    indent=$(( ${#rest} - ${#trimmed} ))
+    _ghm_column_after 0 "${rest:0:${#rest}-${#trimmed}}" indent
     run=''
     info=''
     if [[ "$trimmed" =~ $fence_re ]]; then
@@ -540,7 +547,7 @@ ghm_unwrap_text() {
     elif [[ "$trimmed" == '|'* ]] || _ghm_is_table_delimiter "$trimmed" \
       || _ghm_is_table_delimiter "$next"; then
       in_table=1
-    elif [[ "$trimmed" =~ $link_ref_re ]]; then
+    elif [[ "$trimmed" =~ $link_ref_re || "$trimmed" =~ $alert_re ]]; then
       :
     else
       is_block=0
@@ -559,11 +566,11 @@ ghm_unwrap_text() {
       marker="${BASH_REMATCH[1]}"
       spaces="${BASH_REMATCH[3]}"
       content="${BASH_REMATCH[4]}"
-      if (( ${#spaces} > 4 )); then
-        spaces=' '
-      fi
       in_list=1
-      content_indent=$(( indent + ${#marker} + ${#spaces} ))
+      _ghm_column_after "$(( indent + ${#marker} ))" "$spaces" content_indent
+      if (( content_indent - indent - ${#marker} > 4 )); then
+        content_indent=$(( indent + ${#marker} + 1 ))
+      fi
       out+=("$line")
       para_open=0
       if [[ -n "$content" ]]; then
@@ -610,8 +617,27 @@ ghm_unwrap_text() {
   return 0
 }
 
+# _ghm_column_after <start_column> <whitespace> <out_var>
+# Sets out_var to the visual column reached after whitespace that begins at
+# start_column, expanding each tab to the next multiple of 4 (CommonMark).
+_ghm_column_after() {
+  local -r start="$1"
+  local -r ws="$2"
+  local -n _ghm_column_out="$3"
+  local -i col="$start" j=0
+
+  for (( j = 0; j < ${#ws}; j++ )); do
+    if [[ "${ws:j:1}" == $'\t' ]]; then
+      col=$(( col + 4 - col % 4 ))
+    else
+      col+=1
+    fi
+  done
+  _ghm_column_out=$col
+}
+
 _ghm_ends_with_hard_break() {
-  local -r text="$1"
+  local -r text="${1%$'\r'}"
   [[ "$text" == *"\\" || "$text" == *'  ' ]]
 }
 
