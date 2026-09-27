@@ -1,5 +1,5 @@
 ---
-description: Format agent-authored GitHub issue/PR bodies and comments so they render correctly (blank lines + no hand-wrapped paragraphs)
+description: Format agent-authored GitHub issue/PR bodies, comments and committed Markdown files so they render correctly (blank lines + no hand-wrapped paragraphs)
 alwaysApply: true
 ---
 
@@ -86,11 +86,28 @@ fences, consecutive prose lines (hand-wrapped paragraphs), and a closing
 keyword that is near an issue reference but not immediately adjacent to it.
 Fix findings before posting.
 
+## Committed Markdown files
+
+The no-hand-wrap rule also covers every `.md` file committed to a repository: `AGENTS.md`, `README.md`, `docs/`, `.agents/rules/`, skills and templates. GitHub's file renderer turns a lone newline into a space, so wrapped source looks fine there, but it makes diffs noisy, and templates copied from repository-helpers carry the wraps into every consumer repo (repository-helpers#671).
+
+1. **No hard line breaks:** write one physical line per paragraph, list item and blockquote, however long it gets.
+2. **Blank lines:** put a blank line between paragraphs, and before and after headings, lists, fenced code blocks and tables.
+3. **Leave structure alone:** YAML front matter, code blocks, tables, headings and HTML keep their own lines. So do breadcrumb comments and bare canonical URL lines, which repo-practices checks look for line by line.
+
+Check a file, or unwrap it in place, before committing:
+
+```bash
+scripts/lint-github-markdown --repo-files <file.md>…
+scripts/lint-github-markdown --repo-files --fix <file.md>…
+```
+
+`--repo-files` flags only hard line breaks inside a paragraph, list item or blockquote. It skips front matter, code, tables, headings and HTML, and the body-only checks above do not apply.
+
 ## Scope
 
 Applies to issue bodies, PR descriptions, and PR/review comments or replies
 posted by an agent — same “validate before it ships” principle as Conventional
-Commits PR titles (see `.agents/rules/pr-ship-and-review.md`).
+Commits PR titles (see `.agents/rules/pr-ship-and-review.md`) — and to Markdown files committed to a repository (see above).
 
 <!-- github-content-formatting-canonical: https://github.com/the-hcma/repository-helpers/blob/main/.agents/rules/github-content-formatting.md -->
 Canonical rule: https://github.com/the-hcma/repository-helpers/blob/main/.agents/rules/github-content-formatting.md
