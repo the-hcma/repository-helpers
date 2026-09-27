@@ -225,6 +225,30 @@ ghm_lint_file() {
   return 0
 }
 
+# ghm_lint_repo_file <path>
+# Lint a Markdown file committed to a repository for hand-wrapped paragraphs,
+# list items and blockquotes only (see ghm_unwrap_text). Prints findings to
+# stderr; exit 1 when dirty.
+ghm_lint_repo_file() {
+  local -r path="$1"
+  local out rc
+
+  if [[ ! -f "$path" ]]; then
+    printf 'ERROR: ghm_lint_repo_file: not a file: %s\n' "$path" >&2
+    return 1
+  fi
+
+  out=''
+  rc=0
+  out="$(ghm_unwrap_text lint <"$path")" || rc=$?
+  if (( rc != 0 )); then
+    printf 'ERROR: GITHUB_MARKDOWN_WRAP path=%s\n' "$path" >&2
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  return 0
+}
+
 # ghm_lint_text
 # Reads Markdown on stdin. Prints "line:N: message" findings to stdout.
 # Exit 0 when clean; 1 when any finding.
@@ -354,4 +378,262 @@ ghm_lint_text() {
     return 1
   fi
   return 0
+}
+
+# ghm_unwrap_file <path>
+# Rewrite a committed Markdown file in place with ghm_unwrap_text fix. The
+# file is not rewritten when nothing would change.
+ghm_unwrap_file() {
+  local -r path="$1"
+  local original unwrapped
+
+  if [[ ! -f "$path" ]]; then
+    printf 'ERROR: ghm_unwrap_file: not a file: %s\n' "$path" >&2
+    return 1
+  fi
+  original="$(<"$path")"
+  unwrapped="$(ghm_unwrap_text fix <"$path")"
+  if [[ "$unwrapped" == "$original" ]]; then
+    return 0
+  fi
+  printf '%s\n' "$unwrapped" >"$path"
+}
+
+# ghm_unwrap_text <fix|lint>
+# Reads Markdown committed to a repository on stdin and finds hand-wrapped
+# paragraphs, list items and blockquotes: a line that only continues the
+# paragraph above it (repository-helpers#671).
+#   fix  — print the Markdown with each continuation joined onto its paragraph
+#          (one physical line per paragraph / list item / blockquote).
+#   lint — print "line:N: ..." for each continuation line; exit 1 when any.
+# Never joins YAML front matter, fenced or indented code, HTML blocks
+# (including multi-line comments), tables, headings, thematic breaks, link
+# reference definitions, lines after a hard break, lazy blockquote lines, or
+# any line that starts a new block. Joining a soft break with a space leaves
+# the rendered HTML unchanged apart from whitespace.
+ghm_unwrap_text() {
+  local -r mode="$1"
+  local -r quote_re='^[[:space:]]*>[[:space:]]?(.*)$'
+  local -r fence_re='^(`{3,}|~{3,})(.*)$'
+  local -r heading_re='^#{1,6}([[:space:]]|$)'
+  local -r link_ref_re='^\[[^]]+\]:'
+  local -r list_re='^([-*+]|[0-9]{1,9}[.)])(([[:space:]]+)(.*))?$'
+  local -a lines=() out=()
+  local line rest trimmed next prev run info marker spaces content fence_char=''
+  local -i n=0 i=0 last=0 depth=0 indent=0 findings=0 threshold=0
+  local -i in_front=0 in_fence=0 fence_len=0 in_comment=0 in_html=0 in_table=0
+  local -i in_code=0 code_indent=0 in_list=0 content_indent=0
+  local -i para_open=0 para_depth=0 prev_blank=1 is_block=0
+
+  if [[ "$mode" != 'fix' && "$mode" != 'lint' ]]; then
+    printf 'ERROR: ghm_unwrap_text: mode must be fix or lint (got %s)\n' "$mode" >&2
+    return 1
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lines+=("$line")
+  done
+  n=${#lines[@]}
+
+  for (( i = 0; i < n; i++ )); do
+    line="${lines[i]}"
+
+    if (( i == 0 )) && [[ "$line" == '---' ]]; then
+      in_front=1
+      out+=("$line")
+      continue
+    fi
+    if (( in_front )); then
+      out+=("$line")
+      if [[ "$line" == '---' || "$line" == '...' ]]; then
+        in_front=0
+      fi
+      continue
+    fi
+
+    rest="$line"
+    depth=0
+    while [[ "$rest" =~ $quote_re ]]; do
+      rest="${BASH_REMATCH[1]}"
+      depth+=1
+    done
+    trimmed="${rest#"${rest%%[![:space:]]*}"}"
+    indent=$(( ${#rest} - ${#trimmed} ))
+    run=''
+    info=''
+    if [[ "$trimmed" =~ $fence_re ]]; then
+      run="${BASH_REMATCH[1]}"
+      info="${BASH_REMATCH[2]}"
+    fi
+
+    if (( in_fence )); then
+      out+=("$line")
+      if [[ -n "$run" && "${run:0:1}" == "$fence_char" ]] \
+        && (( ${#run} >= fence_len )) \
+        && [[ -z "${info//[[:space:]]/}" ]]; then
+        in_fence=0
+      fi
+      continue
+    fi
+    if (( in_comment )); then
+      out+=("$line")
+      if [[ "$line" == *'-->'* ]]; then
+        in_comment=0
+      fi
+      continue
+    fi
+    if (( in_html || in_table )) && [[ -n "$trimmed" ]]; then
+      out+=("$line")
+      continue
+    fi
+    in_html=0
+    in_table=0
+    if (( in_code )); then
+      if [[ -z "$trimmed" ]] || (( indent >= code_indent )); then
+        out+=("$line")
+        continue
+      fi
+      in_code=0
+    fi
+
+    if [[ -z "$trimmed" ]]; then
+      out+=("$line")
+      para_open=0
+      prev_blank=1
+      continue
+    fi
+
+    threshold=4
+    if (( in_list )); then
+      threshold=$(( content_indent + 4 ))
+    fi
+    if (( ! para_open && indent >= threshold )); then
+      in_code=1
+      code_indent=$threshold
+      out+=("$line")
+      prev_blank=0
+      continue
+    fi
+
+    if [[ -n "$run" ]] && { [[ "${run:0:1}" == '~' ]] || [[ "$info" != *'`'* ]]; }; then
+      in_fence=1
+      fence_char="${run:0:1}"
+      fence_len=${#run}
+      out+=("$line")
+      para_open=0
+      prev_blank=0
+      continue
+    fi
+
+    is_block=1
+    next=''
+    if (( i + 1 < n )); then
+      next="${lines[i + 1]}"
+      next="${next#"${next%%[![:space:]>]*}"}"
+    fi
+    if [[ "$trimmed" == '<!--'* && "$trimmed" != *'-->'* ]]; then
+      in_comment=1
+    elif [[ "$trimmed" == '<'* ]]; then
+      in_html=1
+    elif [[ "$trimmed" =~ $heading_re ]] || _ghm_is_thematic_or_setext "$trimmed"; then
+      :
+    elif [[ "$trimmed" == '|'* ]] || _ghm_is_table_delimiter "$trimmed" \
+      || _ghm_is_table_delimiter "$next"; then
+      in_table=1
+    elif [[ "$trimmed" =~ $link_ref_re ]]; then
+      :
+    else
+      is_block=0
+    fi
+    if (( is_block )); then
+      out+=("$line")
+      para_open=0
+      prev_blank=0
+      if (( indent < content_indent )); then
+        in_list=0
+      fi
+      continue
+    fi
+
+    if [[ "$trimmed" =~ $list_re ]]; then
+      marker="${BASH_REMATCH[1]}"
+      spaces="${BASH_REMATCH[3]}"
+      content="${BASH_REMATCH[4]}"
+      if (( ${#spaces} > 4 )); then
+        spaces=' '
+      fi
+      in_list=1
+      content_indent=$(( indent + ${#marker} + ${#spaces} ))
+      out+=("$line")
+      para_open=0
+      if [[ -n "$content" ]]; then
+        para_open=1
+      fi
+      para_depth=$depth
+      prev_blank=0
+      continue
+    fi
+
+    if (( prev_blank && in_list && indent < content_indent )); then
+      in_list=0
+    fi
+    last=$(( ${#out[@]} - 1 ))
+    if (( para_open && depth == para_depth )) && ! _ghm_ends_with_hard_break "${out[last]}"; then
+      if [[ "$mode" == 'lint' ]]; then
+        printf 'line:%d: hand-wrapped line continues the previous line (one line per paragraph, list item or blockquote; fix with scripts/lint-github-markdown --repo-files --fix)\n' \
+          "$(( i + 1 ))"
+        findings+=1
+      fi
+      prev="${out[last]}"
+      prev="${prev%"${prev##*[![:space:]]}"}"
+      out[last]="${prev} ${trimmed}"
+    elif (( para_open && depth < para_depth )); then
+      out+=("$line")
+      para_open=0
+    else
+      out+=("$line")
+      para_open=1
+      para_depth=$depth
+    fi
+    prev_blank=0
+  done
+
+  if [[ "$mode" == 'fix' ]]; then
+    if (( ${#out[@]} > 0 )); then
+      printf '%s\n' "${out[@]}"
+    fi
+    return 0
+  fi
+  if (( findings > 0 )); then
+    return 1
+  fi
+  return 0
+}
+
+_ghm_ends_with_hard_break() {
+  local -r text="$1"
+  [[ "$text" == *"\\" || "$text" == *'  ' ]]
+}
+
+# True for a thematic break (--- / *** / ___, spaces allowed between markers)
+# or a setext heading underline (=== / ---).
+_ghm_is_thematic_or_setext() {
+  local -r text="$1"
+  local -r setext_re='^(=+|-+)[[:space:]]*$'
+  local -r dash_re='^(-[[:space:]]*){3,}$'
+  local -r star_re='^(\*[[:space:]]*){3,}$'
+  local -r under_re='^(_[[:space:]]*){3,}$'
+
+  [[ "$text" =~ $setext_re || "$text" =~ $dash_re || "$text" =~ $star_re \
+    || "$text" =~ $under_re ]]
+}
+
+# True for a GFM table delimiter row (| --- | :-: |); requires a pipe so a
+# setext underline is not mistaken for one.
+_ghm_is_table_delimiter() {
+  local -r text="$1"
+  local -r cell='[[:space:]]*:?-+:?[[:space:]]*'
+  local -r delim_re="^\\|?${cell}(\\|${cell})*\\|?[[:space:]]*$"
+
+  [[ "$text" == *'|'* && "$text" =~ $delim_re ]]
 }
