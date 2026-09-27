@@ -5607,10 +5607,7 @@ py_pkg_installed_version() {
 # Prints "value|marker" pairs (marker is "=" for an inclusive <=cap, empty for
 # an exclusive <cap) for every compound-cap or bare-upper-bound match across
 # the four supported specifier shapes: bundled/split, each with or without a
-# floor operator. Shared by py_uv_extract_compound_cap (which reports only
-# the tightest value) and py_uv_extract_compound_cap_is_inclusive (which
-# reports whether the winning value's occurrence(s) were inclusive) so both
-# stay consistent without duplicating the extraction patterns.
+# floor operator. _py_uv_select_compound_cap picks the winning pair.
 _py_uv_extract_compound_cap_markers() {
   local -r path="$1"
   local -r pkg="$2"
@@ -5644,52 +5641,70 @@ _py_uv_extract_compound_cap_markers() {
     | sed -E 's/^<(=?)[[:space:]]*([0-9][0-9a-zA-Z.]*)$/\2|\1/' || true
 }
 
-# py_uv_extract_compound_cap <pyproject_path> <pkg>
-# Prints the tightest (lowest) upper-bound version across every existing
-# compound-cap specifier ("pkg>=1.0.0,<2.0.0") for a direct
-# [project]/[project.*]/[dependency-groups] dependency, or empty when no
-# matching line has such a cap. A compound cap is often an intentional
-# compatibility pin against a known-broken release range, not leftover
-# boilerplate (repository-helpers#665) — py_uv_rewrite_version_floor uses this
-# to decide whether a floor bump can keep the cap. The rewrite's sed passes
-# touch every line matching the package name (bundled, extras,
+# _py_uv_select_compound_cap <pyproject_path> <pkg>
+# Prints the winning "value|marker" pair from _py_uv_extract_compound_cap_markers:
+# the tightest (lowest) cap by PEP 440 comparison (py_uv_version_compare, so
+# "2.0" and "2.0.0" tie), or nothing when pkg has no cap. The rewrite's sed
+# passes touch every line matching the package name (bundled, extras,
 # optional-dependencies, marker-split duplicates), so a single first-found cap
 # is not enough: the tightest cap across all matches is the real violation
 # threshold, otherwise a bump that passes a looser cap could still corrupt a
 # stricter cap on another line into an unsatisfiable range. On a tie between
-# an exclusive and an inclusive occurrence of the same value, sorts the
-# exclusive (empty marker) one first — the safer reading (see
-# py_uv_extract_compound_cap_is_inclusive).
-py_uv_extract_compound_cap() {
+# an exclusive and an inclusive occurrence (e.g. "<2.0.0" and "<=2.0"), the
+# exclusive one wins — the stricter reading, since it still flags a genuine
+# crossing rather than silently accepting the boundary (repository-helpers#669
+# review).
+_py_uv_select_compound_cap() {
   local -r path="$1"
   local -r pkg="$2"
-  local markers
+  local markers value marker best best_marker cmp
 
   markers="$(_py_uv_extract_compound_cap_markers "$path" "$pkg")"
-  [[ -z "$markers" ]] && return 0
-  printf '%s\n' "$markers" | sort -t'|' -k1,1V -k2,2 | head -1 | cut -d'|' -f1
+  best=''
+  best_marker=''
+  while IFS='|' read -r value marker; do
+    [[ -z "$value" ]] && continue
+    if [[ -z "$best" ]]; then
+      best="$value"
+      best_marker="$marker"
+      continue
+    fi
+    cmp="$(py_uv_version_compare "$value" "$best")"
+    if [[ "$cmp" == lt ]] || [[ "$cmp" == eq && -z "$marker" ]]; then
+      best="$value"
+      best_marker="$marker"
+    fi
+  done <<<"$markers"
+  if [[ -n "$best" ]]; then
+    printf '%s|%s\n' "$best" "$best_marker"
+  fi
 }
 
-# py_uv_extract_compound_cap_is_inclusive <pyproject_path> <pkg> <cap_value>
-# True when the winning cap_value (from py_uv_extract_compound_cap) for pkg
-# was written with an inclusive "<=" operator rather than an exclusive "<" --
-# an inclusive cap's valid range includes cap_value itself, so a fix version
-# exactly equal to it is not a crossing the way it would be for an exclusive
-# cap (repository-helpers#669 review). If both an exclusive and an inclusive
-# occurrence of the exact same value exist across different lines, treated
-# as exclusive: the safer reading, since it still flags a genuine crossing
-# rather than silently accepting the boundary.
-py_uv_extract_compound_cap_is_inclusive() {
+# py_uv_compound_cap_crossing <pyproject_path> <pkg> <ver>
+# Returns 0 and prints the crossed cap with its operator ("<2.0.0" or
+# "<=2.0.0") when ver falls outside pkg's tightest existing cap; returns 1
+# (printing nothing) when pkg has no cap or ver still satisfies it. Crossing
+# an exclusive cap (<Y) means ver >= Y; crossing an inclusive cap (<=Y) means
+# ver > Y — ver == Y satisfies an inclusive cap (repository-helpers#669
+# review). Comparison is PEP 440-aware (py_uv_version_compare): "2.0" equals
+# "2.0.0", and "2.0.0.post1" is past "<=2.0.0".
+py_uv_compound_cap_crossing() {
   local -r path="$1"
   local -r pkg="$2"
-  local -r cap_value="$3"
-  local markers
+  local -r ver="$3"
+  local winner cap marker cmp
 
-  [[ -n "$cap_value" ]] || return 1
-  markers="$(_py_uv_extract_compound_cap_markers "$path" "$pkg")"
-  [[ -z "$markers" ]] && return 1
-  grep -qxF "${cap_value}|" <<<"$markers" && return 1
-  grep -qxF "${cap_value}|=" <<<"$markers"
+  winner="$(_py_uv_select_compound_cap "$path" "$pkg")"
+  [[ -n "$winner" ]] || return 1
+  cap="${winner%|*}"
+  marker="${winner##*|}"
+  cmp="$(py_uv_version_compare "$ver" "$cap")"
+  if [[ "$marker" == "=" ]]; then
+    [[ "$cmp" == gt ]] || return 1
+  else
+    [[ "$cmp" != lt ]] || return 1
+  fi
+  printf '<%s%s\n' "$marker" "$cap"
 }
 
 # py_uv_flag_cve_security_cap_crossing <pyproject_path> <pkg> <fix_ver>
@@ -5698,10 +5713,8 @@ py_uv_extract_compound_cap_is_inclusive() {
 # py_uv_rewrite_version_floor it cannot preserve an existing compound cap. A
 # security fix must still land regardless of an existing pin, but losing it
 # without a trace carries the same risk as py_uv_rewrite_version_floor guards
-# against (repository-helpers#665). Crossing an exclusive cap (<Y) means
-# fix_ver >= Y; crossing an inclusive cap (<=Y) means fix_ver > Y -- fix_ver
-# == Y satisfies an inclusive cap, so it is not itself a crossing
-# (repository-helpers#669 review). When fix_ver crosses the cap, logs a
+# against (repository-helpers#665). Crossing semantics follow
+# py_uv_compound_cap_crossing. When fix_ver crosses the cap, logs a
 # WARNING, records an ecosystem failure, and prints "pkg|cap_display|fix_ver"
 # on stdout (empty otherwise, where cap_display already carries its "<" or
 # "<=") so the caller can collect crossings and relay them into the generated
@@ -5712,27 +5725,15 @@ py_uv_flag_cve_security_cap_crossing() {
   local -r path="$1"
   local -r pkg="$2"
   local -r fix_ver="$3"
-  local existing_cap cap_op crosses
+  local crossed_cap
 
-  existing_cap="$(py_uv_extract_compound_cap "$path" "$pkg")"
-  [[ -z "$existing_cap" ]] && return 0
-
-  crosses=0
-  if py_uv_extract_compound_cap_is_inclusive "$path" "$pkg" "$existing_cap"; then
-    cap_op='<='
-    py_uv_version_greater_than "$fix_ver" "$existing_cap" && crosses=1
-  else
-    cap_op='<'
-    py_uv_version_at_least "$fix_ver" "$existing_cap" && crosses=1
-  fi
-  if [[ "$crosses" == 1 ]]; then
-    log "[python/uv] WARNING: CVE fix for ${pkg} to ${fix_ver} crosses its existing compatibility" \
-      "cap ${cap_op}${existing_cap} (repository-helpers#665) — proceeding since the security fix" \
-      "must land, but the pin is now gone; verify compatibility manually."
-    dep_updater_append_ecosystem_failure \
-      "python|${pkg}: CVE fix to ${fix_ver} crossed existing cap ${cap_op}${existing_cap}; pin removed by uv add (verify compatibility)"
-    printf '%s|%s%s|%s\n' "$pkg" "$cap_op" "$existing_cap" "$fix_ver"
-  fi
+  crossed_cap="$(py_uv_compound_cap_crossing "$path" "$pkg" "$fix_ver")" || return 0
+  log "[python/uv] WARNING: CVE fix for ${pkg} to ${fix_ver} crosses its existing compatibility" \
+    "cap ${crossed_cap} (repository-helpers#665) — proceeding since the security fix" \
+    "must land, but the pin is now gone; verify compatibility manually."
+  dep_updater_append_ecosystem_failure \
+    "python|${pkg}: CVE fix to ${fix_ver} crossed existing cap ${crossed_cap}; pin removed by uv add (verify compatibility)"
+  printf '%s|%s|%s\n' "$pkg" "$crossed_cap" "$fix_ver"
   return 0
 }
 
@@ -5767,16 +5768,13 @@ py_uv_render_cve_cap_crossings_section() {
 # Compound caps such as "pkg>=1.0.0,<2.0.0" are preserved when the new floor still
 # satisfies them (rewritten to "pkg>=1.5.0,<2.0.0", say) — the cap is treated as an
 # intentional compatibility pin, not leftover boilerplate (repository-helpers#665).
-# When the new floor would itself violate the cap (new_ver >= cap for an exclusive
-# <Y; new_ver > cap for an inclusive <=Y, since new_ver == cap still satisfies it —
-# repository-helpers#669 review, same boundary rule as
-# py_uv_flag_cve_security_cap_crossing), the rewrite is skipped entirely (specifier
-# left untouched) and a WARNING is logged plus recorded as an ecosystem failure so
-# the run surfaces it for manual review, rather than silently dropping the cap. A
-# trailing PEP 508 environment marker is kept.
-# Two sed passes (bundled before split). The sed patterns themselves still only
-# rewrite an exclusive-cap line -- an inclusive-cap line falls through to the
-# no-op return below rather than being corrupted. Converts == and ~= to >=.
+# When the new floor would itself violate the cap (py_uv_compound_cap_crossing:
+# new_ver >= Y for an exclusive <Y, new_ver > Y for an inclusive <=Y), the
+# rewrite is skipped entirely (specifier left untouched) and a WARNING is logged
+# plus recorded as an ecosystem failure so the run surfaces it for manual
+# review, rather than silently dropping the cap. Both "<" and "<=" caps are kept
+# verbatim by the rewrite. A trailing PEP 508 environment marker is kept.
+# Two sed passes (bundled before split). Converts == and ~= to >=.
 # Returns 1 when sed fails or the constraint line did not change; returns 2
 # when the rewrite was skipped because the new floor would violate an existing
 # compound cap.
@@ -5784,25 +5782,14 @@ py_uv_rewrite_version_floor() {
   local -r path="$1"
   local -r pkg="$2"
   local -r new_ver="$3"
-  local sed_pkg sed_new_ver before existing_cap cap_op crosses
+  local sed_pkg sed_new_ver before crossed_cap
 
-  existing_cap="$(py_uv_extract_compound_cap "$path" "$pkg")"
-  if [[ -n "$existing_cap" ]]; then
-    crosses=0
-    if py_uv_extract_compound_cap_is_inclusive "$path" "$pkg" "$existing_cap"; then
-      cap_op='<='
-      py_uv_version_greater_than "$new_ver" "$existing_cap" && crosses=1
-    else
-      cap_op='<'
-      py_uv_version_at_least "$new_ver" "$existing_cap" && crosses=1
-    fi
-    if [[ "$crosses" == 1 ]]; then
-      log "[python/uv] WARNING: ${pkg} floor bump to ${new_ver} would violate its existing" \
-        "cap ${cap_op}${existing_cap}; leaving the specifier untouched (needs manual review)."
-      dep_updater_append_ecosystem_failure \
-        "python|${pkg}: floor bump to ${new_ver} would violate existing cap ${cap_op}${existing_cap}; skipped (manual review)"
-      return 2
-    fi
+  if crossed_cap="$(py_uv_compound_cap_crossing "$path" "$pkg" "$new_ver")"; then
+    log "[python/uv] WARNING: ${pkg} floor bump to ${new_ver} would violate its existing" \
+      "cap ${crossed_cap}; leaving the specifier untouched (needs manual review)."
+    dep_updater_append_ecosystem_failure \
+      "python|${pkg}: floor bump to ${new_ver} would violate existing cap ${crossed_cap}; skipped (manual review)"
+    return 2
   fi
 
   before="$(mktemp)"
@@ -5812,8 +5799,8 @@ py_uv_rewrite_version_floor() {
   # Bundled: version + optional ,<cap (kept verbatim when present); keep a
   # trailing ;environment-marker.
   gnu_sed_inplace -E "$path" \
-    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?)(~=|>=|==)[0-9][0-9a-zA-Z.]*(,[[:space:]]*<[0-9][0-9a-zA-Z.]*)?(;[^\\\"]*)?\\\"#\\1>=${sed_new_ver}\\4\\5\\\"#" \
-    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?\")[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*([[:space:]]*,[[:space:]]*<[0-9][0-9a-zA-Z.]*)?#\\1 >= ${sed_new_ver}\\4#" \
+    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?)(~=|>=|==)[0-9][0-9a-zA-Z.]*(,[[:space:]]*<=?[[:space:]]*[0-9][0-9a-zA-Z.]*)?(;[^\\\"]*)?\\\"#\\1>=${sed_new_ver}\\4\\5\\\"#" \
+    -e "s#(\\\"${sed_pkg}(\\[[a-zA-Z0-9,_=.-]+\\])?\")[[:space:]]*(~=|>=|==)[[:space:]]*[0-9][0-9a-zA-Z.]*([[:space:]]*,[[:space:]]*<=?[[:space:]]*[0-9][0-9a-zA-Z.]*)?#\\1 >= ${sed_new_ver}\\4#" \
     || {
       cp "$before" "$path"
       rm -f "$before"
@@ -6201,39 +6188,65 @@ py_uv_version_at_least() {
   [[ "$(printf '%s\n' "$minimum" "$ver" | sort -V | head -1)" == "$minimum" ]]
 }
 
-# py_uv_version_greater_than <a> <b>
-# Returns 0 when a is strictly semantically greater than b, using dotted
-# decimal-segment comparison (missing trailing segments treated as 0). Not
-# implemented via sort -V's tail-of-two-lines trick: GNU sort -V is not
-# stable for version-equal-but-differently-formatted strings (e.g. "2.0" vs
-# "2.0.0") -- it applies its own deterministic tie-break independent of
-# argument order, so that trick reports "greater" for either ordering of an
-# equal pair (repository-helpers#669 review). Used by
-# py_uv_flag_cve_security_cap_crossing to test an inclusive (<=) cap, where
-# equality is not itself a crossing (unlike py_uv_version_at_least's use for
-# an exclusive cap, where equality is a crossing).
-py_uv_version_greater_than() {
+# py_uv_version_compare <a> <b>
+# Prints "lt", "eq", or "gt" comparing two PEP 440 versions. Release segments
+# compare numerically with missing trailing segments as 0 ("2.0" == "2.0.0"),
+# then the suffix orders X.devN < X{a,b,rc}N < X < X.postN (a pre-release's
+# own .devN sorts before it; local "+tag" segments are ignored). Not built on
+# sort -V: GNU sort -V is not stable for version-equal-but-differently-
+# formatted strings and ranks "2.0.0.post1" by string, not PEP 440, so cap
+# boundary checks built on it miss crossings (repository-helpers#669 review).
+py_uv_version_compare() {
   local -r a="$1"
   local -r b="$2"
 
-  [[ -n "$a" && -n "$b" ]] || return 1
-  [[ "$a" == "$b" ]] && return 1
   awk -v a="$a" -v b="$b" '
-    BEGIN {
-      na = split(a, pa, ".")
-      nb = split(b, pb, ".")
-      n = (na > nb) ? na : nb
-      for (i = 1; i <= n; i++) {
-        va = (i <= na) ? pa[i] + 0 : 0
-        vb = (i <= nb) ? pb[i] + 0 : 0
-        if (va > vb) { print "gt"; exit }
-        if (va < vb) { print "lt"; exit }
+    function parse(v, k,    rest, tok, i, rel, parts) {
+      v = tolower(v)
+      sub(/^v/, "", v)
+      sub(/\+.*$/, "", v)
+      if (!match(v, /^[0-9]+(\.[0-9]+)*/)) { k["n"] = 0; rest = v }
+      else {
+        rel = substr(v, 1, RLENGTH)
+        rest = substr(v, RLENGTH + 1)
+        k["n"] = split(rel, parts, ".")
+        for (i = 1; i <= k["n"]; i++) k[i] = parts[i] + 0
       }
-      print "eq"
+      k["phase"] = 4; k["pre"] = 0; k["post"] = -1; k["dev"] = 1e18
+      if (match(rest, /^[._-]?(alpha|beta|preview|pre|rc|a|b|c)[._-]?[0-9]*/)) {
+        tok = substr(rest, RSTART, RLENGTH)
+        rest = substr(rest, RLENGTH + 1)
+        k["phase"] = (tok ~ /(alpha|a)/) ? 1 : ((tok ~ /(beta|b)/) ? 2 : 3)
+        if (match(tok, /[0-9]+$/)) k["pre"] = substr(tok, RSTART) + 0
+      }
+      if (match(rest, /^[._-]?(post|rev|r)[._-]?[0-9]*/) || match(rest, /^-[0-9]+/)) {
+        tok = substr(rest, RSTART, RLENGTH)
+        rest = substr(rest, RLENGTH + 1)
+        k["post"] = match(tok, /[0-9]+$/) ? substr(tok, RSTART) + 0 : 0
+      }
+      if (match(rest, /^[._-]?dev[._-]?[0-9]*/)) {
+        tok = substr(rest, RSTART, RLENGTH)
+        k["dev"] = match(tok, /[0-9]+$/) ? substr(tok, RSTART) + 0 : 0
+        if (k["phase"] == 4 && k["post"] < 0) k["phase"] = 0
+      }
     }
-  ' | grep -qx gt
+    function cmp(x, y) { return (x < y) ? -1 : ((x > y) ? 1 : 0) }
+    BEGIN {
+      parse(a, ka)
+      parse(b, kb)
+      n = (ka["n"] > kb["n"]) ? ka["n"] : kb["n"]
+      r = 0
+      for (i = 1; i <= n && r == 0; i++) {
+        r = cmp((i <= ka["n"]) ? ka[i] : 0, (i <= kb["n"]) ? kb[i] : 0)
+      }
+      if (r == 0) r = cmp(ka["phase"], kb["phase"])
+      if (r == 0) r = cmp(ka["pre"], kb["pre"])
+      if (r == 0) r = cmp(ka["post"], kb["post"])
+      if (r == 0) r = cmp(ka["dev"], kb["dev"])
+      print (r < 0) ? "lt" : ((r > 0) ? "gt" : "eq")
+    }
+  '
 }
-
 # py_uv_lock_highest_version <lockfile> <pkg>
 # Prints the highest version of pkg in a uv.lock (marker splits may list several).
 py_uv_lock_highest_version() {
