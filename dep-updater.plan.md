@@ -301,3 +301,4 @@ Runs automatically at end of update mode, or on demand via `dep-updater --cleanu
 → Read .dep-updater-state
 → For each PR number:
   gh api repos/<owner>/<repo>/pulls/<N> --jq '.state, .merged_at'
+```
