@@ -12,7 +12,7 @@ alwaysApply: false
 
 # Org cursor-rule rollout (repository-helpers)
 
-**Layout (repository-helpers#637):** canonical rule bodies live under `.agents/rules/*.md`. `.cursor/rules/*.mdc` are thin Cursor injection shims (frontmatter + pointer). Skills live under `.agents/skills/<name>/SKILL.md` only (no `.cursor/skills/` — Cursor loads `.agents/skills/` directly).
+**Layout (repository-helpers#637):** canonical rule bodies live under `.agents/rules/*.md`. `.cursor/rules/*.mdc` are thin Cursor injection shims (frontmatter + pointer). Skills live under `.agents/skills/<name>/SKILL.md` only (no `.cursor/skills/` — Cursor loads `.agents/skills/` directly). Copilot gets one pointer, `.github/instructions/agents-rules.instructions.md` (`applyTo: '**'`, audited by agent-bootstrap), that tells it to read every `.agents/rules/*.md`; a new rule needs no per-rule `.github/instructions/` file (repository-helpers#681).
 
 When you add or tighten an **org-enforced** Cursor rule in `scripts/lib/repo-practices` (`rp_check_*` + template under `scripts/lib/repo-practices-cursor/` + tests in `tests/aa-github-repo-lint.test`), the nightly `github-repo-lint --enforcer` run and org-wide audits will fail consumers that lack a valid rule — unless the check uses a **SUGGEST-during-roll-out** ratchet (see below).
 
