@@ -2539,6 +2539,7 @@ rp_check_read_agents_and_rules() {
 readonly rp_agent_bootstrap_agents_path='AGENTS.md'
 readonly rp_agent_bootstrap_claude_path='CLAUDE.md'
 readonly rp_agent_bootstrap_copilot_path='.github/copilot-instructions.md'
+readonly rp_agent_bootstrap_instructions_path='.github/instructions/agents-rules.instructions.md'
 
 rp_agent_bootstrap_template() {
   local -r name="$1"
@@ -2614,6 +2615,44 @@ rp_copilot_instructions_shim_is_valid() {
   local -r text="$1"
 
   grep -qiE 'AGENTS\.md' <<<"$text"
+}
+
+# The `.github/instructions/` pointer (repository-helpers#681): Copilot applies
+# it to every file only when the front matter says `applyTo: '**'`, and the body
+# must positively tell the agent to read `.agents/rules` (same probe as AGENTS.md).
+rp_agents_rules_instructions_is_valid() {
+  local -r text="$1"
+  local line front_matter='' body=''
+  local state=start
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$state" in
+      start)
+        if [[ "$line" == '---' ]]; then
+          state=front
+        else
+          state=body
+          body+="${line}"$'\n'
+        fi
+        ;;
+      front)
+        if [[ "$line" == '---' ]]; then
+          state=body
+        else
+          front_matter+="${line}"$'\n'
+        fi
+        ;;
+      body)
+        body+="${line}"$'\n'
+        ;;
+    esac
+  done <<<"$text"
+
+  if ! grep -qE "^applyTo:[[:space:]]*(\\*\\*|'\\*\\*'|\"\\*\\*\")[[:space:]]*$" \
+    <<<"$front_matter"; then
+    return 1
+  fi
+  rp_agents_md_documents_rules_path "$body" '\.agents/rules'
 }
 
 # Is `path` a symlink that points at the **root** AGENTS.md? (Contents API returns
@@ -2701,7 +2740,7 @@ rp_agent_bootstrap_api_error_is_fatal() {
 rp_check_agent_bootstrap() {
   local slug="$1"
   local repo_fail=0
-  local agents_text claude_text copilot_text
+  local agents_text claude_text copilot_text instructions_text instructions_url_path
   local fetch_ec=0
   local sym_rc=0
 
@@ -2831,8 +2870,45 @@ rp_check_agent_bootstrap() {
     fi
   fi
 
+  # 4. .github/instructions/agents-rules.instructions.md — Copilot auto-loads
+  #    `.github/instructions/`, not `.agents/rules/` (repository-helpers#681).
+  #    SUGGEST-during-rollout: missing FAILs --new-repo only; invalid FAILs
+  #    --new-repo and --strict-onboarding.
+  fetch_ec=0
+  instructions_text="$(rp_fetch_github_text_file "$slug" "$rp_agent_bootstrap_instructions_path")" \
+    || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    if rp_agent_bootstrap_api_error_is_fatal "$slug" "${rp_agent_bootstrap_instructions_path}"; then
+      return 1
+    fi
+    return 0
+  fi
+  if [[ -z "$instructions_text" ]] \
+    || ! rp_agents_rules_instructions_is_valid "$instructions_text"; then
+    if [[ "$rp_new_repo" -eq 1 ]] \
+      || { [[ -n "$instructions_text" && "$rp_strict_onboarding" -eq 1 ]]; }; then
+      repo_fail=1
+      instructions_url_path="/new/main/${rp_agent_bootstrap_instructions_path}"
+      if [[ -n "$instructions_text" ]]; then
+        instructions_url_path="/blob/main/${rp_agent_bootstrap_instructions_path}"
+      fi
+      rp_log_check_fail "$slug" \
+        "${rp_agent_bootstrap_instructions_path} (applyTo: '**') telling Copilot to read .agents/rules/*.md" \
+        "$(rp_github_url "$slug" "$instructions_url_path")"
+    fi
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_agent_bootstrap_instructions_path" \
+        "$(rp_agent_bootstrap_template 'agents-rules.instructions.md')" \
+        'add-agents-rules-instructions' \
+        'chore: add .github/instructions pointer so Copilot loads .agents/rules'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: add ${rp_agent_bootstrap_instructions_path} (template: scripts/lib/repo-practices-agents/agents-rules.instructions.md; repository-helpers#681)"
+    fi
+  fi
+
   if [[ "$repo_fail" -eq 0 ]]; then
-    rp_log_check_ok "$slug" 'agent-bootstrap (AGENTS.md + CLAUDE.md + copilot-instructions shims)' \
+    rp_log_check_ok "$slug" 'agent-bootstrap (AGENTS.md + CLAUDE.md + copilot-instructions + .github/instructions shims)' \
       "$(rp_github_url "$slug" '/blob/main/AGENTS.md')"
   fi
   return "$repo_fail"
@@ -5841,6 +5917,7 @@ rp_check_cursor_rules_gitignore() {
 readonly -a rp_agent_shim_gitignore_probe_paths=(
   'CLAUDE.md'
   '.github/copilot-instructions.md'
+  '.github/instructions/agents-rules.instructions.md'
 )
 
 # Classify one path against repo_dir's .gitignore via real `git check-ignore`.
