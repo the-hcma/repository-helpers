@@ -13,11 +13,7 @@ Helper scripts:
 
 - **`scripts/wait-for-agent-review`** — poll, triage, email (no self-approve)
 - **`scripts/trigger-agent-review`** — request a review from the configured agent
-- **`scripts/dev/approve-pending-deployments`** — approve WAITING GitHub
-  environment jobs (`github-repo-lint`, `dep-updater`) on the operator's behalf
-  (`gh` is the operator). Do not wait for a human Actions UI click.
-  `scripts/dev/post-pr-submission-checks` runs this while waiting for CI.
-  On **`ERROR: ENVIRONMENT_APPROVAL_FAILED`**, stop and tell the operator.
+- **`scripts/dev/approve-pending-deployments`** — approve WAITING GitHub environment jobs (`github-repo-lint`, `dep-updater`) on the operator's behalf (`gh` is the operator). Do not wait for a human Actions UI click. `scripts/dev/post-pr-submission-checks` runs this while waiting for CI. On **`ERROR: ENVIRONMENT_APPROVAL_FAILED`**, stop and tell the operator.
 
 Configure `~/.config/agent-review.env` from `etc/agent-review.env.example` (`AGENT_REVIEW_REPORT_TO`, SMTP).
 
@@ -41,10 +37,7 @@ After every later push, re-run **`scripts/dev/post-pr-submission-checks --pr <n>
 
 ### Conventional Commits PR titles (squash / release-please)
 
-`gh stack submit --auto` / `gt submit --publish` may set the PR title from the **branch
-name**, not Conventional Commits. When the repo squash-merges with
-`squash_merge_commit_title=PR_TITLE` and `squash_merge_commit_message=BLANK`, that
-title becomes the entire squash commit message and release-please’s signal.
+`gh stack submit --auto` / `gt submit --publish` may set the PR title from the **branch name**, not Conventional Commits. When the repo squash-merges with `squash_merge_commit_title=PR_TITLE` and `squash_merge_commit_message=BLANK`, that title becomes the entire squash commit message and release-please’s signal.
 
 Before the review loop or merge:
 
@@ -53,24 +46,13 @@ scripts/ensure-pr-conventional-title --pr <n>
 # or: scripts/gh-api pr edit <n> --title 'feat: …'
 ```
 
-`post-pr-submission-checks` runs this after submit (before CI wait). `wait-for-agent-review
-complete` re-checks before the operator email. Non-compliant titles are auto-derived from
-the most releasable commit subject (`feat` > `fix` > other) when possible.
+`post-pr-submission-checks` runs this after submit (before CI wait). `wait-for-agent-review complete` re-checks before the operator email. Non-compliant titles are auto-derived from the most releasable commit subject (`feat` > `fix` > other) when possible.
 
-**Multi-layer stacks (`gh-stack`):** `gh stack submit --auto` opens a PR per branch in one
-call. `stacking_tool_submit` (used by `scripts/dev/submit-stack`) automatically checks
-**every** PR currently in the stack after that submit — not just the branch you happened to
-submit from — via `scripts/lib/stacking-tool`'s `stacking_tool_ensure_stack_conventional_titles`.
-A non-compliant title on any layer that cannot be auto-derived fails the submit. Fix one
-layer by hand with `scripts/ensure-pr-conventional-title --pr <n>`.
+**Multi-layer stacks (`gh-stack`):** `gh stack submit --auto` opens a PR per branch in one call. `stacking_tool_submit` (used by `scripts/dev/submit-stack`) automatically checks **every** PR currently in the stack after that submit — not just the branch you happened to submit from — via `scripts/lib/stacking-tool`'s `stacking_tool_ensure_stack_conventional_titles`. A non-compliant title on any layer that cannot be auto-derived fails the submit. Fix one layer by hand with `scripts/ensure-pr-conventional-title --pr <n>`.
 
 ### GitHub body formatting
 
-Multi-paragraph issue/PR bodies and comments: write a temp file, lint, then
-`--body-file` — see `.agents/rules/github-content-formatting.md` and
-`scripts/lint-github-markdown`. For issues use `scripts/gh-issue create|edit`
-(lint runs before the API call). Do not hand-wrap paragraphs across short
-physical lines — GitHub’s issue/PR UI hard-breaks on a lone newline.
+Multi-paragraph issue/PR bodies and comments: write a temp file, lint, then `--body-file` — see `.agents/rules/github-content-formatting.md` and `scripts/lint-github-markdown`. For issues use `scripts/gh-issue create|edit` (lint runs before the API call). Do not hand-wrap paragraphs across short physical lines — GitHub’s issue/PR UI hard-breaks on a lone newline.
 
 ## Agent review essentials
 
@@ -83,8 +65,7 @@ When `check` reports **`complete_ready: true`** (requires **agent sign-off** on 
 ```
 
 - **No self-approve** — `complete` emails the operator; it does not run `gh pr review --approve`.
-- **No `merge-it`** unless the user explicitly asked. Org merge path is GitHub auto-merge
-  (`gh pr merge --auto --squash` / Enable auto-merge).
+- **No `merge-it`** unless the user explicitly asked. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge).
 
 ## Exit codes (condensed)
 

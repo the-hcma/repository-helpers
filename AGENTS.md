@@ -9,20 +9,14 @@ This file defines the non-negotiable standards for all contributors (human or AI
 At the **start of every agent session**, before acting from assumed conventions:
 
 1. Read this `AGENTS.md` in full.
-2. Read every rule under `.agents/rules/*.md` with `alwaysApply: true` in its
-   front matter, plus any rule whose `globs` match files you will touch.
-   `AGENTS.md` and `.agents/rules/` together are the contract — neither alone is
-   complete. `.cursor/rules/*.mdc` files are Cursor injection shims only (frontmatter
-   + pointer to the matching `.agents/rules/` file); do not treat the shim body as
-   the rule.
+2. Read every rule under `.agents/rules/*.md` with `alwaysApply: true` in its front matter, plus any rule whose `globs` match files you will touch. `AGENTS.md` and `.agents/rules/` together are the contract — neither alone is complete. `.cursor/rules/*.mdc` files are Cursor injection shims only (frontmatter
+   + pointer to the matching `.agents/rules/` file); do not treat the shim body as the rule.
 
-`CLAUDE.md` (a `@AGENTS.md` import) and `.github/copilot-instructions.md` are thin
-shims so Claude Code and Copilot reach this same guidance — do not put rules in them.
+`CLAUDE.md` (a `@AGENTS.md` import) and `.github/copilot-instructions.md` are thin shims so Claude Code and Copilot reach this same guidance — do not put rules in them.
 
 Markdown files you commit, this one included, use one physical line per paragraph, list item and blockquote, with no hard line breaks (see `.agents/rules/github-content-formatting.md`; check with `scripts/lint-github-markdown --repo-files`).
 
-Skills live under `.agents/skills/<name>/SKILL.md` (Cursor and other harnesses that
-follow [agentskills.io](https://agentskills.io) discover that path).
+Skills live under `.agents/skills/<name>/SKILL.md` (Cursor and other harnesses that follow [agentskills.io](https://agentskills.io) discover that path).
 
 ---
 
@@ -63,12 +57,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 - Scripts live in `scripts/` (e.g. `scripts/dep-updater`, `scripts/setup-service`). Sub-directories are allowed (e.g. `scripts/dev/start-development`).
 - Tests live in `tests/` and mirror the script name (e.g. `tests/dep-updater.test`).
 - Target **bash ≥ 5.x** (every script declares `#!/usr/bin/env bash` and uses `set -euo pipefail`).
-- External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`,
- `rg` (ripgrep), `actionlint`, plus the ecosystem tools being managed (`pnpm`,
- `pip`, `uv`, `poetry`, `cargo` + `cargo-outdated` + the `clippy` component) as
- optional callees. Rust is required for any repo dep-updater detects as a Cargo
- project — it shells out to `cargo outdated` and `cargo add`, and the Rust post-bump
- clippy recovery invariant below assumes a toolchain.
+- External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`, `rg` (ripgrep), `actionlint`, plus the ecosystem tools being managed (`pnpm`, `pip`, `uv`, `poetry`, `cargo` + `cargo-outdated` + the `clippy` component) as optional callees. Rust is required for any repo dep-updater detects as a Cargo project — it shells out to `cargo outdated` and `cargo add`, and the Rust post-bump clippy recovery invariant below assumes a toolchain.
 
  ```bash
   rustup component add clippy             # absent under rustup's minimal profile
@@ -76,16 +65,10 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
   ```
 
  Provisioning notes for the batch host:
- - apt's Rust is too old for current `cargo-outdated` — install via rustup. On
- Debian/Ubuntu `build-essential pkg-config libssl-dev` are also needed for
- `openssl-sys` / `libgit2-sys`.
- - `~/.cargo/bin` is not on a systemd/cron `PATH` by default, so a timer-run batch
- can still report the tool missing after a successful interactive install (see
- `tooling_path_ensure_gnu_userland` / the cron bootstraps).
+ - apt's Rust is too old for current `cargo-outdated` — install via rustup. On Debian/Ubuntu `build-essential pkg-config libssl-dev` are also needed for `openssl-sys` / `libgit2-sys`.
+ - `~/.cargo/bin` is not on a systemd/cron `PATH` by default, so a timer-run batch can still report the tool missing after a successful interactive install (see `tooling_path_ensure_gnu_userland` / the cron bootstraps).
 
- A host missing one of these no longer fails the whole run: `--batch --all` skips
- those repos and reports them under **Skipped (missing tooling)** in the email
- (see the batch-all invariant below).
+ A host missing one of these no longer fails the whole run: `--batch --all` skips those repos and reports them under **Skipped (missing tooling)** in the email (see the batch-all invariant below).
 - No Node.js helpers, no Python scripting. Keep the implementation pure Bash.
 - Test harnesses are plain Bash — no test framework installs required.
 
@@ -106,18 +89,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 
 ## Linting
 
-- **`shellcheck`** is mandatory. CI and `scripts/dev/pre-pr-checks` both run
-  `shellcheck -S info` over the full `scripts/**` + `tests/**` globs, at a **pinned
-  version** resolved through `scripts/lib/ci-shellcheck` (currently `0.11.0`) so a
-  developer's local shellcheck can never diverge from CI (repository-helpers#594).
-  The `shellcheck` job downloads the pinned release binary (SHA-256-verified,
-  HTTPS) when the pinned version is not already resolvable — locally into
-  `~/.cache/repository-helpers/bin`, in CI into `/usr/local/bin` — so a machine
-  with no shellcheck, or the wrong version, still passes. Override the version for
-  local experiments with `SHELLCHECK_VERSION` (checksum check is skipped then).
-  `scripts/github-repo-lint` warns when `ci_shellcheck_version` /
-  `ci_shellcheck_sha256` fall behind the newest release-age-eligible shellcheck
-  (same gate as the gitleaks pin); bump both together and re-sync consumers.
+- **`shellcheck`** is mandatory. CI and `scripts/dev/pre-pr-checks` both run `shellcheck -S info` over the full `scripts/**` + `tests/**` globs, at a **pinned version** resolved through `scripts/lib/ci-shellcheck` (currently `0.11.0`) so a developer's local shellcheck can never diverge from CI (repository-helpers#594). The `shellcheck` job downloads the pinned release binary (SHA-256-verified, HTTPS) when the pinned version is not already resolvable — locally into `~/.cache/repository-helpers/bin`, in CI into `/usr/local/bin` — so a machine with no shellcheck, or the wrong version, still passes. Override the version for local experiments with `SHELLCHECK_VERSION` (checksum check is skipped then). `scripts/github-repo-lint` warns when `ci_shellcheck_version` / `ci_shellcheck_sha256` fall behind the newest release-age-eligible shellcheck (same gate as the gitleaks pin); bump both together and re-sync consumers.
 - Zero findings at the `info` level is the bar. No `# shellcheck disable=` suppressions unless absolutely unavoidable; every suppression must have a comment explaining why.
 - Key rules that are always errors:
   - **SC2155** — never combine `local`/`readonly` with a command substitution assignment; declare separately to preserve the exit code.
@@ -166,17 +138,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 - **Rust post-bump clippy recovery.** After `cargo add` bumps (batch or single), dep-updater runs `cargo clippy --all-targets -- -D warnings`. On failure it tries `cargo clippy --fix` (mechanical suggestions only) and re-checks. Unrecovered failures log machine-parseable `ERROR: RUST_CLIPPY_RECOVER_FAILED`, revert the Rust bump (keeping other ecosystems), and continue (repository-helpers#433).
 - **Missing host tooling is a skip in `--batch --all`, not a repo failure.** Absent ecosystem tooling is a property of the host, not the repository, so `check_ecosystem_prereqs` exits **`dep_updater_exit_missing_tooling` (3)** after logging one `ERROR: MISSING_ECOSYSTEM_TOOLING tools=<list>` line instead of `die`ing with 1. A `--batch --all` parent treats exit 3 as `[batch-all] Skipping <repo>: missing host tooling (<tools>)`: `worst_exit` is unchanged, the ephemeral clone is **removed** (the fix is `cargo install` on the host, so there is nothing in the clone to repair), and the repos appear under **Skipped (missing tooling)** in the `dep-updater-batch-run` email so the provisioning gap stays visible. **Single-repo runs still fail loudly** — an operator who pointed dep-updater at one repo wants the error, not a silent skip. Non-tooling failures keep their existing exit code, clone retention, and Failed section (repository-helpers#535).
 - **Wait timeouts must be machine-parseable.** Any long-running wait loop (CI gating, merge polling, PR number discovery, etc.) must, on timeout, emit **one** concise line starting with `ERROR: WAIT_TIMEOUT ...` and then fail. Avoid multi-line timeout chatter — batch runs (`--batch --all`) postprocess these lines into end-of-run actionable summaries.
-- **GNU userland on macOS.** Prefer Homebrew gnubin on `PATH` via
-  `tooling_path_ensure_gnu_userland` / the cron and node bootstraps
-  (`brew install coreutils gnu-sed grep util-linux findutils`) so scripts can
-  assume GNU `sed`, `grep -P`, `date -Is`, `timeout`, `flock`, and `find`. On
-  Darwin, missing or BSD tools fail early with an install hint — do not rely on
-  silent fallback. Do not add BSD vs GNU branches at call sites. `dep-updater`
-  in-place edits still resolve GNU sed explicitly (`gsed` /
-  `tooling_prereq_gnu_sed_path`) as an additional hard prerequisite. Prefer
-  portable bash constructs (`[[ -x ]]`, `[[ -f ]]`, glob loops) over GNU-only
-  `find` primaries in new scripts — the prereq check is a safety net, not a
-  reason to reach for `find` when a portable alternative exists.
+- **GNU userland on macOS.** Prefer Homebrew gnubin on `PATH` via `tooling_path_ensure_gnu_userland` / the cron and node bootstraps (`brew install coreutils gnu-sed grep util-linux findutils`) so scripts can assume GNU `sed`, `grep -P`, `date -Is`, `timeout`, `flock`, and `find`. On Darwin, missing or BSD tools fail early with an install hint — do not rely on silent fallback. Do not add BSD vs GNU branches at call sites. `dep-updater` in-place edits still resolve GNU sed explicitly (`gsed` / `tooling_prereq_gnu_sed_path`) as an additional hard prerequisite. Prefer portable bash constructs (`[[ -x ]]`, `[[ -f ]]`, glob loops) over GNU-only `find` primaries in new scripts — the prereq check is a safety net, not a reason to reach for `find` when a portable alternative exists.
 
 ---
 
@@ -256,38 +218,19 @@ See [`.agents/skills/graphite/SKILL.md`](.agents/skills/graphite/SKILL.md) for G
 
 ### Stacking-tool marker cutover checklist
 
-When flipping `.github/stacking-tool` (or landing an MQ / `gh-stack` cutover PR) in a
-**consumer** repo, also:
+When flipping `.github/stacking-tool` (or landing an MQ / `gh-stack` cutover PR) in a **consumer** repo, also:
 
-1. Update `AGENTS.md` stacking and merge guidance to match the marker (GitHub auto-merge:
-   `gh pr merge --auto --squash` — not `merge-it`).
-2. Rewrite `.agents/rules/pr-ship-and-review.md` submit block to the marker-aware template
-   (copy via `github-repo-lint --apply-fix`, or from
-   `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md`
-   / https://github.com/the-hcma/repository-helpers/blob/main/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md;
-   or document both backends gated on the marker — never leave a Graphite-only
-   `gt create` / `gt submit` snippet when the marker is `gh-stack`; keep a thin
-   `.cursor/rules/pr-ship-and-review.mdc` shim).
+1. Update `AGENTS.md` stacking and merge guidance to match the marker (GitHub auto-merge: `gh pr merge --auto --squash` — not `merge-it`).
+2. Rewrite `.agents/rules/pr-ship-and-review.md` submit block to the marker-aware template (copy via `github-repo-lint --apply-fix`, or from `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md` / https://github.com/the-hcma/repository-helpers/blob/main/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md; or document both backends gated on the marker — never leave a Graphite-only `gt create` / `gt submit` snippet when the marker is `gh-stack`; keep a thin `.cursor/rules/pr-ship-and-review.mdc` shim).
 3. Delete root `GRAPHITE.md` when switching to `gh-stack` (canonical skills live here).
-4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) aligned with
-   `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/stacking-tool.md`
-   (same blob URL under `repository-helpers` `main`).
-5. Run `scripts/github-repo-lint --repo OWNER/NAME --suggest --strict-onboarding` and clear
-   stacking-docs consistency findings (`--apply-fix` can rewrite pr-ship; AGENTS /
-   `GRAPHITE.md` are usually human-driven).
+4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) aligned with `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/stacking-tool.md` (same blob URL under `repository-helpers` `main`).
+5. Run `scripts/github-repo-lint --repo OWNER/NAME --suggest --strict-onboarding` and clear stacking-docs consistency findings (`--apply-fix` can rewrite pr-ship; AGENTS / `GRAPHITE.md` are usually human-driven).
 
 ### Lexicographic code organization (org Cursor rule)
 
-Canonical rule: [`.agents/rules/lexicographic-code-organization.md`](.agents/rules/lexicographic-code-organization.md)
-(public block then private `_` block; ASCII sort within each; sorted closed-set literals such as
-`frozenset` / enum members).
+Canonical rule: [`.agents/rules/lexicographic-code-organization.md`](.agents/rules/lexicographic-code-organization.md) (public block then private `_` block; ASCII sort within each; sorted closed-set literals such as `frozenset` / enum members).
 
-Consumer repos should **copy** that file into their `.agents/rules/` (plus a thin
-`.cursor/rules/*.mdc` shim) or symlink from a local `repository-helpers` clone. Ensure
-`.gitignore` does not ignore `.agents/rules/` or `.cursor/rules/` (same policy as other
-org agent rules). Prefer `github-repo-lint --apply-fix` (uses
-`scripts/lib/repo-practices-agents/rules/` + `scripts/lib/repo-practices-cursor/` shims)
-or copy those templates.
+Consumer repos should **copy** that file into their `.agents/rules/` (plus a thin `.cursor/rules/*.mdc` shim) or symlink from a local `repository-helpers` clone. Ensure `.gitignore` does not ignore `.agents/rules/` or `.cursor/rules/` (same policy as other org agent rules). Prefer `github-repo-lint --apply-fix` (uses `scripts/lib/repo-practices-agents/rules/` + `scripts/lib/repo-practices-cursor/` shims) or copy those templates.
 
 ### `protect-main` ruleset (required)
 
@@ -307,11 +250,7 @@ GitHub rejects the Dependabot app as a ruleset bypass actor (`Actor integration 
 
 Graphite App bypass (`actor_id` **158384**) is **not** required for the org GitHub MQ profile. Leftover Graphite Integration bypass actors may be removed via `--apply-fix`.
 
-`required_signatures` needs every human contributor to have verified commit
-signing configured (`.cursor/rules/git-commit-identity.mdc` covers setup). GitHub
-signs the merge-queue / squash commits itself, so the queue keeps working.
-`--apply-fix` adds `required_signatures`, `require_code_owner_review`, and the
-bypass actors to an existing ruleset.
+`required_signatures` needs every human contributor to have verified commit signing configured (`.cursor/rules/git-commit-identity.mdc` covers setup). GitHub signs the merge-queue / squash commits itself, so the queue keeps working. `--apply-fix` adds `required_signatures`, `require_code_owner_review`, and the bypass actors to an existing ruleset.
 
 Classic branch protection on **`main`** is also required (org standard). It complements the ruleset — reviews and CI — while **`protect-main`** enforces squash-only merges and GitHub `merge_queue`.
 
@@ -325,10 +264,7 @@ Classic branch protection on **`main`** is also required (org standard). It comp
 | Force-push / delete | disabled |
 | `enforce_admins` | `false` (warn if enabled) |
 
-Create or repair ruleset + classic settings with
-`scripts/github-repo-lint --repo OWNER/NAME --apply-fix`. Run it from the target
-repository clone when you want candidate workflow fixes emitted as a stack
-under `.worktrees/repo-practices-candidate-fixes-wt`.
+Create or repair ruleset + classic settings with `scripts/github-repo-lint --repo OWNER/NAME --apply-fix`. Run it from the target repository clone when you want candidate workflow fixes emitted as a stack under `.worktrees/repo-practices-candidate-fixes-wt`.
 
 ### Org default: GitHub merge queue
 
@@ -350,50 +286,25 @@ Disable org repos in [Graphite merge queue settings](https://app.graphite.com/se
 
 ### CVE check workflow (uv Python)
 
-Repos identified as uv Python projects (presence of `uv.lock` + `pyproject.toml` at the repo root) must include
-`.github/workflows/cve-check.yml`, a scheduled daily `pip-audit` run that classifies JSON output (CVE vs transient
-failure), retries only transient tool errors, and opens or updates a `security/cve` issue when vulnerabilities are
-found. The job succeeds when CVEs are found **and** issue notification succeeds; it fails if pip-audit reports CVEs but
-`gh issue` create/comment fails (so silent notification loss does not occur).
+Repos identified as uv Python projects (presence of `uv.lock` + `pyproject.toml` at the repo root) must include `.github/workflows/cve-check.yml`, a scheduled daily `pip-audit` run that classifies JSON output (CVE vs transient failure), retries only transient tool errors, and opens or updates a `security/cve` issue when vulnerabilities are found. The job succeeds when CVEs are found **and** issue notification succeeds; it fails if pip-audit reports CVEs but `gh issue` create/comment fails (so silent notification loss does not occur).
 
 ### pnpm / Corepack CI
 
 Repos with `pnpm-lock.yaml` (root or `web/`) must:
 
-1. Set an exact `"packageManager": "pnpm@X.Y.Z"` in the matching `package.json` (Corepack / CI SSOT).
-   For nested apps (e.g. domesti-bot), put it in `web/package.json` and pass
-   `working-directory: web` to the action.
-2. Install pnpm in GitHub Actions via the org composite action
-   [`actions/setup-pnpm-corepack`](actions/setup-pnpm-corepack/README.md) **after**
-   `actions/setup-node`. Do **not** use `pnpm/action-setup` (especially not
-   `version: latest` — floating tags have broken CI; see
-   [pnpm/action-setup#276](https://github.com/pnpm/action-setup/issues/276)).
-3. Do **not** set `cache: 'pnpm'` on `setup-node` — the composite action owns store-path
-   discovery and `actions/cache`.
+1. Set an exact `"packageManager": "pnpm@X.Y.Z"` in the matching `package.json` (Corepack / CI SSOT). For nested apps (e.g. domesti-bot), put it in `web/package.json` and pass `working-directory: web` to the action.
+2. Install pnpm in GitHub Actions via the org composite action [`actions/setup-pnpm-corepack`](actions/setup-pnpm-corepack/README.md) **after** `actions/setup-node`. Do **not** use `pnpm/action-setup` (especially not `version: latest` — floating tags have broken CI; see [pnpm/action-setup#276](https://github.com/pnpm/action-setup/issues/276)).
+3. Do **not** set `cache: 'pnpm'` on `setup-node` — the composite action owns store-path discovery and `actions/cache`.
 
-**Pin policy:** pin with a **full commit SHA that is on `main`** (a merge commit of this
-repo), not a PR branch tip or other unmerged SHA. Example (current `main` tip as of the
-merge of [#646](https://github.com/the-hcma/repository-helpers/pull/646)):
+**Pin policy:** pin with a **full commit SHA that is on `main`** (a merge commit of this repo), not a PR branch tip or other unmerged SHA. Example (current `main` tip as of the merge of [#646](https://github.com/the-hcma/repository-helpers/pull/646)):
 
 `999844287d1b2684baa91c3e8a5b62eda9f4915e`
 
-Pin by SHA for supply-chain integrity (repository-helpers may be public; treat this as an
-org composite action, not a “private action”). Dependabot does not always bump composite
-action SHAs automatically — plan periodic pin updates when the helper changes.
+Pin by SHA for supply-chain integrity (repository-helpers may be public; treat this as an org composite action, not a “private action”). Dependabot does not always bump composite action SHAs automatically — plan periodic pin updates when the helper changes.
 
-**Nested `uses:` in composites (coding agents):** GitHub evaluates nested steps (e.g.
-`actions/cache` inside `setup-pnpm-corepack`) against the **consumer** repo’s
-`sha_pinning_required` setting. Tag pins like `@v6.1.0` inside the composite fail CI even
-when the consumer workflow only references this action by SHA. Always SHA-pin nested
-third-party `uses:` in `actions/*/action.yml`, and after fixing them bump every consumer’s
-`setup-pnpm-corepack@…` pin to the new `main` merge commit. Failure text looks like
-`The action actions/cache@… is not allowed … must be pinned to a full-length commit SHA`.
+**Nested `uses:` in composites (coding agents):** GitHub evaluates nested steps (e.g. `actions/cache` inside `setup-pnpm-corepack`) against the **consumer** repo’s `sha_pinning_required` setting. Tag pins like `@v6.1.0` inside the composite fail CI even when the consumer workflow only references this action by SHA. Always SHA-pin nested third-party `uses:` in `actions/*/action.yml`, and after fixing them bump every consumer’s `setup-pnpm-corepack@…` pin to the new `main` merge commit. Failure text looks like `The action actions/cache@… is not allowed … must be pinned to a full-length commit SHA`.
 
-**Path-filter gotcha:** CI path filters / “deps changed” gates that only watch
-`package.json` and `pnpm-lock.yaml` will **skip** pnpm install/check jobs on
-workflow-only adoption PRs (seen on [fpdf#464](https://github.com/the-hcma/fpdf/pull/464)).
-When adopting the helper, include `.github/workflows/**` (or your equivalent workflow
-paths) in those gates so the adoption PR actually runs install and check.
+**Path-filter gotcha:** CI path filters / “deps changed” gates that only watch `package.json` and `pnpm-lock.yaml` will **skip** pnpm install/check jobs on workflow-only adoption PRs (seen on [fpdf#464](https://github.com/the-hcma/fpdf/pull/464)). When adopting the helper, include `.github/workflows/**` (or your equivalent workflow paths) in those gates so the adoption PR actually runs install and check.
 
 Canonical snippets (keep `pnpm install` in the same directory as the action input):
 
@@ -422,8 +333,7 @@ Nested app (`packageManager` under `web/`):
   working-directory: web
 ```
 
-See [`actions/setup-pnpm-corepack/README.md`](actions/setup-pnpm-corepack/README.md) for
-inputs, caching, and consumer checklist.
+See [`actions/setup-pnpm-corepack/README.md`](actions/setup-pnpm-corepack/README.md) for inputs, caching, and consumer checklist.
 
 ### Merge settings and GitHub merge queue
 
@@ -512,20 +422,9 @@ scripts/dev/start-development --refresh
 
 ## Worktree-aware Scripts
 
-`setup-service` and `scripts/on-deploy` are **worktree-aware**: unit templates in
-`etc/systemd/`, `@@REPO_DIR@@` substitution in the generated unit file, and the
-`on-deploy` hook itself are resolved from whichever worktree the script is invoked
-from. Calling `setup-service` from a feature worktree therefore deploys that
-worktree's code — this is the primary mechanism for testing feature branches locally.
+`setup-service` and `scripts/on-deploy` are **worktree-aware**: unit templates in `etc/systemd/`, `@@REPO_DIR@@` substitution in the generated unit file, and the `on-deploy` hook itself are resolved from whichever worktree the script is invoked from. Calling `setup-service` from a feature worktree therefore deploys that worktree's code — this is the primary mechanism for testing feature branches locally.
 
-**Opt-out:** a repo that manages its own systemd deployment convention (its own
-placeholder set, system-scope units, a host-guard library, etc.) opts out of this
-generic adoption by shipping an executable `scripts/setup-service` whose content
-differs from this repo's generic helper (`cmp -s`; a byte-identical copy is not
-an opt-out) — `discover_unit_basenames` treats that as self-documenting signal and
-skips adoption entirely, even if the repo also has `etc/systemd/*.service` files
-for its own convention. See
-[docs/SYSTEMD.md](docs/SYSTEMD.md#opting-out-repos-with-their-own-systemd-convention).
+**Opt-out:** a repo that manages its own systemd deployment convention (its own placeholder set, system-scope units, a host-guard library, etc.) opts out of this generic adoption by shipping an executable `scripts/setup-service` whose content differs from this repo's generic helper (`cmp -s`; a byte-identical copy is not an opt-out) — `discover_unit_basenames` treats that as self-documenting signal and skips adoption entirely, even if the repo also has `etc/systemd/*.service` files for its own convention. See [docs/SYSTEMD.md](docs/SYSTEMD.md#opting-out-repos-with-their-own-systemd-convention).
 
 - **`DEPLOYED_COMMIT`:** `setup-service` injects `Environment=DEPLOYED_COMMIT=<HEAD>` into the generated systemd unit (no template change required). The running commit is read from the service process environment, not `git HEAD` at the process cwd. If `DEPLOYED_COMMIT` is missing on the running process, missing from the installed unit, or differs from the current checkout, treat the deploy as stale: run `on-deploy` and restart conservatively.
 - **Service name** is derived from the git remote URL (not the directory name), so it is stable across all worktrees.
@@ -599,18 +498,11 @@ Service repositories install via `scripts/setup-service` and optionally implemen
   - **Workflows**: `actionlint` when helpers-style or when workflows already invoke actionlint
   - **Bash tests**: `tests/*.test` when present (sequential, isolated TMPDIR)
   - **Python** (`pyproject.toml`): prefer `.github/ci/python-static`; else `uv run` ruff check/format + pyright
-  - **Hermetic pytest**: when `.github/ci/pytest-hermetic` is present (same offline
-    subset CI uses; not live Graph tests) — planned as `pytest-hermetic`
+  - **Hermetic pytest**: when `.github/ci/pytest-hermetic` is present (same offline subset CI uses; not live Graph tests) — planned as `pytest-hermetic`
   - **TypeScript**: `web/package.json` → pnpm install + typecheck/build; else root pnpm (only when no `web/`) → `pnpm run check` (or typecheck/lint). Both layouts: web wins; root is not also planned.
   - **Rust** (`Cargo.toml`): `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`
-  - **Secret scan**: when `.github/ci/secret-scan` or `scripts/dev/secret-scan` is
-    present — runs canonical gitleaks (`scripts/lib/ci-secret-scan`) before submit
-    (branch-vs-`main` range when possible). CI `secret-scan` remains post-push
-    triage; this is the submit-path gate (see also deep/org scan #509 — TruffleHog via `scripts/secret-audit` / [docs/secret-audit-trufflehog.md](./docs/secret-audit-trufflehog.md)).
-    Skip with `PRE_PR_CHECKS_SKIP=secret-scan`. Manual: `scripts/dev/secret-scan`.
-  - **Verified commits**: when the branch has commits ahead of `main`/`origin/main` —
-    `git verify-commit` locally, plus GitHub `verification.verified` when an upstream
-    exists (bot authors skipped). Skip with `PRE_PR_CHECKS_SKIP=verified-commits`.
+  - **Secret scan**: when `.github/ci/secret-scan` or `scripts/dev/secret-scan` is present — runs canonical gitleaks (`scripts/lib/ci-secret-scan`) before submit (branch-vs-`main` range when possible). CI `secret-scan` remains post-push triage; this is the submit-path gate (see also deep/org scan #509 — TruffleHog via `scripts/secret-audit` / [docs/secret-audit-trufflehog.md](./docs/secret-audit-trufflehog.md)). Skip with `PRE_PR_CHECKS_SKIP=secret-scan`. Manual: `scripts/dev/secret-scan`.
+  - **Verified commits**: when the branch has commits ahead of `main`/`origin/main` — `git verify-commit` locally, plus GitHub `verification.verified` when an upstream exists (bot authors skipped). Skip with `PRE_PR_CHECKS_SKIP=verified-commits`.
   - Escape hatch: `PRE_PR_CHECKS_SKIP=job1,job2` (documented; no silent skip). Do **not** bypass a failing run with ad-hoc substitutes.
   - Also verifies the **primary worktree** is unchanged when checks finish.
 - Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).
@@ -636,21 +528,9 @@ When CI is green, follow **`.agents/skills/ship-and-review/SKILL.md`** (deep pla
 
 See the Skill for CodeRabbit on_push policy, early-complete loop semantics, per-agent quota fallback, and exit codes (**`scripts/wait-for-agent-review --help`** is the SSOT).
 
-**Copilot code review vs coding agent:** the review loop requests Copilot via
-REST `requested_reviewers` with login `copilot-pull-request-reviewer` (same as
-`gh pr edit --add-reviewer '@copilot'`).
-Do **not** post `@copilot` issue comments or `--add-assignee '@copilot'` from the loop —
-those engage **Copilot coding agent** (pushes commits / `copilot_work_*` timeline events),
-not code review (`repository-helpers#461`).
+**Copilot code review vs coding agent:** the review loop requests Copilot via REST `requested_reviewers` with login `copilot-pull-request-reviewer` (same as `gh pr edit --add-reviewer '@copilot'`). Do **not** post `@copilot` issue comments or `--add-assignee '@copilot'` from the loop — those engage **Copilot coding agent** (pushes commits / `copilot_work_*` timeline events), not code review (`repository-helpers#461`).
 
-**Copilot timeline failures:** credit exhaustion sometimes appears only as a PR timeline event
-`copilot_work_finished_failure` (GitHub App `copilot-swe-agent`) with no issue comment or review
-body. Quota observe scans that timeline event for the local calendar day. Non-quota work failures
-of the same event type also mark Copilot exhausted for the day (acceptable for skip caches).
-Outstanding `@copilot` / Bugbot `probe_requested` waits expire after
-`AGENT_REVIEW_PROBE_REQUESTED_TTL` (default **15m**): the loop re-scans the current PR timeline
-and advances the quota fallback chain instead of hanging (`repository-helpers#408`). Negative
-`timeline_probed` cache entries are scoped to `OWNER/NAME#N` so another PR cannot skip the scan.
+**Copilot timeline failures:** credit exhaustion sometimes appears only as a PR timeline event `copilot_work_finished_failure` (GitHub App `copilot-swe-agent`) with no issue comment or review body. Quota observe scans that timeline event for the local calendar day. Non-quota work failures of the same event type also mark Copilot exhausted for the day (acceptable for skip caches). Outstanding `@copilot` / Bugbot `probe_requested` waits expire after `AGENT_REVIEW_PROBE_REQUESTED_TTL` (default **15m**): the loop re-scans the current PR timeline and advances the quota fallback chain instead of hanging (`repository-helpers#408`). Negative `timeline_probed` cache entries are scoped to `OWNER/NAME#N` so another PR cannot skip the scan.
 
 ---
 

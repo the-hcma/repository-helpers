@@ -1,41 +1,26 @@
 # setup-pnpm-corepack
 
-Org composite action: enable Corepack pnpm from `package.json` `packageManager` and
-optionally cache the pnpm store. Prefer this over `pnpm/action-setup` (especially
-`version: latest` — floating tags have broken CI; see
-[pnpm/action-setup#276](https://github.com/pnpm/action-setup/issues/276)).
+Org composite action: enable Corepack pnpm from `package.json` `packageManager` and optionally cache the pnpm store. Prefer this over `pnpm/action-setup` (especially `version: latest` — floating tags have broken CI; see [pnpm/action-setup#276](https://github.com/pnpm/action-setup/issues/276)).
 
-Call **after** `actions/setup-node`. Do **not** set `cache: 'pnpm'` on `setup-node` —
-this action owns store-path discovery and `actions/cache`.
+Call **after** `actions/setup-node`. Do **not** set `cache: 'pnpm'` on `setup-node` — this action owns store-path discovery and `actions/cache`.
 
 ## Pin policy
 
-Consumers must pin a **full commit SHA that is on `main`** of
-`the-hcma/repository-helpers` (a merge commit), not a PR branch tip or other unmerged
-SHA. Pin by SHA for supply-chain integrity even when this repository is public.
+Consumers must pin a **full commit SHA that is on `main`** of `the-hcma/repository-helpers` (a merge commit), not a PR branch tip or other unmerged SHA. Pin by SHA for supply-chain integrity even when this repository is public.
 
-Example (current `main` tip as of the merge of
-[#646](https://github.com/the-hcma/repository-helpers/pull/646)):
+Example (current `main` tip as of the merge of [#646](https://github.com/the-hcma/repository-helpers/pull/646)):
 
 ```yaml
 - uses: the-hcma/repository-helpers/actions/setup-pnpm-corepack@999844287d1b2684baa91c3e8a5b62eda9f4915e
 ```
 
-Dependabot may not auto-bump this composite SHA; refresh the pin periodically when the
-helper changes.
+Dependabot may not auto-bump this composite SHA; refresh the pin periodically when the helper changes.
 
 ### Nested `uses:` (agents / maintainers)
 
-Composite actions run nested `uses:` **in the calling repo's permission context**. When a
-consumer enables `sha_pinning_required`, GitHub rejects tag/branch refs inside this
-composite (e.g. `actions/cache@v6.1.0`) even if the consumer's own workflows are fully
-SHA-pinned. Keep every third-party `uses:` in `action.yml` on a **full-length commit SHA**
-(with a `# vX.Y.Z` comment). After changing nested pins here, bump consumer composite pins
-to a new `main` merge SHA — stale pins keep the old unpinned nested step.
+Composite actions run nested `uses:` **in the calling repo's permission context**. When a consumer enables `sha_pinning_required`, GitHub rejects tag/branch refs inside this composite (e.g. `actions/cache@v6.1.0`) even if the consumer's own workflows are fully SHA-pinned. Keep every third-party `uses:` in `action.yml` on a **full-length commit SHA** (with a `# vX.Y.Z` comment). After changing nested pins here, bump consumer composite pins to a new `main` merge SHA — stale pins keep the old unpinned nested step.
 
-Symptom: CI fails early with
-`The action actions/cache@… is not allowed … must be pinned to a full-length commit SHA`
-on jobs that call `setup-pnpm-corepack`.
+Symptom: CI fails early with `The action actions/cache@… is not allowed … must be pinned to a full-length commit SHA` on jobs that call `setup-pnpm-corepack`.
 
 ## Inputs
 
@@ -58,8 +43,7 @@ Root app (`package.json` / lockfile at repo root):
 - run: pnpm install --frozen-lockfile
 ```
 
-Nested app (`packageManager` under `web/`, e.g. domesti-bot) — keep install in the
-same directory as the action input:
+Nested app (`packageManager` under `web/`, e.g. domesti-bot) — keep install in the same directory as the action input:
 
 ```yaml
 - uses: actions/checkout@v7.0.1
@@ -75,11 +59,7 @@ same directory as the action input:
 
 ## Path-filter gotcha
 
-CI path filters / “deps changed” gates that only watch `package.json` and
-`pnpm-lock.yaml` will **skip** pnpm jobs on workflow-only PRs (seen on
-[fpdf#464](https://github.com/the-hcma/fpdf/pull/464)). When adopting this helper,
-include `.github/workflows/**` (or equivalent) in those gates so adoption PRs run
-install and check.
+CI path filters / “deps changed” gates that only watch `package.json` and `pnpm-lock.yaml` will **skip** pnpm jobs on workflow-only PRs (seen on [fpdf#464](https://github.com/the-hcma/fpdf/pull/464)). When adopting this helper, include `.github/workflows/**` (or equivalent) in those gates so adoption PRs run install and check.
 
 ## Requirements
 

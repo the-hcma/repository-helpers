@@ -24,10 +24,7 @@ Every **external** command in `scripts/*`, `scripts/dev/*`, and `scripts/lib/*` 
 | `runner_exec_stdout` | `var="$(…)"` substitution |
 | `runner_sh` / `runner_sh_stdout` | Pipelines, `(cd dir && …)`, compound shell |
 
-Optional flag on the helpers above: `--timeout SECONDS` (GNU `timeout` / `gtimeout`).
-Prints `waiting up to Ns: <label>` on stderr before the command runs.
-On expiry the helper exits **124** and prints one `ERROR: WAIT_TIMEOUT <label> timeout=<Ns>` line.
-Ctrl-C prints `[INT] Interrupted: <label>` plus the quoted cmdline, then kills the child (exit 130).
+Optional flag on the helpers above: `--timeout SECONDS` (GNU `timeout` / `gtimeout`). Prints `waiting up to Ns: <label>` on stderr before the command runs. On expiry the helper exits **124** and prints one `ERROR: WAIT_TIMEOUT <label> timeout=<Ns>` line. Ctrl-C prints `[INT] Interrupted: <label>` plus the quoted cmdline, then kills the child (exit 130).
 
 ## Do not wrap
 
@@ -42,28 +39,18 @@ Call `runner_sh_stdout` / `runner_exec_stdout` directly unless the helper encode
 
 ## Nested process sessions (required)
 
-`runner-bootstrap` begins a session and removes it on EXIT unless
-`RUNNER_SESSION_KEEP=1`. A **nested** executable that also sources
-`runner-bootstrap` must **not** keep the parent's `RUNNER_SESSION_DIR` —
-otherwise the child's EXIT trap `rm -rf`s the parent's capture tree
-(`command: ?` in failure emails; repository-helpers#520 / #527 / #540).
+`runner-bootstrap` begins a session and removes it on EXIT unless `RUNNER_SESSION_KEEP=1`. A **nested** executable that also sources `runner-bootstrap` must **not** keep the parent's `RUNNER_SESSION_DIR` — otherwise the child's EXIT trap `rm -rf`s the parent's capture tree (`command: ?` in failure emails; repository-helpers#520 / #527 / #540).
 
-`scripts/lib/runner-bootstrap` clears an inherited `RUNNER_SESSION_DIR` and
-begins a session owned by this process (re-sourcing in the same shell is a
-no-op). Prefer that SSOT over remembering wrapper flags.
+`scripts/lib/runner-bootstrap` clears an inherited `RUNNER_SESSION_DIR` and begins a session owned by this process (re-sourcing in the same shell is a no-op). Prefer that SSOT over remembering wrapper flags.
 
-`runner_session_end` cleanup is best-effort (`rm -rf` failure warns on stderr
-and never changes the process exit code).
+`runner_session_end` cleanup is best-effort (`rm -rf` failure warns on stderr and never changes the process exit code).
 
 Also safe (defense in depth / scripts that source `runner` without bootstrap):
 
 - Child entry: `unset RUNNER_SESSION_DIR` then `runner_session_begin` (dep-updater)
-- Parent wrap: `env -u RUNNER_SESSION_DIR -u RUNNER_SESSION_KEEP` around the child
-  (secret-audit-batch-run)
+- Parent wrap: `env -u RUNNER_SESSION_DIR -u RUNNER_SESSION_KEEP` around the child (secret-audit-batch-run)
 
-Do **not** share one `RUNNER_SESSION_DIR` across parallel jobs in the same process
-tree either — `runner_last_id` / `runner_exec_stdout` race (repository-helpers#556);
-`pre-pr-checks` isolates per job and per `tests/*.test`.
+Do **not** share one `RUNNER_SESSION_DIR` across parallel jobs in the same process tree either — `runner_last_id` / `runner_exec_stdout` race (repository-helpers#556); `pre-pr-checks` isolates per job and per `tests/*.test`.
 
 ## Exceptions (document in code + ratchet skip)
 

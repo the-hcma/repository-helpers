@@ -19,9 +19,7 @@ Helper scripts:
 
 - **`scripts/wait-for-agent-review`** — poll, triage, email (default agent: Copilot; no self-approve)
 - **`scripts/trigger-agent-review`** — request a review from the configured agent
-- **`scripts/dev/approve-pending-deployments`** — approve WAITING GitHub environment
-  jobs on the operator's behalf (`gh` is the operator). Do not wait for a human
-  Actions UI click. `scripts/dev/post-pr-submission-checks` runs this while waiting.
+- **`scripts/dev/approve-pending-deployments`** — approve WAITING GitHub environment jobs on the operator's behalf (`gh` is the operator). Do not wait for a human Actions UI click. `scripts/dev/post-pr-submission-checks` runs this while waiting.
 
 Configure `~/.config/agent-review.env` from `etc/agent-review.env.example` (`AGENT_REVIEW_REPORT_TO`, SMTP).
 
@@ -62,25 +60,11 @@ scripts/dev/post-pr-submission-checks --pr <n>
 scripts/dev/post-pr-submission-checks --pr <n>
 ```
 
-This polls until required checks finish. If a job is **WAITING** on a protected
-environment (`github-repo-lint`, `dep-updater`), the wait **approves it on the
-operator's behalf** (`scripts/dev/approve-pending-deployments`). Coding agents
-MUST do that; `gh` is the authenticated operator. Do not wait for a human to
-click Approve in the Actions UI.
+This polls until required checks finish. If a job is **WAITING** on a protected environment (`github-repo-lint`, `dep-updater`), the wait **approves it on the operator's behalf** (`scripts/dev/approve-pending-deployments`). Coding agents MUST do that; `gh` is the authenticated operator. Do not wait for a human to click Approve in the Actions UI.
 
-If approval fails, the wait prints **`ERROR: ENVIRONMENT_APPROVAL_FAILED`** and
-exits. **Raise that to the operator immediately** — do not keep polling or treat
-CI as still pending. The operator must approve the environment or grant this
-`gh` identity reviewer access.
+If approval fails, the wait prints **`ERROR: ENVIRONMENT_APPROVAL_FAILED`** and exits. **Raise that to the operator immediately** — do not keep polling or treat CI as still pending. The operator must approve the environment or grant this `gh` identity reviewer access.
 
-**Conventional Commits PR titles:** `--auto` / publish may title the PR from the
-branch name. When squash uses `PR_TITLE` + `BLANK`, run
-`scripts/ensure-pr-conventional-title --pr <n>` (also invoked by
-`post-pr-submission-checks` and `wait-for-agent-review complete`) so release-please
-sees a `feat:`/`fix:`/… header. Multi-paragraph bodies: `--body-file` +
-`scripts/lint-github-markdown` (see `.agents/rules/github-content-formatting.md`).
-Issues: `scripts/gh-issue create|edit` (lint before API). Do not hand-wrap
-paragraphs — GitHub’s issue/PR UI hard-breaks on a lone newline.
+**Conventional Commits PR titles:** `--auto` / publish may title the PR from the branch name. When squash uses `PR_TITLE` + `BLANK`, run `scripts/ensure-pr-conventional-title --pr <n>` (also invoked by `post-pr-submission-checks` and `wait-for-agent-review complete`) so release-please sees a `feat:`/`fix:`/… header. Multi-paragraph bodies: `--body-file` + `scripts/lint-github-markdown` (see `.agents/rules/github-content-formatting.md`). Issues: `scripts/gh-issue create|edit` (lint before API). Do not hand-wrap paragraphs — GitHub’s issue/PR UI hard-breaks on a lone newline.
 
 On CI failure it prints:
 
@@ -89,12 +73,9 @@ On CI failure it prints:
 
 **Agent iteration loop when CI is red (including loop exit 10):**
 
-Exit **10** (`CI_FAILED`) is **coding-agent ownership**, not operator give-up — the loop does
-**not** email or post a loop-stopped comment (same as exit **3**). Retrieve failure details,
-identify a fix, push, and resume. Escalate to a human **only** when a fix cannot be identified.
+Exit **10** (`CI_FAILED`) is **coding-agent ownership**, not operator give-up — the loop does **not** email or post a loop-stopped comment (same as exit **3**). Retrieve failure details, identify a fix, push, and resume. Escalate to a human **only** when a fix cannot be identified.
 
-1. Read the failure report from `post-pr-submission-checks` (or the loop’s stderr CI lines /
-   `gh run view <id> --log-failed`).
+1. Read the failure report from `post-pr-submission-checks` (or the loop’s stderr CI lines / `gh run view <id> --log-failed`).
 2. Fix in the stack worktree; run `scripts/dev/pre-pr-checks`.
 3. Push (`gt modify` + `scripts/dev/submit-stack` or `gt submit` / `gh stack submit`).
 4. Re-run `scripts/dev/post-pr-submission-checks --pr <n>` until green.
@@ -102,34 +83,11 @@ identify a fix, push, and resume. Escalate to a human **only** when a fix cannot
 
 Do **not** skip CI monitoring with `--no-wait` / `--no-wait-ci` unless the user explicitly opts out. The agent review loop also blocks when `ci_ready` is false.
 
-**GitHub API rate limits (not CodeRabbit):** `scripts/lib/github-api-rate-limit` wraps
-agent-review / repo-practices / CI-rollup `gh` calls. On `API rate limit exceeded` /
-secondary limits / HTTP 429, helpers print `NOTE: GITHUB_RATE_LIMIT_HIT`, fetch backoff
-from `gh api --include rate_limit` headers (`Retry-After`, `X-RateLimit-Reset`), then
-`NOTE: GITHUB_RATE_LIMIT_WAIT` / `NOTE: GITHUB_RATE_LIMIT_HEADERS` and sleep until that
-deadline. Explicit secondary/abuse limits honor `Retry-After` / body “wait N minute(s)” /
-“a few minutes”, else escalate `secondary_fallback` across attempts (**60s → 180s → 300s**;
-override with `GITHUB_API_SECONDARY_RATE_LIMIT_BACKOFF_S`, repository-helpers#569). When
-REST returns 403 rate-limit wording while primary quota still looks full, helpers emit
-`NOTE: GITHUB_REST_403_QUOTA_INTACT` and use bounded exponential backoff
-(60s → 120s → 300s) instead of a fixed 60s fallback (repository-helpers#547);
-set `GITHUB_API_RATE_LIMIT_QUOTA_INTACT_FAIL_FAST=1` to skip sleep and return 125.
-Exhausted retries emit `ERROR: GITHUB_RATE_LIMIT`; wait budget expiry emits
-`ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT`. Tune with `GITHUB_API_RATE_LIMIT_MAX_RETRIES`,
-`GITHUB_API_RATE_LIMIT_MAX_WAIT_S`, `GITHUB_API_RATE_LIMIT_POLL_S`. Do **not** treat this
-as a hard local failure while NOTES show an active wait — let the wait finish, then resume.
-When GraphQL already shows unresolved review threads, `loop` exits **3** immediately and
-does **not** wait on REST issue-comment pagination, `gh api user`, or an in-flight
-CodeRabbit workflow (repository-helpers#497). Threads that appear **while** waiting
-(CodeRabbit on-push, poll sleep, or `check` exit 5) also abort with exit **3**
-(repository-helpers#501). Unaddressed comments beat waiting.
+**GitHub API rate limits (not CodeRabbit):** `scripts/lib/github-api-rate-limit` wraps agent-review / repo-practices / CI-rollup `gh` calls. On `API rate limit exceeded` / secondary limits / HTTP 429, helpers print `NOTE: GITHUB_RATE_LIMIT_HIT`, fetch backoff from `gh api --include rate_limit` headers (`Retry-After`, `X-RateLimit-Reset`), then `NOTE: GITHUB_RATE_LIMIT_WAIT` / `NOTE: GITHUB_RATE_LIMIT_HEADERS` and sleep until that deadline. Explicit secondary/abuse limits honor `Retry-After` / body “wait N minute(s)” / “a few minutes”, else escalate `secondary_fallback` across attempts (**60s → 180s → 300s**; override with `GITHUB_API_SECONDARY_RATE_LIMIT_BACKOFF_S`, repository-helpers#569). When REST returns 403 rate-limit wording while primary quota still looks full, helpers emit `NOTE: GITHUB_REST_403_QUOTA_INTACT` and use bounded exponential backoff (60s → 120s → 300s) instead of a fixed 60s fallback (repository-helpers#547); set `GITHUB_API_RATE_LIMIT_QUOTA_INTACT_FAIL_FAST=1` to skip sleep and return 125. Exhausted retries emit `ERROR: GITHUB_RATE_LIMIT`; wait budget expiry emits `ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT`. Tune with `GITHUB_API_RATE_LIMIT_MAX_RETRIES`, `GITHUB_API_RATE_LIMIT_MAX_WAIT_S`, `GITHUB_API_RATE_LIMIT_POLL_S`. Do **not** treat this as a hard local failure while NOTES show an active wait — let the wait finish, then resume. When GraphQL already shows unresolved review threads, `loop` exits **3** immediately and does **not** wait on REST issue-comment pagination, `gh api user`, or an in-flight CodeRabbit workflow (repository-helpers#497). Threads that appear **while** waiting (CodeRabbit on-push, poll sleep, or `check` exit 5) also abort with exit **3** (repository-helpers#501). Unaddressed comments beat waiting.
 
-Use `scripts/dev/ship-and-review --no-agent-review` when you only want submit + CI (no loop).
-Use `--no-submit --pr <n>` when the PR already exists (CI + loop only).
-Use `scripts/dev/submit-stack --no-wait-ci` only when CI monitoring is handled separately.
+Use `scripts/dev/ship-and-review --no-agent-review` when you only want submit + CI (no loop). Use `--no-submit --pr <n>` when the PR already exists (CI + loop only). Use `scripts/dev/submit-stack --no-wait-ci` only when CI monitoring is handled separately.
 
-Patch title/body if stale: `scripts/gh-api pr edit <n> --title … --body …`
-(route ad-hoc `gh` through `scripts/gh-api` — see `.cursor/rules/github-api-throttle.mdc`).
+Patch title/body if stale: `scripts/gh-api pr edit <n> --title … --body …` (route ad-hoc `gh` through `scripts/gh-api` — see `.cursor/rules/github-api-throttle.mdc`).
 
 ## 3. Agent review loop (cycle + PR caps)
 
@@ -141,13 +99,9 @@ Prefer the built-in loop (posts a PR comment + emails on timeout give-up):
 ./scripts/wait-for-agent-review loop --pr <n>
 ```
 
-**Early complete (nothing outstanding):** after all feedback is addressed (no pending threads, CI
-green, merge ready), the loop completes as soon as it is **not** waiting on a requested Copilot/Bugbot
-review and CodeRabbit’s workflow is **not** running. No mandatory idle dwell.
-`AGENT_REVIEW_CYCLE_TIMEOUT` is retained for compatibility only.
+**Early complete (nothing outstanding):** after all feedback is addressed (no pending threads, CI green, merge ready), the loop completes as soon as it is **not** waiting on a requested Copilot/Bugbot review and CodeRabbit’s workflow is **not** running. No mandatory idle dwell. `AGENT_REVIEW_CYCLE_TIMEOUT` is retained for compatibility only.
 
-**PR non-convergence cap:** `AGENT_REVIEW_PR_TIMEOUT` (default **12h**) — while review→fix→push
-cycles keep iterating without reaching early-complete, give up after this wall time (exit **6**).
+**PR non-convergence cap:** `AGENT_REVIEW_PR_TIMEOUT` (default **12h**) — while review→fix→push cycles keep iterating without reaching early-complete, give up after this wall time (exit **6**).
 
 Manual iteration (when `loop` exits **3** for triage):
 
@@ -161,16 +115,11 @@ Manual iteration (when `loop` exits **3** for triage):
    - Exit **4** → `restack` (below)
    - Exit **5** → fresh review but not empty yet; push fixes or wait for another review if threads are clear
    - Exit **2** → no fresh review; retry wait if cycle time remains
-   - Exit **6** → PR non-convergence timeout (`give-up` already emailed + commented; idle-success
-     exits **0** via `cmd_complete_idle`, not **6**)
+   - Exit **6** → PR non-convergence timeout (`give-up` already emailed + commented; idle-success exits **0** via `cmd_complete_idle`, not **6**)
 
 ### Triage unaddressed feedback (exit 3)
 
-Feedback may arrive as **inline review threads**, **top-level PR issue comments** (agent or
-**operator-authored** product notes), or **pull-request review bodies**. Use the same workflow:
-address → respond → resolve. Probe/bot boilerplate stays excluded; triage replies that contain
-`(In reply to <url>)` are not new pending items. A later unrelated operator comment does **not**
-clear prior feedback — the reply must cite the target comment/review URL.
+Feedback may arrive as **inline review threads**, **top-level PR issue comments** (agent or **operator-authored** product notes), or **pull-request review bodies**. Use the same workflow: address → respond → resolve. Probe/bot boilerplate stays excluded; triage replies that contain `(In reply to <url>)` are not new pending items. A later unrelated operator comment does **not** clear prior feedback — the reply must cite the target comment/review URL.
 
 List pending items:
 
@@ -200,8 +149,7 @@ For each **issue comment** (`kind: issue_comment` in `list-feedback`):
    ./scripts/wait-for-agent-review resolve-comment --comment-id <id> --pr <n>
    ```
 
-For each **pull request review body** (`kind: pull_request_review` — findings only in the
-review summary, e.g. “outside changed lines”, with no inline threads):
+For each **pull request review body** (`kind: pull_request_review` — findings only in the review summary, e.g. “outside changed lines”, with no inline threads):
 
 1. Fix or skip with rationale as above.
 2. **Reply** with a top-level PR comment referencing the review:
@@ -239,9 +187,7 @@ Two success paths:
 
 Both paths **email `AGENT_REVIEW_REPORT_TO`** when configured. They do **not** run `gh pr review --approve` (self-approve often fails for the PR author and is unnecessary).
 
-Do **not** add `merge-it` unless the user explicitly confirms. Org merge path is
-GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge) when the
-operator asks to merge.
+Do **not** add `merge-it` unless the user explicitly confirms. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge) when the operator asks to merge.
 
 ### Failure (PR non-convergence timeout, exit 6)
 
@@ -263,36 +209,13 @@ Daily quota caches (local calendar day) live under `~/scratch/repository-helpers
 
 When an agent is **exhausted** for the day, `loop` skips waiting on it and probes the next agent in **`AGENT_REVIEW_QUOTA_FALLBACK_CHAIN`** (default `coderabbit,copilot,bugbot`). When **all** agents in the chain are exhausted, `request` / `loop` exit **7** (give-up email + PR comment).
 
-**CodeRabbit is on_push:** a new push starts CodeRabbit — never post `@coderabbitai review`.
-If quota-limited, wait the cooldown with **poll-while-rate-limited** feedback polls
-(`AGENT_REVIEW_CODERABBIT_RATE_LIMIT_POLL`, default **60s**; ceiling
-`AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX`, default 60m; issues #366 / #369), then
-`AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE` (default **60s**); only then, if still no real
-review on head, the loop may post a one-shot `@coderabbitai full review` (idempotent per head).
-**While CodeRabbit is rate-limited**, the loop still **requests the next nudge agent**
-(Copilot, then Bugbot) so a mid-cooldown sign-off can clear the wait without a manual
-`AGENT_REVIEW_AGENT=copilot request` (issue #460). That mid-cooldown nudge does **not**
-set the host-wide per-day `probe_attempted` marker, so a later episode the same day can
-still probe Copilot instead of escalating past it to Bugbot. Prefer CodeRabbit when it
-can deliver; Copilot is a fallback unblock, not a permanent replacement.
-**When CodeRabbit says wait** (“More reviews will be available in N minutes”), do **not**
-re-ask — keep waiting until `retry_after`; the full-review helper hard-refuses while
-rate-limited. Rate-limit stubs are not reviews. Mid-cooldown human/agent feedback wakes
-the loop (exit **3**).
+**CodeRabbit is on_push:** a new push starts CodeRabbit — never post `@coderabbitai review`. If quota-limited, wait the cooldown with **poll-while-rate-limited** feedback polls (`AGENT_REVIEW_CODERABBIT_RATE_LIMIT_POLL`, default **60s**; ceiling `AGENT_REVIEW_CODERABBIT_RATE_LIMIT_WAIT_MAX`, default 60m; issues #366 / #369), then `AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE` (default **60s**); only then, if still no real review on head, the loop may post a one-shot `@coderabbitai full review` (idempotent per head). **While CodeRabbit is rate-limited**, the loop still **requests the next nudge agent** (Copilot, then Bugbot) so a mid-cooldown sign-off can clear the wait without a manual `AGENT_REVIEW_AGENT=copilot request` (issue #460). That mid-cooldown nudge does **not** set the host-wide per-day `probe_attempted` marker, so a later episode the same day can still probe Copilot instead of escalating past it to Bugbot. Prefer CodeRabbit when it can deliver; Copilot is a fallback unblock, not a permanent replacement. **When CodeRabbit says wait** (“More reviews will be available in N minutes”), do **not** re-ask — keep waiting until `retry_after`; the full-review helper hard-refuses while rate-limited. Rate-limit stubs are not reviews. Mid-cooldown human/agent feedback wakes the loop (exit **3**).
 
-CodeRabbit runs via its GitHub App / Actions after pushes. Copilot and Bugbot are probed with
-explicit review requests on new PR heads when quota is unknown.
+CodeRabbit runs via its GitHub App / Actions after pushes. Copilot and Bugbot are probed with explicit review requests on new PR heads when quota is unknown.
 
-**Copilot code review vs coding agent:** request Copilot via REST
-`requested_reviewers` with `copilot-pull-request-reviewer` (equivalent to
-`gh pr edit <n> --add-reviewer '@copilot'`). Never `@copilot` issue comments or
-`--add-assignee '@copilot'` from the loop — those start the **coding agent**
-(commits / `copilot_work_*`), not code review (`repository-helpers#461`).
+**Copilot code review vs coding agent:** request Copilot via REST `requested_reviewers` with `copilot-pull-request-reviewer` (equivalent to `gh pr edit <n> --add-reviewer '@copilot'`). Never `@copilot` issue comments or `--add-assignee '@copilot'` from the loop — those start the **coding agent** (commits / `copilot_work_*`), not code review (`repository-helpers#461`).
 
-**Copilot timeline failures:** credit exhaustion sometimes appears only as a PR timeline event
-`copilot_work_finished_failure` (GitHub App `copilot-swe-agent`) with no issue comment or review
-body. Quota observe scans that timeline event for the local calendar day. Non-quota work failures
-of the same event type also mark Copilot exhausted for the day (acceptable for skip caches).
+**Copilot timeline failures:** credit exhaustion sometimes appears only as a PR timeline event `copilot_work_finished_failure` (GitHub App `copilot-swe-agent`) with no issue comment or review body. Quota observe scans that timeline event for the local calendar day. Non-quota work failures of the same event type also mark Copilot exhausted for the day (acceptable for skip caches).
 
 **Bugbot** completion is detected via the **`Cursor Bugbot`** GitHub check on the PR head. The check **conclusion** and **output** (summary/text) drive status:
 

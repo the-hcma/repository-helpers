@@ -1,11 +1,6 @@
 # Copilot Instructions
 
-> Full coding standards, conventions, and CI requirements are in [AGENTS.md](../AGENTS.md).
-> Stacking tool: [`.cursor/rules/stacking-tool.mdc`](../.cursor/rules/stacking-tool.mdc) (read `.github/stacking-tool`).
-> Graphite skill: [`.agents/skills/graphite/SKILL.md`](../.agents/skills/graphite/SKILL.md).
-> gh-stack skill: [`.agents/skills/gh-stack/SKILL.md`](../.agents/skills/gh-stack/SKILL.md).
-> PR ship and agent review loop: [`.agents/skills/ship-and-review/SKILL.md`](../.agents/skills/ship-and-review/SKILL.md)
-> (thin contract: [`.cursor/rules/pr-ship-and-review.mdc`](../.cursor/rules/pr-ship-and-review.mdc)).
+> Full coding standards, conventions, and CI requirements are in [AGENTS.md](../AGENTS.md). Stacking tool: [`.cursor/rules/stacking-tool.mdc`](../.cursor/rules/stacking-tool.mdc) (read `.github/stacking-tool`). Graphite skill: [`.agents/skills/graphite/SKILL.md`](../.agents/skills/graphite/SKILL.md). gh-stack skill: [`.agents/skills/gh-stack/SKILL.md`](../.agents/skills/gh-stack/SKILL.md). PR ship and agent review loop: [`.agents/skills/ship-and-review/SKILL.md`](../.agents/skills/ship-and-review/SKILL.md) (thin contract: [`.cursor/rules/pr-ship-and-review.mdc`](../.cursor/rules/pr-ship-and-review.mdc)).
 
 ## Starting New Work
 
@@ -16,9 +11,7 @@ scripts/dev/start-development --worktree <stack-name> --no-interactive
 cd .worktrees/<stack-name>-wt
 ```
 
-This is the single entry point for new work. It prunes stale worktrees, syncs per
-`.github/stacking-tool`, and creates or resumes a stack worktree. Do not implement on
-the primary clone (`main` worktree).
+This is the single entry point for new work. It prunes stale worktrees, syncs per `.github/stacking-tool`, and creates or resumes a stack worktree. Do not implement on the primary clone (`main` worktree).
 
 ## Key Rules (Quick Reference)
 
@@ -29,11 +22,8 @@ the primary clone (`main` worktree).
 - Declare `local` / `readonly` separately from command substitutions (SC2155).
 - Never declare `local -r` inside a loop body.
 - Every behaviour change or bug fix must have a test in `tests/`.
-- Never push directly to `main`. Create a stack layer per `.github/stacking-tool`
-  (`gt create` when `graphite`, `gh stack init` / `gh stack add` when `gh-stack`),
-  then `scripts/dev/submit-stack`.
-- To merge a PR: `gh pr merge --auto --squash` (Enable auto-merge / GitHub merge
-  queue — org default). Do not use `merge-it` to land PRs.
+- Never push directly to `main`. Create a stack layer per `.github/stacking-tool` (`gt create` when `graphite`, `gh stack init` / `gh stack add` when `gh-stack`), then `scripts/dev/submit-stack`.
+- To merge a PR: `gh pr merge --auto --squash` (Enable auto-merge / GitHub merge queue — org default). Do not use `merge-it` to land PRs.
 
 ## Submit and ship
 
@@ -53,6 +43,4 @@ scripts/wait-for-agent-review loop --pr <n>    # when CI is green
 
 After every later push, re-run `scripts/dev/post-pr-submission-checks --pr <n>` before agent review.
 
-Read **`.agents/skills/ship-and-review/SKILL.md`** before the agent review loop. The loop uses
-**early-complete** when nothing is outstanding and a **12h** PR non-convergence cap. Reply
-on-thread before resolving agent threads (exit **3** if missing). See `etc/agent-review.env.example`.
+Read **`.agents/skills/ship-and-review/SKILL.md`** before the agent review loop. The loop uses **early-complete** when nothing is outstanding and a **12h** PR non-convergence cap. Reply on-thread before resolving agent threads (exit **3** if missing). See `etc/agent-review.env.example`.
