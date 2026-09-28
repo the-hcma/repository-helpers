@@ -1349,6 +1349,189 @@ else
 fi
 rm -rf "$mock_bin"
 
+printf '\n=== behavioural: header-reported depletion wins over a failing /rate_limit probe ===\n'
+# A virtual clock (MOCK_CLOCK file) advances only when the waiter sleeps. The mock
+# gh serves `--include rate_limit` headers from MOCK_RL_HEADERS (exit MOCK_RL_EXIT,
+# 1 = the 403 the real endpoint can return while depleted), answers `--jq` probes
+# per MOCK_PROBE (fail|true), and fails `gh api user` with the primary-limit 403
+# until the clock reaches MOCK_USER_OK_AT.
+mock_bin="$(mktemp -d)"
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *'rate_limit'* ]]; then
+  if [[ "$*" == *'--include'* ]]; then
+    printf '%b' "${MOCK_RL_HEADERS:-}"
+    exit "${MOCK_RL_EXIT:-0}"
+  fi
+  if [[ "${MOCK_PROBE:-fail}" == 'true' ]]; then
+    printf 'true\n'
+    exit 0
+  fi
+  printf 'gh: API rate limit exceeded for user ID 9 (HTTP 403)\n' >&2
+  exit 1
+fi
+printf 'x\n' >>"${MOCK_USER_CALLS:?}"
+if (( $(cat "${MOCK_CLOCK:?}") < ${MOCK_USER_OK_AT:-0} )); then
+  printf 'gh: API rate limit exceeded for user ID 9 (HTTP 403)\n' >&2
+  exit 1
+fi
+printf '{"login":"ok"}\n'
+EOF
+chmod +x "${mock_bin}/gh"
+
+# run_rl_case <bash-snippet>: sources the lib with a virtual clock and sleep stub.
+run_rl_case() {
+  PATH="${mock_bin}:$(dirname "$BASH"):/usr/bin:/bin" bash -c '
+    root="$1"; snippet="$2"
+    source "${root}/scripts/lib/runner-bootstrap"
+    source "${root}/scripts/lib/github-api-rate-limit"
+    date() {
+      if [[ "${1:-}" == "+%s" ]]; then cat "$MOCK_CLOCK"; else command date "$@"; fi
+    }
+    run_command() {
+      local label="$1"; shift
+      if [[ "${1:-}" == "--timeout" ]]; then shift 2; fi
+      if [[ "${1:-}" == "sleep" ]]; then
+        printf "%s" "$(( $(cat "$MOCK_CLOCK") + $2 ))" >"$MOCK_CLOCK"
+        return 0
+      fi
+      "$@"
+    }
+    github_api_rate_limit_poll_s=30
+    eval "$snippet"
+  ' bash "$root" "$1" 2>&1
+}
+
+export MOCK_CLOCK MOCK_USER_CALLS MOCK_RL_HEADERS MOCK_RL_EXIT MOCK_PROBE MOCK_USER_OK_AT
+MOCK_CLOCK="$(mktemp)"
+MOCK_USER_CALLS="$(mktemp)"
+depleted_headers='HTTP/2.0 403 Forbidden\r\nX-RateLimit-Limit: 5000\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1700000500\r\nX-RateLimit-Resource: core\r\n\r\n{"message":"API rate limit exceeded"}'
+
+# 1. The CI incident: probe fails, headers say remaining=0 until +500s.
+printf '1700000000' >"$MOCK_CLOCK"
+MOCK_RL_HEADERS="$depleted_headers"; MOCK_RL_EXIT=1; MOCK_PROBE=fail
+set +e
+out="$(run_rl_case 'ec=0; github_api_wait_for_rate_limit "API rate limit exceeded for user ID 9" "" 1 || ec=$?; printf "EC=%s\n" "$ec"')"
+set -e
+if grep -qF 'EC=0' <<<"$out" \
+  && grep -qF 'x_ratelimit_reset=1700000500 remaining=0 resource=core' <<<"$out" \
+  && grep -qF 'NOTE: GITHUB_RATE_LIMIT_CLEAR header_reset_reached' <<<"$out" \
+  && ! grep -qF 'QUOTA_INTACT' <<<"$out" \
+  && (( $(cat "$MOCK_CLOCK") >= 1700000502 )); then
+  pass_case "failing probe + remaining=0 headers waits until X-RateLimit-Reset (+cushion), no QUOTA_INTACT ladder"
+else
+  fail_case "header-depleted wait with failing probe (clock=$(cat "$MOCK_CLOCK"))"
+  printf '%s\n' "$out"
+fi
+
+# 2. Headers still win when the probe misleadingly reports quota available.
+printf '1700000000' >"$MOCK_CLOCK"
+MOCK_PROBE=true
+set +e
+out="$(run_rl_case 'ec=0; github_api_wait_for_rate_limit "API rate limit exceeded for user ID 9" "" 1 || ec=$?; printf "EC=%s\n" "$ec"')"
+set -e
+if grep -qF 'EC=0' <<<"$out" && ! grep -qF 'QUOTA_INTACT' <<<"$out" \
+  && ! grep -qF 'remaining_ok' <<<"$out" \
+  && (( $(cat "$MOCK_CLOCK") >= 1700000502 )); then
+  pass_case "remaining=0 headers win over a probe that reports quota available"
+else
+  fail_case "headers vs misleading probe (clock=$(cat "$MOCK_CLOCK"))"
+  printf '%s\n' "$out"
+fi
+
+# 3. Headers with remaining>0 keep the #547 quota-intact ladder.
+printf '1700000000' >"$MOCK_CLOCK"
+MOCK_RL_HEADERS='HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 4000\r\nX-RateLimit-Reset: 1700003000\r\nX-RateLimit-Resource: core\r\n\r\n{}'
+MOCK_RL_EXIT=0; MOCK_PROBE=fail
+set +e
+out="$(run_rl_case 'ec=0; github_api_wait_for_rate_limit "API rate limit exceeded for user ID 9" "" 1 || ec=$?; printf "EC=%s\n" "$ec"')"
+set -e
+if grep -qF 'EC=0' <<<"$out" \
+  && grep -qF 'remaining=4000 resource=core' <<<"$out" \
+  && grep -qF 'NOTE: GITHUB_REST_403_QUOTA_INTACT attempt=1 backoff=60s' <<<"$out"; then
+  pass_case "remaining>0 headers keep the quota-intact ladder and log remaining/resource"
+else
+  fail_case "remaining>0 ladder regression"
+  printf '%s\n' "$out"
+fi
+
+# 4. Reset already passed: clear immediately, no sleep.
+printf '1700000600' >"$MOCK_CLOCK"
+MOCK_RL_HEADERS="$depleted_headers"; MOCK_RL_EXIT=1
+set +e
+out="$(run_rl_case 'ec=0; github_api_wait_for_rate_limit "API rate limit exceeded for user ID 9" "" 1 || ec=$?; printf "EC=%s\n" "$ec"')"
+set -e
+if grep -qF 'EC=0' <<<"$out" && grep -qF 'header_reset_reached waited=0s' <<<"$out" \
+  && [[ "$(cat "$MOCK_CLOCK")" == '1700000600' ]]; then
+  pass_case "reset already elapsed clears immediately without sleeping"
+else
+  fail_case "elapsed reset handling (clock=$(cat "$MOCK_CLOCK"))"
+  printf '%s\n' "$out"
+fi
+
+# 5. Reset beyond the wait budget: deterministic WAIT_TIMEOUT.
+printf '1700000000' >"$MOCK_CLOCK"
+set +e
+out="$(run_rl_case 'github_api_rate_limit_max_wait_s=120; ec=0; github_api_wait_for_rate_limit "API rate limit exceeded for user ID 9" "" 1 || ec=$?; printf "EC=%s\n" "$ec"')"
+set -e
+if grep -qF 'EC=124' <<<"$out" && grep -qF 'ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT timeout=120s' <<<"$out"; then
+  pass_case "header reset beyond max_wait returns WAIT_TIMEOUT (124)"
+else
+  fail_case "header reset beyond max_wait"
+  printf '%s\n' "$out"
+fi
+
+# 6. Non-core resource headers are not treated as core depletion; last block wins.
+multi='HTTP/1.1 301 Moved\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1700000500\r\n\r\nHTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 12\r\nX-RateLimit-Reset: 1700000500\r\n\r\n{}'
+graphql='HTTP/2.0 403\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1700000500\r\nX-RateLimit-Resource: graphql\r\n\r\n{}'
+if github_api_headers_depleted_reset_epoch "$(printf '%b' "$depleted_headers")" >/dev/null \
+  && [[ "$(github_api_headers_depleted_reset_epoch "$(printf '%b' "$depleted_headers")")" == '1700000500' ]] \
+  && ! github_api_headers_depleted_reset_epoch "$(printf '%b' "$multi")" >/dev/null \
+  && ! github_api_headers_depleted_reset_epoch "$(printf '%b' "$graphql")" >/dev/null \
+  && ! github_api_headers_depleted_reset_epoch '' >/dev/null; then
+  pass_case "depletion parse: core remaining=0 only, last HTTP response block wins, empty headers are not depletion"
+else
+  fail_case "github_api_headers_depleted_reset_epoch parsing"
+fi
+
+# 7. End to end: gh api user 403s until the reset; one wait, then success.
+printf '1700000000' >"$MOCK_CLOCK"
+: >"$MOCK_USER_CALLS"
+MOCK_RL_HEADERS="$depleted_headers"; MOCK_RL_EXIT=1; MOCK_PROBE=fail; MOCK_USER_OK_AT=1700000500
+set +e
+out="$(run_rl_case 'ec=0; github_api_exec_with_rate_limit_retry "test-header-depleted" -- gh api user || ec=$?; printf "EC=%s\n" "$ec"')"
+set -e
+user_calls="$(wc -l <"$MOCK_USER_CALLS" | tr -d ' ')"
+if grep -qF 'EC=0' <<<"$out" && grep -qF '{"login":"ok"}' <<<"$out" \
+  && [[ "$user_calls" == '2' ]] && ! grep -qF 'QUOTA_INTACT' <<<"$out"; then
+  pass_case "exec retries once after the header-reported reset and succeeds (the #681 CI incident)"
+else
+  fail_case "end-to-end header-depleted retry (calls=${user_calls})"
+  printf '%s\n' "$out"
+fi
+
+# 8. Final attempt with depleted headers stays fail-closed (no extra wait/re-run)
+#    even though the probe fails.
+printf '1700000000' >"$MOCK_CLOCK"
+: >"$MOCK_USER_CALLS"
+MOCK_USER_OK_AT=1800000000
+set +e
+out="$(run_rl_case 'GITHUB_API_RATE_LIMIT_MAX_RETRIES=2 ec=0; github_api_exec_with_rate_limit_retry "test-final-depleted" -- gh api user || ec=$?; printf "EC=%s\n" "$ec"')"
+set -e
+user_calls="$(wc -l <"$MOCK_USER_CALLS" | tr -d ' ')"
+if grep -qF 'ERROR: GITHUB_RATE_LIMIT label=test-final-depleted' <<<"$out" \
+  && grep -qE 'EC=[1-9]' <<<"$out" && [[ "$user_calls" == '2' ]] \
+  && ! grep -qF 'QUOTA_INTACT' <<<"$out"; then
+  pass_case "final attempt with remaining=0 headers fails closed instead of a probe-driven quota-intact re-run"
+else
+  fail_case "final-attempt header-depleted policy (calls=${user_calls})"
+  printf '%s\n' "$out"
+fi
+
+rm -rf "$mock_bin" "$MOCK_CLOCK" "$MOCK_USER_CALLS"
+unset MOCK_CLOCK MOCK_USER_CALLS MOCK_RL_HEADERS MOCK_RL_EXIT MOCK_PROBE MOCK_USER_OK_AT
+
 printf '\n=== skill docs mention GitHub API rate limits ===\n'
 skill="${root}/.agents/skills/ship-and-review/SKILL.md"
 if grep -qF 'GitHub API rate limit' "$skill"; then
