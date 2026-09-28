@@ -42,6 +42,18 @@ commit_all() {
   )
 }
 
+assert_str_eq() {
+  local -r label="$1"
+  local -r expected="$2"
+  local -r actual="$3"
+  if [[ "$expected" == "$actual" ]]; then
+    pass_case "$label"
+  else
+    printf '[FAIL] %s: expected %q, got %q\n' "$label" "$expected" "$actual" >&2
+    fail_case "$label"
+  fi
+}
+
 printf '\n=== static: pre-pr-ecosystem conventions ===\n'
 if head -1 "$ecosystem_lib" | grep -qF '# shellcheck shell=bash'; then
   pass_case 'ecosystem lib: shellcheck shell=bash'
@@ -463,6 +475,93 @@ if grep -qF 'prec_should_plan_repo_practices_lint' "$ecosystem_lib" \
   pass_case 'repo-practices-lint detect-first wiring in ecosystem and pre-pr-checks'
 else
   fail_case 'repo-practices-lint detect-first wiring in ecosystem and pre-pr-checks'
+fi
+
+printf '\n=== markdown-wrap planning and execution (repository-helpers#671) ===\n'
+md_fix="$(mktemp -d "${TMPDIR:-/tmp}/prec-md-wrap.XXXXXX")"
+make_git_fixture "$md_fix"
+printf '%s\n' '# Legacy' '' 'Old wrapped' 'paragraph left alone.' >"${md_fix}/LEGACY.md"
+printf '%s\n' '# Doc' '' 'One line.' >"${md_fix}/doc.md"
+printf '%s\n' '# Gone' >"${md_fix}/gone.md"
+printf 'x\n' >"${md_fix}/notes.txt"
+commit_all "$md_fix"
+(
+  cd "$md_fix"
+  git branch -M main
+  git checkout -q -b feat/docs
+  printf 'y\n' >>notes.txt
+)
+if ! prec_should_plan_markdown_wrap "$md_fix"; then
+  pass_case 'markdown-wrap not planned when no .md file changed'
+else
+  fail_case 'markdown-wrap not planned when no .md file changed'
+fi
+(cd "$md_fix" && git rm -q gone.md)
+if ! prec_should_plan_markdown_wrap "$md_fix"; then
+  pass_case 'markdown-wrap not planned when the only .md change is a deletion'
+else
+  fail_case 'markdown-wrap not planned when the only .md change is a deletion'
+fi
+printf '%s\n' 'Added text that is' 'hard wrapped.' >>"${md_fix}/doc.md"
+if prec_should_plan_markdown_wrap "$md_fix"; then
+  pass_case 'markdown-wrap planned when a .md file changed'
+else
+  fail_case 'markdown-wrap planned when a .md file changed'
+fi
+md_changed=()
+prec_collect_changed_markdown_files "$md_fix" md_changed
+assert_str_eq 'changed Markdown list holds only the edited existing file' \
+  'doc.md' "${md_changed[*]}"
+md_rc=0
+md_out="$(prec_run_markdown_wrap "$md_fix" 2>&1)" || md_rc=$?
+assert_exit_nonzero 'markdown-wrap fails on a hard-wrapped changed file' "$md_out" "$md_rc"
+assert_contains 'markdown-wrap names the changed file' "$md_out" 'GITHUB_MARKDOWN_WRAP path='
+assert_contains 'markdown-wrap prints the --fix hint' "$md_out" 'lint-github-markdown --repo-files --fix'
+assert_not_contains 'markdown-wrap ignores unchanged wrapped files' "$md_out" 'LEGACY.md'
+# shellcheck disable=SC2034 # array is read by prec_job_is_planned inside prec_apply_formatters
+prec_planned_jobs=('markdown-wrap')
+md_rc=0
+md_out="$(prec_apply_formatters "$md_fix" 2>&1)" || md_rc=$?
+assert_exit_0 'format apply unwraps changed Markdown' "$md_out" "$md_rc"
+assert_str_eq 'format apply joined the wrapped paragraph' \
+  $'# Doc\n\nOne line. Added text that is hard wrapped.' "$(<"${md_fix}/doc.md")"
+assert_str_eq 'format apply left the unchanged legacy file alone' \
+  $'# Legacy\n\nOld wrapped\nparagraph left alone.' "$(<"${md_fix}/LEGACY.md")"
+md_rc=0
+md_out="$(prec_run_markdown_wrap "$md_fix" 2>&1)" || md_rc=$?
+assert_exit_0 'markdown-wrap passes after format apply' "$md_out" "$md_rc"
+md_outside="$(mktemp "${TMPDIR:-/tmp}/prec-md-outside.XXXXXX")"
+printf '%s\n' 'Outside text that is' 'hard wrapped.' >"$md_outside"
+ln -s "$md_outside" "${md_fix}/link.md"
+printf '%s\n' '# Café' >"${md_fix}/Café.md"
+(cd "$md_fix" && git add link.md Café.md)
+md_changed=()
+prec_collect_changed_markdown_files "$md_fix" md_changed
+assert_contains 'changed Markdown list keeps a non-ASCII file name unquoted' \
+  "${md_changed[*]}" 'Café.md'
+assert_not_contains 'changed Markdown list skips a symlinked .md file' "${md_changed[*]}" 'link.md'
+md_rc=0
+md_out="$(
+  # shellcheck disable=SC2329 # stub is called indirectly by prec_unwrap_changed_markdown
+  ghm_unwrap_file() { return 1; }
+  prec_apply_formatters "$md_fix" 2>&1
+)" || md_rc=$?
+assert_exit_nonzero 'format apply fails when a Markdown unwrap fails' "$md_out" "$md_rc"
+assert_contains 'format apply reports the failed unwrap' "$md_out" 'could not unwrap every changed Markdown file'
+assert_not_contains 'format apply does not claim success after a failed unwrap' \
+  "$md_out" 'unwrapped hard line breaks in'
+rm -rf "$md_fix" "$md_outside"
+
+printf '\n=== static: markdown-wrap wiring ===\n'
+if grep -qF 'prec_should_plan_markdown_wrap' "$ecosystem_lib" \
+  && grep -qF "prec_plan_add_job 'markdown-wrap'" "$ecosystem_lib" \
+  && grep -qF "markdown-wrap) start_parallel_job 'markdown-wrap' prec_run_markdown_wrap" "$pre_pr_checks" \
+  && grep -qF 'PRE_PR_CHECKS_SKIP=markdown-wrap' "$pre_pr_checks" \
+  && grep -qF 'PRE_PR_CHECKS_SKIP=markdown-wrap' "${rh_root}/AGENTS.md" \
+  && grep -qF 'markdown-wrap' "${rh_root}/.agents/rules/github-content-formatting.md"; then
+  pass_case 'markdown-wrap detect-first wiring in ecosystem, pre-pr-checks, AGENTS.md and rule'
+else
+  fail_case 'markdown-wrap detect-first wiring in ecosystem, pre-pr-checks, AGENTS.md and rule'
 fi
 
 printf '\n=== static: secret-scan wiring ===\n'

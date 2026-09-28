@@ -13,6 +13,8 @@ readonly _prec_lib_dir
 # shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
 source "${_prec_lib_dir}/runner-ensure"
 # shellcheck disable=SC1091
+source "${_prec_lib_dir}/github-markdown"
+# shellcheck disable=SC1091
 source "${_prec_lib_dir}/github-repo-slug"
 # shellcheck disable=SC1091
 source "${_prec_lib_dir}/pre-pr-verified-commits"
@@ -314,6 +316,10 @@ prec_detect_profile() {
     prec_detected+=('repo-practices')
     prec_plan_add_job 'repo-practices-lint'
   fi
+  if prec_should_plan_markdown_wrap "$root"; then
+    prec_detected+=('markdown')
+    prec_plan_add_job 'markdown-wrap'
+  fi
   if prec_should_plan_secret_scan "$root"; then
     prec_detected+=('secret-scan')
     prec_plan_add_job 'secret-scan'
@@ -408,7 +414,7 @@ prec_git_diff_name_only_for_repo_practices() {
 
   if [[ -n "$ref" ]]; then
     runner_exec_stdout "prec git diff name-only vs ${ref}" \
-      -- git -C "$root" diff --name-only "${ref}...HEAD" \
+      -- git -C "$root" -c core.quotePath=false diff --name-only "${ref}...HEAD" \
       || diff_exit_code=$?
     if (( diff_exit_code != 0 )); then
       printf '==> warn: git diff vs %s failed (exit %s); using working-tree diff only\n' \
@@ -417,10 +423,10 @@ prec_git_diff_name_only_for_repo_practices() {
   fi
 
   runner_exec_stdout "prec git diff name-only working tree" \
-    -- git -C "$root" diff --name-only HEAD \
+    -- git -C "$root" -c core.quotePath=false diff --name-only HEAD \
     || true
   runner_exec_stdout "prec git diff name-only cached" \
-    -- git -C "$root" diff --name-only --cached HEAD \
+    -- git -C "$root" -c core.quotePath=false diff --name-only --cached HEAD \
     || true
 }
 
@@ -590,6 +596,71 @@ prec_should_plan_repo_practices_lint() {
   return 0
 }
 
+# prec_collect_changed_markdown_files <repo_root> <out_array_name>
+# Appends existing *.md paths (relative to repo_root) changed on the branch vs
+# main or in the working tree; deleted files and symlinks are skipped so --fix
+# never writes outside the listed regular files.
+prec_collect_changed_markdown_files() {
+  local -r root="$1"
+  local -n _prec_md_out=$2
+  local -A md_seen=()
+  local line relpath
+
+  while IFS= read -r line; do
+    relpath="${line#./}"
+    if [[ "$relpath" != *.md || -L "${root}/${relpath}" || ! -f "${root}/${relpath}" \
+      || -n "${md_seen[$relpath]:-}" ]]; then
+      continue
+    fi
+    md_seen[$relpath]=1
+    _prec_md_out+=("$relpath")
+  done < <(prec_git_diff_name_only_for_repo_practices "$root")
+}
+
+# Plan markdown-wrap when the branch changes at least one Markdown file.
+prec_should_plan_markdown_wrap() {
+  local -r root="$1"
+  local -a files=()
+
+  prec_collect_changed_markdown_files "$root" files
+  [[ "${#files[@]}" -gt 0 ]]
+}
+
+# Flag hard line breaks inside paragraphs, list items and blockquotes of the
+# changed Markdown files (repository-helpers#671).
+prec_run_markdown_wrap() {
+  local -r root="$1"
+  local -a files=()
+  local relpath rc=0
+
+  prec_collect_changed_markdown_files "$root" files
+  for relpath in "${files[@]+"${files[@]}"}"; do
+    ghm_lint_repo_file "${root}/${relpath}" || rc=1
+  done
+  if (( rc != 0 )); then
+    printf '==> fix: scripts/lint-github-markdown --repo-files --fix <file.md>… (or scripts/dev/pre-pr-checks --fix), then commit\n' >&2
+  fi
+  return "$rc"
+}
+
+# Join hard-wrapped lines in the changed Markdown files in place (--fix).
+prec_unwrap_changed_markdown() {
+  local -r root="$1"
+  local -a files=()
+  local relpath rc=0
+
+  prec_collect_changed_markdown_files "$root" files
+  for relpath in "${files[@]+"${files[@]}"}"; do
+    ghm_unwrap_file "${root}/${relpath}" || rc=1
+  done
+  if (( rc != 0 )); then
+    printf 'ERROR: format apply: could not unwrap every changed Markdown file (see above)\n' >&2
+    return "$rc"
+  fi
+  printf '==> format apply: unwrapped hard line breaks in %s changed Markdown file(s)\n' \
+    "${#files[@]}" >&2
+}
+
 # Plan secret-scan only when a runnable entry point exists in the check-root
 # (.github/ci/secret-scan or scripts/dev/secret-scan). Do not plan on
 # scripts/lib/ci-secret-scan alone — that path cannot execute without a wrapper.
@@ -709,8 +780,14 @@ prec_apply_formatters() {
     )
     applied=1
   fi
+  if prec_job_is_planned 'markdown-wrap'; then
+    if ! prec_unwrap_changed_markdown "$root"; then
+      return 1
+    fi
+    applied=1
+  fi
   if [[ "$applied" -eq 0 ]]; then
-    printf '==> format apply: no python-static/cargo-fmt jobs planned; nothing to apply\n' >&2
+    printf '==> format apply: no python-static/cargo-fmt/markdown-wrap jobs planned; nothing to apply\n' >&2
   else
     # shellcheck disable=SC2034  # read by pre-pr-checks warn_if_format_left_dirty
     prec_formatters_applied=1

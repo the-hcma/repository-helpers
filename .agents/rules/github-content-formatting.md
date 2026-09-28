@@ -70,6 +70,8 @@ scripts/lint-github-markdown --repo-files --fix <file.md>…
 
 `--repo-files` flags only hard line breaks inside a paragraph, list item or blockquote. It skips front matter, code, tables, headings and HTML, and the body-only checks above do not apply.
 
+`scripts/dev/pre-pr-checks` runs the same check on the `.md` files the branch changes (the `markdown-wrap` job), and `scripts/dev/pre-pr-checks --fix` unwraps them.
+
 ## Scope
 
 Applies to issue bodies, PR descriptions, and PR/review comments or replies posted by an agent — same “validate before it ships” principle as Conventional Commits PR titles (see `.agents/rules/pr-ship-and-review.md`) — and to Markdown files committed to a repository (see above).

@@ -503,6 +503,7 @@ Service repositories install via `scripts/setup-service` and optionally implemen
   - **Rust** (`Cargo.toml`): `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`
   - **Secret scan**: when `.github/ci/secret-scan` or `scripts/dev/secret-scan` is present — runs canonical gitleaks (`scripts/lib/ci-secret-scan`) before submit (branch-vs-`main` range when possible). CI `secret-scan` remains post-push triage; this is the submit-path gate (see also deep/org scan #509 — TruffleHog via `scripts/secret-audit` / [docs/secret-audit-trufflehog.md](./docs/secret-audit-trufflehog.md)). Skip with `PRE_PR_CHECKS_SKIP=secret-scan`. Manual: `scripts/dev/secret-scan`.
   - **Verified commits**: when the branch has commits ahead of `main`/`origin/main` — `git verify-commit` locally, plus GitHub `verification.verified` when an upstream exists (bot authors skipped). Skip with `PRE_PR_CHECKS_SKIP=verified-commits`.
+  - **Markdown wrap**: when the branch changes `*.md` files — flags hard line breaks inside paragraphs, list items and blockquotes (`scripts/lint-github-markdown --repo-files`; see `.agents/rules/github-content-formatting.md`). `--fix` unwraps them. Skip with `PRE_PR_CHECKS_SKIP=markdown-wrap`.
   - Escape hatch: `PRE_PR_CHECKS_SKIP=job1,job2` (documented; no silent skip). Do **not** bypass a failing run with ad-hoc substitutes.
   - Also verifies the **primary worktree** is unchanged when checks finish.
 - Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).
