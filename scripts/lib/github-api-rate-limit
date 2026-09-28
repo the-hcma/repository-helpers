@@ -42,6 +42,7 @@ github_api_rate_limit_max_retries="${GITHUB_API_RATE_LIMIT_MAX_RETRIES:-3}"
 github_api_rate_limit_max_wait_s="${GITHUB_API_RATE_LIMIT_MAX_WAIT_S:-3600}"
 github_api_rate_limit_poll_s="${GITHUB_API_RATE_LIMIT_POLL_S:-30}"
 github_api_rate_limit_retry_sleep_s="${GITHUB_API_RATE_LIMIT_RETRY_SLEEP_S:-60}"
+github_api_rate_limit_reset_cushion_s=2
 
 # Effective max retries: re-read GITHUB_API_RATE_LIMIT_MAX_RETRIES on each exec so
 # per-call env prefixes (e.g. GITHUB_API_RATE_LIMIT_MAX_RETRIES=1 cmd) work without
@@ -337,16 +338,26 @@ github_api_exec_with_rate_limit_retry() {
     # (repository-helpers#547 / #569). Ordinary primary-depleted stays
     # fail-closed on the last attempt without an extra up-to-max_wait stall.
     should_wait=0
+    headers=''
     if (( attempt < max_retries )); then
       should_wait=1
     elif (( max_retries > 1 && attempt == max_retries )); then
-      if github_api_detail_is_secondary_rate_limited "$detail" \
-        || _github_api_quota_intact_suspect; then
+      if github_api_detail_is_secondary_rate_limited "$detail"; then
         should_wait=1
+      else
+        # Headers reporting remaining=0 are ordinary primary depletion even when
+        # the /rate_limit probe fails (it can 403 while depleted).
+        headers="$(github_api_fetch_rate_limit_headers || true)"
+        if ! github_api_headers_depleted_reset_epoch "$headers" >/dev/null \
+          && _github_api_quota_intact_suspect; then
+          should_wait=1
+        fi
       fi
     fi
     if (( should_wait )); then
-      headers="$(github_api_fetch_rate_limit_headers || true)"
+      if [[ -z "$headers" ]]; then
+        headers="$(github_api_fetch_rate_limit_headers || true)"
+      fi
       wait_ec=0
       github_api_wait_for_rate_limit "$detail" "$headers" "$attempt" || wait_ec=$?
       # Normalize WAIT_TIMEOUT to the original gh exit so callers are not
@@ -389,6 +400,24 @@ github_api_fetch_rate_limit_headers() {
   fi
   printf '%s' "$out"
   return 0
+}
+
+# github_api_headers_depleted_reset_epoch <headers_text>
+# Prints X-RateLimit-Reset and returns 0 when the last HTTP response block reports
+# X-RateLimit-Remaining: 0 for the core resource (or no resource header). This is
+# authoritative primary depletion and must not be second-guessed by the
+# /rate_limit probe, which can itself fail while the quota is exhausted.
+github_api_headers_depleted_reset_epoch() {
+  local -r headers="$1"
+  local block remaining reset resource
+
+  block="$(_github_api_last_response_headers "$headers")"
+  remaining="$(_github_api_header_value "$block" 'x-ratelimit-remaining' || true)"
+  reset="$(_github_api_header_value "$block" 'x-ratelimit-reset' || true)"
+  resource="$(_github_api_header_value "$block" 'x-ratelimit-resource' || true)"
+  [[ "$remaining" == '0' && "$reset" =~ ^[0-9]+$ ]] || return 1
+  [[ -z "$resource" || "$resource" == 'core' ]] || return 1
+  printf '%s' "$reset"
 }
 
 # github_api_rate_limit_core_reset_epoch
@@ -450,6 +479,7 @@ github_api_wait_for_rate_limit() {
   local waited=0 sleep_s remaining reset_epoch now retry_after_s
   local secondary=0 header_reset header_retry retry_after_from_header=0
   local deadline=0 quota_intact=0 quota_intact_backoff_s secondary_backoff_s
+  local header_block header_remaining header_resource depleted_reset=''
 
   max_wait="${github_api_rate_limit_max_wait_s}"
   poll="${github_api_rate_limit_poll_s}"
@@ -480,8 +510,14 @@ github_api_wait_for_rate_limit() {
     headers="$(github_api_fetch_rate_limit_headers || true)"
   fi
 
-  header_retry="$(_github_api_header_value "$headers" 'retry-after' || true)"
-  header_reset="$(_github_api_header_value "$headers" 'x-ratelimit-reset' || true)"
+  # Read headers from the last HTTP response only (an earlier redirect block may
+  # carry stale or malformed values); fall back to the raw text without one.
+  header_block="$(_github_api_last_response_headers "$headers")"
+  if [[ -z "$header_block" ]]; then
+    header_block="$headers"
+  fi
+  header_retry="$(_github_api_header_value "$header_block" 'retry-after' || true)"
+  header_reset="$(_github_api_header_value "$header_block" 'x-ratelimit-reset' || true)"
   retry_after_s="$(_github_api_parse_retry_after_seconds "$detail" || true)"
   if [[ -n "$header_retry" && "$header_retry" =~ ^[0-9]+$ ]]; then
     retry_after_s="$header_retry"
@@ -497,7 +533,10 @@ github_api_wait_for_rate_limit() {
   # the wait loop.
   if (( secondary == 0 )) && [[ -n "$header_reset" && "$header_reset" =~ ^[0-9]+$ ]]; then
     deadline="$header_reset"
-    printf 'NOTE: GITHUB_RATE_LIMIT_HEADERS x_ratelimit_reset=%s\n' "$header_reset" >&2
+    header_remaining="$(_github_api_header_value "$header_block" 'x-ratelimit-remaining' || true)"
+    header_resource="$(_github_api_header_value "$header_block" 'x-ratelimit-resource' || true)"
+    printf 'NOTE: GITHUB_RATE_LIMIT_HEADERS x_ratelimit_reset=%s remaining=%s resource=%s\n' \
+      "$header_reset" "${header_remaining:-unknown}" "${header_resource:-unknown}" >&2
   elif (( retry_after_from_header == 1 )) \
     && [[ -n "$retry_after_s" && "$retry_after_s" =~ ^[0-9]+$ ]]; then
     deadline=$((now + retry_after_s))
@@ -516,6 +555,44 @@ github_api_wait_for_rate_limit() {
     deadline=$((now + secondary_backoff_s))
     printf 'NOTE: GITHUB_RATE_LIMIT_HEADERS secondary_fallback=%ss attempt=%s\n' \
       "$secondary_backoff_s" "$attempt" >&2
+  fi
+
+  # Headers say remaining=0: wait for the reset they report (plus clock-skew
+  # cushion) and never consult the /rate_limit probe, which can fail while
+  # depleted and would otherwise select the short #547 ladder. A secondary limit
+  # (429, Retry-After) on the same response cannot clear before core resets, so
+  # keep whichever deadline is later.
+  depleted_reset="$(github_api_headers_depleted_reset_epoch "$headers" || true)"
+  if [[ -n "$depleted_reset" ]]; then
+    if (( secondary == 0 )) \
+      || (( deadline < depleted_reset + github_api_rate_limit_reset_cushion_s )); then
+      deadline=$((depleted_reset + github_api_rate_limit_reset_cushion_s))
+    fi
+    while (( waited < max_wait )); do
+      now="$(date +%s)"
+      if (( now >= deadline )); then
+        printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR header_reset_reached waited=%ss\n' "$waited" >&2
+        return 0
+      fi
+      sleep_s=$((deadline - now))
+      printf 'NOTE: GITHUB_RATE_LIMIT_WAIT deadline=%s remaining=%ss sleep_budget=%ss waited=%ss/%ss source=header_depleted\n' \
+        "$deadline" "$sleep_s" "$poll" "$waited" "$max_wait" >&2
+      if (( sleep_s > poll )); then
+        sleep_s="$poll"
+      fi
+      if (( waited + sleep_s > max_wait )); then
+        sleep_s=$((max_wait - waited))
+      fi
+      run_command "github-api-rate-limit wait sleep" sleep "$sleep_s"
+      waited=$((waited + sleep_s))
+    done
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      printf 'NOTE: GITHUB_RATE_LIMIT_CLEAR header_reset_reached waited=%ss\n' "$waited" >&2
+      return 0
+    fi
+    printf 'ERROR: WAIT_TIMEOUT GITHUB_RATE_LIMIT timeout=%ss\n' "$max_wait" >&2
+    return 124
   fi
 
   while (( waited < max_wait )); do
@@ -649,6 +726,31 @@ _github_api_header_value() {
     fi
   done <<<"$text"
   return 1
+}
+
+# _github_api_last_response_headers <text>
+# Prints the header lines of the last HTTP response in `gh api --include` output
+# (from its final `HTTP/` status line up to the first blank line).
+_github_api_last_response_headers() {
+  local -r text="$1"
+  local line block='' in_headers=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line//$'\r'/}"
+    if [[ "$line" == HTTP/* ]]; then
+      block="${line}"$'\n'
+      in_headers=1
+      continue
+    fi
+    if (( in_headers )); then
+      if [[ -z "$line" ]]; then
+        in_headers=0
+      else
+        block+="${line}"$'\n'
+      fi
+    fi
+  done <<<"$text"
+  printf '%s' "$block"
 }
 
 _github_api_last_stderr_summary() {

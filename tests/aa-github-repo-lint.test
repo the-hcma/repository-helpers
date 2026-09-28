@@ -99,6 +99,8 @@ if grep -qF 'rp_log_manual_step' "$lib" \
   && grep -qF 'repo-practices-agents/CLAUDE.md' "$lib" \
   && grep -qF 'add-claude-md-shim' "$lib" \
   && grep -qF 'add-copilot-instructions-shim' "$lib" \
+  && grep -qF 'rp_agents_rules_instructions_is_valid' "$lib" \
+  && grep -qF 'add-agents-rules-instructions' "$lib" \
   && grep -qF 'rp_check_repo_practices_after_config_change' "$lib" \
   && grep -qF 'rp_repo_practices_after_config_change_is_valid' "$lib" \
   && grep -qF 'repo-practices-cursor/repo-practices-after-config-change.mdc' "$lib" \
@@ -5218,6 +5220,162 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== static: #681 .github/instructions pointer template + repository-helpers dogfood ===\n'
+if [[ -f "${agents_tmpl_dir}/agents-rules.instructions.md" ]] \
+  && cmp -s "${agents_tmpl_dir}/agents-rules.instructions.md" \
+    "${rh_root}/.github/instructions/agents-rules.instructions.md"; then
+  printf '[PASS] #681: repository-helpers ships .github/instructions/agents-rules.instructions.md identical to the template\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] #681: .github/instructions/agents-rules.instructions.md missing or drifted from the template\n'
+  fail=$(( fail + 1 ))
+fi
+# A single pointer file, not one generated shim per rule.
+instructions_count=0
+for instructions_file in "${rh_root}"/.github/instructions/*.instructions.md; do
+  [[ -e "$instructions_file" ]] || continue
+  instructions_count=$(( instructions_count + 1 ))
+done
+if (( instructions_count == 1 )); then
+  printf '[PASS] #681: .github/instructions holds exactly one pointer file\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] #681: expected exactly one .github/instructions/*.instructions.md, found %s\n' \
+    "$instructions_count"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: #681 agents-rules instructions validator ===\n'
+air_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${air_dir}/runner-sessions"
+air_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    template="$(cat "$3")"
+    body="Read every rule under .agents/rules/*.md at session start."
+    fails=""
+    rp_agents_rules_instructions_is_valid "$template" || fails="$fails template"
+    for apply_to in "**" "'"'"'**'"'"'" "\"**\""; do
+      rp_agents_rules_instructions_is_valid "$(printf -- "---\napplyTo: %s\n---\n\n%s\n" "$apply_to" "$body")" \
+        || fails="$fails apply-to:${apply_to}"
+    done
+    if rp_agents_rules_instructions_is_valid "$(printf -- "---\napplyTo: \"**/*.sh\"\n---\n\n%s\n" "$body")"; then
+      fails="$fails narrow-glob-accepted"
+    fi
+    if rp_agents_rules_instructions_is_valid "$(printf -- "---\ndescription: x\n---\n\n%s\n" "$body")"; then
+      fails="$fails no-apply-to-accepted"
+    fi
+    if rp_agents_rules_instructions_is_valid "$(printf -- "---\napplyTo: \"**\"\n---\n\nSee AGENTS.md.\n")"; then
+      fails="$fails no-rules-pointer-accepted"
+    fi
+    if rp_agents_rules_instructions_is_valid "$(printf -- "---\napplyTo: \"**\"\ndescription: Load .agents/rules\n---\n\nHello.\n")"; then
+      fails="$fails front-matter-only-pointer-accepted"
+    fi
+    if rp_agents_rules_instructions_is_valid "$(printf -- "---\napplyTo: \"**\"\n---\n\nDo not read .agents/rules.\n")"; then
+      fails="$fails negated-pointer-accepted"
+    fi
+    if [[ -n "$fails" ]]; then printf "FAILS:%s\n" "$fails"; exit 1; fi
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib" "${agents_tmpl_dir}/agents-rules.instructions.md"
+)" || air_out="fail:${air_out}"
+rm -rf "$air_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$air_out" == 'ok' ]]; then
+  printf "[PASS] #681: validator accepts the template and applyTo **, rejects a narrow glob, missing applyTo, missing/negated or front-matter-only .agents/rules pointer\n"
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] #681: agents-rules instructions validator (%s)\n' "$air_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: #681 .github/instructions pointer uses the rollout ratchet ===\n'
+air2_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${air2_dir}/runner-sessions"
+air2_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    agents_md="$(cat "$3")"
+    instructions=""
+    rp_fetch_github_text_file() {
+      case "$2" in
+        AGENTS.md) printf "%s" "$agents_md" ;;
+        CLAUDE.md) printf "@AGENTS.md\n" ;;
+        .github/copilot-instructions.md) printf "Read AGENTS.md first.\n" ;;
+        .github/instructions/agents-rules.instructions.md) printf "%s" "$instructions" ;;
+      esac
+    }
+    rp_agent_bootstrap_path_is_agents_symlink() { return 1; }
+    rp_log_gh_api_fail() { printf "API_FAIL\n" >&2; }
+    rp_log_warn() { :; }
+    rp_log_check_fail() { printf "CHECK_FAIL:%s\n" "$2" >&2; }
+    rp_log_check_ok() { printf "CHECK_OK\n" >&2; }
+    rp_log_suggest() { printf "SUGGEST:%s\n" "$1" >&2; }
+    rp_queue_candidate_file_fix() { printf "QUEUED:%s:%s\n" "$2" "$4" >&2; }
+    rp_github_url() { printf "u\n"; }
+    rp_compact=0; rp_apply_fix=0; rp_suggest=1
+    fails=""
+    run() {
+      local rc=0 out
+      out="$(rp_check_agent_bootstrap the-hcma/example-repo 2>&1)" || rc=$?
+      printf "%s|%s" "$rc" "$out"
+    }
+
+    # missing: SUGGEST under routine and --strict-onboarding, FAIL --new-repo
+    instructions=""
+    rp_strict_onboarding=0; rp_new_repo=0; r="$(run)"
+    [[ "${r%%|*}" == 0 ]] && grep -qF "SUGGEST:the-hcma/example-repo: add .github/instructions/agents-rules.instructions.md" <<<"$r" \
+      || fails="$fails missing-routine"
+    rp_strict_onboarding=1; rp_new_repo=0; r="$(run)"
+    [[ "${r%%|*}" == 0 ]] || fails="$fails missing-strict-should-pass"
+    rp_strict_onboarding=0; rp_new_repo=1; r="$(run)"
+    [[ "${r%%|*}" != 0 ]] && grep -qF "CHECK_FAIL:.github/instructions/agents-rules.instructions.md" <<<"$r" \
+      || fails="$fails missing-new-repo-should-fail"
+
+    # invalid (narrow applyTo): FAIL --strict-onboarding, SUGGEST routine
+    instructions="$(printf -- "---\napplyTo: \"**/*.sh\"\n---\n\nRead .agents/rules/*.md at session start.\n")"
+    rp_strict_onboarding=1; rp_new_repo=0; r="$(run)"
+    [[ "${r%%|*}" != 0 ]] && grep -qF "CHECK_FAIL:.github/instructions/agents-rules.instructions.md" <<<"$r" \
+      || fails="$fails invalid-strict-should-fail"
+    rp_strict_onboarding=0; rp_new_repo=0; r="$(run)"
+    [[ "${r%%|*}" == 0 ]] && ! grep -qF CHECK_FAIL <<<"$r" || fails="$fails invalid-routine-should-pass"
+
+    # --apply-fix queues the template
+    instructions=""
+    rp_apply_fix=1; rp_strict_onboarding=0; rp_new_repo=0; r="$(run)"
+    grep -qF "QUEUED:.github/instructions/agents-rules.instructions.md:add-agents-rules-instructions" <<<"$r" \
+      || fails="$fails apply-fix-not-queued"
+    rp_apply_fix=0
+
+    # valid template: CHECK_OK under --new-repo
+    instructions="$(cat "$4")"
+    rp_strict_onboarding=1; rp_new_repo=1; r="$(run)"
+    [[ "${r%%|*}" == 0 ]] && grep -qF CHECK_OK <<<"$r" && ! grep -qF SUGGEST <<<"$r" \
+      || fails="$fails valid-should-pass:${r}"
+
+    if [[ -n "$fails" ]]; then printf "FAILS:%s\n" "$fails"; exit 1; fi
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib" \
+    "${rh_root}/AGENTS.md" \
+    "${agents_tmpl_dir}/agents-rules.instructions.md"
+)" || air2_out="fail:${air2_out}"
+rm -rf "$air2_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$air2_out" == 'ok' ]]; then
+  printf '[PASS] #681: missing pointer SUGGESTs under routine/strict and FAILs --new-repo; invalid FAILs strict; --apply-fix queues the template\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] #681: .github/instructions rollout ratchet (%s)\n' "$air2_out"
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== static: agent-bootstrap wired into the check dispatch ===\n'
 # shellcheck disable=SC2016  # grep for the literal dispatch line in source
 if grep -qE '^\s*if ! rp_check_agent_bootstrap "\$slug"; then' "$lib" \
@@ -5476,6 +5634,11 @@ shimgi_out="$(
     rc=0; out="$(rp_check_agent_shim_gitignore the-hcma/example-repo 2>&1)" || rc=$?
     { [[ "$rc" != 0 ]] && grep -qF "CHECK_FAIL:.gitignore must not ignore .github/copilot-instructions.md" <<<"$out"; } \
       || { printf "copilot-case: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    GI=".github/instructions/\n"
+    rc=0; out="$(rp_check_agent_shim_gitignore the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] && grep -qF "CHECK_FAIL:.gitignore must not ignore .github/instructions/agents-rules.instructions.md" <<<"$out"; } \
+      || { printf "instructions-case: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
 
     GI="build/\ndist/\n*.log\n"
     rc=0; out="$(rp_check_agent_shim_gitignore the-hcma/example-repo 2>&1)" || rc=$?
@@ -8064,6 +8227,38 @@ if grep -qF 'rp_helpers_primary_checkout_dir' "$lib" \
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] org cursor-rule rollout: missing scan-root or API apply-fix helpers\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: every agent-bootstrap shim path is API apply-fix eligible ===\n'
+ab_elig_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${ab_elig_dir}/runner-sessions"
+ab_elig_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    fails=""
+    for path in "$rp_agent_bootstrap_claude_path" "$rp_agent_bootstrap_copilot_path" \
+      "$rp_agent_bootstrap_instructions_path"; do
+      rp_candidate_fix_path_is_api_eligible "$path" || fails="$fails ${path}"
+    done
+    if rp_candidate_fix_path_is_api_eligible .github/instructions/other.instructions.md; then
+      fails="$fails other-instructions-accepted"
+    fi
+    if [[ -n "$fails" ]]; then printf "FAILS:%s\n" "$fails"; exit 1; fi
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib"
+)" || ab_elig_out="fail:${ab_elig_out}"
+rm -rf "$ab_elig_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$ab_elig_out" == 'ok' ]]; then
+  printf '[PASS] #681: CLAUDE.md, copilot-instructions and the .github/instructions pointer can land via the Contents API (no clone)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] #681: agent-bootstrap shim API eligibility (%s)\n' "$ab_elig_out"
   fail=$(( fail + 1 ))
 fi
 
