@@ -5,7 +5,7 @@ alwaysApply: true
 
 # GitHub content formatting (agent-authored)
 
-Agent-authored issue bodies, PR descriptions, and PR/review comments must render correctly on GitHub.
+Agent-authored issue bodies, issue comments and replies, PR descriptions, and PR/review comments must render correctly on GitHub.
 
 Three failure modes show up here:
 
@@ -46,7 +46,7 @@ rm -f "$body"
 Before posting (or after drafting a body file), run:
 
 ```bash
-scripts/lint-github-markdown <path>
+scripts/lint-github-markdown path/to/body.md
 ```
 
 For **issues**, use `scripts/gh-issue create|edit …` so the lint runs before the API call. For PR bodies / review replies, lint then `scripts/gh-api pr edit` or `reply-thread` / `reply-comment`.
@@ -64,8 +64,8 @@ The no-hand-wrap rule also covers every `.md` file committed to a repository: `A
 Check a file, or unwrap it in place, before committing:
 
 ```bash
-scripts/lint-github-markdown --repo-files <file.md>…
-scripts/lint-github-markdown --repo-files --fix <file.md>…
+scripts/lint-github-markdown --repo-files path/to/file.md
+scripts/lint-github-markdown --repo-files --fix path/to/file.md
 ```
 
 `--repo-files` flags only hard line breaks inside a paragraph, list item or blockquote. It skips front matter, code, tables, headings and HTML, and the body-only checks above do not apply.
@@ -74,7 +74,7 @@ scripts/lint-github-markdown --repo-files --fix <file.md>…
 
 ## Scope
 
-Applies to issue bodies, PR descriptions, and PR/review comments or replies posted by an agent — same “validate before it ships” principle as Conventional Commits PR titles (see `.agents/rules/pr-ship-and-review.md`) — and to Markdown files committed to a repository (see above).
+Applies to issue bodies, issue comments and replies, PR descriptions, and PR/review comments or replies posted by an agent — same “validate before it ships” principle as Conventional Commits PR titles (see `.agents/rules/pr-ship-and-review.md`) — and to Markdown files committed to a repository (see above).
 
 <!-- github-content-formatting-canonical: https://github.com/the-hcma/repository-helpers/blob/main/.agents/rules/github-content-formatting.md -->
 Canonical rule: https://github.com/the-hcma/repository-helpers/blob/main/.agents/rules/github-content-formatting.md
