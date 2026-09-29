@@ -68,7 +68,7 @@ scripts/lint-github-markdown --repo-files path/to/file.md
 scripts/lint-github-markdown --repo-files --fix path/to/file.md
 ```
 
-`--repo-files` flags only hard line breaks inside a paragraph, list item or blockquote. It skips front matter, code, tables, headings and HTML, and the body-only checks above do not apply.
+`--repo-files` flags only hard line breaks inside a paragraph, list item or blockquote. It skips front matter, code, tables, headings and HTML, and the body-only checks above do not apply. A line written directly under a list item with less indentation than the item text (a lazy continuation) is usually a new paragraph or label missing its blank line, so `--fix` leaves it alone and reports it: add a blank line before it, or indent it to keep it in the item.
 
 `scripts/dev/pre-pr-checks` runs the same check on the `.md` files the branch changes (the `markdown-wrap` job), and `scripts/dev/pre-pr-checks --fix` unwraps them.
 
