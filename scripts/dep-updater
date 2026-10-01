@@ -2187,10 +2187,14 @@ dep_updater_ensure_eco_fail_file() {
 # `gh label create` errors when the label is already there (the common case
 # once github-repo-lint has provisioned it), so this always probes — an
 # existing label is an expected miss, not a [FAIL] (repository-helpers#684).
+# Bounded by a 20s timeout (matches the gt-auth probe in check_auth_prereqs)
+# so a hung `gh` call can't block the rest of the run; a timeout or any other
+# failure is swallowed the same as an existing-label miss — worst case the
+# label is still missing and the next run (or github-repo-lint) retries it.
 dep_updater_ensure_label() {
   local -r name="$1" color="$2" description="$3"
 
-  dep_runner_gh --probe "gh label ensure" -- label create "$name" \
+  dep_runner_gh --probe --timeout 20 "gh label ensure" -- label create "$name" \
     --repo "${repo_owner}/${repo_name}" \
     --color "$color" \
     --description "$description" >/dev/null 2>&1 || true
@@ -2424,20 +2428,30 @@ dep_runner_gh_stdout() {
   return "$exit_code"
 }
 
-# dep_runner_gh <label> [--probe] -- <gh-args…>
-# Also accepts --probe before <label> (audit/label call sites).
+# dep_runner_gh <label> [--probe] [--timeout SECONDS] -- <gh-args…>
+# Also accepts --probe/--timeout before <label> (audit/label call sites).
+# --timeout only bounds the non-api path (runner_exec); the api path already
+# waits/retries via github_api_exec_with_rate_limit_retry.
 dep_runner_gh() {
-  local probe=0 label exit_code
+  local probe=0 label exit_code timeout_sec=0
 
   if [[ "${1:-}" == '--probe' ]]; then
     probe=1
     shift
+  fi
+  if [[ "${1:-}" == '--timeout' ]]; then
+    timeout_sec="$2"
+    shift 2
   fi
   label="$1"
   shift
   if [[ "${1:-}" == '--probe' ]]; then
     probe=1
     shift
+  fi
+  if [[ "${1:-}" == '--timeout' ]]; then
+    timeout_sec="$2"
+    shift 2
   fi
   [[ -n "$label" ]] || return 2
   [[ "${1:-}" == '--' ]] || return 2
@@ -2450,9 +2464,17 @@ dep_runner_gh() {
       github_api_exec_with_rate_limit_retry "$label" -- gh "$@" >/dev/null || exit_code=$?
     fi
   elif (( probe )); then
-    runner_exec "$label" --probe -- gh "$@" || exit_code=$?
+    if (( timeout_sec > 0 )); then
+      runner_exec "$label" --probe --timeout "$timeout_sec" -- gh "$@" || exit_code=$?
+    else
+      runner_exec "$label" --probe -- gh "$@" || exit_code=$?
+    fi
   else
-    runner_exec "$label" -- gh "$@" || exit_code=$?
+    if (( timeout_sec > 0 )); then
+      runner_exec "$label" --timeout "$timeout_sec" -- gh "$@" || exit_code=$?
+    else
+      runner_exec "$label" -- gh "$@" || exit_code=$?
+    fi
   fi
   return "$exit_code"
 }
