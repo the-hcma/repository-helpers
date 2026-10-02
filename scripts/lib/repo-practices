@@ -26,6 +26,23 @@ rp_GITHUB_MQ_MERGE_METHOD='SQUASH'
 rp_GITHUB_MQ_CHECK_RESPONSE_TIMEOUT_MINUTES=15
 readonly rp_GITHUB_MQ_CHECK_RESPONSE_TIMEOUT_MINUTES
 
+# Labels dep-updater applies to the PRs it creates. This is the source of
+# truth repo-lint provisions org-wide; dep-updater also lazily self-heals
+# these on a repo it reaches before repo-lint has run (repository-helpers#684).
+# Keep color/description in sync with dep-updater's
+# dep_updater_label_dep_updater_* / dep_updater_label_security_* constants
+# (scripts/dep-updater).
+rp_STANDARD_LABEL_NAMES=(dep-updater security)
+readonly rp_STANDARD_LABEL_NAMES
+declare -rA rp_STANDARD_LABEL_COLORS=(
+  [dep-updater]='0075ca'
+  [security]='b60205'
+)
+declare -rA rp_STANDARD_LABEL_DESCRIPTIONS=(
+  [dep-updater]='Automated dependency update via dep-updater'
+  [security]='Automated CVE / security dependency fixes'
+)
+
 rp_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly rp_lib_dir
 
@@ -6542,7 +6559,7 @@ rp_fetch_repo_labels_json() {
 
   set +e
   rp_runner_gh_api_stream "repo-practices repo labels" \
-    "repos/${slug}/labels" --paginate --jq '[.[].name]'
+    "repos/${slug}/labels" --paginate --slurp --jq 'add | map(.name)'
   exit_code=$?
   set -e
   if (( exit_code != 0 )); then
@@ -6733,6 +6750,19 @@ RULESET
      | .bypass_actors = [
          {actor_id: $admin_id, actor_type: "OrganizationAdmin", bypass_mode: "pull_request"}
        ]'
+}
+
+rp_apply_create_label() {
+  local slug="$1" name="$2" color="$3" description="$4"
+  local payload post_exit_code=0
+
+  payload="$(rp_runner_jq_n "repo-practices create label ${name} payload" \
+    --arg name "$name" --arg color "$color" --arg description "$description" \
+    '{name: $name, color: $color, description: $description}')"
+  rp_log_warn "${slug}: creating label '${name}'"
+  rp_runner_gh_api_input "repo-practices gh create label ${name}" "$payload" \
+    --method POST "repos/${slug}/labels" || post_exit_code=$?
+  (( post_exit_code == 0 ))
 }
 
 rp_apply_protect_main_create() {
@@ -9334,6 +9364,54 @@ rp_check_license_metadata() {
   return "$repo_fail"
 }
 
+# rp_check_standard_labels <slug>
+# Verifies the org-standard labels dep-updater applies to its PRs
+# (rp_STANDARD_LABEL_NAMES) exist on the repo. This is the source-of-truth
+# provisioner; dep-updater's own lazy self-heal (repository-helpers#684) is
+# the fallback for a repo it reaches before repo-lint has run.
+rp_check_standard_labels() {
+  local slug="$1"
+  local repo_fail=0
+  local labels_json fetch_exit name has_label_exit
+
+  fetch_exit=0
+  labels_json="$(rp_fetch_repo_labels_json "$slug")" || fetch_exit=$?
+  if (( fetch_exit != 0 )); then
+    rp_log_gh_api_fail "$slug" 'could not list labels'
+    rp_log_check_fail "$slug" 'standard labels (GitHub API error; retry)' \
+      "$(rp_github_url "$slug" '/labels')"
+    return 1
+  fi
+
+  for name in "${rp_STANDARD_LABEL_NAMES[@]}"; do
+    has_label_exit=0
+    rp_runner_jq_file "repo-practices standard label ${name}" "$labels_json" \
+      -e --arg name "$name" 'index($name) != null' >/dev/null || has_label_exit=$?
+    if (( has_label_exit == 0 )); then
+      continue
+    fi
+    repo_fail=1
+    rp_log_fail "${slug}: missing standard label '${name}'"
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_apply_create_label "$slug" "$name" \
+        "${rp_STANDARD_LABEL_COLORS[$name]}" "${rp_STANDARD_LABEL_DESCRIPTIONS[$name]}"
+    elif [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: run scripts/github-repo-lint --repo ${slug} --apply-fix to create the '${name}' label"
+    fi
+  done
+
+  if [[ "$repo_fail" -eq 0 ]]; then
+    rp_log_check_ok "$slug" 'standard labels (dep-updater, security)' \
+      "$(rp_github_url "$slug" '/labels')"
+  else
+    rp_log_check_fail "$slug" 'standard labels (fix with --apply-fix)' \
+      "$(rp_github_url "$slug" '/labels')"
+  fi
+
+  return "$repo_fail"
+}
+
 # Warn when scripts/lib/ci-secret-scan pins a gitleaks release behind the newest
 # eligible version (same ${release_age_dep_updater_days}-day gate as dep-updater).
 rp_check_ci_secret_scan_gitleaks_pin() {
@@ -10271,6 +10349,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_license_metadata "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_standard_labels "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_git_commit_identity "$slug"; then
