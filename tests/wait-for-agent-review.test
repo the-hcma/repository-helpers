@@ -2241,10 +2241,24 @@ else
   fail=$(( fail + 1 ))
 fi
 
-# Issue #690: limit reached with no parseable time falls back to the default cooldown.
-if retry_iso="$(bash -c "
+# Issue #690: the precise parser never invents a time — the default lives in a separate helper
+# that callers apply only after every parse attempt came up empty.
+if bash -c "
   source '${coderabbit_profile}'
   agent_review_profile_text_quota_retry_after_iso \
+    'Review limit reached. Wait for the free limit to reset.' '2026-10-02T13:47:37Z'
+" >/dev/null 2>&1; then
+  printf '[FAIL] coderabbit profile: precise parser must not fall back to a default cooldown\n'
+  fail=$(( fail + 1 ))
+else
+  printf '[PASS] coderabbit profile: precise parser yields no retry_after for a limit notice without a time\n'
+  pass=$(( pass + 1 ))
+fi
+
+# Default cooldown: limit reached with no parseable time assumes one hour and warns once.
+if retry_iso="$(bash -c "
+  source '${coderabbit_profile}'
+  agent_review_profile_text_quota_default_retry_after_iso \
     'Review limit reached. Wait for the free limit to reset.' \
     '2026-10-02T13:47:37Z' 2>/dev/null
 ")" && [[ "${retry_iso}" == '2026-10-02T14:47:37Z' ]]; then
@@ -2254,6 +2268,74 @@ else
   printf '[FAIL] coderabbit profile: default cooldown fallback failed (got %s)\n' "${retry_iso:-empty}"
   fail=$(( fail + 1 ))
 fi
+
+if warn_out="$(bash -c "
+  source '${coderabbit_profile}'
+  agent_review_profile_text_quota_default_retry_after_iso \
+    'Review rate limited.' '2026-10-02T13:47:37Z' 2>&1 >/dev/null
+")" && [[ "${warn_out}" == *'assuming 3600s cooldown'* ]]; then
+  printf '[PASS] coderabbit profile: default cooldown warns that the retry time was unparseable\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: default cooldown did not warn (got %s)\n' "${warn_out:-empty}"
+  fail=$(( fail + 1 ))
+fi
+
+# AGENT_REVIEW_CODERABBIT_UNKNOWN_RETRY_S: valid override honoured, invalid value ignored with a warning.
+if retry_iso="$(AGENT_REVIEW_CODERABBIT_UNKNOWN_RETRY_S=600 bash -c "
+  source '${coderabbit_profile}'
+  agent_review_profile_text_quota_default_retry_after_iso 'Review limit reached' '2026-10-02T13:47:37Z' 2>/dev/null
+")" && [[ "${retry_iso}" == '2026-10-02T13:57:37Z' ]]; then
+  printf '[PASS] coderabbit profile: AGENT_REVIEW_CODERABBIT_UNKNOWN_RETRY_S overrides the default cooldown\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: unknown-retry override failed (got %s)\n' "${retry_iso:-empty}"
+  fail=$(( fail + 1 ))
+fi
+if out="$(AGENT_REVIEW_CODERABBIT_UNKNOWN_RETRY_S=soon bash -c "
+  source '${coderabbit_profile}'
+  agent_review_profile_text_quota_default_retry_after_iso 'Review limit reached' '2026-10-02T13:47:37Z' 2>&1
+")" && [[ "${out}" == *'invalid AGENT_REVIEW_CODERABBIT_UNKNOWN_RETRY_S'* ]] \
+  && [[ "${out}" == *'2026-10-02T14:47:37Z' ]]; then
+  printf '[PASS] coderabbit profile: invalid unknown-retry value warns and falls back to one hour\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] coderabbit profile: invalid unknown-retry value mishandled (got %s)\n' "${out:-empty}"
+  fail=$(( fail + 1 ))
+fi
+
+# Non-limit text must not get a default cooldown either.
+if bash -c "
+  source '${coderabbit_profile}'
+  agent_review_profile_text_quota_default_retry_after_iso 'Walkthrough: all good' '2026-10-02T13:47:37Z'
+" >/dev/null 2>&1; then
+  printf '[FAIL] coderabbit profile: non-limit text must not get a default cooldown\n'
+  fail=$(( fail + 1 ))
+else
+  printf '[PASS] coderabbit profile: non-limit text gets no default cooldown\n'
+  pass=$(( pass + 1 ))
+fi
+
+# Walkthrough-like prose must not be classified as quota exhausted (review on #691): the
+# classifier is word-bounded and anchored on "available in N <unit>".
+cr_prose_negatives=(
+  'Adds more review tooling; config is now available via the dashboard in settings.'
+  'Next, the reviewer flow is available for line comments'
+  $'<!-- walkthrough_start -->\nSummarize by CodeRabbit: the next review is available in the queue'
+  'Furthermore the review summary is available in the PR description'
+)
+for cr_prose in "${cr_prose_negatives[@]}"; do
+  if CR_TEXT="${cr_prose}" bash -c "
+    source '${coderabbit_profile}'
+    agent_review_profile_text_is_quota_exhausted \"\${CR_TEXT}\"
+  " >/dev/null 2>&1; then
+    printf '[FAIL] coderabbit profile: prose %q wrongly classified as quota exhausted\n' "${cr_prose:0:50}"
+    fail=$(( fail + 1 ))
+  else
+    printf '[PASS] coderabbit profile: prose "%s" is not quota exhausted\n' "${cr_prose:0:40}"
+    pass=$(( pass + 1 ))
+  fi
+done
 
 # Unrelated text must not gain a fabricated retry_after.
 if bash -c "
@@ -2341,6 +2423,59 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -f "${tmp_signal_updated}"
+
+# Issue #690: the signal scan applies the default cooldown only when the latest matching comment
+# has no parseable time, and never overrides a precise one.
+tmp_signal_default="$(mktemp)"
+cat >"${tmp_signal_default}" <<'EOF'
+[
+  {
+    "user": {"login": "coderabbitai"},
+    "created_at": "2026-10-02T10:00:00Z",
+    "body": "Review limit reached. You've used all free OSS reviews for now.",
+    "html_url": "https://example.test/cr-no-time"
+  }
+]
+EOF
+if signal_out="$(bash -c "
+  source '${lib}'
+  source '${coderabbit_profile}'
+  agent_review_use_agent coderabbit
+  agent_review_copilot_quota_local_day() { printf '2026-10-02'; }
+  agent_review_quota_exhaustion_issue_comment_signal_today \"\$(cat '${tmp_signal_default}')\" 2>/dev/null
+")" \
+  && [[ "${signal_out}" == *$'\t2026-10-02T11:00:00Z' ]]; then
+  printf '[PASS] quota signal: limit notice without a time gets the one-hour default retry_after\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota signal: default retry_after missing (got %s)\n' "${signal_out:-empty}"
+  fail=$(( fail + 1 ))
+fi
+cat >"${tmp_signal_default}" <<'EOF'
+[
+  {
+    "user": {"login": "coderabbitai"},
+    "created_at": "2026-10-02T10:00:00Z",
+    "body": "Review limit reached.\n**Next included review available in 5 minutes.**",
+    "html_url": "https://example.test/cr-with-time"
+  }
+]
+EOF
+if signal_out="$(bash -c "
+  source '${lib}'
+  source '${coderabbit_profile}'
+  agent_review_use_agent coderabbit
+  agent_review_copilot_quota_local_day() { printf '2026-10-02'; }
+  agent_review_quota_exhaustion_issue_comment_signal_today \"\$(cat '${tmp_signal_default}')\" 2>/dev/null
+")" \
+  && [[ "${signal_out}" == *$'\t2026-10-02T10:05:00Z' ]]; then
+  printf '[PASS] quota signal: a precise 5-minute cooldown is not replaced by the one-hour default\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] quota signal: precise cooldown overridden (got %s)\n' "${signal_out:-empty}"
+  fail=$(( fail + 1 ))
+fi
+rm -f "${tmp_signal_default}"
 
 # PR #346 wording: "Next review available in: 28 seconds" (issue #347).
 if retry_iso="$(bash -c "

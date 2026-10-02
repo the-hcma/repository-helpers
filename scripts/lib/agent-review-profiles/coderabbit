@@ -54,7 +54,9 @@ agent_review_profile_text_is_quota_exhausted() {
     return 0
   fi
   # Cooldown-only wording (e.g. after full review) may omit "review limit reached".
-  if [[ "${lower}" =~ (next|more)[^0-9.]{0,40}review[^0-9.]{0,40}available[^0-9]*in ]]; then
+  # Anchored on the time and word-bounded: prose such as "the reviewer flow is available in
+  # settings" or "furthermore the review summary is available in the PR" must not match.
+  if [[ "${lower}" =~ (^|[^a-z])(next|more)[^0-9.]{0,40}[^a-z]reviews?[^a-z][^0-9.]{0,40}available[[:space:]]+in[^0-9a-z]{0,8}[0-9]+[[:space:]]*(second|minute|hour) ]]; then
     return 0
   fi
   if [[ "${lower}" == *"rate limit"* && "${lower}" == *coderabbit* ]]; then
@@ -143,7 +145,7 @@ agent_review_profile_text_is_coderabbit_billing_block() {
 agent_review_profile_text_quota_retry_after_iso() {
   local -r text="${1:-}"
   local -r anchor_at="${2:-}"
-  local lower amount unit seconds retry_at
+  local lower amount unit retry_at
 
   if [[ -z "${text}" || -z "${anchor_at}" ]]; then
     return 1
@@ -155,9 +157,10 @@ agent_review_profile_text_quota_retry_after_iso() {
   # in …", "Next included review available in 35 minutes." and "Your next included review
   # will be available in 50 minutes." (issue #690). The unit is captured, so seconds are never
   # misread as minutes (issue #347).
-  if [[ "${lower}" =~ (next|more)[^0-9.]{0,40}review[^0-9.]{0,40}available[^0-9]*in[^0-9]*([0-9]+)[[:space:]]*(second|minute|hour)s? ]]; then
-    amount="${BASH_REMATCH[2]}"
-    unit="${BASH_REMATCH[3]}"
+  # Word-bounded and anchored on the time itself so walkthrough prose cannot match.
+  if [[ "${lower}" =~ (^|[^a-z])(next|more)[^0-9.]{0,40}[^a-z]reviews?[^a-z][^0-9.]{0,40}available[[:space:]]+in[^0-9a-z]{0,8}([0-9]+)[[:space:]]*(second|minute|hour) ]]; then
+    amount="${BASH_REMATCH[3]}"
+    unit="${BASH_REMATCH[4]}"
     retry_at="$(runner_exec_stdout "coderabbit retry_after +${unit}s" -- \
       date -u -d "${anchor_at} + ${amount} ${unit}s" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
     if [[ -n "${retry_at}" ]]; then
@@ -173,26 +176,49 @@ agent_review_profile_text_quota_retry_after_iso() {
       return 0
     fi
   fi
-  # "Review limit reached" with no parseable retry time (wording drift, e.g. "Next included
-  # review available in …" before it was matched — issue #690). Never leave the loop with
-  # "exhausted, retry unknown": assume a default cooldown so the grace + one-shot
-  # `@coderabbitai full review` path runs instead of waiting for the 12h PR cap.
-  # Why one hour: 132 distinct CodeRabbit cooldown comments scanned across the org's PRs
-  # (2026-10-02) advertised 1–59 minutes (median 50, p75/p90/max all 59), so 3600s sits just
-  # above the longest cooldown seen. Overshooting only delays the one-shot full review a few
-  # minutes; undershooting would post it while the limit is still active.
-  if [[ "${lower}" =~ review[[:space:]]+(limit[[:space:]]+reached|rate[[:space:]]+limited) ]]; then
-    seconds="${AGENT_REVIEW_CODERABBIT_UNKNOWN_RETRY_S:-3600}"
-    retry_at="$(runner_exec_stdout "coderabbit retry_after default cooldown" -- \
-      date -u -d "${anchor_at} + ${seconds} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
-    if [[ -n "${retry_at}" ]]; then
-      printf 'wait-for-agent-review: WARN CodeRabbit review limit reached but retry time unparseable — assuming %ss cooldown\n' \
-        "${seconds}" >&2
-      printf '%s' "${retry_at}"
-      return 0
-    fi
-  fi
   return 1
+}
+
+# agent_review_profile_text_quota_default_retry_after_iso <text> <anchor_timestamp_iso>
+# Fallback for a "Review limit reached" / "Review rate limited" notice whose retry time could
+# not be parsed (wording drift — issue #690). It is deliberately separate from
+# agent_review_profile_text_quota_retry_after_iso: callers must apply it only after every parse
+# attempt (review body, then issue comments) came up empty, so it can never shadow a precise
+# time. Never leave the loop with "exhausted, retry unknown": assuming a default cooldown lets
+# the grace + one-shot `@coderabbitai full review` path run instead of waiting for the 12h PR
+# cap. Prints nothing and returns 1 when the text is not a limit notice.
+# Why one hour: 132 distinct CodeRabbit cooldown comments scanned across the org's PRs
+# (2026-10-02) advertised 1–59 minutes (median 50, p75/p90/max all 59), so 3600s sits just
+# above the longest cooldown seen. Overshooting only delays the one-shot full review a few
+# minutes; undershooting would post it while the limit is still active.
+# AGENT_REVIEW_CODERABBIT_UNKNOWN_RETRY_S overrides it (whole seconds; invalid values are
+# ignored with a warning).
+agent_review_profile_text_quota_default_retry_after_iso() {
+  local -r text="${1:-}"
+  local -r anchor_at="${2:-}"
+  local lower seconds retry_at
+
+  if [[ -z "${text}" || -z "${anchor_at}" ]]; then
+    return 1
+  fi
+  lower="${text,,}"
+  if ! [[ "${lower}" =~ review[[:space:]]+(limit[[:space:]]+reached|rate[[:space:]]+limited) ]]; then
+    return 1
+  fi
+  seconds="${AGENT_REVIEW_CODERABBIT_UNKNOWN_RETRY_S:-3600}"
+  if ! [[ "${seconds}" =~ ^[0-9]+$ ]] || (( seconds < 1 )); then
+    printf 'wait-for-agent-review: WARN ignoring invalid AGENT_REVIEW_CODERABBIT_UNKNOWN_RETRY_S=%s — using 3600\n' \
+      "${seconds@Q}" >&2
+    seconds=3600
+  fi
+  retry_at="$(runner_exec_stdout "coderabbit retry_after default cooldown" -- \
+    date -u -d "${anchor_at} + ${seconds} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+  if [[ -z "${retry_at}" ]]; then
+    return 1
+  fi
+  printf 'wait-for-agent-review: WARN CodeRabbit review limit reached but retry time unparseable — assuming %ss cooldown\n' \
+    "${seconds}" >&2
+  printf '%s' "${retry_at}"
 }
 
 # agent_review_profile_issue_comment_is_quota_exhausted <login> <body>
