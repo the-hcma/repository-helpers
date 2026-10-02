@@ -5741,6 +5741,44 @@ _py_uv_select_compound_cap() {
   fi
 }
 
+# Repo-local file a consumer commits to acknowledge an intentional, already-
+# reviewed dependency cap. One entry per line: "<pkg><cap>" exactly matching
+# py_uv_compound_cap_crossing's output (which carries its own "<"/"<="
+# prefix), e.g. "microsoft-kiota-http<1.13.0" — an optional trailing
+# "# comment" and surrounding whitespace are ignored; blank lines and lines
+# starting with "#" are skipped. See py_uv_cap_is_acked (repository-helpers#685).
+py_uv_cap_ack_file_relpath='.dep-updater-acked-caps'
+readonly py_uv_cap_ack_file_relpath
+
+# py_uv_cap_is_acked <pyproject_path> <pkg> <cap_display>
+# True when "${pkg}${cap_display}" (cap_display already carries its "<"/"<=")
+# appears as an entry in ${repo_root}/.dep-updater-acked-caps (repo_root is
+# pyproject_path's directory). A cap a maintainer has already reviewed and
+# deliberately pinned (tracked by its own issue, e.g. the-hcma/blumkin#354/
+# #387) shouldn't re-litigate itself as a fresh failure on every future run
+# merely because PyPI keeps publishing releases above it — an unacknowledged
+# cap still fails loudly, which is the useful default (repository-helpers#685).
+py_uv_cap_is_acked() {
+  local -r path="$1"
+  local -r pkg="$2"
+  local -r cap_display="$3"
+  local repo_root ack_file line entry
+
+  repo_root="$(dirname "$path")"
+  ack_file="${repo_root}/${py_uv_cap_ack_file_relpath}"
+  [[ -f "$ack_file" ]] || return 1
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    entry="${line%%#*}"
+    entry="$(printf '%s' "$entry" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [[ -z "$entry" ]] && continue
+    if [[ "$entry" == "${pkg}${cap_display}" ]]; then
+      return 0
+    fi
+  done <"$ack_file"
+  return 1
+}
+
 # py_uv_compound_cap_crossing <pyproject_path> <pkg> <ver>
 # Returns 0 and prints the crossed cap with its operator ("<2.0.0" or
 # "<=2.0.0") when ver falls outside pkg's tightest existing cap; returns 1
@@ -5831,14 +5869,15 @@ py_uv_render_cve_cap_crossings_section() {
 # intentional compatibility pin, not leftover boilerplate (repository-helpers#665).
 # When the new floor would itself violate the cap (py_uv_compound_cap_crossing:
 # new_ver >= Y for an exclusive <Y, new_ver > Y for an inclusive <=Y), the
-# rewrite is skipped entirely (specifier left untouched) and a WARNING is logged
-# plus recorded as an ecosystem failure so the run surfaces it for manual
-# review, rather than silently dropping the cap. Both "<" and "<=" caps are kept
-# verbatim by the rewrite. A trailing PEP 508 environment marker is kept.
-# Two sed passes (bundled before split). Converts == and ~= to >=.
-# Returns 1 when sed fails or the constraint line did not change; returns 2
-# when the rewrite was skipped because the new floor would violate an existing
-# compound cap.
+# rewrite is skipped entirely (specifier left untouched). An unacknowledged cap
+# logs a WARNING and is recorded as an ecosystem failure so the run surfaces it
+# for manual review; one listed in .dep-updater-acked-caps (py_uv_cap_is_acked)
+# logs INFO instead and is not counted as a failure (repository-helpers#685).
+# Both "<" and "<=" caps are kept verbatim by the rewrite. A trailing PEP 508
+# environment marker is kept. Two sed passes (bundled before split). Converts
+# == and ~= to >=. Returns 1 when sed fails or the constraint line did not
+# change; returns 2 when the rewrite was skipped because the new floor would
+# violate an existing compound cap (acknowledged or not).
 py_uv_rewrite_version_floor() {
   local -r path="$1"
   local -r pkg="$2"
@@ -5846,10 +5885,15 @@ py_uv_rewrite_version_floor() {
   local sed_pkg sed_new_ver before crossed_cap
 
   if crossed_cap="$(py_uv_compound_cap_crossing "$path" "$pkg" "$new_ver")"; then
-    log "[python/uv] WARNING: ${pkg} floor bump to ${new_ver} would violate its existing" \
-      "cap ${crossed_cap}; leaving the specifier untouched (needs manual review)."
-    dep_updater_append_ecosystem_failure \
-      "python|${pkg}: floor bump to ${new_ver} would violate existing cap ${crossed_cap}; skipped (manual review)"
+    if py_uv_cap_is_acked "$path" "$pkg" "$crossed_cap"; then
+      log "[python/uv] INFO: ${pkg} floor bump to ${new_ver} would violate its existing" \
+        "cap ${crossed_cap}; skipped (acknowledged via ${py_uv_cap_ack_file_relpath})."
+    else
+      log "[python/uv] WARNING: ${pkg} floor bump to ${new_ver} would violate its existing" \
+        "cap ${crossed_cap}; leaving the specifier untouched (needs manual review)."
+      dep_updater_append_ecosystem_failure \
+        "python|${pkg}: floor bump to ${new_ver} would violate existing cap ${crossed_cap}; skipped (manual review)"
+    fi
     return 2
   fi
 
