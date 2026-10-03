@@ -5746,7 +5746,10 @@ _py_uv_select_compound_cap() {
 # py_uv_compound_cap_crossing's output (which carries its own "<"/"<="
 # prefix), e.g. "microsoft-kiota-http<1.13.0" — an optional trailing
 # "# comment" and surrounding whitespace are ignored; blank lines and lines
-# starting with "#" are skipped. See py_uv_cap_is_acked (repository-helpers#685).
+# starting with "#" are skipped. An entry's comment may carry "review-by
+# YYYY-MM-DD"; once that date has passed the ack is expired and the cap fails
+# loudly again, forcing a re-check of the upstream issue. See py_uv_cap_is_acked
+# (repository-helpers#685).
 py_uv_cap_ack_file_relpath='.dep-updater-acked-caps'
 readonly py_uv_cap_ack_file_relpath
 
@@ -5758,11 +5761,14 @@ readonly py_uv_cap_ack_file_relpath
 # #387) shouldn't re-litigate itself as a fresh failure on every future run
 # merely because PyPI keeps publishing releases above it — an unacknowledged
 # cap still fails loudly, which is the useful default (repository-helpers#685).
+# Returns 0 when acked (and not expired), 1 when not acked, 2 when the matching
+# entry carries a "review-by YYYY-MM-DD" comment dated before today (prints the
+# date); a missing review-by never expires.
 py_uv_cap_is_acked() {
   local -r path="$1"
   local -r pkg="$2"
   local -r cap_display="$3"
-  local repo_root ack_file line entry
+  local repo_root ack_file line entry comment review_by today
 
   repo_root="$(dirname "$path")"
   ack_file="${repo_root}/${py_uv_cap_ack_file_relpath}"
@@ -5770,9 +5776,23 @@ py_uv_cap_is_acked() {
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     entry="${line%%#*}"
+    comment=""
+    [[ "$line" == *"#"* ]] && comment="${line#*#}"
     entry="$(printf '%s' "$entry" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
     [[ -z "$entry" ]] && continue
     if [[ "$entry" == "${pkg}${cap_display}" ]]; then
+      if [[ "$comment" =~ review-by[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2}) ]]; then
+        review_by="${BASH_REMATCH[1]}"
+        today="$(date +%F)"
+        # A calendar-invalid date (2026-13-45) would sort after today and never expire, so it
+        # counts as expired; the integer compare keeps ordering independent of locale collation.
+        if ! date --date="$review_by" +%F >/dev/null 2>&1 \
+          || [[ "$(date --date="$review_by" +%F)" != "$review_by" ]] \
+          || (( 10#${review_by//-/} < 10#${today//-/} )); then
+          printf '%s\n' "$review_by"
+          return 2
+        fi
+      fi
       return 0
     fi
   done <"$ack_file"
@@ -5882,12 +5902,20 @@ py_uv_rewrite_version_floor() {
   local -r path="$1"
   local -r pkg="$2"
   local -r new_ver="$3"
-  local sed_pkg sed_new_ver before crossed_cap
+  local sed_pkg sed_new_ver before crossed_cap ack_rc expired_on
 
   if crossed_cap="$(py_uv_compound_cap_crossing "$path" "$pkg" "$new_ver")"; then
-    if py_uv_cap_is_acked "$path" "$pkg" "$crossed_cap"; then
+    ack_rc=0
+    expired_on="$(py_uv_cap_is_acked "$path" "$pkg" "$crossed_cap")" || ack_rc=$?
+    if (( ack_rc == 0 )); then
       log "[python/uv] INFO: ${pkg} floor bump to ${new_ver} would violate its existing" \
         "cap ${crossed_cap}; skipped (acknowledged via ${py_uv_cap_ack_file_relpath})."
+    elif (( ack_rc == 2 )); then
+      log "[python/uv] WARNING: ${pkg} cap ${crossed_cap} acknowledgement expired on" \
+        "${expired_on} (review-by in ${py_uv_cap_ack_file_relpath}); re-check the upstream issue," \
+        "then lift the cap or renew the date."
+      dep_updater_append_ecosystem_failure \
+        "python|${pkg}: cap ${crossed_cap} acknowledgement expired ${expired_on}; re-verify upstream, then lift the cap or renew review-by"
     else
       log "[python/uv] WARNING: ${pkg} floor bump to ${new_ver} would violate its existing" \
         "cap ${crossed_cap}; leaving the specifier untouched (needs manual review)."
