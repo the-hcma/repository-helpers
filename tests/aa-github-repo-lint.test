@@ -5487,6 +5487,93 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== unit: entry-point shims must not point at the legacy .cursor/rules location ===\n'
+stale_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${stale_dir}/runner-sessions"
+stale_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    agents_md="$(cat "$3")"
+    instructions="$(cat "$4")"
+    stub_claude="@AGENTS.md"
+    stub_copilot="Read AGENTS.md first."
+    rp_fetch_github_text_file() {
+      case "$2" in
+        AGENTS.md) printf "%s" "$agents_md" ;;
+        CLAUDE.md) printf "%s" "$stub_claude" ;;
+        .github/copilot-instructions.md) printf "%s" "$stub_copilot" ;;
+        .github/instructions/agents-rules.instructions.md) printf "%s" "$instructions" ;;
+      esac
+    }
+    rp_agent_bootstrap_path_is_agents_symlink() { return 1; }
+    rp_log_gh_api_fail() { printf "API_FAIL\n" >&2; }
+    rp_log_warn() { :; }
+    rp_log_check_fail() { printf "CHECK_FAIL:%s\n" "$2" >&2; }
+    rp_log_check_ok() { printf "CHECK_OK\n" >&2; }
+    rp_log_suggest() { printf "SUGGEST:%s\n" "$1" >&2; }
+    rp_queue_candidate_file_fix() { printf "QUEUED:%s:%s\n" "$2" "$4" >&2; }
+    rp_agent_bootstrap_template() { printf "template\n"; }
+    rp_github_url() { printf "u\n"; }
+    rp_compact=0; rp_apply_fix=0; rp_suggest=1
+    fails=""
+    run() {
+      local rc=0 out
+      out="$(rp_check_agent_bootstrap the-hcma/example-repo 2>&1)" || rc=$?
+      printf "%s|%s" "$rc" "$out"
+    }
+
+    # helper: stale only when .cursor/rules is named and .agents/rules is not
+    rp_agent_shim_has_stale_cursor_rules_pointer "load every rule under \`.cursor/rules/\`" || fails="$fails helper-stale"
+    ! rp_agent_shim_has_stale_cursor_rules_pointer "load every rule under \`.agents/rules/\`" || fails="$fails helper-current"
+    ! rp_agent_shim_has_stale_cursor_rules_pointer "rules in .agents/rules (.cursor/rules are shims)" || fails="$fails helper-both-ok"
+
+    # stale copilot shim: FAIL strict and --new-repo, SUGGEST only when routine
+    stub_copilot="Read AGENTS.md; load every rule under .cursor/rules/."
+    rp_strict_onboarding=1; rp_new_repo=0; r="$(run)"
+    [[ "${r%%|*}" != 0 ]] && grep -qF "CHECK_FAIL:.github/copilot-instructions.md must point at .agents/rules" <<<"$r" \
+      || fails="$fails copilot-strict-should-fail"
+    rp_strict_onboarding=0; rp_new_repo=1; r="$(run)"
+    [[ "${r%%|*}" != 0 ]] || fails="$fails copilot-new-repo-should-fail"
+    rp_strict_onboarding=0; rp_new_repo=0; r="$(run)"
+    [[ "${r%%|*}" == 0 ]] && ! grep -qF CHECK_FAIL <<<"$r" \
+      && grep -qF "SUGGEST:the-hcma/example-repo: .github/copilot-instructions.md still points at .cursor/rules" <<<"$r" \
+      || fails="$fails copilot-routine-should-suggest"
+
+    # stale CLAUDE.md: --apply-fix queues the template; the copilot file is never overwritten
+    stub_claude="@AGENTS.md
+Load rules under .cursor/rules/."
+    rp_apply_fix=1; rp_strict_onboarding=0; rp_new_repo=0; r="$(run)"
+    grep -qF "QUEUED:CLAUDE.md:sync-claude-md-shim" <<<"$r" || fails="$fails claude-fix-not-queued"
+    ! grep -qF "QUEUED:.github/copilot-instructions.md" <<<"$r" || fails="$fails copilot-should-not-be-overwritten"
+    rp_apply_fix=0
+
+    # current shims pass under the strictest mode
+    stub_claude="@AGENTS.md"
+    stub_copilot="Read AGENTS.md; load every rule under .agents/rules/."
+    rp_strict_onboarding=1; rp_new_repo=1; r="$(run)"
+    [[ "${r%%|*}" == 0 ]] && grep -qF CHECK_OK <<<"$r" && ! grep -qF SUGGEST <<<"$r" \
+      || fails="$fails current-should-pass:${r}"
+
+    if [[ -n "$fails" ]]; then printf "FAILS:%s\n" "$fails"; exit 1; fi
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib" \
+    "${rh_root}/AGENTS.md" \
+    "${agents_tmpl_dir}/agents-rules.instructions.md"
+)" || stale_out="fail:${stale_out}"
+rm -rf "$stale_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$stale_out" == 'ok' ]]; then
+  printf '[PASS] stale shims: a CLAUDE.md or copilot-instructions.md pointing at .cursor/rules FAILs strict/new-repo, SUGGESTs routine, and --apply-fix only queues CLAUDE.md\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] stale shims: .cursor/rules reference check (%s)\n' "$stale_out"
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== static: agent-bootstrap wired into the check dispatch ===\n'
 # shellcheck disable=SC2016  # grep for the literal dispatch line in source
 if grep -qE '^\s*if ! rp_check_agent_bootstrap "\$slug"; then' "$lib" \
