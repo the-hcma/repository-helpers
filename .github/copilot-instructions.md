@@ -1,6 +1,8 @@
 # Copilot Instructions
 
-> Full coding standards, conventions, and CI requirements are in [AGENTS.md](../AGENTS.md). Stacking tool: [`.cursor/rules/stacking-tool.mdc`](../.cursor/rules/stacking-tool.mdc) (read `.github/stacking-tool`). Graphite skill: [`.agents/skills/graphite/SKILL.md`](../.agents/skills/graphite/SKILL.md). gh-stack skill: [`.agents/skills/gh-stack/SKILL.md`](../.agents/skills/gh-stack/SKILL.md). PR ship and agent review loop: [`.agents/skills/ship-and-review/SKILL.md`](../.agents/skills/ship-and-review/SKILL.md) (thin contract: [`.cursor/rules/pr-ship-and-review.mdc`](../.cursor/rules/pr-ship-and-review.mdc)).
+Rules live under [`.agents/rules/`](../.agents/rules/) (the `.cursor/rules/*.mdc` files are Cursor injection shims only); [`.github/instructions/agents-rules.instructions.md`](instructions/agents-rules.instructions.md) points Copilot at them.
+
+> Full coding standards, conventions, and CI requirements are in [AGENTS.md](../AGENTS.md). Stacking tool: [`.agents/rules/stacking-tool.md`](../.agents/rules/stacking-tool.md) (read `.github/stacking-tool`). Graphite skill: [`.agents/skills/graphite/SKILL.md`](../.agents/skills/graphite/SKILL.md). gh-stack skill: [`.agents/skills/gh-stack/SKILL.md`](../.agents/skills/gh-stack/SKILL.md). PR ship and agent review loop: [`.agents/skills/ship-and-review/SKILL.md`](../.agents/skills/ship-and-review/SKILL.md) (thin contract: [`.agents/rules/pr-ship-and-review.md`](../.agents/rules/pr-ship-and-review.md)).
 
 ## Starting New Work
 
