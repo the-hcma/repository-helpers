@@ -38,3 +38,20 @@ scripts/gh-api api repos/the-hcma/repository-helpers/actions/runs/<id>/jobs
 | Date | PR | Change | `pull_request` wall-clock | Runner time per run | Notes |
 | --- | --- | --- | --- | --- | --- |
 | 2026-10-10 | baseline | none | p50 453s, p95 485s | ~410s (~10 billed min) | see above |
+
+## Decisions on the #692 plan
+
+- **Step 1 (parallel jobs):** `ci.yml` runs `actionlint`, `bash -n + shellcheck` and `tests (shard N/4)` as `ci-part-*` jobs behind one rollup job that keeps the required context name `shellcheck + tests`. Protection discovery skips `ci-part-*`, so parts can be split or renamed without touching branch protection.
+- **Step 2 (shards):** test files are sharded round-robin by `scripts/dev/run-tests --shard I/N`. The 337s `aa-github-repo-lint.test` was split into six real files (`tests/github-repo-lint-part-*.test`) that each stay under the time budget. Tests are never selected by section name or regex.
+- **Step 3 (parallel shellcheck): not done.** `shellcheck` follows `source` into files that are given as inputs of the same invocation, so splitting the file list over several processes loses that context: a trial run produced 531 findings where the single process produces none. The change would also not shorten the critical path, because the shellcheck job already runs alongside the test shards. Caching the pinned binaries was skipped for the same reason: the download is a few seconds.
+- **Step 4 (redundant runs):** a title/body `edited` event no longer starts the heavy jobs unless the base branch changed. Path-gating docs-only PRs was **not** done: the tests read Markdown (`AGENTS.md`, rule templates under `scripts/lib/repo-practices-agents/`, README), so a Markdown-only change can break a test. Whether `merge_group` should re-run the full matrix is left as an explicit decision for the operator, since it trades speed for the integration guarantee.
+- **Step 5 (local gate):** `scripts/dev/pre-pr-checks` runs the same `scripts/dev/run-tests` with parallel jobs (default half the cores, 2 to 8; override with `PRE_PR_CHECKS_TEST_JOBS`).
+- **Step 6 (other workflows):** not started; needs approval-latency data first.
+
+## Local measurements (10-core Mac)
+
+| Measurement | Before | After |
+| --- | --- | --- |
+| Whole test suite, sequential | ~672s | n/a |
+| Whole test suite via `run-tests --jobs 10` | n/a | 164s |
+| `scripts/dev/pre-pr-checks` (all jobs) | ~11 min | 3m13s |

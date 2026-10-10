@@ -42,6 +42,7 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | Agent review | `scripts/wait-for-agent-review`, `scripts/trigger-agent-review` | PR review loop, triage, operator email (no self-approve). |
 | Dev workflow | `scripts/dev/start-development` | Worktree + Graphite sync entry point. |
 | Dev workflow | `scripts/dev/pre-pr-checks` | Detect-first local CI gates (bash + Python/TS/Rust when present; secret-scan when adopted). |
+| Dev workflow | `scripts/dev/run-tests` | Run `tests/*.test` by file, optionally one CI shard (`--shard I/N`) and in parallel (`--jobs`); shared by CI and `pre-pr-checks`. |
 | Dev workflow | `scripts/dev/secret-scan` | Local gitleaks via canonical `ci-secret-scan` (same as CI / pre-pr secret-scan job). |
 | Dev workflow | `scripts/dev/submit-stack` | `pre-pr-checks` → `gt submit` → `post-pr-submission-checks`. |
 | Dev workflow | `scripts/dev/approve-pending-deployments` | Approve WAITING environment jobs on the operator's behalf. |
