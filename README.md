@@ -388,7 +388,8 @@ Focused tests live in `tests/` and can be run directly:
 ```bash
 bash tests/dep-updater.test
 bash tests/dep-updater-batch-run.test
-bash tests/aa-github-repo-lint.test
+bash tests/github-repo-lint-part-1.test   # parts 1-6; see tests/lib/github-repo-lint-part-init
+scripts/dev/run-tests --jobs 8        # the whole suite, files in parallel
 bash tests/a-github-repo-lint-enforcer.test
 bash tests/setup-service.test
 ```

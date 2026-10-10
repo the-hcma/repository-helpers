@@ -42,6 +42,7 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | Agent review | `scripts/wait-for-agent-review`, `scripts/trigger-agent-review` | PR review loop, triage, operator email (no self-approve). |
 | Dev workflow | `scripts/dev/start-development` | Worktree + Graphite sync entry point. |
 | Dev workflow | `scripts/dev/pre-pr-checks` | Detect-first local CI gates (bash + Python/TS/Rust when present; secret-scan when adopted). |
+| Dev workflow | `scripts/dev/run-tests` | Run `tests/*.test` by file, optionally one CI shard (`--shard I/N`) and in parallel (`--jobs`); shared by CI and `pre-pr-checks`. |
 | Dev workflow | `scripts/dev/secret-scan` | Local gitleaks via canonical `ci-secret-scan` (same as CI / pre-pr secret-scan job). |
 | Dev workflow | `scripts/dev/submit-stack` | `pre-pr-checks` → `gt submit` → `post-pr-submission-checks`. |
 | Dev workflow | `scripts/dev/approve-pending-deployments` | Approve WAITING environment jobs on the operator's behalf. |
@@ -101,6 +102,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 ## Testing
 
 - Test files live in `tests/` with no extension (e.g. `tests/dep-updater.test`).
+- **Keep every test file under ~60s** so CI can run files as parallel shards (#692). A file that grows past that is split into several files, never filtered by section name. The `github-repo-lint` / `repo-practices` tests are already split into `tests/github-repo-lint-part-*.test`: add new sections to the lightest part, and read the how-to at the top of `tests/lib/github-repo-lint-part-init` first.
 - Run with: `bash tests/<script-name>.test`
 - Tests are grouped into sections (`=== section name ===`). Each test prints `[PASS]` or `[FAIL]` and the suite exits non-zero if anything fails.
 - **Every new behaviour or bug fix must be accompanied by a test**, even if that test is a dry-run smoke test or a static-analysis assertion (`awk`/`grep` over the source).

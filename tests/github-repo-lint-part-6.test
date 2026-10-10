@@ -1,0 +1,1586 @@
+#!/usr/bin/env bash
+# Tests for scripts/github-repo-lint and scripts/lib/repo-practices — part 6 of 6.
+# Split from the former aa-github-repo-lint.test so CI can run the parts in parallel (#692).
+# To add a test, read the how-to at the top of tests/lib/github-repo-lint-part-init first.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+# shellcheck source=tests/lib/github-repo-lint-part-init
+source "${script_dir}/lib/github-repo-lint-part-init"
+
+pass=0
+fail=0
+
+printf '\n=== functional: HTTP 502 is API error, not missing workflow ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+mkdir -p "$mock_bin"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'auth status'* ]]; then
+  exit 0
+fi
+if [[ "$args" == *'labels'* ]]; then
+  printf '%s\n' '[[{"name":"merge-it"}]]'
+  exit 0
+fi
+if [[ "$args" == *'rulesets'* ]]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+if [[ "$args" == *'branches/main/protection'* ]]; then
+  exit 1
+fi
+if [[ "$args" == *'cleanup-merged-branches.yml'* ]]; then
+  echo 'gh: HTTP 502' >&2
+  exit 1
+fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
+fi
+if [[ "$args" == *'/contents/'* ]]; then
+  echo 'gh: Not Found (HTTP 404)' >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+set +e
+output="$(
+  RP_GH_API_MAX_ATTEMPTS=1 RP_GH_API_RETRY_SLEEP_SECS=0 \
+    PATH="${mock_bin}:${PATH}" bash "$checker" \
+    --repo the-hcma/example-repo --strict-onboarding --suggest 2>&1
+)"
+exit_code=$?
+set -e
+
+if [[ "$exit_code" -ne 0 ]] \
+  && grep -qF 'could not read .github/workflows/cleanup-merged-branches.yml (GitHub API: HTTP 502)' \
+    <<<"$output" \
+  && ! grep -qF 'missing .github/workflows/cleanup-merged-branches.yml' <<<"$output" \
+  && ! grep -qF 'should include a schedule trigger' <<<"$output"; then
+  printf '[PASS] HTTP 502 on workflow path is reported as GitHub API error\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected API error for HTTP 502, not missing/schedule (exit=%s)\n%s\n' \
+    "$exit_code" "$output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
+printf '\n=== functional: path check retries transient 502 then succeeds ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+mkdir -p "$mock_bin"
+state_file="${mock_dir}/cleanup-attempts"
+printf '0\n' >"$state_file"
+
+# shellcheck disable=SC2016  # mock embeds state file path
+cat >"${mock_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+if [[ "\$args" == *'auth status'* ]]; then
+  exit 0
+fi
+if [[ "\$args" == *'labels'* ]]; then
+  printf '%s\\n' '["merge-it"]'
+  exit 0
+fi
+if [[ "\$args" == *'rulesets'* ]]; then
+  printf '%s\\n' '[]'
+  exit 0
+fi
+if [[ "\$args" == *'branches/main/protection'* ]]; then
+  exit 1
+fi
+if [[ "\$args" == *'cleanup-merged-branches.yml'* ]]; then
+  n="\$(cat '${state_file}')"
+  n=\$(( n + 1 ))
+  printf '%s\\n' "\$n" >'${state_file}'
+  if [[ "\$n" -eq 1 ]]; then
+    echo 'gh: HTTP 502' >&2
+    exit 1
+  fi
+  # Second attempt: return a minimal workflow with schedule
+  content="\$(printf '%s' "on:\\n  schedule:\\n    - cron: '0 6 * * *'\\n" | base64)"
+  printf '{"content":"%s"}\\n' "\$content"
+  exit 0
+fi
+if [[ "\$args" == *'cleanup-branch-on-merge.yml'* ]]; then
+  echo 'gh: Not Found (HTTP 404)' >&2
+  exit 1
+fi
+if [[ "\$args" == *'/commits --jq'* ]]; then
+  printf '%s\\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
+fi
+if [[ "\$args" == *'/contents/'* ]]; then
+  echo 'gh: Not Found (HTTP 404)' >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+set +e
+output="$(
+  RP_GH_API_MAX_ATTEMPTS=3 RP_GH_API_RETRY_SLEEP_SECS=0 \
+    PATH="${mock_bin}:${PATH}" bash "$checker" \
+    --repo the-hcma/example-repo --strict-onboarding --suggest 2>&1
+)"
+exit_code=$?
+set -e
+attempts="$(cat "$state_file")"
+
+if [[ "$attempts" -ge 2 ]] \
+  && ! grep -qF 'could not read .github/workflows/cleanup-merged-branches.yml (GitHub API: HTTP 502)' \
+    <<<"$output" \
+  && ! grep -qF 'should include a schedule trigger' <<<"$output"; then
+  printf '[PASS] transient HTTP 502 is retried and does not false-fail schedule check\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected retry past HTTP 502 (attempts=%s exit=%s)\n%s\n' \
+    "$attempts" "$exit_code" "$output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
+printf '\n=== static: python static CI job check wired ===\n'
+if grep -qF 'rp_check_python_static_ci_job' "$lib" \
+  && grep -qF 'rp_python_static_wrapper_is_canonical' "$lib" \
+  && grep -qF 'rp_ci_workflow_has_combined_python_static_job' "$lib" \
+  && grep -qF 'rp_ci_workflow_has_split_python_static_jobs' "$lib" \
+  && grep -qF 'rp_ci_workflow_has_unsafe_python_static_cutover_aliases' "$lib" \
+  && grep -qF 'rp_workflow_has_unsafe_noop_legacy_python_static' "$lib" \
+  && grep -qF 'rp_workflow_has_unsafe_checks_action_python_static' "$lib" \
+  && grep -qF 'rp_workflow_has_unsafe_python_static_publishers' "$lib" \
+  && grep -qF 'rp_fetch_workflow_file_names' "$lib" \
+  && grep -qF 'Backend Lint' "$lib" \
+  && grep -qF 'rp_repo_uses_ruff_ci' "$lib" \
+  && grep -qF 'rp_check_python_static_ci_job() {' "$lib" \
+  && [[ "$(grep -cF 'rp_check_python_static_ci_job' "$lib")" -ge 2 ]]; then
+  printf '[PASS] python-static: check + helpers defined and wired into rp_check_one_repo\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] python-static: missing check function or audit wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: python-static wrapper canonicality ===\n'
+combined_wrapper='#!/usr/bin/env bash
+set -euo pipefail
+bash .github/ci/setup-python
+uv run ruff check app config
+uv run ruff format --check app config
+uv run pyright'
+mypy_wrapper='#!/usr/bin/env bash
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src'
+partial_wrapper='#!/usr/bin/env bash
+uv run ruff check .'
+if bash -c "source '${lib}'; rp_python_static_wrapper_is_canonical \"\$1\"" _ "$combined_wrapper" \
+  && bash -c "source '${lib}'; rp_python_static_wrapper_is_canonical \"\$1\"" _ "$mypy_wrapper" \
+  && ! bash -c "source '${lib}'; rp_python_static_wrapper_is_canonical \"\$1\"" _ "$partial_wrapper"; then
+  printf '[PASS] python-static: wrapper canonical for ruff+typecheck, rejects ruff-only\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] python-static: wrapper canonicality check wrong\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: python-static ci.yml job detection ===\n'
+combined_ci='jobs:
+  python-static:
+    name: Python lint & format checks
+    steps:
+      - run: bash .github/ci/python-static'
+# Non-job 2-space keys under on:/concurrency: must not confuse job parsing.
+combined_with_preamble_ci='name: CI
+on:
+  pull_request:
+  push:
+concurrency:
+  group: ci
+jobs:
+  python-static:
+    name: Python lint & format checks
+    steps:
+      - run: bash .github/ci/python-static'
+# Name and wrapper in different jobs must not count as combined.
+split_markers_ci='jobs:
+  python-static:
+    name: Python lint & format checks
+    steps:
+      - run: echo placeholder
+  other:
+    name: Other
+    steps:
+      - run: bash .github/ci/python-static'
+split_ci='jobs:
+  ruff:
+    name: Ruff
+    steps:
+      - run: bash .github/ci/ruff
+  pyright:
+    name: Pyright
+    steps:
+      - run: bash .github/ci/pyright'
+unsafe_alias_ci='jobs:
+  python-static:
+    name: Python lint & format checks
+    steps:
+      - run: bash .github/ci/python-static
+  ruff:
+    name: Ruff
+    needs: [guard, python-static]
+    if: needs.guard.outputs.skip != '\''true'\''
+    steps:
+      - run: echo covered'
+# Gate on an unrelated job must not mask an unsafe Ruff alias (Vortex #384).
+masked_unsafe_ci='jobs:
+  python-static:
+    name: Python lint & format checks
+    steps:
+      - run: bash .github/ci/python-static
+  ruff:
+    name: Ruff
+    needs: [guard, python-static]
+    if: needs.guard.outputs.skip != '\''true'\''
+    steps:
+      - run: echo covered
+  unrelated:
+    name: Some Other Job
+    if: needs.python-static.result == '\''success'\''
+    steps:
+      - run: echo ok'
+safe_alias_ci='jobs:
+  python-static:
+    name: Python lint & format checks
+    steps:
+      - run: bash .github/ci/python-static
+  backend-lint:
+    name: Backend Lint
+    needs: [guard, python-static]
+    if: needs.guard.outputs.skip != '\''true'\'' && needs.python-static.result == '\''success'\''
+    steps:
+      - run: echo covered'
+# Quoted job name + double-quoted success still count as a safe cutover alias.
+quoted_safe_ci='jobs:
+  ruff:
+    name: "Ruff"
+    needs: [guard, python-static]
+    if: needs.guard.outputs.skip != '\''true'\'' && needs.python-static.result == "success"
+    steps:
+      - run: echo covered'
+# 4-space job indent (valid YAML) must still be parsed (Vortex #384).
+combined_4space_ci='jobs:
+    python-static:
+        name: Python lint & format checks
+        steps:
+            - run: bash .github/ci/python-static'
+unsafe_4space_ci='jobs:
+    python-static:
+        name: Python lint & format checks
+        steps:
+            - run: bash .github/ci/python-static
+    ruff:
+        name: Ruff
+        needs: [guard, python-static]
+        if: needs.guard.outputs.skip != '\''true'\''
+        steps:
+            - run: echo covered'
+# Suffixed wrapper path (python-static-v2) must not count as the wrapper.
+suffixed_wrapper_ci='jobs:
+  python-static:
+    name: Python lint & format checks
+    steps:
+      - run: bash .github/ci/python-static-v2'
+# Valid YAML key ordering: steps: before name: must still detect the combined job.
+combined_reordered_ci='jobs:
+  python-static:
+    steps:
+      - run: bash .github/ci/python-static
+    name: Python lint & format checks'
+# Valid YAML key ordering: if: before name: must still count as a safe alias.
+reordered_safe_alias_ci='jobs:
+  ruff:
+    if: needs.guard.outputs.skip != '\''true'\'' && needs.python-static.result == '\''success'\''
+    name: Ruff
+    needs: [guard, python-static]
+    steps:
+      - run: echo covered'
+# Multi-line if: > scalar with the gate on a continuation line is safe.
+multiline_if_safe_ci='jobs:
+  ruff:
+    name: Ruff
+    needs: [guard, python-static]
+    if: >
+      needs.guard.outputs.skip != '\''true'\'' &&
+      needs.python-static.result == '\''success'\''
+    steps:
+      - run: echo covered'
+# Matrix primary rows named Ruff/Mypy with cutover-ok are unsafe false-greens (#390).
+# shellcheck disable=SC2016  # fixture YAML contains literal ${{ }} expressions
+unsafe_matrix_noop='jobs:
+  release-pr-checks:
+    name: ${{ matrix.check.name }}
+    strategy:
+      matrix:
+        check:
+          - name: Python lint & format checks
+            script: .github/ci/python-static
+          - name: Ruff
+            script: .github/ci/cutover-ok
+          - name: Mypy
+            script: .github/ci/cutover-ok'
+# Safe cutover: aliases share the real job conclusion (still leftover end-state).
+safe_matrix_aliases='jobs:
+  release-pr-checks:
+    strategy:
+      matrix:
+        check:
+          - name: Python lint & format checks
+            script: .github/ci/python-static
+            aliases: Ruff Mypy'
+# checks-action with hardcoded success is unsafe; outcome-tied is not.
+unsafe_checks_action='jobs:
+  publish:
+    steps:
+      - id: run
+        run: bash .github/ci/python-static
+      - uses: LouisBrunner/checks-action@v3.1.0
+        with:
+          name: Ruff
+          conclusion: success'
+# shellcheck disable=SC2016  # fixture YAML contains literal ${{ }} expressions
+safe_checks_action='jobs:
+  publish:
+    steps:
+      - id: run
+        run: bash .github/ci/python-static
+      - uses: LouisBrunner/checks-action@v3.1.0
+        with:
+          name: Ruff
+          conclusion: ${{ steps.run.outcome == '\''success'\'' && '\''success'\'' || '\''failure'\'' }}'
+# Mentioning checks-action in a run: string must not count as a publisher.
+echo_mentions_checks='jobs:
+  publish:
+    steps:
+      - run: echo "checks-action is bad"
+        name: Ruff'
+# Multi-line conclusion scalar still counts as outcome-gated.
+# shellcheck disable=SC2016  # fixture YAML contains literal ${{ }} expressions
+multiline_safe_checks='jobs:
+  publish:
+    steps:
+      - id: run
+        run: bash .github/ci/python-static
+      - uses: LouisBrunner/checks-action@v3.1.0
+        with:
+          name: Ruff
+          conclusion: >
+            ${{ steps.run.outcome == '\''success'\'' && '\''success'\'' || '\''failure'\'' }}'
+# Unrelated steps.*.outcome in another with: key must not clear hardcoded conclusion.
+# shellcheck disable=SC2016  # fixture YAML contains literal ${{ }} expressions
+hardcoded_with_title_outcome='jobs:
+  publish:
+    steps:
+      - uses: LouisBrunner/checks-action@v3.1.0
+        with:
+          name: Ruff
+          conclusion: success
+          title: ${{ steps.run.outcome }}'
+# name: before uses: must still detect unsafe checks-action (Vortex).
+name_before_uses_checks='jobs:
+  publish:
+    steps:
+      - name: Ruff
+        uses: LouisBrunner/checks-action@v3.1.0
+        with:
+          conclusion: success'
+# Trailing YAML comments on legacy names must still match (#412 CodeRabbit).
+commented_split_ci='jobs:
+  ruff:
+    name: Ruff # temporary alias
+    steps:
+      - run: bash .github/ci/ruff'
+commented_matrix_noop='jobs:
+  release-pr-checks:
+    strategy:
+      matrix:
+        check:
+          - name: Ruff # temporary alias
+            script: .github/ci/cutover-ok'
+# Step-level name: Ruff must not count as an unsafe cutover job alias (Vortex).
+step_name_not_alias='jobs:
+  test:
+    name: Pytest
+    steps:
+      - run: pip install ruff
+        name: Ruff'
+# cutover-ok in a name/comment must not count as a matrix no-op (Vortex).
+cutover_ok_in_name_only='jobs:
+  release-pr-checks:
+    strategy:
+      matrix:
+        check:
+          - name: Ruff cutover-ok note
+            script: .github/ci/ruff'
+# Substring cutover-ok in a longer script path must not count as a no-op.
+cutover_ok_substring_script='jobs:
+  release-pr-checks:
+    strategy:
+      matrix:
+        check:
+          - name: Ruff
+            script: .github/ci/validate-cutover-ok-setup'
+# Unquoted Covered-by echo is still a cutover no-op.
+unquoted_covered_echo='jobs:
+  release-pr-checks:
+    strategy:
+      matrix:
+        check:
+          - name: Ruff
+            run: echo Covered by Python lint & format checks'
+# aliases: must match whole tokens, not substrings (Vortex).
+alias_substring_not_legacy='jobs:
+  release-pr-checks:
+    strategy:
+      matrix:
+        check:
+          - name: Python lint & format checks
+            script: .github/ci/python-static
+            aliases: mypy-check ruff-extra'
+# Lone run: true is a noop; run: true beside a real script is not (Vortex).
+matrix_true_only_noop='jobs:
+  release-pr-checks:
+    strategy:
+      matrix:
+        check:
+          - name: Ruff
+            run: true'
+matrix_true_with_real_script='jobs:
+  release-pr-checks:
+    strategy:
+      matrix:
+        check:
+          - name: Ruff
+            script: .github/ci/ruff
+            run: true'
+# Bare script: cutover-ok (no dir prefix) is still a noop (Vortex).
+bare_cutover_ok_script='jobs:
+  release-pr-checks:
+    strategy:
+      matrix:
+        check:
+          - name: Ruff
+            script: cutover-ok'
+# Bare unquoted Covered by at EOL is still a noop.
+bare_covered_by_eol='jobs:
+  release-pr-checks:
+    strategy:
+      matrix:
+        check:
+          - name: Ruff
+            run: echo Covered by'
+if bash -c "source '${lib}'; rp_ci_workflow_has_combined_python_static_job \"\$1\"" _ "$combined_ci" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_combined_python_static_job \"\$1\"" _ "$combined_with_preamble_ci" \
+  && ! bash -c "source '${lib}'; rp_ci_workflow_has_combined_python_static_job \"\$1\"" _ "$split_markers_ci" \
+  && ! bash -c "source '${lib}'; rp_ci_workflow_has_split_python_static_jobs \"\$1\"" _ "$combined_ci" \
+  && ! bash -c "source '${lib}'; rp_ci_workflow_has_combined_python_static_job \"\$1\"" _ "$split_ci" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_split_python_static_jobs \"\$1\"" _ "$split_ci" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_unsafe_python_static_cutover_aliases \"\$1\"" _ "$unsafe_alias_ci" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_unsafe_python_static_cutover_aliases \"\$1\"" _ "$masked_unsafe_ci" \
+  && ! bash -c "source '${lib}'; rp_ci_workflow_has_unsafe_python_static_cutover_aliases \"\$1\"" _ "$safe_alias_ci" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_split_python_static_jobs \"\$1\"" _ "$safe_alias_ci" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_split_python_static_jobs \"\$1\"" _ "$quoted_safe_ci" \
+  && ! bash -c "source '${lib}'; rp_ci_workflow_has_unsafe_python_static_cutover_aliases \"\$1\"" _ "$quoted_safe_ci" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_combined_python_static_job \"\$1\"" _ "$combined_4space_ci" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_unsafe_python_static_cutover_aliases \"\$1\"" _ "$unsafe_4space_ci" \
+  && ! bash -c "source '${lib}'; rp_ci_workflow_has_combined_python_static_job \"\$1\"" _ "$suffixed_wrapper_ci" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_combined_python_static_job \"\$1\"" _ "$combined_reordered_ci" \
+  && ! bash -c "source '${lib}'; rp_ci_workflow_has_unsafe_python_static_cutover_aliases \"\$1\"" _ "$reordered_safe_alias_ci" \
+  && ! bash -c "source '${lib}'; rp_ci_workflow_has_unsafe_python_static_cutover_aliases \"\$1\"" _ "$multiline_if_safe_ci" \
+  && bash -c "source '${lib}'; rp_workflow_has_unsafe_noop_legacy_python_static \"\$1\"" _ "$unsafe_matrix_noop" \
+  && bash -c "source '${lib}'; rp_workflow_has_unsafe_python_static_publishers \"\$1\"" _ "$unsafe_matrix_noop" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_split_python_static_jobs \"\$1\"" _ "$safe_matrix_aliases" \
+  && ! bash -c "source '${lib}'; rp_workflow_has_unsafe_noop_legacy_python_static \"\$1\"" _ "$safe_matrix_aliases" \
+  && bash -c "source '${lib}'; rp_workflow_has_unsafe_checks_action_python_static \"\$1\"" _ "$unsafe_checks_action" \
+  && ! bash -c "source '${lib}'; rp_workflow_has_unsafe_checks_action_python_static \"\$1\"" _ "$safe_checks_action" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_split_python_static_jobs \"\$1\"" _ "$safe_checks_action" \
+  && ! bash -c "source '${lib}'; rp_workflow_has_unsafe_checks_action_python_static \"\$1\"" _ "$echo_mentions_checks" \
+  && ! bash -c "source '${lib}'; rp_workflow_has_unsafe_checks_action_python_static \"\$1\"" _ "$multiline_safe_checks" \
+  && bash -c "source '${lib}'; rp_workflow_has_unsafe_checks_action_python_static \"\$1\"" _ "$hardcoded_with_title_outcome" \
+  && bash -c "source '${lib}'; rp_workflow_has_unsafe_checks_action_python_static \"\$1\"" _ "$name_before_uses_checks" \
+  && bash -c "source '${lib}'; rp_ci_workflow_has_split_python_static_jobs \"\$1\"" _ "$commented_split_ci" \
+  && bash -c "source '${lib}'; rp_workflow_has_unsafe_noop_legacy_python_static \"\$1\"" _ "$commented_matrix_noop" \
+  && ! bash -c "source '${lib}'; rp_workflow_has_unsafe_noop_legacy_python_static \"\$1\"" _ "$cutover_ok_in_name_only" \
+  && ! bash -c "source '${lib}'; rp_workflow_has_unsafe_noop_legacy_python_static \"\$1\"" _ "$cutover_ok_substring_script" \
+  && bash -c "source '${lib}'; rp_workflow_has_unsafe_noop_legacy_python_static \"\$1\"" _ "$unquoted_covered_echo" \
+  && ! bash -c "source '${lib}'; rp_ci_workflow_has_split_python_static_jobs \"\$1\"" _ "$alias_substring_not_legacy" \
+  && bash -c "source '${lib}'; rp_workflow_has_unsafe_noop_legacy_python_static \"\$1\"" _ "$matrix_true_only_noop" \
+  && ! bash -c "source '${lib}'; rp_workflow_has_unsafe_noop_legacy_python_static \"\$1\"" _ "$matrix_true_with_real_script" \
+  && bash -c "source '${lib}'; rp_workflow_has_unsafe_noop_legacy_python_static \"\$1\"" _ "$bare_cutover_ok_script" \
+  && bash -c "source '${lib}'; rp_workflow_has_unsafe_noop_legacy_python_static \"\$1\"" _ "$bare_covered_by_eol" \
+  && ! bash -c "source '${lib}'; rp_ci_workflow_has_unsafe_python_static_cutover_aliases \"\$1\"" _ "$step_name_not_alias"; then
+  printf '[PASS] python-static: detects combined/split jobs and unsafe vs safe cutover aliases\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] python-static: ci.yml job detection wrong\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: python-static split jobs fail audit ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+mkdir -p "$mock_bin"
+split_ci_b64="$(printf '%s' 'name: CI
+jobs:
+  ruff:
+    name: Ruff
+    steps:
+      - run: bash .github/ci/ruff
+  pyright:
+    name: Pyright
+    steps:
+      - run: bash .github/ci/pyright' | base64 -w0)"
+
+cat >"${mock_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+if [[ "\$args" == *'auth status'* ]]; then exit 0; fi
+if [[ "\$args" == *'release-please.yml'* ]]; then exit 1; fi
+if [[ "\$args" == *'/labels'* ]]; then printf '%s\n' '[[]]'; exit 0; fi
+if [[ "\$args" == *'contents/.github/workflows/ci.yml'* ]]; then
+  printf '%s\n' '{"content":"${split_ci_b64}"}'
+  exit 0
+fi
+if [[ "\$args" == *'contents/.github/workflows' ]]; then
+  printf '%s\n' '[{"name":"ci.yml","type":"file"}]'
+  exit 0
+fi
+if [[ "\$args" == *'contents/pyproject.toml'* ]]; then printf '%s\n' '{}'; exit 0; fi
+if [[ "\$args" == *'contents/.github/ci/python-static'* ]]; then exit 1; fi
+if [[ "\$args" == *'/contents/'* ]]; then exit 1; fi
+printf 'unexpected gh call: %s\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+set +e
+output="$(PATH="${mock_bin}:${PATH}" bash "$checker" \
+  --repo the-hcma/split-python-ci --suggest 2>&1)"
+exit_code=$?
+set -e
+
+if [[ "$exit_code" -ne 0 ]] \
+  && grep -qF 'not gated on the combined job/step succeeding' <<<"$output" \
+  && grep -qF "missing combined 'Python lint & format checks' job" <<<"$output" \
+  && grep -qF 'missing .github/ci/python-static wrapper' <<<"$output"; then
+  printf '[PASS] python-static: unsafe split/alias jobs fail audit with suggestions\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] python-static: expected split-job failure (exit=%s)\n%s\n' \
+    "$exit_code" "$output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
+printf '\n=== functional: python-static non-ci.yml matrix no-op fails audit ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+mkdir -p "$mock_bin"
+good_ci_b64="$(printf '%s' 'name: CI
+jobs:
+  python-static:
+    name: Python lint & format checks
+    steps:
+      - run: bash .github/ci/python-static' | base64 -w0)"
+# shellcheck disable=SC2016  # fixture YAML contains literal ${{ }} expressions
+bad_rp_b64="$(printf '%s' 'name: Release Please
+jobs:
+  release-pr-checks:
+    name: ${{ matrix.check.name }}
+    strategy:
+      matrix:
+        check:
+          - name: Python lint & format checks
+            script: .github/ci/python-static
+          - name: Ruff
+            script: .github/ci/cutover-ok
+          - name: Mypy
+            script: .github/ci/cutover-ok' | base64 -w0)"
+wrapper_b64="$(printf '%s' '#!/usr/bin/env bash
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy .' | base64 -w0)"
+
+cat >"${mock_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+if [[ "\$args" == *'auth status'* ]]; then exit 0; fi
+if [[ "\$args" == *'/labels'* ]]; then printf '%s\n' '[[]]'; exit 0; fi
+if [[ "\$args" == *'contents/.github/workflows/ci.yml'* ]]; then
+  printf '%s\n' '{"content":"${good_ci_b64}"}'
+  exit 0
+fi
+if [[ "\$args" == *'contents/.github/workflows/release-please.yml'* ]]; then
+  printf '%s\n' '{"content":"${bad_rp_b64}"}'
+  exit 0
+fi
+if [[ "\$args" == *'contents/.github/workflows' ]]; then
+  printf '%s\n' '[{"name":"ci.yml","type":"file"},{"name":"release-please.yml","type":"file"}]'
+  exit 0
+fi
+if [[ "\$args" == *'contents/pyproject.toml'* ]]; then printf '%s\n' '{}'; exit 0; fi
+if [[ "\$args" == *'contents/.github/ci/python-static'* ]]; then
+  printf '%s\n' '{"content":"${wrapper_b64}"}'
+  exit 0
+fi
+if [[ "\$args" == *'/contents/'* ]]; then exit 1; fi
+printf 'unexpected gh call: %s\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+cat >"${mock_bin}/jq" <<'MOCK_JQ'
+#!/usr/bin/env bash
+exec /usr/bin/jq "$@"
+MOCK_JQ
+chmod +x "${mock_bin}/jq"
+
+set +e
+output="$(PATH="${mock_bin}:${PATH}" bash "$checker" \
+  --repo the-hcma/matrix-noop-python --suggest 2>&1)"
+exit_code=$?
+set -e
+
+if [[ "$exit_code" -ne 0 ]] \
+  && grep -qF 'release-please.yml' <<<"$output" \
+  && grep -qF 'not gated on the combined job/step succeeding' <<<"$output" \
+  && grep -qF 'false-green' <<<"$output"; then
+  printf '[PASS] python-static: release-please matrix cutover-ok no-ops fail audit\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] python-static: expected non-ci.yml matrix failure (exit=%s)\n%s\n' \
+    "$exit_code" "$output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
+printf '\n=== static: org cursor-rule rollout apply-fix helpers ===\n'
+if grep -qF 'rp_helpers_primary_checkout_dir' "$lib" \
+  && grep -qF 'rp_index_scan_root_clones' "$lib" \
+  && grep -qF 'rp_local_repo_scan_root' "$lib" \
+  && grep -qF 'rp_resolve_local_repo_dir_from_scan_root' "$lib" \
+  && grep -qF 'rp_scan_root_clone_dirs' "$lib" \
+  && grep -qF 'rp_candidate_fix_path_is_api_eligible' "$lib" \
+  && grep -qF 'rp_apply_file_pr_via_api' "$lib" \
+  && grep -qF 'rp_apply_candidate_fixes_via_api' "$lib"; then
+  printf '[PASS] org cursor-rule rollout: scan-root resolve and API apply-fix helpers present\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] org cursor-rule rollout: missing scan-root or API apply-fix helpers\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: every agent-bootstrap shim path is API apply-fix eligible ===\n'
+ab_elig_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${ab_elig_dir}/runner-sessions"
+ab_elig_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    fails=""
+    for path in "$rp_agent_bootstrap_claude_path" "$rp_agent_bootstrap_copilot_path" \
+      "$rp_agent_bootstrap_instructions_path"; do
+      rp_candidate_fix_path_is_api_eligible "$path" || fails="$fails ${path}"
+    done
+    if rp_candidate_fix_path_is_api_eligible .github/instructions/other.instructions.md; then
+      fails="$fails other-instructions-accepted"
+    fi
+    if [[ -n "$fails" ]]; then printf "FAILS:%s\n" "$fails"; exit 1; fi
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib"
+)" || ab_elig_out="fail:${ab_elig_out}"
+rm -rf "$ab_elig_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$ab_elig_out" == 'ok' ]]; then
+  printf '[PASS] #681: CLAUDE.md, copilot-instructions and the .github/instructions pointer can land via the Contents API (no clone)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] #681: agent-bootstrap shim API eligibility (%s)\n' "$ab_elig_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: API apply-fix guards and mixed eligibility ===\n'
+# shellcheck disable=SC2016  # assert literal source fragments, not expansions
+if grep -qF 'rp_helpers_primary_checkout_dir' "$lib" \
+  && grep -qF 'worktree list --porcelain' "$lib" \
+  && grep -qF 'rp_scan_root_clone_index_ready' "$lib" \
+  && grep -qF 'runner_sh_stdout "repo-practices file-pr base64"' "$lib" \
+  && grep -qF 'failed to read default branch for API file PR' "$lib" \
+  && grep -qF 'failed to open candidate file PR for' "$lib" \
+  && grep -qF 'gh delete stale file fix ref' "$lib" \
+  && grep -qF 'skipped_ineligible=1' "$lib" \
+  && grep -qF 'not API-eligible' "$lib"; then
+  printf '[PASS] API apply-fix: worktree scan-root, runner encode, guards, mixed eligibility\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] API apply-fix missing scan-root cache, runner encode, or mixed-eligibility skip\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: github-repo-lint CI workflow ===\n'
+grl_ci_workflow="${rh_root}/.github/workflows/github-repo-lint.yml"
+if [[ -f "$grl_ci_workflow" ]] \
+  && grep -qF '.agents/rules/**' "$grl_ci_workflow" \
+  && grep -qF '.agents/skills/**' "$grl_ci_workflow" \
+  && grep -qF '.cursor/rules/**' "$grl_ci_workflow" \
+  && grep -qF '.github/workflows/github-repo-lint.yml' "$grl_ci_workflow" \
+  && grep -qF 'scripts/github-repo-lint' "$grl_ci_workflow" \
+  && grep -qF 'scripts/lib/repo-practices' "$grl_ci_workflow" \
+  && grep -qF 'scripts/lib/repo-practices-agents/**' "$grl_ci_workflow" \
+  && grep -qF 'scripts/lib/repo-practices-cursor/**' "$grl_ci_workflow" \
+  && grep -qF 'environment: github-repo-lint' "$grl_ci_workflow" \
+  && grep -qF 'approve-pending-deployments' "$grl_ci_workflow" \
+  && grep -qF 'workflow_dispatch:' "$grl_ci_workflow" \
+  && ! grep -qF 'merge_group:' "$grl_ci_workflow" \
+  && grep -qF 'secrets.REPO_LINT_TOKEN' "$grl_ci_workflow" \
+  && grep -qF 'persist-credentials: false' "$grl_ci_workflow" \
+  && grep -qF -- '--all --strict-onboarding --compact' "$grl_ci_workflow"; then
+  printf '[PASS] github-repo-lint CI workflow audits org when lint source or cursor rules change\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] github-repo-lint CI workflow missing or incomplete\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: org-cursor-rule-rollout agents rule ===\n'
+org_rollout_rule="${rh_root}/.agents/rules/org-cursor-rule-rollout.md"
+org_rollout_shim="${rh_root}/.cursor/rules/org-cursor-rule-rollout.mdc"
+if [[ -f "$org_rollout_rule" ]] \
+  && [[ -f "$org_rollout_shim" ]] \
+  && grep -qF 'agents-rule-shim: org-cursor-rule-rollout' "$org_rollout_shim" \
+  && grep -qF -- '--apply-fix' "$org_rollout_rule" \
+  && grep -qF -- '--all' "$org_rollout_rule" \
+  && grep -qF 'scripts/lib/repo-practices-cursor/' "$org_rollout_rule" \
+  && grep -qF 'scripts/lib/repo-practices-agents/' "$org_rollout_rule" \
+  && grep -qF '.agents/rules/**' "$org_rollout_rule" \
+  && grep -qF 'scripts/lib/repo-practices-agents/**' "$org_rollout_rule" \
+  && grep -qF 'approve-pending-deployments' "$org_rollout_rule" \
+  && grep -qiF 'lockstep' "$org_rollout_rule" \
+  && grep -qiF 'mergestorm' "$org_rollout_rule" \
+  && grep -qiF 'Merge order' "$org_rollout_rule" \
+  && grep -qiF 'merged **last**' "$org_rollout_rule"; then
+  printf '[PASS] org-cursor-rule-rollout rule documents org-wide deployment\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] org-cursor-rule-rollout rule missing or incomplete\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: GitHub-native security checks wired (repository-helpers#588) ===\n'
+# shellcheck disable=SC2016  # intentional literal $slug in source under test
+if grep -q '^rp_check_github_security_settings()' "$lib" \
+  && grep -q '^rp_check_actions_hardening()' "$lib" \
+  && grep -q '^rp_check_actions_workflow_pinning()' "$lib" \
+  && grep -q '^rp_check_deployment_env_protection()' "$lib" \
+  && grep -q '^rp_check_protection_mechanism_consistency()' "$lib" \
+  && grep -qF 'rp_check_github_security_settings "$slug"' "$lib" \
+  && grep -qF 'rp_check_actions_hardening "$slug"' "$lib" \
+  && grep -qF 'rp_check_actions_workflow_pinning "$slug"' "$lib" \
+  && grep -qF 'rp_check_deployment_env_protection "$slug"' "$lib" \
+  && grep -qF 'rp_check_protection_mechanism_consistency "$slug"' "$lib"; then
+  printf '[PASS] all five #588 checks defined and wired into rp_check_one_repo\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] #588 checks missing or not wired into rp_check_one_repo\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_uses_ref_is_sha_pinned / rp_workflow_uses_refs / rp_workflow_is_publish_like ===\n'
+pin_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${pin_dir}/runner-sessions"
+pin_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+
+    rp_uses_ref_is_sha_pinned "actions/checkout@$(printf "a%.0s" {1..40})" \
+      || { printf "sha-pinned should match\n"; exit 1; }
+    ! rp_uses_ref_is_sha_pinned "actions/checkout@v4" \
+      || { printf "v4 should not be sha-pinned\n"; exit 1; }
+    ! rp_uses_ref_is_sha_pinned "actions/checkout@$(printf "a%.0s" {1..39})" \
+      || { printf "39-char hex should not match (not a full SHA)\n"; exit 1; }
+
+    wf=$'"'"'name: CI\non:\n  push:\njobs:\n  build:\n    steps:\n      - uses: ./local-action\n      - uses: actions/checkout@v4\n      - uses: docker://alpine:3\n      - uses: actions/setup-node@v6.4.0 # comment\n'"'"'
+    refs="$(rp_workflow_uses_refs "$wf")"
+    { grep -qF "actions/checkout@v4" <<<"$refs" \
+      && grep -qF "actions/setup-node@v6.4.0" <<<"$refs" \
+      && ! grep -qF "./local-action" <<<"$refs" \
+      && ! grep -qF "docker://" <<<"$refs"; } \
+      || { printf "uses_refs: %s\n" "$refs"; exit 1; }
+
+    rp_workflow_is_publish_like "release.yml" "" \
+      || { printf "release.yml should be publish-like by name\n"; exit 1; }
+    rp_workflow_is_publish_like "ci.yml" $'"'"'permissions:\n  id-token: write\n'"'"' \
+      || { printf "id-token: write should be publish-like\n"; exit 1; }
+    rp_workflow_is_publish_like "ci.yml" "uses: pypa/gh-action-pypi-publish@release/v1" \
+      || { printf "pypi publish action should be publish-like\n"; exit 1; }
+    ! rp_workflow_is_publish_like "ci.yml" "steps: []" \
+      || { printf "plain ci.yml should not be publish-like\n"; exit 1; }
+
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib"
+)" || pin_out="fail:${pin_out}"
+rm -rf "$pin_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$pin_out" == 'ok' ]]; then
+  printf '[PASS] SHA-pin detection, uses: extraction, and publish-like heuristic\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] workflow pinning helpers (%s)\n' "$pin_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_workflow_environment_names / rp_environment_has_protection ===\n'
+env_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${env_dir}/runner-sessions"
+env_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+
+    wf=$'"'"'jobs:\n  deploy:\n    environment: pypi\n    steps: []\n  build:\n    steps: []\n'"'"'
+    names="$(rp_workflow_environment_names "$wf")"
+    [[ "$names" == "pypi" ]] || { printf "env names: %s\n" "$names"; exit 1; }
+
+    # Regression (review #591): scalar form with quotes and a trailing comment.
+    wf_quoted=$'"'"'jobs:\n  deploy:\n    environment: "pypi" # prod\n'"'"'
+    names="$(rp_workflow_environment_names "$wf_quoted")"
+    [[ "$names" == "pypi" ]] || { printf "quoted+comment env names: %s\n" "$names"; exit 1; }
+
+    # Regression (review #591): the mapping form (environment: on its own
+    # line, followed by name:) was previously dropped entirely.
+    wf_mapping=$'"'"'jobs:\n  publish:\n    environment:\n      name: pypi\n      url: https://pypi.org/p/example\n    steps: []\n'"'"'
+    names="$(rp_workflow_environment_names "$wf_mapping")"
+    [[ "$names" == "pypi" ]] || { printf "mapping-form env names: %s\n" "$names"; exit 1; }
+
+    # Regression (review #591 round 3): a reusable-workflow call'"'"'s `with:`
+    # input named `environment` is not this workflow'"'"'s job environment.
+    wf_with=$'"'"'jobs:\n  deploy:\n    uses: ./.github/workflows/reusable.yml\n    with:\n      environment: staging\n'"'"'
+    names="$(rp_workflow_environment_names "$wf_with")"
+    [[ -z "$names" ]] || { printf "with:-nested environment should be skipped: %s\n" "$names"; exit 1; }
+
+    # Regression (review #591 round 3): an expression value is never a
+    # literal environment name — percent-encoding it 404s against a
+    # completely unrelated (nonexistent) environment.
+    wf_expr=$'"'"'jobs:\n  deploy:\n    environment: ${{ inputs.environment }}\n    steps: []\n'"'"'
+    names="$(rp_workflow_environment_names "$wf_expr")"
+    [[ -z "$names" ]] || { printf "expression environment should be skipped: %s\n" "$names"; exit 1; }
+
+    # The with:/strategy: skip must not swallow a real environment that
+    # follows once the nested block ends (indentation drops back down).
+    wf_after_with=$'"'"'jobs:\n  deploy:\n    uses: ./.github/workflows/reusable.yml\n    with:\n      environment: staging\n  publish:\n    environment: pypi\n    steps: []\n'"'"'
+    names="$(rp_workflow_environment_names "$wf_after_with")"
+    [[ "$names" == "pypi" ]] \
+      || { printf "environment after a with: block should still be found: %s\n" "$names"; exit 1; }
+
+    # Regression (review #591 round 5): a mapping block'"'"'s name: is not
+    # necessarily the first key — url: commonly comes first — so the block
+    # must keep scanning by indentation, not reset on the first non-name: key.
+    wf_url_before_name=$'"'"'jobs:\n  publish:\n    environment:\n      url: https://pypi.org/p/example\n      name: pypi\n    steps: []\n'"'"'
+    names="$(rp_workflow_environment_names "$wf_url_before_name")"
+    [[ "$names" == "pypi" ]] \
+      || { printf "url: before name: should not lose the environment: %s\n" "$names"; exit 1; }
+
+    rp_environment_has_protection '"'"'{"protection_rules":[{"type":"required_reviewers"}]}'"'"' \
+      || { printf "required_reviewers rule should count as protected\n"; exit 1; }
+    rp_environment_has_protection '"'"'{"protection_rules":[],"deployment_branch_policy":{"protected_branches":true}}'"'"' \
+      || { printf "protected_branches:true should count as protected\n"; exit 1; }
+    rp_environment_has_protection '"'"'{"protection_rules":[],"deployment_branch_policy":{"custom_branch_policies":true}}'"'"' \
+      || { printf "custom_branch_policies:true should count as protected\n"; exit 1; }
+    ! rp_environment_has_protection '"'"'{"protection_rules":[],"deployment_branch_policy":null}'"'"' \
+      || { printf "empty rules + null policy should not be protected\n"; exit 1; }
+    # Regression (review #591 round 2): a wait_timer-only rule delays the
+    # deploy but requires no approval — not a human gate.
+    ! rp_environment_has_protection '"'"'{"protection_rules":[{"type":"wait_timer","wait_timer":30}],"deployment_branch_policy":null}'"'"' \
+      || { printf "wait_timer-only should not count as protected\n"; exit 1; }
+    # Regression (review #591 round 2): a branch policy object with both
+    # flags false restricts nothing.
+    ! rp_environment_has_protection '"'"'{"protection_rules":[],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":false}}'"'"' \
+      || { printf "non-restrictive branch policy should not count as protected\n"; exit 1; }
+
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib"
+)" || env_out="fail:${env_out}"
+rm -rf "$env_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$env_out" == 'ok' ]]; then
+  printf '[PASS] environment name extraction and protection detection\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] deployment environment helpers (%s)\n' "$env_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_fetch_environment_protection URL-encodes the environment name ===\n'
+# Regression (review #591): the jq @uri encoding step needs -r (raw output),
+# or the encoded value comes back JSON-quoted (`"dep-updater"`) and the
+# request 404s against a real, protected environment — a false "not
+# protected" finding that stubbing rp_fetch_environment_protection in the
+# other unit tests here cannot catch. Uses a real gh mock so the actual
+# requested path is observable.
+urlenc_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${urlenc_dir}/runner-sessions"
+urlenc_bin="${urlenc_dir}/bin"
+mkdir -p "$urlenc_bin"
+cat >"${urlenc_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+  case "$arg" in
+    repos/*/environments/*)
+      printf '%s\n' "$arg" >>"${MOCK_GH_CAPTURE}"
+      printf '{"protection_rules":[{"type":"required_reviewers"}]}\n'
+      exit 0
+      ;;
+  esac
+done
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 1
+MOCK_GH
+chmod +x "${urlenc_bin}/gh"
+capture_file="${urlenc_dir}/captured-path"
+: >"$capture_file"
+urlenc_out="$(
+  MOCK_GH_CAPTURE="$capture_file" PATH="${urlenc_bin}:${PATH}" bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+
+    rc=0
+    json="$(rp_fetch_environment_protection the-hcma/example-repo "dep-updater")" || rc=$?
+    [[ "$rc" -eq 0 ]] || { printf "plain-name fetch failed: rc=%s\n" "$rc"; exit 1; }
+    rp_environment_has_protection "$json" \
+      || { printf "plain-name should be reported protected\n"; exit 1; }
+
+    rc=0
+    json="$(rp_fetch_environment_protection the-hcma/example-repo "my env")" || rc=$?
+    [[ "$rc" -eq 0 ]] || { printf "spaced-name fetch failed: rc=%s\n" "$rc"; exit 1; }
+
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib"
+)" || urlenc_out="fail:${urlenc_out}"
+captured="$(cat "$capture_file")"
+rm -rf "$urlenc_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$urlenc_out" == 'ok' ]] \
+  && grep -qF 'repos/the-hcma/example-repo/environments/dep-updater' <<<"$captured" \
+  && grep -qF 'repos/the-hcma/example-repo/environments/my%20env' <<<"$captured"; then
+  printf '[PASS] rp_fetch_environment_protection requests the raw (unquoted) percent-encoded path\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rp_fetch_environment_protection URL-encoding (%s) (captured: %s)\n' \
+    "$urlenc_out" "$captured"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_check_github_security_settings (repository-helpers#588) ===\n'
+ghsec_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${ghsec_dir}/runner-sessions"
+ghsec_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    rp_compact=0; rp_suggest=1; rp_apply_fix=0; rp_strict_onboarding=0; rp_new_repo=0
+
+    rp_fetch_repo_security_settings() {
+      printf %s "{\"private\":false,\"security_and_analysis\":{\"secret_scanning\":{\"status\":\"disabled\"}}}"
+    }
+    rp_fetch_repo_toggle_state() { return 1; }
+    rp_fetch_repo_enabled_field() { printf false; return 0; }
+
+    rc=0; out="$(rp_check_github_security_settings the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "SUGGEST: the-hcma/example-repo: enable secret scanning" <<<"$out" \
+      && grep -qF "SUGGEST: the-hcma/example-repo: enable Dependabot alerts" <<<"$out" \
+      && grep -qF "SUGGEST: the-hcma/example-repo: enable Dependabot security updates" <<<"$out" \
+      && grep -qF "SUGGEST: the-hcma/example-repo: enable private vulnerability reporting" <<<"$out"; } \
+      || { printf "routine-public-off: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    # Promoted (repository-helpers#588 org-wide rollout complete, see
+    # .cursor/rules/org-cursor-rule-rollout.mdc): --strict-onboarding alone
+    # now FAILs, matching --new-repo.
+    rp_strict_onboarding=1
+    rc=0; out="$(rp_check_github_security_settings the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] \
+      && grep -qF "FAIL: the-hcma/example-repo: secret scanning is disabled" <<<"$out" \
+      && grep -qF "FAIL: the-hcma/example-repo: Dependabot alerts are disabled" <<<"$out"; } \
+      || { printf "strict-onboarding-alone-now-fail: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    rp_strict_onboarding=0
+
+    rp_new_repo=1
+    rc=0; out="$(rp_check_github_security_settings the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] \
+      && grep -qF "FAIL: the-hcma/example-repo: secret scanning is disabled" <<<"$out" \
+      && grep -qF "FAIL: the-hcma/example-repo: Dependabot alerts are disabled" <<<"$out"; } \
+      || { printf "new-repo-public-off: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    rp_new_repo=0
+
+    rp_fetch_repo_security_settings() {
+      printf %s "{\"private\":true,\"security_and_analysis\":{\"secret_scanning\":{\"status\":\"disabled\"}}}"
+    }
+    rp_fetch_repo_toggle_state() { return 0; }
+    rp_fetch_repo_enabled_field() { printf true; return 0; }
+    rp_new_repo=1
+    rc=0; out="$(rp_check_github_security_settings the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "SUGGEST: the-hcma/example-repo: secret scanning is off (private repo" <<<"$out"; } \
+      || { printf "new-repo-private-off: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    rp_new_repo=0
+
+    # Same private-repo advisory-only exception under --strict-onboarding
+    # (repository-helpers#588 promotion, review #592): the private-repo
+    # secret-scanning gap has no user-actionable fix without a plan/GHAS
+    # upgrade, so it always SUGGESTs, never FAILs.
+    rp_strict_onboarding=1
+    rc=0; out="$(rp_check_github_security_settings the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "SUGGEST: the-hcma/example-repo: secret scanning is off (private repo" <<<"$out" \
+      && ! grep -qF "FAIL:" <<<"$out"; } \
+      || { printf "strict-onboarding-private-off: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    rp_strict_onboarding=0
+
+    # Regression (review #591, verified live against a real private org repo):
+    # private-vulnerability-reporting can 404 for a private repo even when
+    # unrelated to Dependabot alerts state — advisory-only there, same as
+    # secret scanning, never a FAIL even under --new-repo.
+    rp_fetch_repo_security_settings() {
+      printf %s "{\"private\":true,\"security_and_analysis\":{\"secret_scanning\":{\"status\":\"enabled\"},\"secret_scanning_push_protection\":{\"status\":\"enabled\"}}}"
+    }
+    rp_fetch_repo_toggle_state() { return 0; }
+    rp_fetch_repo_enabled_field() {
+      [[ "$2" == "private-vulnerability-reporting" ]] && { printf false; return 0; }
+      printf true; return 0
+    }
+    rp_new_repo=1
+    rc=0; out="$(rp_check_github_security_settings the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "SUGGEST: the-hcma/example-repo: private vulnerability reporting is off (private repo" <<<"$out" \
+      && ! grep -qF "FAIL:" <<<"$out"; } \
+      || { printf "new-repo-private-pvr-off: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    rp_new_repo=0
+
+    applied=""
+    rp_apply_enable_secret_scanning() { applied="${applied}secret_scanning,"; return 0; }
+    rp_apply_repo_put_toggle() { applied="${applied}$2,"; return 0; }
+    rp_fetch_repo_security_settings() {
+      printf %s "{\"private\":false,\"security_and_analysis\":{\"secret_scanning\":{\"status\":\"disabled\"}}}"
+    }
+    rp_fetch_repo_toggle_state() { return 1; }
+    rp_fetch_repo_enabled_field() { printf false; return 0; }
+    rp_apply_fix=1
+    rp_check_github_security_settings the-hcma/example-repo >/dev/null 2>&1 || true
+    { grep -qF "secret_scanning," <<<"$applied" \
+      && grep -qF "vulnerability-alerts," <<<"$applied" \
+      && grep -qF "automated-security-fixes," <<<"$applied" \
+      && grep -qF "private-vulnerability-reporting," <<<"$applied"; } \
+      || { printf "apply-fix: applied=%s\n" "$applied"; exit 1; }
+    rp_apply_fix=0
+
+    rp_fetch_repo_security_settings() {
+      printf %s "{\"private\":false,\"security_and_analysis\":{\"secret_scanning\":{\"status\":\"enabled\"},\"secret_scanning_push_protection\":{\"status\":\"enabled\"}}}"
+    }
+    rp_fetch_repo_toggle_state() { return 0; }
+    rp_fetch_repo_enabled_field() { printf true; return 0; }
+    rc=0; out="$(rp_check_github_security_settings the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] && ! grep -qE "FAIL:|SUGGEST:" <<<"$out"; } \
+      || { printf "clean-case: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib"
+)" || ghsec_out="fail:${ghsec_out}"
+rm -rf "$ghsec_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$ghsec_out" == 'ok' ]]; then
+  printf '[PASS] rp_check_github_security_settings: routine SUGGEST / strict-onboarding+new-repo FAIL / private advisory-only / apply-fix / clean OK\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rp_check_github_security_settings (%s)\n' "$ghsec_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_check_actions_hardening (repository-helpers#588) ===\n'
+acth_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${acth_dir}/runner-sessions"
+acth_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    rp_compact=0; rp_suggest=1; rp_apply_fix=0; rp_strict_onboarding=0; rp_new_repo=0
+
+    rp_fetch_actions_permissions() {
+      printf %s "{\"allowed_actions\":\"all\",\"sha_pinning_required\":false}"
+    }
+    rp_fetch_actions_permissions_workflow() {
+      printf %s "{\"default_workflow_permissions\":\"write\",\"can_approve_pull_request_reviews\":true}"
+    }
+    # Ready-when-pinned gate: treat example-repo as fully SHA-pinned unless a
+    # case overrides this mock.
+    rp_actions_workflows_all_uses_sha_pinned() { return 0; }
+    rp_actions_workflows_setup_pnpm_nested_uses_sha_pinned() { return 0; }
+
+    rc=0; out="$(rp_check_actions_hardening the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "SUGGEST: the-hcma/example-repo: disable Actions" <<<"$out" \
+      && grep -qF "SUGGEST: the-hcma/example-repo: set Actions default workflow permissions" <<<"$out" \
+      && grep -qF "SUGGEST: the-hcma/example-repo: restrict Actions" <<<"$out" \
+      && grep -qF "SUGGEST: the-hcma/example-repo: consider requiring SHA pinning" <<<"$out"; } \
+      || { printf "routine-off: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    # Promoted (repository-helpers#588 / #640): --strict-onboarding alone FAILs
+    # workflow perms + sha_pinning_required (when uses: are SHA-pinned).
+    rp_strict_onboarding=1
+    rc=0; out="$(rp_check_actions_hardening the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] \
+      && grep -qF "FAIL: the-hcma/example-repo: Actions can_approve_pull_request_reviews must be false" <<<"$out" \
+      && grep -qF "FAIL: the-hcma/example-repo: Actions default_workflow_permissions must be read" <<<"$out" \
+      && grep -qF "FAIL: the-hcma/example-repo: Actions sha_pinning_required must be true" <<<"$out" \
+      && grep -qF "SUGGEST: the-hcma/example-repo: restrict Actions" <<<"$out"; } \
+      || { printf "strict-onboarding-alone-now-fail: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    rp_strict_onboarding=0
+
+    rp_new_repo=1
+    rc=0; out="$(rp_check_actions_hardening the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] \
+      && grep -qF "FAIL: the-hcma/example-repo: Actions can_approve_pull_request_reviews must be false" <<<"$out" \
+      && grep -qF "FAIL: the-hcma/example-repo: Actions default_workflow_permissions must be read" <<<"$out" \
+      && grep -qF "FAIL: the-hcma/example-repo: Actions sha_pinning_required must be true" <<<"$out" \
+      && grep -qF "SUGGEST: the-hcma/example-repo: restrict Actions" <<<"$out"; } \
+      || { printf "new-repo-off: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    rp_new_repo=0
+
+    # Unpinned uses: under strict — no sha_pinning FAIL (would brick CI).
+    rp_actions_workflows_all_uses_sha_pinned() { return 1; }
+    rp_strict_onboarding=1
+    rp_suggest=0
+    rc=0; out="$(rp_check_actions_hardening the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] \
+      && grep -qF "FAIL: the-hcma/example-repo: Actions can_approve_pull_request_reviews must be false" <<<"$out" \
+      && ! grep -qF "FAIL: the-hcma/example-repo: Actions sha_pinning_required must be true" <<<"$out"; } \
+      || { printf "strict-unpinned-no-sha-fail: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    rp_strict_onboarding=0
+    rp_suggest=1
+    rp_actions_workflows_all_uses_sha_pinned() { return 0; }
+
+    applied=0
+    sha_applied=0
+    rp_apply_actions_workflow_permissions() { applied=1; return 0; }
+    rp_apply_actions_sha_pinning_required() { sha_applied=1; return 0; }
+    rp_apply_fix=1
+    rp_check_actions_hardening the-hcma/example-repo >/dev/null 2>&1 || true
+    [[ "$applied" -eq 1 ]] || { printf "apply-fix not invoked\n"; exit 1; }
+    [[ "$sha_applied" -eq 1 ]] || { printf "sha_pinning apply-fix not invoked\n"; exit 1; }
+
+    # Unsafe: unpinned uses: must not enable sha_pinning_required.
+    sha_applied=0
+    rp_actions_workflows_all_uses_sha_pinned() { return 1; }
+    rp_suggest=1
+    out="$(
+      rp_check_actions_hardening the-hcma/example-repo 2>&1 || true
+      printf "SHA_APPLIED=%s\n" "$sha_applied"
+    )"
+    { grep -qF "SHA_APPLIED=0" <<<"$out" \
+      && grep -qF "SUGGEST: the-hcma/example-repo: skip sha_pinning_required until" <<<"$out"; } \
+      || { printf "unsafe-skip: out=%s\n" "$out"; exit 1; }
+    rp_apply_fix=0
+    rp_suggest=1
+    rp_actions_workflows_all_uses_sha_pinned() { return 0; }
+
+    # Stale setup-pnpm-corepack nested tags must not enable sha_pinning_required.
+    sha_applied=0
+    rp_actions_workflows_setup_pnpm_nested_uses_sha_pinned() { return 1; }
+    rp_apply_fix=1
+    out="$(
+      rp_check_actions_hardening the-hcma/example-repo 2>&1 || true
+      printf "SHA_APPLIED=%s\n" "$sha_applied"
+    )"
+    { grep -qF "SHA_APPLIED=0" <<<"$out" \
+      && grep -qF "SUGGEST: the-hcma/example-repo: skip sha_pinning_required until setup-pnpm-corepack nested" <<<"$out"; } \
+      || { printf "nested-skip: out=%s\n" "$out"; exit 1; }
+    rp_apply_fix=0
+    rp_actions_workflows_setup_pnpm_nested_uses_sha_pinned() { return 0; }
+
+    rp_fetch_actions_permissions() {
+      printf %s "{\"allowed_actions\":\"selected\",\"sha_pinning_required\":true}"
+    }
+    rp_fetch_actions_permissions_workflow() {
+      printf %s "{\"default_workflow_permissions\":\"read\",\"can_approve_pull_request_reviews\":false}"
+    }
+    rc=0; out="$(rp_check_actions_hardening the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] && ! grep -qE "FAIL:|SUGGEST:" <<<"$out"; } \
+      || { printf "clean-case: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib"
+)" || acth_out="fail:${acth_out}"
+rm -rf "$acth_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$acth_out" == 'ok' ]]; then
+  printf '[PASS] rp_check_actions_hardening: routine SUGGEST / strict-onboarding+new-repo FAIL / apply-fix / clean OK\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rp_check_actions_hardening (%s)\n' "$acth_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_check_actions_workflow_pinning (repository-helpers#588) ===\n'
+pinchk_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${pinchk_dir}/runner-sessions"
+pinchk_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    rp_compact=0; rp_suggest=1; rp_apply_fix=0; rp_strict_onboarding=0; rp_new_repo=0
+
+    rp_fetch_workflow_file_names() { printf "ci.yml\n"; }
+    rp_fetch_github_text_file() {
+      printf "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n"
+    }
+    rc=0; out="$(rp_check_actions_workflow_pinning the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "SUGGEST: the-hcma/example-repo: consider pinning third-party Actions" <<<"$out"; } \
+      || { printf "non-publish-unpinned: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    rp_fetch_workflow_file_names() { printf "release.yml\n"; }
+    rp_fetch_github_text_file() {
+      printf "jobs:\n  publish:\n    steps:\n      - uses: pypa/gh-action-pypi-publish@release/v1\n"
+    }
+    rc=0; out="$(rp_check_actions_workflow_pinning the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "SUGGEST: the-hcma/example-repo: pin release/publish workflow actions" <<<"$out"; } \
+      || { printf "publish-unpinned-routine: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    # Promoted (repository-helpers#588 org-wide rollout complete): --strict-onboarding
+    # alone now FAILs, matching --new-repo.
+    rp_strict_onboarding=1
+    rc=0; out="$(rp_check_actions_workflow_pinning the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] \
+      && grep -qF "FAIL: the-hcma/example-repo: release/publish workflow(s) use non-SHA-pinned actions" <<<"$out"; } \
+      || { printf "strict-onboarding-alone-now-fail: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    rp_strict_onboarding=0
+
+    rp_new_repo=1
+    rc=0; out="$(rp_check_actions_workflow_pinning the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] \
+      && grep -qF "FAIL: the-hcma/example-repo: release/publish workflow(s) use non-SHA-pinned actions" <<<"$out"; } \
+      || { printf "new-repo-publish-unpinned: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    # Regression (review #591): the per-reference detail line must come after
+    # the FAIL line it explains, not before it.
+    fail_line_num="$(grep -n "^FAIL: the-hcma/example-repo: release/publish" <<<"$out" | cut -d: -f1)"
+    detail_line_num="$(grep -n "pypa/gh-action-pypi-publish@release/v1" <<<"$out" | cut -d: -f1)"
+    { [[ -n "$fail_line_num" && -n "$detail_line_num" && "$detail_line_num" -gt "$fail_line_num" ]]; } \
+      || { printf "detail-after-fail: fail_line=%s detail_line=%s out=%s\n" \
+        "$fail_line_num" "$detail_line_num" "$out"; exit 1; }
+    rp_new_repo=0
+
+    rp_fetch_github_text_file() {
+      printf "jobs:\n  publish:\n    steps:\n      - uses: pypa/gh-action-pypi-publish@%s\n" "$(printf "a%.0s" {1..40})"
+    }
+    rc=0; out="$(rp_check_actions_workflow_pinning the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] && ! grep -qE "FAIL:|SUGGEST:" <<<"$out"; } \
+      || { printf "sha-pinned-clean: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib"
+)" || pinchk_out="fail:${pinchk_out}"
+rm -rf "$pinchk_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$pinchk_out" == 'ok' ]]; then
+  printf '[PASS] rp_check_actions_workflow_pinning: generic SUGGEST always / publish-like FAIL under strict-onboarding+new-repo\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rp_check_actions_workflow_pinning (%s)\n' "$pinchk_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_check_deployment_env_protection (repository-helpers#588) ===\n'
+envchk_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${envchk_dir}/runner-sessions"
+envchk_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    rp_compact=0; rp_suggest=1; rp_apply_fix=0; rp_strict_onboarding=0; rp_new_repo=0
+
+    rp_fetch_workflow_file_names() { printf "release.yml\n"; }
+    rp_fetch_github_text_file() {
+      printf "jobs:\n  publish:\n    environment: pypi\n    steps: []\n"
+    }
+    rp_fetch_environment_protection() { printf %s "{\"protection_rules\":[]}"; return 0; }
+
+    rc=0; out="$(rp_check_deployment_env_protection the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "SUGGEST: the-hcma/example-repo:" <<<"$out" \
+      && grep -qF "required reviewer or branch policy" <<<"$out" \
+      && grep -qF "pypi" <<<"$out"; } \
+      || { printf "unprotected-env-routine: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    # Promoted (repository-helpers#588 org-wide rollout complete): --strict-onboarding
+    # alone now FAILs, matching --new-repo.
+    rp_strict_onboarding=1
+    rc=0; out="$(rp_check_deployment_env_protection the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] \
+      && grep -qF "FAIL: the-hcma/example-repo:" <<<"$out" \
+      && grep -qF "no protection rules or branch policy" <<<"$out" \
+      && grep -qF "pypi" <<<"$out"; } \
+      || { printf "strict-onboarding-alone-now-fail: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    rp_strict_onboarding=0
+
+    rp_new_repo=1
+    rc=0; out="$(rp_check_deployment_env_protection the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] \
+      && grep -qF "FAIL: the-hcma/example-repo:" <<<"$out" \
+      && grep -qF "no protection rules or branch policy" <<<"$out" \
+      && grep -qF "pypi" <<<"$out"; } \
+      || { printf "new-repo-unprotected-env: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    rp_new_repo=0
+
+    rp_fetch_environment_protection() {
+      printf %s "{\"protection_rules\":[{\"type\":\"required_reviewers\"}]}"
+      return 0
+    }
+    rc=0; out="$(rp_check_deployment_env_protection the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] && ! grep -qE "FAIL:|SUGGEST:" <<<"$out"; } \
+      || { printf "protected-env-clean: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    rp_fetch_github_text_file() { printf "jobs:\n  build:\n    steps: []\n"; }
+    rc=0; out="$(rp_check_deployment_env_protection the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] && [[ -z "$out" ]]; } \
+      || { printf "no-environment-noop: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib"
+)" || envchk_out="fail:${envchk_out}"
+rm -rf "$envchk_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$envchk_out" == 'ok' ]]; then
+  printf '[PASS] rp_check_deployment_env_protection: routine SUGGEST / strict-onboarding+new-repo FAIL / protected+no-env quiet\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rp_check_deployment_env_protection (%s)\n' "$envchk_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_gh_api_get_json treats an unmocked/empty-stderr gh call as missing, not an error ===\n'
+apiget_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${apiget_dir}/runner-sessions"
+apiget_bin="${apiget_dir}/bin"
+mkdir -p "$apiget_bin"
+cat >"${apiget_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+# No mocked endpoints at all — every call exits 1 with no stderr, exactly
+# like a test fixture's `gh` stub that never mentions this new endpoint
+# (repository-helpers#588: a check added here must not break every existing
+# full-audit test fixture that predates it).
+exit 1
+MOCK_GH
+chmod +x "${apiget_bin}/gh"
+apiget_out="$(
+  PATH="${apiget_bin}:${PATH}" bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+
+    rc=0
+    rp_gh_api_get_json "test" "repos/the-hcma/example-repo" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" == 1 ]] || { printf "expected classify-as-missing (rc=1), got rc=%s\n" "$rc"; exit 1; }
+
+    rp_compact=0; rp_suggest=1; rp_apply_fix=0; rp_strict_onboarding=1; rp_new_repo=0
+    rc=0; out="$(rp_check_github_security_settings the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] && [[ -z "$out" ]]; } \
+      || { printf "security-settings should skip quietly: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    rc=0; out="$(rp_check_actions_hardening the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] && [[ -z "$out" ]]; } \
+      || { printf "actions-hardening should skip quietly: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib"
+)" || apiget_out="fail:${apiget_out}"
+rm -rf "$apiget_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$apiget_out" == 'ok' ]]; then
+  printf '[PASS] unmocked new-endpoint gh calls degrade to a quiet skip, matching rp_gh_path_check convention\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rp_gh_api_get_json / new-check graceful skip (%s)\n' "$apiget_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_check_protection_mechanism_consistency (repository-helpers#588) ===\n'
+pmc_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${pmc_dir}/runner-sessions"
+pmc_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    rp_compact=0; rp_suggest=1; rp_strict_onboarding=1; rp_new_repo=0
+
+    rp_fetch_classic_main_protection_json() {
+      printf %s "{\"required_pull_request_reviews\":{\"require_code_owner_reviews\":true}}"
+    }
+    rp_fetch_protect_main_ruleset() {
+      printf %s "{\"rules\":[{\"type\":\"pull_request\",\"parameters\":{\"require_code_owner_review\":false}}]}"
+    }
+    rc=0; out="$(rp_check_protection_mechanism_consistency the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "SUGGEST: the-hcma/example-repo: classic protection require_code_owner_reviews=true disagrees" <<<"$out"; } \
+      || { printf "disagree-still-rc0: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    rp_fetch_protect_main_ruleset() {
+      printf %s "{\"rules\":[{\"type\":\"pull_request\",\"parameters\":{\"require_code_owner_review\":true}}]}"
+    }
+    rc=0; out="$(rp_check_protection_mechanism_consistency the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] && [[ -z "$out" ]]; } \
+      || { printf "agree-quiet: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    rp_fetch_classic_main_protection_json() { printf ""; }
+    rc=0; out="$(rp_check_protection_mechanism_consistency the-hcma/example-repo 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] && [[ -z "$out" ]]; } \
+      || { printf "no-classic-quiet: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib"
+)" || pmc_out="fail:${pmc_out}"
+rm -rf "$pmc_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$pmc_out" == 'ok' ]]; then
+  printf '[PASS] rp_check_protection_mechanism_consistency: advisory-only, even under --strict-onboarding\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rp_check_protection_mechanism_consistency (%s)\n' "$pmc_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_discover_ci_status_contexts skips ci-part-* jobs (#692) ===\n'
+ctx_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${ctx_dir}/runner-sessions"
+ctx_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    rp_fetch_ci_workflow_text() {
+      cat <<'"'"'YAML'"'"'
+jobs:
+  guard:
+    name: Guard
+  ci-part-tests:
+    name: tests
+  ci-part-shellcheck:
+    name: bash -n + shellcheck
+  check:
+    name: shellcheck + tests
+  secret-scan:
+    name: Secret Scan
+  lint:
+    runs-on: ubuntu-latest
+YAML
+    }
+    rp_discover_ci_status_contexts "the-hcma/example" | paste -sd, -
+  ' _ "$runner_bootstrap" "$lib" 2>&1
+)"
+rm -rf "$ctx_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$ctx_out" == 'shellcheck + tests,lint' ]]; then
+  printf '[PASS] required contexts are the rollup and plain jobs; ci-part-* parts are skipped\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] required contexts expected "shellcheck + tests,lint"; got %s\n' "$ctx_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: ci.yml rollup keeps the required context (#692) ===\n'
+ci_yml="${rh_root}/.github/workflows/ci.yml"
+if awk '
+    /^  check:/ { in_check = 1; next }
+    in_check && /^  [a-zA-Z0-9_-]+:/ { in_check = 0 }
+    in_check && /^    name: shellcheck \+ tests$/ { has_name = 1 }
+    in_check && /^    needs: \[guard, ci-part-actionlint, ci-part-shellcheck, ci-part-tests\]$/ { has_needs = 1 }
+    in_check && /^    if: always\(\) && / { has_always = 1 }
+    END { exit !(has_name && has_needs && has_always) }
+  ' "$ci_yml"; then
+  printf '[PASS] ci.yml check job is named "shellcheck + tests", needs every ci-part job, and runs always()\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] ci.yml check rollup must keep name, needs all ci-part jobs, and use always()\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== summary ===\n'
+printf '%s passed, %s failed\n' "$pass" "$fail"
+
+if [[ "$fail" -gt 0 ]]; then
+  exit 1
+fi

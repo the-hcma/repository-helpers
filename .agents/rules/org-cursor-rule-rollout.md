@@ -14,7 +14,7 @@ alwaysApply: false
 
 **Layout (repository-helpers#637):** canonical rule bodies live under `.agents/rules/*.md`. `.cursor/rules/*.mdc` are thin Cursor injection shims (frontmatter + pointer). Skills live under `.agents/skills/<name>/SKILL.md` only (no `.cursor/skills/` — Cursor loads `.agents/skills/` directly). Copilot gets one pointer, `.github/instructions/agents-rules.instructions.md` (`applyTo: '**'`, audited by agent-bootstrap), that tells it to read every `.agents/rules/*.md`; a new rule needs no per-rule `.github/instructions/` file (repository-helpers#681).
 
-When you add or tighten an **org-enforced** Cursor rule in `scripts/lib/repo-practices` (`rp_check_*` + template under `scripts/lib/repo-practices-cursor/` + tests in `tests/aa-github-repo-lint.test`), the nightly `github-repo-lint --enforcer` run and org-wide audits will fail consumers that lack a valid rule — unless the check uses a **SUGGEST-during-roll-out** ratchet (see below).
+When you add or tighten an **org-enforced** Cursor rule in `scripts/lib/repo-practices` (`rp_check_*` + template under `scripts/lib/repo-practices-cursor/` + tests in `tests/github-repo-lint-part-*.test` (see the how-to in `tests/lib/github-repo-lint-part-init`)), the nightly `github-repo-lint --enforcer` run and org-wide audits will fail consumers that lack a valid rule — unless the check uses a **SUGGEST-during-roll-out** ratchet (see below).
 
 The same process applies to a new **non-cursor-rule** enforced check that expects files in every consumer (e.g. `agent-bootstrap`: `CLAUDE.md` / `.github/copilot-instructions.md` shims, templates under `scripts/lib/repo-practices-agents/`) — land helpers with the ratchet, pilot one consumer, roll org-wide, merge helpers last.
 
@@ -64,7 +64,7 @@ If pilot (or helpers) review finds a substantive problem in the template, `rp_ch
 
 - [ ] Canonical template in `scripts/lib/repo-practices-agents/rules/<name>.md` + shim in `scripts/lib/repo-practices-cursor/<name>.mdc`
 - [ ] `rp_check_*` + `rp_*_is_valid` + `--apply-fix` queue wiring in `scripts/lib/repo-practices`
-- [ ] Tests in `tests/aa-github-repo-lint.test` (static + functional)
+- [ ] Tests in `tests/github-repo-lint-part-*.test` (see the how-to in `tests/lib/github-repo-lint-part-init`) (static + functional)
 - [ ] Local copies in `.agents/rules/` + `.cursor/rules/` shim when this repo should dogfood the rule
 - [ ] Pilot consumer + helpers agent-accepted in lockstep (step 3) before org-wide
 - [ ] Every consumer PR agent-accepted + auto-merged before the helpers PR
