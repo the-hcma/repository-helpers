@@ -101,6 +101,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 ## Testing
 
 - Test files live in `tests/` with no extension (e.g. `tests/dep-updater.test`).
+- **Keep every test file under ~60s** so CI can run files as parallel shards (#692). A file that grows past that is split into several files, never filtered by section name. The `github-repo-lint` / `repo-practices` tests are already split into `tests/github-repo-lint-part-*.test`: add new sections to the lightest part, and read the how-to at the top of `tests/lib/github-repo-lint-part-init` first.
 - Run with: `bash tests/<script-name>.test`
 - Tests are grouped into sections (`=== section name ===`). Each test prints `[PASS]` or `[FAIL]` and the suite exits non-zero if anything fails.
 - **Every new behaviour or bug fix must be accompanied by a test**, even if that test is a dry-run smoke test or a static-analysis assertion (`awk`/`grep` over the source).
