@@ -71,8 +71,8 @@ Jobs (parallel where independent; skip with PRE_PR_CHECKS_SKIP=job1,job2):
   - bash-n / shellcheck -S info — helpers-style (scripts/dev/pre-pr-checks) CI globs;
     or consumer `.github/ci/shellcheck` wrapper when present
   - actionlint — helpers-style, or when workflows already invoke actionlint
-  - tests — bash tests/*.test when present (sequential, isolated TMPDIR +
-    per-test RUNNER_SESSION_ROOT; each parallel job also gets its own runner
+  - tests — bash tests/*.test when present via scripts/dev/run-tests (parallel, isolated
+    TMPDIR + per-test RUNNER_SESSION_ROOT; PRE_PR_CHECKS_TEST_JOBS overrides the job count; each parallel job also gets its own runner
     session so runner_exec_stdout cannot race siblings — #556)
   - python-static — .github/ci/python-static or uv ruff/pyright fallback
   - pytest-hermetic — when `.github/ci/pytest-hermetic` exists (same hermetic
@@ -237,28 +237,27 @@ job_actionlint() {
   runner_exec "pre-pr-checks actionlint" -- actionlint "${files[@]}"
 }
 
-job_test_file() {
-  local -r test_path="$1"
-  local test_tmp rc
-
-  test_tmp="$(mktemp -d "${prec_pr_test_isolate_dir}/job.XXXXXX")"
-  rc=0
-  (
-    export TMPDIR="$test_tmp"
-    # Keep runner artifacts inside the isolate dir so suite children cannot race
-    # sibling parallel jobs (or each other) on ~/scratch/.../runner-sessions (#556).
-    # shellcheck disable=SC2031  # intentional per-test isolate; parent must not inherit
-    export RUNNER_SESSION_ROOT="${test_tmp}/runner-sessions"
-    unset RUNNER_SESSION_DIR RUNNER_SESSION_KEEP
-    mkdir -p "$RUNNER_SESSION_ROOT"
-    bash "$test_path"
-  ) || rc=$?
-  rm -rf "$test_tmp"
-  return "$rc"
+# Default test parallelism: half the cores (the suites are fork-heavy), within 2..8.
+prec_test_jobs() {
+  local cpus jobs
+  if [[ -n "${PRE_PR_CHECKS_TEST_JOBS:-}" ]]; then
+    printf '%s' "$PRE_PR_CHECKS_TEST_JOBS"
+    return 0
+  fi
+  cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '4')"
+  jobs=$(( cpus / 2 ))
+  if (( jobs < 2 )); then
+    jobs=2
+  elif (( jobs > 8 )); then
+    jobs=8
+  fi
+  printf '%s' "$jobs"
 }
 
+# Same runner CI shards use (scripts/dev/run-tests): files in parallel, each with an isolated
+# TMPDIR and RUNNER_SESSION_ROOT so siblings cannot race on runner artifacts (#556, #692).
 job_all_tests() {
-  local t base rc
+  local test_jobs
 
   shopt -s nullglob
   local -a tests=( "${check_root}"/tests/*.test )
@@ -266,16 +265,8 @@ job_all_tests() {
   if [[ "${#tests[@]}" -eq 0 ]]; then
     return 0
   fi
-  for t in "${tests[@]}"; do
-    base="$(basename "$t" .test)"
-    rc=0
-    job_test_file "$t" || rc=$?
-    if (( rc != 0 )); then
-      printf 'FAILED: test-%s (exit %s)\n' "$base" "$rc" >&2
-      return "$rc"
-    fi
-  done
-  return 0
+  test_jobs="$(prec_test_jobs)"
+  TMPDIR="$prec_pr_test_isolate_dir" bash "${script_dir}/run-tests" --dir "$check_root" --jobs "$test_jobs"
 }
 
 start_planned_parallel_checks() {
@@ -308,7 +299,7 @@ start_planned_parallel_checks() {
     log_step 'No planned jobs (nothing to run)'
     return 0
   fi
-  log_step "Running ${prec_pr_job_count} checks in parallel (tests sequential, isolated TMPDIR)…"
+  log_step "Running ${prec_pr_job_count} checks in parallel (test files in parallel, isolated TMPDIR)…"
 }
 
 wait_parallel_checks() {

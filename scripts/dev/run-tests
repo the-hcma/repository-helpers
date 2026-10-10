@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# run-tests — run tests/*.test files, optionally one shard of them, optionally in parallel.
+#
+# Shared by CI (.github/workflows/ci.yml shards) and scripts/dev/pre-pr-checks so the local gate and CI
+# select and isolate tests the same way (#692). Selection is by FILE: the sorted tests/*.test list, shard
+# I of N takes every file whose zero-based index modulo N equals I-1. Tests never filter by section name;
+# to rebalance shards, split a slow test into several files (see tests/lib/github-repo-lint-part-init).
+#
+# Each test runs in its own isolated TMPDIR and RUNNER_SESSION_ROOT so parallel files cannot race.
+# Per-file durations are printed, and the slowest files are appended to $GITHUB_STEP_SUMMARY when set.
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+repo_dir="$(cd "${script_dir}/../.." && pwd)"
+readonly repo_dir
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/dev/run-tests [--shard I/N] [--jobs J] [--list] [--verbose] [--dir PATH]
+
+Run tests/*.test files.
+
+  --shard I/N   Run only shard I of N (1-based). Files are taken round-robin from the sorted list.
+  --jobs J      Run up to J test files at once (default 1).
+  --list        Print the selected test files and exit.
+  --verbose     Print the full log of passing tests too (failing tests always print their log).
+  --dir PATH    Repository root containing tests/ (default: this repository).
+  -h, --help    Show this help.
+
+Exit status is 0 when every selected test passes, 1 otherwise, 2 on a usage error.
+EOF
+}
+
+die_usage() {
+  printf 'ERROR: %s\n' "$1" >&2
+  usage >&2
+  exit 2
+}
+
+# Prints the test files of shard $1 of $2 (one path per line) from the sorted list under $3.
+select_tests() {
+  local -r shard="$1" shards="$2" root="$3"
+  local -a all=()
+  local index=0 path
+
+  shopt -s nullglob
+  all=( "${root}"/tests/*.test )
+  shopt -u nullglob
+  for path in "${all[@]+"${all[@]}"}"; do
+    if (( index % shards == shard - 1 )); then
+      printf '%s\n' "$path"
+    fi
+    index=$(( index + 1 ))
+  done
+}
+
+# run_one <test-path> <log-dir> — runs one test in an isolated environment; writes <base>.log and
+# <base>.result ("<exit> <seconds>") into the log dir. Always returns 0 so `wait -n` is not tripped.
+run_one() {
+  local -r test_path="$1" log_dir="$2"
+  local base test_tmp rc start end
+
+  base="$(basename "$test_path" .test)"
+  test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/run-tests-job.XXXXXX")"
+  start="$EPOCHREALTIME"
+  rc=0
+  (
+    export TMPDIR="$test_tmp"
+    export RUNNER_SESSION_ROOT="${test_tmp}/runner-sessions"
+    unset RUNNER_SESSION_DIR RUNNER_SESSION_KEEP
+    mkdir -p "$RUNNER_SESSION_ROOT"
+    bash "$test_path"
+  ) >"${log_dir}/${base}.log" 2>&1 || rc=$?
+  end="$EPOCHREALTIME"
+  rm -rf "$test_tmp"
+  awk -v rc="$rc" -v s="$start" -v e="$end" 'BEGIN { printf "%d %.1f\n", rc, e - s }' \
+    >"${log_dir}/${base}.result"
+  return 0
+}
+
+main() {
+  local shard=1 shards=1 max_jobs=1 list_only=0 verbose=0 root="$repo_dir"
+  local -a selected=()
+  local log_dir path base rc secs failed=0 running=0 total_secs=0
+  local in_ci="${GITHUB_ACTIONS:-}"
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --shard)
+        [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*/[1-9][0-9]*$ ]] || die_usage '--shard needs I/N (e.g. 2/4)'
+        shard="${2%/*}"
+        shards="${2#*/}"
+        (( shard <= shards )) || die_usage "--shard ${2}: I must be <= N"
+        shift 2
+        ;;
+      --jobs)
+        [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || die_usage '--jobs needs a positive integer'
+        max_jobs="$2"
+        shift 2
+        ;;
+      --dir)
+        [[ $# -ge 2 && -d "$2" ]] || die_usage '--dir needs an existing directory'
+        root="$(cd "$2" && pwd)"
+        shift 2
+        ;;
+      --list) list_only=1; shift ;;
+      --verbose) verbose=1; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *) die_usage "unknown argument: $1" ;;
+    esac
+  done
+
+  while IFS= read -r path; do
+    selected+=( "$path" )
+  done < <(select_tests "$shard" "$shards" "$root")
+
+  if (( list_only == 1 )); then
+    for path in "${selected[@]+"${selected[@]}"}"; do
+      printf '%s\n' "${path#"${root}"/}"
+    done
+    return 0
+  fi
+  if (( ${#selected[@]} == 0 )); then
+    printf 'run-tests: no tests selected (shard %s/%s)\n' "$shard" "$shards"
+    return 0
+  fi
+
+  log_dir="$(mktemp -d "${TMPDIR:-/tmp}/run-tests-logs.XXXXXX")"
+  printf '==> run-tests: shard %s/%s, %s file(s), %s job(s)\n' "$shard" "$shards" "${#selected[@]}" "$max_jobs"
+
+  for path in "${selected[@]}"; do
+    while (( running >= max_jobs )); do
+      wait -n || true
+      running=$(( running - 1 ))
+    done
+    run_one "$path" "$log_dir" &
+    running=$(( running + 1 ))
+  done
+  wait
+
+  for path in "${selected[@]}"; do
+    base="$(basename "$path" .test)"
+    read -r rc secs <"${log_dir}/${base}.result"
+    total_secs="$(awk -v t="$total_secs" -v s="$secs" 'BEGIN { printf "%.1f", t + s }')"
+    if [[ "$rc" != 0 ]]; then
+      failed=$(( failed + 1 ))
+    fi
+    if [[ "$rc" != 0 || "$verbose" == 1 ]]; then
+      if [[ -n "$in_ci" ]]; then
+        printf '::group::%s (%ss)\n' "$base" "$secs"
+      fi
+      cat "${log_dir}/${base}.log"
+      if [[ -n "$in_ci" ]]; then
+        printf '::endgroup::\n'
+      fi
+    fi
+    if [[ "$rc" == 0 ]]; then
+      printf '[PASS] %s (%ss)\n' "${path#"${root}"/}" "$secs"
+    else
+      printf '[FAIL] %s (exit %s, %ss)\n' "${path#"${root}"/}" "$rc" "$secs"
+    fi
+  done
+
+  write_summary "$log_dir" "$shard" "$shards" "$total_secs" "${selected[@]}"
+  rm -rf "$log_dir"
+
+  if (( failed > 0 )); then
+    printf 'ERROR: TESTS_FAILED shard=%s/%s failed=%s\n' "$shard" "$shards" "$failed" >&2
+    return 1
+  fi
+  printf '==> run-tests passed (shard %s/%s, %ss of test time)\n' "$shard" "$shards" "$total_secs"
+}
+
+# write_summary <log-dir> <shard> <shards> <total-secs> <test…> — slowest-10 table to the step summary.
+write_summary() {
+  local -r log_dir="$1" shard="$2" shards="$3" total="$4"
+  shift 4
+  local path base secs
+
+  [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
+  {
+    printf '### Tests shard %s/%s: %ss of test time\n\n' "$shard" "$shards" "$total"
+    printf '| Test file | Seconds |\n| --- | --- |\n'
+    for path in "$@"; do
+      base="$(basename "$path" .test)"
+      read -r _ secs <"${log_dir}/${base}.result"
+      printf '%s\t%s\n' "$secs" "$base"
+    done | sort --numeric-sort --reverse | head --lines=10 | awk -F'\t' '{ printf "| %s | %s |\n", $2, $1 }'
+    printf '\n'
+  } >>"$GITHUB_STEP_SUMMARY"
+}
+
+main "$@"
