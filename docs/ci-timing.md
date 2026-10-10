@@ -55,3 +55,23 @@ scripts/gh-api api repos/the-hcma/repository-helpers/actions/runs/<id>/jobs
 | Whole test suite, sequential | ~672s | n/a |
 | Whole test suite via `run-tests --jobs 10` | n/a | 164s |
 | `scripts/dev/pre-pr-checks` (all jobs) | ~11 min | 3m13s |
+
+## CI results after the stack (PR #702, head 366c062)
+
+Two `pull_request` runs on that head finished in **132s and 137s** of wall clock, against the 453s baseline p50 (about 70% faster, and under the 3-minute target).
+
+| Job | Duration |
+| --- | --- |
+| `bash -n + shellcheck` | 77s |
+| `tests (shard 1/4)` | 80s |
+| `tests (shard 2/4)` | 82s |
+| `tests (shard 3/4)` | 109s |
+| `tests (shard 4/4)` | 117s |
+| `actionlint` | 5s |
+| `Guard` / `Secret Scan` / rollup | 3-4s / 6s / 3s |
+
+Wall clock is now set by the slowest test shard (117s) rather than by the sum of install, shellcheck and tests.
+
+Runner cost went **up**, not down. Each job bills in whole minutes, so the layout bills about 14 minutes per full run (shellcheck 2, four shards at 2 each, actionlint 1, guard 1, secret scan 1, rollup 1) against about 10 before, and the summed job time is about 485s against about 410s. This trades roughly 4 extra billed minutes per run for roughly 5 minutes less waiting.
+
+Open items: the shards are balanced by file count, not time (shard 1 holds 80s of work and shard 4 holds 117s), so moving a heavy test between shards or splitting `dep-updater.test` would lower the maximum further. These are single-run observations, not a p50/p95; re-run the baseline query after more PRs have landed to get distributions.
