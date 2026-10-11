@@ -23,7 +23,7 @@ Per-step means for job `shellcheck + tests` (12 sampled successful runs):
 
 Other jobs: `Guard` 0-3s, `Secret Scan` 3-4s.
 
-Runner cost per full run is the sum of job durations, about 410s of runner time, billed as roughly 10 minutes because each job rounds up to a whole minute. The critical path equals the single `shellcheck + tests` job (347-469s), so wall-clock and runner minutes are both dominated by it.
+Runner cost per full run is the sum of job durations, about 410s of runner time, counted as roughly 10 runner minutes because each job rounds up to a whole minute (runner minutes are free on this public repository; the rounded figure is what a private repository would be billed). The critical path equals the single `shellcheck + tests` job (347-469s), so wall-clock and runner minutes are both dominated by it.
 
 Reproduce with:
 
@@ -37,4 +37,4 @@ scripts/gh-api api repos/the-hcma/repository-helpers/actions/runs/<id>/jobs
 
 | Date | PR | Change | `pull_request` wall-clock | Runner time per run | Notes |
 | --- | --- | --- | --- | --- | --- |
-| 2026-10-10 | baseline | none | p50 453s, p95 485s | ~410s (~10 billed min) | see above |
+| 2026-10-10 | baseline | none | p50 453s, p95 485s | ~410s (~10 runner min) | see above |
