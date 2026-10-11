@@ -75,3 +75,18 @@ Wall clock is now set by the slowest test shard (117s) rather than by the sum of
 Runner cost went **up**, not down. Each job rounds up to whole runner minutes (free on this public repository, but what a private one would be billed), so the layout counts about 14 minutes per full run (shellcheck 2, four shards at 2 each, actionlint 1, guard 1, secret scan 1, rollup 1) against about 10 before, and the summed job time is about 485s against about 410s. This trades roughly 4 extra runner minutes per run for roughly 5 minutes less waiting.
 
 Open items: the shards are balanced by file count, not time (shard 1 holds 80s of work and shard 4 holds 117s), so moving a heavy test between shards or splitting `dep-updater.test` would lower the maximum further. These are single-run observations, not a p50/p95; re-run the baseline query after more PRs have landed to get distributions.
+
+## CI results on the merged layout (after #702 landed on main)
+
+Measured on 2026-10-11 from the CI workflow runs after #701 and #702 merged.
+
+| Run | Wall-clock |
+| --- | --- |
+| Baseline `pull_request`, p50 (p95) | 453s (485s) |
+| #701 only (parallel jobs, tests still serial), merge queue run | 323s |
+| #702 head, six `pull_request` runs (126s, 128s, 133s, 135s, 137s, 137s) | 126-137s |
+| #702, merge queue run on the merged layout (run 38169553461) | 119s |
+
+The target of under 3 minutes (180s) holds for `pull_request` and `merge_group`. Per-job times in the merge queue run: `bash -n + shellcheck` 106s, `tests (shard 1/4)` 93s, `tests (shard 2/4)` 81s, `tests (shard 3/4)` 96s, `tests (shard 4/4)` 103s, `actionlint` 5s, `Secret Scan` 7s, `Guard` 3s, rollup 4s. The summed job time is about 500s and the runner minutes count 14, as predicted above.
+
+The shards are now within 81-103s of each other (the shard 1 and shard 4 gap that was 80s versus 117s has narrowed), and `bash -n + shellcheck` at 106s is the longest single job in the queue run, so shellcheck, not a test shard, is what sets the wall clock there. Still a handful of runs, not a p50/p95: re-run the baseline query once more PRs have landed.
