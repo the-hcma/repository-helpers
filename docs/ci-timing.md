@@ -72,6 +72,6 @@ Two `pull_request` runs on that head finished in **132s and 137s** of wall clock
 
 Wall clock is now set by the slowest test shard (117s) rather than by the sum of install, shellcheck and tests.
 
-Runner cost went **up**, not down. Each job bills in whole minutes, so the layout bills about 14 minutes per full run (shellcheck 2, four shards at 2 each, actionlint 1, guard 1, secret scan 1, rollup 1) against about 10 before, and the summed job time is about 485s against about 410s. This trades roughly 4 extra billed minutes per run for roughly 5 minutes less waiting.
+Runner cost went **up**, not down. Each job rounds up to whole runner minutes (free on this public repository, but what a private one would be billed), so the layout counts about 14 minutes per full run (shellcheck 2, four shards at 2 each, actionlint 1, guard 1, secret scan 1, rollup 1) against about 10 before, and the summed job time is about 485s against about 410s. This trades roughly 4 extra runner minutes per run for roughly 5 minutes less waiting.
 
 Open items: the shards are balanced by file count, not time (shard 1 holds 80s of work and shard 4 holds 117s), so moving a heavy test between shards or splitting `dep-updater.test` would lower the maximum further. These are single-run observations, not a p50/p95; re-run the baseline query after more PRs have landed to get distributions.
