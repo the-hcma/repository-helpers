@@ -6985,8 +6985,8 @@ rp_fix_ci_workflow_add_merge_group() {
 
 # Emit CI check context names for branch protection (job display name, else job id).
 # Skips guard/changed-files/secret-scan/workflow-lint (optional CI gates, not merge blockers).
-# Also skips ci-part-* jobs that another job lists under needs: (the rollup is the required
-# context), so parts can be split or renamed without retargeting protection (#692).
+# Also skips ci-part-* jobs that a rollup covers: another emitted job lists the part under needs: and
+# uses always() (the rollup is the required context), so parts can be split or renamed (#692).
 rp_discover_ci_status_contexts() {
   local slug="$1"
   local text
@@ -6994,8 +6994,9 @@ rp_discover_ci_status_contexts() {
   if [[ -z "$text" ]]; then
     return 0
   fi
-  # A ci-part-* job is skipped only when some job lists it under needs: (the rollup). Without a
-  # rollup it stays a required context, so protection is never written without that validation.
+  # A ci-part-* job is skipped only when a rollup covers it: another emitted job lists its exact id
+  # under needs: AND runs with always() (otherwise a failed part would leave that job skipped, and a
+  # skipped required check counts as passing). Without such a rollup the part stays a required context.
   awk '
     function record() {
       if (job == "") {
@@ -7004,8 +7005,18 @@ rp_discover_ci_status_contexts() {
       n++
       ids[n] = job
       names[n] = disp
+      needs[n] = needs_tokens " "
+      always[n] = has_always
     }
-    BEGIN { in_jobs = 0; in_needs = 0; job = ""; disp = ""; n = 0; needs_text = "" }
+    function add_needs(s) {
+      gsub(/needs:|^[ \t]*-[ \t]|[][,"\047]/, " ", s)
+      gsub(/[ \t]+/, " ", s)
+      needs_tokens = needs_tokens " " s
+    }
+    function excluded(id) {
+      return id == "guard" || id == "changed-files" || id == "secret-scan" || id == "workflow-lint"
+    }
+    BEGIN { in_jobs = 0; in_needs = 0; job = ""; disp = ""; n = 0; needs_tokens = ""; has_always = 0 }
     /^jobs:/ { in_jobs = 1; next }
     !in_jobs { next }
     /^  [a-zA-Z0-9_-]+:/ {
@@ -7014,6 +7025,8 @@ rp_discover_ci_status_contexts() {
       sub(/^  /, "", job)
       sub(/:$/, "", job)
       disp = ""
+      needs_tokens = ""
+      has_always = 0
       in_needs = 0
       next
     }
@@ -7024,19 +7037,29 @@ rp_discover_ci_status_contexts() {
     }
     job != "" && /^    needs:/ {
       in_needs = 1
-      needs_text = needs_text " " $0
+      add_needs($0)
       next
     }
-    in_needs && /^      - / { needs_text = needs_text " " $0; next }
+    in_needs && /^      - / { add_needs($0); next }
+    job != "" && /^    if:/ && /always\(\)/ { has_always = 1 }
     /^    [a-zA-Z_-]+:/ { in_needs = 0 }
     END {
       record()
       for (i = 1; i <= n; i++) {
         id = ids[i]
-        if (id == "guard" || id == "changed-files" || id == "secret-scan" || id == "workflow-lint") {
+        if (excluded(id)) {
           continue
         }
-        if (id ~ /^ci-part-/ && index(needs_text, id) > 0) {
+        covered = 0
+        if (id ~ /^ci-part-/) {
+          for (j = 1; j <= n; j++) {
+            if (j != i && !excluded(ids[j]) && ids[j] !~ /^ci-part-/ && always[j] \
+                && index(needs[j], " " id " ") > 0) {
+              covered = 1
+            }
+          }
+        }
+        if (covered) {
           continue
         }
         print (names[i] != "" ? names[i] : id)
