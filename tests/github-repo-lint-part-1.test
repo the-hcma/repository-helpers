@@ -990,6 +990,148 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== cleanup-merged-branches decides each branch by its own PR (slash-named branches included) ===\n'
+# The REST ``pulls?head=owner:branch`` filter is ignored by GitHub for branch names containing a slash, so
+# every slash-named branch was judged by an unrelated PR. The template must look PRs up by head ref.
+# shellcheck disable=SC2016 # the literal ${...} is the workflow's own text, not a shell expansion here
+cmb_head_ref_lookup='pr list --repo "${REPOSITORY}" --head "${branch}"'
+if ! grep -qE 'pulls\?state=(open|closed)&head=' "$gtmq_template" \
+  && grep -qF "$cmb_head_ref_lookup" "$gtmq_template"; then
+  printf '[PASS] cleanup-merged-branches template looks PRs up by head ref, not the REST head filter\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cleanup-merged-branches template still uses the REST head filter or lacks gh pr list --head\n'
+  fail=$(( fail + 1 ))
+fi
+
+cmb_tmp="$(mktemp -d)"
+mkdir -p "${cmb_tmp}/bin"
+# Extract the single ``run: |`` block (indented ten spaces) of the template into a runnable script.
+awk '/^        run: \|$/ {on=1; next} on {sub(/^          /, ""); print}' "$gtmq_template" >"${cmb_tmp}/sweep.sh"
+cmb_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cat >"${cmb_tmp}/bin/gh" <<GHEOF
+#!/usr/bin/env bash
+# Stub gh: serves raw PR JSON per --head branch and applies the caller's real --jq filter with jq, so the
+# template's filter (owner check, [0] // empty) is exercised. Records deletions in \${CMB_LOG}.
+set -euo pipefail
+if [[ "\$1" == api && "\$2" == repos/*/branches ]]; then
+  [[ -z "\${CMB_FAIL_LIST:-}" ]] || { printf 'HTTP 502\n' >&2; exit 1; }
+  printf '%s\n' main repo-practices/old-closed repo-practices/fresh-closed feature/has-open-pr \
+    feature/no-pr feature/merged feature/fork-merged feature/null-owner graphite-base/stack-1 \
+    feature/lookup-fails graphite-base/lookup-fails feature/other-repo
+  exit 0
+fi
+if [[ "\$1" == api && "\$2" == --method && "\$3" == DELETE ]]; then
+  ref="\${4#repos/*/git/refs/heads/}"
+  ref="\${ref//%2F//}"
+  [[ "\$ref" != "\${CMB_FAIL_DELETE:-}" ]] || { printf 'HTTP 502\n' >&2; exit 1; }
+  printf '%s\n' "\$ref" >>"\${CMB_LOG}"
+  exit 0
+fi
+if [[ "\$1" == pr && "\$2" == list ]]; then
+  head=""; state=""; jq_filter="."
+  while [[ \$# -gt 0 ]]; do
+    case "\$1" in
+      --head) head="\$2"; shift 2 ;;
+      --state) state="\$2"; shift 2 ;;
+      --jq) jq_filter="\$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  own='{"login":"example-org"}'
+  repo='{"name":"example-repo"}'
+  case "\$head" in
+    *lookup-fails)
+      # A failed lookup (rate limit, 5xx, timeout) must never be read as "this branch has no PR".
+      printf 'HTTP 502\n' >&2
+      exit 1 ;;
+    repo-practices/old-closed)
+      prs='[{"number":1,"state":"CLOSED","mergedAt":null,"closedAt":"2020-01-01T00:00:00Z","headRepository":'"\$repo"',"headRepositoryOwner":'"\$own"'}]' ;;
+    repo-practices/fresh-closed)
+      prs='[{"number":2,"state":"CLOSED","mergedAt":null,"closedAt":"${cmb_now}","headRepository":'"\$repo"',"headRepositoryOwner":'"\$own"'}]' ;;
+    feature/merged)
+      prs='[{"number":3,"state":"MERGED","mergedAt":"2020-01-01T00:00:00Z","closedAt":"2020-01-01T00:00:00Z","headRepository":'"\$repo"',"headRepositoryOwner":'"\$own"'}]' ;;
+    feature/has-open-pr)
+      prs='[{"number":7,"state":"OPEN","mergedAt":null,"closedAt":null,"headRepository":'"\$repo"',"headRepositoryOwner":'"\$own"'}]' ;;
+    feature/fork-merged)
+      # A merged PR from someone else's fork that happens to use the same branch name must not decide this branch.
+      prs='[{"number":8,"state":"MERGED","mergedAt":"2020-01-01T00:00:00Z","closedAt":"2020-01-01T00:00:00Z","headRepository":{"name":"example-repo"},"headRepositoryOwner":{"login":"someone-else"}}]' ;;
+    feature/null-owner)
+      # A PR whose head repository was deleted reports a null owner.
+      prs='[{"number":9,"state":"MERGED","mergedAt":"2020-01-01T00:00:00Z","closedAt":"2020-01-01T00:00:00Z","headRepository":null,"headRepositoryOwner":null}]' ;;
+    feature/other-repo)
+      # Same owner, but the PR's head lives in a different repository: it must not decide this repository's branch.
+      prs='[{"number":10,"state":"MERGED","mergedAt":"2020-01-01T00:00:00Z","closedAt":"2020-01-01T00:00:00Z","headRepository":{"name":"other-repo"},"headRepositoryOwner":'"\$own"'}]' ;;
+    *) prs='[]' ;;
+  esac
+  if [[ "\$state" == open ]]; then
+    prs="\$(jq -c '[.[] | select(.state == "OPEN")]' <<<"\$prs")"
+  fi
+  jq -r "\$jq_filter" <<<"\$prs"
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "\$*" >&2
+exit 1
+GHEOF
+chmod +x "${cmb_tmp}/bin/gh"
+: >"${cmb_tmp}/deleted.log"
+cmb_status=0
+cmb_output="$(
+  PATH="${cmb_tmp}/bin:${PATH}" CMB_LOG="${cmb_tmp}/deleted.log" CLEANUP_RETRY_DELAY_S=0 \
+    REPOSITORY=example-org/example-repo REPOSITORY_OWNER=example-org GH_TOKEN=unused \
+    bash "${cmb_tmp}/sweep.sh" 2>&1
+)" || cmb_status=$?
+cmb_deleted="$(sort "${cmb_tmp}/deleted.log" | tr '\n' ' ')"
+if [[ "$cmb_status" -eq 0 ]] \
+  && [[ "$cmb_deleted" == 'feature/merged graphite-base/stack-1 repo-practices/old-closed ' ]] \
+  && grep -qF 'Deleted 3 branches; kept 8 branches.' <<<"$cmb_output" \
+  && grep -qF 'Could not look up open PRs for graphite-base/lookup-fails; keeping it.' <<<"$cmb_output"; then
+  printf '[PASS] cleanup-merged-branches deletes only merged, stale-superseded and Graphite branches, and keeps a branch whose PR lookup failed\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cleanup-merged-branches sweep exit %s, deleted [%s] (expected merged, old repo-practices and graphite-base only; forks, deleted forks, open, fresh and lookup-failed branches kept); output: %s\n' \
+    "$cmb_status" "$cmb_deleted" "$cmb_output"
+  fail=$(( fail + 1 ))
+fi
+
+# A failed branch listing aborts the sweep (non-zero, nothing deleted) instead of looking like "no branches".
+: >"${cmb_tmp}/deleted.log"
+cmb_list_status=0
+cmb_list_output="$(
+  PATH="${cmb_tmp}/bin:${PATH}" CMB_LOG="${cmb_tmp}/deleted.log" CMB_FAIL_LIST=1 CLEANUP_RETRY_DELAY_S=0 \
+    REPOSITORY=example-org/example-repo REPOSITORY_OWNER=example-org GH_TOKEN=unused \
+    bash "${cmb_tmp}/sweep.sh" 2>&1
+)" || cmb_list_status=$?
+if [[ "$cmb_list_status" -ne 0 && ! -s "${cmb_tmp}/deleted.log" ]] \
+  && grep -qF 'Failed to list branches of example-org/example-repo; nothing was deleted.' <<<"$cmb_list_output"; then
+  printf '[PASS] cleanup-merged-branches aborts without deleting when the branch listing fails\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cleanup-merged-branches branch-listing failure: exit %s, output: %s\n' "$cmb_list_status" "$cmb_list_output"
+  fail=$(( fail + 1 ))
+fi
+
+# A failed delete lets the rest of the sweep finish but fails the job (non-zero) so the cleanup is not silently incomplete.
+: >"${cmb_tmp}/deleted.log"
+cmb_del_status=0
+cmb_del_output="$(
+  PATH="${cmb_tmp}/bin:${PATH}" CMB_LOG="${cmb_tmp}/deleted.log" CMB_FAIL_DELETE=feature/merged CLEANUP_RETRY_DELAY_S=0 \
+    REPOSITORY=example-org/example-repo REPOSITORY_OWNER=example-org GH_TOKEN=unused \
+    bash "${cmb_tmp}/sweep.sh" 2>&1
+)" || cmb_del_status=$?
+cmb_del_deleted="$(sort "${cmb_tmp}/deleted.log" | tr '\n' ' ')"
+if [[ "$cmb_del_status" -ne 0 ]] \
+  && [[ "$cmb_del_deleted" == 'graphite-base/stack-1 repo-practices/old-closed ' ]] \
+  && grep -qF 'Failed to delete feature/merged' <<<"$cmb_del_output" \
+  && grep -qF 'Failed to delete 1 branch(es).' <<<"$cmb_del_output"; then
+  printf '[PASS] cleanup-merged-branches finishes the sweep but exits non-zero when a delete fails\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] cleanup-merged-branches delete-failure: exit %s, deleted [%s], output: %s\n' "$cmb_del_status" "$cmb_del_deleted" "$cmb_del_output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$cmb_tmp"
+
 printf '\n=== static: merged-pr-closer closes stale Graphite MQ drafts ===\n'
 closer_template="${templates_dir}/merged-pr-closer.yml"
 if grep -qF 'gtmq_batch_' "$closer_template" \
