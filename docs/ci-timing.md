@@ -84,9 +84,11 @@ Measured on 2026-10-11 from the CI workflow runs after #701 and #702 merged.
 | --- | --- |
 | Baseline `pull_request`, p50 (p95) | 453s (485s) |
 | #701 only (parallel jobs, tests still serial), merge queue run | 323s |
-| #702 head, six `pull_request` runs (126s, 128s, 133s, 135s, 137s, 137s) | 126-137s |
+| #702 branch, six `pull_request` runs on the sharded layout (heads changed during review) | 126-137s |
 | #702, merge queue run on the merged layout (run 38169553461) | 119s |
 
 The target of under 3 minutes (180s) holds for `pull_request` and `merge_group`. Per-job times in the merge queue run: `bash -n + shellcheck` 106s, `tests (shard 1/4)` 93s, `tests (shard 2/4)` 81s, `tests (shard 3/4)` 96s, `tests (shard 4/4)` 103s, `actionlint` 5s, `Secret Scan` 7s, `Guard` 3s, rollup 4s. The summed job time is about 500s and the runner minutes count 14, as predicted above.
 
 The shards are now within 81-103s of each other (the shard 1 and shard 4 gap that was 80s versus 117s has narrowed), and `bash -n + shellcheck` at 106s is the longest single job in the queue run, so shellcheck, not a test shard, is what sets the wall clock there. Still a handful of runs, not a p50/p95: re-run the baseline query once more PRs have landed.
+
+The six `pull_request` runs, by Actions run id and wall-clock: 38147437074 (126s), 38152687915 (128s), 38152404166 (133s), 38160710394 (135s), 38149516116 (137s) and 38152398418 (137s). They span several heads of the `ci-speedup/shard-tests` branch, so they measure the layout, not one commit. To list them again: `scripts/gh-api api "repos/the-hcma/repository-helpers/actions/workflows/ci.yml/runs?per_page=100" --jq '.workflow_runs[] | select(.event == "pull_request" and .head_branch == "ci-speedup/shard-tests" and .conclusion == "success") | [.id, ((.updated_at|fromdateiso8601) - (.run_started_at|fromdateiso8601))] | @tsv'` (the 5-8s rows are the skipped duplicates started by the push trigger).
