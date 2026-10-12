@@ -99,6 +99,10 @@ no_wait_merge=0
 security_only=0
 batch=0
 batch_all=0
+# Empty means "auto": resolved at dispatch (batch_all_default_jobs). --jobs N overrides.
+batch_all_jobs=""
+# Past this the shared GitHub pacing gate, not the workers, is the bottleneck.
+readonly batch_all_jobs_auto_cap=4
 include_private=0
 scan_roots_csv=""
 dir_explicit=0
@@ -990,6 +994,10 @@ Options:
   --include-private Include private GitHub repositories in --batch --all discovery
                     (default: skip private repos; explicit --dir is always processed).
                     Override via DEP_UPDATER_INCLUDE_PRIVATE=1.
+  --jobs <n>        With --batch --all: process up to n repositories concurrently
+                    (default: host cores capped at 4; override via DEP_UPDATER_JOBS;
+                    --jobs 1 is serial). Output is buffered per repo and replayed in
+                    repo order; GitHub API pacing is shared across all jobs.
   --merge-timeout <min>  Minutes to wait for all PRs to merge (default: 15)
   --merge-via <mode>  How to land PRs after CI passes: gh | merge-queue
                     (default: gh — GitHub MQ via --auto --squash; override via
@@ -1062,6 +1070,12 @@ parse_args() {
       --include-private)
         include_private=1
         ;;
+      --jobs)
+        shift
+        [[ $# -eq 0 ]] && die "--jobs requires a positive integer."
+        [[ "$1" =~ ^[1-9][0-9]*$ ]] || die "--jobs requires a positive integer (got: $1)."
+        batch_all_jobs="$1"
+        ;;
       --merge-timeout)
         shift
         [[ $# -eq 0 ]] && die "--merge-timeout requires a number of minutes."
@@ -1132,6 +1146,9 @@ parse_args() {
 
   [[ "$batch_all" == '1' && "$batch" != '1' ]] \
     && die "--all requires --batch."
+
+  [[ -n "$batch_all_jobs" && ( "$batch_all" != '1' || "$batch" != '1' ) ]] \
+    && die "--jobs requires --batch --all."
 
   [[ -n "$scan_roots_csv" && ( "$batch_all" != '1' || "$batch" != '1' ) ]] \
     && die "--scan-root requires --batch --all."
@@ -9633,6 +9650,10 @@ _batch_all_interrupted=0
 _batch_all_active_child_pid=""
 _batch_all_active_child_fifo=""
 _batch_all_active_child_log=""
+_batch_all_dep_self=""
+_batch_all_repo_colors=()
+_batch_all_results_dir=""
+_batch_all_worker_pids=()
 
 # batch_all_reap_stale_ephemeral_roots <base_dir>
 # Retained clone roots from earlier runs are never removed by their own process, so
@@ -9669,6 +9690,20 @@ batch_all_cleanup_on_interrupt() {
   # An ephemeral clone whose removal has not been decided yet may still back a worktree.
   if (( _batch_all_pending_ephemeral_clone )); then
     _batch_all_retained_clones=$(( _batch_all_retained_clones + 1 ))
+  fi
+
+  # Parallel run: stop every worker and its in-flight commands. Their ephemeral clones may still
+  # back worktrees, so keep the clone root whenever any clone is left in it.
+  if (( ${#_batch_all_worker_pids[@]} > 0 )); then
+    batch_all_stop_workers
+    if [[ -n "${_batch_all_ephemeral_root:-}" ]] \
+      && compgen -G "${_batch_all_ephemeral_root}/*" >/dev/null; then
+      _batch_all_retained_clones=$(( _batch_all_retained_clones + 1 ))
+    fi
+  fi
+  if [[ -n "${_batch_all_results_dir:-}" ]]; then
+    rm -rf -- "$_batch_all_results_dir" 2>/dev/null || true
+    _batch_all_results_dir=""
   fi
 
   # Best-effort cleanup: kill active child and remove temp files.
@@ -9839,20 +9874,490 @@ batch_all_materialize_checkout() {
   return 0
 }
 
+# batch_all_process_repo <repo_line> <result_prefix> <color_start> <color_reset>
+# Processes one discovered repository: materializes an ephemeral clone when needed, runs the
+# `--batch --dir` child, and logs the outcome. Everything the parent folds into the run lives in
+# files so the same code serves the serial path (in-process, live output) and the parallel path
+# (background subshell, buffered output):
+#   <prefix>.exit      exit code this repo contributes to worst_exit (absent: success or skipped)
+#   <prefix>.summary   failure summary line(s)
+#   <prefix>.details   failure detail lines
+#   <prefix>.updates   the child's updates report, merged by the parent in repo order
+#   <prefix>.retained  present when the ephemeral clone must be kept for follow-up
+# Returns 130 when interrupted, 0 otherwise. `.done` is written last so a worker that died early
+# (die/exit) is detectable.
+batch_all_process_repo() {
+  local -r repo_line="$1"
+  local -r prefix="$2"
+  local -r _this_color="$3"
+  local -r _color_reset="$4"
+  local repo slug checkout_path repo_ephemeral=0 clone_rc=0 missing_tools scraped child_exit line
+  local repo_started_ms
+  local -a child_args
+
+  slug="${repo_line%%$'\t'*}"
+  checkout_path=""
+  if [[ "$repo_line" == *$'\t'* ]]; then
+    checkout_path="${repo_line#*$'\t'}"
+  fi
+  [[ -n "$slug" ]] || { : >"${prefix}.done"; return 0; }
+
+  repo=""
+  if [[ -n "$checkout_path" ]]; then
+    repo="$checkout_path"
+  else
+    repo_ephemeral=1
+    _batch_all_pending_ephemeral_clone=1
+    repo="$(batch_all_materialize_checkout "$slug" "")" || clone_rc=$?
+    if (( clone_rc != 0 )); then
+      if (( clone_rc == 130 )) || [[ "${_runner_interrupted:-0}" -eq 1 ]]; then
+        return 130
+      fi
+      printf '%s\n' "$clone_rc" >"${prefix}.exit"
+      : >"${prefix}.done"
+      return 0
+    fi
+  fi
+  [[ -n "$repo" ]] || { : >"${prefix}.done"; return 0; }
+  [[ "$_batch_all_interrupted" == '1' ]] && return 130
+
+  # Color just the repo-boundary header and outcome lines; child output keeps its own color.
+  TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
+    log "[batch-all] --- $(basename "$repo") (${repo}) ---"
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    repo_started_ms="$(( ${EPOCHREALTIME/./} / 1000 ))"
+  else
+    repo_started_ms="$(date +%s000)"
+  fi
+
+  child_args=()
+  [[ "$dry_run" == '1' ]] && child_args+=(--dry-run)
+  child_args+=(--batch)
+  [[ "$quiet" == '1' ]] && child_args+=(--quiet)
+  [[ "$semver_only" == '1' ]] && child_args+=(--semver-only)
+  [[ "$no_wait_ci" == '1' ]] && child_args+=(--no-wait-ci)
+  [[ "$no_wait_merge" == '1' ]] && child_args+=(--no-wait-merge)
+  [[ "$security_only" == '1' ]] && child_args+=(--security-only)
+  [[ -n "$wt_tmpdir" ]] && child_args+=(--tmpdir "$wt_tmpdir")
+  child_args+=(--merge-timeout "$merge_timeout_min")
+  child_args+=(--merge-via "$merge_via")
+  [[ "$ecosystem" != 'auto' ]] && child_args+=(--ecosystem "$ecosystem")
+  child_args+=(--dir "$repo")
+
+  child_exit=0
+  local child_log child_fifo child_pid child_report child_updates
+  local root_cause child_clean report_line detail_count
+  local ci_type ci_pr ci_check_name ci_check_conclusion ci_pr_url ci_check_url ci_summary
+  child_log="$(mktemp)"
+  child_report="$(mktemp)"
+  child_updates="${prefix}.updates"
+  child_fifo="$(mktemp -u)"
+  mkfifo "$child_fifo"
+  _batch_all_active_child_log="$child_log"
+  _batch_all_active_child_fifo="$child_fifo"
+
+  # Stream ALL child output live, while also capturing it for concise failure summaries.
+  # Use a fifo so we also have a child PID to kill on Ctrl-C.
+  # DEP_UPDATER_RUN_REPORT: child writes structured JSON on non-zero exit for
+  # batch-all to read (see dep_updater_write_batch_child_report_json).
+  set +e
+  DEP_UPDATER_RUN_REPORT="$child_report" \
+    DEP_UPDATER_UPDATES_REPORT="$child_updates" \
+    "$_batch_all_dep_self" "${child_args[@]}" >"$child_fifo" 2>&1 &
+  child_pid=$!
+  _batch_all_active_child_pid="$child_pid"
+
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+    printf '%s\n' "$line" >>"$child_log"
+  done <"$child_fifo"
+
+  wait "$child_pid" || child_exit=$?
+  rm -f "$child_fifo"
+  _batch_all_active_child_pid=""
+  _batch_all_active_child_fifo=""
+  set -e
+
+  if [[ "$_batch_all_interrupted" == '1' ]]; then
+    rm -f "$child_log" "$child_report"
+    _batch_all_active_child_log=""
+    return 130
+  fi
+
+  if [[ "$child_exit" -eq "$dep_updater_exit_missing_tooling" ]]; then
+    # Host-tooling gap, not a repo problem: skip without a result exit code, and
+    # let the ephemeral clone go — `cargo install` on the host is the fix, so there
+    # is nothing in the clone to repair (repository-helpers#535).
+    missing_tools="$(batch_all_missing_tooling_from_log "$child_log")"
+    TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
+      log "[batch-all] Skipping $(basename "$repo"): missing host tooling (${missing_tools})"
+    rm -f "$child_log" "$child_report"
+    _batch_all_active_child_log=""
+    if (( repo_ephemeral )); then
+      run_command "batch-all rm ephemeral clone $(basename "$repo")" -- rm -rf "$repo"
+      _batch_all_pending_ephemeral_clone=0
+    fi
+    : >"${prefix}.done"
+    return 0
+  fi
+
+  if [[ "$child_exit" -ne 0 ]]; then
+    TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
+      log "[batch-all] FAILED (${repo}) exit ${child_exit}"
+    root_cause=""
+    detail_count=0
+    if [[ -s "$child_report" ]] \
+      && dep_runner_jq_file_args "dep-updater batch-all child report validate" "$child_report" -e \
+        'has("primary") and has("details") and has("exit_code")' >/dev/null 2>&1; then
+      root_cause="$(dep_updater_actionable_primary_from_report "$child_report" "$child_exit")"
+      while IFS= read -r report_line; do
+        [[ -z "$report_line" ]] && continue
+        printf '%s\n' "$(basename "$repo"): ${report_line}" >>"${prefix}.details"
+        detail_count=$((detail_count + 1))
+      done < <(dep_runner_jq_file_args "dep-updater batch-all child report details" "$child_report" -r '.details[]? // empty' 2>/dev/null || true)
+      while IFS= read -r report_line; do
+        [[ -z "$report_line" ]] && continue
+        printf '%s\n' "$(basename "$repo"): ${report_line}" >>"${prefix}.details"
+        detail_count=$((detail_count + 1))
+        log "[batch-all] Command failure ($(basename "$repo")): ${report_line}"
+      done < <(dep_runner_jq_file_args "dep-updater batch-all child command failures" "$child_report" -r \
+        '.command_failures[]? | select(. != null)
+          | if (.stderr_hint // "") != "" then "\(.label) (exit \(.exit_code)) — \(.stderr_hint)"
+            else "\(.label) (exit \(.exit_code))" end' 2>/dev/null || true)
+    fi
+    # Keep batch-all output actionable: strip ANSI noise; use log tail only if
+    # no structured report (e.g. older child or crash before write).
+    child_clean="$(mktemp)"
+    sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' "$child_log" >"$child_clean" 2>/dev/null || cp "$child_log" "$child_clean"
+
+    if [[ -z "$root_cause" ]] \
+      || dep_updater_primary_is_generic "$root_cause" "$child_exit"; then
+      scraped=""
+      scraped="$(batch_all_scrape_actionable_from_log "$child_clean" 2>/dev/null || true)"
+      if [[ -n "$scraped" ]]; then
+        root_cause="$scraped"
+        if [[ "$detail_count" -eq 0 ]]; then
+          printf '%s\n' "$(basename "$repo"): ${scraped}" >>"${prefix}.details"
+          detail_count=1
+        fi
+      fi
+    fi
+
+    if [[ -z "$root_cause" ]]; then
+      root_cause="$(tail -n 1 "$child_clean" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
+    fi
+
+    ci_type=""
+    ci_pr=""
+    ci_check_name=""
+    ci_check_conclusion=""
+    ci_pr_url=""
+    ci_check_url=""
+    if [[ -s "$child_report" ]] \
+      && dep_runner_jq_file_args "dep-updater batch-all child ci failure" "$child_report" -e \
+        'has("ci_failure") and .ci_failure != null' >/dev/null 2>&1; then
+      ci_type="$(dep_runner_jq_file_args "dep-updater batch-all child ci type" "$child_report" \
+        -r '.ci_failure | type' 2>/dev/null || true)"
+      if [[ "$ci_type" == "object" ]]; then
+        ci_pr="$(dep_runner_jq_file_args "dep-updater batch-all child ci pr" "$child_report" \
+          -r '.ci_failure.pr // empty' 2>/dev/null || true)"
+        ci_check_name="$(dep_runner_jq_file_args "dep-updater batch-all child ci check" "$child_report" \
+          -r '.ci_failure.check_name // empty' 2>/dev/null || true)"
+        ci_check_conclusion="$(dep_runner_jq_file_args "dep-updater batch-all child ci conclusion" "$child_report" \
+          -r '.ci_failure.check_conclusion // empty' 2>/dev/null || true)"
+        ci_pr_url="$(dep_runner_jq_file_args "dep-updater batch-all child ci pr url" "$child_report" \
+          -r '.ci_failure.pr_url // empty' 2>/dev/null || true)"
+        ci_check_url="$(dep_runner_jq_file_args "dep-updater batch-all child ci check url" "$child_report" \
+          -r '.ci_failure.check_url // empty' 2>/dev/null || true)"
+        if [[ -n "$ci_pr" ]]; then
+          if [[ -n "$ci_check_name" ]]; then
+            printf '%s\n' "$(basename "$repo"): CI failed on PR #${ci_pr} — ${ci_check_name} (${ci_check_conclusion})" >>"${prefix}.details"
+          else
+            printf '%s\n' "$(basename "$repo"): CI failed on PR #${ci_pr}" >>"${prefix}.details"
+          fi
+          if [[ -n "$ci_pr_url" ]]; then
+            printf '%s\n' "$(basename "$repo"): PR: ${ci_pr_url}" >>"${prefix}.details"
+          fi
+          if [[ -n "$ci_check_url" ]]; then
+            printf '%s\n' "$(basename "$repo"): Check run: ${ci_check_url}" >>"${prefix}.details"
+          fi
+          detail_count=$((detail_count + 1))
+          if [[ -n "$root_cause" && "$root_cause" != *pr_url=* && -n "$ci_pr_url" ]]; then
+            root_cause="${root_cause} pr_url=${ci_pr_url}"
+          fi
+        fi
+      elif [[ "$ci_type" == "string" ]]; then
+        ci_summary="$(dep_runner_jq_file_args "dep-updater batch-all child ci summary" "$child_report" \
+          -r '.ci_failure // empty' 2>/dev/null || true)"
+        if [[ -n "$ci_summary" && "$ci_summary" != "null" ]]; then
+          printf '%s\n' "$(basename "$repo"): ${ci_summary}" >>"${prefix}.details"
+          detail_count=$((detail_count + 1))
+        fi
+      fi
+    fi
+
+    if [[ -n "$root_cause" ]]; then
+      if [[ "$detail_count" -eq 0 ]]; then
+        printf '%s\n' "$(basename "$repo"): ${root_cause}" >>"${prefix}.details"
+      fi
+      log "[batch-all] Root cause: ${root_cause}"
+    fi
+
+    if [[ -n "$ci_pr" ]]; then
+      if [[ -n "$ci_check_name" ]]; then
+        log "[batch-all] CI failure ($(basename "$repo")): pr=#${ci_pr} ${ci_check_name} (${ci_check_conclusion})"
+      else
+        log "[batch-all] CI failure ($(basename "$repo")): pr=#${ci_pr} CI checks failed"
+      fi
+      if [[ -n "$ci_pr_url" ]]; then
+        log "[batch-all] CI failure-link ($(basename "$repo")) pr: ${ci_pr_url}"
+      fi
+      if [[ -n "$ci_check_url" ]]; then
+        log "[batch-all] CI failure-link ($(basename "$repo")) check: ${ci_check_url}"
+      fi
+    elif [[ -n "$ci_type" && "$ci_type" == "string" ]]; then
+      ci_summary="$(dep_runner_jq_file_args "dep-updater batch-all child ci summary repeat" "$child_report" \
+        -r '.ci_failure // empty' 2>/dev/null || true)"
+      if [[ -n "$ci_summary" && "$ci_summary" != "null" ]]; then
+        log "[batch-all] CI failure ($(basename "$repo")): ${ci_summary}"
+      fi
+    fi
+
+    # If pnpm ignored builds were encountered, surface the specific skipped packages.
+    if pnpm_output_has_ignored_builds "$child_clean"; then
+      log "[batch-all] pnpm blocked dependency build scripts (ERR_PNPM_IGNORED_BUILDS)."
+      log "[batch-all] Skipped package(s):"
+      { rg -n '^.*\\[pnpm\\]   ' "$child_clean" || true; } | tail -n 20 | sed -E 's/^[0-9]+://' | sed 's/^/[batch-all]   /' >&2
+      log "[batch-all] Fix: run pnpm approve-builds (or pnpm approve-builds --all) in that repo."
+    fi
+
+    rm -f "$child_clean" "$child_report"
+    if [[ -n "$root_cause" ]]; then
+      printf '%s\n' "$(basename "$repo"): exit ${child_exit} — ${root_cause}" >>"${prefix}.summary"
+    else
+      printf '%s\n' "$(basename "$repo"): exit ${child_exit}" >>"${prefix}.summary"
+    fi
+    printf '%s\n' "$child_exit" >"${prefix}.exit"
+  else
+    local repo_finished_ms repo_elapsed_s
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+      repo_finished_ms="$(( ${EPOCHREALTIME/./} / 1000 ))"
+    else
+      repo_finished_ms="$(date +%s000)"
+    fi
+    repo_elapsed_s="$(( (repo_finished_ms - repo_started_ms) / 1000 ))"
+    TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
+      log "[batch-all] OK ($(basename "$repo")) (${repo_elapsed_s}s)"
+  fi
+  rm -f "$child_log" "$child_report"
+  _batch_all_active_child_log=""
+  if (( repo_ephemeral )); then
+    if batch_all_ephemeral_clone_safe_to_remove "$child_exit"; then
+      run_command "batch-all rm ephemeral clone $(basename "$repo")" -- rm -rf "$repo"
+    else
+      : >"${prefix}.retained"
+    fi
+    _batch_all_pending_ephemeral_clone=0
+  fi
+  : >"${prefix}.done"
+  return 0
+}
+
+# batch_all_descendant_pids <pid>
+# Prints every live descendant of <pid>, children before grandchildren. A worker's active child
+# run (and its gh/pnpm/cargo calls) outlives the worker if only the worker is killed.
+# shellcheck disable=SC2317,SC2329  # reached only via the INT/TERM trap handler
+batch_all_descendant_pids() {
+  local child
+
+  while IFS= read -r child; do
+    [[ "$child" =~ ^[1-9][0-9]*$ ]] || continue
+    printf '%s\n' "$child"
+    batch_all_descendant_pids "$child"
+  done < <(pgrep -P "$1" 2>/dev/null || true)
+}
+
+# batch_all_stop_workers
+# Stops every parallel worker and the processes it started.
+# shellcheck disable=SC2317,SC2329  # reached only via the INT/TERM trap handler
+batch_all_stop_workers() {
+  local pid descendants=""
+
+  for pid in "${_batch_all_worker_pids[@]}"; do
+    [[ -n "$pid" ]] || continue
+    descendants+="$(batch_all_descendant_pids "$pid")"$'\n'
+  done
+  # shellcheck disable=SC2086  # both lists are newline-separated integers
+  kill $descendants "${_batch_all_worker_pids[@]}" 2>/dev/null || true
+}
+
+# batch_all_default_jobs
+# Worker count when --jobs is not given: DEP_UPDATER_JOBS (positive integer) wins, else the host
+# core count capped at batch_all_jobs_auto_cap, never below 1.
+batch_all_default_jobs() {
+  local cores='' env_jobs
+
+  env_jobs="${DEP_UPDATER_JOBS:-}"
+  if [[ "$env_jobs" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$env_jobs"
+    return 0
+  fi
+  if command -v nproc >/dev/null 2>&1; then
+    cores="$(nproc 2>/dev/null || true)"
+  fi
+  if [[ ! "$cores" =~ ^[1-9][0-9]*$ ]]; then
+    cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  fi
+  if [[ ! "$cores" =~ ^[1-9][0-9]*$ ]]; then
+    cores=1
+  fi
+  if (( cores > batch_all_jobs_auto_cap )); then
+    cores="$batch_all_jobs_auto_cap"
+  fi
+  printf '%s' "$cores"
+}
+
+# batch_all_worker_main <repo_line> <result_prefix> <color_start> <color_reset>
+# Background-subshell entry point: runs one repo and records its return code last, so the parent can
+# tell a finished worker from one that died early (die/exit skips the `.rc` write).
+batch_all_worker_main() {
+  local rc=0
+
+  batch_all_process_repo "$@" || rc=$?
+  printf '%s\n' "$rc" >"${2}.rc"
+}
+
+# batch_all_worker_finished <result_prefix> <pid>
+batch_all_worker_finished() {
+  [[ -e "${1}.rc" ]] && return 0
+  kill -0 "$2" 2>/dev/null && return 1
+  return 0
+}
+
+# batch_all_fold_result <slug> <result_prefix>
+# Folds one repo's result files into the run state (worst_exit, failure lists, retained clones, the
+# updates report). Called in repo order so a parallel run reports exactly like a serial one.
+# Uses the caller's worst_exit / failure_summaries / failure_details (dynamic scope).
+batch_all_fold_result() {
+  local -r slug="$1"
+  local -r prefix="$2"
+  local result_exit="" line
+
+  dep_updater_batch_all_append_child_updates "${prefix}.updates"
+  if [[ ! -e "${prefix}.done" ]]; then
+    log "[batch-all] FAILED (${slug}) worker exited before finishing"
+    failure_summaries+=("${slug##*/}: worker exited before finishing")
+    if (( worst_exit == 0 )); then
+      worst_exit=1
+    fi
+    return 0
+  fi
+  if [[ -s "${prefix}.exit" ]]; then
+    result_exit="$(<"${prefix}.exit")"
+    if (( worst_exit == 0 || result_exit > worst_exit )); then
+      worst_exit="$result_exit"
+    fi
+  fi
+  if [[ -f "${prefix}.summary" ]]; then
+    while IFS= read -r line; do
+      failure_summaries+=("$line")
+    done <"${prefix}.summary"
+  fi
+  if [[ -f "${prefix}.details" ]]; then
+    while IFS= read -r line; do
+      failure_details+=("$line")
+    done <"${prefix}.details"
+  fi
+  if [[ -e "${prefix}.retained" ]]; then
+    _batch_all_retained_clones=$(( _batch_all_retained_clones + 1 ))
+  fi
+}
+
+# batch_all_run_serial / batch_all_run_parallel <results_dir> <color_reset> <repo_line>...
+# Both fill the caller's worst_exit / failure_summaries / failure_details (dynamic scope) and return
+# 130 when interrupted. Serial keeps live output; parallel buffers per repo and replays in order.
+batch_all_run_serial() {
+  local -r results_dir="$1"
+  local -r color_reset="$2"
+  shift 2
+  local repo_line idx=0 rc
+
+  for repo_line in "$@"; do
+    [[ "$_batch_all_interrupted" == '1' ]] && return 130
+    rc=0
+    batch_all_process_repo "$repo_line" "${results_dir}/${idx}" "$(batch_all_repo_color "$idx")" \
+      "$color_reset" || rc=$?
+    if (( rc == 130 )) || [[ "$_batch_all_interrupted" == '1' ]]; then
+      return 130
+    fi
+    batch_all_fold_result "${repo_line%%$'\t'*}" "${results_dir}/${idx}"
+    idx=$(( idx + 1 ))
+  done
+}
+
+batch_all_run_parallel() {
+  local -r results_dir="$1"
+  local -r color_reset="$2"
+  shift 2
+  local -a lines=("$@")
+  local -r total="${#lines[@]}"
+  local -a pids=()
+  local spawned=0 replayed=0 running i prefix
+
+  _batch_all_worker_pids=()
+  while (( replayed < total )); do
+    [[ "$_batch_all_interrupted" == '1' ]] && return 130
+    running=0
+    for (( i = replayed; i < spawned; i++ )); do
+      if ! batch_all_worker_finished "${results_dir}/${i}" "${pids[i]}"; then
+        running=$(( running + 1 ))
+      fi
+    done
+    while (( spawned < total && running < batch_all_jobs )); do
+      prefix="${results_dir}/${spawned}"
+      batch_all_worker_main "${lines[spawned]}" "$prefix" "$(batch_all_repo_color "$spawned")" \
+        "$color_reset" >"${prefix}.out" 2>&1 &
+      pids[spawned]=$!
+      _batch_all_worker_pids+=("$!")
+      spawned=$(( spawned + 1 ))
+      running=$(( running + 1 ))
+    done
+    while (( replayed < spawned )) \
+      && batch_all_worker_finished "${results_dir}/${replayed}" "${pids[replayed]}"; do
+      prefix="${results_dir}/${replayed}"
+      cat -- "${prefix}.out"
+      batch_all_fold_result "${lines[replayed]%%$'\t'*}" "$prefix"
+      replayed=$(( replayed + 1 ))
+    done
+    (( replayed < total )) || break
+    # Nothing replayable yet: block until any worker exits. 127 means no workers are left.
+    wait -n 2>/dev/null || [[ $? -ne 127 ]] || break
+  done
+  wait 2>/dev/null || true
+  _batch_all_worker_pids=()
+}
+
+# batch_all_repo_color <index>
+# Prints the ANSI color for the repo at <index> (empty when stderr is not a color TTY).
+batch_all_repo_color() {
+  [[ "${#_batch_all_repo_colors[@]}" -gt 0 ]] || return 0
+  printf '%s' "${_batch_all_repo_colors[$(( $1 % ${#_batch_all_repo_colors[@]} ))]}"
+}
+
 batch_all_dispatch() {
-  local dep_self repo child_exit worst_exit discover_file discover_rc=0 missing_tools
-  local -a child_args repos_found
+  local repo_line worst_exit discover_file discover_rc=0
+  local -a repos_found work_lines
   local -a failure_summaries=()
   local -a failure_details=()
-  local slug checkout_path repo_ephemeral=0 ephemeral_base clone_rc=0
+  local ephemeral_base results_dir run_rc=0
 
   # Palette of ANSI colors cycled across repos so each project's header is visually distinct.
   # Only active when stderr is a TTY (same condition as init_prompt_style).
-  local -a _repo_colors=()
   local _color_reset=""
+  _batch_all_repo_colors=()
   if [[ -t 2 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" && -n "${TERM:-}" ]]; then
     # Bold variants of: magenta, yellow, blue, green, red, cyan, white
-    _repo_colors=(
+    _batch_all_repo_colors=(
       '\033[1;35m'
       '\033[1;33m'
       '\033[1;34m'
@@ -9863,18 +10368,25 @@ batch_all_dispatch() {
     )
     _color_reset='\033[0m'
   fi
-  local _repo_color_idx=0
   _batch_all_interrupted=0
   _batch_all_active_child_pid=""
   _batch_all_active_child_fifo=""
   _batch_all_active_child_log=""
   trap batch_all_cleanup_on_interrupt INT TERM
 
-  dep_self=""
-  dep_self="$(dep_updater_runner_realpath "${BASH_SOURCE[0]}" 2>/dev/null)" \
+  _batch_all_dep_self=""
+  _batch_all_dep_self="$(dep_updater_runner_realpath "${BASH_SOURCE[0]}" 2>/dev/null)" \
     || die "Could not resolve dep-updater script path."
 
   log_batch_all_top_level_dirs
+
+  if [[ -z "$batch_all_jobs" ]]; then
+    # Fail like --jobs does: a set but invalid value is an operator mistake, not a request for auto.
+    if [[ -n "${DEP_UPDATER_JOBS:-}" && ! "${DEP_UPDATER_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+      die "DEP_UPDATER_JOBS requires a positive integer (got: ${DEP_UPDATER_JOBS})"
+    fi
+    batch_all_jobs="$(batch_all_default_jobs)"
+  fi
 
   discover_file="$(mktemp)"
   discover_batch_all_repos >"$discover_file" || discover_rc=$?
@@ -9886,7 +10398,12 @@ batch_all_dispatch() {
   readarray -t repos_found < <(sort -u "$discover_file")
   rm -f "$discover_file"
 
-  if [[ ${#repos_found[@]} -eq 0 ]]; then
+  work_lines=()
+  for repo_line in "${repos_found[@]}"; do
+    [[ -n "$repo_line" ]] && work_lines+=("$repo_line")
+  done
+
+  if [[ ${#work_lines[@]} -eq 0 ]]; then
     log "[batch-all] No org repositories to process."
     return 0
   fi
@@ -9900,297 +10417,28 @@ batch_all_dispatch() {
   [[ -n "$_batch_all_ephemeral_root" && -d "$_batch_all_ephemeral_root" ]] \
     || die "Could not create ephemeral clone directory under ${ephemeral_base}"
 
+  # Per-repo result and output buffers (serial and parallel runs share this layout).
+  results_dir="$(mktemp -d "${ephemeral_base}/dep-updater-batch-results.XXXXXX")" \
+    || die "Could not create batch-all result directory under ${ephemeral_base}"
+  _batch_all_results_dir="$results_dir"
+
   if [[ -n "${DEP_UPDATER_UPDATES_REPORT:-}" ]]; then
     printf '[]\n' >"${DEP_UPDATER_UPDATES_REPORT}"
   fi
 
   worst_exit=0
 
-  for repo_line in "${repos_found[@]}"; do
-    [[ -z "$repo_line" ]] && continue
-    [[ "$_batch_all_interrupted" == '1' ]] && break
+  if (( batch_all_jobs > 1 && ${#work_lines[@]} > 1 )); then
+    log "[batch-all] Processing ${#work_lines[@]} repositories with up to ${batch_all_jobs} parallel jobs (output is replayed per repo in order)"
+    batch_all_run_parallel "$results_dir" "$_color_reset" "${work_lines[@]}" || run_rc=$?
+  else
+    batch_all_run_serial "$results_dir" "$_color_reset" "${work_lines[@]}" || run_rc=$?
+  fi
+  rm -rf -- "$results_dir"
+  _batch_all_results_dir=""
 
-    slug="${repo_line%%$'\t'*}"
-    checkout_path=""
-    if [[ "$repo_line" == *$'\t'* ]]; then
-      checkout_path="${repo_line#*$'\t'}"
-    fi
-    [[ -n "$slug" ]] || continue
-
-    repo=""
-    repo_ephemeral=0
-    if [[ -n "$checkout_path" ]]; then
-      repo="$checkout_path"
-    else
-      repo_ephemeral=1
-      _batch_all_pending_ephemeral_clone=1
-      clone_rc=0
-      repo="$(batch_all_materialize_checkout "$slug" "")" || clone_rc=$?
-      if (( clone_rc != 0 )); then
-        if (( clone_rc == 130 )) || [[ "${_runner_interrupted:-0}" -eq 1 ]]; then
-          _batch_all_interrupted=1
-          break
-        fi
-        if (( worst_exit == 0 || clone_rc > worst_exit )); then
-          worst_exit="$clone_rc"
-        fi
-        continue
-      fi
-    fi
-    [[ -n "$repo" ]] || continue
-    [[ "$_batch_all_interrupted" == '1' ]] && break
-
-    local repo_started_ms
-    local _this_color=""
-    if [[ "${#_repo_colors[@]}" -gt 0 ]]; then
-      _this_color="${_repo_colors[$(( _repo_color_idx % ${#_repo_colors[@]} ))]}"
-      _repo_color_idx=$(( _repo_color_idx + 1 ))
-    fi
-    # Color just the repo-boundary header and outcome lines; child output keeps its own color.
-    TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
-      log "[batch-all] --- $(basename "$repo") (${repo}) ---"
-    if [[ -n "${EPOCHREALTIME:-}" ]]; then
-      repo_started_ms="$(( ${EPOCHREALTIME/./} / 1000 ))"
-    else
-      repo_started_ms="$(date +%s000)"
-    fi
-
-    child_args=()
-    [[ "$dry_run" == '1' ]] && child_args+=(--dry-run)
-    child_args+=(--batch)
-    [[ "$quiet" == '1' ]] && child_args+=(--quiet)
-    [[ "$semver_only" == '1' ]] && child_args+=(--semver-only)
-    [[ "$no_wait_ci" == '1' ]] && child_args+=(--no-wait-ci)
-    [[ "$no_wait_merge" == '1' ]] && child_args+=(--no-wait-merge)
-    [[ "$security_only" == '1' ]] && child_args+=(--security-only)
-    [[ -n "$wt_tmpdir" ]] && child_args+=(--tmpdir "$wt_tmpdir")
-    child_args+=(--merge-timeout "$merge_timeout_min")
-    child_args+=(--merge-via "$merge_via")
-    [[ "$ecosystem" != 'auto' ]] && child_args+=(--ecosystem "$ecosystem")
-    child_args+=(--dir "$repo")
-
-    child_exit=0
-    local child_log child_fifo child_pid child_report child_updates
-    local root_cause child_clean report_line detail_count
-    local ci_type ci_pr ci_check_name ci_check_conclusion ci_pr_url ci_check_url ci_summary
-    child_log="$(mktemp)"
-    child_report="$(mktemp)"
-    child_updates="$(mktemp)"
-    child_fifo="$(mktemp -u)"
-    mkfifo "$child_fifo"
-    _batch_all_active_child_log="$child_log"
-    _batch_all_active_child_fifo="$child_fifo"
-
-    # Stream ALL child output live, while also capturing it for concise failure summaries.
-    # Use a fifo so we also have a child PID to kill on Ctrl-C.
-    # DEP_UPDATER_RUN_REPORT: child writes structured JSON on non-zero exit for
-    # batch-all to read (see dep_updater_write_batch_child_report_json).
-    set +e
-    DEP_UPDATER_RUN_REPORT="$child_report" \
-      DEP_UPDATER_UPDATES_REPORT="$child_updates" \
-      "$dep_self" "${child_args[@]}" >"$child_fifo" 2>&1 &
-    child_pid=$!
-    _batch_all_active_child_pid="$child_pid"
-
-    local line
-    while IFS= read -r line; do
-      printf '%s\n' "$line"
-      printf '%s\n' "$line" >>"$child_log"
-    done <"$child_fifo"
-
-    wait "$child_pid" || child_exit=$?
-    rm -f "$child_fifo"
-    _batch_all_active_child_pid=""
-    _batch_all_active_child_fifo=""
-    set -e
-
-    if [[ "$_batch_all_interrupted" == '1' ]]; then
-      rm -f "$child_log" "$child_report" "$child_updates"
-      _batch_all_active_child_log=""
-      break
-    fi
-
-    dep_updater_batch_all_append_child_updates "$child_updates"
-
-    if [[ "$child_exit" -eq "$dep_updater_exit_missing_tooling" ]]; then
-      # Host-tooling gap, not a repo problem: skip without touching worst_exit, and
-      # let the ephemeral clone go — `cargo install` on the host is the fix, so there
-      # is nothing in the clone to repair (repository-helpers#535).
-      missing_tools="$(batch_all_missing_tooling_from_log "$child_log")"
-      TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
-        log "[batch-all] Skipping $(basename "$repo"): missing host tooling (${missing_tools})"
-      rm -f "$child_log" "$child_report" "$child_updates"
-      _batch_all_active_child_log=""
-      if (( repo_ephemeral )); then
-        run_command "batch-all rm ephemeral clone $(basename "$repo")" -- rm -rf "$repo"
-        _batch_all_pending_ephemeral_clone=0
-      fi
-      continue
-    fi
-
-    if [[ "$child_exit" -ne 0 ]]; then
-      TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
-        log "[batch-all] FAILED (${repo}) exit ${child_exit}"
-      root_cause=""
-      detail_count=0
-      if [[ -s "$child_report" ]] \
-        && dep_runner_jq_file_args "dep-updater batch-all child report validate" "$child_report" -e \
-          'has("primary") and has("details") and has("exit_code")' >/dev/null 2>&1; then
-        root_cause="$(dep_updater_actionable_primary_from_report "$child_report" "$child_exit")"
-        while IFS= read -r report_line; do
-          [[ -z "$report_line" ]] && continue
-          failure_details+=("$(basename "$repo"): ${report_line}")
-          detail_count=$((detail_count + 1))
-        done < <(dep_runner_jq_file_args "dep-updater batch-all child report details" "$child_report" -r '.details[]? // empty' 2>/dev/null || true)
-        while IFS= read -r report_line; do
-          [[ -z "$report_line" ]] && continue
-          failure_details+=("$(basename "$repo"): ${report_line}")
-          detail_count=$((detail_count + 1))
-          log "[batch-all] Command failure ($(basename "$repo")): ${report_line}"
-        done < <(dep_runner_jq_file_args "dep-updater batch-all child command failures" "$child_report" -r \
-          '.command_failures[]? | select(. != null)
-            | if (.stderr_hint // "") != "" then "\(.label) (exit \(.exit_code)) — \(.stderr_hint)"
-              else "\(.label) (exit \(.exit_code))" end' 2>/dev/null || true)
-      fi
-      # Keep batch-all output actionable: strip ANSI noise; use log tail only if
-      # no structured report (e.g. older child or crash before write).
-      child_clean="$(mktemp)"
-      sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' "$child_log" >"$child_clean" 2>/dev/null || cp "$child_log" "$child_clean"
-
-      if [[ -z "$root_cause" ]] \
-        || dep_updater_primary_is_generic "$root_cause" "$child_exit"; then
-        scraped=""
-        scraped="$(batch_all_scrape_actionable_from_log "$child_clean" 2>/dev/null || true)"
-        if [[ -n "$scraped" ]]; then
-          root_cause="$scraped"
-          if [[ "$detail_count" -eq 0 ]]; then
-            failure_details+=("$(basename "$repo"): ${scraped}")
-            detail_count=1
-          fi
-        fi
-      fi
-
-      if [[ -z "$root_cause" ]]; then
-        root_cause="$(tail -n 1 "$child_clean" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
-      fi
-
-      ci_type=""
-      ci_pr=""
-      ci_check_name=""
-      ci_check_conclusion=""
-      ci_pr_url=""
-      ci_check_url=""
-      if [[ -s "$child_report" ]] \
-        && dep_runner_jq_file_args "dep-updater batch-all child ci failure" "$child_report" -e \
-          'has("ci_failure") and .ci_failure != null' >/dev/null 2>&1; then
-        ci_type="$(dep_runner_jq_file_args "dep-updater batch-all child ci type" "$child_report" \
-          -r '.ci_failure | type' 2>/dev/null || true)"
-        if [[ "$ci_type" == "object" ]]; then
-          ci_pr="$(dep_runner_jq_file_args "dep-updater batch-all child ci pr" "$child_report" \
-            -r '.ci_failure.pr // empty' 2>/dev/null || true)"
-          ci_check_name="$(dep_runner_jq_file_args "dep-updater batch-all child ci check" "$child_report" \
-            -r '.ci_failure.check_name // empty' 2>/dev/null || true)"
-          ci_check_conclusion="$(dep_runner_jq_file_args "dep-updater batch-all child ci conclusion" "$child_report" \
-            -r '.ci_failure.check_conclusion // empty' 2>/dev/null || true)"
-          ci_pr_url="$(dep_runner_jq_file_args "dep-updater batch-all child ci pr url" "$child_report" \
-            -r '.ci_failure.pr_url // empty' 2>/dev/null || true)"
-          ci_check_url="$(dep_runner_jq_file_args "dep-updater batch-all child ci check url" "$child_report" \
-            -r '.ci_failure.check_url // empty' 2>/dev/null || true)"
-          if [[ -n "$ci_pr" ]]; then
-            if [[ -n "$ci_check_name" ]]; then
-              failure_details+=("$(basename "$repo"): CI failed on PR #${ci_pr} — ${ci_check_name} (${ci_check_conclusion})")
-            else
-              failure_details+=("$(basename "$repo"): CI failed on PR #${ci_pr}")
-            fi
-            if [[ -n "$ci_pr_url" ]]; then
-              failure_details+=("$(basename "$repo"): PR: ${ci_pr_url}")
-            fi
-            if [[ -n "$ci_check_url" ]]; then
-              failure_details+=("$(basename "$repo"): Check run: ${ci_check_url}")
-            fi
-            detail_count=$((detail_count + 1))
-            if [[ -n "$root_cause" && "$root_cause" != *pr_url=* && -n "$ci_pr_url" ]]; then
-              root_cause="${root_cause} pr_url=${ci_pr_url}"
-            fi
-          fi
-        elif [[ "$ci_type" == "string" ]]; then
-          ci_summary="$(dep_runner_jq_file_args "dep-updater batch-all child ci summary" "$child_report" \
-            -r '.ci_failure // empty' 2>/dev/null || true)"
-          if [[ -n "$ci_summary" && "$ci_summary" != "null" ]]; then
-            failure_details+=("$(basename "$repo"): ${ci_summary}")
-            detail_count=$((detail_count + 1))
-          fi
-        fi
-      fi
-
-      if [[ -n "$root_cause" ]]; then
-        if [[ "$detail_count" -eq 0 ]]; then
-          failure_details+=("$(basename "$repo"): ${root_cause}")
-        fi
-        log "[batch-all] Root cause: ${root_cause}"
-      fi
-
-      if [[ -n "$ci_pr" ]]; then
-        if [[ -n "$ci_check_name" ]]; then
-          log "[batch-all] CI failure ($(basename "$repo")): pr=#${ci_pr} ${ci_check_name} (${ci_check_conclusion})"
-        else
-          log "[batch-all] CI failure ($(basename "$repo")): pr=#${ci_pr} CI checks failed"
-        fi
-        if [[ -n "$ci_pr_url" ]]; then
-          log "[batch-all] CI failure-link ($(basename "$repo")) pr: ${ci_pr_url}"
-        fi
-        if [[ -n "$ci_check_url" ]]; then
-          log "[batch-all] CI failure-link ($(basename "$repo")) check: ${ci_check_url}"
-        fi
-      elif [[ -n "$ci_type" && "$ci_type" == "string" ]]; then
-        ci_summary="$(dep_runner_jq_file_args "dep-updater batch-all child ci summary repeat" "$child_report" \
-          -r '.ci_failure // empty' 2>/dev/null || true)"
-        if [[ -n "$ci_summary" && "$ci_summary" != "null" ]]; then
-          log "[batch-all] CI failure ($(basename "$repo")): ${ci_summary}"
-        fi
-      fi
-
-      # If pnpm ignored builds were encountered, surface the specific skipped packages.
-      if pnpm_output_has_ignored_builds "$child_clean"; then
-        log "[batch-all] pnpm blocked dependency build scripts (ERR_PNPM_IGNORED_BUILDS)."
-        log "[batch-all] Skipped package(s):"
-        { rg -n '^.*\\[pnpm\\]   ' "$child_clean" || true; } | tail -n 20 | sed -E 's/^[0-9]+://' | sed 's/^/[batch-all]   /' >&2
-        log "[batch-all] Fix: run pnpm approve-builds (or pnpm approve-builds --all) in that repo."
-      fi
-
-      rm -f "$child_clean" "$child_report"
-      if [[ -n "$root_cause" ]]; then
-        failure_summaries+=("$(basename "$repo"): exit ${child_exit} — ${root_cause}")
-      else
-        failure_summaries+=("$(basename "$repo"): exit ${child_exit}")
-      fi
-      if [[ "$worst_exit" -eq 0 ]] || [[ "$child_exit" -gt "$worst_exit" ]]; then
-        worst_exit="$child_exit"
-      fi
-    else
-      local repo_finished_ms repo_elapsed_s
-      if [[ -n "${EPOCHREALTIME:-}" ]]; then
-        repo_finished_ms="$(( ${EPOCHREALTIME/./} / 1000 ))"
-      else
-        repo_finished_ms="$(date +%s000)"
-      fi
-      repo_elapsed_s="$(( (repo_finished_ms - repo_started_ms) / 1000 ))"
-      TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
-        log "[batch-all] OK ($(basename "$repo")) (${repo_elapsed_s}s)"
-    fi
-    rm -f "$child_log" "$child_report" "$child_updates"
-    _batch_all_active_child_log=""
-    if (( repo_ephemeral )); then
-      if batch_all_ephemeral_clone_safe_to_remove "$child_exit"; then
-        run_command "batch-all rm ephemeral clone $(basename "$repo")" -- rm -rf "$repo"
-      else
-        _batch_all_retained_clones=$(( _batch_all_retained_clones + 1 ))
-      fi
-      _batch_all_pending_ephemeral_clone=0
-    fi
-  done
-
-  if [[ "$_batch_all_interrupted" == '1' ]]; then
+  if (( run_rc == 130 )) || [[ "$_batch_all_interrupted" == '1' ]]; then
+    _batch_all_interrupted=1
     batch_all_cleanup_ephemeral_root
     trap - INT TERM
     return 130

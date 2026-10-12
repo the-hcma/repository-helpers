@@ -44,7 +44,11 @@ scripts/dep-updater --security-only --dir /path/to/repo
 scripts/dep-updater --batch --all --no-wait-ci --no-wait-merge
 ```
 
-Useful flags: `--ecosystem npm|python|rust|gha|auto`, `--report-json` (implies `--dry-run --quiet`), `--merge-via gh|merge-queue`, `--cleanup`, `--rebase`. See [Dependency Updates](#dependency-updates) for ecosystem policy details.
+Useful flags: `--ecosystem npm|python|rust|gha|auto`, `--jobs N` (with `--batch --all`), `--report-json` (implies `--dry-run --quiet`), `--merge-via gh|merge-queue`, `--cleanup`, `--rebase`. See [Dependency Updates](#dependency-updates) for ecosystem policy details.
+
+#### Parallel batch runs (`--jobs N`)
+
+With `--batch --all`, `--jobs N` runs up to N per-repository `dep-updater --batch --dir <repo>` children at once; most of a repo's time is spent waiting on CI, merge polling and registry calls, so the daily batch no longer takes the sum of every repo's wait. The default follows the host: the core count capped at 4 (beyond that the children only queue behind the shared GitHub pacing gate). Set `DEP_UPDATER_JOBS=N` (a positive integer; anything else is an error, like `--jobs`) to change the default for a host, or pass `--jobs 1` for the serial, live-streamed run. Each repo's output is buffered and replayed in the original repo order, and the failure summary, the updates report, `worst_exit` and the Skipped (missing tooling) handling are folded in that same order, so the log markers `dep-updater-batch-run` parses and the exit status match a serial run. Differences to know about: output is not streamed (a repo's log appears once it and every repo before it finished), stdout and stderr of a repo are replayed as one stream on stdout, and TTY-only colour hints are not applied to replayed output. Ephemeral clones are made inside the workers, so they run in parallel too. Ctrl-C or TERM stops every worker and its in-flight commands and removes the buffers; clones that may still back a worktree are kept. Every `gh` call the children make passes the shared pacing gate (see "Shared GitHub API pacing" below), so they share one quota budget and one rate-limit backoff.
 
 ### `dep-updater-batch-run`
 

@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# Tests for dep-updater --batch --all --jobs: a parallel run must report exactly like a serial one.
+# shellcheck disable=SC2016  # bash -c programs are single-quoted so the child shell expands them
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/dep-updater"
+readonly script
+
+tmp="$(mktemp -d)"
+readonly tmp
+trap 'rm -rf "$tmp"' EXIT
+
+# Copies named top-level functions out of dep-updater (it runs main on source, so it cannot be sourced).
+extract_functions() {
+  local fn
+  for fn in "$@"; do
+    awk -v fn="$fn" '$0 == fn "() {" { on = 1 } on { print } on && $0 == "}" { exit }' "$script"
+  done
+}
+extract_functions \
+  batch_all_default_jobs batch_all_descendant_pids batch_all_fold_result batch_all_repo_color \
+  batch_all_run_parallel batch_all_run_serial batch_all_stop_workers batch_all_worker_finished \
+  batch_all_worker_main >"${tmp}/functions"
+
+# Drives batch_all_run_serial/parallel with a stubbed batch_all_process_repo. Stub behaviour per repo:
+#   o/a  passes, but (when GATE=1) blocks until o/c has finished, so it completes after repos that
+#        started later: proves concurrency and out-of-order completion without any sleep.
+#   o/b  passes and leaves its ephemeral clone for follow-up.
+#   o/c  fails with exit 2, a summary and a detail line.
+#   o/d  exits early without recording a result (a dead worker) when DIE_D=1, else fails with exit 1.
+read -r -d '' driver <<'DRIVER' || true
+set -euo pipefail
+source "$1"
+jobs="$2"; results="$3"; gate_dir="$4"
+batch_all_jobs="$jobs"
+batch_all_jobs_auto_cap=4
+_batch_all_interrupted=0
+_batch_all_retained_clones=0
+_batch_all_repo_colors=()
+_batch_all_worker_pids=()
+log() { printf '%s\n' "$*" >&2; }
+dep_updater_batch_all_append_child_updates() { :; }
+batch_all_process_repo() {
+  local line="$1" prefix="$2" slug here spin=0
+  slug="${line%%$'\t'*}"
+  if [[ "${GATE:-0}" == 1 && "$slug" == o/a ]]; then
+    while [[ ! -e "${gate_dir}/c" ]]; do
+      spin=$(( spin + 1 ))
+      if (( spin > 3000000 )); then printf 'gate timeout\n' >&2; return 9; fi
+    done
+  fi
+  printf 'out:%s\n' "$slug"
+  here=yes; [[ "$BASHPID" != "$PARENT_PID" ]] || here=no
+  printf 'log:%s in_subshell=%s\n' "$slug" "$here" >&2
+  case "$slug" in
+    o/b) : >"${prefix}.retained" ;;
+    o/c)
+      printf '%s\n' 2 >"${prefix}.exit"
+      printf '%s\n' "c: exit 2 — boom" >"${prefix}.summary"
+      printf '%s\n' "c: detail one" >"${prefix}.details"
+      : >"${gate_dir}/c"
+      ;;
+    o/d)
+      [[ "${DIE_D:-0}" != 1 ]] || exit 7
+      printf '%s\n' 1 >"${prefix}.exit"
+      ;;
+  esac
+  : >"${prefix}.done"
+}
+PARENT_PID="$BASHPID"
+worst_exit=0
+failure_summaries=()
+failure_details=()
+mkdir -p "$results"
+lines=($'o/a\t/x/a' $'o/b\t/x/b' $'o/c\t/x/c' $'o/d\t/x/d')
+rc=0
+if [[ "$MODE" == parallel ]]; then
+  batch_all_run_parallel "$results" "" "${lines[@]}" || rc=$?
+else
+  batch_all_run_serial "$results" "" "${lines[@]}" || rc=$?
+fi
+printf 'RESULT rc=%s worst=%s retained=%s\n' "$rc" "$worst_exit" "$_batch_all_retained_clones"
+printf 'SUMMARY %s\n' "${failure_summaries[@]}"
+printf 'DETAIL %s\n' "${failure_details[@]}"
+DRIVER
+
+# run_case <name> <mode> <jobs> [VAR=value ...]  -> $tmp/<name>.{out,err}
+run_case() {
+  local -r name="$1" mode="$2" jobs="$3"
+  shift 3
+  mkdir -p "${tmp}/${name}.gate"
+  env MODE="$mode" "$@" bash -c "$driver" bash "${tmp}/functions" "$jobs" "${tmp}/${name}.results" \
+    "${tmp}/${name}.gate" >"${tmp}/${name}.out" 2>&1 || true
+}
+
+same_file() {
+  local -r label="$1" left="$2" right="$3"
+  if cmp -s "$left" "$right"; then
+    pass_case "$label"
+  else
+    fail_case "$label"
+    diff "$left" "$right" >&2 || true
+  fi
+}
+
+printf '\n=== jobs: parallel run folds results like a serial run ===\n'
+run_case serial serial 1 GATE=0
+run_case par parallel 4 GATE=1
+sed -E "s/ in_subshell=(yes|no)//" "${tmp}/serial.out" >"${tmp}/serial.norm"
+sed -E "s/ in_subshell=(yes|no)//" "${tmp}/par.out" >"${tmp}/par.norm"
+same_file "combined output (replayed child output and the folded result) is identical for 4 jobs and 1" \
+  "${tmp}/serial.norm" "${tmp}/par.norm"
+assert_contains "worst exit is the highest repo exit" "$(cat "${tmp}/par.out")" "RESULT rc=0 worst=2 retained=1"
+assert_contains "failure summary lines are kept" "$(cat "${tmp}/par.out")" "SUMMARY c: exit 2 — boom"
+assert_contains "failure detail lines are kept" "$(cat "${tmp}/par.out")" "DETAIL c: detail one"
+
+printf '\n=== jobs: repos really run concurrently ===\n'
+assert_contains "gated repo completes only because a later repo ran at the same time" \
+  "$(cat "${tmp}/par.out")" "out:o/a"
+assert_not_contains "no gate timeout in the concurrent run" "$(cat "${tmp}/par.out")" "gate timeout"
+run_case par_two parallel 2 GATE=1
+assert_contains "2 jobs are enough to run the gated repo alongside the next one" \
+  "$(cat "${tmp}/par_two.out")" "RESULT rc=0 worst=2 retained=1"
+assert_contains "parallel mode runs repos in background workers" "$(cat "${tmp}/par.out")" "log:o/b in_subshell=yes"
+assert_contains "serial mode runs repos in the parent shell" "$(cat "${tmp}/serial.out")" "log:o/b in_subshell=no"
+
+printf '\n=== jobs: output is replayed in repo order ===\n'
+order="$(grep -o '^out:o/.' "${tmp}/par.out" | tr '\n' ' ')"
+assert_contains "replayed output follows repo order though o/a finished last" "$order" "out:o/a out:o/b out:o/c out:o/d "
+
+printf '\n=== jobs: a worker that dies is reported as a failed repo ===\n'
+run_case died parallel 4 GATE=1 DIE_D=1
+assert_contains "dead worker is logged" "$(cat "${tmp}/died.out")" "[batch-all] FAILED (o/d) worker exited before finishing"
+assert_contains "dead worker is in the failure summary" "$(cat "${tmp}/died.out")" "SUMMARY c: exit 2 — boom"
+assert_contains "dead worker summary names the repo" "$(cat "${tmp}/died.out")" "d: worker exited before finishing"
+
+printf '\n=== jobs: INT/TERM stops workers and their in-flight commands ===\n'
+extract_functions batch_all_cleanup_on_interrupt >>"${tmp}/functions"
+read -r -d '' intr_driver <<'DRIVER' || true
+set -euo pipefail
+source "$1"
+dir="$2"
+batch_all_jobs=2
+_batch_all_interrupted=0
+_batch_all_retained_clones=0
+_batch_all_pending_ephemeral_clone=0
+_batch_all_repo_colors=()
+_batch_all_worker_pids=()
+_batch_all_active_child_pid=""
+_batch_all_active_child_fifo=""
+_batch_all_active_child_log=""
+_batch_all_ephemeral_root=""
+_batch_all_results_dir="${dir}/results"
+log() { printf '%s\n' "$*" >&2; }
+batch_all_cleanup_ephemeral_root() { :; }
+dep_updater_batch_all_append_child_updates() { :; }
+batch_all_process_repo() {
+  local slug="${1%%$'\t'*}"
+  # A long-lived in-flight command (stands in for gh/pnpm/cargo) the worker is waiting on.
+  sleep 300 &
+  printf '%s\n' "$!" >"${dir}/inflight-${slug##*/}"
+  wait
+}
+mkdir -p "$_batch_all_results_dir"
+trap batch_all_cleanup_on_interrupt INT TERM
+worst_exit=0; failure_summaries=(); failure_details=()
+rc=0
+batch_all_run_parallel "$_batch_all_results_dir" "" $'o/a\t/x/a' $'o/b\t/x/b' || rc=$?
+printf 'RESULT rc=%s results_dir_exists=%s\n' "$rc" "$([[ -d "$_batch_all_results_dir" ]] && echo yes || echo no)"
+DRIVER
+mkdir -p "${tmp}/intr"
+bash -c "$intr_driver" bash "${tmp}/functions" "${tmp}/intr" >"${tmp}/intr.out" 2>&1 &
+intr_pid=$!
+spin=0
+while [[ ! -e "${tmp}/intr/inflight-a" || ! -e "${tmp}/intr/inflight-b" ]]; do
+  spin=$(( spin + 1 ))
+  (( spin < 3000000 )) || break
+done
+kill -TERM "$intr_pid" 2>/dev/null || true
+wait "$intr_pid" || true
+inflight_a="$(<"${tmp}/intr/inflight-a")"
+inflight_b="$(<"${tmp}/intr/inflight-b")"
+spin=0
+while { kill -0 "$inflight_a" 2>/dev/null || kill -0 "$inflight_b" 2>/dev/null; } && (( spin < 3000000 )); do
+  spin=$(( spin + 1 ))
+done
+if kill -0 "$inflight_a" 2>/dev/null || kill -0 "$inflight_b" 2>/dev/null; then
+  fail_case "in-flight commands of every worker are stopped on TERM"
+  kill "$inflight_a" "$inflight_b" 2>/dev/null || true
+else
+  pass_case "in-flight commands of every worker are stopped on TERM"
+fi
+assert_contains "the interrupt handler logs the interruption" "$(cat "${tmp}/intr.out")" "[batch-all] Interrupted."
+assert_not_contains "the run reports interrupted and the buffers are removed" \
+  "$(cat "${tmp}/intr.out")" "results_dir_exists=yes"
+
+printf '\n=== jobs: worker count defaults ===\n'
+jobs_for() {
+  bash -c 'source "$1"; batch_all_jobs_auto_cap=4; batch_all_default_jobs' bash "${tmp}/functions"
+}
+assert_contains "DEP_UPDATER_JOBS overrides the host core count" \
+  "$(DEP_UPDATER_JOBS=7 jobs_for)" "7"
+auto="$(env -u DEP_UPDATER_JOBS bash -c 'source "$1"; batch_all_jobs_auto_cap=4; batch_all_default_jobs' bash "${tmp}/functions")"
+if [[ "$auto" =~ ^[1-4]$ ]]; then
+  pass_case "the default is between 1 and the auto cap"
+else
+  fail_case "the default is between 1 and the auto cap (got: ${auto})"
+fi
+
+printf '\n=== jobs: argument handling ===\n'
+arg_out="$("$script" --batch --all --jobs 0 2>&1 || true)"
+assert_contains "--jobs 0 is rejected" "$arg_out" "--jobs requires a positive integer (got: 0)"
+arg_out="$("$script" --batch --all --jobs 2>&1 || true)"
+assert_contains "--jobs without a value is rejected" "$arg_out" "--jobs requires a positive integer."
+arg_out="$("$script" --jobs 2 --dry-run 2>&1 || true)"
+assert_contains "--jobs without --batch --all is rejected" "$arg_out" "--jobs requires --batch --all."
+arg_out="$("$script" --help 2>&1 || true)"
+assert_contains "usage documents --jobs" "$arg_out" "--jobs <n>"
+
+printf '\n=== static: batch-all parallel code ===\n'
+# shellcheck disable=SC2016  # the pattern is a literal awk/grep regex over the script source
+if awk '/^batch_all_dispatch\(\) \{/ { on = 1 } on && /dep_updater_batch_all_append_child_updates/ { found = 1 } END { exit found }' "$script"; then
+  pass_case "the dispatcher leaves updates-report merging to the in-order fold"
+else
+  fail_case "the dispatcher leaves updates-report merging to the in-order fold"
+fi
+if grep -q 'batch_all_process_repo' "$script" && grep -q 'wait -n' "$script"; then
+  pass_case "the parallel path blocks on wait -n instead of sleeping"
+else
+  fail_case "the parallel path blocks on wait -n instead of sleeping"
+fi
+
+printf '\n=== jobs: end to end over real child runs ===\n'
+e2e="${tmp}/e2e"
+home="${e2e}/home"
+mkdir -p "${e2e}/roots/alpha" "${e2e}/roots/beta" "${home}/.local/bin"
+for name in alpha beta; do
+  git -C "${e2e}/roots/${name}" -c user.name=t -c user.email=t@example.com init -q
+  git -C "${e2e}/roots/${name}" remote add origin "https://github.com/the-hcma/${name}.git"
+  git -C "${e2e}/roots/${name}" -c user.name=t -c user.email=t@example.com commit --allow-empty -q -m init
+done
+cat >"${home}/.local/bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == 'stack --help' ]]; then
+  exit 0
+fi
+if [[ "$args" == *'orgs/the-hcma/repos'* ]]; then
+  printf '%s\n' $'alpha\tfalse\tfalse' $'beta\tfalse\tfalse'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${home}/.local/bin/gh"
+for jobs in 1 2; do
+  rc=0
+  out="$(cd "$e2e" && HOME="$home" PATH="${home}/.local/bin:${PATH}" \
+    "$script" --batch --all --dry-run --jobs "$jobs" --scan-root "${e2e}/roots" 2>&1)" || rc=$?
+  assert_contains "--jobs ${jobs} run exits 0" "exit=${rc}" "exit=0"
+  assert_contains "--jobs ${jobs} run reports success" "$out" "[batch-all] All repos completed successfully."
+  first="$(grep -n '\[batch-all\] --- alpha' <<<"$out" | head -n 1 | cut -d: -f1)"
+  second="$(grep -n '\[batch-all\] --- beta' <<<"$out" | head -n 1 | cut -d: -f1)"
+  if [[ -n "$first" && -n "$second" ]] && (( first < second )); then
+    pass_case "--jobs ${jobs} run lists alpha before beta"
+  else
+    fail_case "--jobs ${jobs} run lists alpha before beta"
+  fi
+done
+assert_contains "--jobs 2 announces the parallel run" "$out" "up to 2 parallel jobs"
+
+test_summary
