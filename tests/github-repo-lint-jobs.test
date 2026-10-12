@@ -174,4 +174,58 @@ assert_contains "second worker reads its own last command" "$runner_out" "saw:o/
 assert_contains "third worker reads its own last command" "$runner_out" "saw:o/c:o/c"
 assert_not_contains "no gate timeout while sharing a runner session root" "$runner_out" "gate timeout"
 
+printf '\n=== jobs: interrupt cleanup and TMPDIR fallback ===\n'
+# TERM while workers are running must stop the workers and remove the buffer directory.
+intr_tmp="${tmp}/intr-tmp"
+intr_dir="${tmp}/intr"
+mkdir -p "$intr_tmp" "$intr_dir"
+TMPDIR="$intr_tmp" bash -c '
+  set -euo pipefail
+  source "$1"
+  dir="$2"
+  rp_jobs=2; rp_compact=1; rp_repo_slugs=(o/a o/b)
+  rp_check_one_repo() {
+    printf "%s\n" "$BASHPID" >"${dir}/pid-${1//\//_}"
+    local spin=0
+    while [[ ! -e "${dir}/release" ]]; do
+      spin=$(( spin + 1 ))
+      if (( spin > 6000000 )); then return 9; fi
+    done
+  }
+  rp_audit_repos 2
+' bash "$lib" "$intr_dir" >"${tmp}/intr.out" 2>"${tmp}/intr.err" &
+intr_pid=$!
+spin=0
+while [[ ! -e "${intr_dir}/pid-o_a" || ! -e "${intr_dir}/pid-o_b" ]]; do
+  spin=$(( spin + 1 ))
+  if (( spin > 3000000 )); then break; fi
+done
+kill -TERM "$intr_pid"
+intr_rc=0
+wait "$intr_pid" || intr_rc=$?
+worker_alive=0
+for worker_file in "${intr_dir}"/pid-*; do
+  worker_pid="$(<"$worker_file")"
+  spin=0
+  while kill -0 "$worker_pid" 2>/dev/null; do
+    spin=$(( spin + 1 ))
+    if (( spin > 300000 )); then worker_alive=$(( worker_alive + 1 )); break; fi
+  done
+done
+: >"${intr_dir}/release"
+leftover="$(find "$intr_tmp" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+assert_contains "TERM during a parallel audit exits with 130" "$intr_rc" "130"
+assert_contains "TERM during a parallel audit says it was interrupted" "$(cat "${tmp}/intr.err")" "audit interrupted"
+assert_contains "TERM during a parallel audit stops every worker" "workers_alive=${worker_alive}" "workers_alive=0"
+assert_contains "TERM during a parallel audit removes the buffer directory" "leftover=${leftover}" "leftover=0"
+
+# An unusable TMPDIR must degrade to the serial audit instead of aborting the run.
+run_case bad_tmpdir 4 1 0 GATE=0 TMPDIR=/nonexistent-tmpdir-for-test
+assert_contains "unwritable TMPDIR falls back to a serial audit with a note" \
+  "$(cat "${tmp}/bad_tmpdir.err")" "auditing serially"
+assert_contains "serial fallback still audits in the parent shell" \
+  "$(cat "${tmp}/bad_tmpdir.err")" "err:o/b pid_is_parent=yes"
+assert_contains "serial fallback still reports the same result" \
+  "$(cat "${tmp}/bad_tmpdir.out")" "RESULT fail=2 warn=2"
+
 test_summary

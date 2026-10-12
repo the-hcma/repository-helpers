@@ -90,7 +90,7 @@ Requires an authenticated `gh` CLI and `jq`. Merge-queue-only subset: `scripts/c
 
 #### Parallel audits (`--jobs N`)
 
-`--jobs N` audits up to N repositories at once (default 1, serial). Each repository's output is buffered and replayed in the original repo order and the `--compact` report is built from the same per-repository results, so stdout, stderr and the exit status match a serial run. `--apply-fix` always runs serially. All `gh` calls keep the primary and secondary rate-limit backoff, but each worker backs off independently, so a high N can trigger GitHub secondary rate limits and slow the run down; start with 4.
+`--jobs N` audits up to N repositories at once (default 1, serial). Each repository's output is buffered and replayed in the original repo order and the `--compact` report is built from the same per-repository results, so the report, the failure summary and the exit status match a serial run (verified byte-identical on the real org). Differences to know about: output is not streamed (nothing prints until all workers finish), each repo's stdout is printed before its stderr, TTY-only colour hints are not applied to replayed output, and per-process caches (for example SHA lookups) are repeated per worker so API volume is somewhat higher. `--apply-fix` always runs serially, and an unwritable `TMPDIR` falls back to a serial audit. Ctrl-C or TERM stops the workers and removes the buffers. All `gh` calls keep the primary and secondary rate-limit backoff, but each worker backs off independently, so a high N can trigger GitHub secondary rate limits and slow the run down; start with 4.
 
 ### Secret scanning
 

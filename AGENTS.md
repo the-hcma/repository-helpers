@@ -153,11 +153,11 @@ Run **`scripts/github-repo-lint`** to audit or onboard a GitHub repository again
 scripts/github-repo-lint --new-repo --repo OWNER/NAME       # checklist + SUGGEST hints
 scripts/github-repo-lint --repo OWNER/NAME --suggest        # audit one repo with remediation lines
 scripts/github-repo-lint --all --org the-hcma               # every repo in the org
-scripts/github-repo-lint --all --org the-hcma --jobs 4     # same audit, 4 repos at a time (serial-identical report)
+scripts/github-repo-lint --all --org the-hcma --jobs 4      # same audit, 4 repos at a time (serial-equivalent report)
 scripts/github-repo-lint --apply-fix --repo OWNER/NAME      # patch settings + candidate workflow PRs
 ```
 
-`--jobs N` audits up to N repositories concurrently (default 1). Each repo's output is buffered and replayed in the original order and the `--compact` report is built from the same per-repo results, so output and exit status match a serial run; `--apply-fix` stays serial. Workers get private runner sub-sessions (`RUNNER_SESSION_DIR/worker-<n>`) because `runner_last_id` reads one shared `.order` file. Rate-limit backoff is per worker, so keep N modest (4) to avoid GitHub secondary limits.
+`--jobs N` audits up to N repositories concurrently (default 1). Each repo's output is buffered and replayed in the original order and the `--compact` report is built from the same per-repo results, so the report and exit status match a serial run; output is not streamed, per-repo stdout precedes stderr, and per-process caches repeat per worker. `--apply-fix` stays serial, as does an unwritable `TMPDIR`; INT/TERM stops the workers and removes the buffers. Workers get private runner sub-sessions (`RUNNER_SESSION_DIR/worker-<n>`) because `runner_last_id` reads one shared `.order` file. Rate-limit backoff is per worker, so keep N modest (4) to avoid GitHub secondary limits.
 
 CI (`.github/workflows/github-repo-lint.yml`) runs the same `--all --strict-onboarding --compact` audit only when a PR changes `.agents/rules/**`, `.agents/skills/**`, `.cursor/rules/**`, `.github/stacking-tool`, `.github/workflows/github-repo-lint.yml`, `scripts/github-repo-lint`, `scripts/lib/repo-practices-agents/**`, `scripts/lib/repo-practices-cursor/**`, or `scripts/lib/repo-practices`. Path filters skip the workflow (and the approval prompt) otherwise. When it does run, environment **`github-repo-lint`** waits to unlock **`REPO_LINT_TOKEN`**.
 

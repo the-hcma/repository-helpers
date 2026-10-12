@@ -209,6 +209,7 @@ rp_compact=0
 rp_track_failures=0
 rp_jobs=1
 rp_audit_total_fail=0
+rp_audit_workdir=""
 rp_single_repo=0
 rp_warn_count=0
 rp_current_slug=""
@@ -281,9 +282,10 @@ With no --repo: audit the current git repository when run inside a clone (origin
 otherwise discover org repos with release-please.yml, GitHub MQ, or merge-it leftovers.
 --suggest: print SUGGEST lines with remediation hints (non-zero exit still on FAIL).
 --compact: print one passed-repos line plus grouped failures and fixes (implies --suggest).
---jobs N: audit up to N repositories concurrently (default 1 = serial). Output and exit status match
-a serial run: each repository's output is buffered and replayed in the original repo order, and the
---compact report is built from the same per-repository results. Ignored (serial) with --apply-fix.
+--jobs N: audit up to N repositories concurrently (default 1 = serial). The report (including --compact), the failure summary and the
+exit status match a serial run: each repository's output is buffered and replayed in the original repo
+order. Output is not streamed, per-repo stdout precedes stderr, and per-process caches repeat per worker.
+Serial with --apply-fix, and when TMPDIR is not writable.
 
 Requires: gh (authenticated), jq.
 
@@ -10612,15 +10614,42 @@ rp_audit_repo_worker() {
   : >"${prefix}.done"
 }
 
+# rp_audit_parallel_abort
+# INT/TERM handler for the parallel audit: stop the workers and remove the buffer directory so a
+# Ctrl-C does not leave workers calling gh or leak the directory. EXIT is deliberately not trapped:
+# it belongs to the runner session cleanup and must keep running.
+rp_audit_parallel_abort() {
+  local pids
+
+  trap - INT TERM
+  pids="$(jobs -p)"
+  if [[ -n "$pids" ]]; then
+    # shellcheck disable=SC2086  # pids is a newline-separated list of integers
+    kill $pids 2>/dev/null || true
+  fi
+  if [[ -n "$rp_audit_workdir" ]]; then
+    rm -rf -- "$rp_audit_workdir"
+  fi
+  printf 'ERROR: audit interrupted; stopped workers\n' >&2
+  exit 130
+}
+
 # rp_audit_repos_parallel <repo-count>
 # Audits up to rp_jobs repositories at once, then replays each repo's buffered output and folds its
 # result into the report state in the original repo order, so output and the --compact report match
-# a serial run regardless of which repo finishes first.
+# a serial run regardless of which repo finishes first. Falls back to serial when no writable
+# TMPDIR is available for the per-repo buffers.
 rp_audit_repos_parallel() {
   local -r repo_count="$1"
   local workdir slug prefix idx running status warn entries
 
-  workdir="$(mktemp -d)"
+  if ! workdir="$(mktemp -d 2>/dev/null)"; then
+    printf 'NOTE: --jobs needs a writable TMPDIR for per-repo buffers; auditing serially\n' >&2
+    rp_audit_repos_serial "$repo_count"
+    return 0
+  fi
+  rp_audit_workdir="$workdir"
+  trap 'rp_audit_parallel_abort' INT TERM
   idx=0
   running=0
   for slug in "${rp_repo_slugs[@]}"; do
@@ -10659,7 +10688,9 @@ rp_audit_repos_parallel() {
     fi
     rp_audit_record_result "$slug" "$status"
   done
+  trap - INT TERM
   rm -rf -- "$workdir"
+  rp_audit_workdir=""
 }
 
 # rp_audit_repos <repo-count>
