@@ -76,6 +76,9 @@ scripts/github-repo-lint --new-repo --repo OWNER/NAME
 # Every repo in the org
 scripts/github-repo-lint --all --org the-hcma --suggest
 
+# Same audit, 4 repos at a time (identical report and exit status; see "Parallel audits" below)
+scripts/github-repo-lint --all --org the-hcma --compact --jobs 4
+
 # Repair supported settings (+ candidate workflow stack when run from the clone)
 scripts/github-repo-lint --repo OWNER/NAME --apply-fix
 
@@ -84,6 +87,10 @@ scripts/github-repo-lint --enforcer
 ```
 
 Requires an authenticated `gh` CLI and `jq`. Merge-queue-only subset: `scripts/check-merge-settings` (same flags, `--merge-only` behavior). Full check table: [github-repo-lint checks](#github-repo-lint-checks).
+
+#### Parallel audits (`--jobs N`)
+
+`--jobs N` audits up to N repositories at once (default 1, serial). Each repository's output is buffered and replayed in the original repo order and the `--compact` report is built from the same per-repository results, so stdout, stderr and the exit status match a serial run. `--apply-fix` always runs serially. All `gh` calls keep the primary and secondary rate-limit backoff, but each worker backs off independently, so a high N can trigger GitHub secondary rate limits and slow the run down; start with 4.
 
 ### Secret scanning
 

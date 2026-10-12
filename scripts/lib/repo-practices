@@ -207,6 +207,8 @@ rp_merge_only=0
 rp_strict_onboarding=0
 rp_compact=0
 rp_track_failures=0
+rp_jobs=1
+rp_audit_total_fail=0
 rp_single_repo=0
 rp_warn_count=0
 rp_current_slug=""
@@ -279,6 +281,9 @@ With no --repo: audit the current git repository when run inside a clone (origin
 otherwise discover org repos with release-please.yml, GitHub MQ, or merge-it leftovers.
 --suggest: print SUGGEST lines with remediation hints (non-zero exit still on FAIL).
 --compact: print one passed-repos line plus grouped failures and fixes (implies --suggest).
+--jobs N: audit up to N repositories concurrently (default 1 = serial). Output and exit status match
+a serial run: each repository's output is buffered and replayed in the original repo order, and the
+--compact report is built from the same per-repository results. Ignored (serial) with --apply-fix.
 
 Requires: gh (authenticated), jq.
 
@@ -8125,6 +8130,12 @@ rp_parse_args() {
         rp_audit_all=1
         shift
         ;;
+      --jobs)
+        [[ $# -ge 2 ]] || rp_die "--jobs requires a positive integer"
+        [[ "$2" =~ ^[1-9][0-9]*$ ]] || rp_die "--jobs requires a positive integer (got: $2)"
+        rp_jobs="$2"
+        shift 2
+        ;;
       --include-private)
         rp_include_private=1
         shift
@@ -10540,6 +10551,138 @@ rp_check_one_repo() {
   return "$total_fail"
 }
 
+# rp_audit_record_result <slug> <exit-status>
+# Folds one repository's audit result into the report state (shared by the serial and parallel paths).
+rp_audit_record_result() {
+  local -r slug="$1"
+  local -r status="$2"
+
+  if [[ "$status" -ne 0 ]]; then
+    rp_audit_total_fail=$(( rp_audit_total_fail + 1 ))
+    if [[ "$rp_compact" -eq 1 || "$rp_track_failures" -eq 1 ]]; then
+      rp_compact_failed_repos+=("$slug")
+    fi
+  elif [[ "$rp_compact" -eq 1 ]]; then
+    rp_compact_passed_repos+=("$slug")
+  fi
+}
+
+# rp_audit_repos_serial <repo-count>
+rp_audit_repos_serial() {
+  local -r repo_count="$1"
+  local slug
+  local status
+
+  for slug in "${rp_repo_slugs[@]}"; do
+    if [[ "$repo_count" -gt 1 && "$rp_compact" -eq 0 ]]; then
+      printf '\n%s\n' "$slug" >&2
+    fi
+    rp_current_slug="$slug"
+    status=0
+    rp_check_one_repo "$slug" || status=$?
+    rp_audit_record_result "$slug" "$status"
+    rp_current_slug=""
+  done
+}
+
+# rp_audit_repo_worker <slug> <path-prefix>
+# Runs inside a background subshell: audits one repository with its stdout/stderr buffered to files
+# and writes the per-repo state the parent needs (exit status, warning count, compact entries).
+# `.done` is written last, so a worker that died early (rp_die/exit) is detectable.
+rp_audit_repo_worker() {
+  local -r slug="$1"
+  local -r prefix="$2"
+  local status=0
+
+  # The runner keeps per-session state in one shared file (.order, read by runner_last_id), so
+  # concurrent workers must not share RUNNER_SESSION_DIR or they read each other's command results.
+  # A private sub-session under the parent's keeps artifacts and failure reports with the parent,
+  # which still owns cleanup.
+  if [[ -n "${RUNNER_SESSION_DIR:-}" && -d "${RUNNER_SESSION_DIR}" ]]; then
+    RUNNER_SESSION_DIR="${RUNNER_SESSION_DIR}/worker-${prefix##*/}"
+    mkdir -p -- "$RUNNER_SESSION_DIR"
+    export RUNNER_SESSION_DIR
+  fi
+  rp_current_slug="$slug"
+  rp_warn_count=0
+  rp_check_one_repo "$slug" >"${prefix}.out" 2>"${prefix}.err" || status=$?
+  printf '%s\n' "$status" >"${prefix}.status"
+  printf '%s\n' "$rp_warn_count" >"${prefix}.warn"
+  printf '%s' "${rp_compact_entries[$slug]:-}" >"${prefix}.entries"
+  : >"${prefix}.done"
+}
+
+# rp_audit_repos_parallel <repo-count>
+# Audits up to rp_jobs repositories at once, then replays each repo's buffered output and folds its
+# result into the report state in the original repo order, so output and the --compact report match
+# a serial run regardless of which repo finishes first.
+rp_audit_repos_parallel() {
+  local -r repo_count="$1"
+  local workdir slug prefix idx running status warn entries
+
+  workdir="$(mktemp -d)"
+  idx=0
+  running=0
+  for slug in "${rp_repo_slugs[@]}"; do
+    while (( running >= rp_jobs )); do
+      wait -n || true
+      running=$(( running - 1 ))
+    done
+    ( rp_audit_repo_worker "$slug" "${workdir}/${idx}" ) &
+    running=$(( running + 1 ))
+    idx=$(( idx + 1 ))
+  done
+  wait || true
+
+  idx=0
+  for slug in "${rp_repo_slugs[@]}"; do
+    prefix="${workdir}/${idx}"
+    idx=$(( idx + 1 ))
+    if [[ "$rp_compact" -eq 0 ]]; then
+      printf '\n%s\n' "$slug" >&2
+    fi
+    if [[ ! -e "${prefix}.done" ]]; then
+      [[ ! -f "${prefix}.out" ]] || cat -- "${prefix}.out"
+      [[ ! -f "${prefix}.err" ]] || cat -- "${prefix}.err" >&2
+      printf 'ERROR: audit worker for %s exited before finishing\n' "$slug" >&2
+      rp_audit_record_result "$slug" 1
+      continue
+    fi
+    cat -- "${prefix}.out"
+    cat -- "${prefix}.err" >&2
+    status="$(<"${prefix}.status")"
+    warn="$(<"${prefix}.warn")"
+    entries="$(<"${prefix}.entries")"
+    rp_warn_count=$(( rp_warn_count + warn ))
+    if [[ -n "$entries" ]]; then
+      rp_compact_entries[$slug]="$entries"
+    fi
+    rp_audit_record_result "$slug" "$status"
+  done
+  rm -rf -- "$workdir"
+}
+
+# rp_audit_repos <repo-count>
+# Sets rp_audit_total_fail. Parallel only for >1 repos with --jobs > 1; --apply-fix stays serial
+# because it queues candidate-fix state in shared arrays and creates worktrees per repo.
+rp_audit_repos() {
+  local -r repo_count="$1"
+  local slug
+
+  rp_audit_total_fail=0
+  for slug in "${rp_repo_slugs[@]}"; do
+    if [[ "$slug" != */* ]]; then
+      rp_die "Invalid --repo (expected OWNER/NAME): ${slug}"
+    fi
+  done
+
+  if [[ "$rp_jobs" -gt 1 && "$repo_count" -gt 1 && "$rp_apply_fix" -eq 0 ]]; then
+    rp_audit_repos_parallel "$repo_count"
+  else
+    rp_audit_repos_serial "$repo_count"
+  fi
+}
+
 rp_main() {
   local prog="$1"
   shift
@@ -10566,24 +10709,8 @@ rp_main() {
     rp_check_ci_shellcheck_pin
   fi
 
-  for slug in "${rp_repo_slugs[@]}"; do
-    if [[ "$slug" != */* ]]; then
-      rp_die "Invalid --repo (expected OWNER/NAME): ${slug}"
-    fi
-    if [[ "$repo_count" -gt 1 && "$rp_compact" -eq 0 ]]; then
-      printf '\n%s\n' "$slug" >&2
-    fi
-    rp_current_slug="$slug"
-    if ! rp_check_one_repo "$slug"; then
-      total_fail=$(( total_fail + 1 ))
-      if [[ "$rp_compact" -eq 1 || "$rp_track_failures" -eq 1 ]]; then
-        rp_compact_failed_repos+=("$slug")
-      fi
-    elif [[ "$rp_compact" -eq 1 ]]; then
-      rp_compact_passed_repos+=("$slug")
-    fi
-    rp_current_slug=""
-  done
+  rp_audit_repos "$repo_count"
+  total_fail="$rp_audit_total_fail"
 
   if [[ "$rp_compact" -eq 1 ]]; then
     rp_compact_print_report

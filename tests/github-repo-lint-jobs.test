@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Tests for github-repo-lint --jobs: parallel per-repo audits must report exactly like a serial run.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+lib="${script_dir}/../scripts/lib/repo-practices"
+runner_bootstrap="${script_dir}/../scripts/lib/runner-bootstrap"
+readonly lib runner_bootstrap
+
+tmp="$(mktemp -d)"
+readonly tmp
+trap 'rm -rf "$tmp"' EXIT
+
+# Drives rp_audit_repos with a stubbed rp_check_one_repo and prints the same report pieces rp_main
+# does. Stub behaviour per repo:
+#   o/a  passes, but (when GATE=1) blocks until o/c has finished, so it completes after repos that
+#        started later: proves concurrency and out-of-order completion without any sleep.
+#   o/b  passes with two warnings.
+#   o/c  fails with a compact failure + fix entry.
+#   o/d  fails with plain output and no compact entry (and exits early when DIE_D=1).
+read -r -d '' driver <<'DRIVER' || true
+set -euo pipefail
+source "$1"
+jobs="$2"; compact="$3"; apply_fix="$4"
+gate_dir="$5"
+rp_jobs="$jobs"; rp_compact="$compact"; rp_apply_fix="$apply_fix"; rp_track_failures=1
+rp_repo_slugs=(o/a o/b o/c o/d)
+rp_check_one_repo() {
+  local slug="$1" spin=0 here="$BASHPID" in_parent=no
+  [[ "$here" != "$PARENT_PID" ]] || in_parent=yes
+  if [[ "${GATE:-0}" == 1 && "$slug" == o/a ]]; then
+    while [[ ! -e "${gate_dir}/c" ]]; do
+      spin=$(( spin + 1 ))
+      if (( spin > 3000000 )); then printf 'gate timeout\n' >&2; return 9; fi
+    done
+  fi
+  printf 'out:%s\n' "$slug"
+  printf 'err:%s pid_is_parent=%s\n' "$slug" "$in_parent" >&2
+  case "$slug" in
+    o/b) rp_warn_count=$(( rp_warn_count + 2 )); return 0 ;;
+    o/c)
+      rp_compact_record_failure "$slug" "$slug: bad thing"
+      rp_compact_record_fix "$slug" "$slug: do the fix"
+      : >"${gate_dir}/c"
+      return 1
+      ;;
+    o/d)
+      [[ "${DIE_D:-0}" != 1 ]] || exit 7
+      return 1
+      ;;
+  esac
+  return 0
+}
+PARENT_PID="$BASHPID"
+rp_audit_repos "${#rp_repo_slugs[@]}"
+if [[ "$rp_compact" -eq 1 ]]; then rp_compact_print_report; fi
+if [[ "$rp_compact" -eq 0 ]]; then rp_print_failure_summary; fi
+printf 'RESULT fail=%s warn=%s\n' "$rp_audit_total_fail" "$rp_warn_count"
+DRIVER
+
+# run_case <name> <jobs> <compact> <apply_fix> [VAR=value ...]  -> $tmp/<name>.{out,err,rc}
+run_case() {
+  local -r name="$1" jobs="$2" compact="$3" apply_fix="$4"
+  shift 4
+  local rc=0
+  mkdir -p "${tmp}/${name}.gate"
+  env "$@" bash -c "$driver" bash "$lib" "$jobs" "$compact" "$apply_fix" "${tmp}/${name}.gate" \
+    >"${tmp}/${name}.out" 2>"${tmp}/${name}.err" || rc=$?
+  printf '%s\n' "$rc" >"${tmp}/${name}.rc"
+}
+
+same_file() {
+  local -r label="$1" left="$2" right="$3"
+  if cmp -s "$left" "$right"; then
+    pass_case "$label"
+  else
+    fail_case "$label"
+    diff "$left" "$right" >&2 || true
+  fi
+}
+
+printf '\n=== jobs: parallel report matches serial ===\n'
+run_case serial_compact 1 1 0 GATE=0
+run_case par_compact 4 1 0 GATE=1
+run_case serial_plain 1 0 0 GATE=0
+run_case par_plain 4 0 0 GATE=1
+same_file "compact stdout is identical for --jobs 4 and --jobs 1" "${tmp}/serial_compact.out" "${tmp}/par_compact.out"
+# err lines embed pid_is_parent, which legitimately differs between serial and parallel; normalise it.
+sed -E 's/ pid_is_parent=(yes|no)//' "${tmp}/serial_compact.err" >"${tmp}/serial_compact.norm"
+sed -E 's/ pid_is_parent=(yes|no)//' "${tmp}/par_compact.err" >"${tmp}/par_compact.norm"
+same_file "compact stderr (report) is identical for --jobs 4 and --jobs 1" "${tmp}/serial_compact.norm" "${tmp}/par_compact.norm"
+same_file "non-compact stdout is identical for --jobs 4 and --jobs 1" "${tmp}/serial_plain.out" "${tmp}/par_plain.out"
+sed -E 's/ pid_is_parent=(yes|no)//' "${tmp}/serial_plain.err" >"${tmp}/serial_plain.norm"
+sed -E 's/ pid_is_parent=(yes|no)//' "${tmp}/par_plain.err" >"${tmp}/par_plain.norm"
+same_file "non-compact stderr (headers, output, summary) is identical for --jobs 4 and --jobs 1" "${tmp}/serial_plain.norm" "${tmp}/par_plain.norm"
+assert_contains "parallel compact run aggregates failures and warnings" "$(cat "${tmp}/par_compact.out")" "RESULT fail=2 warn=2"
+assert_contains "parallel compact report keeps the failing repo's grouped entry" "$(cat "${tmp}/par_compact.err")" "- bad thing"
+assert_contains "parallel compact report keeps the fix line" "$(cat "${tmp}/par_compact.err")" "Fix: do the fix"
+
+printf '\n=== jobs: repos really run concurrently ===\n'
+assert_contains "gated repo completes only because a later repo ran at the same time" \
+  "$(cat "${tmp}/par_compact.out")" "out:o/a"
+assert_not_contains "no gate timeout in the concurrent run" "$(cat "${tmp}/par_compact.err")" "gate timeout"
+run_case par_two 2 1 0 GATE=1
+assert_contains "--jobs 2 is enough to run the gated repo alongside the next one" \
+  "$(cat "${tmp}/par_two.out")" "RESULT fail=2 warn=2"
+
+printf '\n=== jobs: --apply-fix stays serial ===\n'
+run_case apply_fix 4 1 1 GATE=0
+assert_contains "--apply-fix with --jobs 4 audits in the parent shell" \
+  "$(cat "${tmp}/apply_fix.err")" "err:o/b pid_is_parent=yes"
+run_case par_pid 4 1 0 GATE=0
+assert_contains "--jobs 4 audits in a background worker" \
+  "$(cat "${tmp}/par_pid.err")" "err:o/b pid_is_parent=no"
+
+printf '\n=== jobs: a worker that dies is reported as a failed repo ===\n'
+run_case died 4 1 0 GATE=1 DIE_D=1
+assert_contains "dead worker is surfaced on stderr" "$(cat "${tmp}/died.err")" "audit worker for o/d exited before finishing"
+assert_contains "dead worker counts as a failure" "$(cat "${tmp}/died.out")" "RESULT fail=2 warn=2"
+
+printf '\n=== jobs: argument handling and session safety ===\n'
+parse_out="$(bash -c 'source "$1"; rp_parse_args prog --jobs 0' bash "$lib" 2>&1 || true)"
+assert_contains "--jobs 0 is rejected" "$parse_out" "--jobs requires a positive integer (got: 0)"
+parse_out="$(bash -c 'source "$1"; rp_parse_args prog --jobs' bash "$lib" 2>&1 || true)"
+assert_contains "--jobs without a value is rejected" "$parse_out" "--jobs requires a positive integer"
+parse_out="$(bash -c 'source "$1"; rp_parse_args prog --jobs 6 --repo o/a; printf "jobs=%s\n" "$rp_jobs"' bash "$lib" 2>&1)"
+assert_contains "--jobs N is stored" "$parse_out" "jobs=6"
+usage_out="$(bash -c 'source "$1"; rp_usage prog' bash "$lib" 2>&1)"
+assert_contains "usage documents --jobs" "$usage_out" "--jobs N:"
+session_out="$(bash -c '
+  source "$1"; source "$2"
+  rp_check_one_repo() { :; }
+  rp_jobs=3; rp_repo_slugs=(o/a o/b o/c)
+  rp_audit_repos 3
+  [[ -d "$RUNNER_SESSION_DIR" ]] && printf "session_alive\n" || printf "session_gone\n"
+' bash "$runner_bootstrap" "$lib" 2>&1)"
+assert_contains "workers do not tear down the parent's runner session" "$session_out" "session_alive"
+
+printf '\n=== jobs: workers do not share runner command history ===\n'
+mkdir -p "${tmp}/runner.gate"
+# o/a records a command, then waits for o/c to record its own; if both shared one session, o/a's
+# runner_last_id would return o/c's command and o/a would read o/c's stdout.
+runner_out="$(bash -c '
+  set -euo pipefail
+  source "$1"; source "$2"
+  gate_dir="$3"
+  rp_jobs=3; rp_compact=1; rp_repo_slugs=(o/a o/b o/c)
+  rp_check_one_repo() {
+    local slug="$1" spin=0 id got
+    runner_exec probe --probe -- printf "%s" "$slug" >/dev/null
+    if [[ "$slug" == o/a ]]; then
+      while [[ ! -e "${gate_dir}/c" ]]; do
+        spin=$(( spin + 1 ))
+        if (( spin > 3000000 )); then printf "gate timeout\n"; return 9; fi
+      done
+    fi
+    id="$(runner_last_id)"
+    got="$(runner_read "$id" stdout)"
+    printf "saw:%s:%s\n" "$slug" "$got"
+    [[ "$slug" != o/c ]] || : >"${gate_dir}/c"
+    return 0
+  }
+  rp_audit_repos 3
+  [[ -d "$RUNNER_SESSION_DIR" ]] && printf "session_alive\n"
+' bash "$runner_bootstrap" "$lib" "${tmp}/runner.gate" 2>&1)"
+assert_contains "gated worker reads its own last command, not a concurrent worker's" "$runner_out" "saw:o/a:o/a"
+assert_contains "second worker reads its own last command" "$runner_out" "saw:o/b:o/b"
+assert_contains "third worker reads its own last command" "$runner_out" "saw:o/c:o/c"
+assert_not_contains "no gate timeout while sharing a runner session root" "$runner_out" "gate timeout"
+
+test_summary
