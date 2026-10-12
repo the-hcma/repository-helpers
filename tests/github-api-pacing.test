@@ -50,6 +50,16 @@ MOCK
 cat >"${mock_bin}/sleep" <<'MOCK'
 #!/usr/bin/env bash
 if [[ "$1" == "0.01" ]]; then
+  # Lock-spin sleep. MOCK_LOCK_RELEASE_AFTER=N releases the held lock after N spins, standing in
+  # for the holder finishing.
+  if [[ -n "${MOCK_LOCK_RELEASE_AFTER:-}" ]]; then
+    n="$(cat -- "${MOCK_SPIN_COUNT:?}" 2>/dev/null || printf 0)"
+    n=$(( n + 1 ))
+    printf '%s' "$n" >"$MOCK_SPIN_COUNT"
+    if (( n >= MOCK_LOCK_RELEASE_AFTER )); then
+      rm -rf -- "${MOCK_LOCK_DIR:?}"
+    fi
+  fi
   exec /bin/sleep 0.01
 fi
 printf '%s\n' "$1" >>"${MOCK_SLEEP_LOG:?}"
@@ -79,6 +89,19 @@ new_case() {
   zen_headers 4000 "$(( EPOCHSECONDS + 3000 ))" >"$case_zen"
 }
 
+# Like the real --jobs workers, each concurrent caller gets a private runner sub-session: one
+# session shares a single .order file, so concurrent probes would read each other's results.
+read -r -d '' gate_prelude <<'PRELUDE' || true
+spawn_gate_worker() {
+  (
+    RUNNER_SESSION_DIR="${RUNNER_SESSION_DIR}/gate-$1"
+    mkdir -p -- "$RUNNER_SESSION_DIR"
+    export RUNNER_SESSION_DIR
+    github_api_pace_gate "worker-$1"
+  ) &
+}
+PRELUDE
+
 # run_lib <code>: runs <code> with the library loaded and pacing enabled against $case_state.
 run_lib() {
   env PATH="${mock_bin}:${PATH}" \
@@ -86,7 +109,10 @@ run_lib() {
     MOCK_GH_LOG="$case_gh_log" MOCK_GH_ZEN="$case_zen" MOCK_SLEEP_LOG="$case_sleep_log" \
     MOCK_SLEEP_HOOK="${MOCK_SLEEP_HOOK:-}" \
     GITHUB_API_QUOTA_RESERVE="${GITHUB_API_QUOTA_RESERVE:-200}" \
-    bash -c 'source "$1"; source "$2"; eval "$3"' bash "$runner_bootstrap" "$lib" "$1"
+    GITHUB_API_PACE_LOCK="${pace_lock_mode:-}" \
+    GATE_PRELUDE="$gate_prelude" \
+    bash -c 'source "$1"; source "$2"; eval "$GATE_PRELUDE"; eval "$3"' \
+    bash "$runner_bootstrap" "$lib" "$1"
 }
 
 read_state() {
@@ -95,23 +121,24 @@ read_state() {
   printf '%s' "$line"
 }
 
-printf '\n=== pacing: concurrent callers share one quota, slot sequence and call count ===\n'
-new_case concurrent
+printf '\n=== pacing: concurrent callers share one quota, slot sequence and call count (mkdir lock) ===\n'
+new_case concurrent-mkdir
 mkdir -p "$case_state"
 now="$EPOCHSECONDS"
 printf '%s %s %s\n' 1000 "$(( now + 3000 ))" "$now" >"${case_state}/quota"
 start_us="${EPOCHREALTIME/./}"
+pace_lock_mode='mkdir'
 run_lib '
   for i in 1 2 3 4 5 6 7 8; do
-    github_api_pace_gate "worker-$i" &
+    spawn_gate_worker "$i"
   done
   wait
 ' >"${case_dir}/out" 2>&1
 quota_after="$(read_state quota)"
 read -r remaining_after _ <<<"$quota_after"
-assert_contains "eight concurrent gates leave exactly 992 of 1000 calls (no lost update)" \
+assert_contains "eight concurrent gates leave exactly 992 of 1000 calls (no lost update) (mkdir lock)" \
   "remaining=${remaining_after}" "remaining=992"
-assert_contains "the shared call counter admitted all eight callers" \
+assert_contains "the shared call counter admitted all eight callers (mkdir lock)" \
   "calls=$(read_state calls)" "calls=8"
 next_slot="$(read_state next_slot)"
 if (( next_slot >= start_us + 8 * 100000 )); then
@@ -119,29 +146,87 @@ if (( next_slot >= start_us + 8 * 100000 )); then
 else
   fail_case "eight callers reserved eight distinct 100 ms slots (next_slot=${next_slot} start=${start_us})"
 fi
-assert_not_contains "a fresh cached quota is not re-probed" "$(cat "$case_gh_log")" "zen"
+assert_not_contains "a fresh cached quota is not re-probed (mkdir lock)" "$(cat "$case_gh_log")" "zen"
+
+printf '\n=== pacing: concurrent callers share one quota, slot sequence and call count (default lock) ===\n'
+new_case concurrent-default
+mkdir -p "$case_state"
+now="$EPOCHSECONDS"
+printf '%s %s %s\n' 1000 "$(( now + 3000 ))" "$now" >"${case_state}/quota"
+start_us="${EPOCHREALTIME/./}"
+pace_lock_mode=
+run_lib '
+  for i in 1 2 3 4 5 6 7 8; do
+    spawn_gate_worker "$i"
+  done
+  wait
+' >"${case_dir}/out" 2>&1
+quota_after="$(read_state quota)"
+read -r remaining_after _ <<<"$quota_after"
+assert_contains "eight concurrent gates leave exactly 992 of 1000 calls (no lost update) (default lock)" \
+  "remaining=${remaining_after}" "remaining=992"
+assert_contains "the shared call counter admitted all eight callers (default lock)" \
+  "calls=$(read_state calls)" "calls=8"
+next_slot="$(read_state next_slot)"
+if (( next_slot >= start_us + 8 * 100000 )); then
+  pass_case "eight callers reserved eight distinct 100 ms slots"
+else
+  fail_case "eight callers reserved eight distinct 100 ms slots (next_slot=${next_slot} start=${start_us})"
+fi
+assert_not_contains "a fresh cached quota is not re-probed (default lock)" "$(cat "$case_gh_log")" "zen"
 
 printf '\n=== pacing: the gate is silent on stderr when nothing is wrong ===\n'
 new_case quiet
 quiet_err="$(run_lib 'github_api_pace_gate first; github_api_pace_gate second' 2>&1 >/dev/null)"
 assert_contains "first use of a fresh state directory prints nothing to stderr" "stderr=[${quiet_err}]" "stderr=[]"
 
-printf '\n=== pacing: a stale quota is probed once, however many callers race ===\n'
-new_case singleflight
+printf '\n=== pacing: a stale quota is probed once, however many callers race (mkdir lock) ===\n'
+new_case singleflight-mkdir
 mkdir -p "$case_state"
 printf '%s %s %s\n' 10 "$(( EPOCHSECONDS + 3000 ))" "$(( EPOCHSECONDS - 500 ))" >"${case_state}/quota"
 zen_headers 4000 "$(( EPOCHSECONDS + 3000 ))" >"$case_zen"
+pace_lock_mode='mkdir'
 run_lib '
   for i in 1 2 3 4 5 6; do
-    github_api_pace_gate "worker-$i" &
+    spawn_gate_worker "$i"
   done
   wait
 ' >"${case_dir}/out" 2>&1
 probe_count="$(grep -c -- '--include zen' "$case_gh_log" || true)"
-assert_contains "six racing callers trigger exactly one quota probe" "probes=${probe_count}" "probes=1"
+assert_contains "six racing callers trigger exactly one quota probe (mkdir lock)" "probes=${probe_count}" "probes=1"
 read -r remaining_after _ <<<"$(read_state quota)"
-assert_contains "the probed quota (4000) is shared and decremented once per caller" \
+assert_contains "the probed quota (4000) is shared and decremented once per caller (mkdir lock)" \
   "remaining=${remaining_after}" "remaining=3994"
+
+printf '\n=== pacing: a stale quota is probed once, however many callers race (default lock) ===\n'
+new_case singleflight-default
+mkdir -p "$case_state"
+printf '%s %s %s\n' 10 "$(( EPOCHSECONDS + 3000 ))" "$(( EPOCHSECONDS - 500 ))" >"${case_state}/quota"
+zen_headers 4000 "$(( EPOCHSECONDS + 3000 ))" >"$case_zen"
+pace_lock_mode=
+run_lib '
+  for i in 1 2 3 4 5 6; do
+    spawn_gate_worker "$i"
+  done
+  wait
+' >"${case_dir}/out" 2>&1
+probe_count="$(grep -c -- '--include zen' "$case_gh_log" || true)"
+assert_contains "six racing callers trigger exactly one quota probe (default lock)" "probes=${probe_count}" "probes=1"
+read -r remaining_after _ <<<"$(read_state quota)"
+assert_contains "the probed quota (4000) is shared and decremented once per caller (default lock)" \
+  "remaining=${remaining_after}" "remaining=3994"
+
+printf '\n=== pacing: a failed quota probe is treated as unknown, never as stale data ===\n'
+new_case probefail
+mkdir -p "$case_state"
+# Stale cached quota that would trip the reserve if it were trusted; the probe returns nothing.
+printf '%s %s %s\n' 10 "$(( EPOCHSECONDS + 3000 ))" "$(( EPOCHSECONDS - 500 ))" >"${case_state}/quota"
+: >"$case_zen"
+out="$(run_lib 'github_api_pace_gate a; github_api_pace_gate b; github_api_pace_gate c; printf "EC=%s\n" "$?"' 2>&1)"
+assert_contains "callers are not blocked by a stale quota when the probe fails" "$out" "EC=0"
+assert_not_contains "no reserve stop is taken from stale data" "$out" "GITHUB_API_PACE_RESERVE"
+probe_count="$(grep -c -- '--include zen' "$case_gh_log" || true)"
+assert_contains "a failing probe is not retried by every caller within the TTL" "probes=${probe_count}" "probes=1"
 
 printf '\n=== pacing: blocked_until stops every caller until it passes ===\n'
 new_case blocked
@@ -206,6 +291,31 @@ else
   fail_case "GITHUB_API_PACING=0 never creates the state directory"
 fi
 
+printf '\n=== pacing: the mkdir fallback lock respects a live holder and breaks only an old one ===\n'
+new_case lockfresh
+mkdir -p "${case_state}/lock"
+printf '%s\n' "$EPOCHSECONDS" >"${case_state}/lock/since"
+printf '%s %s %s\n' 1000 "$(( EPOCHSECONDS + 3000 ))" "$EPOCHSECONDS" >"${case_state}/quota"
+pace_lock_mode='mkdir'
+out="$(MOCK_LOCK_RELEASE_AFTER=40 MOCK_SPIN_COUNT="${case_dir}/spins" MOCK_LOCK_DIR="${case_state}/lock" \
+  run_lib 'github_api_pace_gate holder-wait; printf "EC=%s\n" "$?"' 2>&1)"
+assert_contains "a caller waits out a fresh lock instead of breaking it" "spins=$(cat "${case_dir}/spins")" "spins=40"
+assert_contains "the caller then proceeds normally" "$out" "EC=0"
+read -r remaining_after _ <<<"$(read_state quota)"
+assert_contains "the caller counted its call once the lock was free" "remaining=${remaining_after}" "remaining=999"
+
+new_case lockstale
+mkdir -p "${case_state}/lock"
+printf '%s\n' "$(( EPOCHSECONDS - 120 ))" >"${case_state}/lock/since"
+printf '%s %s %s\n' 1000 "$(( EPOCHSECONDS + 3000 ))" "$EPOCHSECONDS" >"${case_state}/quota"
+pace_lock_mode='mkdir'
+out="$(run_lib 'github_api_pace_gate crashed-holder; printf "EC=%s\n" "$?"' 2>&1)"
+assert_contains "a lock held for over 30 s (crashed holder) is broken" "$out" "EC=0"
+assert_not_contains "breaking a stale lock needs no lock-timeout fallback" "$out" "lock_timeout"
+read -r remaining_after _ <<<"$(read_state quota)"
+assert_contains "the caller counted its call after breaking the stale lock" "remaining=${remaining_after}" "remaining=999"
+
+pace_lock_mode=
 printf '\n=== pacing: flock is the primary lock when available ===\n'
 new_case flock
 flock_bin="${tmp}/flock-bin"
@@ -229,6 +339,8 @@ fi
 out="$(MOCK_FLOCK_EXIT=1 MOCK_FLOCK_LOG="${case_dir}/flock2.log" PATH="${flock_bin}:${PATH}" run_lib 'github_api_pace_gate y; printf "EC=%s\n" "$?"' 2>&1)"
 assert_contains "a flock timeout fails open with a NOTE" "$out" "GITHUB_API_PACE_DISABLED reason=lock_timeout"
 assert_contains "a flock timeout never blocks the caller" "$out" "EC=0"
+out="$(MOCK_FLOCK_EXIT=1 MOCK_FLOCK_LOG="${case_dir}/flock3.log" PATH="${flock_bin}:${PATH}" run_lib 'github_api_pace_gate z; printf "FD=[%s]\n" "${_github_api_pace_lock_fd:-}"' 2>&1)"
+assert_contains "a flock timeout leaves no stale lock descriptor behind" "$out" "FD=[]"
 
 printf '\n=== static: every attempt passes the gate ===\n'
 # shellcheck disable=SC2016  # awk program is a literal string

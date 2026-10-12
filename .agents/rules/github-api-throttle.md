@@ -19,7 +19,7 @@ A bare, unwrapped `gh api`/`gh pr`/`gh issue` call — one that goes through nei
 
 The wrapper (and the library function underneath it) applies GitHub primary **and** secondary rate-limit backoff automatically. A direct `gh` call 403s hard for the better part of an hour once the *secondary* limiter trips, and `wait-for-agent-review resolve-comment`'s own verification probe fails with it.
 
-Known gap, not yet solved by either shape above: every consumer of one personal `gh` token's shared hourly quota — concurrent `scripts/gh-api` calls, a sustained `wait-for-agent-review` poll, and even a wholly separate process authenticated as the same identity — retries/backs off independently, with no shared, cross-process visibility into how close that one shared budget is to exhaustion. See [repository-helpers#664](https://github.com/the-hcma/repository-helpers/issues/664).
+Remaining gap: pacing is shared only among callers that go through the wrapper (`github_api_pace_gate`, repository-helpers#710). A separate process using the same token without the wrapper (a raw `gh` call, another tool, a CI job on the same identity) is invisible to the shared budget and can still exhaust the one hourly quota. See [repository-helpers#664](https://github.com/the-hcma/repository-helpers/issues/664).
 
 Args, stdin, stdout, and the exit code (`125` for quota-intact fail-fast included) pass straight through. Interactive `gh` (`auth`, prompts, `--web`) is exempt; `scripts/gh-api -- <args>` opts in a subcommand the wrapper rejects. `scripts/gh-api --help` is the SSOT.
 

@@ -739,6 +739,8 @@ github_api_wait_for_rate_limit() {
 #   GITHUB_API_QUOTA_RESERVE      stop admitting calls at this many remaining and wait for the
 #                                 reset instead (default 200)
 #   GITHUB_API_QUOTA_TTL_S        re-probe the quota when the cached value is older (default 30)
+#   GITHUB_API_PACE_LOCK          mkdir forces the portable mkdir lock even when flock exists
+#                                 (default: flock when available)
 
 # github_api_pacing_enabled
 github_api_pacing_enabled() {
@@ -1048,31 +1050,43 @@ _github_api_pace_dir() {
 
 # _github_api_pace_lock <dir>
 # Takes the state lock. Primary path is flock(1) on <dir>/lock.file (released by the kernel when
-# the holder dies, so no stale locks); hosts without flock fall back to an atomic mkdir lock with a
-# dead-owner / empty-owner stale breaker. ~5 s budget either way, then fails.
+# the holder dies, so no stale locks); hosts without flock fall back to an atomic mkdir lock. The
+# fallback only breaks a lock that has been held for more than 30 s (critical sections last
+# milliseconds, so that is a crashed holder). It deliberately does not judge staleness by owner
+# pid liveness: a waiter can read an owner that has since exited normally and then remove the
+# lock of the next holder, which admits two callers at once. ~5 s budget either way, then fails.
 _github_api_pace_lock() {
   local -r lockdir="${1}/lock"
-  local tries=0 owner
+  local tries=0 since nosince=0 now
 
-  if command -v flock >/dev/null 2>&1; then
+  if [[ "${GITHUB_API_PACE_LOCK:-}" != 'mkdir' ]] && command -v flock >/dev/null 2>&1; then
     exec {_github_api_pace_lock_fd}>"${1}/lock.file" || return 1
     if flock --exclusive --timeout 5 "$_github_api_pace_lock_fd"; then
       return 0
     fi
     exec {_github_api_pace_lock_fd}>&-
+    _github_api_pace_lock_fd=''
     return 1
   fi
   while ! mkdir -- "$lockdir" 2>/dev/null; do
-    owner=''
-    { read -r owner <"${lockdir}/owner"; } 2>/dev/null || true
-    if [[ "$owner" =~ ^[0-9]+$ ]]; then
-      if ! kill -0 "$owner" 2>/dev/null; then
+    since=''
+    { read -r since <"${lockdir}/since"; } 2>/dev/null || true
+    now="$EPOCHSECONDS"
+    if [[ "$since" =~ ^[0-9]+$ ]]; then
+      nosince=0
+      if (( now - since > 30 )); then
         rm -rf -- "$lockdir"
         continue
       fi
-    elif (( tries > 300 )); then
-      rm -rf -- "$lockdir"
-      continue
+    else
+      # A holder writes "since" microseconds after mkdir; only a long, unbroken absence means it
+      # crashed in between.
+      nosince=$(( nosince + 1 ))
+      if (( nosince > 100 )); then
+        rm -rf -- "$lockdir"
+        nosince=0
+        continue
+      fi
     fi
     tries=$(( tries + 1 ))
     if (( tries > 500 )); then
@@ -1080,7 +1094,7 @@ _github_api_pace_lock() {
     fi
     run_command "github-api pace lock wait" sleep 0.01
   done
-  printf '%s\n' "$BASHPID" >"${lockdir}/owner"
+  printf '%s\n' "$EPOCHSECONDS" >"${lockdir}/since"
 }
 
 # _github_api_pace_unlock <dir>
@@ -1156,8 +1170,12 @@ _github_api_pace_claim() {
     probed="$(_github_api_pace_probe_quota)"
     if [[ -n "$probed" ]]; then
       read -r remaining reset <<<"$probed"
-      observed="$now"
+    else
+      # Probe failed: the cached figure is stale, so do not enforce the reserve on it. Record the
+      # attempt time so the next callers do not each re-probe a failing endpoint within the TTL.
+      remaining='?' reset='?'
     fi
+    observed="$now"
   fi
 
   if [[ "$remaining" =~ ^[0-9]+$ && "$reset" =~ ^[0-9]+$ && "$observed" =~ ^[0-9]+$ ]]; then
@@ -1173,6 +1191,10 @@ _github_api_pace_claim() {
       remaining=$(( remaining - 1 ))
     fi
     _github_api_pace_write "${dir}/quota" "${remaining} ${reset} ${observed}"
+  fi
+
+  if [[ "$remaining" == '?' ]]; then
+    _github_api_pace_write "${dir}/quota" "? ? ${observed}"
   fi
 
   slot="$(_github_api_pace_read "${dir}/next_slot")"
