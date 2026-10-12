@@ -9663,7 +9663,7 @@ batch_all_reap_stale_ephemeral_roots() {
 
   [[ -d "$base_dir" ]] || return 0
   runner_sh "batch-all reap stale ephemeral clone roots" -- \
-    "find $(printf '%q' "$base_dir") -maxdepth 1 -type d -name 'dep-updater-batch-clones.*' \
+    "find $(printf '%q' "$base_dir") -maxdepth 1 -type d \\( -name 'dep-updater-batch-clones.*' -o -name 'dep-updater-batch-results.*' \\) \
       -mtime +${batch_all_ephemeral_root_retention_days} -exec rm -rf {} + 2>/dev/null || true"
 }
 
@@ -9913,6 +9913,8 @@ batch_all_write_timings() {
   for row in "$@"; do
     IFS=$'\t' read -r name status seconds <<<"$row"
     sum=$(( sum + seconds ))
+    name="${name//\\/\\\\}"
+    name="${name//\"/\\\"}"
     rows_json+="${rows_json:+,}{\"repo\":\"${name}\",\"status\":\"${status}\",\"seconds\":${seconds}}"
   done
   [[ "$dry_run" == '1' ]] && dry_run_json=true
@@ -9999,11 +10001,11 @@ batch_all_process_repo() {
   local child_log child_fifo child_pid child_report child_updates
   local root_cause child_clean report_line detail_count
   local ci_type ci_pr ci_check_name ci_check_conclusion ci_pr_url ci_check_url ci_summary
-  child_log="$(mktemp)"
-  child_report="$(mktemp)"
+  child_log="$(mktemp)" || return 1
+  child_report="$(mktemp)" || return 1
   child_updates="${prefix}.updates"
   child_fifo="$(mktemp -u)"
-  mkfifo "$child_fifo"
+  mkfifo "$child_fifo" || return 1
   _batch_all_active_child_log="$child_log"
   _batch_all_active_child_fifo="$child_fifo"
 
@@ -10231,14 +10233,29 @@ batch_all_descendant_pids() {
 # Stops every parallel worker and the processes it started.
 # shellcheck disable=SC2317,SC2329  # reached only via the INT/TERM trap handler
 batch_all_stop_workers() {
-  local pid descendants=""
+  local pid descendants tries=0 alive
 
-  for pid in "${_batch_all_worker_pids[@]}"; do
-    [[ -n "$pid" ]] || continue
-    descendants+="$(batch_all_descendant_pids "$pid")"$'\n'
+  # TERM first, then a bounded wait, then KILL on a fresh snapshot (a worker may have started
+  # another command meanwhile, and children that ignore TERM must not outlive the buffers).
+  while (( tries < 6 )); do
+    descendants=""
+    alive=0
+    for pid in "${_batch_all_worker_pids[@]}"; do
+      [[ -n "$pid" ]] || continue
+      descendants+="$(batch_all_descendant_pids "$pid")"$'\n'
+      kill -0 "$pid" 2>/dev/null && alive=1
+    done
+    (( alive )) || [[ -n "${descendants//$'\n'/}" ]] || return 0
+    if (( tries < 5 )); then
+      # shellcheck disable=SC2086  # both lists are newline-separated integers
+      kill -TERM $descendants "${_batch_all_worker_pids[@]}" 2>/dev/null || true
+      sleep 0.2
+    else
+      # shellcheck disable=SC2086  # both lists are newline-separated integers
+      kill -KILL $descendants "${_batch_all_worker_pids[@]}" 2>/dev/null || true
+    fi
+    tries=$(( tries + 1 ))
   done
-  # shellcheck disable=SC2086  # both lists are newline-separated integers
-  kill $descendants "${_batch_all_worker_pids[@]}" 2>/dev/null || true
 }
 
 # batch_all_default_jobs
@@ -10386,8 +10403,10 @@ batch_all_run_parallel() {
       replayed=$(( replayed + 1 ))
     done
     (( replayed < total )) || break
-    # Nothing replayable yet: block until any worker exits. 127 means no workers are left.
-    wait -n 2>/dev/null || [[ $? -ne 127 ]] || break
+    # Nothing replayable yet: block until any worker exits. A non-zero status (127 when the last
+    # worker was already reaped) is fine: liveness is judged by batch_all_worker_finished, so the
+    # next pass sees the exit instead of this loop giving up on unreplayed repos.
+    wait -n 2>/dev/null || true
   done
   wait 2>/dev/null || true
   _batch_all_worker_pids=()
