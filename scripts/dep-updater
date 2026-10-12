@@ -9874,6 +9874,60 @@ batch_all_materialize_checkout() {
   return 0
 }
 
+# batch_all_now_ms
+# Prints the current time in milliseconds since the epoch.
+batch_all_now_ms() {
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    printf '%s' "$(( ${EPOCHREALTIME/./} / 1000 ))"
+  else
+    date +%s000
+  fi
+}
+
+# batch_all_record_timing <result_prefix> <repo_name> <status> <started_ms>
+# Records one repo's wall time (status: ok | failed | skipped) for the parent to fold and logs a
+# machine-parseable line, so every outcome (not only success) contributes to the timing baseline.
+batch_all_record_timing() {
+  local -r prefix="$1"
+  local -r name="$2"
+  local -r status="$3"
+  local -r started_ms="$4"
+  local now_ms seconds
+
+  now_ms="$(batch_all_now_ms)"
+  seconds="$(( (now_ms - started_ms) / 1000 ))"
+  printf '%s\t%s\t%s\n' "$name" "$status" "$seconds" >"${prefix}.timing"
+  log "[batch-all] TIMING repo=${name} status=${status} seconds=${seconds}"
+}
+
+# batch_all_write_timings <jobs> <wall_seconds> <timing_row>...
+# Logs the run's total vs summed per-repo time and appends one JSON line to the host-local timings
+# file (DEP_UPDATER_TIMINGS_FILE; empty disables; default under ~/scratch/repository-helpers) so
+# serial and parallel runs can be compared. A failed write never fails the run.
+batch_all_write_timings() {
+  local -r jobs="$1"
+  local -r wall_seconds="$2"
+  shift 2
+  local row name status seconds sum=0 rows_json="" timings_file dry_run_json=false
+
+  for row in "$@"; do
+    IFS=$'\t' read -r name status seconds <<<"$row"
+    sum=$(( sum + seconds ))
+    rows_json+="${rows_json:+,}{\"repo\":\"${name}\",\"status\":\"${status}\",\"seconds\":${seconds}}"
+  done
+  [[ "$dry_run" == '1' ]] && dry_run_json=true
+  log "[batch-all] TIMING total wall_seconds=${wall_seconds} sum_repo_seconds=${sum} jobs=${jobs} repos=$#"
+  timings_file="${DEP_UPDATER_TIMINGS_FILE-${HOME:-}/scratch/repository-helpers/dep-updater-batch-timings.jsonl}"
+  [[ -n "$timings_file" ]] || return 0
+  {
+    mkdir -p -- "$(dirname -- "$timings_file")" \
+      && printf '{"timestamp":"%s","jobs":%s,"dry_run":%s,"repos":%s,"wall_seconds":%s,"sum_repo_seconds":%s,"results":[%s]}\n' \
+        "$(time_log_date_utc '%Y-%m-%dT%H:%M:%SZ')" "$jobs" "$dry_run_json" "$#" "$wall_seconds" "$sum" "$rows_json" \
+        >>"$timings_file"
+  } 2>/dev/null || log "[batch-all] Could not append timings to ${timings_file}"
+  return 0
+}
+
 # batch_all_process_repo <repo_line> <result_prefix> <color_start> <color_reset>
 # Processes one discovered repository: materializes an ephemeral clone when needed, runs the
 # `--batch --dir` child, and logs the outcome. Everything the parent folds into the run lives in
@@ -9892,6 +9946,7 @@ batch_all_process_repo() {
   local -r _this_color="$3"
   local -r _color_reset="$4"
   local repo slug checkout_path repo_ephemeral=0 clone_rc=0 missing_tools scraped child_exit line
+  local timing_status
   local repo_started_ms
   local -a child_args
 
@@ -9924,11 +9979,7 @@ batch_all_process_repo() {
   # Color just the repo-boundary header and outcome lines; child output keeps its own color.
   TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
     log "[batch-all] --- $(basename "$repo") (${repo}) ---"
-  if [[ -n "${EPOCHREALTIME:-}" ]]; then
-    repo_started_ms="$(( ${EPOCHREALTIME/./} / 1000 ))"
-  else
-    repo_started_ms="$(date +%s000)"
-  fi
+  repo_started_ms="$(batch_all_now_ms)"
 
   child_args=()
   [[ "$dry_run" == '1' ]] && child_args+=(--dry-run)
@@ -9991,6 +10042,7 @@ batch_all_process_repo() {
     missing_tools="$(batch_all_missing_tooling_from_log "$child_log")"
     TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
       log "[batch-all] Skipping $(basename "$repo"): missing host tooling (${missing_tools})"
+    batch_all_record_timing "$prefix" "$(basename "$repo")" skipped "$repo_started_ms"
     rm -f "$child_log" "$child_report"
     _batch_all_active_child_log=""
     if (( repo_ephemeral )); then
@@ -10139,16 +10191,14 @@ batch_all_process_repo() {
     fi
     printf '%s\n' "$child_exit" >"${prefix}.exit"
   else
-    local repo_finished_ms repo_elapsed_s
-    if [[ -n "${EPOCHREALTIME:-}" ]]; then
-      repo_finished_ms="$(( ${EPOCHREALTIME/./} / 1000 ))"
-    else
-      repo_finished_ms="$(date +%s000)"
-    fi
-    repo_elapsed_s="$(( (repo_finished_ms - repo_started_ms) / 1000 ))"
+    local repo_elapsed_s
+    repo_elapsed_s="$(( ($(batch_all_now_ms) - repo_started_ms) / 1000 ))"
     TIME_LOG_COLOR_START="$_this_color" TIME_LOG_COLOR_RESET="$_color_reset" \
       log "[batch-all] OK ($(basename "$repo")) (${repo_elapsed_s}s)"
   fi
+  timing_status=ok
+  [[ "$child_exit" -eq 0 ]] || timing_status=failed
+  batch_all_record_timing "$prefix" "$(basename "$repo")" "$timing_status" "$repo_started_ms"
   rm -f "$child_log" "$child_report"
   _batch_all_active_child_log=""
   if (( repo_ephemeral )); then
@@ -10247,10 +10297,16 @@ batch_all_fold_result() {
   if [[ ! -e "${prefix}.done" ]]; then
     log "[batch-all] FAILED (${slug}) worker exited before finishing"
     failure_summaries+=("${slug##*/}: worker exited before finishing")
+    timing_rows+=("${slug##*/}"$'\t'died$'\t'0)
     if (( worst_exit == 0 )); then
       worst_exit=1
     fi
     return 0
+  fi
+  if [[ -s "${prefix}.timing" ]]; then
+    timing_rows+=("$(<"${prefix}.timing")")
+  else
+    timing_rows+=("${slug##*/}"$'\t'failed$'\t'0)
   fi
   if [[ -s "${prefix}.exit" ]]; then
     result_exit="$(<"${prefix}.exit")"
@@ -10349,7 +10405,8 @@ batch_all_dispatch() {
   local -a repos_found work_lines
   local -a failure_summaries=()
   local -a failure_details=()
-  local ephemeral_base results_dir run_rc=0
+  local ephemeral_base results_dir run_rc=0 wall_started_ms
+  local -a timing_rows=()
 
   # Palette of ANSI colors cycled across repos so each project's header is visually distinct.
   # Only active when stderr is a TTY (same condition as init_prompt_style).
@@ -10427,6 +10484,7 @@ batch_all_dispatch() {
   fi
 
   worst_exit=0
+  wall_started_ms="$(batch_all_now_ms)"
 
   if (( batch_all_jobs > 1 && ${#work_lines[@]} > 1 )); then
     log "[batch-all] Processing ${#work_lines[@]} repositories with up to ${batch_all_jobs} parallel jobs (output is replayed per repo in order)"
@@ -10446,6 +10504,9 @@ batch_all_dispatch() {
 
   batch_all_cleanup_ephemeral_root
   trap - INT TERM
+
+  batch_all_write_timings "$batch_all_jobs" "$(( ($(batch_all_now_ms) - wall_started_ms) / 1000 ))" \
+    "${timing_rows[@]}"
 
   if [[ "$worst_exit" -ne 0 ]]; then
     log "[batch-all] Finished with failures (exit ${worst_exit})."

@@ -25,9 +25,12 @@ extract_functions() {
   done
 }
 extract_functions \
-  batch_all_default_jobs batch_all_descendant_pids batch_all_fold_result batch_all_repo_color \
+  batch_all_default_jobs batch_all_descendant_pids batch_all_fold_result batch_all_now_ms \
+  batch_all_record_timing batch_all_repo_color batch_all_write_timings \
   batch_all_run_parallel batch_all_run_serial batch_all_stop_workers batch_all_worker_finished \
   batch_all_worker_main >"${tmp}/functions"
+# shellcheck disable=SC2016  # written literally; the functions file is sourced by the driver shells
+printf 'source "%s"\n' "${script_dir}/../scripts/lib/time-log" >>"${tmp}/functions"
 
 # Drives batch_all_run_serial/parallel with a stubbed batch_all_process_repo. Stub behaviour per repo:
 #   o/a  passes, but (when GATE=1) blocks until o/c has finished, so it completes after repos that
@@ -60,7 +63,7 @@ batch_all_process_repo() {
   here=yes; [[ "$BASHPID" != "$PARENT_PID" ]] || here=no
   printf 'log:%s in_subshell=%s\n' "$slug" "$here" >&2
   case "$slug" in
-    o/b) : >"${prefix}.retained" ;;
+    o/b) : >"${prefix}.retained"; printf 'b\tok\t5\n' >"${prefix}.timing" ;;
     o/c)
       printf '%s\n' 2 >"${prefix}.exit"
       printf '%s\n' "c: exit 2 — boom" >"${prefix}.summary"
@@ -78,6 +81,7 @@ PARENT_PID="$BASHPID"
 worst_exit=0
 failure_summaries=()
 failure_details=()
+timing_rows=()
 mkdir -p "$results"
 lines=($'o/a\t/x/a' $'o/b\t/x/b' $'o/c\t/x/c' $'o/d\t/x/d')
 rc=0
@@ -89,6 +93,7 @@ fi
 printf 'RESULT rc=%s worst=%s retained=%s\n' "$rc" "$worst_exit" "$_batch_all_retained_clones"
 printf 'SUMMARY %s\n' "${failure_summaries[@]}"
 printf 'DETAIL %s\n' "${failure_details[@]}"
+printf 'TIMING_ROW %s\n' "${timing_rows[@]}"
 DRIVER
 
 # run_case <name> <mode> <jobs> [VAR=value ...]  -> $tmp/<name>.{out,err}
@@ -140,6 +145,39 @@ run_case died parallel 4 GATE=1 DIE_D=1
 assert_contains "dead worker is logged" "$(cat "${tmp}/died.out")" "[batch-all] FAILED (o/d) worker exited before finishing"
 assert_contains "dead worker is in the failure summary" "$(cat "${tmp}/died.out")" "SUMMARY c: exit 2 — boom"
 assert_contains "dead worker summary names the repo" "$(cat "${tmp}/died.out")" "d: worker exited before finishing"
+
+printf '\n=== timings: baseline rows and the timings file ===\n'
+assert_contains "a recorded repo timing is folded into the run rows" "$(cat "${tmp}/par.out")" "TIMING_ROW b"$'\t'"ok"$'\t'"5"
+assert_contains "a repo without a timing is still listed as failed" "$(cat "${tmp}/par.out")" "TIMING_ROW c"$'\t'"failed"$'\t'"0"
+assert_contains "a dead worker is listed as died" "$(cat "${tmp}/died.out")" "TIMING_ROW d"$'\t'"died"$'\t'"0"
+same_file "timing rows are identical for 4 jobs and 1" \
+  <(grep '^TIMING_ROW' "${tmp}/serial.out") <(grep '^TIMING_ROW' "${tmp}/par.out")
+timings_file="${tmp}/timings/nested/timings.jsonl"
+timing_out="$(bash -c '
+  source "$1"
+  dry_run=1
+  log() { printf "%s\n" "$*"; }
+  batch_all_write_timings 3 42 $'"'"'a\tok\t30'"'"' $'"'"'b\tfailed\t20'"'"'
+' bash "${tmp}/functions" 2>&1)"
+assert_contains "the run logs wall time against the summed repo time" "$timing_out" \
+  "[batch-all] TIMING total wall_seconds=42 sum_repo_seconds=50 jobs=3 repos=2"
+env DEP_UPDATER_TIMINGS_FILE="$timings_file" bash -c '
+  source "$1"; dry_run=1; log() { :; }
+  batch_all_write_timings 3 42 $'"'"'a\tok\t30'"'"' $'"'"'b\tfailed\t20'"'"'
+  batch_all_write_timings 1 90 $'"'"'a\tok\t30'"'"'
+' bash "${tmp}/functions"
+assert_contains "one JSON line per run is appended with jobs and wall time" \
+  "$(jq -c '[.jobs, .wall_seconds, .sum_repo_seconds, .repos, .dry_run]' "$timings_file" | tr '\n' ' ')" \
+  "[3,42,50,2,true] [1,90,30,1,true] "
+assert_contains "per-repo results are recorded in the JSON line" \
+  "$(jq -c '.results[1]' "$timings_file" | head -n 1)" '{"repo":"b","status":"failed","seconds":20}'
+rm -rf "${tmp}/timings"
+env DEP_UPDATER_TIMINGS_FILE='' HOME="${tmp}/nohome" bash -c 'source "$1"; dry_run=0; log() { :; }; batch_all_write_timings 1 1 $'"'"'a\tok\t1'"'"'' bash "${tmp}/functions"
+if [[ ! -e "${tmp}/nohome" ]]; then
+  pass_case "an empty DEP_UPDATER_TIMINGS_FILE disables the timings file"
+else
+  fail_case "an empty DEP_UPDATER_TIMINGS_FILE disables the timings file"
+fi
 
 printf '\n=== jobs: INT/TERM stops workers and their in-flight commands ===\n'
 extract_functions batch_all_cleanup_on_interrupt >>"${tmp}/functions"
@@ -263,10 +301,15 @@ MOCK_GH
 chmod +x "${home}/.local/bin/gh"
 for jobs in 1 2; do
   rc=0
-  out="$(cd "$e2e" && HOME="$home" PATH="${home}/.local/bin:${PATH}" \
+  rm -f "${e2e}/timings.jsonl"
+  out="$(cd "$e2e" && HOME="$home" PATH="${home}/.local/bin:${PATH}" DEP_UPDATER_TIMINGS_FILE="${e2e}/timings.jsonl" \
     "$script" --batch --all --dry-run --jobs "$jobs" --scan-root "${e2e}/roots" 2>&1)" || rc=$?
   assert_contains "--jobs ${jobs} run exits 0" "exit=${rc}" "exit=0"
   assert_contains "--jobs ${jobs} run reports success" "$out" "[batch-all] All repos completed successfully."
+  assert_contains "--jobs ${jobs} run logs a timing line per repo" "$out" "[batch-all] TIMING repo=alpha status=ok seconds="
+  assert_contains "--jobs ${jobs} run logs the total timing line" "$out" "jobs=${jobs} repos=2"
+  assert_contains "--jobs ${jobs} run appends one JSON baseline line" \
+    "$(jq -c "[.jobs, .repos, (.results | length)]" "${e2e}/timings.jsonl")" "[${jobs},2,2]"
   first="$(grep -n '\[batch-all\] --- alpha' <<<"$out" | head -n 1 | cut -d: -f1)"
   second="$(grep -n '\[batch-all\] --- beta' <<<"$out" | head -n 1 | cut -d: -f1)"
   if [[ -n "$first" && -n "$second" ]] && (( first < second )); then
