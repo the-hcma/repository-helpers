@@ -76,8 +76,10 @@ scripts/github-repo-lint --new-repo --repo OWNER/NAME
 # Every repo in the org
 scripts/github-repo-lint --all --org the-hcma --suggest
 
-# Same audit, 4 repos at a time (identical report and exit status; see "Parallel audits" below)
-scripts/github-repo-lint --all --org the-hcma --compact --jobs 4
+# Repos are audited concurrently by default (min(cores, 4); identical report and exit status; see "Parallel audits" below)
+scripts/github-repo-lint --all --org the-hcma --compact
+# Force a serial audit
+scripts/github-repo-lint --all --org the-hcma --compact --jobs 1
 
 # Repair supported settings (+ candidate workflow stack when run from the clone)
 scripts/github-repo-lint --repo OWNER/NAME --apply-fix
@@ -90,7 +92,7 @@ Requires an authenticated `gh` CLI and `jq`. Merge-queue-only subset: `scripts/c
 
 #### Parallel audits (`--jobs N`)
 
-`--jobs N` audits up to N repositories at once (default 1, serial). Each repository's output is buffered and replayed in the original repo order and the `--compact` report is built from the same per-repository results, so the report, the failure summary and the exit status match a serial run (verified byte-identical on the real org). Differences to know about: output is not streamed (nothing prints until all workers finish), each repo's stdout is printed before its stderr, TTY-only colour hints are not applied to replayed output, and per-process caches (for example SHA lookups) are repeated per worker so API volume is somewhat higher. `--apply-fix` always runs serially, and an unwritable `TMPDIR` falls back to a serial audit. Ctrl-C or TERM stops the workers and removes the buffers. Every `gh` call the workers make passes the shared pacing gate (see "Shared GitHub API pacing" below), so the workers share one quota budget, one minimum call spacing and one rate-limit backoff instead of each pacing alone.
+`--jobs N` audits up to N repositories at once. The default is parallel: the host core count capped at 4, because beyond that the workers only queue behind the shared pacing gate (the 100 ms call spacing, not the worker count, bounds throughput). Set `GITHUB_REPO_LINT_JOBS=N` to change the default for a host (for example in the systemd unit or workflow env), or pass `--jobs 1` for a serial audit. Each repository's output is buffered and replayed in the original repo order and the `--compact` report is built from the same per-repository results, so the report, the failure summary and the exit status match a serial run (verified byte-identical on the real org). Differences to know about: output is not streamed (nothing prints until all workers finish), each repo's stdout is printed before its stderr, TTY-only colour hints are not applied to replayed output, and per-process caches (for example SHA lookups) are repeated per worker so API volume is somewhat higher. `--apply-fix` always runs serially, and an unwritable `TMPDIR` falls back to a serial audit. Ctrl-C or TERM stops the workers and removes the buffers. Every `gh` call the workers make passes the shared pacing gate (see "Shared GitHub API pacing" below), so the workers share one quota budget, one minimum call spacing and one rate-limit backoff instead of each pacing alone.
 
 #### Shared GitHub API pacing
 

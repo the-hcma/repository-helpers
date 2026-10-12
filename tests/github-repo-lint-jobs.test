@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Tests for github-repo-lint --jobs: parallel per-repo audits must report exactly like a serial run.
+# shellcheck disable=SC2016  # bash -c programs are single-quoted so the child shell expands them
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -141,6 +142,41 @@ session_out="$(bash -c '
   [[ -d "$RUNNER_SESSION_DIR" ]] && printf "session_alive\n" || printf "session_gone\n"
 ' bash "$runner_bootstrap" "$lib" 2>&1)"
 assert_contains "workers do not tear down the parent's runner session" "$session_out" "session_alive"
+
+printf '\n=== jobs: the default worker count comes from the host ===\n'
+mkdir -p "${tmp}/cores"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "${MOCK_NPROC:-}"\n' >"${tmp}/cores/nproc"
+chmod +x "${tmp}/cores/nproc"
+default_jobs() {
+  env PATH="${tmp}/cores:${PATH}" MOCK_NPROC="$1" GITHUB_REPO_LINT_JOBS="${2:-}" \
+    bash -c 'source "$1"; printf "[%s]" "$(rp_default_jobs)"' bash "$lib"
+}
+assert_contains "a single-core host audits serially" "$(default_jobs 1)" "[1]"
+assert_contains "two cores give two workers" "$(default_jobs 2)" "[2]"
+assert_contains "many cores are capped where the pacing gate becomes the bottleneck" "$(default_jobs 64)" "[4]"
+assert_not_contains "an unreadable core count still yields a positive worker count" "$(default_jobs garbage)" "[]"
+assert_contains "GITHUB_REPO_LINT_JOBS overrides the core count" "$(default_jobs 2 7)" "[7]"
+assert_contains "an invalid GITHUB_REPO_LINT_JOBS is ignored" "$(default_jobs 2 0)" "[2]"
+parse_out="$(bash -c 'source "$1"; rp_parse_args prog --repo o/a; printf "jobs=[%s]\n" "$rp_jobs"' bash "$lib" 2>&1)"
+assert_contains "without --jobs the setting stays unresolved until the audit" "$parse_out" "jobs=[]"
+auto_out="$(env PATH="${tmp}/cores:${PATH}" MOCK_NPROC=3 bash -c '
+  source "$1"; source "$2"
+  rp_check_one_repo() { :; }
+  rp_repo_slugs=(o/a o/b o/c)
+  rp_audit_repos_parallel() { printf "parallel jobs=%s\n" "$rp_jobs"; }
+  rp_audit_repos 3
+' bash "$runner_bootstrap" "$lib" 2>&1)"
+assert_contains "several repos without --jobs run in parallel on a multi-core host" "$auto_out" "parallel jobs=3"
+serial_out="$(env PATH="${tmp}/cores:${PATH}" MOCK_NPROC=3 bash -c '
+  source "$1"; source "$2"
+  rp_check_one_repo() { :; }
+  rp_repo_slugs=(o/a o/b o/c)
+  rp_jobs=1
+  rp_audit_repos_parallel() { printf "parallel\n"; }
+  rp_audit_repos 3
+  printf "serial-ran\n"
+' bash "$runner_bootstrap" "$lib" 2>&1)"
+assert_not_contains "--jobs 1 forces a serial audit" "$serial_out" "parallel"
 
 printf '\n=== jobs: workers do not share runner command history ===\n'
 mkdir -p "${tmp}/runner.gate"

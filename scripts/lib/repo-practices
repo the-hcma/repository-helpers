@@ -207,7 +207,10 @@ rp_merge_only=0
 rp_strict_onboarding=0
 rp_compact=0
 rp_track_failures=0
-rp_jobs=1
+# Empty means "auto": resolved from the host at audit time (rp_default_jobs). --jobs N overrides.
+rp_jobs=''
+# Past this the shared pacing gate (not the workers) is the bottleneck, so more cores add nothing.
+readonly rp_jobs_auto_cap=4
 rp_audit_total_fail=0
 rp_audit_workdir=""
 rp_single_repo=0
@@ -282,7 +285,7 @@ With no --repo: audit the current git repository when run inside a clone (origin
 otherwise discover org repos with release-please.yml, GitHub MQ, or merge-it leftovers.
 --suggest: print SUGGEST lines with remediation hints (non-zero exit still on FAIL).
 --compact: print one passed-repos line plus grouped failures and fixes (implies --suggest).
---jobs N: audit up to N repositories concurrently (default 1 = serial). The report (including --compact), the failure summary and the
+--jobs N: audit up to N repositories concurrently. Default: the host core count capped at 4 (GITHUB_REPO_LINT_JOBS overrides; --jobs 1 forces a serial run). The report (including --compact), the failure summary and the
 exit status match a serial run: each repository's output is buffered and replayed in the original repo
 order. Output is not streamed, per-repo stdout precedes stderr, and per-process caches repeat per worker.
 Serial with --apply-fix, and when TMPDIR is not writable.
@@ -10730,6 +10733,32 @@ rp_audit_repos_parallel() {
 }
 
 # rp_audit_repos <repo-count>
+# rp_default_jobs
+# Worker count when --jobs is not given: GITHUB_REPO_LINT_JOBS (positive integer) wins, else the
+# host core count capped at rp_jobs_auto_cap, never below 1.
+rp_default_jobs() {
+  local cores='' jobs
+
+  jobs="${GITHUB_REPO_LINT_JOBS:-}"
+  if [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$jobs"
+    return 0
+  fi
+  if command -v nproc >/dev/null 2>&1; then
+    cores="$(nproc 2>/dev/null || true)"
+  fi
+  if [[ ! "$cores" =~ ^[1-9][0-9]*$ ]]; then
+    cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  fi
+  if [[ ! "$cores" =~ ^[1-9][0-9]*$ ]]; then
+    cores=1
+  fi
+  if (( cores > rp_jobs_auto_cap )); then
+    cores="$rp_jobs_auto_cap"
+  fi
+  printf '%s' "$cores"
+}
+
 # Sets rp_audit_total_fail. Parallel only for >1 repos with --jobs > 1; --apply-fix stays serial
 # because it queues candidate-fix state in shared arrays and creates worktrees per repo.
 rp_audit_repos() {
@@ -10743,6 +10772,9 @@ rp_audit_repos() {
     fi
   done
 
+  if [[ -z "$rp_jobs" ]]; then
+    rp_jobs="$(rp_default_jobs)"
+  fi
   if [[ "$rp_jobs" -gt 1 && "$repo_count" -gt 1 && "$rp_apply_fix" -eq 0 ]]; then
     rp_audit_repos_parallel "$repo_count"
   else
