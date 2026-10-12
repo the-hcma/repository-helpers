@@ -31,6 +31,13 @@ cat >"${mock_bin}/gh" <<'MOCK'
 printf '%s\n' "$*" >>"${MOCK_GH_LOG:?}"
 case "$*" in
   *'--include zen'*)
+    if [[ -n "${MOCK_STATE_DIR:-}" ]]; then
+      if [[ -d "${MOCK_STATE_DIR}/lock" ]]; then
+        printf 'held\n' >>"${MOCK_STATE_DIR}/../probe-lock-state"
+      else
+        printf 'free\n' >>"${MOCK_STATE_DIR}/../probe-lock-state"
+      fi
+    fi
     cat -- "${MOCK_GH_ZEN:?}"
     ;;
   *'--include rate_limit'*)
@@ -49,6 +56,9 @@ MOCK
 # interleave; a hook script stands in for "time passed" during pacing waits.
 cat >"${mock_bin}/sleep" <<'MOCK'
 #!/usr/bin/env bash
+if [[ "$1" == "0.05" ]]; then
+  exec /bin/sleep 0.05
+fi
 if [[ "$1" == "0.01" ]]; then
   # Lock-spin sleep. MOCK_LOCK_RELEASE_AFTER=N releases the held lock after N spins, standing in
   # for the holder finishing.
@@ -107,7 +117,7 @@ run_lib() {
   env PATH="${mock_bin}:${PATH}" \
     GITHUB_API_PACING=1 GITHUB_API_STATE_DIR="$case_state" \
     MOCK_GH_LOG="$case_gh_log" MOCK_GH_ZEN="$case_zen" MOCK_SLEEP_LOG="$case_sleep_log" \
-    MOCK_SLEEP_HOOK="${MOCK_SLEEP_HOOK:-}" \
+    MOCK_SLEEP_HOOK="${MOCK_SLEEP_HOOK:-}" MOCK_STATE_DIR="$case_state" \
     GITHUB_API_QUOTA_RESERVE="${GITHUB_API_QUOTA_RESERVE:-200}" \
     GITHUB_API_PACE_LOCK="${pace_lock_mode:-}" \
     GATE_PRELUDE="$gate_prelude" \
@@ -316,6 +326,77 @@ read -r remaining_after _ <<<"$(read_state quota)"
 assert_contains "the caller counted its call after breaking the stale lock" "remaining=${remaining_after}" "remaining=999"
 
 pace_lock_mode=
+printf '\n=== pacing: the quota probe never runs while the state lock is held ===\n'
+new_case probeunlocked
+mkdir -p "$case_state"
+printf '%s %s %s\n' 10 "$(( EPOCHSECONDS + 3000 ))" "$(( EPOCHSECONDS - 500 ))" >"${case_state}/quota"
+pace_lock_mode='mkdir'
+run_lib 'github_api_pace_gate prober' >"${case_dir}/out" 2>&1
+assert_contains "the zen probe runs with the mkdir lock released" "$(cat "${case_dir}/probe-lock-state")" "free"
+assert_not_contains "the zen probe never sees the mkdir lock held" "$(cat "${case_dir}/probe-lock-state")" "held"
+pace_lock_mode=
+assert_contains "the probe has an explicit short timeout" "$(grep -c -- '--probe --timeout 5 -- gh api --include zen' "$lib" || true)" "1"
+
+printf '\n=== pacing: a block published since the caller looked is honored under the lock ===\n'
+new_case lateblock
+mkdir -p "$case_state"
+printf '%s %s %s\n' 1000 "$(( EPOCHSECONDS + 3000 ))" "$EPOCHSECONDS" >"${case_state}/quota"
+printf '%s\n' "$(( EPOCHSECONDS + 60 ))" >"${case_state}/blocked_until"
+out="$(run_lib '_github_api_pace_dir; ec=0; _github_api_pace_claim "$_github_api_pace_dir_value" late || ec=$?; printf "CLAIM=%s\n" "$ec"' 2>&1)"
+assert_contains "a stale-zero reader is turned back when a block exists" "$out" "CLAIM=10"
+read -r remaining_after _ <<<"$(read_state quota)"
+assert_contains "the turned-back caller did not spend a call" "remaining=${remaining_after}" "remaining=1000"
+late_block="$(( EPOCHSECONDS + 9000 ))"
+printf '%s\n' "$late_block" >"${case_state}/blocked_until"
+printf '%s %s %s\n' 100 "$(( EPOCHSECONDS + 300 ))" "$EPOCHSECONDS" >"${case_state}/quota"
+out="$(run_lib '_github_api_pace_dir; ec=0; _github_api_pace_claim "$_github_api_pace_dir_value" reserve || ec=$?; printf "CLAIM=%s\n" "$ec"' 2>&1)"
+assert_contains "the reserve path does not lower a later published block" "block=$(read_state blocked_until)" "block=${late_block}"
+
+printf '\n=== pacing: an extra core probe is only made when the 403 is inconclusive ===\n'
+new_case probeskip
+mkdir -p "$case_state"
+depleted_hdrs="HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: $(( EPOCHSECONDS + 3 ))\r\nX-Ratelimit-Resource: core\r\n\r\n"
+run_lib 'github_api_rate_limit_max_wait_s=4; hdrs="$(printf "'"${depleted_hdrs}"'")"; github_api_wait_for_rate_limit "API rate limit exceeded for user ID 9" "$hdrs" 1 || true' >"${case_dir}/out" 2>&1
+assert_not_contains "headers already showing depletion cost no extra probe" "$(cat "$case_gh_log")" "zen"
+: >"$case_gh_log"
+retry_hdrs="HTTP/2.0 403 Forbidden\r\nRetry-After: 2\r\n\r\n"
+run_lib 'github_api_rate_limit_max_wait_s=4; hdrs="$(printf "'"${retry_hdrs}"'")"; github_api_wait_for_rate_limit "You have exceeded a secondary rate limit" "$hdrs" 1 || true' >"${case_dir}/out" 2>&1
+assert_not_contains "an explicit Retry-After costs no extra probe" "$(cat "$case_gh_log")" "zen"
+
+printf '\n=== pacing: stale-lock breaking is verified, not check-then-act ===\n'
+new_case breakstale
+run_lib '
+  mkdir -p "${GITHUB_API_STATE_DIR}/lock"; printf "100\n" >"${GITHUB_API_STATE_DIR}/lock/since"
+  _github_api_pace_break_stale "${GITHUB_API_STATE_DIR}/lock" 50
+  [[ -d "${GITHUB_API_STATE_DIR}/lock" ]] && printf "DIFFERENT_HOLDER_KEPT\n"
+  _github_api_pace_break_stale "${GITHUB_API_STATE_DIR}/lock" 100
+  [[ ! -d "${GITHUB_API_STATE_DIR}/lock" ]] && printf "SAME_STALE_REMOVED\n"
+  ls "${GITHUB_API_STATE_DIR}" | grep -c "lock.stale" || true
+' >"${case_dir}/out" 2>&1
+assert_contains "a lock that is not the one judged stale is put back" "$(cat "${case_dir}/out")" "DIFFERENT_HOLDER_KEPT"
+assert_contains "the lock that was judged stale is removed" "$(cat "${case_dir}/out")" "SAME_STALE_REMOVED"
+assert_contains "no renamed stale directory is left behind" "$(tail -1 "${case_dir}/out")" "0"
+
+printf '\n=== pacing: the state directory lookup is cached in the calling shell ===\n'
+new_case dircache
+out="$(run_lib 'github_api_pace_gate a; printf "DIR=%s\n" "${_github_api_pace_dir_value:-unset}"' 2>&1)"
+assert_contains "the resolved state directory persists after the gate returns" "$out" "DIR=${case_state}"
+
+printf '\n=== pacing: microsecond slots do not depend on the locale decimal separator ===\n'
+assert_not_contains "no EPOCHREALTIME decimal-point substitution that a comma locale breaks" \
+  "$(grep -c 'EPOCHREALTIME/\./' "$lib" || true)" "1"
+comma_locale="$(locale -a 2>/dev/null | grep -iE '^(de_DE|pt_BR|fr_FR)\.(utf-?8)$' | head -1 || true)"
+if [[ -n "$comma_locale" ]]; then
+  new_case locale
+  out="$(LC_ALL="$comma_locale" run_lib 'github_api_pace_gate a; github_api_pace_gate b; printf "NEXT=%s\n" "$(cat "${GITHUB_API_STATE_DIR}/next_slot")"' 2>&1)"
+  next_slot="$(sed -n 's/^NEXT=//p' <<<"$out")"
+  if [[ "$next_slot" =~ ^[0-9]{16}$ ]]; then
+    pass_case "next_slot is a full microsecond epoch under ${comma_locale}"
+  else
+    fail_case "next_slot is a full microsecond epoch under ${comma_locale} (got ${next_slot})"
+  fi
+fi
+
 printf '\n=== pacing: flock is the primary lock when available ===\n'
 new_case flock
 flock_bin="${tmp}/flock-bin"
