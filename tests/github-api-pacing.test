@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# Tests for the shared GitHub API pacing gate (repository-helpers#710): every caller on the host
+# coordinates through one state directory (blocked_until, quota, next_slot, calls) so concurrent
+# workers share a single budget and a single backoff. gh and sleep are mocked, so nothing here
+# talks to GitHub or waits.
+# shellcheck disable=SC2016  # the bash -c programs are literal strings expanded by the child shell
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+lib="${script_dir}/../scripts/lib/github-api-rate-limit"
+runner_bootstrap="${script_dir}/../scripts/lib/runner-bootstrap"
+readonly lib runner_bootstrap
+
+tmp="$(mktemp -d)"
+readonly tmp
+trap 'rm -rf "$tmp"' EXIT
+
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin"
+
+# gh: serves core headers for `--include zen` from $MOCK_GH_ZEN, a deliberately wrong "always full"
+# core figure for `--include rate_limit`, and logs every call.
+cat >"${mock_bin}/gh" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${MOCK_GH_LOG:?}"
+case "$*" in
+  *'--include zen'*)
+    cat -- "${MOCK_GH_ZEN:?}"
+    ;;
+  *'--include rate_limit'*)
+    printf 'HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: 5000\r\nX-Ratelimit-Reset: %s\r\nX-Ratelimit-Resource: core\r\n\r\n{}\n' \
+      "$(( $(date +%s) + 3600 ))"
+    ;;
+  *'rate_limit'*'--jq'*)
+    printf 'true\n'
+    ;;
+  *)
+    printf 'ok\n'
+    ;;
+esac
+MOCK
+# sleep: records the request. Lock-spin sleeps (0.01) are real so concurrent callers still
+# interleave; a hook script stands in for "time passed" during pacing waits.
+cat >"${mock_bin}/sleep" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "0.01" ]]; then
+  exec /bin/sleep 0.01
+fi
+printf '%s\n' "$1" >>"${MOCK_SLEEP_LOG:?}"
+if [[ -n "${MOCK_SLEEP_HOOK:-}" && -x "${MOCK_SLEEP_HOOK}" ]]; then
+  "${MOCK_SLEEP_HOOK}"
+fi
+exit 0
+MOCK
+chmod +x "${mock_bin}/gh" "${mock_bin}/sleep"
+
+zen_headers() {
+  local -r remaining="$1" reset="$2"
+  printf 'HTTP/2.0 200 OK\r\nX-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: %s\r\nX-Ratelimit-Reset: %s\r\nX-Ratelimit-Resource: core\r\nX-Ratelimit-Used: %s\r\n\r\nKeep it logically awesome.\n' \
+    "$remaining" "$reset" "$(( 5000 - remaining ))"
+}
+
+# new_case <name>: fresh state dir, logs and a zen fixture; sets case_* globals.
+new_case() {
+  case_dir="${tmp}/$1"
+  case_state="${case_dir}/state"
+  mkdir -p "$case_dir"
+  case_gh_log="${case_dir}/gh.log"
+  case_sleep_log="${case_dir}/sleep.log"
+  case_zen="${case_dir}/zen"
+  : >"$case_gh_log"
+  : >"$case_sleep_log"
+  zen_headers 4000 "$(( EPOCHSECONDS + 3000 ))" >"$case_zen"
+}
+
+# run_lib <code>: runs <code> with the library loaded and pacing enabled against $case_state.
+run_lib() {
+  env PATH="${mock_bin}:${PATH}" \
+    GITHUB_API_PACING=1 GITHUB_API_STATE_DIR="$case_state" \
+    MOCK_GH_LOG="$case_gh_log" MOCK_GH_ZEN="$case_zen" MOCK_SLEEP_LOG="$case_sleep_log" \
+    MOCK_SLEEP_HOOK="${MOCK_SLEEP_HOOK:-}" \
+    GITHUB_API_QUOTA_RESERVE="${GITHUB_API_QUOTA_RESERVE:-200}" \
+    bash -c 'source "$1"; source "$2"; eval "$3"' bash "$runner_bootstrap" "$lib" "$1"
+}
+
+read_state() {
+  local line=''
+  read -r line <"${case_state}/$1" 2>/dev/null || true
+  printf '%s' "$line"
+}
+
+printf '\n=== pacing: concurrent callers share one quota, slot sequence and call count ===\n'
+new_case concurrent
+mkdir -p "$case_state"
+now="$EPOCHSECONDS"
+printf '%s %s %s\n' 1000 "$(( now + 3000 ))" "$now" >"${case_state}/quota"
+start_us="${EPOCHREALTIME/./}"
+run_lib '
+  for i in 1 2 3 4 5 6 7 8; do
+    github_api_pace_gate "worker-$i" &
+  done
+  wait
+' >"${case_dir}/out" 2>&1
+quota_after="$(read_state quota)"
+read -r remaining_after _ <<<"$quota_after"
+assert_contains "eight concurrent gates leave exactly 992 of 1000 calls (no lost update)" \
+  "remaining=${remaining_after}" "remaining=992"
+assert_contains "the shared call counter admitted all eight callers" \
+  "calls=$(read_state calls)" "calls=8"
+next_slot="$(read_state next_slot)"
+if (( next_slot >= start_us + 8 * 100000 )); then
+  pass_case "eight callers reserved eight distinct 100 ms slots"
+else
+  fail_case "eight callers reserved eight distinct 100 ms slots (next_slot=${next_slot} start=${start_us})"
+fi
+assert_not_contains "a fresh cached quota is not re-probed" "$(cat "$case_gh_log")" "zen"
+
+printf '\n=== pacing: the gate is silent on stderr when nothing is wrong ===\n'
+new_case quiet
+quiet_err="$(run_lib 'github_api_pace_gate first; github_api_pace_gate second' 2>&1 >/dev/null)"
+assert_contains "first use of a fresh state directory prints nothing to stderr" "stderr=[${quiet_err}]" "stderr=[]"
+
+printf '\n=== pacing: a stale quota is probed once, however many callers race ===\n'
+new_case singleflight
+mkdir -p "$case_state"
+printf '%s %s %s\n' 10 "$(( EPOCHSECONDS + 3000 ))" "$(( EPOCHSECONDS - 500 ))" >"${case_state}/quota"
+zen_headers 4000 "$(( EPOCHSECONDS + 3000 ))" >"$case_zen"
+run_lib '
+  for i in 1 2 3 4 5 6; do
+    github_api_pace_gate "worker-$i" &
+  done
+  wait
+' >"${case_dir}/out" 2>&1
+probe_count="$(grep -c -- '--include zen' "$case_gh_log" || true)"
+assert_contains "six racing callers trigger exactly one quota probe" "probes=${probe_count}" "probes=1"
+read -r remaining_after _ <<<"$(read_state quota)"
+assert_contains "the probed quota (4000) is shared and decremented once per caller" \
+  "remaining=${remaining_after}" "remaining=3994"
+
+printf '\n=== pacing: blocked_until stops every caller until it passes ===\n'
+new_case blocked
+mkdir -p "$case_state"
+printf '%s\n' "$(( EPOCHSECONDS + 40 ))" >"${case_state}/blocked_until"
+hook="${case_dir}/hook"
+printf '#!/usr/bin/env bash\nprintf "0\\n" >"%s/blocked_until"\n' "$case_state" >"$hook"
+chmod +x "$hook"
+out="$(MOCK_SLEEP_HOOK="$hook" run_lib 'github_api_pace_gate "late-worker"; printf "EC=%s\n" "$?"' 2>&1)"
+assert_contains "caller waits for the shared block" "$out" "GITHUB_API_PACE_WAIT label=late-worker"
+assert_contains "caller sleeps at most one poll chunk at a time" "$(cat "$case_sleep_log")" "30"
+assert_contains "caller proceeds once the block is lifted" "$out" "EC=0"
+
+printf '\n=== pacing: stopping at the reserve waits for the reset instead of failing ===\n'
+new_case reserve
+mkdir -p "$case_state"
+reset_epoch="$(( EPOCHSECONDS + 300 ))"
+printf '%s %s %s\n' 150 "$reset_epoch" "$EPOCHSECONDS" >"${case_state}/quota"
+hook="${case_dir}/hook"
+cat >"$hook" <<HOOK
+#!/usr/bin/env bash
+cp -- "${case_state}/blocked_until" "${case_dir}/seen_block"
+printf '0\n' >"${case_state}/blocked_until"
+printf '5000 %s %s\n' "$(( EPOCHSECONDS + 3000 ))" "$EPOCHSECONDS" >"${case_state}/quota"
+HOOK
+chmod +x "$hook"
+out="$(MOCK_SLEEP_HOOK="$hook" run_lib 'github_api_pace_gate "reserve-worker"; printf "EC=%s\n" "$?"' 2>&1)"
+assert_contains "caller reports it stopped at the reserve" "$out" "GITHUB_API_PACE_RESERVE label=reserve-worker remaining=150 reserve=200"
+assert_contains "the shared block is the quota reset plus the clock-skew cushion" \
+  "block=$(cat "${case_dir}/seen_block")" "block=$(( reset_epoch + 2 ))"
+assert_contains "caller proceeds after the reset" "$out" "EC=0"
+
+printf '\n=== pacing: one rate-limit wait blocks every other caller ===\n'
+new_case publish
+mkdir -p "$case_state"
+reset_epoch="$(( EPOCHSECONDS + 5 ))"
+zen_headers 0 "$reset_epoch" >"$case_zen"
+out="$(run_lib 'github_api_rate_limit_max_wait_s=7; github_api_wait_for_rate_limit "API rate limit exceeded for user ID 9" "" 1 || true' 2>&1)"
+assert_contains "the wait publishes its deadline for other callers" \
+  "block=$(read_state blocked_until)" "block=$(( reset_epoch + 2 ))"
+assert_contains "primary depletion is read from real response headers" "$out" "source=header_depleted"
+assert_not_contains "a full /rate_limit core figure does not select the quota-intact ladder" "$out" "QUOTA_INTACT"
+
+printf '\n=== pacing: fail-open and opt-out ===\n'
+new_case unusable
+: >"${case_dir}/not-a-dir"
+case_state="${case_dir}/not-a-dir/state"
+out="$(run_lib 'github_api_pace_gate a; github_api_pace_gate b; printf "EC=%s\n" "$?"' 2>&1)"
+assert_contains "an unusable state directory fails open with one NOTE" "$out" "GITHUB_API_PACE_DISABLED reason=state_dir_unusable"
+assert_contains "an unusable state directory never blocks the caller" "$out" "EC=0"
+note_count="$(grep -c 'GITHUB_API_PACE_DISABLED' <<<"$out" || true)"
+assert_contains "the fail-open NOTE is printed once" "notes=${note_count}" "notes=1"
+
+new_case disabled
+out="$(GITHUB_API_PACING=0 env PATH="${mock_bin}:${PATH}" GITHUB_API_PACING=0 GITHUB_API_STATE_DIR="$case_state" \
+  MOCK_GH_LOG="$case_gh_log" MOCK_GH_ZEN="$case_zen" MOCK_SLEEP_LOG="$case_sleep_log" \
+  bash -c 'source "$1"; source "$2"; github_api_pace_gate x; printf "EC=%s\n" "$?"' bash "$runner_bootstrap" "$lib" 2>&1)"
+assert_contains "GITHUB_API_PACING=0 skips the gate" "$out" "EC=0"
+if [[ ! -e "$case_state" ]]; then
+  pass_case "GITHUB_API_PACING=0 never creates the state directory"
+else
+  fail_case "GITHUB_API_PACING=0 never creates the state directory"
+fi
+
+printf '\n=== pacing: flock is the primary lock when available ===\n'
+new_case flock
+flock_bin="${tmp}/flock-bin"
+mkdir -p "$flock_bin"
+cat >"${flock_bin}/flock" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${MOCK_FLOCK_LOG:?}"
+exit "${MOCK_FLOCK_EXIT:-0}"
+MOCK
+chmod +x "${flock_bin}/flock"
+mkdir -p "$case_state"
+printf '%s %s %s\n' 1000 "$(( EPOCHSECONDS + 3000 ))" "$EPOCHSECONDS" >"${case_state}/quota"
+out="$(MOCK_FLOCK_LOG="${case_dir}/flock.log" PATH="${flock_bin}:${PATH}" run_lib 'github_api_pace_gate x; printf "EC=%s\n" "$?"' 2>&1)"
+assert_contains "the gate takes an exclusive flock with a timeout" "$(cat "${case_dir}/flock.log")" "--exclusive --timeout 5"
+assert_contains "the gate completes under flock" "$out" "EC=0"
+if [[ ! -e "${case_state}/lock" ]]; then
+  pass_case "no mkdir lock directory is used when flock exists"
+else
+  fail_case "no mkdir lock directory is used when flock exists"
+fi
+out="$(MOCK_FLOCK_EXIT=1 MOCK_FLOCK_LOG="${case_dir}/flock2.log" PATH="${flock_bin}:${PATH}" run_lib 'github_api_pace_gate y; printf "EC=%s\n" "$?"' 2>&1)"
+assert_contains "a flock timeout fails open with a NOTE" "$out" "GITHUB_API_PACE_DISABLED reason=lock_timeout"
+assert_contains "a flock timeout never blocks the caller" "$out" "EC=0"
+
+printf '\n=== static: every attempt passes the gate ===\n'
+# shellcheck disable=SC2016  # awk program is a literal string
+if awk '
+  /^github_api_exec_with_rate_limit_retry\(\)/ { in_fn=1 }
+  in_fn && /^}/ { in_fn=0 }
+  in_fn && /github_api_pace_gate "\$label"/ { gate=NR }
+  in_fn && /runner_exec "\$label"/ { if (!first_exec) first_exec=NR }
+  END { exit (gate && first_exec && gate < first_exec) ? 0 : 1 }
+' "$lib"; then
+  pass_case "the retry wrapper gates before every runner_exec attempt"
+else
+  fail_case "the retry wrapper gates before every runner_exec attempt"
+fi
+
+printf '\n=== static: audit and fix paths never call gh around the pacing wrapper ===\n'
+# shellcheck disable=SC2016  # awk program is a literal string
+if awk '
+  /^[[:space:]]*#/ { next }
+  /-- gh (api|pr) / || /runner_exec(_stdout)? .*-- gh (api|pr) / {
+    if (prev !~ /github_api_exec_with_rate_limit_retry/ && $0 !~ /github_api_exec_with_rate_limit_retry/) {
+      printf "%d: %s\n", NR, $0 > "/dev/stderr"; bad=1
+    }
+  }
+  { prev=$0 }
+  END { exit bad }
+' "${script_dir}/../scripts/lib/repo-practices"; then
+  pass_case "every gh api / gh pr call in repo-practices goes through the retry wrapper"
+else
+  fail_case "every gh api / gh pr call in repo-practices goes through the retry wrapper"
+fi
+
+test_summary

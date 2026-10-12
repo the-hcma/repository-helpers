@@ -13,7 +13,7 @@ Any `gh` call — PR / issue triage, review replies, CI polling, `gh api`, and `
   "${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/gh-api" <gh args…>
   ```
 
-- **First-party library code that already runs inside a bash process** (e.g. `wait-for-agent-review`, `github-repo-lint`): source `scripts/lib/github-api-rate-limit` and call `github_api_exec_with_rate_limit_retry <label> -- gh <args…>` directly — the exact function `scripts/gh-api` itself is a thin CLI wrapper around. Sourcing it directly avoids a redundant child-script fork per call; it is not a bypass, since it's the same backoff logic either way.
+- **First-party library code that already runs inside a bash process** (e.g. `wait-for-agent-review`, `github-repo-lint`): source `scripts/lib/github-api-rate-limit` and call `github_api_exec_with_rate_limit_retry <label> -- gh <args…>` directly — the exact function `scripts/gh-api` itself is a thin CLI wrapper around. Sourcing it directly avoids a redundant child-script fork per call; it is not a bypass, since it's the same backoff logic either way. That function is also the host-wide pacing gate (`github_api_pace_gate`): concurrent callers share one quota budget, call spacing and rate-limit backoff through a state directory, so never bypass it with a raw `gh` call in a loop.
 
 A bare, unwrapped `gh api`/`gh pr`/`gh issue` call — one that goes through neither of the above — is the violation this rule exists to catch, regardless of which shape the surrounding code takes.
 
