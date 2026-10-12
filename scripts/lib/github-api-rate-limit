@@ -1176,6 +1176,19 @@ _github_api_pace_probe_quota() {
   printf '%s %s' "$remaining" "$reset"
 }
 
+# Reset probing_until only while it still holds our marker (a later prober may have replaced it).
+# Caller holds the state lock.
+_github_api_pace_clear_probe_marker() {
+  local -r dir="$1"
+  local -r marker="$2"
+  local current
+
+  current="$(_github_api_pace_read "${dir}/probing_until")"
+  if [[ "$current" == "$marker" ]]; then
+    _github_api_pace_write "${dir}/probing_until" 0
+  fi
+}
+
 # _github_api_pace_claim <dir> <label>
 # Admits one call. Under the state lock only (never across a network call): honor a block published
 # since the caller looked, refresh a stale quota, stop at the reserve, else claim the next call slot
@@ -1188,7 +1201,7 @@ _github_api_pace_claim() {
   local -r dir="$1"
   local -r label="$2"
   local now now_us quota remaining reset observed ttl reserve interval_us slot calls cushion probed
-  local wait_us until_epoch probing current_block
+  local wait_us until_epoch probing current_block probe_marker
 
   _github_api_pace_slot_sleep_s=''
   ttl="${GITHUB_API_QUOTA_TTL_S:-30}"
@@ -1218,10 +1231,18 @@ _github_api_pace_claim() {
     fi
     # Claim the probe: the marker outlives the probe timeout, so a killed prober delays nobody for
     # long, and the network call happens with the state lock released.
-    _github_api_pace_write "${dir}/probing_until" "$(( now + 10 ))"
+    probe_marker="$(( now + 10 ))"
+    _github_api_pace_write "${dir}/probing_until" "$probe_marker"
     _github_api_pace_unlock "$dir"
     probed="$(_github_api_pace_probe_quota)"
-    _github_api_pace_lock "$dir" || return 1
+    if ! _github_api_pace_lock "$dir"; then
+      # Best effort: one more try so a lock hiccup does not leave the marker up for its full expiry.
+      if _github_api_pace_lock "$dir"; then
+        _github_api_pace_clear_probe_marker "$dir" "$probe_marker"
+        _github_api_pace_unlock "$dir"
+      fi
+      return 1
+    fi
     now="$EPOCHSECONDS"
     if [[ -n "$probed" ]]; then
       read -r remaining reset <<<"$probed"
@@ -1232,7 +1253,7 @@ _github_api_pace_claim() {
     fi
     observed="$now"
     _github_api_pace_write "${dir}/quota" "${remaining} ${reset} ${observed}"
-    _github_api_pace_write "${dir}/probing_until" 0
+    _github_api_pace_clear_probe_marker "$dir" "$probe_marker"
     until_epoch="$(_github_api_pace_read "${dir}/blocked_until")"
     if [[ "$until_epoch" =~ ^[0-9]+$ ]] && (( now < until_epoch )); then
       _github_api_pace_unlock "$dir"
