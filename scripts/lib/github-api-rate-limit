@@ -480,7 +480,7 @@ github_api_wait_for_rate_limit() {
   local waited=0 sleep_s remaining reset_epoch now retry_after_s
   local secondary=0 header_reset header_retry retry_after_from_header=0
   local deadline=0 quota_intact=0 quota_intact_backoff_s secondary_backoff_s
-  local header_block header_remaining header_resource depleted_reset='' core_depleted_headers
+  local header_block header_remaining header_resource depleted_reset=''
 
   max_wait="${github_api_rate_limit_max_wait_s}"
   poll="${github_api_rate_limit_poll_s}"
@@ -516,9 +516,10 @@ github_api_wait_for_rate_limit() {
   # already showing depletion): more requests during a secondary limit can extend the block.
   if ! github_api_headers_depleted_reset_epoch "$headers" >/dev/null \
     && [[ -z "$(_github_api_header_value "$(_github_api_last_response_headers "$headers")" 'retry-after' || true)" ]]; then
-    core_depleted_headers="$(github_api_core_depleted_headers || true)"
-    if [[ -n "$core_depleted_headers" ]]; then
-      headers="$core_depleted_headers"
+    # A new wait always probes fresh; the poll loop and the intact check then reuse that result.
+    _github_api_core_probe_clean_at=0
+    if _github_api_core_probe_refresh; then
+      headers="$_github_api_core_headers_value"
     fi
   fi
 
@@ -769,14 +770,38 @@ github_api_fetch_core_quota_headers() {
   printf '%s' "$out"
 }
 
+# _github_api_core_probe_refresh
+# Probes core quota (no subshell, so the cache survives). Sets _github_api_core_headers_value to the
+# headers when they report remaining=0 (return 0), else clears it (return 1). A probe that found the
+# quota intact is reused for GITHUB_API_QUOTA_TTL_S, so one wait does not re-probe per poll (#710).
+_github_api_core_probe_clean_at=0
+_github_api_core_headers_value=''
+_github_api_core_probe_refresh() {
+  local headers ttl
+
+  _github_api_core_headers_value=''
+  ttl="${GITHUB_API_QUOTA_TTL_S:-30}"
+  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=30
+  if (( _github_api_core_probe_clean_at > 0 && EPOCHSECONDS - _github_api_core_probe_clean_at < ttl )); then
+    return 1
+  fi
+  headers="$(github_api_fetch_core_quota_headers || true)"
+  if github_api_headers_depleted_reset_epoch "$headers" >/dev/null; then
+    _github_api_core_headers_value="$headers"
+    _github_api_core_probe_clean_at=0
+    return 0
+  fi
+  if [[ -n "$headers" ]]; then
+    _github_api_core_probe_clean_at="$EPOCHSECONDS"
+  fi
+  return 1
+}
+
 # github_api_core_depleted_headers
 # Prints the core probe headers and returns 0 only when they report remaining=0.
 github_api_core_depleted_headers() {
-  local headers
-
-  headers="$(github_api_fetch_core_quota_headers || true)"
-  if github_api_headers_depleted_reset_epoch "$headers" >/dev/null; then
-    printf '%s' "$headers"
+  if _github_api_core_probe_refresh; then
+    printf '%s' "$_github_api_core_headers_value"
     return 0
   fi
   return 1
@@ -976,7 +1001,7 @@ _github_api_quota_intact_suspect() {
   local out exit_code
 
   # Real core headers showing depletion beat the (unreliable) /rate_limit core figure (#710).
-  if github_api_core_depleted_headers >/dev/null; then
+  if _github_api_core_probe_refresh; then
     return 1
   fi
   exit_code=0
