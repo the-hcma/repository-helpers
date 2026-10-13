@@ -811,18 +811,18 @@ github_api_core_depleted_headers() {
 # Raises the shared blocked_until to <epoch> (never lowers it) so every caller waits with us.
 github_api_pace_publish_block() {
   local -r until_epoch="${1:-0}"
-  local dir current
+  local state_dir current
 
   [[ "$until_epoch" =~ ^[1-9][0-9]*$ ]] || return 0
   github_api_pacing_enabled || return 0
   _github_api_pace_dir || return 0
-  dir="$_github_api_pace_dir_value"
-  _github_api_pace_lock "$dir" || return 0
-  current="$(_github_api_pace_read "${dir}/blocked_until")"
+  state_dir="$_github_api_pace_dir_value"
+  _github_api_pace_lock "$state_dir" || return 0
+  current="$(_github_api_pace_read "${state_dir}/blocked_until")"
   if [[ ! "$current" =~ ^[0-9]+$ ]] || (( until_epoch > current )); then
-    _github_api_pace_write "${dir}/blocked_until" "$until_epoch"
+    _github_api_pace_write "${state_dir}/blocked_until" "$until_epoch"
   fi
-  _github_api_pace_unlock "$dir"
+  _github_api_pace_unlock "$state_dir"
 }
 
 # github_api_pace_gate [label]
@@ -830,7 +830,7 @@ github_api_pace_publish_block() {
 # quota reserve (waiting for the reset), then claims the next minimum-spacing slot.
 github_api_pace_gate() {
   local -r label="${1:-gh}"
-  local dir now until_epoch claim_ec sleep_s waited=0 max_wait poll noted=0 probe_waits=0
+  local state_dir now until_epoch claim_ec sleep_s waited=0 max_wait poll noted=0 probe_waits=0
 
   github_api_pacing_enabled || return 0
   if ! _github_api_pace_dir; then
@@ -838,7 +838,7 @@ github_api_pace_gate() {
     printf 'NOTE: GITHUB_API_PACE_DISABLED reason=state_dir_unusable\n' >&2
     return 0
   fi
-  dir="$_github_api_pace_dir_value"
+  state_dir="$_github_api_pace_dir_value"
   max_wait="${github_api_rate_limit_max_wait_s}"
   poll="${github_api_rate_limit_poll_s}"
   [[ "$max_wait" =~ ^[0-9]+$ ]] || max_wait=3600
@@ -846,7 +846,7 @@ github_api_pace_gate() {
 
   while :; do
     now="$EPOCHSECONDS"
-    until_epoch="$(_github_api_pace_read "${dir}/blocked_until")"
+    until_epoch="$(_github_api_pace_read "${state_dir}/blocked_until")"
     [[ "$until_epoch" =~ ^[0-9]+$ ]] || until_epoch=0
     if (( now < until_epoch )); then
       sleep_s=$(( until_epoch - now ))
@@ -867,7 +867,7 @@ github_api_pace_gate() {
       continue
     fi
     claim_ec=0
-    _github_api_pace_claim "$dir" "$label" || claim_ec=$?
+    _github_api_pace_claim "$state_dir" "$label" || claim_ec=$?
     if (( claim_ec == 0 )); then
       if [[ -n "${_github_api_pace_slot_sleep_s:-}" ]]; then
         run_command "github-api pace slot" sleep "$_github_api_pace_slot_sleep_s"
@@ -1072,26 +1072,26 @@ _github_api_secondary_backoff_s() {
 # Sets _github_api_pace_dir_value to the shared state directory, creating it (0700) on first use;
 # fails when unusable. Callers must not wrap it in $(...): the cache lives in this shell.
 _github_api_pace_dir() {
-  local dir
+  local state_dir
 
   if [[ -n "${_github_api_pace_dir_value:-}" && -d "$_github_api_pace_dir_value" ]]; then
     return 0
   fi
-  dir="${GITHUB_API_STATE_DIR:-}"
-  if [[ -z "$dir" ]]; then
+  state_dir="${GITHUB_API_STATE_DIR:-}"
+  if [[ -z "$state_dir" ]]; then
     [[ -n "${HOME:-}" ]] || return 1
-    dir="${HOME}/scratch/repository-helpers/github-api-state"
+    state_dir="${HOME}/scratch/repository-helpers/github-api-state"
   fi
-  if [[ ! -d "$dir" ]]; then
-    mkdir -p -- "$dir" 2>/dev/null || return 1
-    chmod 700 -- "$dir" 2>/dev/null || true
+  if [[ ! -d "$state_dir" ]]; then
+    mkdir -p -- "$state_dir" 2>/dev/null || return 1
+    chmod 700 -- "$state_dir" 2>/dev/null || true
   fi
-  [[ -d "$dir" && -w "$dir" ]] || return 1
-  _github_api_pace_dir_value="$dir"
+  [[ -d "$state_dir" && -w "$state_dir" ]] || return 1
+  _github_api_pace_dir_value="$state_dir"
 }
 
-# _github_api_pace_lock <dir>
-# Takes the state lock. Primary path is flock(1) on <dir>/lock.file (released by the kernel when
+# _github_api_pace_lock <state_dir>
+# Takes the state lock. Primary path is flock(1) on <state_dir>/lock.file (released by the kernel when
 # the holder dies, so no stale locks); hosts without flock fall back to an atomic mkdir lock. The
 # fallback only breaks a lock that has been held for more than 30 s (critical sections last
 # milliseconds, so that is a crashed holder). It deliberately does not judge staleness by owner
@@ -1162,7 +1162,7 @@ _github_api_pace_break_stale() {
   rm -rf -- "$grave"
 }
 
-# _github_api_pace_unlock <dir>
+# _github_api_pace_unlock <state_dir>
 _github_api_pace_unlock() {
   if [[ -n "${_github_api_pace_lock_fd:-}" ]]; then
     exec {_github_api_pace_lock_fd}>&-
@@ -1207,17 +1207,17 @@ _github_api_pace_probe_quota() {
 # Reset probing_until only while it still holds our marker (a later prober may have replaced it).
 # Caller holds the state lock.
 _github_api_pace_clear_probe_marker() {
-  local -r dir="$1"
+  local -r state_dir="$1"
   local -r marker="$2"
   local current
 
-  current="$(_github_api_pace_read "${dir}/probing_until")"
+  current="$(_github_api_pace_read "${state_dir}/probing_until")"
   if [[ "$current" == "$marker" ]]; then
-    _github_api_pace_write "${dir}/probing_until" 0
+    _github_api_pace_write "${state_dir}/probing_until" 0
   fi
 }
 
-# _github_api_pace_claim <dir> <label>
+# _github_api_pace_claim <state_dir> <label>
 # Admits one call. Under the state lock only (never across a network call): honor a block published
 # since the caller looked, refresh a stale quota, stop at the reserve, else claim the next call slot
 # and count the call. A stale quota is refreshed by one caller at a time without holding the lock:
@@ -1226,7 +1226,7 @@ _github_api_pace_clear_probe_marker() {
 # Returns 0 admitted (slot wait in _github_api_pace_slot_sleep_s), 10 blocked (blocked_until set or
 # raised; caller re-loops), 11 a probe is in flight (caller retries), 1 lock timeout.
 _github_api_pace_claim() {
-  local -r dir="$1"
+  local -r state_dir="$1"
   local -r label="$2"
   local now now_us quota remaining reset observed ttl reserve interval_us slot calls cushion probed
   local wait_us until_epoch probing current_block probe_marker
@@ -1241,33 +1241,33 @@ _github_api_pace_claim() {
   [[ "$interval_us" =~ ^[0-9]+$ ]] || interval_us=100
   interval_us=$(( interval_us * 1000 ))
 
-  _github_api_pace_lock "$dir" || return 1
+  _github_api_pace_lock "$state_dir" || return 1
   now="$EPOCHSECONDS"
-  until_epoch="$(_github_api_pace_read "${dir}/blocked_until")"
+  until_epoch="$(_github_api_pace_read "${state_dir}/blocked_until")"
   if [[ "$until_epoch" =~ ^[0-9]+$ ]] && (( now < until_epoch )); then
-    _github_api_pace_unlock "$dir"
+    _github_api_pace_unlock "$state_dir"
     return 10
   fi
-  quota="$(_github_api_pace_read "${dir}/quota")"
+  quota="$(_github_api_pace_read "${state_dir}/quota")"
   remaining='' reset='' observed=''
   read -r remaining reset observed <<<"$quota" || true
   if [[ ! "$observed" =~ ^[0-9]+$ ]] || (( now - observed > ttl )); then
-    probing="$(_github_api_pace_read "${dir}/probing_until")"
+    probing="$(_github_api_pace_read "${state_dir}/probing_until")"
     if [[ "$probing" =~ ^[0-9]+$ ]] && (( now < probing )); then
-      _github_api_pace_unlock "$dir"
+      _github_api_pace_unlock "$state_dir"
       return 11
     fi
     # Claim the probe: the marker outlives the probe timeout, so a killed prober delays nobody for
     # long, and the network call happens with the state lock released.
     probe_marker="$(( now + 10 ))"
-    _github_api_pace_write "${dir}/probing_until" "$probe_marker"
-    _github_api_pace_unlock "$dir"
+    _github_api_pace_write "${state_dir}/probing_until" "$probe_marker"
+    _github_api_pace_unlock "$state_dir"
     probed="$(_github_api_pace_probe_quota)"
-    if ! _github_api_pace_lock "$dir"; then
+    if ! _github_api_pace_lock "$state_dir"; then
       # Best effort: one more try so a lock hiccup does not leave the marker up for its full expiry.
-      if _github_api_pace_lock "$dir"; then
-        _github_api_pace_clear_probe_marker "$dir" "$probe_marker"
-        _github_api_pace_unlock "$dir"
+      if _github_api_pace_lock "$state_dir"; then
+        _github_api_pace_clear_probe_marker "$state_dir" "$probe_marker"
+        _github_api_pace_unlock "$state_dir"
       fi
       return 1
     fi
@@ -1280,11 +1280,11 @@ _github_api_pace_claim() {
       remaining='?' reset='?'
     fi
     observed="$now"
-    _github_api_pace_write "${dir}/quota" "${remaining} ${reset} ${observed}"
-    _github_api_pace_clear_probe_marker "$dir" "$probe_marker"
-    until_epoch="$(_github_api_pace_read "${dir}/blocked_until")"
+    _github_api_pace_write "${state_dir}/quota" "${remaining} ${reset} ${observed}"
+    _github_api_pace_clear_probe_marker "$state_dir" "$probe_marker"
+    until_epoch="$(_github_api_pace_read "${state_dir}/blocked_until")"
     if [[ "$until_epoch" =~ ^[0-9]+$ ]] && (( now < until_epoch )); then
-      _github_api_pace_unlock "$dir"
+      _github_api_pace_unlock "$state_dir"
       return 10
     fi
   fi
@@ -1292,33 +1292,33 @@ _github_api_pace_claim() {
 
   if [[ "$remaining" =~ ^[0-9]+$ && "$reset" =~ ^[0-9]+$ && "$observed" =~ ^[0-9]+$ ]]; then
     if (( remaining <= reserve && now < reset )); then
-      _github_api_pace_write "${dir}/quota" "${remaining} ${reset} ${observed}"
+      _github_api_pace_write "${state_dir}/quota" "${remaining} ${reset} ${observed}"
       printf 'NOTE: GITHUB_API_PACE_RESERVE label=%s remaining=%s reserve=%s reset=%s\n' \
         "$label" "$remaining" "$reserve" "$reset" >&2
       # Only ever raise the shared block (another caller may have published a later deadline).
-      current_block="$(_github_api_pace_read "${dir}/blocked_until")"
+      current_block="$(_github_api_pace_read "${state_dir}/blocked_until")"
       if [[ ! "$current_block" =~ ^[0-9]+$ ]] || (( reset + cushion > current_block )); then
-        _github_api_pace_write "${dir}/blocked_until" "$(( reset + cushion ))"
+        _github_api_pace_write "${state_dir}/blocked_until" "$(( reset + cushion ))"
       fi
-      _github_api_pace_unlock "$dir"
+      _github_api_pace_unlock "$state_dir"
       return 10
     fi
     if (( remaining > 0 )); then
       remaining=$(( remaining - 1 ))
     fi
-    _github_api_pace_write "${dir}/quota" "${remaining} ${reset} ${observed}"
+    _github_api_pace_write "${state_dir}/quota" "${remaining} ${reset} ${observed}"
   fi
 
-  slot="$(_github_api_pace_read "${dir}/next_slot")"
+  slot="$(_github_api_pace_read "${state_dir}/next_slot")"
   [[ "$slot" =~ ^[0-9]+$ ]] || slot=0
   if (( slot < now_us )); then
     slot="$now_us"
   fi
-  _github_api_pace_write "${dir}/next_slot" "$(( slot + interval_us ))"
-  calls="$(_github_api_pace_read "${dir}/calls")"
+  _github_api_pace_write "${state_dir}/next_slot" "$(( slot + interval_us ))"
+  calls="$(_github_api_pace_read "${state_dir}/calls")"
   [[ "$calls" =~ ^[0-9]+$ ]] || calls=0
-  _github_api_pace_write "${dir}/calls" "$(( calls + 1 ))"
-  _github_api_pace_unlock "$dir"
+  _github_api_pace_write "${state_dir}/calls" "$(( calls + 1 ))"
+  _github_api_pace_unlock "$state_dir"
 
   wait_us=$(( slot - now_us ))
   if (( wait_us > 5000 )); then
