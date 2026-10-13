@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Tests for repository-helpers#713: reply-comment / resolve-comment must accept the IC_<id> form that
+# check and list-feedback print, fail loudly on an unknown id, and CodeRabbit pings must not count as
+# pending feedback. Hermetic: comments come from a fixture file and gh is a recording stub.
+# shellcheck disable=SC2016  # bash -c programs are single-quoted so the child shell expands them
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+tmp="$(mktemp -d)"
+readonly tmp
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "${tmp}/bin"
+cat >"${tmp}/bin/gh" <<'GH'
+#!/usr/bin/env bash
+# Records the --body of `gh pr comment` and nothing else.
+if [[ "$1 $2" == 'pr comment' ]]; then
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == '--body' ]]; then printf '%s' "$2" >>"${GH_POSTED}"; printf '\n--END--\n' >>"${GH_POSTED}"; fi
+    shift
+  done
+fi
+exit 0
+GH
+chmod +x "${tmp}/bin/gh"
+
+# Fixture: an operator-authored product note (id 6001) and a CodeRabbit ping (id 6002).
+cat >"${tmp}/comments.json" <<'JSON'
+[
+  {"id": "6001", "login": "thehcma", "body": "Independent review notes", "created_at": "2026-10-12T23:50:00Z",
+   "html_url": "https://github.com/o/r/pull/9#issuecomment-6001"},
+  {"id": "6002", "login": "thehcma", "body": "@coderabbitai review", "created_at": "2026-10-13T02:00:00Z",
+   "html_url": "https://github.com/o/r/pull/9#issuecomment-6002"},
+  {"id": "6003", "login": "thehcma", "body": "@coderabbitai full review\n", "created_at": "2026-10-13T02:01:00Z",
+   "html_url": "https://github.com/o/r/pull/9#issuecomment-6003"}
+]
+JSON
+
+# run_lib <state-file> <program>: sources the libraries with the comment fetch and login stubbed.
+run_lib() {
+  local -r state="$1" program="$2"
+  env PATH="${tmp}/bin:${PATH}" GH_POSTED="${tmp}/posted" AGENT_REVIEW_RESOLVED_COMMENTS_FILE="$state" \
+    bash -c '
+      set -euo pipefail
+      source "$1/scripts/lib/runner-bootstrap"
+      source "$1/scripts/lib/agent-review"
+      comments_file="$2"
+      agent_review_feedback_issue_comments_array_json() { cat "${comments_file}"; }
+      agent_review_authenticated_login() { printf thehcma; }
+      pending() { agent_review_feedback_issue_comments_pending_from_array_json thehcma o/r 9 "$(cat "${comments_file}")" | jq -c "map({id: .comment_id, state})"; }
+      '"${program}"'
+    ' bash "${script_dir}/.." "${tmp}/comments.json" 2>&1
+}
+
+printf '\n=== ids: IC_ prefix is normalised ===\n'
+assert_contains "IC_<id> becomes the bare id" "$(run_lib "${tmp}/s1" 'agent_review_feedback_normalize_comment_id IC_6001')" "6001"
+assert_contains "a bare id is unchanged" "$(run_lib "${tmp}/s1" 'agent_review_feedback_normalize_comment_id 6001')" "6001"
+assert_contains "a non-numeric id is rejected" "$(run_lib "${tmp}/s1" 'agent_review_feedback_normalize_comment_id abc || true')" "invalid issue comment id 'abc'"
+assert_contains "an empty id after the prefix is rejected" "$(run_lib "${tmp}/s1" 'agent_review_feedback_normalize_comment_id IC_ || true')" "invalid issue comment id 'IC_'"
+
+printf '\n=== ids: reply-comment with the IC_ form cites the original ===\n'
+rm -f "${tmp}/posted"
+out="$(run_lib "${tmp}/s2" 'agent_review_reply_issue_comment o/r 9 IC_6001 "Addressed in a follow-up."')"
+assert_contains "the reply is reported" "$out" "Replied on issue comment 6001"
+assert_contains "the posted body ends with the in-reply-to citation" "$(cat "${tmp}/posted")" \
+  "(In reply to https://github.com/o/r/pull/9#issuecomment-6001)"
+
+printf '\n=== ids: reply-comment on an unknown comment posts nothing ===\n'
+rm -f "${tmp}/posted"
+rc=0
+out="$(run_lib "${tmp}/s3" 'agent_review_reply_issue_comment o/r 9 IC_999999 "lost reply"')" || rc=$?
+assert_contains "the error names the missing comment" "$out" "issue comment IC_999999 not found on o/r#9; nothing was posted"
+if [[ "$rc" -ne 0 && ! -e "${tmp}/posted" ]]; then
+  pass_case "an unknown comment id exits non-zero and posts no uncited reply"
+else
+  fail_case "an unknown comment id exits non-zero and posts no uncited reply (rc=${rc})"
+fi
+
+printf '\n=== ids: resolve-comment with the IC_ form hides the comment ===\n'
+state="${tmp}/s4"
+assert_contains "an unanswered operator comment is pending" "$(run_lib "$state" 'pending')" '{"id":"6001","state":"unaddressed"}'
+run_lib "$state" 'agent_review_resolve_issue_comment o/r 9 IC_6001 1' >/dev/null
+assert_contains "the resolved state stores the bare id" "$(cat "$state")" "o/r#9=6001"
+if grep -q 'IC_' "$state"; then
+  fail_case "the resolved state never stores the IC_ form"
+else
+  pass_case "the resolved state never stores the IC_ form"
+fi
+assert_not_contains "the resolved comment is no longer pending" "$(run_lib "$state" 'pending')" '"id":"6001"'
+
+printf '\n=== ids: resolve-comment on an unknown comment fails even with --force ===\n'
+state="${tmp}/s5"
+rc=0
+out="$(run_lib "$state" 'agent_review_resolve_issue_comment o/r 9 IC_999999 1')" || rc=$?
+assert_contains "the error names the missing comment" "$out" "issue comment IC_999999 not found on o/r#9; nothing was resolved"
+if [[ "$rc" -ne 0 && ! -s "$state" ]]; then
+  pass_case "an unknown comment id exits non-zero and records nothing"
+else
+  fail_case "an unknown comment id exits non-zero and records nothing (rc=${rc})"
+fi
+
+printf '\n=== probes: CodeRabbit pings are not pending feedback ===\n'
+pending_out="$(run_lib "${tmp}/s6" 'pending')"
+assert_not_contains "@coderabbitai review is not pending" "$pending_out" '"id":"6002"'
+assert_not_contains "@coderabbitai full review is not pending" "$pending_out" '"id":"6003"'
+assert_contains "a real operator note next to the pings still is" "$pending_out" '"id":"6001"'
+assert_contains "the bash probe check also recognises a CodeRabbit ping" \
+  "$(run_lib "${tmp}/s6" 'agent_review_feedback_issue_comment_is_probe "@CodeRabbitAI full review" && echo probe')" "probe"
+assert_not_contains "a note that merely mentions CodeRabbit is not a probe" \
+  "$(run_lib "${tmp}/s6" 'agent_review_feedback_issue_comment_is_probe "thanks @coderabbitai, fixed" && echo probe || echo note')" "probe"
+
+test_summary

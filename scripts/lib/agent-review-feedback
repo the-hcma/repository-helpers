@@ -96,6 +96,31 @@ agent_review_feedback_normalize_review_id() {
   printf '%s' "${id}"
 }
 
+# Strip optional IC_ prefix from --comment-id: list-feedback / check print feedback_id as
+# IC_<id> next to the bare comment_id, and every lookup and the resolved state use the bare id
+# (repository-helpers#713). Anything that is not a number afterwards is rejected.
+agent_review_feedback_normalize_comment_id() {
+  local id="${1:-}"
+
+  id="${id#IC_}"
+  [[ "${id}" =~ ^[0-9]+$ ]] \
+    || agent_review_die "invalid issue comment id '${1:-}' (expected the numeric comment_id or IC_<id>)"
+  printf '%s' "${id}"
+}
+
+# True when <comment_id> (bare) is an issue comment on the PR.
+agent_review_feedback_issue_comment_exists() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r comment_id="$3"
+  local found
+
+  found="$(ar_runner_jq_file "agent-review feedback issue comment exists" \
+    "$(agent_review_feedback_issue_comments_array_json "${repo}" "${pr}")" \
+    --arg id "${comment_id}" -r 'if any(.[]; .id == $id) then "yes" else "no" end')"
+  [[ "${found}" == 'yes' ]]
+}
+
 agent_review_feedback_mark_review_resolved() {
   local -r repo="$1"
   local -r pr="$2"
@@ -149,6 +174,10 @@ agent_review_feedback_issue_comment_is_probe() {
     return 0
   fi
   if [[ "${lower}" =~ ^@copilot[[:space:]]+please[[:space:]]+review ]]; then
+    return 0
+  fi
+  # CodeRabbit review pings (@coderabbitai review / full review) are triggers, not product notes.
+  if [[ "${lower}" =~ ^@coderabbitai[[:space:]]+(full[[:space:]]+)?review ]]; then
     return 0
   fi
   # Bugbot explicit trigger (agent_review_profile_trigger_comment).
@@ -328,6 +357,7 @@ agent_review_feedback_issue_comments_pending_from_array_json() {
       def is_probe($body):
         ($body // "") | test("wait-for-agent-review:";"i")
         or test("^@copilot[[:space:]]+please[[:space:]]+review";"i")
+        or test("^@coderabbitai[[:space:]]+(full[[:space:]]+)?review";"i")
         or test("^bugbot[[:space:]]+run[[:space:]]*$";"i")
         or test("summarize by coderabbit\\.ai";"i")
         or test("walkthrough_start";"i")
@@ -675,6 +705,7 @@ agent_review_feedback_posted_count() {
       def is_probe($body):
         ($body // "") | test("wait-for-agent-review:";"i")
         or test("^@copilot[[:space:]]+please[[:space:]]+review";"i")
+        or test("^@coderabbitai[[:space:]]+(full[[:space:]]+)?review";"i")
         or test("^bugbot[[:space:]]+run[[:space:]]*$";"i")
         or test("summarize by coderabbit\\.ai";"i")
         or test("walkthrough_start";"i")
@@ -859,23 +890,24 @@ agent_review_feedback_issue_comment_mark_quota_exhausted_if_notice() {
 agent_review_reply_issue_comment() {
   local -r repo="$1"
   local -r pr="$2"
-  local -r comment_id="$3"
+  local -r raw_comment_id="$3"
   local -r body="$4"
-  local full_body comment_url
+  local comment_id full_body comment_url
 
   agent_review_require_cmd gh
-  agent_review_feedback_issue_comment_mark_quota_exhausted_if_notice "${repo}" "${pr}" "${comment_id}" || true
+  comment_id="$(agent_review_feedback_normalize_comment_id "${raw_comment_id}")" || return 1
   [[ -n "${body}" ]] || agent_review_die 'reply-comment requires --body'
+  # Look the target up before anything is posted: a reply without the "(In reply to <url>)" line
+  # never answers the original comment and becomes new pending feedback itself (#713).
   comment_url="$(ar_runner_jq_file "agent-review feedback reply target url" \
     "$(agent_review_feedback_issue_comments_array_json "${repo}" "${pr}")" \
     --arg id "${comment_id}" -r 'map(select(.id == $id)) | first | .html_url // ""')"
-  if [[ -n "${comment_url}" ]]; then
-    full_body="${body}
+  [[ -n "${comment_url}" ]] \
+    || agent_review_die "issue comment ${raw_comment_id} not found on ${repo}#${pr}; nothing was posted (use the comment_id from list-feedback)"
+  agent_review_feedback_issue_comment_mark_quota_exhausted_if_notice "${repo}" "${pr}" "${comment_id}" || true
+  full_body="${body}
 
 (In reply to ${comment_url})"
-  else
-    full_body="${body}"
-  fi
   runner_exec "agent-review reply issue comment" -- gh pr comment "${pr}" --repo "${repo}" --body "${full_body}" >/dev/null
   printf 'Replied on issue comment %s (PR #%s)\n' "${comment_id}" "${pr}" >&2
 }
@@ -910,9 +942,15 @@ agent_review_reply_pull_request_review() {
 agent_review_resolve_issue_comment() {
   local -r repo="$1"
   local -r pr="$2"
-  local -r comment_id="$3"
+  local -r raw_comment_id="$3"
   local force="${4:-0}"
+  local comment_id
 
+  comment_id="$(agent_review_feedback_normalize_comment_id "${raw_comment_id}")" || return 1
+  # Recording an id that matches no comment would silently hide nothing (#713), so even --force
+  # insists the comment exists on this PR.
+  agent_review_feedback_issue_comment_exists "${repo}" "${pr}" "${comment_id}" \
+    || agent_review_die "issue comment ${raw_comment_id} not found on ${repo}#${pr}; nothing was resolved (use the comment_id from list-feedback)"
   if [[ "${force}" != '1' ]]; then
     if ! agent_review_feedback_issue_comment_has_operator_reply "${repo}" "${pr}" "${comment_id}"; then
       agent_review_die "issue comment ${comment_id} has no operator reply — run reply-comment before resolve-comment"
