@@ -38,14 +38,16 @@ cat >"${tmp}/comments.json" <<'JSON'
   {"id": "6002", "login": "thehcma", "body": "@coderabbitai review", "created_at": "2026-10-13T02:00:00Z",
    "html_url": "https://github.com/o/r/pull/9#issuecomment-6002"},
   {"id": "6003", "login": "thehcma", "body": "@coderabbitai full review\n", "created_at": "2026-10-13T02:01:00Z",
-   "html_url": "https://github.com/o/r/pull/9#issuecomment-6003"}
+   "html_url": "https://github.com/o/r/pull/9#issuecomment-6003"},
+  {"id": "6004", "login": "thehcma", "body": "@coderabbitai reviewing the fix, can you check X?", "created_at": "2026-10-13T02:02:00Z",
+   "html_url": "https://github.com/o/r/pull/9#issuecomment-6004"}
 ]
 JSON
 
 # run_lib <state-file> <program>: sources the libraries with the comment fetch and login stubbed.
 run_lib() {
   local -r state="$1" program="$2"
-  env PATH="${tmp}/bin:${PATH}" GH_POSTED="${tmp}/posted" AGENT_REVIEW_RESOLVED_COMMENTS_FILE="$state" \
+  env COMMENTS_FILE="${COMMENTS_FILE:-}" PATH="${tmp}/bin:${PATH}" GH_POSTED="${tmp}/posted" AGENT_REVIEW_RESOLVED_COMMENTS_FILE="$state" \
     bash -c '
       set -euo pipefail
       source "$1/scripts/lib/runner-bootstrap"
@@ -55,7 +57,7 @@ run_lib() {
       agent_review_authenticated_login() { printf thehcma; }
       pending() { agent_review_feedback_issue_comments_pending_from_array_json thehcma o/r 9 "$(cat "${comments_file}")" | jq -c "map({id: .comment_id, state})"; }
       '"${program}"'
-    ' bash "${script_dir}/.." "${tmp}/comments.json" 2>&1
+    ' bash "${script_dir}/.." "${COMMENTS_FILE:-${tmp}/comments.json}" 2>&1
 }
 
 printf '\n=== ids: IC_ prefix is normalised ===\n'
@@ -105,6 +107,31 @@ else
   fail_case "an unknown comment id exits non-zero and records nothing (rc=${rc})"
 fi
 
+printf '\n=== ids: an API error is not reported as a missing comment ===\n'
+printf '[]\n' >"${tmp}/empty.json"
+rm -f "${tmp}/posted"
+rc=0
+out="$(COMMENTS_FILE="${tmp}/empty.json" run_lib "${tmp}/s7" 'agent_review_reply_issue_comment o/r 9 IC_6001 "x"')" || rc=$?
+assert_contains "reply says the comments could not be loaded" "$out" "could not load the comments of o/r#9 (API error?); nothing was posted"
+assert_not_contains "reply does not blame the id on an API error" "$out" "not found on"
+rc=0
+out="$(COMMENTS_FILE="${tmp}/empty.json" run_lib "${tmp}/s7" 'agent_review_resolve_issue_comment o/r 9 IC_6001 1')" || rc=$?
+assert_contains "resolve says the comments could not be loaded" "$out" "could not load the comments of o/r#9 (API error?); nothing was resolved"
+if [[ "$rc" -ne 0 && ! -s "${tmp}/s7" && ! -e "${tmp}/posted" ]]; then
+  pass_case "an API error posts nothing and records nothing"
+else
+  fail_case "an API error posts nothing and records nothing (rc=${rc})"
+fi
+
+printf '\n=== ids: resolve-addressed skips the per-comment existence re-fetch ===\n'
+COMMENTS_FILE="${tmp}/empty.json" run_lib "${tmp}/s8" 'agent_review_resolve_issue_comment o/r 9 6001 1 1' >/dev/null 2>&1 || true
+assert_contains "skip_exists records the id without re-fetching comments" "$(cat "${tmp}/s8" 2>/dev/null)" "o/r#9=6001"
+
+printf '\n=== ids: resolve without --force needs the operator reply (IC_ form) ===\n'
+rc=0
+out="$(run_lib "${tmp}/s9" 'agent_review_resolve_issue_comment o/r 9 IC_6001 0')" || rc=$?
+assert_contains "an unanswered comment is refused with the bare id in the message" "$out" "issue comment 6001 has no operator reply"
+
 printf '\n=== probes: CodeRabbit pings are not pending feedback ===\n'
 pending_out="$(run_lib "${tmp}/s6" 'pending')"
 assert_not_contains "@coderabbitai review is not pending" "$pending_out" '"id":"6002"'
@@ -112,6 +139,7 @@ assert_not_contains "@coderabbitai full review is not pending" "$pending_out" '"
 assert_contains "a real operator note next to the pings still is" "$pending_out" '"id":"6001"'
 assert_contains "the bash probe check also recognises a CodeRabbit ping" \
   "$(run_lib "${tmp}/s6" 'agent_review_feedback_issue_comment_is_probe "@CodeRabbitAI full review" && echo probe')" "probe"
+assert_contains "a body that only starts with the ping words (reviewing the fix) stays pending" "$pending_out" '"id":"6004"'
 assert_not_contains "a note that merely mentions CodeRabbit is not a probe" \
   "$(run_lib "${tmp}/s6" 'agent_review_feedback_issue_comment_is_probe "thanks @coderabbitai, fixed" && echo probe || echo note')" "probe"
 
