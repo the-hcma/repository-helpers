@@ -9878,7 +9878,7 @@ batch_all_materialize_checkout() {
 # Prints the current time in milliseconds since the epoch.
 batch_all_now_ms() {
   if [[ -n "${EPOCHREALTIME:-}" ]]; then
-    printf '%s' "$(( ${EPOCHREALTIME/./} / 1000 ))"
+    printf '%s' "$(( ${EPOCHREALTIME//[!0-9]/} / 1000 ))"
   else
     date +%s000
   fi
@@ -10284,13 +10284,70 @@ batch_all_default_jobs() {
   printf '%s' "$cores"
 }
 
+# batch_all_resolve_jobs
+# Fills batch_all_jobs when --jobs was not given. A set but invalid DEP_UPDATER_JOBS is an error, like
+# --jobs. Parallel children have no stdin, so their interactive prompts (rebase, resume-CI gate)
+# would silently take the non-interactive answer: with the *default* count an operator at a terminal
+# keeps the serial run, while an explicit --jobs / DEP_UPDATER_JOBS is honoured with a NOTE.
+batch_all_resolve_jobs() {
+  local from_default=0
+
+  if [[ -z "$batch_all_jobs" ]]; then
+    if [[ -n "${DEP_UPDATER_JOBS:-}" && ! "${DEP_UPDATER_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+      die "DEP_UPDATER_JOBS requires a positive integer (got: ${DEP_UPDATER_JOBS})"
+    fi
+    batch_all_jobs="$(batch_all_default_jobs)"
+    [[ -n "${DEP_UPDATER_JOBS:-}" ]] || from_default=1
+  fi
+  (( batch_all_jobs > 1 )) || return 0
+  batch_all_stdin_is_tty || return 0
+  if (( from_default )); then
+    log "[batch-all] NOTE: stdin is a terminal, so running serially to keep child prompts interactive (pass --jobs N to run in parallel without prompts)"
+    batch_all_jobs=1
+  else
+    log "[batch-all] NOTE: parallel children have no stdin; interactive prompts take their non-interactive answer"
+  fi
+}
+
+# batch_all_stdin_is_tty
+# True when stdin is the operator's terminal (a seam so tests can stub it).
+batch_all_stdin_is_tty() {
+  [[ -t 0 ]]
+}
+
+# batch_all_adopt_worker_session <result_prefix>
+# Moves a worker's runner records into the parent session, appending them to the parent's .order,
+# so failure reports built from the parent session list worker failures too. Called in repo order.
+batch_all_adopt_worker_session() {
+  local -r worker_dir="${RUNNER_SESSION_DIR:-}/worker-$(basename -- "$1")"
+  local uuid
+
+  [[ -n "${RUNNER_SESSION_DIR:-}" && -f "${worker_dir}/.order" ]] || return 0
+  while IFS= read -r uuid; do
+    [[ -n "$uuid" && -d "${worker_dir}/${uuid}" ]] || continue
+    mv -- "${worker_dir}/${uuid}" "${RUNNER_SESSION_DIR}/${uuid}"
+    printf '%s\n' "$uuid" >>"${RUNNER_SESSION_DIR}/.order"
+  done <"${worker_dir}/.order"
+  rm -rf -- "$worker_dir"
+}
+
 # batch_all_worker_main <repo_line> <result_prefix> <color_start> <color_reset>
 # Background-subshell entry point: runs one repo and records its return code last, so the parent can
-# tell a finished worker from one that died early (die/exit skips the `.rc` write).
+# tell a finished worker from one that died early (die/exit skips the `.rc` write). The runner keeps
+# per-session state in shared files (.order, first-failure file), so each worker gets a private
+# sub-session and first-failure file or concurrent workers would read each other's command results.
 batch_all_worker_main() {
   local rc=0
 
+  if [[ -n "${RUNNER_SESSION_DIR:-}" && -d "${RUNNER_SESSION_DIR}" ]]; then
+    RUNNER_SESSION_DIR="${RUNNER_SESSION_DIR}/worker-$(basename -- "$2")"
+    mkdir -p -- "$RUNNER_SESSION_DIR"
+    export RUNNER_SESSION_DIR
+  fi
+  RUNNER_FIRST_FAILURE_FILE="$(mktemp)"
+  export RUNNER_FIRST_FAILURE_FILE
   batch_all_process_repo "$@" || rc=$?
+  rm -f -- "$RUNNER_FIRST_FAILURE_FILE"
   printf '%s\n' "$rc" >"${2}.rc"
 }
 
@@ -10310,6 +10367,7 @@ batch_all_fold_result() {
   local -r prefix="$2"
   local result_exit="" line
 
+  batch_all_adopt_worker_session "$prefix"
   dep_updater_batch_all_append_child_updates "${prefix}.updates"
   if [[ ! -e "${prefix}.done" ]]; then
     log "[batch-all] FAILED (${slug}) worker exited before finishing"
@@ -10456,13 +10514,7 @@ batch_all_dispatch() {
 
   log_batch_all_top_level_dirs
 
-  if [[ -z "$batch_all_jobs" ]]; then
-    # Fail like --jobs does: a set but invalid value is an operator mistake, not a request for auto.
-    if [[ -n "${DEP_UPDATER_JOBS:-}" && ! "${DEP_UPDATER_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
-      die "DEP_UPDATER_JOBS requires a positive integer (got: ${DEP_UPDATER_JOBS})"
-    fi
-    batch_all_jobs="$(batch_all_default_jobs)"
-  fi
+  batch_all_resolve_jobs
 
   discover_file="$(mktemp)"
   discover_batch_all_repos >"$discover_file" || discover_rc=$?

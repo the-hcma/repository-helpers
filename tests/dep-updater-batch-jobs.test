@@ -25,7 +25,8 @@ extract_functions() {
   done
 }
 extract_functions \
-  batch_all_default_jobs batch_all_descendant_pids batch_all_fold_result batch_all_now_ms \
+  batch_all_adopt_worker_session batch_all_default_jobs batch_all_descendant_pids \
+  batch_all_fold_result batch_all_now_ms batch_all_resolve_jobs batch_all_stdin_is_tty \
   batch_all_record_timing batch_all_repo_color batch_all_write_timings \
   batch_all_run_parallel batch_all_run_serial batch_all_stop_workers batch_all_worker_finished \
   batch_all_worker_main >"${tmp}/functions"
@@ -194,6 +195,71 @@ env DEP_UPDATER_TIMINGS_FILE="${tmp}/quoted.jsonl" bash -c '
 ' bash "${tmp}/functions"
 assert_contains "a repo name with a quote and a backslash stays valid JSON" \
   "$(jq -r '.results[0].repo' "${tmp}/quoted.jsonl")" 'we"ird\name'
+
+printf '\n=== jobs: a terminal keeps the default run serial (child prompts need stdin) ===\n'
+resolve_jobs() {
+  # resolve_jobs <tty:yes|no> <batch_all_jobs> [VAR=value ...]
+  local -r tty="$1" jobs="$2"
+  shift 2
+  env "$@" bash -c '
+    source "$1"; batch_all_jobs_auto_cap=4; batch_all_jobs="$3"
+    log() { printf "%s\n" "$*"; }
+    if [[ "$2" == yes ]]; then batch_all_stdin_is_tty() { return 0; }; else batch_all_stdin_is_tty() { return 1; }; fi
+    batch_all_resolve_jobs
+    printf "jobs=%s\n" "$batch_all_jobs"
+  ' bash "${tmp}/functions" "$tty" "$jobs"
+}
+tty_default="$(resolve_jobs yes '' DEP_UPDATER_JOBS=4)"
+assert_contains "an explicit DEP_UPDATER_JOBS is honoured at a terminal" "$tty_default" "jobs=4"
+assert_contains "an explicit DEP_UPDATER_JOBS at a terminal warns that prompts are skipped" "$tty_default" "parallel children have no stdin"
+tty_auto="$(env -u DEP_UPDATER_JOBS bash -c '
+  source "$1"; batch_all_jobs_auto_cap=4; batch_all_jobs=""; log() { printf "%s\n" "$*"; }
+  batch_all_default_jobs() { printf 4; }; batch_all_stdin_is_tty() { return 0; }
+  batch_all_resolve_jobs; printf "jobs=%s\n" "$batch_all_jobs"' bash "${tmp}/functions")"
+assert_contains "the default run is serial at a terminal" "$tty_auto" "jobs=1"
+assert_contains "the serial fallback at a terminal is explained" "$tty_auto" "stdin is a terminal, so running serially"
+assert_contains "an explicit --jobs 3 is honoured at a terminal" "$(resolve_jobs yes 3)" "jobs=3"
+assert_contains "the default count is kept when stdin is not a terminal" \
+  "$(env -u DEP_UPDATER_JOBS bash -c '
+    source "$1"; batch_all_jobs_auto_cap=4; batch_all_jobs=""; log() { :; }
+    batch_all_default_jobs() { printf 4; }; batch_all_stdin_is_tty() { return 1; }
+    batch_all_resolve_jobs; printf "jobs=%s\n" "$batch_all_jobs"' bash "${tmp}/functions")" "jobs=4"
+invalid_out="$(env DEP_UPDATER_JOBS=abc bash -c '
+  source "$1"; batch_all_jobs=""; die() { printf "DIE %s\n" "$*"; exit 1; }
+  batch_all_resolve_jobs' bash "${tmp}/functions" 2>&1 || true)"
+assert_contains "an invalid DEP_UPDATER_JOBS is an error" "$invalid_out" "DEP_UPDATER_JOBS requires a positive integer (got: abc)"
+
+printf '\n=== jobs: workers get private runner state ===\n'
+runner_out="$(bash -c '
+  source "$1"
+  RUNNER_SESSION_DIR="$(mktemp -d)"; export RUNNER_SESSION_DIR
+  parent_session="$RUNNER_SESSION_DIR"
+  batch_all_process_repo() {
+    printf "session=%s first_failure=%s\n" "$RUNNER_SESSION_DIR" "$RUNNER_FIRST_FAILURE_FILE"
+    mkdir -p "${RUNNER_SESSION_DIR}/uuid-$(basename "$2")"
+    printf "uuid-%s\n" "$(basename "$2")" >"${RUNNER_SESSION_DIR}/.order"
+  }
+  d="$(mktemp -d)"
+  ( batch_all_worker_main x "${d}/0" "" "" ) >"${d}/0.out" 2>&1
+  ( batch_all_worker_main x "${d}/1" "" "" ) >"${d}/1.out" 2>&1
+  printf "%s\n" "$(<"${d}/0.out")" "$(<"${d}/1.out")"
+  RUNNER_SESSION_DIR="$parent_session" batch_all_adopt_worker_session "${d}/0"
+  RUNNER_SESSION_DIR="$parent_session" batch_all_adopt_worker_session "${d}/1"
+  printf "adopted=%s\n" "$(tr "\n" " " <"${parent_session}/.order")"
+  printf "worker_dir_left=%s\n" "$(compgen -G "${parent_session}/worker-*" || true)"
+' bash "${tmp}/functions" 2>&1)"
+assert_contains "each worker runs in its own runner sub-session" "$runner_out" "/worker-0 first_failure="
+assert_contains "workers do not share a runner sub-session" "$runner_out" "/worker-1 first_failure="
+assert_contains "the parent adopts every worker's runner records in repo order" "$runner_out" "adopted=uuid-0 uuid-1 "
+assert_contains "adopting removes the worker sub-session" "$runner_out" "worker_dir_left="$'\n'
+
+printf '\n=== static: EPOCHREALTIME is locale safe ===\n'
+# shellcheck disable=SC2016  # literal source patterns
+if grep -qF '${EPOCHREALTIME//[!0-9]/}' "$script" && ! grep -qF '${EPOCHREALTIME/./}' "$script"; then
+  pass_case "timing strips every non-digit from EPOCHREALTIME (comma-decimal locales)"
+else
+  fail_case "timing strips every non-digit from EPOCHREALTIME (comma-decimal locales)"
+fi
 
 printf '\n=== jobs: INT/TERM stops workers and their in-flight commands ===\n'
 extract_functions batch_all_cleanup_on_interrupt >>"${tmp}/functions"
