@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# agent-review-reviewers — which agent reviewers are active for a repo (repository-helpers#716).
+#
+# Source of truth is the GitHub custom property `agent-reviewers` (multi-select: coderabbit,
+# copilot, bugbot, none), with an org-level default. Precedence, highest first:
+#   1. AGENT_REVIEW_QUOTA_FALLBACK_CHAIN (explicit operator override; the property is not read)
+#   2. the repo's `agent-reviewers` custom property
+#   3. the built-in default chain (coderabbit,copilot,bugbot)
+#
+# The property filters the SET only; escalation order stays fixed in code. `none` disables agent
+# review. An empty/unset property, or a failed read, falls back to the default (read failures WARN).
+# shellcheck disable=SC2016  # jq filter strings use single quotes
+
+agent_review_reviewers_default_chain='coderabbit,copilot,bugbot'
+agent_review_reviewers_property_name='agent-reviewers'
+# Cache TTL for the property read (seconds); the property rarely changes mid-review.
+agent_review_reviewers_cache_ttl_s=300
+
+# Prints the effective ordered, comma-separated reviewer chain for <repo> ("" when disabled).
+# Returns 0 always; a disabled repo is an empty chain, not an error.
+agent_review_reviewers_effective_chain() {
+  local -r repo="${1:-}"
+  local prop
+
+  if [[ -n "${AGENT_REVIEW_QUOTA_FALLBACK_CHAIN:-}" ]]; then
+    printf '%s' "${AGENT_REVIEW_QUOTA_FALLBACK_CHAIN}"
+    return 0
+  fi
+  if [[ -z "${repo}" ]]; then
+    printf '%s' "${agent_review_reviewers_default_chain}"
+    return 0
+  fi
+  prop="$(agent_review_reviewers_property_cached "${repo}")"
+  agent_review_reviewers_filter_chain "${prop}"
+}
+
+# agent_review_reviewers_filter_chain <property-csv> — applies the property to the default chain.
+agent_review_reviewers_filter_chain() {
+  local -r prop="${1:-}"
+  local agent known out="" has_none=0 want=","
+
+  if [[ -z "${prop}" ]]; then
+    printf '%s' "${agent_review_reviewers_default_chain}"
+    return 0
+  fi
+  while IFS= read -r agent || [[ -n "${agent}" ]]; do
+    if [[ "${agent}" == 'none' ]]; then
+      has_none=1
+    elif [[ -n "${agent}" ]]; then
+      want+="${agent},"
+    fi
+  done < <(printf '%s' "${prop}" | tr ',' '\n')
+  if (( has_none == 1 )) && [[ "${want}" == ',' ]]; then
+    return 0
+  fi
+  while IFS= read -r known || [[ -n "${known}" ]]; do
+    if [[ "${want}" == *",${known},"* ]]; then
+      out+="${out:+,}${known}"
+    fi
+  done < <(printf '%s' "${agent_review_reviewers_default_chain}" | tr ',' '\n')
+  if [[ -z "${out}" ]]; then
+    printf 'wait-for-agent-review: WARN: %s=%s has no known reviewer; using default\n' \
+      "${agent_review_reviewers_property_name}" "${prop}" >&2
+    printf '%s' "${agent_review_reviewers_default_chain}"
+    return 0
+  fi
+  printf '%s' "${out}"
+}
+
+# True when <repo> has agent review disabled (agent-reviewers=none): no agent sign-off is required.
+agent_review_reviewers_is_disabled() {
+  local chain
+
+  chain="$(agent_review_reviewers_effective_chain "${1:-}")"
+  [[ -z "${chain}" ]]
+}
+
+# True when <agent> is active for <repo>.
+agent_review_reviewers_is_enabled() {
+  local -r agent="$1"
+  local chain
+
+  chain="$(agent_review_reviewers_effective_chain "${2:-}")"
+  [[ ",${chain}," == *",${agent},"* ]]
+}
+
+# Cached property read (file cache so $(...) subshells and repeated calls share one API hit).
+agent_review_reviewers_property_cached() {
+  local -r repo="$1"
+  local cache_dir cache_file now mtime value
+
+  cache_dir="${AGENT_REVIEW_REVIEWERS_CACHE_DIR:-${HOME}/scratch/repository-helpers/agent-reviewers}"
+  cache_file="${cache_dir}/${repo//\//__}"
+  now="$(date +%s)"
+  if [[ -f "${cache_file}" ]]; then
+    mtime="$(stat --format=%Y "${cache_file}" 2>/dev/null || printf '0')"
+    if (( now - mtime < agent_review_reviewers_cache_ttl_s )); then
+      cat "${cache_file}"
+      return 0
+    fi
+  fi
+  if ! value="$(agent_review_reviewers_property_fetch "${repo}" 2>/dev/null)"; then
+    printf 'wait-for-agent-review: WARN: could not read %s for %s; using default reviewers\n' \
+      "${agent_review_reviewers_property_name}" "${repo}" >&2
+    return 0
+  fi
+  if mkdir -p "${cache_dir}" 2>/dev/null; then
+    printf '%s' "${value}" >"${cache_file}"
+  fi
+  printf '%s' "${value}"
+}
+
+# Prints the property value as a comma-separated list; empty when unset. Returns 1 on API failure.
+agent_review_reviewers_property_fetch() {
+  local -r repo="$1"
+
+  ar_runner_gh_api_stream "agent-review ${agent_review_reviewers_property_name} property" \
+    "repos/${repo}/properties/values" --jq \
+    '[.[] | select(.property_name == "'"${agent_review_reviewers_property_name}"'") | .value]
+      | first // [] | (if type == "array" then . else [.] end) | map(select(. != null)) | join(",")'
+}

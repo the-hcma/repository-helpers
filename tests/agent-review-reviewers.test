@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Tests for scripts/lib/agent-review-reviewers (agent-reviewers custom property, #716).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+lib="${script_dir}/../scripts/lib/agent-review"
+quota_lib="${script_dir}/../scripts/lib/agent-review-quota"
+reviewers_lib="${script_dir}/../scripts/lib/agent-review-reviewers"
+readonly lib quota_lib reviewers_lib
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+fake_bin="${work_dir}/bin"
+gh_log="${work_dir}/gh.log"
+fixture="${work_dir}/properties.json"
+mkdir -p "${fake_bin}"
+
+# Fake gh: logs the call, fails when FAKE_GH_FAIL=1, else applies the caller's --jq to the fixture.
+cat >"${fake_bin}/gh" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FAKE_GH_LOG}"
+if [[ "${FAKE_GH_FAIL:-0}" == '1' ]]; then
+  printf 'HTTP 403: Resource not accessible\n' >&2
+  exit 1
+fi
+filter='.'
+while (( $# > 0 )); do
+  if [[ "$1" == '--jq' ]]; then
+    filter="$2"
+    shift
+  fi
+  shift
+done
+exec jq -r "${filter}" "${FAKE_GH_FIXTURE}"
+FAKE
+chmod +x "${fake_bin}/gh"
+
+# run_chain <fixture-json> [env assignments…] — prints stdout of the effective chain for a repo.
+run_case() {
+  local -r json="$1"
+  local -r snippet="$2"
+  shift 2
+
+  printf '%s' "${json}" >"${fixture}"
+  : >"${gh_log}"
+  rm -rf "${work_dir}/cache"
+  env -u AGENT_REVIEW_QUOTA_FALLBACK_CHAIN -u AGENT_REVIEW_GITHUB_REPO \
+    PATH="${fake_bin}:${PATH}" FAKE_GH_LOG="${gh_log}" FAKE_GH_FIXTURE="${fixture}" \
+    AGENT_REVIEW_REVIEWERS_CACHE_DIR="${work_dir}/cache" "$@" \
+    bash -c "source '${lib}'; source '${quota_lib}'; ${snippet}" 2>&1
+}
+
+printf '\n=== property filters the default chain ===\n'
+out="$(run_case '[{"property_name":"agent-reviewers","value":["bugbot","copilot"]}]' \
+  "agent_review_reviewers_effective_chain the-hcma/example")"
+assert_contains "property [bugbot, copilot] keeps the fixed escalation order" "$out" "copilot,bugbot"
+assert_not_contains "a disabled agent is dropped from the chain" "$out" "coderabbit"
+
+out="$(run_case '[{"property_name":"agent-reviewers","value":["none"]}]' \
+  "printf '[%s]' \"\$(agent_review_reviewers_effective_chain the-hcma/example)\"")"
+assert_contains "property none yields an empty chain" "$out" "[]"
+
+out="$(run_case '[{"property_name":"agent-reviewers","value":["none"]}]' \
+  "agent_review_reviewers_is_enabled copilot the-hcma/example && echo enabled || echo disabled")"
+assert_contains "property none disables copilot" "$out" "disabled"
+
+out="$(run_case '[{"property_name":"agent-reviewers","value":["none"]}]' \
+  "agent_review_reviewers_is_disabled the-hcma/example && echo disabled || echo active")"
+assert_contains "property none marks agent review disabled" "$out" "disabled"
+
+out="$(run_case '[{"property_name":"agent-reviewers","value":["copilot"]}]' \
+  "agent_review_reviewers_is_disabled the-hcma/example && echo disabled || echo active")"
+assert_contains "property copilot leaves agent review active" "$out" "active"
+
+printf '\n=== unset or empty property falls back to the default ===\n'
+out="$(run_case '[{"property_name":"other","value":"x"}]' \
+  "agent_review_reviewers_effective_chain the-hcma/example")"
+assert_contains "absent property uses the default chain" "$out" "coderabbit,copilot,bugbot"
+
+out="$(run_case '[{"property_name":"agent-reviewers","value":null}]' \
+  "agent_review_reviewers_effective_chain the-hcma/example")"
+assert_contains "null property value uses the default chain" "$out" "coderabbit,copilot,bugbot"
+
+out="$(run_case '[{"property_name":"agent-reviewers","value":["nonsense"]}]' \
+  "agent_review_reviewers_effective_chain the-hcma/example")"
+assert_contains "property with no known reviewer warns" "$out" "has no known reviewer; using default"
+assert_contains "property with no known reviewer uses the default chain" "$out" "coderabbit,copilot,bugbot"
+
+printf '\n=== API failure falls back with a warning ===\n'
+out="$(run_case '[]' "agent_review_reviewers_effective_chain the-hcma/example" FAKE_GH_FAIL=1)"
+assert_contains "failed property read warns" "$out" "could not read agent-reviewers for the-hcma/example"
+assert_contains "failed property read uses the default chain" "$out" "coderabbit,copilot,bugbot"
+
+printf '\n=== explicit env override wins over the property ===\n'
+out="$(run_case '[{"property_name":"agent-reviewers","value":["none"]}]' \
+  "agent_review_reviewers_effective_chain the-hcma/example" \
+  AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=bugbot)"
+assert_contains "AGENT_REVIEW_QUOTA_FALLBACK_CHAIN overrides the property" "$out" "bugbot"
+if [[ -s "${gh_log}" ]]; then
+  fail_case "env override does not read the property (gh was called: $(tr '\n' ';' <"${gh_log}"))"
+else
+  pass_case "env override does not read the property"
+fi
+
+printf '\n=== property read is cached ===\n'
+run_case '[{"property_name":"agent-reviewers","value":["copilot"]}]' \
+  "agent_review_reviewers_effective_chain the-hcma/example >/dev/null
+   agent_review_reviewers_effective_chain the-hcma/example >/dev/null
+   agent_review_reviewers_effective_chain the-hcma/example >/dev/null" >/dev/null
+assert_count_equals "three lookups hit the properties API once" "$(cat "${gh_log}")" "properties/values" 1
+assert_contains "the API call targets the repo properties endpoint" \
+  "$(cat "${gh_log}")" "repos/the-hcma/example/properties/values"
+
+printf '\n=== chain and candidates follow the property ===\n'
+out="$(run_case '[{"property_name":"agent-reviewers","value":["bugbot"]}]' \
+  "AGENT_REVIEW_GITHUB_REPO=the-hcma/example
+   agent_review_quota_escalation_agent_ids | tr '\n' ' '" )"
+assert_contains "escalation ids list only the enabled agent" "$out" "bugbot"
+assert_not_contains "escalation ids omit disabled copilot" "$out" "copilot"
+
+out="$(run_case '[{"property_name":"agent-reviewers","value":["bugbot"]}]' \
+  "AGENT_REVIEW_GITHUB_REPO=the-hcma/example
+   agent_review_requestable_agent_candidates copilot | tr '\n' ' '")"
+assert_contains "requestable candidates include the enabled agent" "$out" "bugbot"
+assert_not_contains "a disabled preferred agent is not requestable" "$out" "copilot"
+
+printf '\n=== static: status gate ===\n'
+if grep -qF "agent_review_reviewers_is_disabled \"\${repo}\"" "$lib"; then
+  pass_case "complete_ready skips the agent sign-off requirement when agent review is disabled"
+else
+  fail_case "complete_ready skips the agent sign-off requirement when agent review is disabled"
+fi
+
+printf '\n=== static: reviewers lib ===\n'
+if ! grep -nE '(^|[^_[:alnum:]])gh (api|pr|issue)' "$reviewers_lib" \
+  | grep -vE 'github_api_exec_with_rate_limit_retry|^[0-9]+:\s*#|gh api "repos' >/dev/null; then
+  pass_case "reviewers lib has no unwrapped gh call"
+else
+  fail_case "reviewers lib has an unwrapped gh call"
+fi
+
+test_summary
