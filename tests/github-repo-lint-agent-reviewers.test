@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Tests for the agent-reviewers custom property check in scripts/lib/repo-practices (#716).
+# Kept apart from tests/github-repo-lint-part-*.test, which are already at the ~60s shard budget.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+# shellcheck source=tests/lib/github-repo-lint-part-init
+source "${script_dir}/lib/github-repo-lint-part-init"
+
+pass=0
+fail=0
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+mock_bin="${work_dir}/bin"
+capture="${work_dir}/capture"
+mkdir -p "$mock_bin"
+
+# Mock gh: serves MOCK_VALUES for the repo properties read; records the org schema PUT and its payload.
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+case "$args" in
+  *properties/values*)
+    if [[ "${MOCK_VALUES_FAIL:-0}" == '1' ]]; then
+      printf 'HTTP 403\n' >&2
+      exit 1
+    fi
+    cat "${MOCK_VALUES}"
+    exit 0
+    ;;
+  *--method\ PUT*orgs/*/properties/schema/*)
+    printf '%s\n' "$args" >>"${MOCK_CAPTURE}"
+    while (( $# > 0 )); do
+      if [[ "$1" == '--input' ]]; then
+        cat "$2" >>"${MOCK_CAPTURE}"
+        printf '\n' >>"${MOCK_CAPTURE}"
+      fi
+      shift
+    done
+    exit 0
+    ;;
+esac
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+# run_check <values-json> <suggest> <apply-fix> [extra env…] — prints "rc=<n>" then the log.
+run_check() {
+  local -r values="$1" suggest="$2" apply="$3"
+  shift 3
+
+  printf '%s' "$values" >"${work_dir}/values.json"
+  : >"$capture"
+  # shellcheck disable=SC2016  # the bash -c body is intentionally single-quoted
+  env RUNNER_SESSION_ROOT="${work_dir}/runner-sessions" MOCK_VALUES="${work_dir}/values.json" \
+    MOCK_CAPTURE="$capture" PATH="${mock_bin}:${PATH}" "$@" \
+    bash -c '
+      set -uo pipefail
+      # shellcheck disable=SC1091
+      source "$1"
+      # shellcheck disable=SC1091
+      source "$2"
+      rp_suggest="$3"
+      rp_apply_fix="$4"
+      rc=0
+      rp_check_agent_reviewers_property the-hcma/example-repo || rc=$?
+      printf "rc=%s\n" "$rc"
+    ' bash "$runner_bootstrap" "$lib" "$suggest" "$apply" 2>&1
+}
+
+check() {
+  local -r label="$1" haystack="$2" needle="$3"
+
+  if grep -qF -- "$needle" <<<"$haystack"; then
+    printf '[PASS] %s\n' "$label"
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] %s (missing %q in: %s)\n' "$label" "$needle" "$haystack"
+    fail=$(( fail + 1 ))
+  fi
+}
+
+printf '\n=== agent-reviewers property: defined values ===\n'
+out="$(run_check '[{"property_name":"agent-reviewers","value":["copilot","bugbot"]}]' 0 0)"
+check "a valid multi-select value passes" "$out" "rc=0"
+check "a valid value logs OK" "$out" "agent reviewers property"
+
+out="$(run_check '[{"property_name":"agent-reviewers","value":["none"]}]' 0 0)"
+check "none alone is valid" "$out" "rc=0"
+
+out="$(run_check '[{"property_name":"agent-reviewers","value":["copilot","none"]}]' 0 0)"
+check "none combined with a reviewer fails" "$out" "rc=1"
+check "the failure names the property" "$out" "custom property 'agent-reviewers' has an invalid value"
+
+out="$(run_check '[{"property_name":"agent-reviewers","value":["gemini"]}]' 0 0)"
+check "an unknown reviewer fails" "$out" "rc=1"
+
+printf '\n=== agent-reviewers property: undefined or unreadable ===\n'
+out="$(run_check '[{"property_name":"team","value":"x"}]' 1 0)"
+check "an undefined property does not fail the audit" "$out" "rc=0"
+check "an undefined property suggests defining it" "$out" "define org custom property 'agent-reviewers'"
+
+out="$(run_check '[]' 0 0 MOCK_VALUES_FAIL=1)"
+check "an unreadable property does not fail the audit" "$out" "rc=0"
+
+printf '\n=== agent-reviewers property: --apply-fix defines the org schema ===\n'
+out="$(run_check '[]' 0 1)"
+check "apply-fix succeeds" "$out" "rc=0"
+cap="$(cat "$capture")"
+check "apply-fix PUTs the org property schema" "$cap" "orgs/the-hcma/properties/schema/agent-reviewers"
+check "the schema is a multi-select" "$cap" '"value_type":"multi_select"'
+check "the schema allows none" "$cap" '"allowed_values":["coderabbit","copilot","bugbot","none"]'
+check "the schema defaults to every reviewer" "$cap" '"default_value":["coderabbit","copilot","bugbot"]'
+
+printf '\n=== static: wiring ===\n'
+# shellcheck disable=SC2016  # literal source text, not an expansion
+if grep -qF 'rp_check_agent_reviewers_property "$slug"' "$lib"; then
+  printf '[PASS] the check runs in the full audit\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] the check runs in the full audit\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '%s passed, %s failed\n' "$pass" "$fail"
+if [[ "$fail" -gt 0 ]]; then
+  exit 1
+fi
