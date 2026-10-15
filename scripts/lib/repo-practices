@@ -10402,24 +10402,32 @@ rp_check_deployment_env_protection() {
 }
 
 # ---------------------------------------------------------------------------
-# agent-reviewers custom property (repository-helpers#716). The org-level
-# multi-select property `agent-reviewers` picks which agent reviewers
-# (coderabbit, copilot, bugbot, or none) watch a repo's PRs; see
-# scripts/lib/agent-review-reviewers. A missing definition is advisory (every
-# repo falls back to all reviewers); a malformed value FAILS.
+# agent-reviewers custom properties (repository-helpers#716). The org-level
+# multi-select `agent-reviewers` (coderabbit, copilot, bugbot) picks which agent
+# reviewers watch a repo's PRs and the true/false `agent-review-enabled` turns
+# agent review off; see scripts/lib/agent-review-reviewers. A missing definition
+# is advisory (a repo falls back to coderabbit only); a malformed value FAILS.
 # ---------------------------------------------------------------------------
 
 rp_agent_reviewers_schema_applied=0
 
-# rp_agent_reviewers_allowed_json — JSON array of the values the property accepts.
+# rp_agent_reviewers_allowed_json — JSON array of the reviewers the multi-select accepts.
 rp_agent_reviewers_allowed_json() {
-  local -r csv="${agent_review_reviewers_default_chain},none"
-
   rp_runner_jq_n 'repo-practices agent-reviewers allowed values' -c \
-    --arg csv "$csv" '$csv | split(",")'
+    --arg csv "$agent_review_reviewers_known_chain" '$csv | split(",")'
 }
 
-# rp_apply_agent_reviewers_schema <org> — define the org property once per run.
+# rp_agent_reviewers_put_schema <org> <name> <payload> — PUT one org property definition.
+rp_agent_reviewers_put_schema() {
+  local -r org="$1" name="$2" payload="$3"
+
+  rp_log_warn "${org}: defining org custom property '${name}'"
+  rp_runner_gh_api_input "repo-practices gh define ${name} property" "$payload" \
+    --method PUT "orgs/${org}/properties/schema/${name}"
+}
+
+# rp_apply_agent_reviewers_schema <org> — define both org properties once per run.
+# GitHub rejects default_value on an optional property, so an unset value is the default.
 rp_apply_agent_reviewers_schema() {
   local -r org="$1"
   local allowed payload
@@ -10432,15 +10440,19 @@ rp_apply_agent_reviewers_schema() {
   allowed="$(rp_agent_reviewers_allowed_json)"
   payload="$(rp_runner_jq_n 'repo-practices agent-reviewers schema payload' -c \
     --argjson allowed "$allowed" \
-    '{value_type: "multi_select", required: false,
-      allowed_values: $allowed,
-      description: "Agent code reviewers active on PRs (none disables agent review)"}')"
-  rp_log_warn "${org}: defining org custom property '${agent_review_reviewers_property_name}'"
-  rp_runner_gh_api_input "repo-practices gh define agent-reviewers property" "$payload" \
-    --method PUT "orgs/${org}/properties/schema/${agent_review_reviewers_property_name}" \
+    '{value_type: "multi_select", required: false, allowed_values: $allowed,
+      description: "Agent code reviewers active on PRs (unset: coderabbit only)"}')"
+  rp_agent_reviewers_put_schema "$org" "$agent_review_reviewers_property_name" "$payload" \
     || put_exit_code=$?
+  if (( put_exit_code == 0 )); then
+    payload="$(rp_runner_jq_n 'repo-practices agent-review-enabled schema payload' -c \
+      '{value_type: "true_false", required: false,
+        description: "Set to false to turn agent review off for the repo (unset: on)"}')"
+    rp_agent_reviewers_put_schema "$org" "$agent_review_reviewers_enabled_property_name" \
+      "$payload" || put_exit_code=$?
+  fi
   if (( put_exit_code != 0 )); then
-    rp_log_warn "${org}: could not define org custom property '${agent_review_reviewers_property_name}' (the gh token needs the admin:org scope); define it in the org settings instead"
+    rp_log_warn "${org}: could not define the agent review custom properties (the gh token needs the admin:org scope); define them in the org settings instead"
     return 1
   fi
   return 0
@@ -10448,7 +10460,7 @@ rp_apply_agent_reviewers_schema() {
 
 rp_check_agent_reviewers_property() {
   local slug="$1"
-  local values_json entry allowed url
+  local values_json reviewers_entry enabled_entry allowed url
   local fetch_exit=0 invalid_exit=0
 
   url="$(rp_github_url "$slug" '/settings/custom-properties')"
@@ -10456,36 +10468,44 @@ rp_check_agent_reviewers_property() {
     "repos/${slug}/properties/values")" || fetch_exit=$?
   if (( fetch_exit != 0 )); then
     if [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest "${slug}: could not read custom properties; agent reviewers default to all"
+      rp_log_suggest "${slug}: could not read custom properties; agent review defaults to coderabbit only"
     fi
     return 0
   fi
-  entry="$(rp_runner_jq_file "repo-practices agent-reviewers entry" "$values_json" -c \
+  reviewers_entry="$(rp_runner_jq_file "repo-practices agent-reviewers entry" "$values_json" -c \
     --arg name "$agent_review_reviewers_property_name" \
     '[.[]? | select(.property_name == $name)] | first // empty')"
-  if [[ -z "$entry" ]]; then
+  enabled_entry="$(rp_runner_jq_file "repo-practices agent-review-enabled entry" "$values_json" -c \
+    --arg name "$agent_review_reviewers_enabled_property_name" \
+    '[.[]? | select(.property_name == $name)] | first // empty')"
+  if [[ -z "$reviewers_entry" || -z "$enabled_entry" ]]; then
     if [[ "$rp_apply_fix" -eq 1 ]]; then
       if ! rp_apply_agent_reviewers_schema "${slug%%/*}"; then
-        rp_log_suggest "${slug}: define org custom property '${agent_review_reviewers_property_name}' in the org settings (multi-select: coderabbit, copilot, bugbot, none)"
+        rp_log_suggest "${slug}: define org custom properties '${agent_review_reviewers_property_name}' (multi-select: coderabbit, copilot, bugbot) and '${agent_review_reviewers_enabled_property_name}' (true/false) in the org settings"
       fi
     elif [[ "$rp_suggest" -eq 1 ]]; then
       rp_log_suggest \
-        "${slug}: define org custom property '${agent_review_reviewers_property_name}' (run scripts/github-repo-lint --repo ${slug} --apply-fix); until then all reviewers are active"
+        "${slug}: define org custom properties '${agent_review_reviewers_property_name}' and '${agent_review_reviewers_enabled_property_name}' (run scripts/github-repo-lint --repo ${slug} --apply-fix); until then only coderabbit is active"
     fi
-    rp_log_check_ok "$slug" 'agent reviewers (property not defined; default: all)' "$url"
+    rp_log_check_ok "$slug" 'agent reviewers (properties not defined; default: coderabbit only)' "$url"
     return 0
   fi
   allowed="$(rp_agent_reviewers_allowed_json)"
-  rp_runner_jq_file "repo-practices agent-reviewers value valid" "$entry" -e \
+  rp_runner_jq_file "repo-practices agent-reviewers value valid" "$reviewers_entry" -e \
     --argjson allowed "$allowed" \
-    '(.value // []) as $v
-      | ($v | if type == "array" then . else [.] end) as $a
-      | ($a | all(. as $x | $allowed | index($x) != null))
-        and (($a | index("none")) == null or ($a | length) == 1)' >/dev/null \
+    '(.value // []) | (if type == "array" then . else [.] end)
+      | all(. as $x | $allowed | index($x) != null)' >/dev/null || invalid_exit=$?
+  if (( invalid_exit != 0 )); then
+    rp_log_fail "${slug}: custom property '${agent_review_reviewers_property_name}' has an invalid value (allowed: coderabbit, copilot, bugbot)"
+    rp_log_check_fail "$slug" 'agent reviewers property (invalid value)' "$url"
+    return 1
+  fi
+  rp_runner_jq_file "repo-practices agent-review-enabled value valid" "$enabled_entry" -e \
+    '(.value // "true") | tostring | . == "true" or . == "false"' >/dev/null \
     || invalid_exit=$?
   if (( invalid_exit != 0 )); then
-    rp_log_fail "${slug}: custom property '${agent_review_reviewers_property_name}' has an invalid value (allowed: coderabbit, copilot, bugbot, or none alone)"
-    rp_log_check_fail "$slug" 'agent reviewers property (invalid value)' "$url"
+    rp_log_fail "${slug}: custom property '${agent_review_reviewers_enabled_property_name}' has an invalid value (allowed: true, false)"
+    rp_log_check_fail "$slug" 'agent review enabled property (invalid value)' "$url"
     return 1
   fi
   rp_log_check_ok "$slug" 'agent reviewers property' "$url"
