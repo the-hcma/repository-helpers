@@ -15,6 +15,9 @@ agent_review_reviewers_default_chain='coderabbit,copilot,bugbot'
 agent_review_reviewers_property_name='agent-reviewers'
 # Cache TTL for the property read (seconds); the property rarely changes mid-review.
 agent_review_reviewers_cache_ttl_s=300
+# A failed read is remembered this long so a quota or API outage is not re-tried (and re-warned)
+# on every chain lookup.
+agent_review_reviewers_failure_ttl_s=60
 
 # Prints the effective ordered, comma-separated reviewer chain for <repo> ("" when disabled).
 # Returns 0 always; a disabled repo is an empty chain, not an error.
@@ -23,6 +26,10 @@ agent_review_reviewers_effective_chain() {
   local prop
 
   if [[ -n "${AGENT_REVIEW_QUOTA_FALLBACK_CHAIN:-}" ]]; then
+    # The override takes the same `none` as the property: agent review disabled.
+    if [[ "${AGENT_REVIEW_QUOTA_FALLBACK_CHAIN}" == 'none' ]]; then
+      return 0
+    fi
     printf '%s' "${AGENT_REVIEW_QUOTA_FALLBACK_CHAIN}"
     return 0
   fi
@@ -87,7 +94,7 @@ agent_review_reviewers_is_enabled() {
 # Cached property read (file cache so $(...) subshells and repeated calls share one API hit).
 agent_review_reviewers_property_cached() {
   local -r repo="$1"
-  local cache_dir cache_file now mtime value
+  local cache_dir cache_file now mtime value tmp
 
   cache_dir="${AGENT_REVIEW_REVIEWERS_CACHE_DIR:-${HOME}/scratch/repository-helpers/agent-reviewers}"
   cache_file="${cache_dir}/${repo//\//__}"
@@ -99,13 +106,25 @@ agent_review_reviewers_property_cached() {
       return 0
     fi
   fi
+  if [[ -f "${cache_file}.fail" ]]; then
+    mtime="$(stat --format=%Y "${cache_file}.fail" 2>/dev/null || printf '0')"
+    if (( now - mtime < agent_review_reviewers_failure_ttl_s )); then
+      return 0
+    fi
+  fi
   if ! value="$(agent_review_reviewers_property_fetch "${repo}" 2>/dev/null)"; then
     printf 'wait-for-agent-review: WARN: could not read %s for %s; using default reviewers\n' \
       "${agent_review_reviewers_property_name}" "${repo}" >&2
+    if mkdir -p "${cache_dir}" 2>/dev/null; then
+      : >"${cache_file}.fail"
+    fi
     return 0
   fi
   if mkdir -p "${cache_dir}" 2>/dev/null; then
-    printf '%s' "${value}" >"${cache_file}"
+    # Write via a temp file so a concurrent reader never sees a half-written (empty) cache.
+    tmp="$(mktemp "${cache_file}.XXXXXX" 2>/dev/null)" && printf '%s' "${value}" >"${tmp}" \
+      && mv "${tmp}" "${cache_file}"
+    rm -f "${cache_file}.fail"
   fi
   printf '%s' "${value}"
 }
