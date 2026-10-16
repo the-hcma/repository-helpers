@@ -108,9 +108,16 @@ assert_contains "every ask is counted" "$out" "$(printf 'accepted\t2\t')"
 out="$(ask_status "[${ask1},${limited5},${manual}]")"
 assert_contains "a manual retry marker counts as an ask" "$out" "$(printf 'pending\t2\t')"
 
+markerless_ack="{\"user\":{\"login\":\"coderabbitai[bot]\"},\"created_at\":\"2026-10-16T01:54:05Z\",\"body\":\"Action performed\\n\\nFull review triggered.\"}"
+review_mentioning_ack="{\"user\":{\"login\":\"coderabbitai[bot]\"},\"created_at\":\"2026-10-16T01:54:05Z\",\"body\":\"<!-- walkthrough_start -->\\nWalkthrough ... Action performed by the author earlier.\"}"
 paged="[${ask1}][${limited5}]"
 out="$(ask_status "${paged}")"
 assert_contains "paginated comment pages are flattened" "$out" "rate_limited"
+
+out="$(ask_status "[${ask2},${markerless_ack}]")"
+assert_contains "a markerless Action performed reply is recognised as the answer" "$out" "accepted"
+out="$(ask_status "[${ask2},${review_mentioning_ack}]")"
+assert_contains "a real review that merely contains the ack phrase is not an answer" "$out" "pending"
 
 printf '\n=== full-review asks: when another ask is allowed ===\n'
 max=4
@@ -164,9 +171,10 @@ assert_contains "a later ask is marked with its attempt number" "$out" "coderabb
 assert_contains "a later ask still contains the base marker" "$out" "coderabbit-full:${head_sha}"
 
 printf '\n=== the loop posts a numbered retry after a rate-limited ask ===\n'
+: >"${work_dir}/reads.log"
 out="$(run_lib "
   agent_review_agent_quota_rate_limited_for_agent() { return 1; }
-  agent_review_pr_issue_comments_json() { printf '%s' '[${ask1},${limited5}]'; }
+  agent_review_pr_issue_comments_json() { printf x >>'${work_dir}/reads.log'; printf '%s' '[${ask1},${limited5}]'; }
   runner_exec_stdout() { printf '%s\n' '$(( ready + 3600 ))'; }
   runner_exec() {
     if [[ \"\$*\" == *'gh pr comment'* ]]; then printf 'EXEC %s\n' \"\$*\"; return 0; fi
@@ -176,6 +184,8 @@ out="$(run_lib "
   agent_review_profile_request_last_resort_full_review o/r 7 '${head_sha}'")"
 assert_contains "the retry is posted on the PR" "$out" "gh pr comment 7 --repo o/r"
 assert_contains "the retry is numbered as attempt 2" "$out" "coderabbit-full:${head_sha}:retry2"
+assert_count_equals "the poster reads the PR comments once, so a failed re-read cannot reset the count" \
+  "$(cat "${work_dir}/reads.log")" "x" 1
 
 # --- the loop: does CodeRabbit have an answer for this head? ----------------------------------------
 response_seen() {
@@ -299,13 +309,14 @@ assert_contains "an ask older than an hour no longer holds the gate" "$out" "cle
 
 # --- sign-off: a clean zero-comment pass counts, a rate-limited head does not --------------------------------
 signed_off() {
-  # $1 head state -> "signed-off" or "not-signed-off" for a CodeRabbit-only repo with no comments
+  # $1 head state, $2 PR comments json (default none) -> "signed-off" or "not-signed-off" for a
+  # CodeRabbit-only repo
   bash -c "
     set -uo pipefail
     export AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=coderabbit
     source '${lib}'
     agent_review_coderabbit_head_state() { printf '%s\n' '$1'; }
-    agent_review_pr_issue_comments_json() { printf '[]\n'; }
+    agent_review_pr_issue_comments_json() { printf '%s' '${2:-[]}'; }
     agent_review_latest_issue_comment_body_for_profile() { printf ''; }
     rc=0
     agent_review_delivered_recognized_pass_on_head '{}' '${head_sha}' o/r 5 || rc=\$?
@@ -319,6 +330,12 @@ out="$(signed_off rate_limited)"
 assert_contains "Review rate limited is not a sign-off" "$out" "not-signed-off"
 out="$(signed_off none)"
 assert_contains "no CodeRabbit status and no comment is not a sign-off" "$out" "not-signed-off"
+clean_comment="[{\"user\":{\"login\":\"coderabbitai[bot]\"},\"created_at\":\"2026-10-16T01:54:05Z\",\"body\":\"<!-- walkthrough_start -->\\n**Actionable comments posted: 0**\\nReviewed ${head_sha}\"}]"
+out="$(signed_off none "${clean_comment}")"
+assert_contains "with no CodeRabbit status a clean current-head comment still signs off" "$out" "signed-off"
+assert_not_contains "that clean comment is a sign-off, not an unsigned head" "$out" "not-signed-off"
+out="$(signed_off rate_limited "${clean_comment}")"
+assert_contains "a rate-limited head is not signed off by an older clean comment" "$out" "not-signed-off"
 
 # --- the configured agent decides ------------------------------------------------------------------------
 printf '\n=== the active agent comes from the repo settings ===\n'
