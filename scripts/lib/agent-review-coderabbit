@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# agent-review-coderabbit — what CodeRabbit did with a head, and what the loop asked it (#717, #723).
+#
+# Two pure readers, kept out of the CodeRabbit profile so the loop can use them without switching the
+# active agent profile:
+#   * the head's commit status ("Review completed" vs "Review rate limited"), the reliable signal
+#     that a review ran (rate-limited heads end "success" with no review, and CodeRabbit also posts
+#     empty stub reviews and thread replies);
+#   * the loop's "@coderabbitai full review" asks on a PR and CodeRabbit's replies to them, so a
+#     rate-limited ask is repeated after the wait CodeRabbit stated instead of being counted as sent.
+# The agent_review_default_coderabbit_* constants are assigned in scripts/lib/agent-review, which
+# sources this lib; they exist by the time any function here runs.
+# shellcheck disable=SC2154
+
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runner-ensure"
+
+# agent_review_coderabbit_full_review_may_post <status-line> <now_epoch>
+# Decides from agent_review_coderabbit_full_review_status_from_comments output whether a (new)
+# ask may be posted: 0 yes, 1 no (CodeRabbit is working on it, its stated wait has not passed, or
+# the attempts are used up). Never asks again while CodeRabbit says to wait (#723).
+agent_review_coderabbit_full_review_may_post() {
+  local -r line="${1:-}"
+  local -r now="${2:-0}"
+  local status attempts ready asked
+
+  IFS=$'\t' read -r status attempts ready asked <<<"${line}"
+  : "${attempts:=0}" "${ready:=0}" "${asked:=0}"
+  case "${status}" in
+    none)
+      return 0
+      ;;
+    pending)
+      if (( attempts < agent_review_default_coderabbit_full_review_max_attempts )) \
+        && (( now - asked >= agent_review_default_coderabbit_full_review_pending_ttl_s )); then
+        return 0
+      fi
+      return 1
+      ;;
+    rate_limited)
+      if (( attempts < agent_review_default_coderabbit_full_review_max_attempts )) \
+        && (( now >= ready + agent_review_default_coderabbit_full_review_retry_margin_s )); then
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# agent_review_coderabbit_full_review_status_from_comments <comments-json> <head_sha>
+# Reads the PR's issue comments and prints one tab-separated line:
+#   <status> <attempts> <ready_epoch> <asked_epoch>
+# status is one of
+#   none          no ask for this head is on the PR
+#   pending       the newest ask has no CodeRabbit reply yet
+#   accepted      CodeRabbit replied that it ran (or started) the review
+#   rate_limited  CodeRabbit replied "Review rate limited"; ready_epoch is when it said to retry
+# A manual retry marker (coderabbit-full-retry) counts as an ask like the loop's own.
+agent_review_coderabbit_full_review_status_from_comments() {
+  local -r comments_json="${1:-}"
+  local -r head="${2:-}"
+  local base manual
+
+  base="$(agent_review_coderabbit_full_review_marker "${head}")"
+  manual="wait-for-agent-review:coderabbit-full-retry:${head}"
+  # shellcheck disable=SC2016  # jq program uses $base / $manual from --arg
+  ar_runner_jq_file "coderabbit full-review status" "${comments_json}" -r --slurp \
+    --arg base "${base}" --arg manual "${manual}" '
+    def ts: ((.created_at // "") | if . == "" then 0 else fromdateiso8601 end);
+    def wait_secs:
+      ((capture("available in (?<n>[0-9]+) (?<u>second|minute|hour)"; "i")? // null)
+        | if . == null then 1800
+          else ((.n | tonumber)
+                * ((.u | ascii_downcase) as $u
+                   | if $u == "hour" then 3600 elif $u == "minute" then 60 else 1 end))
+          end);
+    [ .[] | if type == "array" then .[] else . end ] as $all
+    | ($all | map(select((.body // "") | (contains($base) or contains($manual))))
+            | sort_by(.created_at // "")) as $asks
+    | if ($asks | length) == 0 then ["none", 0, 0, 0]
+      else
+        ($asks | last) as $ask
+        | ($all | map(select(((.user.login // "") | test("coderabbit|rabbit"; "i"))
+                             and ((.created_at // "") > ($ask.created_at // ""))
+                             and ((.body // "")
+                                  | test("auto-generated reply by coderabbit|command invocation"; "i"))))
+                | sort_by(.created_at // "")) as $replies
+        | if ($replies | length) == 0 then ["pending", ($asks | length), 0, ($ask | ts)]
+          else
+            ($replies | last) as $reply
+            | if (($reply.body // "") | test("rate limited|action not completed"; "i"))
+              then ["rate_limited", ($asks | length), (($reply | ts) + (($reply.body // "") | wait_secs)),
+                    ($ask | ts)]
+              else ["accepted", ($asks | length), 0, ($ask | ts)] end
+          end
+      end
+    | @tsv'
+}
+
+# agent_review_coderabbit_head_state <repo> <head_sha> — first field of agent_review_coderabbit_head_status.
+agent_review_coderabbit_head_state() {
+  local state rest
+
+  IFS=$'\t' read -r state rest <<<"$(agent_review_coderabbit_head_status "$1" "$2")"
+  : "${rest}"
+  printf '%s\n' "${state:-unknown}"
+}
+
+# agent_review_coderabbit_head_status <repo> <head_sha>
+# Same output as agent_review_coderabbit_head_status_from_statuses, read from the API and reused
+# for agent_review_default_coderabbit_head_state_cache_ttl_s. Prints "unknown 0" when the read
+# fails so callers can fall back to the older comment-based checks.
+agent_review_coderabbit_head_status() {
+  local -r repo="$1"
+  local -r head="$2"
+  local cache_dir cache_file now mtime statuses_json out
+
+  cache_dir="${AGENT_REVIEW_CODERABBIT_STATE_CACHE_DIR:-${HOME}/scratch/repository-helpers/coderabbit-head-state}"
+  cache_file="${cache_dir}/${repo//\//__}__${head}"
+  printf -v now '%(%s)T' -1
+  if [[ -f "${cache_file}" ]]; then
+    mtime="$(runner_exec_stdout "coderabbit head status cache mtime" -- stat --format=%Y "${cache_file}" 2>/dev/null || printf '0')"
+    if [[ "${mtime}" =~ ^[0-9]+$ ]] \
+      && (( now - mtime < agent_review_default_coderabbit_head_state_cache_ttl_s )); then
+      printf '%s\n' "$(<"${cache_file}")"
+      return 0
+    fi
+  fi
+  if ! statuses_json="$(ar_runner_gh_api_stream "agent-review coderabbit head statuses" \
+    "repos/${repo}/commits/${head}/statuses?per_page=50" 2>/dev/null)"; then
+    printf 'unknown\t0\n'
+    return 0
+  fi
+  if ! out="$(agent_review_coderabbit_head_status_from_statuses "${statuses_json}")"; then
+    printf 'unknown\t0\n'
+    return 0
+  fi
+  if runner_exec "coderabbit head status cache dir" -- mkdir --parents "${cache_dir}" >/dev/null 2>&1; then
+    printf '%s\n' "${out}" >"${cache_file}"
+  fi
+  printf '%s\n' "${out}"
+}
+
+# agent_review_coderabbit_head_status_from_statuses <statuses-json>
+# CodeRabbit publishes its outcome as a commit status on the head; a rate-limited head ends
+# "success" with the description "Review rate limited" and no review (#717). Prints
+# "<state> <updated_epoch>" for the newest CodeRabbit status, state being
+#   completed     success / "Review completed"
+#   rate_limited  description mentions a rate limit
+#   in_progress   pending status
+#   failed        failure or error
+#   other         any other success text (for example a skipped review)
+#   none          no CodeRabbit status on the head
+agent_review_coderabbit_head_status_from_statuses() {
+  local -r statuses_json="${1:-}"
+
+  if [[ -z "${statuses_json}" || "${statuses_json}" == 'null' ]]; then
+    printf 'none\t0\n'
+    return 0
+  fi
+  # shellcheck disable=SC2016  # jq program text, not shell expansion
+  ar_runner_jq_file "coderabbit head status" "${statuses_json}" -r '
+    (if type == "array" then . else [.] end)
+    | map(select((.context // "") | test("coderabbit"; "i")))
+    | sort_by(.updated_at // .created_at // "") | last
+    | if . == null then ["none", 0]
+      else
+        ((.description // "") | ascii_downcase) as $d
+        | (if ($d | test("rate[ -]?limit")) then "rate_limited"
+           elif (.state == "pending" or ($d | test("in progress|reviewing"))) then "in_progress"
+           elif (.state == "failure" or .state == "error") then "failed"
+           elif (.state == "success" and ($d | test("review completed"))) then "completed"
+           else "other" end) as $s
+        | [$s, ((.updated_at // .created_at // "") | if . == "" then 0 else fromdateiso8601 end)]
+      end
+    | @tsv'
+}

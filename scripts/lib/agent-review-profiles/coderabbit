@@ -536,52 +536,45 @@ agent_review_coderabbit_full_review_marker() {
   printf 'wait-for-agent-review:coderabbit-full:%s' "${head}"
 }
 
-# agent_review_coderabbit_full_review_comment_body <head_sha>
+# agent_review_coderabbit_full_review_comment_body <head_sha> [attempt]
+# Attempt 1 carries the base marker; a retry adds ":retryN". Every attempt still contains the base
+# marker, so one scan finds them all, while each ask stays distinguishable (#723).
 agent_review_coderabbit_full_review_comment_body() {
   local -r head="$1"
+  local -r attempt="${2:-1}"
   local marker
 
   marker="$(agent_review_coderabbit_full_review_marker "${head}")"
+  if [[ "${attempt}" =~ ^[0-9]+$ ]] && (( attempt > 1 )); then
+    marker+=":retry${attempt}"
+  fi
   printf '@coderabbitai full review\n\n<!-- %s -->' "${marker}"
 }
 
-# True when a last-resort full-review ask is already on this PR for <head>.
-# Exit 0 = marker present, 1 = marker absent, 2 = comment lookup failed (caller must not
-# treat as absent or it may re-post and break one-shot-per-head).
+# True when no new full-review ask should be posted for <head> right now.
+# Exit 0 = an ask is in flight, waiting out CodeRabbit's stated wait, answered, or the attempts are
+# used up; 1 = an ask may be posted (none yet, or a rate-limited ask whose wait has passed);
+# 2 = comment lookup failed (caller must not post, or it may break one-ask-per-wait).
 agent_review_coderabbit_full_review_already_sent() {
   local -r repo="$1"
   local -r pr="$2"
   local -r head="$3"
-  local marker comments_json exit_code
+  local comments_json line now
 
-  marker="$(agent_review_coderabbit_full_review_marker "${head}")"
   if ! comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"; then
     return 2
   fi
   if [[ -z "${comments_json}" || "${comments_json}" == 'null' ]]; then
     return 2
   fi
-  # Paginated gh --paginate pages (slurp) then flat single-page fallback — same
-  # pattern as Copilot marker scans. A failed fetch that yields [] looks like
-  # "absent"; callers treat exit 2 as inconclusive and must not re-post.
-  exit_code=0
-  # shellcheck disable=SC2016  # jq filter uses $marker
-  ar_runner_jq_file "coderabbit full-review marker" "${comments_json}" \
-    --raw-output --exit-status --slurp \
-    --arg marker "${marker}" \
-    '[ .[] | .[] | .body // "" | select(contains($marker)) ] | length > 0' \
-    >/dev/null 2>&1 || exit_code=$?
-  if (( exit_code == 0 )); then
-    return 0
+  if ! line="$(agent_review_coderabbit_full_review_status_from_comments "${comments_json}" "${head}")"; then
+    return 2
   fi
-  exit_code=0
-  # shellcheck disable=SC2016  # jq filter uses $marker
-  ar_runner_jq_file "coderabbit full-review marker flat" "${comments_json}" \
-    --raw-output --exit-status \
-    --arg marker "${marker}" \
-    '[ .[] | .body // "" | select(contains($marker)) ] | length > 0' \
-    >/dev/null 2>&1 || exit_code=$?
-  (( exit_code == 0 ))
+  now="$(runner_exec_stdout "coderabbit full-review now epoch" -- date -u +%s)"
+  if agent_review_coderabbit_full_review_may_post "${line}" "${now}"; then
+    return 1
+  fi
+  return 0
 }
 
 # agent_review_profile_request <repo> <pr>
@@ -603,7 +596,7 @@ agent_review_profile_request_last_resort_full_review() {
   local -r repo="$1"
   local -r pr="$2"
   local -r head="$3"
-  local body sent_rc=0 retry_after
+  local body sent_rc=0 retry_after comments_json line asked_status attempts ready_epoch asked_epoch
 
   if [[ -z "${head}" ]]; then
     return 1
@@ -627,6 +620,11 @@ agent_review_profile_request_last_resort_full_review() {
       "${pr}" >&2
     return 2
   fi
-  body="$(agent_review_coderabbit_full_review_comment_body "${head}")"
+  # Number this ask: a repeat after a rate-limited reply carries a new marker (#723).
+  comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
+  line="$(agent_review_coderabbit_full_review_status_from_comments "${comments_json}" "${head}" 2>/dev/null || true)"
+  IFS=$'\t' read -r asked_status attempts ready_epoch asked_epoch <<<"${line}"
+  : "${asked_status}" "${ready_epoch}" "${asked_epoch}"
+  body="$(agent_review_coderabbit_full_review_comment_body "${head}" "$(( ${attempts:-0} + 1 ))")"
   runner_exec "coderabbit profile last-resort full review" -- gh pr comment "${pr}" --repo "${repo}" --body "${body}"
 }

@@ -1169,7 +1169,7 @@ cmd_loop_agent_response_seen() {
   local -r head="$3"
   local -r agent="$4"
   local -r snapshot="$5"
-  local saved_agent
+  local saved_agent cr_state
 
   if agent_review_agent_quota_exhausted_for_agent "${agent}"; then
     if agent_review_agent_quota_rate_limited_for_agent "${agent}"; then
@@ -1183,6 +1183,23 @@ cmd_loop_agent_response_seen() {
   fi
   saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
   agent_review_use_agent "${agent}"
+  # CodeRabbit's commit status for the head is the signal, not review objects: it also posts empty
+  # stub reviews and thread replies, and a rate-limited head ends "success" with no review
+  # (#717, #723). "Review completed" is an answer; "Review rate limited" or a running check is not.
+  if [[ "${agent}" == 'coderabbit' ]]; then
+    cr_state="$(agent_review_coderabbit_head_state "${repo}" "${head}")"
+    case "${cr_state}" in
+      completed)
+        agent_review_use_agent "${saved_agent}"
+        return 0
+        ;;
+      rate_limited | in_progress)
+        agent_review_use_agent "${saved_agent}"
+        return 1
+        ;;
+      *) ;;
+    esac
+  fi
   if [[ "${agent}" == 'copilot' ]] \
     && declare -F agent_review_profile_review_complete_on_head >/dev/null 2>&1; then
     if agent_review_profile_review_complete_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
@@ -1295,6 +1312,10 @@ cmd_loop_nothing_outstanding() {
     && ! agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
     return 1
   fi
+  if agent_review_reviewers_is_enabled coderabbit "${repo}" \
+    && cmd_loop_coderabbit_answer_outstanding "${repo}" "${pr}" "${head}"; then
+    return 1
+  fi
   saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
   for agent in copilot bugbot; do
     if ! agent_review_reviewers_is_enabled "${agent}" "${repo}"; then
@@ -1318,6 +1339,40 @@ cmd_loop_nothing_outstanding() {
     return 1
   fi
   return 0
+}
+
+# True while CodeRabbit owes an answer to a full review the loop asked for on <head>: the ask is on
+# the PR (waiting for a reply, running, or rate limited and due to be repeated) and the head's
+# commit status is not yet "Review completed". The early-complete gate must not pass in the same
+# pass as the ask, so a review that arrives minutes later is not missed (#717).
+cmd_loop_coderabbit_answer_outstanding() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local comments_json line ask_status attempts ready_epoch asked_epoch
+  local state now outstanding=1
+
+  state="$(agent_review_coderabbit_head_state "${repo}" "${head}")"
+  if [[ "${state}" != 'completed' ]]; then
+    comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}")"
+    if line="$(agent_review_coderabbit_full_review_status_from_comments "${comments_json}" "${head}" 2>/dev/null)"; then
+      IFS=$'\t' read -r ask_status attempts ready_epoch asked_epoch <<<"${line}"
+      : "${attempts}" "${ready_epoch}"
+      printf -v now '%(%s)T' -1
+      # An ask older than four pending TTLs (an hour by default) no longer holds the gate, so a
+      # status that never turns to "Review completed" cannot keep the loop here for good.
+      case "${ask_status}" in
+        pending | accepted | rate_limited)
+          # shellcheck disable=SC2154  # agent_review_default_* constants are assigned in scripts/lib/agent-review
+          if (( now - ${asked_epoch:-0} < agent_review_default_coderabbit_full_review_pending_ttl_s * 4 )); then
+            outstanding=0
+          fi
+          ;;
+        *) ;;
+      esac
+    fi
+  fi
+  return "${outstanding}"
 }
 
 # Sleep up to total_s seconds in short chunks, aborting with exit 3 when pending
@@ -1393,6 +1448,7 @@ cmd_loop_handle_coderabbit_rate_limit() {
   local saved_agent retry_after remaining sleep_s retry_epoch now_epoch grace_s grace_remaining
   local profiles_dir coderabbit_profile _owner _name sent_rc
   local poll_s pending_exit provisional_retry
+  local head_status head_state head_state_epoch fallback_wait_s fallback_epoch
 
   if [[ -n "${snapshot}" ]] \
     && agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
@@ -1400,11 +1456,38 @@ cmd_loop_handle_coderabbit_rate_limit() {
       "${head:0:7}" "${pr}" >&2
     return 1
   fi
-  # Do not treat bare "CodeRabbit: Review completed" commit status as a sign-off.
-  # A rate-limit/summarize stub can still flip that status while no real review exists.
   retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent 'coderabbit')"
-  if [[ -z "${retry_after}" ]]; then
+  # The head's commit status says what CodeRabbit did with it (#717). "Review completed" means
+  # it answered (a clean pass included), so there is nothing to wait for or to ask.
+  head_status="$(agent_review_coderabbit_head_status "${repo}" "${head}")"
+  IFS=$'\t' read -r head_state head_state_epoch <<<"${head_status}"
+  if [[ "${head_state}" == 'completed' ]]; then
+    agent_review_agent_quota_clear_observed_for_agent 'coderabbit'
+    printf 'wait-for-agent-review: CodeRabbit completed its review of head %s (PR #%s) — nothing to wait for\n' \
+      "${head:0:7}" "${pr}" >&2
+    agent_review_loop_wait_remove 'coderabbit' || true
     return 1
+  fi
+  if [[ -z "${retry_after}" ]]; then
+    if [[ "${head_state}" != 'rate_limited' ]]; then
+      return 1
+    fi
+    # Rate limited with no cooldown on record (a push right after an earlier episode): wait a
+    # bounded time from the status, then ask once, so the loop never idles with nothing to time
+    # out on (#717). A too-early ask is answered with the real wait, which is then honoured.
+    # shellcheck disable=SC2154  # agent_review_default_* constants are assigned in scripts/lib/agent-review
+    fallback_wait_s="${agent_review_default_coderabbit_status_rate_limit_wait_s}"
+    fallback_epoch=$(( ${head_state_epoch:-0} + fallback_wait_s ))
+    retry_after="$(runner_exec_stdout "coderabbit status fallback retry_after" -- \
+      date -u -d "@${fallback_epoch}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+    if [[ -z "${retry_after}" ]]; then
+      return 1
+    fi
+    printf 'wait-for-agent-review: CodeRabbit status for head %s is rate limited with no cooldown on record — asking after %ss (at %s)\n' \
+      "${head:0:7}" "${fallback_wait_s}" "${retry_after}" >&2
+    agent_review_coderabbit_quota_mark_exhausted \
+      "CodeRabbit rate limited head ${head:0:7} on ${repo}#${pr}; no cooldown on record." \
+      "" "${retry_after}" || true
   fi
   saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
   agent_review_use_agent 'coderabbit'
@@ -2241,6 +2324,14 @@ main() {
 
   agent_review_load_env
   agent_review_load_agent_profile
+
+  case "${cmd}" in
+    check | complete | loop | request | status | wait)
+      # No preferred agent configured: the repo's enabled reviewers decide who is active.
+      agent_review_reviewers_select_agent "$(agent_review_resolve_repo "${repo_arg}")" || true
+      ;;
+    *) ;;
+  esac
 
   case "${cmd}" in
     status)

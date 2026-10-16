@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# Tests for the status-based CodeRabbit handling in the review loop (#717, #723): the head's commit
+# status decides whether CodeRabbit reviewed, a rate-limited full-review ask is repeated after the
+# wait CodeRabbit stated, and the loop does not complete before CodeRabbit has answered an ask.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+lib="${script_dir}/../scripts/lib/agent-review"
+cr_lib="${script_dir}/../scripts/lib/agent-review-coderabbit"
+profile="${script_dir}/../scripts/lib/agent-review-profiles/coderabbit"
+wait_script="${script_dir}/../scripts/wait-for-agent-review"
+readonly lib cr_lib profile wait_script
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+export HOME="${work_dir}/home"
+mkdir -p "${HOME}"
+export AGENT_REVIEW_ENV_FILE=/dev/null
+export AGENT_REVIEW_REVIEWERS_CACHE_DIR="${work_dir}/reviewers-cache"
+export AGENT_REVIEW_CODERABBIT_STATE_CACHE_DIR="${work_dir}/head-state-cache"
+export AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE="${work_dir}/coderabbit-quota.env"
+export AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE="${work_dir}/copilot-quota.env"
+export AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE="${work_dir}/bugbot-quota.env"
+unset AGENT_REVIEW_AGENT AGENT_REVIEW_QUOTA_FALLBACK_CHAIN AGENT_REVIEW_GITHUB_REPO
+
+head_sha='0123456789abcdef0123456789abcdef01234567'
+readonly head_sha
+
+# run_lib <snippet> — runs a snippet with the lib and the CodeRabbit profile loaded.
+run_lib() {
+  bash -c "set -uo pipefail; source '${lib}'; source '${profile}'; $1" 2>&1
+}
+
+epoch() {
+  date -u -d "$1" +%s
+}
+
+# --- fixtures -------------------------------------------------------------------------------------
+declare -A statuses=(
+  [completed]='[{"context":"CodeRabbit","state":"success","description":"Review completed","updated_at":"2026-10-14T19:11:00Z"},{"context":"CodeRabbit","state":"pending","description":"Review in progress","updated_at":"2026-10-14T19:06:00Z"}]'
+  [limited]='[{"context":"CodeRabbit","state":"success","description":"Review rate limited","updated_at":"2026-10-14T21:45:12Z"},{"context":"CodeRabbit","state":"pending","description":"Review in progress","updated_at":"2026-10-14T21:45:02Z"}]'
+  [progress]='[{"context":"CodeRabbit","state":"pending","description":"Review in progress","updated_at":"2026-10-14T21:45:02Z"}]'
+  [failed]='[{"context":"CodeRabbit","state":"failure","description":"Review failed","updated_at":"2026-10-14T21:45:02Z"}]'
+  [other]='[{"context":"CodeRabbit","state":"success","description":"Review skipped","updated_at":"2026-10-14T21:45:02Z"}]'
+  [foreign]='[{"context":"ci/build","state":"success","description":"Review completed","updated_at":"2026-10-14T21:45:02Z"}]'
+)
+
+printf '\n=== head status: the newest CodeRabbit commit status decides ===\n'
+for case_name in completed limited progress failed other foreign; do
+  out="$(run_lib "agent_review_coderabbit_head_status_from_statuses '${statuses[$case_name]}'")"
+  case "${case_name}" in
+    completed) want='completed' ;;
+    limited) want='rate_limited' ;;
+    progress) want='in_progress' ;;
+    failed) want='failed' ;;
+    other) want='other' ;;
+    foreign) want='none' ;;
+    *) want='?' ;;
+  esac
+  assert_contains "a ${case_name} status is classified as ${want}" "$out" "${want}"
+done
+out="$(run_lib "agent_review_coderabbit_head_status_from_statuses '${statuses[limited]}'")"
+assert_contains "the status carries its update time" "$out" "$(epoch 2026-10-14T21:45:12Z)"
+out="$(run_lib "agent_review_coderabbit_head_status_from_statuses ''")"
+assert_contains "an empty status list means no CodeRabbit status" "$out" "none"
+out="$(run_lib "agent_review_coderabbit_head_status_from_statuses '[]'")"
+assert_contains "a head with no statuses means no CodeRabbit status" "$out" "none"
+
+# --- full-review asks and CodeRabbit's replies ----------------------------------------------------
+ask_marker="<!-- wait-for-agent-review:coderabbit-full:${head_sha} -->"
+ask1="{\"user\":{\"login\":\"thehcma\"},\"created_at\":\"2026-10-15T23:53:41Z\",\"body\":\"@coderabbitai full review\\n\\n${ask_marker}\"}"
+ask2="{\"user\":{\"login\":\"thehcma\"},\"created_at\":\"2026-10-16T01:53:57Z\",\"body\":\"@coderabbitai full review\\n\\n<!-- wait-for-agent-review:coderabbit-full:${head_sha}:retry2 -->\"}"
+manual="{\"user\":{\"login\":\"thehcma\"},\"created_at\":\"2026-10-16T13:53:57Z\",\"body\":\"@coderabbitai full review\\n\\n<!-- wait-for-agent-review:coderabbit-full-retry:${head_sha} -->\"}"
+limited5="{\"user\":{\"login\":\"coderabbitai[bot]\"},\"created_at\":\"2026-10-15T23:53:52Z\",\"body\":\"<!-- This is an auto-generated reply by CodeRabbit -->\\n<!-- CodeRabbit review command invocation: v2:aa -->\\n<summary>⚠️ Action not completed</summary>\\n\\nReview rate limited.\\n\\nYour next included review will be available in 5 minutes.\"}"
+limited31="{\"user\":{\"login\":\"coderabbitai[bot]\"},\"created_at\":\"2026-10-16T11:29:19Z\",\"body\":\"<!-- This is an auto-generated reply by CodeRabbit -->\\n<!-- CodeRabbit review command invocation: v2:bb -->\\n<summary>⚠️ Action not completed</summary>\\n\\nReview rate limited.\\n\\nYour next included review will be available in 31 minutes.\"}"
+accepted="{\"user\":{\"login\":\"coderabbitai[bot]\"},\"created_at\":\"2026-10-16T01:54:05Z\",\"body\":\"<!-- This is an auto-generated reply by CodeRabbit -->\\n<!-- CodeRabbit review command invocation: v2:cc -->\\n<summary>✅ Action performed</summary>\\n\\nFull review triggered.\"}"
+unrelated="{\"user\":{\"login\":\"someone\"},\"created_at\":\"2026-10-15T23:00:00Z\",\"body\":\"looks fine\"}"
+
+ask_status() {
+  run_lib "agent_review_coderabbit_full_review_status_from_comments '$1' '${head_sha}'"
+}
+
+printf '\n=== full-review asks: what CodeRabbit answered ===\n'
+out="$(ask_status "[${unrelated}]")"
+assert_contains "no ask on the PR is reported as none" "$out" "none"
+
+out="$(ask_status "[${ask1},${unrelated}]")"
+assert_contains "an ask with no reply is pending" "$out" "pending"
+assert_contains "a pending ask records when it was made" "$out" "$(epoch 2026-10-15T23:53:41Z)"
+
+out="$(ask_status "[${ask1},${limited5}]")"
+assert_contains "a rate-limited reply is recognised" "$out" "rate_limited"
+assert_contains "the stated 5 minute wait is added to the reply time" "$out" "$(( $(epoch 2026-10-15T23:53:52Z) + 300 ))"
+
+out="$(ask_status "[${ask1},${limited31}]")"
+assert_contains "the stated 31 minute wait is parsed" "$out" "$(( $(epoch 2026-10-16T11:29:19Z) + 1860 ))"
+out="$(ask_status "[${ask1},${limited5},${ask2},${accepted}]")"
+assert_contains "the newest ask and its reply decide" "$out" "accepted"
+assert_contains "every ask is counted" "$out" "$(printf 'accepted\t2\t')"
+
+out="$(ask_status "[${ask1},${limited5},${manual}]")"
+assert_contains "a manual retry marker counts as an ask" "$out" "$(printf 'pending\t2\t')"
+
+paged="[${ask1}][${limited5}]"
+out="$(ask_status "${paged}")"
+assert_contains "paginated comment pages are flattened" "$out" "rate_limited"
+
+printf '\n=== full-review asks: when another ask is allowed ===\n'
+max=4
+may_post() {
+  run_lib "agent_review_coderabbit_full_review_may_post \$'$1' '$2' && echo may-post || echo wait"
+}
+tab='\t'
+reply_epoch="$(epoch 2026-10-15T23:53:52Z)"
+ask_epoch="$(epoch 2026-10-15T23:53:41Z)"
+ready=$(( reply_epoch + 300 ))
+out="$(may_post "none${tab}0${tab}0${tab}0" "${ready}")"
+assert_contains "with no ask yet one may be posted" "$out" "may-post"
+out="$(may_post "pending${tab}1${tab}0${tab}${ask_epoch}" "$(( ask_epoch + 60 ))")"
+assert_contains "a fresh unanswered ask is waited on" "$out" "wait"
+out="$(may_post "pending${tab}1${tab}0${tab}${ask_epoch}" "$(( ask_epoch + 901 ))")"
+assert_contains "an ask CodeRabbit never answered is repeated after the pending TTL" "$out" "may-post"
+out="$(may_post "accepted${tab}1${tab}0${tab}${ask_epoch}" "$(( ask_epoch + 99999 ))")"
+assert_contains "an accepted ask is never repeated" "$out" "wait"
+out="$(may_post "rate_limited${tab}1${tab}${ready}${tab}${ask_epoch}" "$(( ready + 30 ))")"
+assert_contains "a rate-limited ask is not repeated inside the stated wait plus margin" "$out" "wait"
+out="$(may_post "rate_limited${tab}1${tab}${ready}${tab}${ask_epoch}" "$(( ready + 61 ))")"
+assert_contains "a rate-limited ask is repeated once the wait and margin have passed" "$out" "may-post"
+out="$(may_post "rate_limited${tab}${max}${tab}${ready}${tab}${ask_epoch}" "$(( ready + 99999 ))")"
+assert_contains "asks stop when the attempts are used up" "$out" "wait"
+
+printf '\n=== full-review asks: the check the loop runs before posting ===\n'
+already_sent() {
+  # $1 comments json, $2 now epoch -> prints "sent" (exit 0), "may-post" (1) or "lookup-failed" (2)
+  run_lib "
+    agent_review_pr_issue_comments_json() { printf '%s' '$1'; }
+    runner_exec_stdout() { printf '%s\n' '$2'; }
+    rc=0
+    agent_review_coderabbit_full_review_already_sent o/r 1 '${head_sha}' || rc=\$?
+    case \$rc in 0) echo sent ;; 1) echo may-post ;; *) echo lookup-failed ;; esac"
+}
+out="$(already_sent "[${ask1},${limited5}]" "$(( ready + 30 ))")"
+assert_contains "inside CodeRabbit's stated wait the ask counts as sent" "$out" "sent"
+out="$(already_sent "[${ask1},${limited5}]" "$(( ready + 3600 ))")"
+assert_contains "after CodeRabbit's stated wait a rate-limited ask is no longer sent" "$out" "may-post"
+out="$(already_sent "[${ask1},${accepted}]" "$(( ready + 3600 ))")"
+assert_contains "an accepted ask stays sent" "$out" "sent"
+out="$(already_sent "[]" "${ready}")"
+assert_contains "a PR with no ask may get one" "$out" "may-post"
+
+printf '\n=== full-review asks: every attempt is marked and still found ===\n'
+out="$(run_lib "agent_review_coderabbit_full_review_comment_body '${head_sha}'")"
+assert_contains "the first ask carries the base marker" "$out" "${ask_marker}"
+assert_not_contains "the first ask has no retry suffix" "$out" ":retry"
+out="$(run_lib "agent_review_coderabbit_full_review_comment_body '${head_sha}' 3")"
+assert_contains "a later ask is marked with its attempt number" "$out" "coderabbit-full:${head_sha}:retry3"
+assert_contains "a later ask still contains the base marker" "$out" "coderabbit-full:${head_sha}"
+
+printf '\n=== the loop posts a numbered retry after a rate-limited ask ===\n'
+out="$(run_lib "
+  agent_review_agent_quota_rate_limited_for_agent() { return 1; }
+  agent_review_pr_issue_comments_json() { printf '%s' '[${ask1},${limited5}]'; }
+  runner_exec_stdout() { printf '%s\n' '$(( ready + 3600 ))'; }
+  runner_exec() {
+    if [[ \"\$*\" == *'gh pr comment'* ]]; then printf 'EXEC %s\n' \"\$*\"; return 0; fi
+    shift 2 || true
+    command \"\$@\"
+  }
+  agent_review_profile_request_last_resort_full_review o/r 7 '${head_sha}'")"
+assert_contains "the retry is posted on the PR" "$out" "gh pr comment 7 --repo o/r"
+assert_contains "the retry is numbered as attempt 2" "$out" "coderabbit-full:${head_sha}:retry2"
+
+# --- the loop: does CodeRabbit have an answer for this head? ----------------------------------------
+response_seen() {
+  # $1 status line ("state<TAB>epoch"), $2 whether stub review objects exist (0|1) -> rc as text
+  bash -c "
+    set -uo pipefail
+    source '${lib}'
+    source '${profile}'
+    $(awk '/^cmd_loop_agent_response_seen\(\)/,/^}/' "${wait_script}")
+    agent_review_agent_quota_exhausted_for_agent() { return 1; }
+    agent_review_agent_quota_probe_expired_for_agent() { return 1; }
+    agent_review_use_agent() { return 0; }
+    agent_review_coderabbit_head_status() { printf '%b\n' '$1'; }
+    agent_review_fresh_agent_on_head() { return 1; }
+    agent_review_fresh_agent_review_on_head() { return $2; }
+    agent_review_named_pr_check_is_pending() { return 1; }
+    agent_review_head_has_inline_actionable_review_on_head() { return 1; }
+    agent_review_head_check_complete_on_head() { return $2; }
+    rc=0
+    cmd_loop_agent_response_seen o/r 5 '${head_sha}' coderabbit '{}' || rc=\$?
+    if (( rc == 0 )); then echo seen; else echo not-seen; fi" 2>&1
+}
+printf '\n=== the loop: a response is read from the head status, not from review objects ===\n'
+out="$(response_seen 'completed\t1' 1)"
+assert_contains "a completed review with no comments or review objects is an answer" "$out" "seen"
+assert_not_contains "a completed status is not 'not seen'" "$out" "not-seen"
+out="$(response_seen 'rate_limited\t1' 0)"
+assert_contains "stub reviews on a rate-limited head are not an answer" "$out" "not-seen"
+out="$(response_seen 'in_progress\t1' 0)"
+assert_contains "a running review is not yet an answer" "$out" "not-seen"
+out="$(response_seen 'unknown\t0' 0)"
+assert_contains "an unreadable status falls back to the review objects (review present)" "$out" "seen"
+assert_not_contains "an unreadable status falls back to the review objects (no false negative)" "$out" "not-seen"
+
+# --- the loop: a rate-limited head with no cooldown on record -------------------------------------------
+handler() {
+  # $1 status line, $2 comments json, $3 polls already counted (2 = the cooldown has elapsed)
+  # -> runs the rate-limit handler with every effect stubbed
+  : >"${work_dir}/exec.log"
+  rm -f "${AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE}"
+  timeout 30 bash -c "
+    set -uo pipefail
+    source '${wait_script}'
+    agent_review_agent_signed_off_on_head() { return 1; }
+    agent_review_use_agent() { return 0; }
+    agent_review_loop_wait_add() { return 0; }
+    agent_review_loop_wait_remove() { return 0; }
+    agent_review_pr_is_merged() { return 1; }
+    agent_review_abort_if_pending_threads() { return 0; }
+    agent_review_repo_parts() { printf 'o r\n'; }
+    agent_review_graphql_pr_snapshot() { printf '{}\n'; }
+    agent_review_named_pr_check_is_pending() { return 1; }
+    agent_review_pr_issue_comments_json() { printf '%s' '$2'; }
+    agent_review_coderabbit_head_status() { printf '%b\n' '$1'; }
+    cmd_loop_agent_response_seen() { return 1; }
+    cmd_loop_maybe_request_agents_on_head() { return 0; }
+    cmd_loop_sleep_abort_if_pending() { printf 'GRACE %s\n' \"\$2\"; return 0; }
+    run_command() { return 0; }
+    # Limited for the first two checks (enter the wait, one poll chunk), then elapsed: no real sleeping.
+    polls='$3'
+    agent_review_agent_quota_rate_limited_for_agent() {
+      polls=\$((polls + 1))
+      if (( polls <= 2 )); then return 0; fi
+      return 1
+    }
+    agent_review_agent_quota_seconds_until_retry_for_agent() { printf '120\n'; }
+    runner_exec() {
+      printf 'EXEC %s\n' \"\$*\" >>'${work_dir}/exec.log'
+      if [[ \"\$*\" == *'gh pr comment'* ]]; then return 0; fi
+      shift 2 || true
+      command \"\$@\"
+    }
+    agent_review_default_coderabbit_rate_limit_poll_s=5
+    rc=0
+    cmd_loop_handle_coderabbit_rate_limit o/r 5 '${head_sha}' || rc=\$?
+    echo handler-rc=\$rc" 2>&1
+}
+printf '\n=== the loop: a rate-limited head with no cooldown on record is not left idle ===\n'
+out="$(handler "rate_limited\\t$(epoch 2026-10-14T21:45:12Z)" '[]' 2)"
+assert_contains "the missing cooldown is derived from the status" "$out" "no cooldown on record"
+assert_contains "the loop then posts the one full review" "$(cat "${work_dir}/exec.log")" "gh pr comment 5 --repo o/r"
+assert_contains "the post carries the head marker" "$(cat "${work_dir}/exec.log")" "coderabbit-full:${head_sha}"
+assert_contains "the handler hands back to the loop after the ask" "$out" "handler-rc=1"
+
+out="$(handler "rate_limited\\t$(date -u +%s)" '[]' 0)"
+assert_contains "a fresh rate-limited status still waits its bounded time first" "$out" "no cooldown on record"
+assert_not_contains "no ask is posted inside the bounded wait" "$(cat "${work_dir}/exec.log")" "gh pr comment"
+
+out="$(handler "completed\\t$(date -u +%s)" '[]' 0)"
+assert_contains "a completed review needs no wait or ask" "$out" "nothing to wait for"
+assert_not_contains "no ask is posted for a completed review" "$(cat "${work_dir}/exec.log")" "gh pr comment"
+
+# --- the loop: do not complete before CodeRabbit has answered an ask ---------------------------------------
+answer_outstanding() {
+  # $1 head state, $2 comments json -> "outstanding" or "clear"
+  bash -c "
+    set -uo pipefail
+    source '${wait_script}'
+    agent_review_coderabbit_head_state() { printf '%s\n' '$1'; }
+    agent_review_pr_issue_comments_json() { printf '%s' '$2'; }
+    rc=0
+    cmd_loop_coderabbit_answer_outstanding o/r 5 '${head_sha}' || rc=\$?
+    if (( rc == 0 )); then echo outstanding; else echo clear; fi" 2>&1
+}
+iso_ago() {
+  date -u -d "$1 seconds ago" +%Y-%m-%dT%H:%M:%SZ
+}
+recent_ask="{\"user\":{\"login\":\"thehcma\"},\"created_at\":\"$(iso_ago 60)\",\"body\":\"@coderabbitai full review\\n\\n${ask_marker}\"}"
+old_ask="{\"user\":{\"login\":\"thehcma\"},\"created_at\":\"$(iso_ago 7200)\",\"body\":\"@coderabbitai full review\\n\\n${ask_marker}\"}"
+printf '\n=== the loop: early complete waits for CodeRabbit to answer a full review ===\n'
+out="$(answer_outstanding rate_limited "[${recent_ask}]")"
+assert_contains "an ask with no answer yet holds the early-complete gate" "$out" "outstanding"
+out="$(answer_outstanding in_progress "[${recent_ask}]")"
+assert_contains "an ask whose review is still running holds the gate" "$out" "outstanding"
+out="$(answer_outstanding completed "[${recent_ask}]")"
+assert_contains "an answered ask (Review completed) releases the gate" "$out" "clear"
+out="$(answer_outstanding rate_limited '[]')"
+assert_contains "no ask means CodeRabbit owes nothing" "$out" "clear"
+out="$(answer_outstanding rate_limited "[${old_ask}]")"
+assert_contains "an ask older than an hour no longer holds the gate" "$out" "clear"
+
+# --- sign-off: a clean zero-comment pass counts, a rate-limited head does not --------------------------------
+signed_off() {
+  # $1 head state -> "signed-off" or "not-signed-off" for a CodeRabbit-only repo with no comments
+  bash -c "
+    set -uo pipefail
+    export AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=coderabbit
+    source '${lib}'
+    agent_review_coderabbit_head_state() { printf '%s\n' '$1'; }
+    agent_review_pr_issue_comments_json() { printf '[]\n'; }
+    agent_review_latest_issue_comment_body_for_profile() { printf ''; }
+    rc=0
+    agent_review_delivered_recognized_pass_on_head '{}' '${head_sha}' o/r 5 || rc=\$?
+    if (( rc == 0 )); then echo signed-off; else echo not-signed-off; fi" 2>&1
+}
+printf '\n=== sign-off: the head status counts, a rate-limited head does not ===\n'
+out="$(signed_off completed)"
+assert_contains "Review completed with no comments is a clean sign-off" "$out" "signed-off"
+assert_not_contains "Review completed is not reported as unsigned" "$out" "not-signed-off"
+out="$(signed_off rate_limited)"
+assert_contains "Review rate limited is not a sign-off" "$out" "not-signed-off"
+out="$(signed_off none)"
+assert_contains "no CodeRabbit status and no comment is not a sign-off" "$out" "not-signed-off"
+
+# --- the configured agent decides ------------------------------------------------------------------------
+printf '\n=== the active agent comes from the repo settings ===\n'
+out="$(bash -c "
+  set -uo pipefail
+  export AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=coderabbit
+  source '${lib}'
+  unset AGENT_REVIEW_AGENT
+  agent_review_reviewers_select_agent o/r
+  echo \"agent=\${AGENT_REVIEW_AGENT:-<unset>}\"" 2>&1)"
+assert_contains "with no preferred agent the first enabled reviewer is chosen" "$out" "agent=coderabbit"
+assert_not_contains "choosing it from the settings alone prints no notice" "$out" "is not an enabled reviewer"
+
+main_body="$(awk '/^main\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "${wait_script}")"
+assert_contains "the commands that act on an agent select it from the repo settings" "$main_body" \
+  'agent_review_reviewers_select_agent'
+assert_contains "status and check are among them" "$main_body" 'check | complete | loop | request | status | wait'
+
+# --- wiring ---------------------------------------------------------------------------------------------
+printf '\n=== static: wiring and conventions ===\n'
+# shellcheck disable=SC2016  # literal source text, not an expansion
+assert_contains "the lib loads the CodeRabbit status helpers" "$(cat "${lib}")" \
+  'source "${_ar_lib_dir}/agent-review-coderabbit"'
+assert_contains "the early-complete gate checks for an unanswered ask" \
+  "$(awk '/^cmd_loop_nothing_outstanding\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "${wait_script}")" \
+  'cmd_loop_coderabbit_answer_outstanding'
+if ! grep -nE '(^|[^_[:alnum:]/-])(tr|date|stat|cat|mkdir|mktemp|mv|rm|sed|awk) ' "${cr_lib}" \
+  | grep -vE '^[0-9]+:\s*#|runner_exec|"[^"]*(date|stat|mkdir)[^"]*"' >/dev/null; then
+  pass_case "the CodeRabbit status lib calls no external utility outside the runner"
+else
+  fail_case "the CodeRabbit status lib calls no external utility outside the runner"
+fi
+if ! grep -nE '(^|[^_[:alnum:]])gh (api|pr|issue)' "${cr_lib}" \
+  | grep -vE '^[0-9]+:\s*#' >/dev/null; then
+  pass_case "the CodeRabbit status lib has no unwrapped gh call"
+else
+  fail_case "the CodeRabbit status lib has an unwrapped gh call"
+fi
+sorted="$(grep -oE '^agent_review_coderabbit_[a-z_]+\(\)' "${cr_lib}" | LC_ALL=C sort)"
+listed="$(grep -oE '^agent_review_coderabbit_[a-z_]+\(\)' "${cr_lib}")"
+if [[ "${sorted}" == "${listed}" ]]; then
+  pass_case "the CodeRabbit status lib keeps its functions in lexicographic order"
+else
+  fail_case "the CodeRabbit status lib keeps its functions in lexicographic order"
+fi
+
+test_summary

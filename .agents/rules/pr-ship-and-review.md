@@ -58,7 +58,7 @@ Multi-paragraph issue/PR bodies and comments: write a temp file, lint, then `--b
 
 > **Reply before resolve (required):** Post an on-thread human reply via **`reply-thread`** (or `reply-comment`) **before** **`resolve-thread`**. Exit **3** means threads lack a human reply. Pending feedback also includes operator-authored PR conversation comments until an explicit URL-citing reply + **`resolve-comment`**.
 
-When `check` reports **`complete_ready: true`** (requires **agent sign-off** on the current head — not a bare CodeRabbit status):
+When `check` reports **`complete_ready: true`** (requires **agent sign-off** on the current head: for CodeRabbit that is the head's `Review completed` commit status, a clean pass with no comments included; `Review rate limited` ends green but is not a review):
 
 ```bash
 ./scripts/wait-for-agent-review complete --pr <n>
