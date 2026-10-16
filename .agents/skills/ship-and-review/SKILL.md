@@ -179,7 +179,7 @@ Then: `gt modify`, `scripts/dev/pre-pr-checks`, push, **`scripts/dev/post-pr-sub
 
 Two success paths:
 
-1. **`complete_ready`** — `check` returns **0** and `status` shows `complete_ready: true`. That requires at least one **agent sign-off on the current head** (Copilot/Bugbot empty pass, or a real CodeRabbit review body). A green CodeRabbit commit status alone is **not** enough — rate-limit stubs can still flip that status. Run:
+1. **`complete_ready`** — `check` returns **0** and `status` shows `complete_ready: true`. That requires at least one **agent sign-off on the current head** (Copilot/Bugbot empty pass, or CodeRabbit's `Review completed` commit status on that head with no actionable findings). A CodeRabbit status of `Review rate limited` is **not** a review — it ends green with no review — so it never signs a head off. Run:
    ```bash
    ./scripts/wait-for-agent-review complete --pr <n>
    ```
