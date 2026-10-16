@@ -12,11 +12,17 @@
 # failed read, falls back to the default (read failures WARN).
 # shellcheck disable=SC2016  # jq filter strings use single quotes
 
+_ar_reviewers_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_ar_reviewers_lib_dir}/runner-ensure"
+
 # Every reviewer the property can select, in escalation order.
 agent_review_reviewers_known_chain='coderabbit,copilot,bugbot'
 # Active when nothing is configured.
 agent_review_reviewers_default_chain='coderabbit'
 agent_review_reviewers_enabled_property_name='agent-review-enabled'
+# Internal chain value for "agent review disabled" (never a valid property member).
+agent_review_reviewers_disabled_sentinel='@disabled'
 agent_review_reviewers_property_name='agent-reviewers'
 # Cache TTL for the property read (seconds); the property rarely changes mid-review.
 agent_review_reviewers_cache_ttl_s=300
@@ -49,27 +55,34 @@ agent_review_reviewers_effective_chain() {
 # agent_review_reviewers_filter_chain <property-csv> — applies the property to the default chain.
 agent_review_reviewers_filter_chain() {
   local -r prop="${1:-}"
-  local agent known out="" has_none=0 want=","
+  local member known out="" want=","
+  local -a members=() known_ids=()
 
   if [[ -z "${prop}" ]]; then
     printf '%s' "${agent_review_reviewers_default_chain}"
     return 0
   fi
-  while IFS= read -r agent || [[ -n "${agent}" ]]; do
-    if [[ "${agent}" == 'none' ]]; then
-      has_none=1
-    elif [[ -n "${agent}" ]]; then
-      want+="${agent},"
-    fi
-  done < <(printf '%s' "${prop}" | tr ',' '\n')
-  if (( has_none == 1 )) && [[ "${want}" == ',' ]]; then
+  if [[ "${prop}" == "${agent_review_reviewers_disabled_sentinel}" ]]; then
     return 0
   fi
-  while IFS= read -r known || [[ -n "${known}" ]]; do
+  IFS=, read -r -a members <<<"${prop}"
+  for member in "${members[@]}"; do
+    if [[ "${member}" == 'none' ]]; then
+      printf 'wait-for-agent-review: WARN: %s=%s is invalid (none is not a reviewer); using default\n' \
+        "${agent_review_reviewers_property_name}" "${prop}" >&2
+      printf '%s' "${agent_review_reviewers_default_chain}"
+      return 0
+    fi
+    if [[ -n "${member}" ]]; then
+      want+="${member},"
+    fi
+  done
+  IFS=, read -r -a known_ids <<<"${agent_review_reviewers_known_chain}"
+  for known in "${known_ids[@]}"; do
     if [[ "${want}" == *",${known},"* ]]; then
       out+="${out:+,}${known}"
     fi
-  done < <(printf '%s' "${agent_review_reviewers_known_chain}" | tr ',' '\n')
+  done
   if [[ -z "${out}" ]]; then
     printf 'wait-for-agent-review: WARN: %s=%s has no known reviewer; using default\n' \
       "${agent_review_reviewers_property_name}" "${prop}" >&2
@@ -96,6 +109,18 @@ agent_review_reviewers_is_enabled() {
   [[ ",${chain}," == *",${agent},"* ]]
 }
 
+# Prints the mtime (epoch) of <file>, or 0 when it cannot be read.
+agent_review_reviewers_mtime() {
+  local -r file="$1"
+  local mtime
+
+  if mtime="$(runner_exec_stdout "agent-reviewers cache mtime" -- stat --format=%Y "${file}" 2>/dev/null)"; then
+    printf '%s' "${mtime}"
+  else
+    printf '0'
+  fi
+}
+
 # Cached property read (file cache so $(...) subshells and repeated calls share one API hit).
 agent_review_reviewers_property_cached() {
   local -r repo="$1"
@@ -103,16 +128,16 @@ agent_review_reviewers_property_cached() {
 
   cache_dir="${AGENT_REVIEW_REVIEWERS_CACHE_DIR:-${HOME}/scratch/repository-helpers/agent-reviewers}"
   cache_file="${cache_dir}/${repo//\//__}"
-  now="$(date +%s)"
+  printf -v now '%(%s)T' -1
   if [[ -f "${cache_file}" ]]; then
-    mtime="$(stat --format=%Y "${cache_file}" 2>/dev/null || printf '0')"
+    mtime="$(agent_review_reviewers_mtime "${cache_file}")"
     if (( now - mtime < agent_review_reviewers_cache_ttl_s )); then
-      cat "${cache_file}"
+      printf '%s' "$(<"${cache_file}")"
       return 0
     fi
   fi
   if [[ -f "${cache_file}.fail" ]]; then
-    mtime="$(stat --format=%Y "${cache_file}.fail" 2>/dev/null || printf '0')"
+    mtime="$(agent_review_reviewers_mtime "${cache_file}.fail")"
     if (( now - mtime < agent_review_reviewers_failure_ttl_s )); then
       return 0
     fi
@@ -120,16 +145,18 @@ agent_review_reviewers_property_cached() {
   if ! value="$(agent_review_reviewers_property_fetch "${repo}" 2>/dev/null)"; then
     printf 'wait-for-agent-review: WARN: could not read %s for %s; using default reviewers\n' \
       "${agent_review_reviewers_property_name}" "${repo}" >&2
-    if mkdir -p "${cache_dir}" 2>/dev/null; then
+    if agent_review_reviewers_run_quiet mkdir --parents "${cache_dir}"; then
       : >"${cache_file}.fail"
     fi
     return 0
   fi
-  if mkdir -p "${cache_dir}" 2>/dev/null; then
+  if agent_review_reviewers_run_quiet mkdir --parents "${cache_dir}"; then
     # Write via a temp file so a concurrent reader never sees a half-written (empty) cache.
-    tmp="$(mktemp "${cache_file}.XXXXXX" 2>/dev/null)" && printf '%s' "${value}" >"${tmp}" \
-      && mv "${tmp}" "${cache_file}"
-    rm -f "${cache_file}.fail"
+    if tmp="$(runner_exec_stdout "agent-reviewers cache temp file" -- mktemp "${cache_file}.XXXXXX" 2>/dev/null)"; then
+      printf '%s' "${value}" >"${tmp}"
+      agent_review_reviewers_run_quiet mv "${tmp}" "${cache_file}"
+    fi
+    agent_review_reviewers_run_quiet rm --force "${cache_file}.fail"
   fi
   printf '%s' "${value}"
 }
@@ -141,8 +168,13 @@ agent_review_reviewers_property_fetch() {
   ar_runner_gh_api_stream "agent-review ${agent_review_reviewers_property_name} property" \
     "repos/${repo}/properties/values" --jq \
     '(map({(.property_name): .value}) | add // {}) as $p
-      | if ($p["'"${agent_review_reviewers_enabled_property_name}"'"] | tostring) == "false" then "none"
+      | if ($p["'"${agent_review_reviewers_enabled_property_name}"'"] | tostring) == "false" then "'"${agent_review_reviewers_disabled_sentinel}"'"
         else ($p["'"${agent_review_reviewers_property_name}"'"] // [])
           | (if type == "array" then . else [.] end) | map(select(. != null)) | join(",")
         end'
+}
+
+# Runs a cache-maintenance command through the runner; its output is not interesting.
+agent_review_reviewers_run_quiet() {
+  runner_exec "agent-reviewers cache $1" -- "$@" >/dev/null 2>&1
 }
