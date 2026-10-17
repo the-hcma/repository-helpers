@@ -8289,6 +8289,24 @@ batch_update_all() {
 # CI polling
 # ---------------------------------------------------------------------------
 
+# dep_updater_approve_waiting_environments <pr_num>
+# Approves the protected environment (dep-updater, github-repo-lint, ...) a PR's CI is waiting on, as the
+# repo rules require of a coding agent: a PR that touches a path-filtered workflow otherwise sits pending
+# until WAIT_TIMEOUT (#731). Runs in the PR's repository, since dep-updater does not run from that
+# repository's directory. A failed approval stops the run with one machine-parseable line.
+dep_updater_approve_waiting_environments() {
+  local -r pr_num="$1"
+  local approve_rc=0
+
+  log "CI pending on PR #${pr_num} — approving any environment waiting on it"
+  runner_exec "dep-updater approve pending deployments" -- \
+    "${dep_script_dir}/dev/approve-pending-deployments" --pr "${pr_num}" \
+    --repo "${repo_owner}/${repo_name}" || approve_rc=$?
+  if (( approve_rc != 0 )); then
+    die "ENVIRONMENT_APPROVAL_FAILED pr=#${pr_num} repo=${repo_owner}/${repo_name} — the operator must approve the waiting environment or grant this gh identity reviewer access"
+  fi
+}
+
 wait_for_ci() {
   local -r branch="$1"
   local -r target_sha="${2:-}"
@@ -8300,6 +8318,10 @@ wait_for_ci() {
   # Check for merge conflicts every 4 cycles (~2 min) while CI runs.
   local -r mergeable_check_interval=4
   local cycles_since_mergeable_check=0
+  # Approve a waiting environment on the first pending poll, then about every minute (4 x 15s).
+  local -r approval_check_interval=4
+  local cycles_since_approval_check=$(( approval_check_interval - 1 ))
+  local approval_due=0
   local status raw merge_state already_merged
   local cancelled_diag rollup_diag latest_diag
 
@@ -8344,12 +8366,24 @@ wait_for_ci() {
         # GitHub hasn't scheduled CI yet — this is normal right after a push.
         # Keep polling; the 20-minute timeout guards against CI never being scheduled.
         log "Still waiting for CI scheduling: pr=#${pr_num} branch='${branch}' status=${status} ${wait_suffix}"
+        approval_due=1
         ;;
       *)
         # CI is running — log progress and break down per-workflow status.
         log "Still waiting for CI completion: pr=#${pr_num} branch='${branch}' status=${status} ${wait_suffix}"
+        approval_due=1
         ;;
     esac
+
+    # A gated workflow would otherwise hold CI pending until the timeout: unblock it (#731).
+    if (( approval_due == 1 )); then
+      approval_due=0
+      cycles_since_approval_check=$(( cycles_since_approval_check + 1 ))
+      if (( cycles_since_approval_check >= approval_check_interval )); then
+        cycles_since_approval_check=0
+        dep_updater_approve_waiting_environments "$pr_num"
+      fi
+    fi
 
     # Periodically re-check for merge conflicts so a conflict that appears
     # after the initial push (e.g. concurrent merge to main) is caught quickly.

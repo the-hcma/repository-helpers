@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# Tests for the environment approval in dep-updater's CI wait (#731): while a PR's CI is pending or not
+# yet scheduled, wait_for_ci approves the protected environment it may be waiting on, in the PR's
+# repository, instead of timing out. Hermetic: wait_for_ci is extracted from the script and every
+# dependency (CI status, gh, the approver, sleep) is stubbed.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+dep_updater="${script_dir}/../scripts/dep-updater"
+readonly dep_updater
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+
+# run_wait <status sequence> <approver exit code> -> output of one wait_for_ci call, then "rc=<n>".
+# The status sequence is space separated (pending, missing, success, failure); the last one repeats.
+run_wait() {
+  local -r sequence="$1" approver_rc="$2"
+
+  : >"${work_dir}/approver.log"
+  printf 0 >"${work_dir}/polls.n"
+  timeout 60 bash -c "
+    set -uo pipefail
+    dep_script_dir='/dep/scripts'
+    repo_owner='the-hcma'
+    repo_name='repository-helpers'
+    ci_required_contexts=''
+    $(awk '/^dep_updater_approve_waiting_environments\(\) \{/,/^\}/' "${dep_updater}")
+    $(awk '/^wait_for_ci\(\) \{/,/^\}/' "${dep_updater}")
+    log() { printf '%s\n' \"\$*\"; }
+    die() { printf 'ERROR: %s\n' \"\$*\"; exit 1; }
+    sleep() { :; }
+    gh_pr_merged_for_number() { printf 'false'; }
+    dep_runner_gh_pr_jq() { printf 'MERGEABLE'; }
+    dep_updater_handle_ci_failure() { die \"CI failed: pr=#\$1\"; }
+    ci_rollup_json_for_pr() { printf '[]'; }
+    ci_rollup_latest_by_name_json() { printf '[]'; }
+    ci_rollup_without_agent_product_checks() { printf '[]'; }
+    ci_rollup_cancelled_names_csv() { printf ''; }
+    runner_exec() {
+      printf 'APPROVE %s\n' \"\$*\" >>'${work_dir}/approver.log'
+      return ${approver_rc}
+    }
+    read -r -a statuses <<<'${sequence}'
+    # The counter lives in a file: this runs inside a command substitution, a subshell.
+    ci_conclusion_for_pr() {
+      local idx
+      idx=\$(cat '${work_dir}/polls.n')
+      printf '%s' \"\$(( idx + 1 ))\" >'${work_dir}/polls.n'
+      (( idx < \${#statuses[@]} )) || idx=\$(( \${#statuses[@]} - 1 ))
+      printf '%s' \"\${statuses[idx]}\"
+    }
+    rc=0
+    wait_for_ci dep-updates/batch-1 deadbeefcafe 729 || rc=\$?
+    echo \"rc=\$rc\"" 2>&1 || true
+}
+
+approvals() {
+  grep -c '^APPROVE ' "${work_dir}/approver.log" || true
+}
+
+printf '\n=== pending CI: the waiting environment is approved in the PR repository ===\n'
+out="$(run_wait 'pending pending success' 0)"
+assert_contains "the wait still ends successfully" "$out" "rc=0"
+assert_contains "the first pending poll announces an approval attempt" "$out" \
+  "CI pending on PR #729 — approving any environment waiting on it"
+assert_contains "the approver runs for the PR" "$(cat "${work_dir}/approver.log")" \
+  "/dep/scripts/dev/approve-pending-deployments --pr 729"
+assert_contains "the approver targets the repository, not the current directory" \
+  "$(cat "${work_dir}/approver.log")" "--repo the-hcma/repository-helpers"
+assert_count_equals "two pending polls approve only once" "$(cat "${work_dir}/approver.log")" "APPROVE" 1
+
+printf '\n=== pending CI: approvals repeat about once a minute, not on every poll ===\n'
+run_wait 'pending pending pending pending pending pending success' 0 >/dev/null
+assert_count_equals "six pending polls approve on the first and the fifth" \
+  "$(cat "${work_dir}/approver.log")" "APPROVE" 2
+
+printf '\n=== CI not yet scheduled counts as waiting too ===\n'
+out="$(run_wait 'missing success' 0)"
+assert_contains "a missing status is followed by an approval attempt" "$(cat "${work_dir}/approver.log")" \
+  "approve-pending-deployments --pr 729"
+assert_contains "the wait still ends successfully after a missing status" "$out" "rc=0"
+
+printf '\n=== settled CI never calls the approver ===\n'
+run_wait 'success' 0 >/dev/null
+assert_count_equals "green CI needs no approval" "$(cat "${work_dir}/approver.log")" "APPROVE" 0
+out="$(run_wait 'failure' 0)"
+assert_contains "failed CI stops through the failure handler" "$out" "CI failed: pr=#729"
+assert_count_equals "failed CI needs no approval" "$(cat "${work_dir}/approver.log")" "APPROVE" 0
+
+printf '\n=== a failed approval stops the run with a parseable line ===\n'
+out="$(run_wait 'pending success' 1)"
+assert_contains "the run reports ENVIRONMENT_APPROVAL_FAILED for the PR and repository" "$out" \
+  "ERROR: ENVIRONMENT_APPROVAL_FAILED pr=#729 repo=the-hcma/repository-helpers"
+assert_contains "the stop names what the operator must do" "$out" "the operator must approve the waiting environment"
+assert_not_contains "the run does not go on to report success" "$out" "rc=0"
+
+printf '\n=== a status that never settles still ends in the 20 minute timeout ===\n'
+out="$(run_wait 'pending' 0)"
+assert_contains "the timeout line is unchanged" "$out" "ERROR: WAIT_TIMEOUT ci pr=#729"
+assert_contains "the timeout is still 20 minutes" "$out" "timeout=20m status=pending"
+if (( $(approvals) > 1 )); then
+  pass_case "approvals are repeated while CI stays pending"
+else
+  fail_case "approvals are repeated while CI stays pending (got $(approvals))"
+fi
+
+printf '\n=== static: the approval is part of the CI wait ===\n'
+wait_body="$(awk '/^wait_for_ci\(\) \{/,/^\}/' "${dep_updater}")"
+assert_contains "wait_for_ci calls the approval helper" "$wait_body" \
+  "dep_updater_approve_waiting_environments \"\$pr_num\""
+helper_body="$(awk '/^dep_updater_approve_waiting_environments\(\) \{/,/^\}/' "${dep_updater}")"
+assert_contains "the helper passes the repository to the approver" "$helper_body" \
+  "--repo \"\${repo_owner}/\${repo_name}\""
+assert_contains "the helper runs the approver through the runner" "$helper_body" "runner_exec"
+
+test_summary
