@@ -146,6 +146,101 @@ assert_contains "a legacy IC_ entry in the state file is found by the bare id" \
 assert_not_contains "a legacy IC_ entry in the state file hides the comment from pending feedback" \
   "$(run_lib "${tmp}/s11" 'pending')" '"id":"6001"'
 
+printf '\n=== ids (#715): every spelling of an issue comment id maps to the listed key ===\n'
+for spelling in 'IC_6001' 'ic_6001' ' 6001 ' ' IC_6001 ' '06001' 'IC_006001' 'Ic_6001'; do
+  assert_contains "comment id [${spelling}] normalises to 6001" \
+    "[$(run_lib "${tmp}/n1" "agent_review_feedback_normalize_comment_id '${spelling}'")]" "[6001]"
+done
+for bad in 'IC_' ' ' '60a1' 'IC_60 01' '-6001'; do
+  assert_contains "comment id [${bad}] is rejected" \
+    "$(run_lib "${tmp}/n1" "agent_review_feedback_normalize_comment_id '${bad}' || true")" "invalid issue comment id '${bad}'"
+done
+
+printf '\n=== ids (#715): a leading-zero comment id is recorded under the listed key ===\n'
+state="${tmp}/z1"
+run_lib "$state" 'agent_review_resolve_issue_comment o/r 9 06001 1' >/dev/null
+assert_contains "the resolved state stores the canonical id" "$(cat "$state")" "o/r#9=6001"
+assert_not_contains "the leading zeros are never stored" "$(cat "$state")" "=06001"
+assert_not_contains "the comment is no longer pending (it used to stay unaddressed)" \
+  "$(run_lib "$state" 'pending')" '"id":"6001"'
+
+printf '\n=== ids (#715): every spelling of a review id maps to the numeric database id ===\n'
+for spelling in 'PRR_5551' 'prr_5551' ' 5551 ' ' PRR_5551 ' '05551' 'PRR_005551' 'Prr_5551'; do
+  assert_contains "review id [${spelling}] normalises to 5551" \
+    "[$(run_lib "${tmp}/n2" "agent_review_feedback_normalize_review_id '${spelling}'")]" "[5551]"
+done
+for bad in 'abc' 'PRR_abc' '55a1' 'PRR_' '-5551'; do
+  assert_contains "review id [${bad}] is rejected" \
+    "$(run_lib "${tmp}/n2" "agent_review_feedback_normalize_review_id '${bad}' || true")" "invalid pull request review id '${bad}'"
+done
+assert_contains "an empty review id stays empty so callers keep their own message" \
+  "[$(run_lib "${tmp}/n2" "agent_review_feedback_normalize_review_id ''")]" "[]"
+
+# A minimal snapshot with one submitted review (databaseId 5551) and one pending one.
+review_snapshot='{"data":{"repository":{"pullRequest":{"reviews":{"pageInfo":{"hasPreviousPage":false},"nodes":[{"databaseId":5551,"state":"COMMENTED","url":"https://github.com/o/r/pull/9#pullrequestreview-5551","submittedAt":"2026-10-17T01:00:00Z"},{"databaseId":5552,"state":"PENDING","url":"","submittedAt":""}]}}}}}'
+review_prog() {
+  printf "snap='%s'; %s" "${review_snapshot}" "$1"
+}
+
+printf '\n=== ids (#715): reply-comment --review-id cites an existing review ===\n'
+for spelling in '5551' 'PRR_5551' 'prr_5551' '05551'; do
+  rm -f "${tmp}/posted"
+  out="$(run_lib "${tmp}/r1" "$(review_prog "agent_review_reply_pull_request_review o/r 9 \"\${snap}\" '${spelling}' 'Fixed.'")")"
+  assert_contains "reply to review [${spelling}] is reported with the canonical id" "$out" "Replied on pull request review 5551"
+  assert_contains "reply to review [${spelling}] cites the review" "$(cat "${tmp}/posted")" \
+    "(In reply to https://github.com/o/r/pull/9#pullrequestreview-5551)"
+done
+
+printf '\n=== ids (#715): reply-comment --review-id on an unknown review posts nothing ===\n'
+for target in '9999' 'PRR_9999' '5552'; do
+  rm -f "${tmp}/posted"
+  rc=0
+  out="$(run_lib "${tmp}/r2" "$(review_prog "agent_review_reply_pull_request_review o/r 9 \"\${snap}\" '${target}' 'lost'")")" || rc=$?
+  assert_contains "the error names the missing review [${target}]" "$out" \
+    "pull request review ${target} not found on o/r#9; nothing was posted"
+  if [[ "$rc" -ne 0 && ! -e "${tmp}/posted" ]]; then
+    pass_case "an unknown review [${target}] exits non-zero and posts no stray comment"
+  else
+    fail_case "an unknown review [${target}] exits non-zero and posts no stray comment (rc=${rc})"
+  fi
+done
+rm -f "${tmp}/posted"
+rc=0
+out="$(run_lib "${tmp}/r2" "$(review_prog "agent_review_reply_pull_request_review o/r 9 \"\${snap}\" 'abc' 'lost'")")" || rc=$?
+assert_contains "a malformed review id is rejected before anything is posted" "$out" "invalid pull request review id 'abc'"
+if [[ "$rc" -ne 0 && ! -e "${tmp}/posted" ]]; then
+  pass_case "a malformed review id exits non-zero and posts nothing"
+else
+  fail_case "a malformed review id exits non-zero and posts nothing (rc=${rc})"
+fi
+
+printf '\n=== ids (#715): resolve-comment --review-id records only real reviews ===\n'
+for spelling in 'PRR_05551' 'prr_5551' ' 5551 '; do
+  state="${tmp}/rv-${#spelling}-${spelling//[^0-9a-z]/}"
+  run_lib "$state" "$(review_prog "agent_review_resolve_pull_request_review o/r 9 \"\${snap}\" '${spelling}' 1")" >/dev/null
+  assert_contains "resolving review [${spelling}] stores the canonical PRR_ key" "$(cat "$state")" "o/r#9=PRR_5551"
+  assert_not_contains "no zero-padded or spaced key is stored for [${spelling}]" "$(cat "$state")" "PRR_05551"
+done
+state="${tmp}/rv-missing"
+rc=0
+out="$(run_lib "$state" "$(review_prog "agent_review_resolve_pull_request_review o/r 9 \"\${snap}\" 'PRR_9999' 1")")" || rc=$?
+assert_contains "an unknown review is refused even with --force" "$out" \
+  "pull request review PRR_9999 not found on o/r#9; nothing was resolved"
+if [[ "$rc" -ne 0 && ! -s "$state" ]]; then
+  pass_case "an unknown review exits non-zero and records nothing"
+else
+  fail_case "an unknown review exits non-zero and records nothing (rc=${rc})"
+fi
+state="${tmp}/rv-bad"
+rc=0
+out="$(run_lib "$state" "$(review_prog "agent_review_resolve_pull_request_review o/r 9 \"\${snap}\" 'abc' 1")")" || rc=$?
+assert_contains "a malformed review id is rejected before anything is recorded" "$out" "invalid pull request review id 'abc'"
+if [[ "$rc" -ne 0 && ! -s "$state" ]]; then
+  pass_case "a malformed review id records nothing"
+else
+  fail_case "a malformed review id records nothing (rc=${rc})"
+fi
+
 printf '\n=== probes: CodeRabbit pings are not pending feedback ===\n'
 pending_out="$(run_lib "${tmp}/s6" 'pending')"
 assert_not_contains "@coderabbitai review is not pending" "$pending_out" '"id":"6002"'

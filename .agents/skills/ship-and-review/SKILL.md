@@ -161,6 +161,8 @@ For each **pull request review body** (`kind: pull_request_review` — findings 
    ./scripts/wait-for-agent-review resolve-comment --review-id <id> --pr <n>
    ```
 
+   Ids are forgiving but checked (#715): `PRR_<id>` or `IC_<id>` in any case, surrounding whitespace and leading zeros are accepted and stored under the canonical numeric key; a non-numeric id, or a review or comment that is not on the PR, is refused before anything is posted or recorded, even with `--force`.
+
 Batch resolve threads and replied issue comments / review bodies:
 
 `./scripts/wait-for-agent-review resolve-addressed --pr <n>` (requires an existing human reply per item)

@@ -88,22 +88,49 @@ agent_review_feedback_review_resolved_id() {
   printf 'PRR_%s' "$(agent_review_feedback_normalize_review_id "${review_id}")"
 }
 
-# Strip optional PRR_ prefix from --review-id / feedback ids (repository-helpers#539).
-agent_review_feedback_normalize_review_id() {
+# agent_review_feedback_canonical_numeric_id <raw> <prefix>
+# Trims surrounding whitespace, drops the optional <prefix> in any case, and strips leading zeros, so
+# every spelling of an id maps to the one key the listing and the resolved state use (#715). Prints
+# nothing and returns 1 unless a number is left.
+agent_review_feedback_canonical_numeric_id() {
   local id="${1:-}"
+  local -r prefix="${2:-}"
 
-  id="${id#PRR_}"
+  id="${id#"${id%%[![:space:]]*}"}"
+  id="${id%"${id##*[![:space:]]}"}"
+  if [[ -n "${prefix}" && "${id,,}" == "${prefix,,}"* ]]; then
+    id="${id:${#prefix}}"
+  fi
+  [[ "${id}" =~ ^[0-9]+$ ]] || return 1
+  while [[ "${id}" == 0?* ]]; do
+    id="${id#0}"
+  done
+  printf '%s' "${id}"
+}
+
+# Canonical numeric id from --review-id / feedback ids: an optional PRR_ prefix (any case), surrounding
+# whitespace and leading zeros are accepted (repository-helpers#539, #715). Anything else that is not a
+# number is rejected; an empty id stays empty so each caller keeps its own "requires a review id" error.
+agent_review_feedback_normalize_review_id() {
+  local -r raw="${1:-}"
+  local id
+
+  if [[ -z "${raw//[[:space:]]/}" ]]; then
+    return 0
+  fi
+  id="$(agent_review_feedback_canonical_numeric_id "${raw}" PRR_)" \
+    || agent_review_die "invalid pull request review id '${raw}' (expected the numeric review_id or PRR_<id>)"
   printf '%s' "${id}"
 }
 
 # Strip optional IC_ prefix from --comment-id: list-feedback / check print feedback_id as
 # IC_<id> next to the bare comment_id, and every lookup and the resolved state use the bare id
-# (repository-helpers#713). Anything that is not a number afterwards is rejected.
+# (repository-helpers#713). The prefix may be any case and the id may carry surrounding whitespace or
+# leading zeros (#715); anything that is not a number afterwards is rejected.
 agent_review_feedback_normalize_comment_id() {
-  local id="${1:-}"
+  local id
 
-  id="${id#IC_}"
-  [[ "${id}" =~ ^[0-9]+$ ]] \
+  id="$(agent_review_feedback_canonical_numeric_id "${1:-}" IC_)" \
     || agent_review_die "invalid issue comment id '${1:-}' (expected the numeric comment_id or IC_<id>)"
   printf '%s' "${id}"
 }
@@ -144,6 +171,20 @@ agent_review_feedback_review_canonical_url() {
 
   printf 'https://github.com/%s/pull/%s#pullrequestreview-%s' \
     "${repo}" "${pr}" "$(agent_review_feedback_normalize_review_id "${review_id}")"
+}
+
+# agent_review_feedback_review_exists <snapshot> <review_id>
+# Returns 0 when <review_id> (canonical, numeric) is a submitted review in the snapshot. The snapshot is
+# asserted complete by the caller (every review is listed, or the command stops), so a miss means the
+# id is wrong; a typo must neither post a citation that points nowhere nor be recorded as resolved (#715).
+agent_review_feedback_review_exists() {
+  local -r snapshot="$1"
+  local -r review_id="$2"
+  local meta found
+
+  meta="$(agent_review_feedback_review_meta_json "${snapshot}" "${review_id}")"
+  found="$(ar_runner_jq_file "agent-review feedback review exists" "${meta}" -r '.review_id // ""')"
+  [[ -n "${found}" && "${found}" == "${review_id}" ]]
 }
 
 # Lookup review meta by databaseId across *all* non-PENDING reviews in the snapshot
@@ -926,14 +967,18 @@ agent_review_reply_pull_request_review() {
   local -r repo="$1"
   local -r pr="$2"
   local -r snapshot="$3"
-  local review_id="$4"
+  local -r raw_review_id="$4"
   local -r body="$5"
-  local meta review_url full_body
+  local review_id meta review_url full_body
 
   agent_review_require_cmd gh
   [[ -n "${body}" ]] || agent_review_die 'reply-comment --review-id requires --body'
-  review_id="$(agent_review_feedback_normalize_review_id "${review_id}")"
+  review_id="$(agent_review_feedback_normalize_review_id "${raw_review_id}")" || return 1
   [[ -n "${review_id}" ]] || agent_review_die 'reply-comment --review-id requires a review id'
+  # Look the target up before anything is posted: a typo would otherwise post a citation that points
+  # at no review, which then becomes new pending feedback itself (#715).
+  agent_review_feedback_review_exists "${snapshot}" "${review_id}" \
+    || agent_review_die "pull request review ${raw_review_id} not found on ${repo}#${pr}; nothing was posted (use the review_id from list-feedback)"
 
   meta="$(agent_review_feedback_review_meta_json "${snapshot}" "${review_id}")"
   review_url="$(ar_runner_jq_file "agent-review feedback reply-review url" "${meta}" -r \
@@ -983,8 +1028,16 @@ agent_review_resolve_pull_request_review() {
   local -r repo="$1"
   local -r pr="$2"
   local -r snapshot="$3"
-  local -r review_id="$4"
+  local -r raw_review_id="$4"
   local force="${5:-0}"
+  local review_id
+
+  review_id="$(agent_review_feedback_normalize_review_id "${raw_review_id}")" || return 1
+  [[ -n "${review_id}" ]] || agent_review_die 'resolve-comment --review-id requires a review id'
+  # Recording an id that matches no review would silently hide nothing, so even --force insists the
+  # review exists on this PR (#715).
+  agent_review_feedback_review_exists "${snapshot}" "${review_id}" \
+    || agent_review_die "pull request review ${raw_review_id} not found on ${repo}#${pr}; nothing was resolved (use the review_id from list-feedback)"
 
   if [[ "${force}" != '1' ]]; then
     if ! agent_review_feedback_review_has_operator_reply "${repo}" "${pr}" "${snapshot}" "${review_id}"; then
