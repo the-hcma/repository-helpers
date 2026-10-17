@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Tests for the review-loop follow-ups (#726): the loop approves waiting environments itself, the
+# entrypoint runs the GNU userland check (which now covers stat), and the unknown-cooldown
+# warning prints once per cooldown.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+lib="${script_dir}/../scripts/lib/agent-review"
+profile="${script_dir}/../scripts/lib/agent-review-profiles/coderabbit"
+wait_script="${script_dir}/../scripts/wait-for-agent-review"
+readonly lib profile wait_script
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+export HOME="${work_dir}/home"
+mkdir -p "${HOME}"
+export AGENT_REVIEW_ENV_FILE=/dev/null
+export AGENT_REVIEW_CODERABBIT_STATE_CACHE_DIR="${work_dir}/cr-state"
+unset AGENT_REVIEW_AGENT AGENT_REVIEW_QUOTA_FALLBACK_CHAIN AGENT_REVIEW_GITHUB_REPO
+
+# --- 1. the loop approves waiting environments ---------------------------------------------------
+# loop_ci <ci_rc> <approve_rc> <calls> -> prints the log of approver runs, then "rc=<n>" per call
+loop_ci() {
+  : >"${work_dir}/approve.log"
+  timeout 30 bash -c "
+    set -uo pipefail
+    source '${wait_script}'
+    agent_review_ci_check_for_pr() { return $1; }
+    agent_review_print_ci_failures() { :; }
+    agent_review_resolve_repo() { printf '%s\n' \"\${1}\"; }
+    agent_review_resolve_pr() { printf '%s\n' \"\${1}\"; }
+    run_command() {
+      printf 'RUN %s\n' \"\$*\" >>'${work_dir}/approve.log'
+      return $2
+    }
+    for _ in \$(seq $3); do
+      rc=0
+      cmd_loop_abort_if_ci_failed o/r 7 || rc=\$?
+      echo \"rc=\$rc\"
+    done" 2>&1
+}
+
+printf '\n=== the loop approves a waiting environment instead of idling on it ===\n'
+out="$(loop_ci 2 0 1)"
+assert_contains "pending CI still reports 'waiting' to the loop" "$out" "rc=2"
+assert_contains "the approver runs for the PR's repo" "$(cat "${work_dir}/approve.log")" \
+  "approve-pending-deployments --pr 7 --repo o/r"
+
+out="$(loop_ci 2 0 3)"
+assert_count_equals "back-to-back pending polls approve only once within the interval" \
+  "$(cat "${work_dir}/approve.log")" "RUN" 1
+assert_count_equals "every poll still reports waiting" "$out" "rc=2" 3
+
+out="$(loop_ci 2 1 1)"
+assert_contains "a failed approval stops the loop with the new exit code" "$out" "rc=12"
+
+out="$(loop_ci 0 0 1)"
+assert_contains "green CI continues" "$out" "rc=0"
+assert_not_contains "no approval is attempted when CI is not waiting" "$(cat "${work_dir}/approve.log")" "RUN"
+
+out="$(loop_ci 1 0 1)"
+assert_contains "failed CI still stops as CI_FAILED" "$out" "rc=10"
+assert_not_contains "no approval is attempted for failed CI" "$(cat "${work_dir}/approve.log")" "RUN"
+
+# The interval is elapsed once the last attempt is old enough.
+: >"${work_dir}/approve.log"
+out="$(timeout 30 bash -c "
+  set -uo pipefail
+  source '${wait_script}'
+  agent_review_ci_check_for_pr() { return 2; }
+  agent_review_resolve_repo() { printf '%s\n' \"\${1}\"; }
+  agent_review_resolve_pr() { printf '%s\n' \"\${1}\"; }
+  run_command() { printf 'RUN\n' >>'${work_dir}/approve.log'; return 0; }
+  cmd_loop_abort_if_ci_failed o/r 7 || true
+  agent_review_loop_last_env_approval_epoch=0
+  cmd_loop_abort_if_ci_failed o/r 7 || true" 2>&1)"
+assert_count_equals "an old last attempt allows approving again" "$(cat "${work_dir}/approve.log")" "RUN" 2
+
+printf '\n=== the loop reports the approval failure to the operator ===\n'
+loop_body="$(awk '/^cmd_loop\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "${wait_script}")"
+assert_contains "the loop turns exit 12 into the ENVIRONMENT_APPROVAL_FAILED stop reason" "$loop_body" \
+  "ci_exit == 12"
+assert_count_equals "the stop reason is set both by the loop and by the exit-code mapping" \
+  "$(cat "${wait_script}")" "agent_review_loop_set_stop 'ENVIRONMENT_APPROVAL_FAILED'" 2
+assert_contains "--help documents exit 12" "$(bash "${wait_script}" --help 2>&1)" \
+  "ENVIRONMENT_APPROVAL_FAILED"
+
+# --- 2. the entrypoint runs the GNU userland check ---------------------------------------------------
+printf '\n=== static: the entrypoint runs the GNU userland check before any subcommand ===\n'
+main_body="$(awk '/^main\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "${wait_script}")"
+assert_contains "main prepends the GNU userland PATH" "$main_body" "tooling_path_prepend_gnu_userland"
+assert_contains "main collects the GNU userland problems" "$main_body" \
+  "tooling_prereq_collect_gnu_userland"
+assert_contains "main fails early with the consolidated install plan" "$main_body" \
+  "tooling_prereq_report_finish || exit 1"
+if [[ "${main_body%%tooling_prereq_report_finish*}" != *"agent_review_require_cmd gh"* ]]; then
+  pass_case "the GNU userland report comes before the gh/jq/git preflight"
+else
+  fail_case "the GNU userland report comes before the gh/jq/git preflight"
+fi
+
+# --- 3. the unknown-cooldown warning prints once per cooldown ---------------------------------------------
+warn_calls() {
+  # $1.. -> list of anchors; prints stderr+stdout of calling the helper for each
+  local anchor
+  rm -rf "${AGENT_REVIEW_CODERABBIT_STATE_CACHE_DIR}"
+  for anchor in "$@"; do
+    bash -c "
+      set -uo pipefail
+      source '${lib}'
+      source '${profile}'
+      agent_review_profile_text_quota_default_retry_after_iso 'Review limit reached' '${anchor}'
+      echo" 2>&1
+  done
+}
+printf '\n=== the unknown-cooldown warning prints once per cooldown ===\n'
+out="$(warn_calls 2026-10-16T22:00:00Z 2026-10-16T22:00:00Z 2026-10-16T22:00:00Z)"
+assert_count_equals "the same cooldown warns once, however often it is read" "$out" \
+  "retry time unparseable" 1
+assert_contains "every read still returns the assumed retry time" "$out" "2026-10-16T23:00:00Z"
+assert_count_equals "the retry time is returned on each read" "$out" "2026-10-16T23:00:00Z" 3
+
+out="$(warn_calls 2026-10-16T22:00:00Z 2026-10-17T01:00:00Z)"
+assert_count_equals "a different cooldown warns again" "$out" "retry time unparseable" 2
+
+out="$(warn_calls 2026-10-16T22:00:00Z 2026-10-17T01:00:00Z 2026-10-16T22:00:00Z)"
+assert_count_equals "returning to an earlier cooldown after a newer one warns again" "$out" \
+  "retry time unparseable" 3
+
+test_summary

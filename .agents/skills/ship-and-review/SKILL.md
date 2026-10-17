@@ -60,7 +60,7 @@ scripts/dev/post-pr-submission-checks --pr <n>
 scripts/dev/post-pr-submission-checks --pr <n>
 ```
 
-This polls until required checks finish. If a job is **WAITING** on a protected environment (`github-repo-lint`, `dep-updater`), the wait **approves it on the operator's behalf** (`scripts/dev/approve-pending-deployments`). Coding agents MUST do that; `gh` is the authenticated operator. Do not wait for a human to click Approve in the Actions UI.
+This polls until required checks finish. If a job is **WAITING** on a protected environment (`github-repo-lint`, `dep-updater`), the wait **approves it on the operator's behalf** (`scripts/dev/approve-pending-deployments`). Coding agents MUST do that; `gh` is the authenticated operator. Do not wait for a human to click Approve in the Actions UI. The review loop does the same while CI is pending (at most every 2 minutes) and stops with exit **12** if an approval fails.
 
 If approval fails, the wait prints **`ERROR: ENVIRONMENT_APPROVAL_FAILED`** and exits. **Raise that to the operator immediately** — do not keep polling or treat CI as still pending. The operator must approve the environment or grant this `gh` identity reviewer access.
 
@@ -250,3 +250,4 @@ Use `./scripts/wait-for-agent-review request --pr <n>` with `AGENT_REVIEW_AGENT=
 | 9 | Wait idle break — no PR activity with all agent quotas exhausted (`loop` continues) |
 | 10 | Required CI failed — coding agent must fix and resume; no operator email (escalate only if unfixable) |
 | 11 | Permanent merge block (`DIRTY`/`CONFLICTING`/`DRAFT`) — human intervention |
+| 12 | A waiting protected environment could not be approved (`ERROR: ENVIRONMENT_APPROVAL_FAILED`) — the operator must approve it or grant this gh identity reviewer access |

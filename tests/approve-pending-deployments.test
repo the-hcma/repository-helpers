@@ -92,6 +92,70 @@ fi
 rm -rf "$tmp"
 unset RUNNER_SESSION_ROOT
 
+printf '\n=== functional: --repo targets another repository without asking gh for the current one ===\n'
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin"
+export RUNNER_SESSION_ROOT="${tmp}/runner-sessions"
+
+write_mock_jq_passthrough "${mock_bin}"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+printf '%s\n' "$args" >>"__TMP__/gh.log"
+if [[ "$args" == *'repo view'* ]]; then
+  printf 'gh: no repository for the current directory\n' >&2
+  exit 1
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'statusCheckRollup'* ]]; then
+  printf '%s\n' '[{"name":"org repo-practices audit","status":"WAITING","conclusion":null,"detailsUrl":"https://github.com/the-hcma/other-repo/actions/runs/777/job/1"}]'
+  exit 0
+fi
+if [[ "$args" == *'actions/runs/'* && "$args" == *'.status'* ]]; then
+  printf 'in_progress\n'
+  exit 0
+fi
+if [[ "$args" == *'--method POST'* && "$args" == *'pending_deployments'* ]]; then
+  printf '1\n' >"__TMP__/posted"
+  printf '[]\n'
+  exit 0
+fi
+if [[ "$args" == *'pending_deployments'* ]]; then
+  printf '%s\n' '[{"environment":{"id":19823000136,"name":"github-repo-lint"},"current_user_can_approve":true}]'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+sed -i "s|__TMP__|${tmp}|g" "${mock_bin}/gh"
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(PATH="${mock_bin}:${PATH}" bash "$script" --pr 42 --repo the-hcma/other-repo 2>&1)"
+exit_code=$?
+set -e
+
+assert_exit_0 "approve waiting env in another repo" "$out" "$exit_code"
+assert_contains "approve log names the environment" "$out" "Approving environment github-repo-lint"
+assert_not_contains "the current directory's repo is never looked up" "$(cat "${tmp}/gh.log")" "repo view"
+assert_contains "gh calls target the repo given with --repo" "$(cat "${tmp}/gh.log")" "the-hcma/other-repo"
+if [[ -f "${tmp}/posted" ]]; then
+  pass_case "posted pending_deployments approve in the other repo"
+else
+  fail_case "posted pending_deployments approve in the other repo"
+fi
+
+set +e
+bad_out="$(bash "$script" --pr 42 --repo not-a-slug 2>&1)"
+bad_exit=$?
+set -e
+assert_exit_nonzero "a malformed --repo is rejected" "$bad_out" "$bad_exit"
+assert_contains "the rejection explains the expected form" "$bad_out" "OWNER/NAME"
+rm -rf "$tmp"
+unset RUNNER_SESSION_ROOT
+
 printf '\n=== functional: no WAITING checks is a no-op ===\n'
 tmp="$(mktemp -d)"
 mock_bin="${tmp}/bin"

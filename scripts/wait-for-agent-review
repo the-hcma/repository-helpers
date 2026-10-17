@@ -32,6 +32,8 @@ agent_review_loop_stop_reason_code=''
 agent_review_loop_stop_reason_detail=''
 agent_review_loop_last_error=''
 agent_review_loop_last_merge_state=''
+# Epoch of the loop's last attempt to approve a waiting environment (0 = never).
+agent_review_loop_last_env_approval_epoch=0
 agent_review_loop_attempt_count=0
 agent_review_loop_attempt_max=0
 # Per-head agents we requested and are still waiting on (space-separated).
@@ -52,6 +54,10 @@ source "${script_dir}/lib/agent-review-email"
 source "${script_dir}/lib/stacking-tool"
 # shellcheck disable=SC1091  # Conventional Commits PR title gate (#651)
 source "${script_dir}/lib/pr-conventional-title"
+# shellcheck source=scripts/lib/tooling-path
+source "${script_dir}/lib/tooling-path"
+# shellcheck source=scripts/lib/gnu-userland
+source "${script_dir}/lib/gnu-userland"
 
 wait_ar_jq_status() {
   local -r json="$1"
@@ -134,6 +140,7 @@ Exit codes:
   9  wait idle break — no PR activity with all agent quotas exhausted (loop continues to check)
  10  required CI failed — coding agent must fix and resume (no operator email; escalate only if unfixable)
  11  permanent merge block (DIRTY/CONFLICTING/DRAFT) — human intervention required
+ 12  a waiting protected environment could not be approved (ERROR: ENVIRONMENT_APPROVAL_FAILED) — operator must approve it
 
 Non-success loop exits email AGENT_REVIEW_REPORT_TO and post a PR comment when the loop
 command exits, except exit 3 (pending feedback) and exit 10 (CI failed): those are
@@ -161,6 +168,26 @@ cmd_status() {
   agent_review_status_json_from_snapshot "${snapshot}" "${repo}" "${pr}"
 }
 
+# Approves a waiting protected environment (github-repo-lint, dep-updater, ...) on the operator's
+# behalf, as the repo rules require of a coding agent, at most once per
+# agent_review_default_env_approval_interval_s. Returns the approver's exit code (non-zero means it
+# printed ERROR: ENVIRONMENT_APPROVAL_FAILED and the operator must act).
+cmd_loop_approve_pending_environments() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local now approve_rc=0
+
+  printf -v now '%(%s)T' -1
+  # shellcheck disable=SC2154  # agent_review_default_* constants are assigned in scripts/lib/agent-review
+  if (( now - agent_review_loop_last_env_approval_epoch < agent_review_default_env_approval_interval_s )); then
+    return 0
+  fi
+  agent_review_loop_last_env_approval_epoch="${now}"
+  run_command "loop approve pending deployments" \
+    "${script_dir}/dev/approve-pending-deployments" --pr "${pr}" --repo "${repo}" || approve_rc=$?
+  return "${approve_rc}"
+}
+
 cmd_loop_abort_if_ci_failed() {
   local repo pr ci_rc
 
@@ -173,6 +200,10 @@ cmd_loop_abort_if_ci_failed() {
     return 10
   fi
   if (( ci_rc == 2 )); then
+    # CI is waiting: unblock a protected environment instead of idling on it (#726).
+    if ! cmd_loop_approve_pending_environments "${repo}" "${pr}"; then
+      return 12
+    fi
     return 2
   fi
   return 0
@@ -250,6 +281,10 @@ agent_review_loop_default_stop_for_exit() {
     11)
       agent_review_loop_set_stop 'MERGE_STATE_BLOCKED' \
         'Permanent merge block (DIRTY/CONFLICTING/DRAFT) — human intervention required.'
+      ;;
+    12)
+      agent_review_loop_set_stop 'ENVIRONMENT_APPROVAL_FAILED' \
+        'A waiting environment could not be approved (ENVIRONMENT_APPROVAL_FAILED) — the operator must approve it or grant this gh identity reviewer access.'
       ;;
     *)
       agent_review_loop_set_stop 'LOOP_STOPPED' \
@@ -2011,6 +2046,11 @@ cmd_loop() {
       agent_review_loop_set_stop 'CI_FAILED' 'Required CI checks failed.'
       return 10
     fi
+    if (( ci_exit == 12 )); then
+      agent_review_loop_set_stop 'ENVIRONMENT_APPROVAL_FAILED' \
+        'A waiting environment could not be approved (ENVIRONMENT_APPROVAL_FAILED) — the operator must approve it or grant this gh identity reviewer access.'
+      return 12
+    fi
     if (( ci_exit == 2 )); then
       printf 'wait-for-agent-review loop: waiting for CI on PR #%s…\n' "${pr}" >&2
       pending_exit=0
@@ -2252,6 +2292,12 @@ main() {
 
   # One-time tool preflight (issue #644) — fail before subcommand noise.
   if [[ -n "${cmd}" && "${cmd}" != '-h' && "${cmd}" != '--help' && "${cmd}" != 'help' ]]; then
+    # GNU userland (macOS: gnubin first on PATH; every platform: report GNU sed/grep/date/stat/
+    # timeout/flock/find problems with one install plan) before any subcommand relies on them (#726).
+    tooling_path_prepend_gnu_userland
+    tooling_prereq_report_reset
+    tooling_prereq_collect_gnu_userland || true
+    tooling_prereq_report_finish || exit 1
     agent_review_require_cmd gh
     agent_review_require_cmd jq
     agent_review_require_cmd git
