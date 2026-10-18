@@ -79,6 +79,74 @@ out="$(run_confirm "${reviewed_old}")"
 assert_not_contains 'a head not reviewed yet is not asked for a full review' "${out}" 'POSTED'
 assert_contains 'a head not reviewed yet says there is nothing to confirm' "${out}" 'nothing to confirm'
 
+printf '\n=== head reviewed / clean: same source as the confirm gate ===\n'
+review_json() { # <sha> <submittedAt> <body>
+  printf '{"author":{"login":"coderabbitai"},"state":"COMMENTED","submittedAt":"%s","body":"%s","commit":{"oid":"%s"}}' "$2" "$3" "$1"
+}
+head_state() { # <reviews-json-array> <unaddressed> -> "reviewed clean"
+  local -r snap="$(snapshot_with "$1")"
+  run_lib "
+    agent_review_head_reviewed '${snap}' '${head_sha}' && printf 'reviewed ' || printf 'unreviewed '
+    agent_review_head_review_is_clean '${snap}' '${head_sha}' '$2' && printf 'clean' || printf 'not-clean'"
+}
+clean_body='**Actionable comments posted: 0**'
+findings_body='**Actionable comments posted: 1**\n\n<details><summary>Nitpick comments: 1</summary></details>'
+assert_contains 'a head with a clean review body is reviewed and clean' \
+  "$(head_state "[$(review_json "${head_sha}" 2026-10-18T09:33:00Z "${clean_body}")]" 0)" 'reviewed clean'
+assert_contains 'a head whose review has findings is reviewed but not clean' \
+  "$(head_state "[$(review_json "${head_sha}" 2026-10-18T09:33:00Z "${findings_body}")]" 0)" 'reviewed not-clean'
+assert_contains 'an unaddressed thread makes a clean-bodied head not clean' \
+  "$(head_state "[$(review_json "${head_sha}" 2026-10-18T09:33:00Z "${clean_body}")]" 1)" 'reviewed not-clean'
+assert_contains 'an empty stub review body is not clean' \
+  "$(head_state "[$(review_json "${head_sha}" 2026-10-18T09:33:00Z "")]" 0)" 'reviewed not-clean'
+assert_contains 'a later review of an older commit makes the head unreviewed' \
+  "$(head_state "[$(review_json "${head_sha}" 2026-10-18T09:33:00Z "${clean_body}"),$(review_json "${old_sha}" 2026-10-18T10:00:00Z "${clean_body}")]" 0)" 'unreviewed not-clean'
+
+printf '\n=== confirm-clean outcomes ===\n'
+# run_confirm_with <helper-exit> <rate-limited 0|1>
+run_confirm_with() {
+  snapshot_with "${reviewed_head}" >"${work_dir}/snapshot.json"
+  bash -c "
+    set -uo pipefail
+    source '${wait_script}'; source '${profile}'
+    agent_review_graphql_pr_snapshot() { cat '${work_dir}/snapshot.json'; }
+    agent_review_assert_snapshot_complete() { :; }
+    AGENT_REVIEW_AGENT=coderabbit
+    agent_review_profile_request_last_resort_full_review() { return $1; }
+    agent_review_agent_quota_rate_limited_for_agent() { return $(( 1 - $2 )); }
+    set +e
+    cmd_request_confirm_clean o r o/r 7
+    echo \"exit=\$?\"
+  " 2>&1
+}
+out="$(run_confirm_with 0 1)"
+assert_contains 'a rate-limited agent is told no full review was posted' "${out}" 'no full review posted'
+assert_not_contains 'a rate-limited agent is not told a review was requested' "${out}" 'asked for a full review'
+out="$(run_confirm_with 2 0)"
+assert_contains 'a failed comment lookup is retryable, not fatal' "${out}" 'retry shortly'
+assert_contains 'a failed comment lookup exits 2' "${out}" 'exit=2'
+out="$(run_confirm_with 0 0)"
+assert_contains 'a posted ask tells the operator to read the agent reply' "${out}" 'read the agent reply on the PR'
+
+printf '\n=== confirm-clean is refused where it cannot work ===\n'
+out="$(bash -c "
+  set -uo pipefail
+  source '${wait_script}'; source '${script_dir}/../scripts/lib/agent-review-profiles/copilot'
+  agent_review_resolve_repo() { echo o/r; }
+  agent_review_repo_parts() { echo o r; }
+  agent_review_resolve_pr() { echo 7; }
+  agent_review_require_cmd() { :; }
+  agent_review_reviewers_is_disabled() { return 1; }
+  agent_review_reviewers_select_agent() { return 0; }
+  gh() { echo \"GH \$*\"; }
+  AGENT_REVIEW_AGENT=copilot
+  cmd_request o/r 7 1
+" 2>&1 || true)"
+assert_contains 'a nudge-style agent refuses --confirm-clean' "${out}" 'only supported for an incremental reviewer'
+assert_not_contains 'a nudge-style agent posts nothing for --confirm-clean' "${out}" 'GH '
+out="$("${wait_script}" wait --pr 7 --repo o/r --confirm-clean 2>&1 || true)"
+assert_contains '--confirm-clean is rejected outside the request command' "${out}" 'only applies to the request command'
+
 printf '\n=== static: wiring ===\n'
 usage="$("${wait_script}" --help)"
 assert_contains 'usage lists request --confirm-clean' "${usage}" '--confirm-clean'

@@ -374,19 +374,34 @@ cmd_request_confirm_clean() {
   local -r name="$2"
   local -r repo="$3"
   local -r pr="$4"
-  local snapshot head
+  local snapshot head helper_exit=0
 
   snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
   agent_review_assert_snapshot_complete "${snapshot}"
   head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
-  if ! agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
+  if ! agent_review_head_reviewed "${snapshot}" "${head}"; then
     printf 'wait-for-agent-review: %s has not reviewed head %s of PR #%s yet - waiting on its on-push review; nothing to confirm\n' \
       "${AGENT_REVIEW_AGENT:-copilot}" "${head:0:7}" "${pr}" >&2
     return 0
   fi
-  agent_review_profile_request_last_resort_full_review "${repo}" "${pr}" "${head}" \
-    || agent_review_die 'failed to request the full review'
-  printf 'wait-for-agent-review: head %s of PR #%s is already reviewed - full review requested or already pending to confirm it is clean (see head_review_clean in check)\n' \
+  agent_review_profile_request_last_resort_full_review "${repo}" "${pr}" "${head}" || helper_exit=$?
+  case "${helper_exit}" in
+    0) ;;
+    2)
+      printf 'wait-for-agent-review: could not read the PR comments to place the full-review ask on PR #%s - retry shortly\n' \
+        "${pr}" >&2
+      return 2
+      ;;
+    *)
+      agent_review_die 'failed to request the full review'
+      ;;
+  esac
+  if agent_review_agent_quota_rate_limited_for_agent "${AGENT_REVIEW_AGENT:-coderabbit}"; then
+    printf 'wait-for-agent-review: no full review posted for head %s of PR #%s: the agent is rate-limited (see above); retry after its stated wait\n' \
+      "${head:0:7}" "${pr}" >&2
+    return 0
+  fi
+  printf 'wait-for-agent-review: head %s of PR #%s is already reviewed - asked for a full review, or one is already pending; read the agent reply on the PR to confirm it started, then check head_review_clean\n' \
     "${head:0:7}" "${pr}" >&2
 }
 
@@ -408,6 +423,10 @@ cmd_request() {
     return 0
   fi
   agent_review_reviewers_select_agent "${repo}" || return 0
+  if [[ "${confirm_clean}" == '1' ]] \
+    && ! declare -F agent_review_profile_request_last_resort_full_review >/dev/null 2>&1; then
+    agent_review_die "--confirm-clean is only supported for an incremental reviewer (coderabbit), not ${AGENT_REVIEW_AGENT:-copilot}"
+  fi
   if agent_review_pr_is_merged "${repo}" "${pr}"; then
     printf 'PR #%s is already merged — skipping agent request\n' "${pr}" >&2
     return 0
@@ -428,7 +447,7 @@ cmd_request() {
       "${AGENT_REVIEW_AGENT:-copilot}" "${pr}" >&2
     return 0
   fi
-  if [[ "${confirm_clean}" == '1' ]] && declare -F agent_review_profile_request_last_resort_full_review >/dev/null 2>&1; then
+  if [[ "${confirm_clean}" == '1' ]]; then
     cmd_request_confirm_clean "${owner}" "${name}" "${repo}" "${pr}"
     return
   fi
@@ -2392,6 +2411,10 @@ main() {
         ;;
     esac
   done
+
+  if [[ "${confirm_clean}" == '1' && "${cmd}" != 'request' ]]; then
+    agent_review_die "--confirm-clean only applies to the request command, not ${cmd}"
+  fi
 
   case "${cmd}" in
     -h|--help|help)
