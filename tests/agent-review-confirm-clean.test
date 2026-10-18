@@ -73,6 +73,7 @@ run_confirm() {
     agent_review_graphql_pr_snapshot() { cat '${work_dir}/snapshot.json'; }
     agent_review_assert_snapshot_complete() { :; }
     agent_review_pr_issue_comments_json() { cat '${work_dir}/comments.json'; }
+    agent_review_pr_issue_comments_json_strict() { cat '${work_dir}/comments.json'; }
     agent_review_latest_issue_comment_body_for_profile() { :; }
     agent_review_coderabbit_head_state() { printf %s \${HEAD_STATE:-completed}; }
     agent_review_agent_quota_rate_limited_for_agent() { return 1; }
@@ -128,6 +129,7 @@ run_confirm_with() {
     agent_review_graphql_pr_snapshot() { cat '${work_dir}/snapshot.json'; }
     agent_review_assert_snapshot_complete() { :; }
     agent_review_pr_issue_comments_json() { cat '${work_dir}/comments.json'; }
+    agent_review_pr_issue_comments_json_strict() { cat '${work_dir}/comments.json'; }
     agent_review_latest_issue_comment_body_for_profile() { :; }
     agent_review_coderabbit_head_state() { printf completed; }
     AGENT_REVIEW_AGENT=coderabbit
@@ -146,6 +148,68 @@ assert_contains 'a failed comment lookup is retryable, not fatal' "${out}" 'retr
 assert_contains 'a failed comment lookup exits 2' "${out}" 'exit=2'
 out="$(run_confirm_with 0 0)"
 assert_contains 'a posted ask tells the operator to read the agent reply' "${out}" 'read the agent reply on the PR'
+
+printf '\n=== a paused or unknown CodeRabbit status (repository-helpers#739) ===\n'
+paused_out="$(HEAD_STATE=other head_state "[$(comment_json "${review_comment}")]" 0)"
+assert_contains 'a paused/skipped head status is neither reviewed nor clean' "${paused_out}" 'unreviewed not-clean'
+for missing_state in none unknown; do
+  out="$(HEAD_STATE="${missing_state}" head_state "[$(comment_json "${review_comment}")]" 0)"
+  assert_contains "a ${missing_state} head status still counts as reviewed (comment signal)" "${out}" 'reviewed '
+  assert_contains "a ${missing_state} head status is not clean: clean needs completed" "${out}" 'not-clean'
+done
+out="$(HEAD_STATE=other run_confirm "[$(comment_json "${review_comment}")]")"
+assert_not_contains 'a paused head is not confirmed with a full review' "${out}" 'POSTED'
+assert_contains 'a paused head says there is nothing to confirm' "${out}" 'nothing to confirm'
+
+printf '\n=== an unreadable PR comment list is retryable, not "not reviewed" (repository-helpers#739) ===\n'
+mkdir -p "${work_dir}/bin"
+cat >"${work_dir}/bin/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+# gh stub: GH_STUB_FAIL=1 fails every call with a non-transient error (a transient 502/network error
+# would be retried with sleeps by the API runner); otherwise answers with GH_STUB_BODY.
+if [[ "${GH_STUB_FAIL:-0}" == 1 ]]; then
+  echo 'gh: Not Found (HTTP 404)' >&2
+  exit 1
+fi
+printf '%s' "${GH_STUB_BODY:-[]}"
+GH_STUB
+chmod +x "${work_dir}/bin/gh"
+run_comments_fn() { # <fn> <fail 0|1> <body>
+  env PATH="${work_dir}/bin:${PATH}" GH_STUB_FAIL="$2" GH_STUB_BODY="$3" \
+    bash -c "set -uo pipefail; source '${lib}'; source '${profile}'; set +e; $1 o/r 7; echo \"rc=\$?\"" 2>&1
+}
+out="$(run_comments_fn agent_review_pr_issue_comments_json_strict 1 '')"
+assert_contains 'the strict reader fails when the API fails' "${out}" 'rc=1'
+assert_not_contains 'the strict reader prints no fake empty list on failure' "${out}" '[]'
+out="$(run_comments_fn agent_review_pr_issue_comments_json_strict 0 '[{"id":1}]')"
+assert_contains 'the strict reader returns the comments when the API answers' "${out}" '[{"id":1}]'
+assert_contains 'the strict reader succeeds when the API answers' "${out}" 'rc=0'
+out="$(run_comments_fn agent_review_pr_issue_comments_json_strict 0 '[]')"
+assert_contains 'an empty comment list is a successful read, not a failure' "${out}" 'rc=0'
+out="$(run_comments_fn agent_review_pr_issue_comments_json 1 '')"
+assert_contains 'the best-effort reader still degrades to an empty list' "${out}" '[]'
+assert_contains 'the best-effort reader still succeeds on failure' "${out}" 'rc=0'
+
+# run_confirm_unreadable: the gate with the comment read failing.
+snapshot_with '[]' >"${work_dir}/snapshot.json"
+out="$(bash -c "
+  set -uo pipefail
+  source '${wait_script}'; source '${profile}'
+  agent_review_graphql_pr_snapshot() { cat '${work_dir}/snapshot.json'; }
+  agent_review_assert_snapshot_complete() { :; }
+  agent_review_pr_issue_comments_json_strict() { return 1; }
+  agent_review_pr_issue_comments_json() { printf '[]'; }
+  agent_review_coderabbit_head_state() { printf completed; }
+  AGENT_REVIEW_AGENT=coderabbit
+  agent_review_profile_request_last_resort_full_review() { printf 'POSTED\n'; }
+  set +e
+  cmd_request_confirm_clean o r o/r 7
+  echo \"exit=\$?\"
+" 2>&1)"
+assert_contains 'an unreadable comment list exits 2' "${out}" 'exit=2'
+assert_contains 'an unreadable comment list says to retry' "${out}" 'retry shortly'
+assert_not_contains 'an unreadable comment list is not reported as nothing to confirm' "${out}" 'nothing to confirm'
+assert_not_contains 'an unreadable comment list posts nothing' "${out}" 'POSTED'
 
 printf '\n=== confirm-clean is refused where it cannot work ===\n'
 out="$(bash -c "

@@ -769,6 +769,18 @@ agent_review_last_reviewed_sha() {
     | sort_by(.submittedAt) | last | .commit.oid // ""'
 }
 
+# CodeRabbit's head state for a CodeRabbit profile; empty for any other agent, or when the status
+# helper is not loaded, so callers apply the commit-status rules only where they exist.
+agent_review_profile_coderabbit_head_state() {
+  local -r repo="$1"
+  local -r head="$2"
+
+  if declare -F agent_review_coderabbit_head_state >/dev/null 2>&1 \
+    && [[ "${agent_review_profile_request_login_regex:-}" == *coderabbit* ]]; then
+    agent_review_coderabbit_head_state "${repo}" "${head}"
+  fi
+}
+
 # True when the agent has completed a review of <head>, by the same signal the loop uses for
 # "fresh" (the profile's own: CodeRabbit's issue-comment review that is not a rate-limit or ack
 # stub, a head check for check-based agents, else a review object). One definition shared by the
@@ -780,21 +792,21 @@ agent_review_head_reviewed() {
   local -r pr="$4"
 
   agent_review_fresh_agent_on_head "${snapshot}" "${head}" "${repo}" "${pr}" || return 1
-  # CodeRabbit's commit status is authoritative for whether it is still working or was rate limited;
-  # a stub or a stale comment on the head must not read as a completed review (#717).
-  if declare -F agent_review_coderabbit_head_state >/dev/null 2>&1 \
-    && [[ "${agent_review_profile_request_login_regex:-}" == *coderabbit* ]]; then
-    case "$(agent_review_coderabbit_head_state "${repo}" "${head}")" in
-      rate_limited | in_progress | failed) return 1 ;;
-      *) ;;
-    esac
-  fi
+  # CodeRabbit's commit status is authoritative for whether it is still working, was rate limited,
+  # or paused/skipped (`other`); a stub or a stale comment on the head must not read as a completed
+  # review (#717, #739). A missing status (none/unknown) falls back to the comment signal above.
+  case "$(agent_review_profile_coderabbit_head_state "${repo}" "${head}")" in
+    rate_limited | in_progress | failed | other) return 1 ;;
+    *) ;;
+  esac
   return 0
 }
 
 # True when <head> was reviewed and the agent's review body on it reports nothing: that body is an
 # empty pass and no agent thread is unaddressed. A green head check or a fallback pass is not
-# enough, since a review can carry findings outside threads.
+# enough, since a review can carry findings outside threads. For CodeRabbit the commit status must
+# also say the review completed: this is the conservative signal, so a missing status is not clean
+# (#739).
 agent_review_head_review_is_clean() {
   local -r snapshot="$1"
   local -r head="$2"
@@ -805,6 +817,10 @@ agent_review_head_review_is_clean() {
 
   agent_review_head_reviewed "${snapshot}" "${head}" "${repo}" "${pr}" || return 1
   (( unaddressed == 0 )) || return 1
+  case "$(agent_review_profile_coderabbit_head_state "${repo}" "${head}")" in
+    '' | completed) ;;
+    *) return 1 ;;
+  esac
   if declare -F agent_review_profile_latest_review_body_on_head >/dev/null 2>&1; then
     body="$(agent_review_profile_latest_review_body_on_head "${snapshot}" "${head}" "${repo}" "${pr}")"
   else
@@ -2653,8 +2669,10 @@ agent_review_pr_has_quota_issue_comment_today() {
   return 1
 }
 
-# Fetch PR issue comments once for quota observation (REST paginate).
-agent_review_pr_issue_comments_json() {
+# Fetch PR issue comments once for quota observation (REST paginate). Prints nothing and returns 1
+# when the API call fails or returns nothing, so a caller that must tell "no comments" from "could
+# not read" can (repository-helpers#739).
+agent_review_pr_issue_comments_json_strict() {
   local -r repo="$1"
   local -r pr="$2"
   local owner name exit_code api_json
@@ -2666,10 +2684,14 @@ agent_review_pr_issue_comments_json() {
   api_json="$(ar_runner_gh_api_stream "agent-review pr issue comments" \
     "repos/${owner}/${name}/issues/${pr}/comments" --paginate)" || exit_code=$?
   if (( exit_code != 0 )) || [[ -z "${api_json}" ]]; then
-    printf '[]\n'
-    return 0
+    return 1
   fi
   printf '%s' "${api_json}"
+}
+
+# Best-effort variant of the above: "[]" when the comments cannot be read.
+agent_review_pr_issue_comments_json() {
+  agent_review_pr_issue_comments_json_strict "$@" || printf '[]\n'
 }
 
 # True when comments_json has a same-day "@copilot please review" ask (any author).
