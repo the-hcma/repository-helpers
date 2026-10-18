@@ -10274,18 +10274,31 @@ rp_fetch_systemd_unit_names() {
 
 # rp_systemd_unit_hardening_gaps <unit text>
 # One token per gap on stdout, judged on the effective [Service] values (the
-# last assignment of a key wins; other sections and comments are ignored):
+# last assignment of a key wins; other sections and comments are ignored; a line
+# ending in a backslash continues on the next line, as in systemd; booleans are
+# systemd's 1/yes/y/true/t/on):
 #   no_new_privileges - NoNewPrivileges is not a true boolean
 #   sandboxing        - none of ProtectSystem= / ProtectHome= / PrivateTmp= (enabled values),
 #                       RestrictAddressFamilies= (non-empty) or CapabilityBoundingSet= (any
 #                       value, an empty set is the strictest) is in effect
+# Last-wins is right for "is anything restricted" even for list-type keys
+# (RestrictAddressFamilies=, CapabilityBoundingSet=), which systemd accumulates until
+# an empty assignment resets them.
 rp_systemd_unit_hardening_gaps() {
   local text="$1"
-  local line key val in_service=0
+  local line key val in_service=0 pending=""
   local -A service_values=()
 
   while IFS= read -r line; do
     line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    # Join backslash continuations before interpreting the directive.
+    if [[ "$line" == *"\\" ]]; then
+      pending+="${line%\\} "
+      continue
+    fi
+    line="${pending}${line}"
+    pending=""
     case "$line" in
       '' | '#'* | ';'*) continue ;;
       '['*)
@@ -10302,6 +10315,8 @@ rp_systemd_unit_hardening_gaps() {
     [[ "$line" == *=* ]] || continue
     key="${line%%=*}"
     key="${key%"${key##*[![:space:]]}"}"
+    # A malformed line with an empty key (`=x`) is not a directive and cannot be an array index.
+    [[ -n "$key" ]] || continue
     val="${line#*=}"
     val="${val#"${val%%[![:space:]]*}"}"
     val="${val%"${val##*[![:space:]]}"}"
@@ -10309,20 +10324,20 @@ rp_systemd_unit_hardening_gaps() {
   done <<<"$text"
 
   case "${service_values[NoNewPrivileges]-}" in
-    true | yes | on | 1) ;;
+    true | yes | y | t | on | 1) ;;
     *) printf '%s\n' 'no_new_privileges' ;;
   esac
 
   case "${service_values[ProtectSystem]-}" in
-    true | yes | on | 1 | full | strict) return 0 ;;
+    true | yes | y | t | on | 1 | full | strict) return 0 ;;
     *) ;;
   esac
   case "${service_values[ProtectHome]-}" in
-    true | yes | on | 1 | read-only | tmpfs) return 0 ;;
+    true | yes | y | t | on | 1 | read-only | tmpfs) return 0 ;;
     *) ;;
   esac
   case "${service_values[PrivateTmp]-}" in
-    true | yes | on | 1 | disconnected) return 0 ;;
+    true | yes | y | t | on | 1 | disconnected) return 0 ;;
     *) ;;
   esac
   if [[ -n "${service_values[RestrictAddressFamilies]-}" ]]; then
@@ -10344,6 +10359,10 @@ rp_check_systemd_unit_hardening() {
   if (( list_ec == 2 )); then
     detail="$(rp_runner_last_stderr_summary || true)"
     rp_log_warn "${slug}: could not list etc/systemd (GitHub API: ${detail:-gh api request failed}); systemd hardening advisory skipped"
+    return 0
+  fi
+  if (( list_ec > 2 )); then
+    rp_log_warn "${slug}: unexpected result (${list_ec}) listing etc/systemd; systemd hardening advisory skipped"
     return 0
   fi
   if (( list_ec != 0 )) || [[ -z "$names_out" ]]; then
