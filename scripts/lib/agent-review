@@ -754,8 +754,8 @@ agent_review_fresh_agent_review_on_head() {
   [[ "${count}" -gt 0 ]]
 }
 
-# Commit the newest non-pending agent review was made on ("" when the agent has not reviewed).
-# Lets an operator tell "reviewed this head" from "reviewed an older head" (repository-helpers#735).
+# Commit the newest non-pending agent review object was made on ("" when there is none): the
+# fallback for `last_reviewed_sha` when the head itself has no completed review (repository-helpers#735).
 agent_review_last_reviewed_sha() {
   local -r snapshot="$1"
 
@@ -769,30 +769,47 @@ agent_review_last_reviewed_sha() {
     | sort_by(.submittedAt) | last | .commit.oid // ""'
 }
 
-# True when the newest non-pending agent review is on <head>. One definition shared by the status
-# JSON and `request --confirm-clean`, so they cannot disagree (repository-helpers#735).
+# True when the agent has completed a review of <head>, by the same signal the loop uses for
+# "fresh" (the profile's own: CodeRabbit's issue-comment review that is not a rate-limit or ack
+# stub, a head check for check-based agents, else a review object). One definition shared by the
+# status JSON and `request --confirm-clean`, so they cannot disagree (repository-helpers#735).
 agent_review_head_reviewed() {
   local -r snapshot="$1"
   local -r head="$2"
-  local last
+  local -r repo="$3"
+  local -r pr="$4"
 
-  last="$(agent_review_last_reviewed_sha "${snapshot}")"
-  [[ -n "${last}" && "${last}" == "${head}" ]]
+  agent_review_fresh_agent_on_head "${snapshot}" "${head}" "${repo}" "${pr}" || return 1
+  # CodeRabbit's commit status is authoritative for whether it is still working or was rate limited;
+  # a stub or a stale comment on the head must not read as a completed review (#717).
+  if declare -F agent_review_coderabbit_head_state >/dev/null 2>&1 \
+    && [[ "${agent_review_profile_request_login_regex:-}" == *coderabbit* ]]; then
+    case "$(agent_review_coderabbit_head_state "${repo}" "${head}")" in
+      rate_limited | in_progress | failed) return 1 ;;
+      *) ;;
+    esac
+  fi
+  return 0
 }
 
-# True when <head> was reviewed and the agent's review body on it reports nothing: the latest
-# non-empty review body is an empty pass and no agent thread is unaddressed. A green head check or a
-# fallback pass is not enough, since a review can carry findings outside threads. Only agents that
-# post a review on the head (CodeRabbit) can be clean this way.
+# True when <head> was reviewed and the agent's review body on it reports nothing: that body is an
+# empty pass and no agent thread is unaddressed. A green head check or a fallback pass is not
+# enough, since a review can carry findings outside threads.
 agent_review_head_review_is_clean() {
   local -r snapshot="$1"
   local -r head="$2"
-  local -r unaddressed="${3:-0}"
+  local -r unaddressed="$3"
+  local -r repo="$4"
+  local -r pr="$5"
   local body
 
-  agent_review_head_reviewed "${snapshot}" "${head}" || return 1
+  agent_review_head_reviewed "${snapshot}" "${head}" "${repo}" "${pr}" || return 1
   (( unaddressed == 0 )) || return 1
-  body="$(agent_review_latest_nonempty_agent_review_body_on_head "${snapshot}" "${head}")"
+  if declare -F agent_review_profile_latest_review_body_on_head >/dev/null 2>&1; then
+    body="$(agent_review_profile_latest_review_body_on_head "${snapshot}" "${head}" "${repo}" "${pr}")"
+  else
+    body="$(agent_review_latest_nonempty_agent_review_body_on_head "${snapshot}" "${head}")"
+  fi
   [[ -n "${body}" ]] || return 1
   agent_review_profile_review_is_empty "${body}"
 }
@@ -1675,11 +1692,13 @@ agent_review_status_json_from_snapshot() {
     coderabbit_rate_limited=true
     coderabbit_retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent 'coderabbit')"
   fi
-  last_reviewed_sha="$(agent_review_last_reviewed_sha "${snapshot}")"
-  if agent_review_head_reviewed "${snapshot}" "${head}"; then
+  if agent_review_head_reviewed "${snapshot}" "${head}" "${repo}" "${pr}"; then
     head_reviewed=true
+    last_reviewed_sha="${head}"
   else
     head_reviewed=false
+    # The newest review object, which may be on an older commit (empty when none).
+    last_reviewed_sha="$(agent_review_last_reviewed_sha "${snapshot}")"
   fi
   pass_delivered_by_fallback=false
   if agent_review_delivered_recognized_pass_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
@@ -1704,7 +1723,7 @@ agent_review_status_json_from_snapshot() {
   fi
   # Clean means the agent reviewed this exact head and its review body reported nothing (not
   # "findings declined", not just a green head check).
-  if agent_review_head_review_is_clean "${snapshot}" "${head}" "${unaddressed}"; then
+  if agent_review_head_review_is_clean "${snapshot}" "${head}" "${unaddressed}" "${repo}" "${pr}"; then
     head_review_clean=true
   else
     head_review_clean=false
