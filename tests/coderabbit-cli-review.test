@@ -39,6 +39,7 @@ case "${1:-}" in
   usage) default_usage='{"includedReviews":{"remaining":3,"limit":3}}'; printf '%s\n' "${STUB_USAGE:-$default_usage}" ;;
   review)
     if [[ "${2:-}" == '--help' ]]; then
+      if [[ -z "${STUB_HELP_UNBRANDED:-}" ]]; then printf 'Usage: coderabbit review [options]\n'; fi
       printf 'Options:\n  --agent\n  --base-commit <commit>\n  --committed\n  --dir <path>\n  --fresh\n'
       [[ -z "${STUB_HELP_EXTRA:-}" ]] || printf '%s\n' "$STUB_HELP_EXTRA"
       exit 0
@@ -46,7 +47,9 @@ case "${1:-}" in
     if [[ -n "${STUB_SLEEP:-}" ]]; then
       exec sleep "$STUB_SLEEP"
     fi
+    if [[ -n "${STUB_STDERR:-}" ]]; then printf "%s\n" "$STUB_STDERR" >&2; fi
     cat "${STUB_REVIEW_FILE:?}"
+    if [[ -n "${STUB_SLEEP_AFTER:-}" ]]; then exec sleep "$STUB_SLEEP_AFTER"; fi
     exit "${STUB_REVIEW_RC:-0}"
     ;;
 esac
@@ -172,6 +175,14 @@ else
   pass_case 'a timed-out review records no result'
 fi
 
+printf '\n=== findings streamed before a timeout are still reported ===\n'
+export STUB_REVIEW_FILE="$findings_review"
+STUB_SLEEP_AFTER=30 run_wrapper "${work}/s27" --timeout 1
+assert_eq 'findings streamed before a timeout exit 2' "$rc" '2'
+assert_contains 'the timeout is noted next to the findings' "$out" 'timed out after 1s; reporting the findings streamed so far'
+assert_contains 'the streamed findings are printed' "$out" '[minor] scripts/a: First problem'
+export STUB_REVIEW_FILE="$clean_review"
+
 printf '\n=== skips never fail ===\n'
 export STUB_USAGE='{"includedReviews":{"remaining":0,"limit":3}}'
 run_wrapper "${work}/s7"
@@ -182,7 +193,7 @@ run_wrapper "${work}/s8"
 assert_eq 'unreadable allowance (not signed in) exits 3' "$rc" '3'
 assert_contains 'sign-in hint is printed' "$out" 'cr auth login'
 unset STUB_USAGE
-for odd_remaining in '3.0' '"unlimited"' '-1'; do
+for odd_remaining in '2.5' '"unlimited"' '-1'; do
   export STUB_USAGE="{\"includedReviews\":{\"remaining\":${odd_remaining},\"limit\":3}}"
   run_wrapper "${work}/s17"
   assert_eq "an unexpected allowance value ${odd_remaining} skips with exit 3" "$rc" '3'
@@ -299,11 +310,104 @@ got=0
 FAKE_DETECT_RC=1 prec_should_plan_coderabbit_cli "$fake_root" || got=$?
 assert_eq 'the job is not planned without a CLI' "$got" '1'
 
+printf '\n=== independent review findings: robustness ===\n'
+# Findings are reported even when the CLI also errors or never sends complete.
+mixed_review="${work}/mixed.ndjson"
+printf '%s\n' '{"type":"review_context"}' 'plain text warning line' 'null' \
+  '{"type":"finding","severity":"major","fileName":"scripts/c","title":"Kept problem","comment":"still reported"}' \
+  '{"type":"error","message":"non-fatal warning"}' > "$mixed_review"
+export STUB_REVIEW_FILE="$mixed_review"
+run_wrapper "${work}/s18"
+assert_eq 'findings plus an error event and no complete still exit 2' "$rc" '2'
+assert_contains 'the finding survives the error event and non-object lines' "$out" '[major] scripts/c: Kept problem'
+# Replay reprints the finding details, not just the count.
+run_wrapper "${work}/s18"
+assert_eq 'replayed mixed findings exit 2' "$rc" '2'
+assert_contains 'replay prints the finding details again' "$out" '[major] scripts/c: Kept problem'
+
+# Non-object lines never break a clean verdict.
+garbage_clean="${work}/garbage-clean.ndjson"
+printf '%s\n' 'not json at all' 'null' '"a string"' \
+  '{"type":"complete","status":"review_completed","findings":0}' > "$garbage_clean"
+export STUB_REVIEW_FILE="$garbage_clean"
+run_wrapper "${work}/s19"
+assert_eq 'a clean review with non-object lines still exits 0' "$rc" '0'
+
+# The CLI's own stderr explains an empty failure.
+export STUB_REVIEW_FILE="$incomplete_review"
+STUB_STDERR='auth token expired' run_wrapper "${work}/s20"
+assert_eq 'a review that dies with no complete event exits 1' "$rc" '1'
+assert_contains 'the CLI stderr is shown on failure' "$out" 'auth token expired'
+
+# A binary that is not the CodeRabbit CLI is refused before it is used.
+rc=0
+out="$(STUB_HELP_UNBRANDED=1 CODERABBIT_BIN="$stub" STUB_LOG="${work}/stub.log" STUB_REVIEW_FILE="$clean_review" \
+  bash "$wrapper" --dir "$repo" --state-dir "${work}/s21" 2>&1)" || rc=$?
+assert_eq 'a binary whose help never mentions coderabbit exits 3' "$rc" '3'
+assert_contains 'the identity check is explained' "$out" 'does not look like the CodeRabbit CLI'
+
+printf '\n=== git history problems skip, they do not fail ===\n'
+# A root commit unrelated to feature (no merge-base), built without touching the checkout.
+unrelated_commit="$(printf "unrelated\n" | git -C "$repo" commit-tree "$(git -C "$repo" mktree < /dev/null)")"
+git -C "$repo" update-ref refs/heads/unrelated "$unrelated_commit"
+export STUB_REVIEW_FILE="$clean_review"
+run_wrapper "${work}/s22" --base unrelated
+assert_eq 'no merge-base (shallow or unrelated history) exits 3' "$rc" '3'
+assert_contains 'the merge-base skip is explained' "$out" 'cannot compute a merge-base with unrelated'
+empty_repo="${work}/empty-repo"
+mkdir -p "$empty_repo"
+git -C "$empty_repo" init --quiet --initial-branch=main
+rc=0
+out="$(CODERABBIT_BIN="$stub" STUB_LOG="${work}/stub.log" bash "$wrapper" --dir "$empty_repo" \
+  --state-dir "${work}/s23" 2>&1)" || rc=$?
+assert_eq 'a repository without commits exits 3' "$rc" '3'
+
+printf '\n=== state handling ===\n'
+mkdir -p "${work}/s24"
+chmod 555 "${work}/s24"
+if [[ -w "${work}/s24" ]]; then
+  # root (e.g. a container CI job) can write to a 555 directory, so the case cannot be set up.
+  pass_case 'unwritable state directory case skipped: this user can write to a read-only directory'
+else
+  run_wrapper "${work}/s24"
+  assert_eq 'an unwritable state directory does not hide the verdict' "$rc" '0'
+  assert_contains 'the failed state write is a warning' "$out" 'WARN: coderabbit-cli-review: could not write'
+fi
+chmod 755 "${work}/s24"
+
+long_branch="feature-$(printf 'x%.0s' {1..120})"
+git -C "$repo" checkout --quiet -b "$long_branch" feature
+printf 'long\n' >> "${repo}/file"
+git -C "$repo" commit --quiet --all --message 'long branch'
+run_wrapper "${work}/s25"
+assert_eq 'a very long branch name still reviews' "$rc" '0'
+longest="$(find "${work}/s25" -type f -exec basename {} \; | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+if (( longest > 0 && longest < 255 )); then
+  pass_case "long branch names keep the state file name under 255 bytes (${longest})"
+else
+  fail_case "long branch names keep the state file name under 255 bytes (${longest})"
+fi
+git -C "$repo" checkout --quiet feature
+
+printf '\n=== uncommitted changes are called out ===\n'
+printf 'dirty\n' >> "${repo}/file"
+run_wrapper "${work}/s26"
+assert_contains 'a dirty tree gets a NOTE that it is not reviewed' "$out" 'uncommitted changes are not reviewed'
+git -C "$repo" checkout --quiet -- file
+
+printf '\n=== a passing job still prints its SKIPPED reason ===\n'
+skip_log="${work}/job.log"
+printf 'noise\nSKIPPED: coderabbit-cli-review: CLI allowance exhausted\nmore noise\n' > "$skip_log"
+printed="$(prec_print_skip_notes "$skip_log" 2>&1 >/dev/null)"
+assert_eq 'only the SKIPPED lines are printed to stderr' "$printed" 'SKIPPED: coderabbit-cli-review: CLI allowance exhausted'
+printed="$(prec_print_skip_notes "${work}/missing.log" 2>&1 >/dev/null)"
+assert_eq 'a missing log prints nothing' "$printed" ''
+
 pre_pr_checks_text="$(<"${rh_root}/scripts/dev/pre-pr-checks")"
 assert_contains 'pre-pr-checks dispatches the coderabbit-cli job' "$pre_pr_checks_text" \
   "coderabbit-cli) start_parallel_job 'coderabbit-cli' prec_run_coderabbit_cli"
-assert_contains 'a passing job still prints its SKIPPED: reason' "$pre_pr_checks_text" \
-  "grep -E '^SKIPPED: '"
+assert_contains 'pre-pr-checks prints skip notes for passing jobs' "$pre_pr_checks_text" \
+  'prec_print_skip_notes'
 assert_contains 'pre-pr-checks documents the skip hatch' "$pre_pr_checks_text" \
   'PRE_PR_CHECKS_SKIP=coderabbit-cli'
 

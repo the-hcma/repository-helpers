@@ -7,6 +7,10 @@ readonly script_dir
 # shellcheck disable=SC1091  # sibling lib resolved at runtime
 source "${script_dir}/../lib/runner-bootstrap"
 
+# Parse the CLI output line by line and keep only JSON objects: a stray plain-text line must not
+# make jq reject the whole stream and silently drop the findings.
+readonly jq_events='def evs: [inputs | fromjson? | objects];'
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -18,15 +22,21 @@ Usage:
 Review the committed changes of the current branch (merge-base with REF, default
 origin/main, else main) with the CodeRabbit CLI (`coderabbit` / `cr`) before pushing.
 This is a local pass that uses the CLI's own allowance, not the PR-review allowance;
-the PR review on the pushed head is still the sign-off. Run it after committing; it
-runs from scripts/dev/pre-pr-checks as the `coderabbit-cli` job when the CLI is installed.
+the PR review on the pushed head is still the sign-off. Run it after committing
+(uncommitted changes are not reviewed; a NOTE says so); it runs from
+scripts/dev/pre-pr-checks as the `coderabbit-cli` job when the CLI is installed.
 
 Guard rails:
   - Never passes --use-credits. A review that would need credits ends as a skip.
-  - Each head commit is reviewed once (the result is replayed from the state file).
+  - Each head+base is reviewed once; the recorded result, including the finding details,
+    is replayed from the state file at no cost.
   - At most --max-runs (default 2) distinct heads are reviewed per repository branch.
-  - Skips (never fails) when the CLI, its flags, sign-in, allowance or the run cap are missing.
-  - A review without a `complete` event is an error, never a clean pass.
+    Concurrent runs on one branch are not serialised, so they can both spend allowance.
+  - Skips (never fails) when the CLI, its flags, sign-in, allowance, a usable git history
+    (shallow clone, no merge-base) or the run cap are missing.
+  - Findings are always reported, even when the CLI also errors. A review with no findings
+    and no `complete` event, an error event, or a nonzero CLI exit is an error, never a
+    clean pass.
 
 Exit status:
   0  clean (or replayed clean)
@@ -44,6 +54,7 @@ EOF
 }
 
 # Resolve the CLI binary: explicit override, then PATH, then the vendor install dir.
+# `coderabbit` is preferred over the short alias `cr`, which other tools also use.
 resolve_cli() {
   local candidate
   if [[ -n "${CODERABBIT_BIN:-}" ]]; then
@@ -53,8 +64,8 @@ resolve_cli() {
   fi
   for candidate in \
     "$(command -v coderabbit 2>/dev/null || true)" \
-    "$(command -v cr 2>/dev/null || true)" \
     "${HOME}/.local/bin/coderabbit" \
+    "$(command -v cr 2>/dev/null || true)" \
     "${HOME}/.local/bin/cr"; do
     if [[ -n "$candidate" && -x "$candidate" ]]; then
       printf '%s\n' "$candidate"
@@ -89,14 +100,33 @@ jq_out() {
   runner_exec_stdout "coderabbit-cli-review ${label}" --probe -- jq "$@"
 }
 
+# ndjson_query <label> <ndjson file> <jq filter over evs> [extra jq flags…]
+ndjson_query() {
+  local -r label="$1"
+  local -r file="$2"
+  local -r filter="$3"
+  shift 3
+  jq_out "$label" "$@" --null-input --raw-input "${jq_events} ${filter}" "$file"
+}
+
 # Print the findings from an NDJSON review file.
 print_findings() {
   local -r ndjson="$1"
-  jq_out 'format findings' --raw-output --slurp '
-    map(select(.type == "finding"))
-    | .[]
+  ndjson_query 'format findings' "$ndjson" '
+    evs | map(select(.type == "finding")) | .[]
     | "  [\(.severity // "unknown")] \(.fileName // "?"): \(.title // "")\n      \((.comment // "") | gsub("\\s+"; " ") | .[0:400])"
-  ' "$ndjson"
+  ' --raw-output
+}
+
+# Last lines of the CLI's own stderr for the run `uuid`, so a failure shows its real cause.
+print_cli_stderr() {
+  local -r uuid="$1"
+  local text
+  [[ -n "$uuid" ]] || return 0
+  text="$(runner_read "$uuid" stderr 2> /dev/null | tail --lines=20 || true)"
+  if [[ -n "$text" ]]; then
+    printf 'coderabbit-cli-review: CLI stderr (last lines):\n%s\n' "$text" >&2
+  fi
 }
 
 # Replay a recorded result for this head against this base:
@@ -111,6 +141,13 @@ state_lookup() {
     '$1 == head && $2 == base { line = $0 } END { if (line != "") print line; else exit 1 }' "$state_file"
 }
 
+# Number of distinct head+base pairs already reviewed (portable: awk only).
+state_run_count() {
+  local -r state_file="$1"
+  [[ -f "$state_file" ]] || { printf '0\n'; return 0; }
+  awk '!seen[$1 ":" $2]++ { n++ } END { print n + 0 }' "$state_file"
+}
+
 # encode_key <text>: reversible, collision-free file-name fragment ('%' and '/' escaped).
 encode_key() {
   local text="$1"
@@ -119,12 +156,23 @@ encode_key() {
   printf '%s' "$text"
 }
 
+# record_result <state_file> <head> <base> <result> <count>: a failed write warns instead of
+# ending the run silently after the review has already spent allowance.
+record_result() {
+  local -r state_file="$1"
+  if ! printf '%s %s %s %s\n' "$2" "$3" "$4" "$5" >> "$state_file" 2> /dev/null; then
+    printf 'WARN: coderabbit-cli-review: could not write %s; this result will not be replayed\n' \
+      "$state_file" >&2
+  fi
+}
+
 main() {
   local dir="$PWD" base_ref="" max_runs=2 timeout_s=1200 state_dir=""
   local detect=0 flag
-  local cli top branch head base_commit key state_file
+  local cli top branch head base_commit key key_hash state_file findings_file dirty
   local recorded recorded_result recorded_findings runs usage_file remaining
-  local help_text ndjson findings_count rc review_rc complete_line error_message cli_version
+  local help_text ndjson findings_count review_rc review_id error_message cli_version
+  local has_error has_complete
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -151,8 +199,8 @@ main() {
   cli="$(resolve_cli)" || skip "CodeRabbit CLI not installed (coderabbit/cr not found)"
 
   top="$(git_out 'show-toplevel' "$dir" rev-parse --show-toplevel)" || fail "not a git repository: ${dir}"
-  branch="$(git_out 'branch' "$top" rev-parse --abbrev-ref HEAD)" || fail "cannot read the current branch"
-  head="$(git_out 'head' "$top" rev-parse HEAD)" || fail "cannot read HEAD"
+  branch="$(git_out 'branch' "$top" rev-parse --abbrev-ref HEAD)" || skip "cannot read the current branch (repository without commits?)"
+  head="$(git_out 'head' "$top" rev-parse HEAD)" || skip "cannot read HEAD (repository without commits?)"
   [[ "$branch" != "HEAD" ]] || skip "detached HEAD"
 
   if [[ -z "$base_ref" ]]; then
@@ -165,15 +213,26 @@ main() {
     fi
   fi
   base_commit="$(git_out 'merge-base' "$top" merge-base HEAD "$base_ref")" \
-    || fail "cannot compute merge-base with ${base_ref}"
+    || skip "cannot compute a merge-base with ${base_ref} (shallow clone or unrelated history?)"
   if [[ "$base_commit" == "$head" ]]; then
     skip "no commits ahead of ${base_ref}"
   fi
 
+  dirty="$(git_out 'status' "$top" status --porcelain --untracked-files=no || true)"
+  if [[ -n "$dirty" ]]; then
+    printf 'NOTE: coderabbit-cli-review: uncommitted changes are not reviewed (committed diff only)\n' >&2
+  fi
+
   state_dir="${state_dir:-${CODERABBIT_CLI_REVIEW_STATE_DIR:-${HOME}/scratch/repository-helpers/coderabbit-cli-review}}"
-  mkdir -p "$state_dir"
+  mkdir -p "$state_dir" || fail "cannot create the state directory ${state_dir}"
   key="$(encode_key "$top")__$(encode_key "$branch")"
+  if (( ${#key} > 180 )); then
+    # Keep file names under the 255-byte limit: readable prefix plus a checksum of the full key.
+    key_hash="$(printf '%s' "$key" | cksum | awk '{ print $1 "-" $2 }')"
+    key="${key:0:120}__${key_hash}"
+  fi
   state_file="${state_dir}/${key}.log"
+  findings_file="${state_dir}/${key}.${head:0:12}.${base_commit:0:12}.findings"
 
   # Replay: this exact head against this exact base was already reviewed, so spend nothing.
   if recorded="$(state_lookup "$state_file" "$head" "$base_commit")"; then
@@ -184,15 +243,15 @@ main() {
     if [[ "$recorded_result" == "findings" ]]; then
       printf 'ERROR: CODERABBIT_CLI_FINDINGS count=%s head=%s (replayed; address them and commit to re-run)\n' \
         "$recorded_findings" "${head:0:7}" >&2
+      if [[ -f "$findings_file" ]]; then
+        cat "$findings_file" >&2
+      fi
       exit 2
     fi
     exit 0
   fi
 
-  runs=0
-  if [[ -f "$state_file" ]]; then
-    runs="$(awk '{ print $1 ":" $2 }' "$state_file" | sort --unique | wc --lines | tr --delete '[:space:]')"
-  fi
+  runs="$(state_run_count "$state_file")"
   if (( runs >= max_runs )); then
     skip "run cap reached (${runs} of ${max_runs} reviews already used on ${branch}); the PR review is the next gate"
   fi
@@ -201,6 +260,9 @@ main() {
   cli_version="$(runner_exec_stdout 'coderabbit-cli-review version' --probe --timeout 30 -- "$cli" --version 2> /dev/null || true)"
   cli_version="${cli_version:-unknown}"
   help_text="$(runner_exec_stdout 'coderabbit-cli-review review help' --probe --timeout 30 -- "$cli" review --help 2> /dev/null || true)"
+  if [[ "${help_text,,}" != *coderabbit* ]]; then
+    skip "${cli} does not look like the CodeRabbit CLI ('review --help' never mentions coderabbit)"
+  fi
   for flag in '--agent' '--base-commit' '--committed' '--dir' '--fresh'; do
     if [[ "$help_text" != *"$flag"* ]]; then
       skip "installed CLI (${cli_version}) has no 'review ${flag}'; check 'cr review --help'"
@@ -231,42 +293,65 @@ main() {
   runner_exec 'coderabbit-cli-review review' --probe --stream-stdout --timeout "$timeout_s" -- \
     "$cli" review --agent --fresh --committed --base-commit "$base_commit" --dir "$top" \
     > "$ndjson" || review_rc=$?
+  review_id="$(runner_last_id)"
 
+  if ndjson_query 'credits' "$ndjson" \
+    'evs | any(.[]; .status == "awaiting_confirmation" or .type == "awaiting_confirmation")' \
+    --exit-status > /dev/null 2>&1; then
+    skip "review needs credits (awaiting_confirmation); --use-credits is never passed"
+  fi
+
+  findings_count="$(ndjson_query 'count findings' "$ndjson" \
+    'evs | map(select(.type == "finding")) | length' 2> /dev/null || printf '0')"
+  [[ "$findings_count" =~ ^[0-9]+$ ]] || findings_count=0
+
+  # Findings are always reported, whatever else the CLI did: dropping them would waste the
+  # allowance the review just spent.
+  if (( findings_count > 0 )); then
+    if (( review_rc == 124 )); then
+      printf 'NOTE: coderabbit-cli-review: the review timed out after %ss; reporting the findings streamed so far\n' \
+        "$timeout_s" >&2
+    fi
+    record_result "$state_file" "$head" "$base_commit" findings "$findings_count"
+    printf 'ERROR: CODERABBIT_CLI_FINDINGS count=%s head=%s\n' "$findings_count" "${head:0:7}" >&2
+    print_findings "$ndjson" > "$findings_file" 2> /dev/null || true
+    print_findings "$ndjson" >&2
+    exit 2
+  fi
+
+  # No findings and the review did not finish: nothing is recorded, so the next run can retry.
   if (( review_rc == 124 )); then
     fail "review timed out after ${timeout_s}s (no result recorded)"
   fi
-  if jq_out 'credits' --exit-status --slurp \
-    'any(.[]; .status == "awaiting_confirmation" or .type == "awaiting_confirmation")' \
-    "$ndjson" > /dev/null 2>&1; then
-    skip "review needs credits (awaiting_confirmation); --use-credits is never passed"
+
+  # No findings: a clean verdict needs a complete event, no error event and a clean exit.
+  has_error=0
+  if ndjson_query 'errors' "$ndjson" 'evs | any(.[]; .type == "error")' --exit-status > /dev/null 2>&1; then
+    has_error=1
   fi
-  if jq_out 'errors' --exit-status --slurp 'any(.[]; .type == "error")' "$ndjson" > /dev/null 2>&1; then
-    error_message="$(jq_out 'error message' --raw-output --slurp \
-      'map(select(.type == "error")) | .[0] | (.message // .error // "unknown")' "$ndjson" 2> /dev/null || true)"
+  has_complete=0
+  if ndjson_query 'complete' "$ndjson" 'evs | any(.[]; .type == "complete")' --exit-status > /dev/null 2>&1; then
+    has_complete=1
+  fi
+  if (( has_error == 1 )); then
+    error_message="$(ndjson_query 'error message' "$ndjson" \
+      'evs | map(select(.type == "error")) | .[0] | (.message // .error // "unknown")' \
+      --raw-output 2> /dev/null || true)"
+    print_cli_stderr "$review_id"
     fail "review reported an error: ${error_message%%$'\n'*}"
   fi
-  complete_line="$(jq_out 'complete' --compact-output --slurp \
-    'map(select(.type == "complete")) | .[-1] // empty' "$ndjson" 2> /dev/null || true)"
-  if [[ -z "$complete_line" ]]; then
+  if (( has_complete == 0 )); then
+    print_cli_stderr "$review_id"
     fail "no 'complete' event from the CLI (exit ${review_rc}); treating as an error, not a clean pass"
   fi
-
-  findings_count="$(jq_out 'count findings' --slurp 'map(select(.type == "finding")) | length' "$ndjson")"
-  # Findings are reported whatever the CLI's exit status is; a clean verdict needs a clean exit.
-  if (( findings_count == 0 && review_rc != 0 )); then
+  if (( review_rc != 0 )); then
+    print_cli_stderr "$review_id"
     fail "the CLI exited ${review_rc} after its 'complete' event with no findings; treating as an error, not a clean pass"
   fi
-  rc=0
-  if (( findings_count > 0 )); then
-    rc=2
-    printf '%s %s %s %s\n' "$head" "$base_commit" findings "$findings_count" >> "$state_file"
-    printf 'ERROR: CODERABBIT_CLI_FINDINGS count=%s head=%s\n' "$findings_count" "${head:0:7}" >&2
-    print_findings "$ndjson" >&2
-  else
-    printf '%s %s %s %s\n' "$head" "$base_commit" clean 0 >> "$state_file"
-    printf 'coderabbit-cli-review: clean (0 findings) on %s\n' "${head:0:7}" >&2
-  fi
-  exit "$rc"
+
+  record_result "$state_file" "$head" "$base_commit" clean 0
+  printf 'coderabbit-cli-review: clean (0 findings) on %s\n' "${head:0:7}" >&2
+  exit 0
 }
 
 main "$@"
