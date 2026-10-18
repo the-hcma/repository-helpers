@@ -144,7 +144,8 @@ Daily timer (optional): `scripts/setup-secret-audit` installs `secret-audit.serv
 | --- | --- | --- |
 | `scripts/dev/approve-pending-deployments` | Approve WAITING GitHub environments (`github-repo-lint`, `dep-updater`) | `scripts/dev/approve-pending-deployments --pr <n>` |
 | `scripts/dev/post-pr-submission-checks` | Poll required checks; print agent-friendly failure logs | `scripts/dev/post-pr-submission-checks --pr <n>` |
-| `scripts/dev/pre-pr-checks` | Detect-first local CI (shellcheck, tests, Python/TS/Rust when present; secret-scan when adopted) | from `.worktrees/<stack>-wt`: `scripts/dev/pre-pr-checks` |
+| `scripts/dev/pre-pr-checks` | Detect-first local CI (shellcheck, tests, Python/TS/Rust when present; secret-scan when adopted; CodeRabbit CLI review when `cr` is installed) | from `.worktrees/<stack>-wt`: `scripts/dev/pre-pr-checks` |
+| `scripts/dev/coderabbit-cli-review` | Optional pre-push review with the CodeRabbit CLI (`cr`): own allowance, findings fail, each head once (max 2 per branch), never `--use-credits`; also the `coderabbit-cli` job of `pre-pr-checks` when `cr` is installed | `scripts/dev/coderabbit-cli-review` (after committing) |
 | `scripts/dev/start-development` | Prune/sync; create or resume a stack worktree | `scripts/dev/start-development --worktree my-change --no-interactive` |
 | `scripts/dev/submit-stack` | `pre-pr-checks` → stack submit → CI wait | `scripts/dev/submit-stack` |
 

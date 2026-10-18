@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# Optional pre-push review with the CodeRabbit CLI (repository-helpers#730).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+# shellcheck disable=SC1091  # sibling lib resolved at runtime
+source "${script_dir}/../lib/runner-bootstrap"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/dev/coderabbit-cli-review [--dir DIR] [--base REF] [--max-runs N]
+                                    [--timeout SECONDS] [--state-dir DIR]
+  scripts/dev/coderabbit-cli-review --detect
+  scripts/dev/coderabbit-cli-review --help
+
+Review the committed changes of the current branch (merge-base with REF, default
+origin/main, else main) with the CodeRabbit CLI (`coderabbit` / `cr`) before pushing.
+This is a local pass that uses the CLI's own allowance, not the PR-review allowance;
+the PR review on the pushed head is still the sign-off. Run it after committing; it
+runs from scripts/dev/pre-pr-checks as the `coderabbit-cli` job when the CLI is installed.
+
+Guard rails:
+  - Never passes --use-credits. A review that would need credits ends as a skip.
+  - Each head commit is reviewed once (the result is replayed from the state file).
+  - At most --max-runs (default 2) distinct heads are reviewed per repository branch.
+  - Skips (never fails) when the CLI, its flags, sign-in, allowance or the run cap are missing.
+  - A review without a `complete` event is an error, never a clean pass.
+
+Exit status:
+  0  clean (or replayed clean)
+  1  error (the review could not be completed)
+  2  findings (printed; address them, then commit and run again)
+  3  skipped (reason on a `SKIPPED:` line)
+
+--detect exits 0 when a CodeRabbit CLI binary is resolvable (no network, no allowance
+used), 1 otherwise.
+
+Environment:
+  CODERABBIT_BIN                  Path to the CLI (default: coderabbit/cr on PATH, then ~/.local/bin)
+  CODERABBIT_CLI_REVIEW_STATE_DIR State directory (default: ~/scratch/repository-helpers/coderabbit-cli-review)
+EOF
+}
+
+# Resolve the CLI binary: explicit override, then PATH, then the vendor install dir.
+resolve_cli() {
+  local candidate
+  if [[ -n "${CODERABBIT_BIN:-}" ]]; then
+    [[ -x "$CODERABBIT_BIN" ]] || return 1
+    printf '%s\n' "$CODERABBIT_BIN"
+    return 0
+  fi
+  for candidate in \
+    "$(command -v coderabbit 2>/dev/null || true)" \
+    "$(command -v cr 2>/dev/null || true)" \
+    "${HOME}/.local/bin/coderabbit" \
+    "${HOME}/.local/bin/cr"; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+skip() {
+  printf 'SKIPPED: coderabbit-cli-review: %s\n' "$*" >&2
+  exit 3
+}
+
+fail() {
+  printf 'ERROR: coderabbit-cli-review: %s\n' "$*" >&2
+  exit 1
+}
+
+# git_out <label> <repo> <git args…>: stdout of a git command; non-zero when it fails.
+git_out() {
+  local -r label="$1"
+  local -r repo="$2"
+  shift 2
+  runner_exec_stdout "coderabbit-cli-review ${label}" --probe -- git -C "$repo" "$@"
+}
+
+# jq_out <label> <jq args…>: stdout of jq over files; non-zero when jq fails or is false.
+jq_out() {
+  local -r label="$1"
+  shift
+  runner_exec_stdout "coderabbit-cli-review ${label}" --probe -- jq "$@"
+}
+
+# Print the findings from an NDJSON review file.
+print_findings() {
+  local -r ndjson="$1"
+  jq_out 'format findings' --raw-output --slurp '
+    map(select(.type == "finding"))
+    | .[]
+    | "  [\(.severity // "unknown")] \(.fileName // "?"): \(.title // "")\n      \((.comment // "") | gsub("\\s+"; " ") | .[0:400])"
+  ' "$ndjson"
+}
+
+# Replay a recorded result for this head against this base:
+# "<head> <base> <result> <findings>" per line. The base is part of the key because a
+# different --base changes the reviewed diff.
+state_lookup() {
+  local -r state_file="$1"
+  local -r head="$2"
+  local -r base="$3"
+  [[ -f "$state_file" ]] || return 1
+  awk -v head="$head" -v base="$base" \
+    '$1 == head && $2 == base { line = $0 } END { if (line != "") print line; else exit 1 }' "$state_file"
+}
+
+# encode_key <text>: reversible, collision-free file-name fragment ('%' and '/' escaped).
+encode_key() {
+  local text="$1"
+  text="${text//%/%25}"
+  text="${text//\//%2F}"
+  printf '%s' "$text"
+}
+
+main() {
+  local dir="$PWD" base_ref="" max_runs=2 timeout_s=1200 state_dir=""
+  local detect=0 flag
+  local cli top branch head base_commit key state_file
+  local recorded recorded_result recorded_findings runs usage_file remaining
+  local help_text ndjson findings_count rc review_rc complete_line error_message cli_version
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir) dir="${2:?--dir needs a value}"; shift 2 ;;
+      --base) base_ref="${2:?--base needs a value}"; shift 2 ;;
+      --max-runs) max_runs="${2:?--max-runs needs a value}"; shift 2 ;;
+      --timeout) timeout_s="${2:?--timeout needs a value}"; shift 2 ;;
+      --state-dir) state_dir="${2:?--state-dir needs a value}"; shift 2 ;;
+      --detect) detect=1; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *) usage >&2; exit 1 ;;
+    esac
+  done
+
+  if [[ "$detect" -eq 1 ]]; then
+    resolve_cli > /dev/null
+    exit $?
+  fi
+
+  [[ "$max_runs" =~ ^[0-9]+$ && "$max_runs" -ge 1 ]] || fail "--max-runs must be a positive integer"
+  [[ "$timeout_s" =~ ^[0-9]+$ && "$timeout_s" -ge 1 ]] || fail "--timeout must be a positive integer"
+  command -v jq > /dev/null 2>&1 || fail "jq not found"
+
+  cli="$(resolve_cli)" || skip "CodeRabbit CLI not installed (coderabbit/cr not found)"
+
+  top="$(git_out 'show-toplevel' "$dir" rev-parse --show-toplevel)" || fail "not a git repository: ${dir}"
+  branch="$(git_out 'branch' "$top" rev-parse --abbrev-ref HEAD)" || fail "cannot read the current branch"
+  head="$(git_out 'head' "$top" rev-parse HEAD)" || fail "cannot read HEAD"
+  [[ "$branch" != "HEAD" ]] || skip "detached HEAD"
+
+  if [[ -z "$base_ref" ]]; then
+    if git_out 'origin/main' "$top" rev-parse --verify --quiet origin/main > /dev/null; then
+      base_ref="origin/main"
+    elif git_out 'main' "$top" rev-parse --verify --quiet main > /dev/null; then
+      base_ref="main"
+    else
+      skip "no origin/main or main to compare against"
+    fi
+  fi
+  base_commit="$(git_out 'merge-base' "$top" merge-base HEAD "$base_ref")" \
+    || fail "cannot compute merge-base with ${base_ref}"
+  if [[ "$base_commit" == "$head" ]]; then
+    skip "no commits ahead of ${base_ref}"
+  fi
+
+  state_dir="${state_dir:-${CODERABBIT_CLI_REVIEW_STATE_DIR:-${HOME}/scratch/repository-helpers/coderabbit-cli-review}}"
+  mkdir -p "$state_dir"
+  key="$(encode_key "$top")__$(encode_key "$branch")"
+  state_file="${state_dir}/${key}.log"
+
+  # Replay: this exact head against this exact base was already reviewed, so spend nothing.
+  if recorded="$(state_lookup "$state_file" "$head" "$base_commit")"; then
+    recorded_result="$(awk '{ print $3 }' <<<"$recorded")"
+    recorded_findings="$(awk '{ print $4 }' <<<"$recorded")"
+    printf 'coderabbit-cli-review: head %s already reviewed (%s findings); replaying\n' \
+      "${head:0:7}" "$recorded_findings" >&2
+    if [[ "$recorded_result" == "findings" ]]; then
+      printf 'ERROR: CODERABBIT_CLI_FINDINGS count=%s head=%s (replayed; address them and commit to re-run)\n' \
+        "$recorded_findings" "${head:0:7}" >&2
+      exit 2
+    fi
+    exit 0
+  fi
+
+  runs=0
+  if [[ -f "$state_file" ]]; then
+    runs="$(awk '{ print $1 ":" $2 }' "$state_file" | sort --unique | wc --lines | tr --delete '[:space:]')"
+  fi
+  if (( runs >= max_runs )); then
+    skip "run cap reached (${runs} of ${max_runs} reviews already used on ${branch}); the PR review is the next gate"
+  fi
+
+  # Every call into the CLI is bounded: it auto-updates and talks to the vendor backend.
+  cli_version="$(runner_exec_stdout 'coderabbit-cli-review version' --probe --timeout 30 -- "$cli" --version 2> /dev/null || true)"
+  cli_version="${cli_version:-unknown}"
+  help_text="$(runner_exec_stdout 'coderabbit-cli-review review help' --probe --timeout 30 -- "$cli" review --help 2> /dev/null || true)"
+  for flag in '--agent' '--base-commit' '--committed' '--dir' '--fresh'; do
+    if [[ "$help_text" != *"$flag"* ]]; then
+      skip "installed CLI (${cli_version}) has no 'review ${flag}'; check 'cr review --help'"
+    fi
+  done
+
+  # Artifacts live in the runner session, which is removed on exit (no EXIT trap of our own).
+  usage_file="${RUNNER_SESSION_DIR}/usage.json"
+  ndjson="${RUNNER_SESSION_DIR}/review.ndjson"
+  runner_exec_stdout 'coderabbit-cli-review usage' --probe --timeout 60 -- "$cli" usage --agent \
+    > "$usage_file" 2> /dev/null || true
+  remaining="$(jq_out 'allowance' --raw-output '.includedReviews.remaining // empty' "$usage_file" 2> /dev/null || true)"
+  if [[ -z "$remaining" ]]; then
+    skip "could not read the CLI allowance (not signed in? run: cr auth login)"
+  fi
+  if [[ ! "$remaining" =~ ^[0-9]+$ ]]; then
+    skip "unexpected allowance value '${remaining}' from 'usage --agent'; check 'cr usage --agent'"
+  fi
+  if (( remaining < 1 )); then
+    skip "CLI allowance exhausted (0 remaining this hour); not using credits"
+  fi
+
+  printf 'coderabbit-cli-review: reviewing %s (%s..%s) with %s %s; %s allowance remaining\n' \
+    "$branch" "${base_commit:0:7}" "${head:0:7}" "$(basename "$cli")" \
+    "$cli_version" "$remaining" >&2
+
+  review_rc=0
+  runner_exec 'coderabbit-cli-review review' --probe --stream-stdout --timeout "$timeout_s" -- \
+    "$cli" review --agent --fresh --committed --base-commit "$base_commit" --dir "$top" \
+    > "$ndjson" || review_rc=$?
+
+  if (( review_rc == 124 )); then
+    fail "review timed out after ${timeout_s}s (no result recorded)"
+  fi
+  if jq_out 'credits' --exit-status --slurp \
+    'any(.[]; .status == "awaiting_confirmation" or .type == "awaiting_confirmation")' \
+    "$ndjson" > /dev/null 2>&1; then
+    skip "review needs credits (awaiting_confirmation); --use-credits is never passed"
+  fi
+  if jq_out 'errors' --exit-status --slurp 'any(.[]; .type == "error")' "$ndjson" > /dev/null 2>&1; then
+    error_message="$(jq_out 'error message' --raw-output --slurp \
+      'map(select(.type == "error")) | .[0] | (.message // .error // "unknown")' "$ndjson" 2> /dev/null || true)"
+    fail "review reported an error: ${error_message%%$'\n'*}"
+  fi
+  complete_line="$(jq_out 'complete' --compact-output --slurp \
+    'map(select(.type == "complete")) | .[-1] // empty' "$ndjson" 2> /dev/null || true)"
+  if [[ -z "$complete_line" ]]; then
+    fail "no 'complete' event from the CLI (exit ${review_rc}); treating as an error, not a clean pass"
+  fi
+
+  findings_count="$(jq_out 'count findings' --slurp 'map(select(.type == "finding")) | length' "$ndjson")"
+  # Findings are reported whatever the CLI's exit status is; a clean verdict needs a clean exit.
+  if (( findings_count == 0 && review_rc != 0 )); then
+    fail "the CLI exited ${review_rc} after its 'complete' event with no findings; treating as an error, not a clean pass"
+  fi
+  rc=0
+  if (( findings_count > 0 )); then
+    rc=2
+    printf '%s %s %s %s\n' "$head" "$base_commit" findings "$findings_count" >> "$state_file"
+    printf 'ERROR: CODERABBIT_CLI_FINDINGS count=%s head=%s\n' "$findings_count" "${head:0:7}" >&2
+    print_findings "$ndjson" >&2
+  else
+    printf '%s %s %s %s\n' "$head" "$base_commit" clean 0 >> "$state_file"
+    printf 'coderabbit-cli-review: clean (0 findings) on %s\n' "${head:0:7}" >&2
+  fi
+  exit "$rc"
+}
+
+main "$@"

@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# Tests for scripts/dev/coderabbit-cli-review and its pre-pr-checks wiring (repository-helpers#730).
+# A stub `cr` replaces the real CLI: no network, no review allowance is ever spent.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+rh_root="$(cd "${script_dir}/.." && pwd)"
+readonly rh_root
+wrapper="${rh_root}/scripts/dev/coderabbit-cli-review"
+readonly wrapper
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+# assert_eq <label> <actual> <expected>
+assert_eq() {
+  if [[ "$2" == "$3" ]]; then
+    pass_case "$1"
+  else
+    printf '  expected [%s], got [%s]\n' "$3" "$2" >&2
+    fail_case "$1"
+  fi
+}
+
+# --- fixtures ---------------------------------------------------------------------------------
+
+stub="${work}/cr"
+cat > "$stub" <<'STUB'
+#!/usr/bin/env bash
+# Stub CodeRabbit CLI. Behaviour is driven by STUB_* variables; every call is logged.
+printf '%s\n' "$*" >> "${STUB_LOG:?}"
+case "${1:-}" in
+  --version) printf '0.9.0\n' ;;
+  usage) default_usage='{"includedReviews":{"remaining":3,"limit":3}}'; printf '%s\n' "${STUB_USAGE:-$default_usage}" ;;
+  review)
+    if [[ "${2:-}" == '--help' ]]; then
+      printf 'Options:\n  --agent\n  --base-commit <commit>\n  --committed\n  --dir <path>\n  --fresh\n'
+      [[ -z "${STUB_HELP_EXTRA:-}" ]] || printf '%s\n' "$STUB_HELP_EXTRA"
+      exit 0
+    fi
+    if [[ -n "${STUB_SLEEP:-}" ]]; then
+      exec sleep "$STUB_SLEEP"
+    fi
+    cat "${STUB_REVIEW_FILE:?}"
+    exit "${STUB_REVIEW_RC:-0}"
+    ;;
+esac
+STUB
+chmod +x "$stub"
+
+clean_review="${work}/clean.ndjson"
+printf '%s\n' '{"type":"review_context"}' '{"type":"heartbeat","status":"reviewing"}' \
+  '{"type":"complete","status":"review_completed","findings":0,"outcome":"completed"}' > "$clean_review"
+
+findings_review="${work}/findings.ndjson"
+printf '%s\n' '{"type":"review_context"}' \
+  '{"type":"finding","severity":"minor","fileName":"scripts/a","title":"First problem","comment":"Explain\nthe first   problem."}' \
+  '{"type":"finding","severity":"major","fileName":"scripts/b","title":"Second problem","comment":"Explain the second."}' \
+  '{"type":"complete","status":"review_completed","findings":2,"outcome":"completed"}' > "$findings_review"
+
+incomplete_review="${work}/incomplete.ndjson"
+printf '%s\n' '{"type":"review_context"}' '{"type":"heartbeat","status":"reviewing"}' > "$incomplete_review"
+
+credits_review="${work}/credits.ndjson"
+printf '%s\n' '{"type":"status","status":"awaiting_confirmation","message":"needs credits"}' > "$credits_review"
+
+error_review="${work}/error.ndjson"
+printf '%s\n' '{"type":"error","message":"backend exploded"}' > "$error_review"
+
+# A repo with main, a fabricated origin/main, and one commit ahead on a feature branch.
+repo="${work}/repo"
+mkdir -p "$repo"
+git -C "$repo" init --quiet --initial-branch=main
+git -C "$repo" config user.name test
+git -C "$repo" config user.email test@example.invalid
+git -C "$repo" config commit.gpgsign false
+printf 'base\n' > "${repo}/file"
+git -C "$repo" add file
+git -C "$repo" commit --quiet --message 'base'
+git -C "$repo" update-ref refs/remotes/origin/main "$(git -C "$repo" rev-parse main)"
+git -C "$repo" checkout --quiet -b feature
+printf 'change\n' >> "${repo}/file"
+git -C "$repo" commit --quiet --all --message 'change'
+
+# run_wrapper <state-dir> [wrapper args...]: sets out (stdout+stderr) and rc.
+run_wrapper() {
+  local -r state_dir="$1"
+  shift
+  rc=0
+  out="$(CODERABBIT_BIN="$stub" STUB_LOG="${work}/stub.log" \
+    bash "$wrapper" --dir "$repo" --state-dir "$state_dir" "$@" 2>&1)" || rc=$?
+}
+
+review_calls() {
+  grep -c '^review --agent' "${work}/stub.log" 2>/dev/null || true
+}
+
+# --- cases ------------------------------------------------------------------------------------
+
+printf '\n=== missing CLI / detect ===\n'
+: > "${work}/stub.log"
+rc=0
+out="$(CODERABBIT_BIN=/nonexistent/cr bash "$wrapper" --dir "$repo" --state-dir "${work}/s0" 2>&1)" || rc=$?
+assert_eq 'missing CLI exits 3' "$rc" '3'
+assert_contains 'missing CLI prints a SKIPPED line' "$out" 'SKIPPED: coderabbit-cli-review: CodeRabbit CLI not installed'
+rc=0
+CODERABBIT_BIN=/nonexistent/cr bash "$wrapper" --detect > /dev/null 2>&1 || rc=$?
+assert_eq 'detect fails without a CLI' "$rc" '1'
+rc=0
+CODERABBIT_BIN="$stub" bash "$wrapper" --detect > /dev/null 2>&1 || rc=$?
+assert_eq 'detect succeeds with a CLI' "$rc" '0'
+
+printf '\n=== clean review, then replay of the same head ===\n'
+: > "${work}/stub.log"
+export STUB_REVIEW_FILE="$clean_review"
+run_wrapper "${work}/s1"
+assert_eq 'clean review exits 0' "$rc" '0'
+assert_contains 'clean review says so' "$out" 'clean (0 findings)'
+merge_base="$(git -C "$repo" merge-base HEAD origin/main 2> /dev/null || git -C "$repo" rev-parse main)"
+assert_contains 'review is run against the merge-base commit' "$(<"${work}/stub.log")" "--base-commit ${merge_base}"
+assert_contains 'review is committed-only and fresh' "$(<"${work}/stub.log")" '--agent --fresh --committed'
+if grep -q -- '--use-credits' "${work}/stub.log"; then
+  fail_case 'review never passes --use-credits'
+else
+  pass_case 'review never passes --use-credits'
+fi
+run_wrapper "${work}/s1"
+assert_eq 'replayed head exits 0' "$rc" '0'
+assert_contains 'replay is announced' "$out" 'already reviewed'
+assert_eq 'replay does not run another review' "$(review_calls)" '1'
+
+printf '\n=== findings fail and are replayed ===\n'
+: > "${work}/stub.log"
+export STUB_REVIEW_FILE="$findings_review"
+run_wrapper "${work}/s2"
+assert_eq 'findings exit 2' "$rc" '2'
+assert_contains 'findings are counted on a machine-parseable line' "$out" 'ERROR: CODERABBIT_CLI_FINDINGS count=2'
+assert_contains 'finding lists severity, file and title' "$out" '[minor] scripts/a: First problem'
+assert_contains 'finding comments are squashed to one line' "$out" 'Explain the first problem.'
+run_wrapper "${work}/s2"
+assert_eq 'replayed findings still exit 2' "$rc" '2'
+assert_eq 'replayed findings do not run another review' "$(review_calls)" '1'
+
+printf '\n=== safe failure modes ===\n'
+export STUB_REVIEW_FILE="$incomplete_review"
+run_wrapper "${work}/s3"
+assert_eq 'a review without a complete event exits 1' "$rc" '1'
+assert_contains 'incomplete review is an error, not a clean pass' "$out" "no 'complete' event"
+
+export STUB_REVIEW_FILE="$credits_review"
+run_wrapper "${work}/s4"
+assert_eq 'a review that needs credits exits 3' "$rc" '3'
+assert_contains 'credits are never confirmed' "$out" 'needs credits (awaiting_confirmation)'
+
+export STUB_REVIEW_FILE="$error_review"
+run_wrapper "${work}/s5"
+assert_eq 'an error event exits 1' "$rc" '1'
+assert_contains 'the error message is surfaced' "$out" 'backend exploded'
+
+export STUB_REVIEW_FILE="$clean_review"
+STUB_SLEEP=30 run_wrapper "${work}/s6" --timeout 1
+assert_eq 'a timed-out review exits 1' "$rc" '1'
+assert_contains 'timeout is reported and nothing is recorded' "$out" 'timed out after 1s'
+if compgen -G "${work}/s6/*.log" > /dev/null; then
+  fail_case 'a timed-out review records no result'
+else
+  pass_case 'a timed-out review records no result'
+fi
+
+printf '\n=== skips never fail ===\n'
+export STUB_USAGE='{"includedReviews":{"remaining":0,"limit":3}}'
+run_wrapper "${work}/s7"
+assert_eq 'exhausted allowance exits 3' "$rc" '3'
+assert_contains 'exhausted allowance does not use credits' "$out" 'allowance exhausted'
+export STUB_USAGE='not json'
+run_wrapper "${work}/s8"
+assert_eq 'unreadable allowance (not signed in) exits 3' "$rc" '3'
+assert_contains 'sign-in hint is printed' "$out" 'cr auth login'
+unset STUB_USAGE
+for odd_remaining in '3.0' '"unlimited"' '-1'; do
+  export STUB_USAGE="{\"includedReviews\":{\"remaining\":${odd_remaining},\"limit\":3}}"
+  run_wrapper "${work}/s17"
+  assert_eq "an unexpected allowance value ${odd_remaining} skips with exit 3" "$rc" '3'
+  assert_contains "the unexpected allowance value ${odd_remaining} is reported" "$out" 'unexpected allowance value'
+done
+unset STUB_USAGE
+run_wrapper "${work}/s9"
+assert_eq 'a normal run after the skips still works' "$rc" '0'
+
+printf '\n=== run cap ===\n'
+: > "${work}/stub.log"
+printf 'more\n' >> "${repo}/file"
+git -C "$repo" commit --quiet --all --message 'more'
+run_wrapper "${work}/s9" --max-runs 1
+assert_eq 'a second head past --max-runs 1 exits 3' "$rc" '3'
+assert_contains 'run cap is explained' "$out" 'run cap reached (1 of 1'
+assert_eq 'run cap does not run a review' "$(review_calls)" '0'
+run_wrapper "${work}/s9" --max-runs 2
+assert_eq 'a second head within --max-runs 2 is reviewed' "$rc" '0'
+
+printf '\n=== unsupported CLI / nothing to review ===\n'
+stub_old="${work}/cr-old"
+sed 's/--base-commit <commit>//' "$stub" > "$stub_old"
+chmod +x "$stub_old"
+rc=0
+out="$(CODERABBIT_BIN="$stub_old" STUB_LOG="${work}/stub.log" bash "$wrapper" --dir "$repo" \
+  --state-dir "${work}/s10" 2>&1)" || rc=$?
+assert_eq 'a CLI without --base-commit exits 3' "$rc" '3'
+assert_contains 'the missing flag is named' "$out" "no 'review --base-commit'"
+
+git -C "$repo" checkout --quiet main
+run_wrapper "${work}/s11"
+assert_eq 'a branch with nothing ahead exits 3' "$rc" '3'
+assert_contains 'nothing-ahead is explained' "$out" 'no commits ahead of origin/main'
+git -C "$repo" checkout --quiet feature
+
+printf '\n=== a failed CLI process is never a clean pass ===\n'
+export STUB_REVIEW_FILE="$clean_review"
+STUB_REVIEW_RC=3 run_wrapper "${work}/s12"
+assert_eq 'a nonzero CLI exit after a clean complete event exits 1' "$rc" '1'
+assert_contains 'the nonzero exit is explained' "$out" "exited 3 after its 'complete' event"
+if compgen -G "${work}/s12/*.log" > /dev/null; then
+  fail_case 'a failed CLI process records no result'
+else
+  pass_case 'a failed CLI process records no result'
+fi
+export STUB_REVIEW_FILE="$findings_review"
+STUB_REVIEW_RC=1 run_wrapper "${work}/s13"
+assert_eq 'findings are still reported when the CLI exits nonzero' "$rc" '2'
+unset STUB_REVIEW_RC
+
+printf '\n=== replay is keyed by head and base; state keys do not collide ===\n'
+export STUB_REVIEW_FILE="$clean_review"
+: > "${work}/stub.log"
+run_wrapper "${work}/s14" --max-runs 3
+assert_eq 'first review of the head against the default base exits 0' "$rc" '0'
+run_wrapper "${work}/s14" --max-runs 3 --base 'HEAD~1'
+assert_eq 'the same head against a different base is reviewed again, not replayed' "$rc" '0'
+assert_eq 'both bases ran a review' "$(review_calls)" '2'
+run_wrapper "${work}/s14" --max-runs 3 --base 'HEAD~1'
+assert_eq 'repeating the second base replays' "$(review_calls)" '2'
+
+git -C "$repo" checkout --quiet main
+for branch_name in 'x/a' 'x_a'; do
+  git -C "$repo" checkout --quiet -b "$branch_name" main
+  printf '%s\n' "$branch_name" >> "${repo}/file"
+  git -C "$repo" commit --quiet --all --message "$branch_name"
+  run_wrapper "${work}/s15" --max-runs 1
+  assert_eq "branch ${branch_name} gets its own run budget" "$rc" '0'
+done
+assert_eq 'branches x/a and x_a use two state files' "$(find "${work}/s15" -name '*.log' | wc -l | tr -d '[:space:]')" '2'
+git -C "$repo" checkout --quiet feature
+
+printf '\n=== the wrapper leaves a parent runner session alone ===\n'
+session_check="$(
+  RUNNER_SESSION_ROOT="${work}/parent-sessions" bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1/scripts/lib/runner-bootstrap"
+    parent="$RUNNER_SESSION_DIR"
+    CODERABBIT_BIN="$2" STUB_LOG="$3" STUB_REVIEW_FILE="$4" \
+      bash "$1/scripts/dev/coderabbit-cli-review" --dir "$5" --state-dir "$6" > /dev/null 2>&1 || true
+    [[ -d "$parent" ]] && printf "parent-session-kept\n" || printf "parent-session-deleted\n"
+  ' _ "$rh_root" "$stub" "${work}/stub.log" "$clean_review" "$repo" "${work}/s16" 2>&1
+)"
+assert_eq 'a parent runner session survives the wrapper exiting' "$session_check" 'parent-session-kept'
+
+printf '\n=== pre-pr-checks wiring ===\n'
+# shellcheck disable=SC1091
+source "${rh_root}/scripts/lib/runner-bootstrap"
+# shellcheck disable=SC1091
+source "${rh_root}/scripts/lib/pre-pr-ecosystem"
+
+fake_root="${work}/fake-root"
+mkdir -p "${fake_root}/scripts/dev"
+cat > "${fake_root}/scripts/dev/coderabbit-cli-review" <<'FAKE'
+#!/usr/bin/env bash
+[[ "${1:-}" == '--detect' ]] && exit "${FAKE_DETECT_RC:-0}"
+exit "${FAKE_REVIEW_RC:-0}"
+FAKE
+for review_rc in 0 3 2 1; do
+  want=1
+  if [[ "$review_rc" == 0 || "$review_rc" == 3 ]]; then
+    want=0
+  fi
+  got=0
+  FAKE_REVIEW_RC="$review_rc" prec_run_coderabbit_cli "$fake_root" > /dev/null 2>&1 || got=$?
+  assert_eq "job maps wrapper exit ${review_rc} to job exit ${want}" "$got" "$want"
+done
+got=0
+FAKE_DETECT_RC=0 prec_should_plan_coderabbit_cli "$fake_root" || got=$?
+assert_eq 'the job is planned when the CLI is detected' "$got" '0'
+got=0
+FAKE_DETECT_RC=1 prec_should_plan_coderabbit_cli "$fake_root" || got=$?
+assert_eq 'the job is not planned without a CLI' "$got" '1'
+
+pre_pr_checks_text="$(<"${rh_root}/scripts/dev/pre-pr-checks")"
+assert_contains 'pre-pr-checks dispatches the coderabbit-cli job' "$pre_pr_checks_text" \
+  "coderabbit-cli) start_parallel_job 'coderabbit-cli' prec_run_coderabbit_cli"
+assert_contains 'a passing job still prints its SKIPPED: reason' "$pre_pr_checks_text" \
+  "grep -E '^SKIPPED: '"
+assert_contains 'pre-pr-checks documents the skip hatch' "$pre_pr_checks_text" \
+  'PRE_PR_CHECKS_SKIP=coderabbit-cli'
+
+test_summary

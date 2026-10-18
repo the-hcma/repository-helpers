@@ -44,6 +44,7 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | Dev workflow | `scripts/dev/pre-pr-checks` | Detect-first local CI gates (bash + Python/TS/Rust when present; secret-scan when adopted). |
 | Dev workflow | `scripts/dev/run-tests` | Run `tests/*.test` by file, optionally one CI shard (`--shard I/N`) and in parallel (`--jobs`); shared by CI and `pre-pr-checks`. |
 | Dev workflow | `scripts/dev/secret-scan` | Local gitleaks via canonical `ci-secret-scan` (same as CI / pre-pr secret-scan job). |
+| Dev workflow | `scripts/dev/coderabbit-cli-review` | Optional pre-push review with the CodeRabbit CLI (own allowance, never `--use-credits`, each head once, at most 2 per branch); runs as the `coderabbit-cli` job of `pre-pr-checks` when `cr` is installed. |
 | Dev workflow | `scripts/dev/submit-stack` | `pre-pr-checks` → `gt submit` → `post-pr-submission-checks`. |
 | Dev workflow | `scripts/dev/approve-pending-deployments` | Approve WAITING environment jobs on the operator's behalf. |
 | Dev workflow | `scripts/dev/post-pr-submission-checks` | Wait for PR CI; print agent-friendly failure excerpts. |
@@ -58,7 +59,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 - Scripts live in `scripts/` (e.g. `scripts/dep-updater`, `scripts/setup-service`). Sub-directories are allowed (e.g. `scripts/dev/start-development`).
 - Tests live in `tests/` and mirror the script name (e.g. `tests/dep-updater.test`).
 - Target **bash ≥ 5.x** (every script declares `#!/usr/bin/env bash` and uses `set -euo pipefail`).
-- External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`, `rg` (ripgrep), `actionlint`, plus the ecosystem tools being managed (`pnpm`, `pip`, `uv`, `poetry`, `cargo` + `cargo-outdated` + the `clippy` component) as optional callees. Rust is required for any repo dep-updater detects as a Cargo project — it shells out to `cargo outdated` and `cargo add`, and the Rust post-bump clippy recovery invariant below assumes a toolchain.
+- External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`, `rg` (ripgrep), `actionlint`, the optional CodeRabbit CLI (`coderabbit` / `cr`, see `scripts/dev/coderabbit-cli-review`), plus the ecosystem tools being managed (`pnpm`, `pip`, `uv`, `poetry`, `cargo` + `cargo-outdated` + the `clippy` component) as optional callees. Rust is required for any repo dep-updater detects as a Cargo project — it shells out to `cargo outdated` and `cargo add`, and the Rust post-bump clippy recovery invariant below assumes a toolchain.
 
  ```bash
   rustup component add clippy             # absent under rustup's minimal profile
@@ -514,6 +515,7 @@ Service repositories install via `scripts/setup-service` and optionally implemen
   - **Secret scan**: when `.github/ci/secret-scan` or `scripts/dev/secret-scan` is present — runs canonical gitleaks (`scripts/lib/ci-secret-scan`) before submit (branch-vs-`main` range when possible). CI `secret-scan` remains post-push triage; this is the submit-path gate (see also deep/org scan #509 — TruffleHog via `scripts/secret-audit` / [docs/secret-audit-trufflehog.md](./docs/secret-audit-trufflehog.md)). Skip with `PRE_PR_CHECKS_SKIP=secret-scan`. Manual: `scripts/dev/secret-scan`.
   - **Verified commits**: when the branch has commits ahead of `main`/`origin/main` — `git verify-commit` locally, plus GitHub `verification.verified` when an upstream exists (bot authors skipped). Skip with `PRE_PR_CHECKS_SKIP=verified-commits`.
   - **Markdown wrap**: when the branch changes `*.md` files — flags hard line breaks inside paragraphs, list items and blockquotes (`scripts/lint-github-markdown --repo-files`; see `.agents/rules/github-content-formatting.md`). `--fix` unwraps them. Skip with `PRE_PR_CHECKS_SKIP=markdown-wrap`.
+  - **CodeRabbit CLI** (`coderabbit-cli`): when the CodeRabbit CLI (`coderabbit` / `cr`) is installed on the host — reviews the committed branch diff before the push through `scripts/dev/coderabbit-cli-review`, on the CLI's own allowance (not the PR-review allowance). Findings fail the job: address them, commit, and re-run. A missing CLI, sign-in, allowance or run cap is a `SKIPPED:` notice, never a failure; each head is reviewed once, at most 2 heads per branch, and `--use-credits` is never passed. It complements the PR review and `pre-pr-checks`, it does not replace them (#730). Skip with `PRE_PR_CHECKS_SKIP=coderabbit-cli`.
   - Escape hatch: `PRE_PR_CHECKS_SKIP=job1,job2` (documented; no silent skip). Do **not** bypass a failing run with ad-hoc substitutes.
   - Also verifies the **primary worktree** is unchanged when checks finish.
 - Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).
