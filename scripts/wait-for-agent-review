@@ -84,7 +84,7 @@ Usage: scripts/wait-for-agent-review <command> [options]
 
 Commands:
   status [--pr N] [--repo OWNER/NAME]
-  request [--pr N] [--repo OWNER/NAME]
+  request [--pr N] [--repo OWNER/NAME] [--confirm-clean]
   wait [--pr N] [--repo OWNER/NAME] [--timeout SECONDS] [--poll-interval SECONDS]
   list-threads [--pr N] [--repo OWNER/NAME]
   list-human-threads [--pr N] [--repo OWNER/NAME]
@@ -364,7 +364,34 @@ cmd_loop_exit_notify() {
   agent_review_loop_notify_stopped "${repo}" "${pr}" "${exit_code}"
 }
 
+# request --confirm-clean: an incremental reviewer (CodeRabbit) never re-reviews a head it already
+# reviewed, so confirming the head is clean needs a full review. Post it through the gated
+# last-resort helper (one ask per head, honours rate limits) only when the head WAS reviewed; an
+# unreviewed head is still waiting on its on-push review, so there is nothing to confirm yet
+# (repository-helpers#735).
+cmd_request_confirm_clean() {
+  local -r owner="$1"
+  local -r name="$2"
+  local -r repo="$3"
+  local -r pr="$4"
+  local snapshot head
+
+  snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}")"
+  agent_review_assert_snapshot_complete "${snapshot}"
+  head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
+  if ! agent_review_fresh_agent_review_on_head "${snapshot}" "${head}"; then
+    printf 'wait-for-agent-review: %s has not reviewed head %s of PR #%s yet - waiting on its on-push review; nothing to confirm\n' \
+      "${AGENT_REVIEW_AGENT:-copilot}" "${head:0:7}" "${pr}" >&2
+    return 0
+  fi
+  agent_review_profile_request_last_resort_full_review "${repo}" "${pr}" "${head}" \
+    || agent_review_die 'failed to request the full review'
+  printf 'wait-for-agent-review: head %s of PR #%s is already reviewed - full review requested or already pending to confirm it is clean (see head_review_clean in check)\n' \
+    "${head:0:7}" "${pr}" >&2
+}
+
 cmd_request() {
+  local -r confirm_clean="${3:-0}"
   local repo pr owner name snapshot request_exit
 
   repo="$(agent_review_resolve_repo "${1:-}")"
@@ -400,6 +427,10 @@ cmd_request() {
     printf 'wait-for-agent-review: %s quota probe already requested today - skipping request on PR #%s\n' \
       "${AGENT_REVIEW_AGENT:-copilot}" "${pr}" >&2
     return 0
+  fi
+  if [[ "${confirm_clean}" == '1' ]] && declare -F agent_review_profile_request_last_resort_full_review >/dev/null 2>&1; then
+    cmd_request_confirm_clean "${owner}" "${name}" "${repo}" "${pr}"
+    return
   fi
   if [[ "${agent_review_profile_trigger:-nudge}" == 'on_push' \
     || "${agent_review_profile_auto_review:-false}" == 'true' ]]; then
@@ -2289,7 +2320,7 @@ cmd_loop() {
 main() {
   local cmd="${1:-}"
   shift || true
-  local repo_arg='' pr_arg='' timeout_arg='' interval_arg='' thread_id='' comment_id='' review_id='' reason='' body='' force_resolve=0
+  local confirm_clean=0 repo_arg='' pr_arg='' timeout_arg='' interval_arg='' thread_id='' comment_id='' review_id='' reason='' body='' force_resolve=0
 
   # One-time tool preflight (issue #644) — fail before subcommand noise.
   if [[ -n "${cmd}" && "${cmd}" != '-h' && "${cmd}" != '--help' && "${cmd}" != 'help' ]]; then
@@ -2340,6 +2371,10 @@ main() {
         body="$(agent_review_require_option_value --body "${2:-}")"
         shift 2
         ;;
+      --confirm-clean)
+        confirm_clean=1
+        shift
+        ;;
       --force)
         force_resolve=1
         shift
@@ -2385,7 +2420,7 @@ main() {
       cmd_status "${repo_arg}" "${pr_arg}"
       ;;
     request)
-      cmd_request "${repo_arg}" "${pr_arg}"
+      cmd_request "${repo_arg}" "${pr_arg}" "${confirm_clean}"
       ;;
     wait)
       cmd_wait "${repo_arg}" "${pr_arg}" \

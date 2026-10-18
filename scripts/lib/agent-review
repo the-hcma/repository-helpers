@@ -754,6 +754,21 @@ agent_review_fresh_agent_review_on_head() {
   [[ "${count}" -gt 0 ]]
 }
 
+# Commit the newest non-pending agent review was made on ("" when the agent has not reviewed).
+# Lets an operator tell "reviewed this head" from "reviewed an older head" (repository-helpers#735).
+agent_review_last_reviewed_sha() {
+  local -r snapshot="$1"
+
+  # shellcheck disable=SC2154  # agent_review_profile_request_login_regex from sourced profile
+  ar_runner_jq_file "agent-review last reviewed sha" "${snapshot}" -r \
+    --arg re "${agent_review_profile_request_login_regex}" '
+    [(.data.repository.pullRequest.reviews.nodes // [])
+      | .[]
+      | select((.author.login // "") | test($re;"i"))
+      | select(.state != "PENDING")]
+    | sort_by(.submittedAt) | last | .commit.oid // ""'
+}
+
 agent_review_head_check_json_for_pr() {
   local -r repo="$1"
   local -r pr="$2"
@@ -1561,7 +1576,7 @@ agent_review_status_json_from_snapshot() {
   local head_check_state head_check_clean head_check_findings head_check_error head_check_quota head_check_conclusion
   local threads_json human_open_json human_threads_json head_check_complete_json
   local request_visible wait_reason agents_json
-  local coderabbit_rate_limited coderabbit_retry_after
+  local coderabbit_rate_limited coderabbit_retry_after last_reviewed_sha head_reviewed head_review_clean
 
   agent_review_assert_reviews_complete "${snapshot}"
   head="$(ar_runner_jq_file "agent-review status head sha" "${snapshot}" -r '.data.repository.pullRequest.headRefOid')"
@@ -1632,6 +1647,12 @@ agent_review_status_json_from_snapshot() {
     coderabbit_rate_limited=true
     coderabbit_retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent 'coderabbit')"
   fi
+  last_reviewed_sha="$(agent_review_last_reviewed_sha "${snapshot}")"
+  if [[ -n "${last_reviewed_sha}" && "${last_reviewed_sha}" == "${head}" ]]; then
+    head_reviewed=true
+  else
+    head_reviewed=false
+  fi
   pass_delivered_by_fallback=false
   if agent_review_delivered_recognized_pass_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
     pass_delivered_by_fallback=true
@@ -1652,6 +1673,12 @@ agent_review_status_json_from_snapshot() {
     agent_quota_exhausted=true
   else
     agent_quota_exhausted=false
+  fi
+  # Clean means the agent reviewed this exact head and reported nothing (not "findings declined").
+  if [[ "${head_reviewed}" == 'true' && "${agent_review_empty}" == 'true' ]]; then
+    head_review_clean=true
+  else
+    head_review_clean=false
   fi
   merge_json="$(agent_review_pr_merge_json "${repo}" "${pr}")"
   pr_state="$(ar_runner_jq_file "agent-review status pr state" "${merge_json}" -r '.state')"
@@ -1708,6 +1735,9 @@ agent_review_status_json_from_snapshot() {
     --argjson agent_request_visible "${request_visible}" \
     --argjson fresh_review_on_head "${fresh}" \
     --argjson agent_review_empty "${agent_review_empty}" \
+    --arg last_reviewed_sha "${last_reviewed_sha}" \
+    --argjson head_reviewed "${head_reviewed}" \
+    --argjson head_review_clean "${head_review_clean}" \
     --argjson agent_quota_exhausted "${agent_quota_exhausted}" \
     --argjson open_agent_threads "${open}" \
     --argjson unaddressed_agent_threads "${unaddressed}" \
@@ -1743,6 +1773,9 @@ agent_review_status_json_from_snapshot() {
       agent_request_visible: $agent_request_visible,
       fresh_review_on_head: $fresh_review_on_head,
       agent_review_empty: $agent_review_empty,
+      last_reviewed_sha: (if $last_reviewed_sha == "" then null else $last_reviewed_sha end),
+      head_reviewed: $head_reviewed,
+      head_review_clean: $head_review_clean,
       agent_quota_exhausted: $agent_quota_exhausted,
       open_agent_threads: $open_agent_threads,
       unaddressed_agent_threads: $unaddressed_agent_threads,

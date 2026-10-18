@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Tests for confirming a head is clean (repository-helpers#735): the status JSON says which commit
+# the agent last reviewed, and `request --confirm-clean` asks CodeRabbit for a full review only when
+# the head was already reviewed (the incremental review never re-reviews it).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+lib="${script_dir}/../scripts/lib/agent-review"
+profile="${script_dir}/../scripts/lib/agent-review-profiles/coderabbit"
+wait_script="${script_dir}/../scripts/wait-for-agent-review"
+readonly lib profile wait_script
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+export HOME="${work_dir}/home"
+mkdir -p "${HOME}"
+export AGENT_REVIEW_ENV_FILE=/dev/null
+
+old_sha='1111111111111111111111111111111111111111'
+head_sha='2222222222222222222222222222222222222222'
+readonly old_sha head_sha
+
+# snapshot_with <reviews-json-array> — the slice of the PR snapshot the helpers read.
+snapshot_with() {
+  printf '{"data":{"repository":{"pullRequest":{"headRefOid":"%s","reviews":{"nodes":%s}}}}}' "${head_sha}" "$1"
+}
+
+run_lib() {
+  bash -c "set -uo pipefail; source '${lib}'; source '${profile}'; $1" 2>&1
+}
+
+printf '\n=== last reviewed sha: the newest non-pending agent review decides ===\n'
+reviews="[
+  {\"author\":{\"login\":\"coderabbitai\"},\"state\":\"COMMENTED\",\"submittedAt\":\"2026-10-18T04:50:00Z\",\"commit\":{\"oid\":\"${old_sha}\"}},
+  {\"author\":{\"login\":\"coderabbitai\"},\"state\":\"COMMENTED\",\"submittedAt\":\"2026-10-18T09:33:00Z\",\"commit\":{\"oid\":\"${head_sha}\"}},
+  {\"author\":{\"login\":\"coderabbitai\"},\"state\":\"PENDING\",\"submittedAt\":\"2026-10-18T10:00:00Z\",\"commit\":{\"oid\":\"${old_sha}\"}},
+  {\"author\":{\"login\":\"someone\"},\"state\":\"APPROVED\",\"submittedAt\":\"2026-10-18T11:00:00Z\",\"commit\":{\"oid\":\"${old_sha}\"}}
+]"
+out="$(run_lib "agent_review_last_reviewed_sha '$(snapshot_with "${reviews}")'")"
+if [[ "${out}" == "${head_sha}" ]]; then
+  pass_case 'last_reviewed_sha is the newest non-pending agent review, ignoring other authors'
+else
+  fail_case "last_reviewed_sha picked the wrong commit: ${out}"
+fi
+out="$(run_lib "agent_review_last_reviewed_sha '$(snapshot_with '[]')'")"
+if [[ -z "${out}" ]]; then
+  pass_case 'last_reviewed_sha is empty when the agent has not reviewed'
+else
+  fail_case "last_reviewed_sha was not empty without a review: ${out}"
+fi
+
+printf '\n=== request --confirm-clean ===\n'
+# run_confirm <reviews-json-array> — runs cmd_request_confirm_clean with gh and the full-review
+# helper stubbed; prints what it posted.
+run_confirm() {
+  snapshot_with "$1" >"${work_dir}/snapshot.json"
+  bash -c "
+    set -uo pipefail
+    source '${wait_script}'; source '${profile}'
+    agent_review_graphql_pr_snapshot() { cat '${work_dir}/snapshot.json'; }
+    agent_review_assert_snapshot_complete() { :; }
+    AGENT_REVIEW_AGENT=coderabbit
+    agent_review_profile_request_last_resort_full_review() { printf 'POSTED full review for %s\n' \"\$3\"; }
+    cmd_request_confirm_clean o r o/r 7
+  " 2>&1
+}
+reviewed_head="[{\"author\":{\"login\":\"coderabbitai\"},\"state\":\"COMMENTED\",\"submittedAt\":\"2026-10-18T09:33:00Z\",\"commit\":{\"oid\":\"${head_sha}\"}}]"
+reviewed_old="[{\"author\":{\"login\":\"coderabbitai\"},\"state\":\"COMMENTED\",\"submittedAt\":\"2026-10-18T04:50:00Z\",\"commit\":{\"oid\":\"${old_sha}\"}}]"
+out="$(run_confirm "${reviewed_head}")"
+assert_contains 'an already-reviewed head gets a full review' "${out}" "POSTED full review for ${head_sha}"
+out="$(run_confirm "${reviewed_old}")"
+assert_not_contains 'a head not reviewed yet is not asked for a full review' "${out}" 'POSTED'
+assert_contains 'a head not reviewed yet says there is nothing to confirm' "${out}" 'nothing to confirm'
+
+printf '\n=== static: wiring ===\n'
+usage="$("${wait_script}" --help)"
+assert_contains 'usage lists request --confirm-clean' "${usage}" '--confirm-clean'
+for field in last_reviewed_sha head_reviewed head_review_clean; do
+  if grep -qF "${field}: \$${field}" "${lib}" || grep -qF "${field}: (" "${lib}"; then
+    pass_case "status JSON exposes ${field}"
+  else
+    fail_case "status JSON does not expose ${field}"
+  fi
+done
+
+test_summary
