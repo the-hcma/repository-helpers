@@ -884,6 +884,176 @@ else
 fi
 rm -rf "$mock_dir"
 
+printf '\n=== unit: rp_systemd_unit_hardening_gaps (repository-helpers#634) ===\n'
+sysd_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+
+    gaps_of() { rp_systemd_unit_hardening_gaps "$1" | paste -sd, -; }
+    expect() {
+      local label="$1" want="$2" text="$3" got
+      got="$(gaps_of "$text")"
+      [[ "$got" == "$want" ]] || { printf "%s: want [%s] got [%s]\n" "$label" "$want" "$got"; exit 1; }
+    }
+
+    expect bare "no_new_privileges,sandboxing" "$(printf "[Service]\nExecStart=/bin/true\n")"
+    expect empty-capability-set-counts "" "$(printf "[Service]\nNoNewPrivileges=true\nCapabilityBoundingSet=\n")"
+    expect nnp-false "no_new_privileges" "$(printf "[Service]\nNoNewPrivileges=false\nPrivateTmp=true\n")"
+    expect commented "no_new_privileges,sandboxing" \
+      "$(printf "[Service]\n# NoNewPrivileges=true\n  # ProtectSystem=strict\n; PrivateTmp=true\n")"
+    expect spaced-and-uppercase "" "$(printf "[Service]\n  NoNewPrivileges = YES\nProtectHome = true\n")"
+    # CodeRabbit CLI finding: settings outside [Service] are not in effect.
+    expect other-section-ignored "no_new_privileges,sandboxing" \
+      "$(printf "[Unit]\nNoNewPrivileges=true\nPrivateTmp=true\n[Service]\nExecStart=/bin/true\n")"
+    # CodeRabbit CLI finding: a disabled value is not hardening.
+    expect disabled-values "no_new_privileges,sandboxing" \
+      "$(printf "[Service]\nPrivateTmp=false\nProtectSystem=no\nProtectHome=no\nRestrictAddressFamilies=\n")"
+    expect last-assignment-wins "no_new_privileges,sandboxing" \
+      "$(printf "[Service]\nNoNewPrivileges=true\nPrivateTmp=true\nNoNewPrivileges=false\nPrivateTmp=no\n")"
+    expect enabled-protect-system-full "" "$(printf "[Service]\nNoNewPrivileges=true\nProtectSystem=full\n")"
+    expect address-families-set "" "$(printf "[Service]\nNoNewPrivileges=1\nRestrictAddressFamilies=AF_UNIX AF_INET\n")"
+    printf "ok\n"
+  ' _ "$runner_bootstrap" "$lib" 2>&1
+)" || true
+if [[ "$sysd_out" == 'ok' ]]; then
+  printf '[PASS] systemd hardening gaps follow effective [Service] values (sections, disabled values, last assignment)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] systemd hardening gaps: %s\n' "$sysd_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_check_systemd_unit_hardening is SUGGEST-only (repository-helpers#634) ===\n'
+sysd_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${sysd_dir}/runner-sessions"
+sysd_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    rp_compact=0; rp_suggest=1; rp_apply_fix=0; rp_strict_onboarding=1; rp_new_repo=1
+    slug=the-hcma/example-repo
+
+    # No etc/systemd (listing says "not found"): silent, passes under the strictest flags.
+    rp_fetch_systemd_unit_names() { return 1; }
+    rc=0; out="$(rp_check_systemd_unit_hardening "$slug" 2>&1)" || rc=$?
+    { [[ "$rc" == 0 && -z "$out" ]]; } || { printf "no-units: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    # Listing API error: a WARN that the advisory could not run, never FAIL/OK/silence.
+    rp_fetch_systemd_unit_names() { return 2; }
+    rc=0; out="$(rp_check_systemd_unit_hardening "$slug" 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "WARN: ${slug}: could not list etc/systemd" <<<"$out" \
+      && ! grep -qE "^(FAIL|OK):" <<<"$out"; } \
+      || { printf "list-error: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    # Bare units: both suggestions, exit 0 even with --new-repo and --strict-onboarding.
+    rp_fetch_systemd_unit_names() { printf "a.service\nb.service\n"; }
+    rp_fetch_github_text_file() { printf "[Service]\nExecStart=/bin/true\n"; }
+    rc=0; out="$(rp_check_systemd_unit_hardening "$slug" 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "SUGGEST: ${slug}: add NoNewPrivileges=true to [Service] in etc/systemd/{a.service,b.service}" <<<"$out" \
+      && grep -qF "enable none of ProtectSystem=, ProtectHome=, PrivateTmp=, RestrictAddressFamilies= or CapabilityBoundingSet=" <<<"$out" \
+      && ! grep -qE "^FAIL:" <<<"$out"; } \
+      || { printf "bare-units: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    # Without --suggest the same gaps print nothing and still pass.
+    rp_suggest=0
+    rc=0; out="$(rp_check_systemd_unit_hardening "$slug" 2>&1)" || rc=$?
+    { [[ "$rc" == 0 && -z "$out" ]]; } || { printf "no-suggest-flag: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    rp_suggest=1
+
+    # Hardened units: an OK check line and no suggestions.
+    rp_fetch_github_text_file() { printf "[Service]\nNoNewPrivileges=true\nProtectSystem=strict\n"; }
+    rc=0; out="$(rp_check_systemd_unit_hardening "$slug" 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "systemd unit hardening" <<<"$out" \
+      && ! grep -qF "SUGGEST:" <<<"$out"; } \
+      || { printf "hardened: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    # CodeRabbit CLI finding: an unreadable unit is an incomplete result, so WARN, no FAIL,
+    # and never an OK line even when every readable unit is hardened.
+    rp_fetch_systemd_unit_names() { printf "good.service\nbad.service\n"; }
+    rp_fetch_github_text_file() {
+      if [[ "$2" == *bad.service ]]; then return 2; fi
+      printf "[Service]\nNoNewPrivileges=true\nProtectSystem=strict\n"
+    }
+    rc=0; out="$(rp_check_systemd_unit_hardening "$slug" 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] \
+      && grep -qF "WARN: ${slug}: could not read etc/systemd/{bad.service}" <<<"$out" \
+      && ! grep -qE "^(FAIL|OK):" <<<"$out"; } \
+      || { printf "unreadable-unit: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    printf "ok\n"
+  ' _ "$runner_bootstrap" "$lib" 2>&1
+)" || true
+if [[ "$sysd_out" == 'ok' ]]; then
+  printf '[PASS] systemd hardening check suggests, warns when unknown, stays silent without --suggest and never fails\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] systemd hardening check: %s\n' "$sysd_out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$sysd_dir"
+
+printf '\n=== functional: rp_fetch_systemd_unit_names (listing, 404 vs API error) ===\n'
+sysd_mock="$(mktemp -d)"
+mkdir -p "${sysd_mock}/bin"
+cat >"${sysd_mock}/bin/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *'auth status'* ]]; then exit 0; fi
+case "$*" in
+  *'repos/the-hcma/has-units/contents/etc/systemd'*)
+    printf '[{"name":"x.service","type":"file"},{"name":"x.timer","type":"file"},{"name":"d.service","type":"dir"},{"name":"README.md","type":"file"}]'
+    exit 0
+    ;;
+  *'repos/the-hcma/no-units/contents/etc/systemd'*)
+    printf 'gh: Not Found (HTTP 404)\n' >&2
+    exit 1
+    ;;
+  *'repos/the-hcma/broken/contents/etc/systemd'*)
+    printf 'gh: Internal Server Error (HTTP 500)\n' >&2
+    exit 1
+    ;;
+esac
+exit 1
+MOCK_GH
+chmod +x "${sysd_mock}/bin/gh"
+export RUNNER_SESSION_ROOT="${sysd_mock}/runner-sessions"
+sysd_out="$(
+  PATH="${sysd_mock}/bin:${PATH}" bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+
+    names="$(rp_fetch_systemd_unit_names the-hcma/has-units)"
+    [[ "$names" == "x.service" ]] || { printf "listing: [%s]\n" "$names"; exit 1; }
+
+    rc=0; out="$(rp_fetch_systemd_unit_names the-hcma/no-units 2>&1)" || rc=$?
+    { [[ "$rc" == 1 && -z "$out" ]]; } || { printf "404: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    rc=0; out="$(rp_fetch_systemd_unit_names the-hcma/broken 2>&1)" || rc=$?
+    { [[ "$rc" == 2 ]] && ! grep -qF "FAIL" <<<"$out"; } || { printf "500: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    printf "ok\n"
+  ' _ "$runner_bootstrap" "$lib" 2>&1
+)" || true
+if [[ "$sysd_out" == 'ok' ]]; then
+  printf '[PASS] etc/systemd listing keeps .service files, treats 404 as none and 500 as an API error without FAIL noise\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] etc/systemd listing: %s\n' "$sysd_out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$sysd_mock"
+
 printf '\n=== summary ===\n'
 printf '%s passed, %s failed\n' "$pass" "$fail"
 

@@ -10219,6 +10219,191 @@ rp_check_actions_workflow_pinning() {
 }
 
 # ---------------------------------------------------------------------------
+# systemd unit hardening (repository-helpers#634): SUGGEST-only. A repo that
+# ships etc/systemd/*.service templates gets a nudge when a unit lacks the
+# baseline hardening directives. Never FAILs: the right sandboxing values are
+# service-specific, so only NoNewPrivileges=true is suggested by value.
+# ---------------------------------------------------------------------------
+
+# rp_fetch_systemd_unit_names <slug>
+# Prints the *.service file names under etc/systemd. Exit 0 = listed (possibly
+# none), 1 = no etc/systemd directory, 2 = GitHub API error after retries.
+rp_fetch_systemd_unit_names() {
+  local slug="$1"
+  local response
+  local attempt max_attempts class_ec sleep_ec
+  local fetch_exit_code=0 type_exit_code=0
+
+  max_attempts="$(rp_gh_api_max_attempts)"
+  attempt=1
+  while (( attempt <= max_attempts )); do
+    fetch_exit_code=0
+    set +e
+    response="$(rp_runner_gh_api_stream "repo-practices gh list systemd units" --probe \
+      "repos/${slug}/contents/etc/systemd")"
+    fetch_exit_code=$?
+    set -e
+    if (( fetch_exit_code == 0 )) && [[ -n "$response" ]]; then
+      break
+    fi
+    class_ec=0
+    rp_gh_api_classify_contents_failure "$attempt" || class_ec=$?
+    if (( class_ec == 3 )); then
+      sleep_ec=0
+      rp_gh_api_retry_sleep "$attempt" || sleep_ec=$?
+      if (( sleep_ec == 124 || sleep_ec == 125 )); then
+        return 2
+      fi
+      attempt=$(( attempt + 1 ))
+      continue
+    fi
+    return "$class_ec"
+  done
+  if (( fetch_exit_code != 0 )) || [[ -z "$response" ]]; then
+    return 2
+  fi
+  # etc/systemd that is a file (not a directory) returns an object, not an array.
+  rp_runner_jq_file "repo-practices systemd units response type" "$response" \
+    -e 'type == "array"' >/dev/null || type_exit_code=$?
+  if (( type_exit_code != 0 )); then
+    return 1
+  fi
+  rp_runner_jq_file "repo-practices systemd unit names" "$response" \
+    -r '.[]? | select(.type == "file" and (.name | endswith(".service"))) | .name // empty'
+}
+
+# rp_systemd_unit_hardening_gaps <unit text>
+# One token per gap on stdout, judged on the effective [Service] values (the
+# last assignment of a key wins; other sections and comments are ignored):
+#   no_new_privileges - NoNewPrivileges is not a true boolean
+#   sandboxing        - none of ProtectSystem= / ProtectHome= / PrivateTmp= (enabled values),
+#                       RestrictAddressFamilies= (non-empty) or CapabilityBoundingSet= (any
+#                       value, an empty set is the strictest) is in effect
+rp_systemd_unit_hardening_gaps() {
+  local text="$1"
+  local line key val in_service=0
+  local -A service_values=()
+
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in
+      '' | '#'* | ';'*) continue ;;
+      '['*)
+        if [[ "$line" == '[Service]'* ]]; then
+          in_service=1
+        else
+          in_service=0
+        fi
+        continue
+        ;;
+      *) ;;
+    esac
+    (( in_service == 1 )) || continue
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    key="${key%"${key##*[![:space:]]}"}"
+    val="${line#*=}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    service_values["$key"]="${val,,}"
+  done <<<"$text"
+
+  case "${service_values[NoNewPrivileges]-}" in
+    true | yes | on | 1) ;;
+    *) printf '%s\n' 'no_new_privileges' ;;
+  esac
+
+  case "${service_values[ProtectSystem]-}" in
+    true | yes | on | 1 | full | strict) return 0 ;;
+    *) ;;
+  esac
+  case "${service_values[ProtectHome]-}" in
+    true | yes | on | 1 | read-only | tmpfs) return 0 ;;
+    *) ;;
+  esac
+  case "${service_values[PrivateTmp]-}" in
+    true | yes | on | 1 | disconnected) return 0 ;;
+    *) ;;
+  esac
+  if [[ -n "${service_values[RestrictAddressFamilies]-}" ]]; then
+    return 0
+  fi
+  if [[ -v 'service_values[CapabilityBoundingSet]' ]]; then
+    return 0
+  fi
+  printf '%s\n' 'sandboxing'
+}
+
+rp_check_systemd_unit_hardening() {
+  local slug="$1"
+  local -a names=() no_nnp_units=() no_sandbox_units=() unread_units=()
+  local names_out name text fetch_ec list_ec gap unit_url detail
+
+  list_ec=0
+  names_out="$(rp_fetch_systemd_unit_names "$slug")" || list_ec=$?
+  if (( list_ec == 2 )); then
+    detail="$(rp_runner_last_stderr_summary || true)"
+    rp_log_warn "${slug}: could not list etc/systemd (GitHub API: ${detail:-gh api request failed}); systemd hardening advisory skipped"
+    return 0
+  fi
+  if (( list_ec != 0 )) || [[ -z "$names_out" ]]; then
+    return 0
+  fi
+  mapfile -t names <<<"$names_out"
+
+  for name in "${names[@]}"; do
+    fetch_ec=0
+    text="$(rp_fetch_github_text_file "$slug" "etc/systemd/${name}")" || fetch_ec=$?
+    if (( fetch_ec == 2 )); then
+      unread_units+=("$name")
+      continue
+    fi
+    [[ -n "$text" ]] || continue
+    while IFS= read -r gap; do
+      case "$gap" in
+        no_new_privileges) no_nnp_units+=("$name") ;;
+        sandboxing) no_sandbox_units+=("$name") ;;
+        *) ;;
+      esac
+    done < <(rp_systemd_unit_hardening_gaps "$text")
+  done
+
+  # An unreadable unit makes the result unknown: say so instead of FAILing
+  # (advisory check) and never follow it with a contradictory OK line.
+  if [[ "${#unread_units[@]}" -gt 0 ]]; then
+    rp_log_warn "${slug}: could not read etc/systemd/{$(
+      IFS=,
+      printf '%s' "${unread_units[*]}"
+    )} (GitHub API error); systemd hardening result is incomplete"
+  fi
+
+  unit_url="$(rp_github_url "$slug" '/tree/main/etc/systemd')"
+  if [[ "${#no_nnp_units[@]}" -eq 0 && "${#no_sandbox_units[@]}" -eq 0 ]]; then
+    if [[ "${#unread_units[@]}" -eq 0 ]]; then
+      rp_log_check_ok "$slug" 'systemd unit hardening (etc/systemd/*.service)' "$unit_url"
+    fi
+    return 0
+  fi
+
+  if [[ "$rp_suggest" -eq 1 ]]; then
+    if [[ "${#no_nnp_units[@]}" -gt 0 ]]; then
+      rp_log_suggest "${slug}: add NoNewPrivileges=true to [Service] in etc/systemd/{$(
+        IFS=,
+        printf '%s' "${no_nnp_units[*]}"
+      )} (cheap and almost always safe)"
+    fi
+    if [[ "${#no_sandbox_units[@]}" -gt 0 ]]; then
+      rp_log_suggest "${slug}: etc/systemd/{$(
+        IFS=,
+        printf '%s' "${no_sandbox_units[*]}"
+      )} enable none of ProtectSystem=, ProtectHome=, PrivateTmp=, RestrictAddressFamilies= or CapabilityBoundingSet=; consider them (values are service-specific, see systemd.exec(5); SystemCallFilter= can break a service at runtime)"
+    fi
+  fi
+
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Deployment environment protection (repository-helpers#588): any environment
 # a workflow deploys to must have a protection rule (required reviewer) or a
 # deployment_branch_policy. FAIL under --new-repo and --strict-onboarding
@@ -10691,6 +10876,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_actions_workflow_pinning "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_systemd_unit_hardening "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_deployment_env_protection "$slug"; then
