@@ -160,7 +160,7 @@ Never implement on the primary clone — always `cd` into the stack worktree fir
 | `scripts/gh-api` | Throttled `gh` passthrough for agent flows (primary/secondary rate-limit backoff) |
 | `scripts/grandfather-pnpm-release-age` | One-time pnpm `minimumReleaseAge` / exclude cutover for existing lockfiles |
 | `scripts/on-deploy` | Example deploy hook; consumer repos implement their own |
-| `scripts/trigger-agent-review` | Request a review from the configured agent profile (`--confirm-clean` asks CodeRabbit for a full review of an already-reviewed head) |
+| `scripts/trigger-agent-review` | Request a review from the configured agent profile (`--confirm-clean` asks CodeRabbit for a full review of an already-reviewed head; `check` / `status` report `last_reviewed_sha`, an object-based hint rather than a verdict that must be read together with `head_reviewed`) |
 
 Shared libraries live under `scripts/lib/` (`agent-review`, `ci-secret-scan`, `on-deploy-deps`, `release-age-defaults`, `repo-practices`, `runner`, …).
 
