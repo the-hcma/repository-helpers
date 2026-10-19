@@ -1443,6 +1443,36 @@ cmd_loop_nothing_outstanding() {
   return 0
 }
 
+# True (0) while a fallback reviewer (Copilot, Bugbot) was asked for <head> and has not answered yet,
+# so giving up on CodeRabbit would cut that review short.
+cmd_loop_fallback_review_outstanding() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r snapshot="$4"
+  local agent saved_agent outstanding=1
+
+  saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
+  for agent in copilot bugbot; do
+    if ! agent_review_reviewers_is_enabled "${agent}" "${repo}"; then
+      continue
+    fi
+    agent_review_use_agent "${agent}"
+    if declare -F agent_review_profile_review_outstanding >/dev/null 2>&1 \
+      && agent_review_profile_review_outstanding "${snapshot}" "${head}" "${repo}" "${pr}"; then
+      outstanding=0
+      break
+    fi
+    if agent_review_agent_requested_from_snapshot "${snapshot}" \
+      && ! cmd_loop_agent_response_seen "${repo}" "${pr}" "${head}" "${agent}" "${snapshot}"; then
+      outstanding=0
+      break
+    fi
+  done
+  agent_review_use_agent "${saved_agent}"
+  return "${outstanding}"
+}
+
 # True while CodeRabbit owes an answer to a full review the loop asked for on <head>: the ask is on
 # the PR (waiting for a reply, running, or rate limited and due to be repeated) and the head's
 # commit status is not yet "Review completed". The early-complete gate must not pass in the same
@@ -1548,7 +1578,7 @@ cmd_loop_handle_coderabbit_rate_limit() {
   local -r head="$3"
   local snapshot="${4:-}"
   local saved_agent retry_after remaining sleep_s retry_epoch now_epoch grace_s grace_remaining
-  local profiles_dir coderabbit_profile _owner _name sent_rc exhausted_reason give_exit
+  local profiles_dir coderabbit_profile _owner _name sent_rc exhausted_reason give_exit snapshot_head
   local poll_s pending_exit provisional_retry
   local head_status head_state head_state_epoch fallback_wait_s fallback_epoch
 
@@ -1725,7 +1755,16 @@ cmd_loop_handle_coderabbit_rate_limit() {
         printf 'wait-for-agent-review: could not refresh PR #%s before giving up on CodeRabbit — will retry\n' "${pr}" >&2
         return 1
       fi
+      snapshot_head="$(wait_ar_jq_snapshot "${snapshot}" '.data.repository.pullRequest.headRefOid' 2>/dev/null || true)"
+      if [[ "${snapshot_head}" != "${head}" ]]; then
+        # A new commit arrived: its asks are counted afresh, so let the loop pick the new head up.
+        return 1
+      fi
       if agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+        return 1
+      fi
+      if cmd_loop_fallback_review_outstanding "${repo}" "${pr}" "${head}" "${snapshot}"; then
+        printf 'wait-for-agent-review: CodeRabbit asks are used up but a fallback review is outstanding on PR #%s — waiting\n' "${pr}" >&2
         return 1
       fi
       # shellcheck disable=SC2154  # agent_review_default_coderabbit_* are assigned in scripts/lib/agent-review
