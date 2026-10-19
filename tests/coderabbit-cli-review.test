@@ -44,12 +44,8 @@ case "${1:-}" in
       [[ -z "${STUB_HELP_EXTRA:-}" ]] || printf '%s\n' "$STUB_HELP_EXTRA"
       exit 0
     fi
-    if [[ -n "${STUB_SLEEP:-}" ]]; then
-      exec sleep "$STUB_SLEEP"
-    fi
     if [[ -n "${STUB_STDERR:-}" ]]; then printf "%s\n" "$STUB_STDERR" >&2; fi
     cat "${STUB_REVIEW_FILE:?}"
-    if [[ -n "${STUB_SLEEP_AFTER:-}" ]]; then exec sleep "$STUB_SLEEP_AFTER"; fi
     exit "${STUB_REVIEW_RC:-0}"
     ;;
 esac
@@ -68,6 +64,29 @@ printf '%s\n' '{"type":"review_context"}' \
 
 incomplete_review="${work}/incomplete.ndjson"
 printf '%s\n' '{"type":"review_context"}' '{"type":"heartbeat","status":"reviewing"}' > "$incomplete_review"
+
+skipped_review="${work}/skipped.ndjson"
+printf '%s\n' '{"type":"review_context"}' \
+  '{"type":"complete","status":"review_skipped","findings":0}' > "$skipped_review"
+
+silent_review="${work}/silent.ndjson"
+: > "$silent_review"
+
+# A fake timeout(1) keeps the timeout cases deterministic (no sleeping): it runs the command and then
+# reports expiry (124) for the review call only when FAKE_TIMEOUT_EXPIRES is set, as GNU timeout does
+# after killing a command that outlived its budget. Probe calls pass through untouched.
+fake_to="${work}/fake-timeout-bin"
+mkdir -p "$fake_to"
+cat > "${fake_to}/timeout" <<'FAKE'
+#!/usr/bin/env bash
+while [[ "${1:-}" == -* ]]; do shift; done
+shift
+"$@"
+cmd_rc=$?
+if [[ -n "${FAKE_TIMEOUT_EXPIRES:-}" && "$*" == *"review --agent"* ]]; then exit 124; fi
+exit "$cmd_rc"
+FAKE
+chmod +x "${fake_to}/timeout"
 
 credits_review="${work}/credits.ndjson"
 printf '%s\n' '{"type":"status","status":"awaiting_confirmation","message":"needs credits"}' > "$credits_review"
@@ -96,6 +115,7 @@ run_wrapper() {
   shift
   rc=0
   out="$(CODERABBIT_BIN="$stub" STUB_LOG="${work}/stub.log" \
+    PATH="${TEST_PATH_PREFIX:+${TEST_PATH_PREFIX}:}${PATH}" \
     bash "$wrapper" --dir "$repo" --state-dir "$state_dir" "$@" 2>&1)" || rc=$?
 }
 
@@ -165,8 +185,21 @@ run_wrapper "${work}/s5"
 assert_eq 'an error event exits 1' "$rc" '1'
 assert_contains 'the error message is surfaced' "$out" 'backend exploded'
 
-export STUB_REVIEW_FILE="$clean_review"
-STUB_SLEEP=30 run_wrapper "${work}/s6" --timeout 1
+export STUB_REVIEW_FILE="$skipped_review"
+run_wrapper "${work}/s5b"
+assert_eq 'a skipped review exits 3 (skip), not clean' "$rc" '3'
+assert_contains 'the skip names the CLI status' "$out" 'skipped the review (review_skipped)'
+if compgen -G "${work}/s5b/*.log" > /dev/null; then
+  fail_case 'a skipped review records no result'
+else
+  pass_case 'a skipped review records no result'
+fi
+skipped_before="$(review_calls)"
+run_wrapper "${work}/s5b"
+assert_eq 'a skipped review is run again, never replayed as clean' "$(( $(review_calls) - skipped_before ))" '1'
+
+export STUB_REVIEW_FILE="$silent_review"
+FAKE_TIMEOUT_EXPIRES=1 TEST_PATH_PREFIX="$fake_to" run_wrapper "${work}/s6" --timeout 1
 assert_eq 'a timed-out review exits 1' "$rc" '1'
 assert_contains 'timeout is reported and nothing is recorded' "$out" 'timed out after 1s'
 if compgen -G "${work}/s6/*.log" > /dev/null; then
@@ -177,7 +210,7 @@ fi
 
 printf '\n=== findings streamed before a timeout are still reported ===\n'
 export STUB_REVIEW_FILE="$findings_review"
-STUB_SLEEP_AFTER=30 run_wrapper "${work}/s27" --timeout 1
+FAKE_TIMEOUT_EXPIRES=1 TEST_PATH_PREFIX="$fake_to" run_wrapper "${work}/s27" --timeout 1
 assert_eq 'findings streamed before a timeout exit 2' "$rc" '2'
 assert_contains 'the timeout is noted next to the findings' "$out" 'timed out after 1s; reporting the findings streamed so far'
 assert_contains 'the streamed findings are printed' "$out" '[minor] scripts/a: First problem'
