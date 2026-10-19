@@ -92,7 +92,8 @@ assert_not_contains 'a rate-limit stub on the head is not a review to confirm' "
 
 printf '\n=== head reviewed / clean: the profile signal, shared with the confirm gate ===\n'
 head_state() { # <issue-comments-json-array> <unaddressed> -> "reviewed clean"
-  local -r snap="$(snapshot_with '[]')"
+  local snap
+  snap="$(snapshot_with '[]')"
   printf '%s' "$1" >"${work_dir}/comments.json"
   run_lib "
     agent_review_pr_issue_comments_json() { cat '${work_dir}/comments.json'; }
@@ -117,6 +118,45 @@ out="$(HEAD_STATE=rate_limited run_confirm "[$(comment_json "${review_comment}")
 assert_not_contains 'a rate-limited head status blocks the confirm gate even with a review comment' "${out}" 'POSTED'
 out="$(HEAD_STATE=in_progress run_confirm "[$(comment_json "${review_comment}")]")"
 assert_not_contains 'a head CodeRabbit is still reviewing is not confirmed yet' "${out}" 'POSTED'
+
+printf '\n=== reviewing agent: reported for the agent that reviewed, not the quota-chain pick (#742) ===\n'
+# any_agent_state <status-agent> <issue-comments-json-array> <unaddressed> -> "<agent>\t<clean>" or nothing.
+# The status agent is what the quota chain selected; a reviewer other than it may have reviewed the head.
+any_agent_state() {
+  local snap
+  snap="$(snapshot_with '[]')"
+  printf '%s' "$2" >"${work_dir}/comments.json"
+  run_lib "
+    AGENT_REVIEW_AGENT='$1'
+    agent_review_reviewers_is_enabled() { return 0; }
+    agent_review_head_check_complete_on_head() { return 1; }
+    agent_review_pr_issue_comments_json() { cat '${work_dir}/comments.json'; }
+    agent_review_latest_issue_comment_body_for_profile() { :; }
+    agent_review_coderabbit_head_state() { printf %s \${HEAD_STATE:-completed}; }
+    agent_review_head_review_by_any_agent '${snap}' '${head_sha}' '$3' o/r 7"
+}
+clean_comment="[$(comment_json "${review_comment}")]"
+out="$(any_agent_state copilot "${clean_comment}" 0)"
+assert_contains 'a head CodeRabbit reviewed clean is attributed to coderabbit when the chain picked copilot' \
+  "${out}" "$(printf 'coderabbit\ttrue')"
+out="$(any_agent_state coderabbit "${clean_comment}" 0)"
+assert_contains 'the status agent is reported when it is the one that reviewed' "${out}" "$(printf 'coderabbit\ttrue')"
+out="$(any_agent_state copilot "[$(comment_json "${findings_comment}")]" 0)"
+assert_contains 'a review with findings is attributed but not clean' "${out}" "$(printf 'coderabbit\tfalse')"
+out="$(any_agent_state copilot "${clean_comment}" 1)"
+assert_contains 'an unaddressed thread makes the attributed review not clean' "${out}" "$(printf 'coderabbit\tfalse')"
+out="$(any_agent_state copilot '[]' 0)"
+if [[ -z "${out}" ]]; then
+  pass_case 'a head no agent reviewed reports no reviewing agent'
+else
+  fail_case "a head no agent reviewed reported an agent: ${out}"
+fi
+out="$(HEAD_STATE=rate_limited any_agent_state copilot "${clean_comment}" 0)"
+if [[ -z "${out}" ]]; then
+  pass_case 'a rate-limited CodeRabbit head is not attributed to any agent'
+else
+  fail_case "a rate-limited head was attributed: ${out}"
+fi
 
 printf '\n=== confirm-clean outcomes ===\n'
 # run_confirm_with <helper-exit> <rate-limited 0|1>
@@ -280,7 +320,7 @@ assert_contains '--confirm-clean is rejected outside the request command' "${out
 printf '\n=== static: wiring ===\n'
 usage="$("${wait_script}" --help)"
 assert_contains 'usage lists request --confirm-clean' "${usage}" '--confirm-clean'
-for field in last_reviewed_sha head_reviewed head_review_clean; do
+for field in last_reviewed_sha head_reviewed head_review_clean head_reviewed_by; do
   if grep -qF "${field}: \$${field}" "${lib}" || grep -qF "${field}: (" "${lib}"; then
     pass_case "status JSON exposes ${field}"
   else

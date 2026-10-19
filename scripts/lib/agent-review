@@ -832,6 +832,45 @@ agent_review_head_review_is_clean() {
   agent_review_profile_review_is_empty "${body}"
 }
 
+# Which configured agent reviewed <head> (repository-helpers#742): prints "<agent><TAB><true|false>" (the
+# second field is whether that review is clean) for the first agent with a completed review of the head,
+# trying the status agent first and then the other reviewers the repo enables. Prints nothing when no
+# agent has. The status agent is the quota-chain pick, which is not necessarily the agent that reviewed:
+# CodeRabbit can have reviewed a head while the chain, with its quota exhausted, selected Copilot.
+agent_review_head_review_by_any_agent() {
+  local -r snapshot="$1"
+  local -r head="$2"
+  local -r unaddressed="$3"
+  local -r repo="$4"
+  local -r pr="$5"
+  local saved_agent agent clean
+  local -A seen=()
+
+  saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
+  for agent in "${saved_agent}" copilot bugbot coderabbit; do
+    if [[ -n "${seen[${agent}]:-}" ]]; then
+      continue
+    fi
+    seen["${agent}"]=1
+    # The status agent is always considered; the others only when the repo enables them (#716).
+    if [[ "${agent}" != "${saved_agent}" ]] && ! agent_review_reviewers_is_enabled "${agent}" "${repo}"; then
+      continue
+    fi
+    agent_review_use_agent "${agent}"
+    if agent_review_head_reviewed "${snapshot}" "${head}" "${repo}" "${pr}"; then
+      clean=false
+      if agent_review_head_review_is_clean "${snapshot}" "${head}" "${unaddressed}" "${repo}" "${pr}"; then
+        clean=true
+      fi
+      agent_review_use_agent "${saved_agent}"
+      printf '%s\t%s\n' "${agent}" "${clean}"
+      return 0
+    fi
+  done
+  agent_review_use_agent "${saved_agent}"
+  return 0
+}
+
 agent_review_head_check_json_for_pr() {
   local -r repo="$1"
   local -r pr="$2"
@@ -1640,6 +1679,7 @@ agent_review_status_json_from_snapshot() {
   local threads_json human_open_json human_threads_json head_check_complete_json
   local request_visible wait_reason agents_json
   local coderabbit_rate_limited coderabbit_retry_after last_reviewed_sha head_reviewed head_review_clean
+  local head_reviewed_by reviewer_line
 
   agent_review_assert_reviews_complete "${snapshot}"
   head="$(ar_runner_jq_file "agent-review status head sha" "${snapshot}" -r '.data.repository.pullRequest.headRefOid')"
@@ -1710,11 +1750,16 @@ agent_review_status_json_from_snapshot() {
     coderabbit_rate_limited=true
     coderabbit_retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent 'coderabbit')"
   fi
-  if agent_review_head_reviewed "${snapshot}" "${head}" "${repo}" "${pr}"; then
+  # The agent that reviewed the head, which is not always the status agent (repository-helpers#742).
+  reviewer_line="$(agent_review_head_review_by_any_agent "${snapshot}" "${head}" "${unaddressed}" "${repo}" "${pr}")"
+  if [[ -n "${reviewer_line}" ]]; then
+    IFS=$'\t' read -r head_reviewed_by head_review_clean <<<"${reviewer_line}"
     head_reviewed=true
     last_reviewed_sha="${head}"
   else
     head_reviewed=false
+    head_reviewed_by=''
+    head_review_clean=false
     # The newest review object, which may be on an older commit (empty when none).
     last_reviewed_sha="$(agent_review_last_reviewed_sha "${snapshot}")"
   fi
@@ -1739,13 +1784,8 @@ agent_review_status_json_from_snapshot() {
   else
     agent_quota_exhausted=false
   fi
-  # Clean means the agent reviewed this exact head and its review body reported nothing (not
-  # "findings declined", not just a green head check).
-  if agent_review_head_review_is_clean "${snapshot}" "${head}" "${unaddressed}" "${repo}" "${pr}"; then
-    head_review_clean=true
-  else
-    head_review_clean=false
-  fi
+  # head_review_clean (above, with head_reviewed): the reviewing agent reviewed this exact head and its
+  # review body reported nothing (not "findings declined", not just a green head check).
   merge_json="$(agent_review_pr_merge_json "${repo}" "${pr}")"
   pr_state="$(ar_runner_jq_file "agent-review status pr state" "${merge_json}" -r '.state')"
   if [[ "${pr_state}" == 'MERGED' ]]; then
@@ -1803,6 +1843,7 @@ agent_review_status_json_from_snapshot() {
     --argjson agent_review_empty "${agent_review_empty}" \
     --arg last_reviewed_sha "${last_reviewed_sha}" \
     --argjson head_reviewed "${head_reviewed}" \
+    --arg head_reviewed_by "${head_reviewed_by}" \
     --argjson head_review_clean "${head_review_clean}" \
     --argjson agent_quota_exhausted "${agent_quota_exhausted}" \
     --argjson open_agent_threads "${open}" \
@@ -1841,6 +1882,7 @@ agent_review_status_json_from_snapshot() {
       agent_review_empty: $agent_review_empty,
       last_reviewed_sha: (if $last_reviewed_sha == "" then null else $last_reviewed_sha end),
       head_reviewed: $head_reviewed,
+      head_reviewed_by: (if $head_reviewed_by == "" then null else $head_reviewed_by end),
       head_review_clean: $head_review_clean,
       agent_quota_exhausted: $agent_quota_exhausted,
       open_agent_threads: $open_agent_threads,
