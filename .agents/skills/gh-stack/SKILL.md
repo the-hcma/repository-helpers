@@ -915,6 +915,6 @@ gh stack unstack --local
 1. **Stacks are strictly linear.** Branching stacks (multiple children on a single parent) are not supported. Each branch has exactly one parent and at most one child. If you need parallel workstreams, use separate stacks.
 2. **Stack disambiguation cannot be bypassed.** If the current branch is the trunk of multiple stacks, commands error with code 6. Check out a non-shared branch first.
 3. **Multiple remotes require `--remote` or config.** If more than one remote is configured, pass `--remote <name>` or set `remote.pushDefault` in git config before running `push`, `sync`, or `rebase`.
-4. **Merging PRs:** Merging Stacked PRs from the CLI is not supported yet. Direct users to open the PR URL in a browser to merge PRs.
+4. **Merging PRs:** auto-merge is not available for a stacked PR (`gh pr merge --auto --squash` fails with `Auto-merge is not supported for stacked pull requests`). Merge from the CLI with `gh stack merge` (see `Merging a stack` above, or `scripts/dev/merge-stack`), or have the operator open the PR URL in a browser.
 5. **Remote stack checkout requires a PR number.** `checkout` with a branch name only works with locally tracked stacks. Use a PR number (e.g. `gh stack checkout 123`) to pull stacks from GitHub.
 6. **PR title and body are auto-generated.** There is no flag to set a custom PR title or body during `submit`. The title and body are generated from commit messages plus a footer. Use `gh pr edit` to modify PR title and body after creation.
