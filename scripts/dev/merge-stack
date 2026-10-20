@@ -42,7 +42,7 @@ poll_interval_s=15
 
 usage() {
   runner_sh_stdout "merge-stack usage" -- \
-    "sed -n '2,22p' $(printf '%q' "${BASH_SOURCE[0]}") | sed 's/^# \{0,1\}//'"
+    "sed -n '2,21p' $(printf '%q' "${BASH_SOURCE[0]}") | sed 's/^# \{0,1\}//'"
 }
 
 die() {
@@ -90,14 +90,14 @@ pr_field() {
   if [[ -n "$repo_arg" ]]; then
     repo_flags=(--repo "$repo_arg")
   fi
-  runner_exec_stdout "merge-stack gh pr view ${pr_number}" -- gh pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json state,mergeStateStatus,isDraft,autoMergeRequest,mergedAt --jq "$jq_filter"
+  runner_exec_stdout "merge-stack gh pr view ${pr_number}" --timeout 60 -- gh pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json state,mergeStateStatus,isDraft,autoMergeRequest,mergedAt --jq "$jq_filter"
 }
 
 # local_slug — OWNER/NAME of the current directory's origin (empty when it cannot be resolved).
 local_slug() {
   local origin_url slug=""
 
-  origin_url="$(runner_exec_stdout "merge-stack git remote origin" --probe -- git remote get-url origin)" || return 0
+  origin_url="$(runner_exec_stdout "merge-stack git remote origin" --probe --timeout 20 -- git remote get-url origin)" || return 0
   slug="$(gh_slug_from_origin_url "$origin_url")" || slug=""
   printf '%s' "$slug"
 }
@@ -108,7 +108,7 @@ stack_branch_state() {
   local -r jq_filter="$1"
   local view_json
 
-  view_json="$(runner_exec_stdout "merge-stack gh stack view" --probe -- gh stack view --json)" || return 1
+  view_json="$(runner_exec_stdout "merge-stack gh stack view" --probe --timeout 60 -- gh stack view --json)" || return 1
   runner_exec_stdout "merge-stack jq stack state" -- jq --null-input --exit-status --argjson stack "$view_json" --argjson pr "$pr_number" "$jq_filter" >/dev/null
 }
 
@@ -155,24 +155,26 @@ main() {
   [[ "$state" == 'OPEN' ]] || { printf 'ERROR: merge-stack: PR #%s is %s, not open\n' "$pr_number" "$state" >&2; exit 2; }
   is_draft="$(pr_field '.isDraft')"
   [[ "$is_draft" == 'false' ]] || { printf 'ERROR: merge-stack: PR #%s is a draft\n' "$pr_number" >&2; exit 2; }
-  merge_state="$(pr_field '.mergeStateStatus')"
-  case "$merge_state" in
-    CLEAN | HAS_HOOKS | UNSTABLE) ;;
-    *)
-      printf 'ERROR: merge-stack: PR #%s is not ready to merge (mergeStateStatus=%s); wait for checks or fix it first\n' \
-        "$pr_number" "$merge_state" >&2
-      exit 2
-      ;;
-  esac
-
   if in_stack; then
     stacked=1
+    # `gh stack merge` only checks that the PR is open and not a draft, then asks GitHub to merge, so it
+    # needs a PR that is ready now. Auto-merge (below) is the opposite: it exists to wait for pending checks
+    # or reviews, so the plain path takes no readiness gate.
+    merge_state="$(pr_field '.mergeStateStatus')"
+    case "$merge_state" in
+      CLEAN | HAS_HOOKS | UNSTABLE) ;;
+      *)
+        printf 'ERROR: merge-stack: stacked PR #%s is not ready to merge (mergeStateStatus=%s); wait for checks or fix it first\n' \
+          "$pr_number" "$merge_state" >&2
+        exit 2
+        ;;
+    esac
     printf 'merge-stack: PR #%s is part of a gh stack: gh stack merge (auto-merge is not available for stacked PRs)\n' \
       "$pr_number"
-    runner_exec "merge-stack gh stack merge ${pr_number}" -- gh stack merge "$pr_number" --yes --squash || merge_rc=$?
+    runner_exec "merge-stack gh stack merge ${pr_number}" --timeout 180 -- gh stack merge "$pr_number" --yes --squash || merge_rc=$?
   else
     printf 'merge-stack: PR #%s is not in a stack: gh pr merge --auto --squash\n' "$pr_number"
-    runner_exec "merge-stack gh pr merge ${pr_number}" -- gh pr merge "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --auto --squash || merge_rc=$?
+    runner_exec "merge-stack gh pr merge ${pr_number}" --timeout 180 -- gh pr merge "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --auto --squash || merge_rc=$?
   fi
   if (( merge_rc != 0 )); then
     printf 'ERROR: merge-stack: the merge command failed (exit %s); read its output above, nothing was queued\n' \
