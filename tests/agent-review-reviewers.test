@@ -259,21 +259,7 @@ wait_text="$(<"${script_dir}/../scripts/wait-for-agent-review")"
 # shellcheck disable=SC2016  # literal source text to look for, not an expansion
 assert_contains "the loop checks the property before requesting a fallback agent" "$wait_text" 'agent_review_reviewers_property_allows_request "${agent}" "${repo}"'
 
-printf '\n=== the escalation skips reviewers the property turns off, so the probe moves past them (#751) ===\n'
-out="$(run_case '[{"property_name":"agent-reviewers","value":["coderabbit","bugbot"]}]' \
-  "agent_review_quota_escalation_agent_ids | paste -sd, -" \
-  AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=coderabbit,copilot,bugbot AGENT_REVIEW_GITHUB_REPO=the-hcma/example)"
-assert_contains "an override-added copilot is dropped but bugbot stays, in override order" "$out" "coderabbit,bugbot"
-assert_not_contains "copilot is not in the escalation" "$out" "copilot"
-out="$(run_case '[{"property_name":"agent-reviewers","value":["coderabbit"]}]' \
-  "agent_review_quota_escalation_agent_ids | paste -sd, -" \
-  AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=coderabbit,copilot,bugbot AGENT_REVIEW_GITHUB_REPO=the-hcma/example)"
-assert_contains "a coderabbit-only property leaves a coderabbit-only escalation" "$out" "coderabbit"
-assert_not_contains "no fallback agent remains for a coderabbit-only repo" "$out" "bugbot"
-out="$(run_case '[{"property_name":"other","value":"x"}]' \
-  "agent_review_quota_escalation_agent_ids | paste -sd, -" \
-  AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=coderabbit,copilot,bugbot AGENT_REVIEW_GITHUB_REPO=the-hcma/example)"
-assert_contains "with no property set the override chain applies in full" "$out" "coderabbit,copilot,bugbot"
+printf '\n=== direct requests select only reviewers the property enables (#751) ===\n'
 out="$(run_case '[{"property_name":"agent-reviewers","value":["bugbot"]}]' \
   "AGENT_REVIEW_AGENT=''; agent_review_use_agent() { AGENT_REVIEW_AGENT=\"\$1\"; }; agent_review_reviewers_select_agent the-hcma/example && echo \"selected=\${AGENT_REVIEW_AGENT}\"" \
   AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=copilot,bugbot)"
@@ -286,6 +272,35 @@ out="$(run_case '[{"property_name":"agent-reviewers","value":["coderabbit"]}]' \
   "AGENT_REVIEW_AGENT=''; agent_review_use_agent() { AGENT_REVIEW_AGENT=\"\$1\"; }; agent_review_reviewers_select_agent the-hcma/example && echo \"selected=\${AGENT_REVIEW_AGENT}\" || echo none" \
   AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=copilot,bugbot)"
 assert_contains "no enabled reviewer in the override chain selects nothing" "$out" "none"
+
+printf '\n=== the loop nudges only a reviewer the property enables, moving past one it does not (#751) ===\n'
+cat >"${work_dir}/loop-nudge.sh" <<'NUDGE'
+set -uo pipefail
+source "$1"
+agent_review_resolve_repo() { echo o/r; }
+agent_review_resolve_pr() { echo 7; }
+agent_review_repo_parts() { echo "o r"; }
+agent_review_graphql_pr_snapshot() { echo ''; }
+agent_review_quota_probe_agent_for_today() { echo "${PROBE_AGENT}"; }
+agent_review_reviewers_property_allows_request() { [[ ",${ALLOWED}," == *",$1,"* ]]; }
+agent_review_agent_quota_exhausted_for_agent() { return 1; }
+agent_review_agent_quota_rate_limited_for_agent() { return 1; }
+agent_review_bugbot_quota_refresh_for_today() { :; }
+agent_review_bugbot_quota_repo_is_disabled() { return 1; }
+agent_review_loop_wait_add() { :; }
+agent_review_loop_wait_remove() { :; }
+cmd_request() { echo "REQUEST agent=${AGENT_REVIEW_AGENT:-?}"; return 0; }
+export AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=coderabbit,copilot,bugbot
+cmd_loop_maybe_request_agents_on_head o/r 7 abcdef0123456789 '' 1 2>&1
+NUDGE
+nudge() { PROBE_AGENT="$1" ALLOWED="$2" bash "${work_dir}/loop-nudge.sh" "${script_dir}/../scripts/wait-for-agent-review" 2>&1; }
+out="$(nudge copilot coderabbit,bugbot)"
+assert_contains "a probe pick the property disables is replaced by the next enabled reviewer" "$out" "REQUEST agent=bugbot"
+assert_contains "the skip says why" "$out" "skip copilot"
+out="$(nudge copilot coderabbit)"
+assert_not_contains "a coderabbit-only repo gets no fallback request" "$out" "REQUEST"
+out="$(nudge bugbot coderabbit,bugbot)"
+assert_contains "an enabled probe pick is requested unchanged" "$out" "REQUEST agent=bugbot"
 
 printf '\n=== an empty override is no override ===\n'
 out="$(run_case '[{"property_name":"agent-reviewers","value":["bugbot"]}]' \
