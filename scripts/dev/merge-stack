@@ -129,6 +129,21 @@ local_slug() {
   printf '%s' "$slug"
 }
 
+# in_merge_queue — true when the PR has an entry in the base branch's merge queue. Once GitHub moves a PR
+# into the queue, autoMergeRequest is null, so queue membership is a landing signal of its own (gh pr view has
+# no field for it, hence the GraphQL read). False when the repository slug cannot be resolved.
+in_merge_queue() {
+  local slug owner name queued
+
+  slug="${repo_arg:-$(local_slug)}"
+  [[ "$slug" == */* ]] || return 1
+  owner="${slug%%/*}"
+  name="${slug#*/}"
+  # shellcheck disable=SC2016  # $o, $n and $p are GraphQL variables, not shell expansions
+  queued="$(gh_read "merge-stack gh queue membership ${pr_number}" api graphql -f query='query($o: String!, $n: String!, $p: Int!) { repository(owner: $o, name: $n) { pullRequest(number: $p) { isInMergeQueue } } }' -f o="$owner" -f n="$name" -F p="$pr_number" --jq '.data.repository.pullRequest.isInMergeQueue')" || return 1
+  [[ "$queued" == 'true' ]]
+}
+
 # stack_branch_state <jq-filter> — runs a jq filter over `gh stack view --json` of the current directory with
 # $pr bound to the PR number. Fails when there is no stack.
 stack_branch_state() {
@@ -213,6 +228,9 @@ confirm_landed() {
     if [[ -n "$merged_at" || "$auto" == 'true' ]]; then
       return 0
     fi
+    if in_merge_queue; then
+      return 0
+    fi
     if (( stacked_flag == 1 )) && stack_pr_landed; then
       return 0
     fi
@@ -291,7 +309,8 @@ main() {
   fi
 
   # Confirm the enqueue instead of assuming it: a merge command that exits 0 without any of the signals in
-  # confirm_landed did not queue anything.
+  # confirm_landed (merged, auto-merge requested, a merge queue entry, or queued/merged in the stack) did not
+  # queue anything.
   if ! confirm_landed "$stacked"; then
     printf 'ERROR: merge-stack: PR #%s shows no merge, no auto-merge request and no queue entry after the merge command; it was not queued\n' \
       "$pr_number" >&2
@@ -317,7 +336,8 @@ main() {
       exit 2
     fi
     # Still OPEN with neither auto-merge nor a queue entry any more: the queue dropped it.
-    if [[ "$state" == 'OPEN' ]] && [[ "$(pr_field '(.autoMergeRequest != null) | tostring' || true)" == 'false' ]]; then
+    if [[ "$state" == 'OPEN' ]] && [[ "$(pr_field '(.autoMergeRequest != null) | tostring' || true)" == 'false' ]] \
+      && ! in_merge_queue; then
       landed_rc=1
       if (( stacked == 1 )); then
         landed_rc=0
