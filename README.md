@@ -390,7 +390,7 @@ When `check` reports `complete_ready: true` (agent sign-off on the current head)
 scripts/wait-for-agent-review complete --pr <n>   # emails the operator; does not self-approve
 ```
 
-**Merging (org default):** use GitHub’s merge queue (`gh pr merge --auto --squash` / Enable auto-merge; a PR in a gh stack cannot use auto-merge — land it with `gh stack merge <pr> --yes --squash` or `scripts/dev/merge-stack --pr <n>`). Do **not** use the `merge-it` label to land PRs — leftover labels are ignored. Graphite stacking (`gt`) remains available via `.github/stacking-tool`; disable Graphite’s merge-queue UI for org repos.
+**Merging (org default):** use GitHub’s merge queue (`gh pr merge --auto --squash` / Enable auto-merge; a PR in a gh stack cannot use auto-merge — land it with `gh stack merge --yes --squash` (from the stack's worktree) or `scripts/dev/merge-stack --pr <n>`). Do **not** use the `merge-it` label to land PRs — leftover labels are ignored. Graphite stacking (`gt`) remains available via `.github/stacking-tool`; disable Graphite’s merge-queue UI for org repos.
 
 Configure `~/.config/agent-review.env` from `etc/agent-review.env.example` (SMTP, `AGENT_REVIEW_REPORT_TO`, early-complete when nothing outstanding, **12h** PR non-convergence cap).
 

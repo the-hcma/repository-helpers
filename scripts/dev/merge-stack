@@ -34,6 +34,8 @@ source "${script_dir}/../lib/runner-bootstrap"
 source "${script_dir}/../lib/stacking-tool"
 # shellcheck disable=SC1091  # sibling lib: OWNER/NAME from a remote URL
 source "${script_dir}/../lib/github-repo-slug"
+# shellcheck disable=SC1091  # sibling lib: throttled gh reads (primary/secondary rate-limit backoff)
+source "${script_dir}/../lib/github-api-rate-limit"
 # Referenced below; assigned readonly in scripts/lib/stacking-tool.
 # shellcheck disable=SC2154
 : "${stacking_tool_value_gh_stack}"
@@ -92,6 +94,21 @@ parse_args() {
   [[ "$wait_timeout_s" =~ ^[0-9]+$ ]] || die '--timeout must be a non-negative integer'
 }
 
+# gh_read <label> [--probe] <gh args…> — a read-only gh call through the throttled wrapper (rate-limit and
+# transient-network retries), bounded to 60 s per attempt. Merge mutations are not routed through it: they
+# run once, with their own longer timeout, and are never retried.
+gh_read() {
+  local -r label="$1"
+  shift
+  local -a probe=()
+
+  if [[ "${1:-}" == '--probe' ]]; then
+    probe=(--probe)
+    shift
+  fi
+  github_api_exec_with_rate_limit_retry "$label" "${probe[@]+"${probe[@]}"}" -- timeout 60 gh "$@"
+}
+
 # pr_field <jq-filter> — one `gh pr view` read, with --repo when given.
 pr_field() {
   local -r jq_filter="$1"
@@ -100,7 +117,7 @@ pr_field() {
   if [[ -n "$repo_arg" ]]; then
     repo_flags=(--repo "$repo_arg")
   fi
-  runner_exec_stdout "merge-stack gh pr view ${pr_number}" --timeout 60 -- gh pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json state,mergeStateStatus,isDraft,autoMergeRequest,mergedAt --jq "$jq_filter"
+  gh_read "merge-stack gh pr view ${pr_number}" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json state,mergeStateStatus,isDraft,autoMergeRequest,mergedAt --jq "$jq_filter"
 }
 
 # local_slug — OWNER/NAME of the current directory's origin (empty when it cannot be resolved).
@@ -118,7 +135,9 @@ stack_branch_state() {
   local -r jq_filter="$1"
   local view_json
 
-  view_json="$(runner_exec_stdout "merge-stack gh stack view" --probe --timeout 60 -- gh stack view --json)" || return 1
+  # Exit 2 means the stack could not be read (gh stack view failed or timed out, which includes "not part of a
+  # stack"); exit 1 is a readable stack for which the predicate is false. A wait loop must tell them apart.
+  view_json="$(gh_read "merge-stack gh stack view" --probe stack view --json)" || return 2
   runner_exec_stdout "merge-stack jq stack state" -- jq --null-input --exit-status --argjson stack "$view_json" --argjson pr "$pr_number" "$jq_filter" >/dev/null
 }
 
@@ -160,8 +179,9 @@ stack_is_top() {
 stack_open_pr_numbers() {
   local view_json
 
-  view_json="$(runner_exec_stdout "merge-stack gh stack view" --probe --timeout 60 -- gh stack view --json)" || return 1
-  runner_exec_stdout "merge-stack jq stack open prs" -- jq --raw-output '.branches[]? | select(.isMerged != true) | .pr.number // empty' <<<"$view_json"
+  view_json="$(gh_read "merge-stack gh stack view" --probe stack view --json)" || return 1
+  # shellcheck disable=SC2016  # the jq program's $stack is bound by --argjson, not a shell expansion
+  runner_exec_stdout "merge-stack jq stack open prs" -- jq --null-input --raw-output --argjson stack "$view_json" '$stack.branches[]? | select(.isMerged != true) | .pr.number // empty'
 }
 
 # ready_state <pr> — mergeStateStatus of a PR, re-read a few times while it is UNKNOWN (GitHub computes it
@@ -171,7 +191,7 @@ ready_state() {
   local state attempt
 
   for attempt in 1 2 3; do
-    state="$(runner_exec_stdout "merge-stack gh pr view ${target} state" --timeout 60 -- gh pr view "$target" "${repo_flags[@]+"${repo_flags[@]}"}" --json mergeStateStatus --jq '.mergeStateStatus')" || state=''
+    state="$(gh_read "merge-stack gh pr view ${target} state" pr view "$target" "${repo_flags[@]+"${repo_flags[@]}"}" --json mergeStateStatus --jq '.mergeStateStatus')" || state=''
     if [[ "$state" != 'UNKNOWN' && -n "$state" ]]; then
       break
     fi
@@ -204,7 +224,7 @@ confirm_landed() {
 }
 
 main() {
-  local state is_draft stacked=0 merge_rc=0 merge_out tool open_pr merge_state
+  local state is_draft stacked=0 merge_rc=0 merge_out tool open_pr open_prs merge_state landed_rc
   local -a repo_flags=()
 
   parse_args "$@"
@@ -237,6 +257,8 @@ main() {
     # `gh stack merge` only checks that the PRs are open and not drafts, then asks GitHub to merge, so every
     # open PR of the stack has to be ready now. Auto-merge (below) is the opposite: it exists to wait for
     # pending checks or reviews, so the plain path takes no readiness gate.
+    open_prs="$(stack_open_pr_numbers)" || die "could not read the stack's open PRs; nothing was merged"
+    [[ -n "$open_prs" ]] || die "the stack lists no open PRs; nothing was merged"
     while IFS= read -r open_pr; do
       [[ -n "$open_pr" ]] || continue
       merge_state="$(ready_state "$open_pr")"
@@ -248,7 +270,7 @@ main() {
           exit 2
           ;;
       esac
-    done < <(stack_open_pr_numbers)
+    done <<<"$open_prs"
     printf 'merge-stack: PR #%s is the top of a gh stack: gh stack merge (auto-merge is not available for stacked PRs)\n' \
       "$pr_number"
     runner_exec "merge-stack gh stack merge" --timeout 180 -- gh stack merge --yes --squash || merge_rc=$?
@@ -295,11 +317,18 @@ main() {
       exit 2
     fi
     # Still OPEN with neither auto-merge nor a queue entry any more: the queue dropped it.
-    if [[ "$state" == 'OPEN' ]] && [[ "$(pr_field '(.autoMergeRequest != null) | tostring' || true)" == 'false' ]] \
-      && { (( stacked == 0 )) || ! stack_pr_landed; }; then
-      printf 'ERROR: merge-stack: PR #%s is no longer queued (dropped from the merge queue?); check its checks and run merge-stack again\n' \
-        "$pr_number" >&2
-      exit 2
+    if [[ "$state" == 'OPEN' ]] && [[ "$(pr_field '(.autoMergeRequest != null) | tostring' || true)" == 'false' ]]; then
+      landed_rc=1
+      if (( stacked == 1 )); then
+        landed_rc=0
+        stack_pr_landed || landed_rc=$?
+      fi
+      # Exit 2 is an unreadable stack (a transient gh failure), not an answer: poll again instead of reporting a drop.
+      if (( stacked == 0 || landed_rc == 1 )); then
+        printf 'ERROR: merge-stack: PR #%s is no longer queued (dropped from the merge queue?); check its checks and run merge-stack again\n' \
+          "$pr_number" >&2
+        exit 2
+      fi
     fi
     runner_exec "merge-stack poll sleep" -- sleep "$poll_interval_s"
   done
