@@ -28,6 +28,8 @@ readonly script_dir
 source "${script_dir}/../lib/runner-bootstrap"
 # shellcheck disable=SC1091  # sibling lib: the stacking-tool marker decides whether stacks exist
 source "${script_dir}/../lib/stacking-tool"
+# shellcheck disable=SC1091  # sibling lib: OWNER/NAME from a remote URL
+source "${script_dir}/../lib/github-repo-slug"
 # Referenced below; assigned readonly in scripts/lib/stacking-tool.
 # shellcheck disable=SC2154
 : "${stacking_tool_value_gh_stack}"
@@ -80,7 +82,7 @@ parse_args() {
   [[ "$wait_timeout_s" =~ ^[0-9]+$ ]] || die '--timeout must be a positive integer'
 }
 
-# pr_json <fields> — one `gh pr view` read, with --repo when given.
+# pr_field <jq-filter> — one `gh pr view` read, with --repo when given.
 pr_field() {
   local -r jq_filter="$1"
   local -a repo_flags=()
@@ -88,30 +90,56 @@ pr_field() {
   if [[ -n "$repo_arg" ]]; then
     repo_flags=(--repo "$repo_arg")
   fi
-  runner_exec_stdout "merge-stack gh pr view ${pr_number}" -- \
-    gh pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" \
-    --json state,mergeStateStatus,isDraft,autoMergeRequest,mergedAt \
-    --jq "$jq_filter"
+  runner_exec_stdout "merge-stack gh pr view ${pr_number}" -- gh pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json state,mergeStateStatus,isDraft,autoMergeRequest,mergedAt --jq "$jq_filter"
 }
 
-# in_stack — true when the PR is one of the branches of the current stack (gh stack view --json). Only a
-# gh-stack repository (.github/stacking-tool) has stacks; a graphite one, or a missing marker read as
-# gh-stack by default, falls through to the plain auto-merge for anything that is not in a gh stack.
+# local_slug — OWNER/NAME of the current directory's origin (empty when it cannot be resolved).
+local_slug() {
+  local origin_url slug=""
+
+  origin_url="$(runner_exec_stdout "merge-stack git remote origin" --probe -- git remote get-url origin)" || return 0
+  slug="$(gh_slug_from_origin_url "$origin_url")" || slug=""
+  printf '%s' "$slug"
+}
+
+# stack_branch_state <jq-filter> — runs a jq filter over `gh stack view --json` of the current directory with
+# $pr bound to the PR number. Fails when there is no stack.
+stack_branch_state() {
+  local -r jq_filter="$1"
+  local view_json
+
+  view_json="$(runner_exec_stdout "merge-stack gh stack view" --probe -- gh stack view --json)" || return 1
+  runner_exec_stdout "merge-stack jq stack state" -- jq --null-input --exit-status --argjson stack "$view_json" --argjson pr "$pr_number" "$jq_filter" >/dev/null
+}
+
+# in_stack — true when the PR is one of the branches of the stack in the current directory. Only a gh-stack
+# repository (.github/stacking-tool) has stacks, and `gh stack` reads the current directory's repository, so a
+# --repo that is not this clone, a graphite marker, or no stack all fall through to the plain auto-merge.
 in_stack() {
-  local view_json tool
+  local tool slug
 
   tool="$(stacking_tool_read_or_default "" "$stacking_tool_value_gh_stack" 'merge-stack' 2>/dev/null)" || return 1
   [[ "$tool" == "$stacking_tool_value_gh_stack" ]] || return 1
-
-  view_json="$(runner_exec_stdout "merge-stack gh stack view" --probe -- gh stack view --json)" || return 1
+  if [[ -n "$repo_arg" ]]; then
+    slug="$(local_slug)"
+    if [[ "$slug" != "$repo_arg" ]]; then
+      printf 'merge-stack: NOTE: --repo %s is not the current directory'\''s repository (%s), so stack detection is skipped; run it from that clone to merge a stacked PR\n' \
+        "$repo_arg" "${slug:-unknown}" >&2
+      return 1
+    fi
+  fi
   # shellcheck disable=SC2016  # the jq program's $stack and $pr are bound by --argjson, not shell expansions
-  runner_exec_stdout "merge-stack jq stack membership" -- \
-    jq --null-input --exit-status --argjson stack "$view_json" --argjson pr "$pr_number" \
-    'any($stack.branches[]?; (.pr.number // 0) == $pr)' >/dev/null
+  stack_branch_state 'any($stack.branches[]?; (.pr.number // 0) == $pr)'
+}
+
+# stack_pr_landed — true when the stack lists the PR as merged or queued (gh stack view --json isMerged/isQueued).
+stack_pr_landed() {
+  # shellcheck disable=SC2016  # the jq program's $stack and $pr are bound by --argjson, not shell expansions
+  stack_branch_state 'any($stack.branches[]?; (.pr.number // 0) == $pr and ((.isMerged // false) or (.isQueued // false)))'
 }
 
 main() {
-  local state merge_state is_draft stacked=0 merge_rc=0 merged_at auto elapsed=0
+  local state merge_state is_draft stacked=0 merge_rc=0 merged_at auto landed=0 elapsed=0
   local -a repo_flags=()
 
   parse_args "$@"
@@ -144,8 +172,7 @@ main() {
     runner_exec "merge-stack gh stack merge ${pr_number}" -- gh stack merge "$pr_number" --yes --squash || merge_rc=$?
   else
     printf 'merge-stack: PR #%s is not in a stack: gh pr merge --auto --squash\n' "$pr_number"
-    runner_exec "merge-stack gh pr merge ${pr_number}" -- \
-      gh pr merge "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --auto --squash || merge_rc=$?
+    runner_exec "merge-stack gh pr merge ${pr_number}" -- gh pr merge "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --auto --squash || merge_rc=$?
   fi
   if (( merge_rc != 0 )); then
     printf 'ERROR: merge-stack: the merge command failed (exit %s); read its output above, nothing was queued\n' \
@@ -153,11 +180,17 @@ main() {
     exit 2
   fi
 
-  # Confirm the enqueue instead of assuming it: merged, queued by auto-merge, or in the queue (stack merge).
+  # Confirm the enqueue instead of assuming it: merged, auto-merge requested, or (stacked) merged or queued
+  # in the stack. A merge command that exits 0 without any of these did not queue anything.
   merged_at="$(pr_field '.mergedAt // ""')"
   auto="$(pr_field '(.autoMergeRequest != null) | tostring')"
-  if [[ -z "$merged_at" && "$auto" != 'true' && "$stacked" -eq 0 ]]; then
-    printf 'ERROR: merge-stack: PR #%s shows no merge and no auto-merge request after the merge command; it was not queued\n' \
+  if [[ -n "$merged_at" || "$auto" == 'true' ]]; then
+    landed=1
+  elif (( stacked == 1 )) && stack_pr_landed; then
+    landed=1
+  fi
+  if (( landed == 0 )); then
+    printf 'ERROR: merge-stack: PR #%s shows no merge, no auto-merge request and no queue entry after the merge command; it was not queued\n' \
       "$pr_number" >&2
     exit 2
   fi

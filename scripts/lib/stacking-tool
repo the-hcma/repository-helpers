@@ -226,16 +226,22 @@ stacking_tool_require_cli() {
 # `gh stack init` fails. A no-op for graphite.
 stacking_tool_ensure_registered() {
   local -r tool="${1:-}"
-  local st_dir quoted_repo branch
+  local st_dir quoted_repo branch view_rc init_rc=0
 
   [[ "$tool" == "$stacking_tool_value_gh_stack" ]] || return 0
   st_dir="$(stacking_tool_resolve_repo_dir "${2:-}")"
   quoted_repo="$(printf '%q' "$st_dir")"
-  # --probe: "not part of a stack" is the expected miss here, not an error.
-  if runner_sh "stacking-tool probe gh stack view" --probe --timeout 30 -- \
-    "cd ${quoted_repo} && exec gh stack view --json >/dev/null 2>&1"; then
-    return 0
-  fi
+  # --probe: exit 2 ("not part of a stack") is the expected miss here, not an error. Any other failure
+  # (timeout, auth, network) says nothing about the stack, so it must not lead to a second registration:
+  # a branch in more than one stack makes later gh stack commands exit 6.
+  view_rc=0
+  runner_sh "stacking-tool probe gh stack view" --probe --timeout 30 -- \
+    "cd ${quoted_repo} && exec gh stack view --json >/dev/null 2>&1" || view_rc=$?
+  case "$view_rc" in
+    0) return 0 ;;
+    2) ;;
+    *) stacking_tool_die "could not read the gh stack state in ${st_dir} (gh stack view exited ${view_rc}); not registering" ;;
+  esac
   branch="$(runner_exec_stdout "stacking-tool git current branch" -- git -C "$st_dir" branch --show-current)" \
     || stacking_tool_die "cannot read the current branch of ${st_dir}"
   if [[ -z "$branch" ]]; then
@@ -248,9 +254,15 @@ stacking_tool_ensure_registered() {
     *) ;;
   esac
   printf 'stacking-tool: branch %s is not part of a gh stack; registering it (gh stack init)\n' "$branch" >&2
+  # rerere.enabled is set for this one call (never written to the config) so gh stack init cannot stop on its
+  # rerere prompt in a non-interactive session (see the gh-stack Skill); stdin is closed for the same reason.
   runner_sh "stacking-tool gh stack init" --timeout 60 -- \
-    "cd ${quoted_repo} && exec gh stack init $(printf '%q' "$branch")" \
-    || stacking_tool_die "gh stack init ${branch} failed in ${st_dir}"
+    "cd ${quoted_repo} && exec env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=rerere.enabled GIT_CONFIG_VALUE_0=true gh stack init $(printf '%q' "$branch") </dev/null" \
+    || init_rc=$?
+  # Exit 5 is "already part of a stack": another process registered it between the probe and the init.
+  if (( init_rc != 0 && init_rc != 5 )); then
+    stacking_tool_die "gh stack init ${branch} failed in ${st_dir} (exit ${init_rc})"
+  fi
 }
 
 # stacking_tool_ensure_stack_conventional_titles <repo_dir>

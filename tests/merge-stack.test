@@ -31,6 +31,14 @@ fake_bin="${work_dir}/bin"
 gh_log="${work_dir}/gh.log"
 mkdir -p "${fake_bin}"
 
+# merge-stack reads the stacking-tool marker and the origin of the directory it runs in, so every case runs
+# from a fixture clone instead of whatever directory the test was started from.
+fixture_repo="${work_dir}/clone"
+mkdir -p "${fixture_repo}/.github"
+git -C "${fixture_repo}" init --quiet
+git -C "${fixture_repo}" remote add origin https://github.com/the-hcma/example.git
+printf 'gh-stack\n' >"${fixture_repo}/.github/stacking-tool"
+
 # Fake gh. `gh pr view` applies the caller's --jq to the PR fixture; `gh stack view --json` prints the
 # stack fixture (or fails like gh does outside a stack); the merge commands log and exit as told.
 cat >"${fake_bin}/gh" <<'FAKE'
@@ -68,7 +76,8 @@ chmod +x "${fake_bin}/gh"
 pr_open='{"state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null}'
 pr_queued='{"state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":{"enabledAt":"x"},"mergedAt":null}'
 pr_merged='{"state":"MERGED","mergeStateStatus":"UNKNOWN","isDraft":false,"autoMergeRequest":null,"mergedAt":"2026-10-19T00:00:00Z"}'
-stack_json='{"branches":[{"name":"a","pr":{"number":10}},{"name":"b","pr":{"number":11}}]}'
+stack_json='{"branches":[{"name":"a","pr":{"number":10},"isQueued":true},{"name":"b","pr":{"number":11},"isQueued":true}]}'
+stack_unqueued_json='{"branches":[{"name":"a","pr":{"number":10},"isQueued":false},{"name":"b","pr":{"number":11},"isQueued":false}]}'
 printf '%s' "${stack_json}" >"${work_dir}/stack.json"
 
 # run_merge <pr-json> [env assignments…] -- <merge-stack args…>
@@ -84,7 +93,7 @@ run_merge() {
   printf '%s' "${pr_json}" >"${work_dir}/pr.json"
   : >"${gh_log}"
   rc=0
-  out="$(env PATH="${fake_bin}:${PATH}" FAKE_GH_LOG="${gh_log}" FAKE_PR_FIXTURE="${work_dir}/pr.json" \
+  out="$(cd "${fixture_repo}" && env PATH="${fake_bin}:${PATH}" FAKE_GH_LOG="${gh_log}" FAKE_PR_FIXTURE="${work_dir}/pr.json" \
     FAKE_STACK_FIXTURE="${work_dir}/stack.json" "${envs[@]+"${envs[@]}"}" \
     bash "${merge_stack}" "$@" 2>&1)" || rc=$?
 }
@@ -95,6 +104,10 @@ assert_eq 'a stacked PR exits 0 once queued' "${rc}" '0'
 assert_contains 'the stack merge command is used' "$(<"${gh_log}")" 'stack merge 11 --yes --squash'
 assert_not_contains 'auto-merge is not attempted for a stacked PR' "$(<"${gh_log}")" 'pr merge'
 assert_contains 'the restack follow-up is printed' "${out}" 'gh stack rebase'
+
+run_merge "${pr_open}" -- --pr 11 --repo the-hcma/other
+assert_contains 'a --repo that is not the current clone skips stack detection with a note' "${out}" 'stack detection is skipped'
+assert_not_contains 'no gh stack merge is run for another repository' "$(<"${gh_log}")" 'stack merge'
 
 printf '\n=== a PR outside a stack is auto-merged ===\n'
 run_merge "${pr_queued}" FAKE_NO_STACK=1 -- --pr 12
@@ -107,6 +120,11 @@ run_merge "${pr_open}" FAKE_STACK_MERGE_RC=1 -- --pr 11
 assert_eq 'a failed stack merge exits 2' "${rc}" '2'
 assert_contains 'the merge command output is shown, not hidden' "${out}" 'stack merge output'
 assert_contains 'the failure says nothing was queued' "${out}" 'nothing was queued'
+printf '%s' "${stack_unqueued_json}" >"${work_dir}/stack.json"
+run_merge "${pr_open}" -- --pr 11
+assert_eq 'a stack merge that exits 0 but leaves no queue entry exits 2' "${rc}" '2'
+assert_contains 'the unconfirmed stacked enqueue is named' "${out}" 'it was not queued'
+printf '%s' "${stack_json}" >"${work_dir}/stack.json"
 run_merge "${pr_open}" FAKE_NO_STACK=1 -- --pr 12
 assert_eq 'a plain PR with no auto-merge request after the command exits 2' "${rc}" '2'
 assert_contains 'the unconfirmed enqueue is named' "${out}" 'it was not queued'
