@@ -255,9 +255,6 @@ out="$(run_case '[{"property_name":"agent-reviewers","value":["coderabbit"]}]' \
   "agent_review_reviewers_property_allows_request bugbot the-hcma/example && echo allowed || echo refused" \
   FAKE_GH_FAIL=1)"
 assert_contains "an unreadable property does not block a request" "$out" "allowed"
-wait_text="$(<"${script_dir}/../scripts/wait-for-agent-review")"
-# shellcheck disable=SC2016  # literal source text to look for, not an expansion
-assert_contains "the loop checks the property before requesting a fallback agent" "$wait_text" 'agent_review_reviewers_property_allows_request "${agent}" "${repo}"'
 
 printf '\n=== direct requests select only reviewers the property enables (#751) ===\n'
 out="$(run_case '[{"property_name":"agent-reviewers","value":["bugbot"]}]' \
@@ -273,17 +270,58 @@ out="$(run_case '[{"property_name":"agent-reviewers","value":["coderabbit"]}]' \
   AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=copilot,bugbot)"
 assert_contains "no enabled reviewer in the override chain selects nothing" "$out" "none"
 
-printf '\n=== the loop nudges only a reviewer the property enables, moving past one it does not (#751) ===\n'
+printf '\n=== the escalation skips reviewers the property turns off, so every walker moves past them (#751) ===\n'
+esc() { # <property-json> <override-chain> <snippet>
+  run_case "$1" "$3" AGENT_REVIEW_QUOTA_FALLBACK_CHAIN="$2" AGENT_REVIEW_GITHUB_REPO=the-hcma/example
+}
+out="$(esc '[{"property_name":"agent-reviewers","value":["coderabbit","bugbot"]}]' coderabbit,copilot,bugbot \
+  "agent_review_quota_escalation_agent_ids | paste -sd, -")"
+assert_contains "an override-added copilot is dropped but bugbot stays, in override order" "$out" "coderabbit,bugbot"
+assert_not_contains "copilot is not in the escalation" "$out" "copilot"
+out="$(esc '[{"property_name":"agent-reviewers","value":["coderabbit"]}]' coderabbit,copilot,bugbot \
+  "agent_review_quota_escalation_agent_ids | paste -sd, -")"
+assert_not_contains "a coderabbit-only repo has no fallback agent in the escalation" "$out" "bugbot"
+out="$(esc '[{"property_name":"other","value":"x"}]' coderabbit,copilot,bugbot \
+  "agent_review_quota_escalation_agent_ids | paste -sd, -")"
+assert_contains "with no property set the override chain applies in full" "$out" "coderabbit,copilot,bugbot"
+out="$(esc '[{"property_name":"agent-reviewers","value":["coderabbit","bugbot"]}]' coderabbit,copilot,bugbot \
+  "agent_review_quota_escalation_next_agent coderabbit")"
+assert_contains "the next agent after coderabbit skips the disabled copilot" "$out" "bugbot"
+out="$(esc '[{"property_name":"agent-reviewers","value":["coderabbit"]}]' coderabbit,copilot,bugbot \
+  "agent_review_quota_escalation_next_agent coderabbit || echo none")"
+assert_contains "a coderabbit-only repo has no next agent after coderabbit" "$out" "none"
+out="$(esc '[{"property_name":"agent-reviewers","value":["coderabbit","bugbot"]}]' coderabbit,copilot,bugbot \
+  "agent_review_agent_quota_exhausted_for_agent() { [[ \"\$1\" == coderabbit ]]; }; agent_review_agent_quota_confirmed_for_agent() { return 1; }; agent_review_agent_quota_probe_attempted_for_agent() { return 1; }; agent_review_quota_probe_agent_for_today")"
+assert_contains "with coderabbit exhausted the probe lands on bugbot, not the disabled copilot" "$out" "bugbot"
+out="$(esc '[{"property_name":"agent-reviewers","value":["coderabbit"]}]' coderabbit,copilot,bugbot \
+  "agent_review_agent_quota_exhausted_for_agent() { [[ \"\$1\" == coderabbit ]]; }; agent_review_agent_quota_confirmed_for_agent() { return 1; }; agent_review_agent_quota_probe_attempted_for_agent() { return 1; }; agent_review_quota_probe_agent_for_today || echo none")"
+assert_contains "with coderabbit exhausted on a coderabbit-only repo the probe finds nothing" "$out" "none"
+
+printf '\n=== direct requests select only reviewers the property enables (#751) ===\n'
+out="$(run_case '[{"property_name":"agent-reviewers","value":["bugbot"]}]' \
+  "AGENT_REVIEW_AGENT=''; agent_review_use_agent() { AGENT_REVIEW_AGENT=\"\$1\"; }; agent_review_reviewers_select_agent the-hcma/example && echo \"selected=\${AGENT_REVIEW_AGENT}\"" \
+  AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=copilot,bugbot)"
+assert_contains "a direct request skips an override-added copilot and selects the enabled bugbot" "$out" "selected=bugbot"
+out="$(run_case '[{"property_name":"agent-reviewers","value":["bugbot"]}]' \
+  "AGENT_REVIEW_AGENT=copilot; agent_review_use_agent() { AGENT_REVIEW_AGENT=\"\$1\"; }; agent_review_reviewers_select_agent the-hcma/example && echo \"selected=\${AGENT_REVIEW_AGENT}\"" \
+  AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=copilot,bugbot)"
+assert_contains "a preferred agent the property turns off is replaced by an enabled one" "$out" "selected=bugbot"
+out="$(run_case '[{"property_name":"agent-reviewers","value":["coderabbit"]}]' \
+  "AGENT_REVIEW_AGENT=''; agent_review_use_agent() { AGENT_REVIEW_AGENT=\"\$1\"; }; agent_review_reviewers_select_agent the-hcma/example && echo \"selected=\${AGENT_REVIEW_AGENT}\" || echo none" \
+  AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=copilot,bugbot)"
+assert_contains "no enabled reviewer in the override chain selects nothing" "$out" "none"
+
+printf '\n=== the loop nudge requests only a reviewer the property enables (#751) ===\n'
 cat >"${work_dir}/loop-nudge.sh" <<'NUDGE'
 set -uo pipefail
 source "$1"
-agent_review_resolve_repo() { echo o/r; }
+agent_review_resolve_repo() { echo the-hcma/example; }
 agent_review_resolve_pr() { echo 7; }
-agent_review_repo_parts() { echo "o r"; }
+agent_review_repo_parts() { echo "the-hcma example"; }
 agent_review_graphql_pr_snapshot() { echo ''; }
-agent_review_quota_probe_agent_for_today() { echo "${PROBE_AGENT}"; }
-agent_review_reviewers_property_allows_request() { [[ ",${ALLOWED}," == *",$1,"* ]]; }
-agent_review_agent_quota_exhausted_for_agent() { return 1; }
+agent_review_agent_quota_exhausted_for_agent() { [[ "$1" == coderabbit ]]; }
+agent_review_agent_quota_confirmed_for_agent() { return 1; }
+agent_review_agent_quota_probe_attempted_for_agent() { return 1; }
 agent_review_agent_quota_rate_limited_for_agent() { return 1; }
 agent_review_bugbot_quota_refresh_for_today() { :; }
 agent_review_bugbot_quota_repo_is_disabled() { return 1; }
@@ -291,16 +329,21 @@ agent_review_loop_wait_add() { :; }
 agent_review_loop_wait_remove() { :; }
 cmd_request() { echo "REQUEST agent=${AGENT_REVIEW_AGENT:-?}"; return 0; }
 export AGENT_REVIEW_QUOTA_FALLBACK_CHAIN=coderabbit,copilot,bugbot
-cmd_loop_maybe_request_agents_on_head o/r 7 abcdef0123456789 '' 1 2>&1
+cmd_loop_maybe_request_agents_on_head the-hcma/example 7 abcdef0123456789 '' 1 2>&1
 NUDGE
-nudge() { PROBE_AGENT="$1" ALLOWED="$2" bash "${work_dir}/loop-nudge.sh" "${script_dir}/../scripts/wait-for-agent-review" 2>&1; }
-out="$(nudge copilot coderabbit,bugbot)"
-assert_contains "a probe pick the property disables is replaced by the next enabled reviewer" "$out" "REQUEST agent=bugbot"
-assert_contains "the skip says why" "$out" "skip copilot"
-out="$(nudge copilot coderabbit)"
+nudge() { # <property-json>
+  printf '%s' "$1" >"${fixture}"
+  rm -rf "${work_dir}/cache"
+  PATH="${fake_bin}:${PATH}" FAKE_GH_LOG="${gh_log}" FAKE_GH_FIXTURE="${fixture}" \
+    AGENT_REVIEW_REVIEWERS_CACHE_DIR="${work_dir}/cache" \
+    bash "${work_dir}/loop-nudge.sh" "${script_dir}/../scripts/wait-for-agent-review" 2>&1
+}
+out="$(nudge '[{"property_name":"agent-reviewers","value":["coderabbit","bugbot"]}]')"
+assert_contains "with coderabbit exhausted the nudge goes to the enabled bugbot" "$out" "REQUEST agent=bugbot"
+out="$(nudge '[{"property_name":"agent-reviewers","value":["coderabbit"]}]')"
 assert_not_contains "a coderabbit-only repo gets no fallback request" "$out" "REQUEST"
-out="$(nudge bugbot coderabbit,bugbot)"
-assert_contains "an enabled probe pick is requested unchanged" "$out" "REQUEST agent=bugbot"
+out="$(nudge '[{"property_name":"other","value":"x"}]')"
+assert_contains "with no property the override chain's first fallback is requested" "$out" "REQUEST agent=copilot"
 
 printf '\n=== an empty override is no override ===\n'
 out="$(run_case '[{"property_name":"agent-reviewers","value":["bugbot"]}]' \
