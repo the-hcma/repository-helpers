@@ -113,4 +113,4 @@ When `check` reports `complete_ready: true`:
 
 `complete_ready` requires an agent sign-off on the current head (not a bare CodeRabbit commit status / rate-limit stub). This emails `AGENT_REVIEW_REPORT_TO`. It does **not** run `gh pr review --approve` (self-approve is skipped; merge stays an explicit operator step).
 
-Do **not** add `merge-it` unless the user explicitly confirms. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge) when the operator asks to merge.
+Do **not** add `merge-it` unless the user explicitly confirms. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge) when the operator asks to merge; a PR that belongs to a gh stack cannot use auto-merge (`Auto-merge is not supported for stacked pull requests`) and is landed with `gh stack merge <pr> --yes --squash`. Check the command's exit status and output, never pipe it through `tail`, and confirm `autoMergeRequest` or the queue entry before waiting.

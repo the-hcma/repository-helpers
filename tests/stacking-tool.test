@@ -720,6 +720,121 @@ else
 fi
 rm -f "$ratchet_report"
 
+printf '\n=== functional: stacking_tool_ensure_registered (repository-helpers#744) ===\n'
+reg_repo="$(mktemp -d)"
+git -C "$reg_repo" init --quiet --initial-branch=main
+git -C "$reg_repo" -c user.name=t -c user.email=t@example.invalid commit --quiet --allow-empty --no-gpg-sign -m init
+git -C "$reg_repo" checkout --quiet -b feature-x
+reg_bin="$(mktemp -d)"
+reg_log="${reg_bin}/gh.log"
+# Fake gh: `gh stack view --json` fails like gh does for an unregistered branch until `gh stack init` ran
+# (it drops a marker file), then succeeds; everything is logged.
+cat >"${reg_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${GH_LOG:?}"
+case "$1 $2" in
+  'stack view')
+    if [[ -f "${REG_MARK:?}" ]]; then exit 0; fi
+    printf 'current branch is not part of a stack\n' >&2
+    exit 2
+    ;;
+  'stack init')
+    if [[ -n "${REG_INIT_FAIL:-}" ]]; then exit 1; fi
+    : >"${REG_MARK}"
+    exit 0
+    ;;
+esac
+exit 0
+MOCK_GH
+chmod +x "${reg_bin}/gh"
+reg_mark="${reg_bin}/registered"
+reg_run() { # <tool> [env…] — runs ensure_registered for the repo, prints exit code
+  local -r tool="$1"
+  shift
+  local rc=0
+  ( env PATH="${reg_bin}:${PATH}" GH_LOG="$reg_log" REG_MARK="$reg_mark" "$@" bash -c "
+      source '${lib}'
+      stacking_tool_ensure_registered '${tool}' '${reg_repo}'" ) >/dev/null 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+: >"$reg_log"
+reg_rc="$(reg_run gh-stack)"
+if [[ "$reg_rc" == '0' ]] && grep -qF 'stack init feature-x' "$reg_log"; then
+  pass_case 'an unregistered feature branch is adopted with gh stack init'
+else
+  fail_case "an unregistered feature branch is adopted with gh stack init (rc=${reg_rc})"
+fi
+: >"$reg_log"
+reg_rc="$(reg_run gh-stack)"
+if [[ "$reg_rc" == '0' ]] && ! grep -qF 'stack init' "$reg_log"; then
+  pass_case 'a branch already in a stack is left alone (idempotent)'
+else
+  fail_case "a branch already in a stack is left alone (rc=${reg_rc})"
+fi
+rm -f "$reg_mark"
+: >"$reg_log"
+reg_rc="$(reg_run graphite)"
+if [[ "$reg_rc" == '0' ]] && [[ ! -s "$reg_log" ]]; then
+  pass_case 'the graphite backend needs no stack registration'
+else
+  fail_case "the graphite backend needs no stack registration (rc=${reg_rc})"
+fi
+reg_rc="$(reg_run gh-stack REG_INIT_FAIL=1)"
+if [[ "$reg_rc" != '0' ]]; then
+  pass_case 'a failed gh stack init is an error'
+else
+  fail_case 'a failed gh stack init is an error'
+fi
+git -C "$reg_repo" checkout --quiet main
+: >"$reg_log"
+reg_rc="$(reg_run gh-stack)"
+if [[ "$reg_rc" != '0' ]] && ! grep -qF 'stack init' "$reg_log"; then
+  pass_case 'the trunk branch is never registered as a stack'
+else
+  fail_case "the trunk branch is never registered as a stack (rc=${reg_rc})"
+fi
+git -C "$reg_repo" checkout --quiet --detach
+reg_rc="$(reg_run gh-stack)"
+if [[ "$reg_rc" != '0' ]]; then
+  pass_case 'a detached HEAD is refused'
+else
+  fail_case 'a detached HEAD is refused'
+fi
+rm -rf "$reg_repo" "$reg_bin"
+
+printf '\n=== static: submit-stack and start-development register the branch (#744) ===\n'
+submit_text="$(<"${rh_root}/scripts/dev/submit-stack")"
+start_text="$(<"${rh_root}/scripts/dev/start-development")"
+# shellcheck disable=SC2016  # literal source text to look for, not an expansion
+# Registration must come before the long pre-PR run, or the failure it prevents happens after ten minutes.
+if [[ "${submit_text}" == *stacking_tool_ensure_registered*'"${script_dir}/pre-pr-checks"'* ]]; then
+  pass_case 'submit-stack registers the branch before it runs pre-pr-checks'
+else
+  fail_case 'submit-stack registers the branch before it runs pre-pr-checks'
+fi
+# shellcheck disable=SC2016  # literal source text to look for, not an expansion
+if [[ "${start_text}" == *'stacking_tool_ensure_registered "$stacking_tool_value_gh_stack" "$selected_path"'* ]]; then
+  pass_case 'start-development registers the new worktree branch for gh-stack'
+else
+  fail_case 'start-development registers the new worktree branch for gh-stack'
+fi
+
+printf '\n=== static: merge guidance names the stacked-PR exception (#748) ===\n'
+# Every agent-facing rule that tells agents to merge with `gh pr merge --auto` must also say that a PR in a
+# gh stack cannot use auto-merge and is landed with `gh stack merge`, or an agent follows the plain command
+# and the merge silently never happens. The scripts/lib/repo-practices-agents copies are what consumers get.
+for doc in AGENTS.md README.md .agents/rules/pr-ship-and-review.md .agents/rules/pr-workflow.md \
+  .agents/rules/stacking-tool.md .agents/skills/gh-stack/SKILL.md .agents/skills/ship-and-review/SKILL.md \
+  .github/copilot-instructions.md scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md \
+  scripts/lib/repo-practices-agents/rules/stacking-tool.md; do
+  doc_text="$(<"${rh_root}/${doc}")"
+  if [[ "$doc_text" == *'gh pr merge'*'--auto'* && "$doc_text" != *'gh stack merge'* ]]; then
+    fail_case "${doc} tells agents to auto-merge without the gh stack merge exception"
+  else
+    pass_case "${doc} names the gh stack merge exception wherever it says gh pr merge --auto"
+  fi
+done
+
 printf '\n=== summary ===\n'
 printf 'pass=%s fail=%s\n' "$pass" "$fail"
 if [[ "$fail" -ne 0 ]]; then

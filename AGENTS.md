@@ -45,7 +45,8 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | Dev workflow | `scripts/dev/run-tests` | Run `tests/*.test` by file, optionally one CI shard (`--shard I/N`) and in parallel (`--jobs`); shared by CI and `pre-pr-checks`. |
 | Dev workflow | `scripts/dev/secret-scan` | Local gitleaks via canonical `ci-secret-scan` (same as CI / pre-pr secret-scan job). |
 | Dev workflow | `scripts/dev/coderabbit-cli-review` | Optional pre-push review with the CodeRabbit CLI (own allowance, never `--use-credits`, each head once, at most 2 per branch); runs as the `coderabbit-cli` job of `pre-pr-checks` when `cr` is installed. |
-| Dev workflow | `scripts/dev/submit-stack` | `pre-pr-checks` → `gt submit` → `post-pr-submission-checks`. |
+| Dev workflow | `scripts/dev/submit-stack` | Register the branch as a gh stack (gh-stack marker), then `pre-pr-checks` → `gt submit` / `gh stack submit` → `post-pr-submission-checks`. |
+| Dev workflow | `scripts/dev/merge-stack` | Land a PR through the merge queue: `gh stack merge` for a PR in a gh stack (auto-merge is unavailable for stacked PRs), `gh pr merge --auto --squash` otherwise; confirms the enqueue. |
 | Dev workflow | `scripts/dev/approve-pending-deployments` | Approve WAITING environment jobs on the operator's behalf. |
 | Dev workflow | `scripts/dev/post-pr-submission-checks` | Wait for PR CI; print agent-friendly failure excerpts. |
 | Dev workflow | `scripts/dev/ship-and-review` | Submit + CI wait + `wait-for-agent-review loop`. |
@@ -231,7 +232,7 @@ See [`.agents/skills/graphite/SKILL.md`](.agents/skills/graphite/SKILL.md) for G
 
 When flipping `.github/stacking-tool` (or landing an MQ / `gh-stack` cutover PR) in a **consumer** repo, also:
 
-1. Update `AGENTS.md` stacking and merge guidance to match the marker (GitHub auto-merge: `gh pr merge --auto --squash` — not `merge-it`).
+1. Update `AGENTS.md` stacking and merge guidance to match the marker (GitHub auto-merge: `gh pr merge --auto --squash` for a PR outside a stack, `gh stack merge <pr> --yes --squash` for a stacked PR — not `merge-it`).
 2. Rewrite `.agents/rules/pr-ship-and-review.md` submit block to the marker-aware template (copy via `github-repo-lint --apply-fix`, or from `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md` / https://github.com/the-hcma/repository-helpers/blob/main/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md; or document both backends gated on the marker — never leave a Graphite-only `gt create` / `gt submit` snippet when the marker is `gh-stack`; keep a thin `.cursor/rules/pr-ship-and-review.mdc` shim).
 3. Delete root `GRAPHITE.md` when switching to `gh-stack` (canonical skills live here).
 4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) aligned with `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/stacking-tool.md` (same blob URL under `repository-helpers` `main`).
@@ -283,7 +284,7 @@ Create or repair ruleset + classic settings with `scripts/github-repo-lint --rep
 
 - `protect-main` includes a `merge_queue` rule (`SQUASH`)
 - `ci.yml` triggers on `merge_group` (and ignores `gh-readonly-queue/**` pushes when needed)
-- Merge with **Enable auto-merge** / **Merge when ready** (or `gh pr merge --auto --squash`)
+- Merge with **Enable auto-merge** / **Merge when ready** (or `gh pr merge --auto --squash`); a PR in a gh stack cannot use auto-merge and is landed with `gh stack merge <pr> --yes --squash` (see `scripts/dev/merge-stack`)
 - Do **not** use the `merge-it` label to land PRs — leftover labels are harmless noise and are ignored by dep-updater
 
 Disable org repos in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue) so Graphite does not also try to land PRs. Graphite **stacking** (`gt`, `.github/stacking-tool`) remains supported and is unrelated to merge enqueue.
@@ -520,7 +521,7 @@ Service repositories install via `scripts/setup-service` and optionally implemen
   - Also verifies the **primary worktree** is unchanged when checks finish.
 - Before submitting a PR, ensure it has a useful description (at minimum: **Summary** + **Test plan**).
 - PRs must be **published (not draft)** so reviewers see them normally. Prefer `scripts/dev/submit-stack` for non-interactive submit (implies `--publish`).
-- To merge a PR in **any org repo**: enable auto-merge / Merge when ready so GitHub’s merge queue lands it (`gh pr merge --auto --squash`). Do **not** use `merge-it` to enqueue. `dep-updater` batch runs (`--batch`, including daily `--batch --all`) use the same path after CI passes (`--merge-via gh` / `merge-queue` both mean `--auto --squash`; leftover `merge-it` is ignored).
+- To merge a PR in **any org repo**: enable auto-merge / Merge when ready so GitHub’s merge queue lands it (`gh pr merge --auto --squash`), **except a PR that belongs to a gh stack**: GitHub refuses auto-merge there (`Auto-merge is not supported for stacked pull requests`), so land it with `gh stack merge <pr> --yes --squash` (queue-aware, bottom-up; afterwards `gh stack rebase` restacks the rest) or with **`scripts/dev/merge-stack --pr <n>`**, which picks the right command, shows its output and confirms the enqueue. Read the command's exit status and output instead of piping it through `tail`, and confirm `autoMergeRequest` or the merge queue entry before waiting for a merge. Do **not** use `merge-it` to enqueue. `dep-updater` batch runs (`--batch`, including daily `--batch --all`) use the same path after CI passes (`--merge-via gh` / `merge-queue` both mean `--auto --squash`; leftover `merge-it` is ignored).
 - Follow **Conventional Commits**: `feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`.
 - Each commit must pass all CI checks (see below) before being pushed.
 - Never merge a PR until **all checks have run and are green** (no skipped required checks).

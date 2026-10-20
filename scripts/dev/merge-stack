@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# scripts/dev/merge-stack — Land a PR (and everything below it in its stack) through the merge queue.
+#
+# GitHub refuses auto-merge for a stacked pull request ("Auto-merge is not supported for stacked pull
+# requests"), so `gh pr merge --auto --squash` fails for every gh-stack PR that belongs to a stack. This
+# helper picks the right command:
+#
+#   PR is in a gh stack  → gh stack merge <pr> --yes --squash   (atomic, bottom-up, queue-aware)
+#   PR is not in a stack → gh pr merge <pr> --auto --squash
+#
+# It never pipes the merge command through tail/head: the command's own exit status and output are shown,
+# and it confirms the PR is merged or queued (autoMergeRequest / merge queue entry) before reporting
+# success, so a failed enqueue cannot be mistaken for a pending merge. With --wait it then polls until the
+# PR is MERGED and prints the follow-up (`gh stack rebase` restacks what is left onto main).
+#
+# Exit codes: 0 merged or queued, 1 usage/error, 2 PR not ready or the merge command failed,
+# 3 queued but not merged within --timeout (ERROR: WAIT_TIMEOUT line).
+#
+# Usage:
+#   scripts/dev/merge-stack --pr <number> [--repo OWNER/NAME] [--wait] [--timeout SECONDS]
+#   scripts/dev/merge-stack --help
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # runner-bootstrap begins session for runner_exec calls
+source "${script_dir}/../lib/runner-bootstrap"
+# shellcheck disable=SC1091  # sibling lib: the stacking-tool marker decides whether stacks exist
+source "${script_dir}/../lib/stacking-tool"
+# Referenced below; assigned readonly in scripts/lib/stacking-tool.
+# shellcheck disable=SC2154
+: "${stacking_tool_value_gh_stack}"
+
+pr_number=""
+repo_arg=""
+wait_for_merge=0
+wait_timeout_s=2400
+poll_interval_s=15
+
+usage() {
+  runner_sh_stdout "merge-stack usage" -- \
+    "sed -n '2,22p' $(printf '%q' "${BASH_SOURCE[0]}") | sed 's/^# \{0,1\}//'"
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help | -h)
+        usage
+        exit 0
+        ;;
+      --pr)
+        pr_number="${2:-}"
+        shift 2
+        ;;
+      --repo)
+        repo_arg="${2:-}"
+        shift 2
+        ;;
+      --wait)
+        wait_for_merge=1
+        shift
+        ;;
+      --timeout)
+        wait_timeout_s="${2:-}"
+        shift 2
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+  done
+  [[ "$pr_number" =~ ^[0-9]+$ ]] || die '--pr <number> is required'
+  [[ "$wait_timeout_s" =~ ^[0-9]+$ ]] || die '--timeout must be a positive integer'
+}
+
+# pr_json <fields> — one `gh pr view` read, with --repo when given.
+pr_field() {
+  local -r jq_filter="$1"
+  local -a repo_flags=()
+
+  if [[ -n "$repo_arg" ]]; then
+    repo_flags=(--repo "$repo_arg")
+  fi
+  runner_exec_stdout "merge-stack gh pr view ${pr_number}" -- \
+    gh pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" \
+    --json state,mergeStateStatus,isDraft,autoMergeRequest,mergedAt \
+    --jq "$jq_filter"
+}
+
+# in_stack — true when the PR is one of the branches of the current stack (gh stack view --json). Only a
+# gh-stack repository (.github/stacking-tool) has stacks; a graphite one, or a missing marker read as
+# gh-stack by default, falls through to the plain auto-merge for anything that is not in a gh stack.
+in_stack() {
+  local view_json tool
+
+  tool="$(stacking_tool_read_or_default "" "$stacking_tool_value_gh_stack" 'merge-stack' 2>/dev/null)" || return 1
+  [[ "$tool" == "$stacking_tool_value_gh_stack" ]] || return 1
+
+  view_json="$(runner_exec_stdout "merge-stack gh stack view" --probe -- gh stack view --json)" || return 1
+  # shellcheck disable=SC2016  # the jq program's $stack and $pr are bound by --argjson, not shell expansions
+  runner_exec_stdout "merge-stack jq stack membership" -- \
+    jq --null-input --exit-status --argjson stack "$view_json" --argjson pr "$pr_number" \
+    'any($stack.branches[]?; (.pr.number // 0) == $pr)' >/dev/null
+}
+
+main() {
+  local state merge_state is_draft stacked=0 merge_rc=0 merged_at auto elapsed=0
+  local -a repo_flags=()
+
+  parse_args "$@"
+  if [[ -n "$repo_arg" ]]; then
+    repo_flags=(--repo "$repo_arg")
+  fi
+
+  state="$(pr_field '.state')"
+  if [[ "$state" == 'MERGED' ]]; then
+    printf 'merge-stack: PR #%s is already merged\n' "$pr_number"
+    exit 0
+  fi
+  [[ "$state" == 'OPEN' ]] || { printf 'ERROR: merge-stack: PR #%s is %s, not open\n' "$pr_number" "$state" >&2; exit 2; }
+  is_draft="$(pr_field '.isDraft')"
+  [[ "$is_draft" == 'false' ]] || { printf 'ERROR: merge-stack: PR #%s is a draft\n' "$pr_number" >&2; exit 2; }
+  merge_state="$(pr_field '.mergeStateStatus')"
+  case "$merge_state" in
+    CLEAN | HAS_HOOKS | UNSTABLE) ;;
+    *)
+      printf 'ERROR: merge-stack: PR #%s is not ready to merge (mergeStateStatus=%s); wait for checks or fix it first\n' \
+        "$pr_number" "$merge_state" >&2
+      exit 2
+      ;;
+  esac
+
+  if in_stack; then
+    stacked=1
+    printf 'merge-stack: PR #%s is part of a gh stack: gh stack merge (auto-merge is not available for stacked PRs)\n' \
+      "$pr_number"
+    runner_exec "merge-stack gh stack merge ${pr_number}" -- gh stack merge "$pr_number" --yes --squash || merge_rc=$?
+  else
+    printf 'merge-stack: PR #%s is not in a stack: gh pr merge --auto --squash\n' "$pr_number"
+    runner_exec "merge-stack gh pr merge ${pr_number}" -- \
+      gh pr merge "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --auto --squash || merge_rc=$?
+  fi
+  if (( merge_rc != 0 )); then
+    printf 'ERROR: merge-stack: the merge command failed (exit %s); read its output above, nothing was queued\n' \
+      "$merge_rc" >&2
+    exit 2
+  fi
+
+  # Confirm the enqueue instead of assuming it: merged, queued by auto-merge, or in the queue (stack merge).
+  merged_at="$(pr_field '.mergedAt // ""')"
+  auto="$(pr_field '(.autoMergeRequest != null) | tostring')"
+  if [[ -z "$merged_at" && "$auto" != 'true' && "$stacked" -eq 0 ]]; then
+    printf 'ERROR: merge-stack: PR #%s shows no merge and no auto-merge request after the merge command; it was not queued\n' \
+      "$pr_number" >&2
+    exit 2
+  fi
+
+  if (( wait_for_merge == 0 )); then
+    printf 'merge-stack: PR #%s queued; check with: gh pr view %s --json state,mergedAt\n' "$pr_number" "$pr_number"
+    [[ "$stacked" -eq 0 ]] || printf 'merge-stack: after it merges, restack the rest: gh stack rebase\n'
+    exit 0
+  fi
+
+  while (( elapsed < wait_timeout_s )); do
+    state="$(pr_field '.state')"
+    if [[ "$state" == 'MERGED' ]]; then
+      printf 'merge-stack: PR #%s merged\n' "$pr_number"
+      [[ "$stacked" -eq 0 ]] || printf 'merge-stack: restack the rest onto main: gh stack rebase\n'
+      exit 0
+    fi
+    if [[ "$state" == 'CLOSED' ]]; then
+      printf 'ERROR: merge-stack: PR #%s was closed without merging\n' "$pr_number" >&2
+      exit 2
+    fi
+    runner_exec "merge-stack poll sleep" -- sleep "$poll_interval_s"
+    elapsed=$(( elapsed + poll_interval_s ))
+  done
+  printf 'ERROR: WAIT_TIMEOUT merge-stack pr=%s waited=%ss timeout=%ss (queued, not merged yet)\n' \
+    "$pr_number" "$elapsed" "$wait_timeout_s" >&2
+  exit 3
+}
+
+main "$@"

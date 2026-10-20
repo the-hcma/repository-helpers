@@ -65,7 +65,7 @@ When `check` reports **`complete_ready: true`** (requires **agent sign-off** on 
 ```
 
 - **No self-approve** — `complete` emails the operator; it does not run `gh pr review --approve`.
-- **No `merge-it`** unless the user explicitly asked. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge).
+- **No `merge-it`** unless the user explicitly asked. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge); a PR that belongs to a gh stack cannot use auto-merge (`Auto-merge is not supported for stacked pull requests`) and is landed with `gh stack merge <pr> --yes --squash` (or `scripts/dev/merge-stack --pr <n>`). Check the command's exit status and output, never pipe it through `tail`, and confirm `autoMergeRequest` or the queue entry before waiting.
 
 ## Exit codes (condensed)
 

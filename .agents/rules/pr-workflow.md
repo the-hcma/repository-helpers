@@ -90,7 +90,7 @@ Until merge-ready:
 3. Re-run `scripts/dev/post-pr-submission-checks --pr <number>` and fix any CI failures surfaced in the agent log report.
 4. Resolve merge conflicts if base moved (`gh stack rebase` / `gh stack sync` when `gh-stack`; `gt sync` / `gt restack` when `graphite`; or `scripts/wait-for-agent-review restack`).
 
-Do not merge manually; org default is GitHub merge queue (Enable auto-merge / `gh pr merge --auto --squash`). Do not use `merge-it` to land PRs.
+Do not merge manually; org default is GitHub merge queue (Enable auto-merge / `gh pr merge --auto --squash`; for a PR in a gh stack use `gh stack merge <pr> --yes --squash`, because auto-merge is not available for stacked PRs). Do not use `merge-it` to land PRs.
 
 ## 7. Notify user
 

@@ -147,7 +147,8 @@ Daily timer (optional): `scripts/setup-secret-audit` installs `secret-audit.serv
 | `scripts/dev/pre-pr-checks` | Detect-first local CI (shellcheck, tests, Python/TS/Rust when present; secret-scan when adopted; CodeRabbit CLI review when `cr` is installed) | from `.worktrees/<stack>-wt`: `scripts/dev/pre-pr-checks` |
 | `scripts/dev/coderabbit-cli-review` | Optional pre-push review with the CodeRabbit CLI (`cr`): own allowance, findings fail, each head once (max 2 per branch), never `--use-credits`; also the `coderabbit-cli` job of `pre-pr-checks` when `cr` is installed | `scripts/dev/coderabbit-cli-review` (after committing) |
 | `scripts/dev/start-development` | Prune/sync; create or resume a stack worktree | `scripts/dev/start-development --worktree my-change --no-interactive` |
-| `scripts/dev/submit-stack` | `pre-pr-checks` → stack submit → CI wait | `scripts/dev/submit-stack` |
+| `scripts/dev/submit-stack` | Register the branch as a gh stack, `pre-pr-checks` → stack submit → CI wait | `scripts/dev/submit-stack` |
+| `scripts/dev/merge-stack` | Land a PR through the merge queue: `gh stack merge` for a stacked PR, `gh pr merge --auto --squash` otherwise | `scripts/dev/merge-stack --pr <n> [--wait]` |
 
 Never implement on the primary clone — always `cd` into the stack worktree first. See [Development](#development).
 
@@ -389,7 +390,7 @@ When `check` reports `complete_ready: true` (agent sign-off on the current head)
 scripts/wait-for-agent-review complete --pr <n>   # emails the operator; does not self-approve
 ```
 
-**Merging (org default):** use GitHub’s merge queue (`gh pr merge --auto --squash` / Enable auto-merge). Do **not** use the `merge-it` label to land PRs — leftover labels are ignored. Graphite stacking (`gt`) remains available via `.github/stacking-tool`; disable Graphite’s merge-queue UI for org repos.
+**Merging (org default):** use GitHub’s merge queue (`gh pr merge --auto --squash` / Enable auto-merge; a PR in a gh stack cannot use auto-merge — land it with `gh stack merge <pr> --yes --squash` or `scripts/dev/merge-stack --pr <n>`). Do **not** use the `merge-it` label to land PRs — leftover labels are ignored. Graphite stacking (`gt`) remains available via `.github/stacking-tool`; disable Graphite’s merge-queue UI for org repos.
 
 Configure `~/.config/agent-review.env` from `etc/agent-review.env.example` (SMTP, `AGENT_REVIEW_REPORT_TO`, early-complete when nothing outstanding, **12h** PR non-convergence cap).
 

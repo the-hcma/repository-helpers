@@ -25,7 +25,7 @@ This is the single entry point for new work. It prunes stale worktrees, syncs pe
 - Never declare `local -r` inside a loop body.
 - Every behaviour change or bug fix must have a test in `tests/`.
 - Never push directly to `main`. Create a stack layer per `.github/stacking-tool` (`gt create` when `graphite`, `gh stack init` / `gh stack add` when `gh-stack`), then `scripts/dev/submit-stack`.
-- To merge a PR: `gh pr merge --auto --squash` (Enable auto-merge / GitHub merge queue — org default). Do not use `merge-it` to land PRs.
+- To merge a PR: `gh pr merge --auto --squash` (Enable auto-merge / GitHub merge queue — org default); a PR in a gh stack cannot use auto-merge, so use `gh stack merge <pr> --yes --squash`. Do not use `merge-it` to land PRs.
 
 ## Submit and ship
 

@@ -21,7 +21,7 @@ Before creating branches or submitting/restacking PRs, **read** `.github/stackin
 
 When flipping `.github/stacking-tool` (or landing an MQ/`gh-stack` cutover PR) in a **consumer** repo:
 
-1. Update `AGENTS.md` stacking/merge guidance to match the new marker (GitHub auto-merge: `gh pr merge --auto --squash` — not `merge-it`).
+1. Update `AGENTS.md` stacking/merge guidance to match the new marker (GitHub auto-merge: `gh pr merge --auto --squash` for a PR outside a stack, `gh stack merge <pr> --yes --squash` for a stacked PR — not `merge-it`).
 2. Rewrite `.agents/rules/pr-ship-and-review.md` submit block to the marker-aware template (copy via `--apply-fix`, or from `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md` / https://github.com/the-hcma/repository-helpers/blob/main/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md; plus thin `.cursor/rules/pr-ship-and-review.mdc` shim).
 3. Delete root `GRAPHITE.md` when switching to `gh-stack` (skills here are SSOT).
 4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) aligned with the consumer stacking-tool template.

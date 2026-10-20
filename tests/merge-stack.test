@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Tests for scripts/dev/merge-stack: a stacked PR is landed with `gh stack merge`, a plain PR with
+# `gh pr merge --auto --squash`, and a failed or unconfirmed enqueue is an error, never a silent success
+# (repository-helpers#748).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+merge_stack="${script_dir}/../scripts/dev/merge-stack"
+readonly merge_stack
+
+# assert_eq <label> <actual> <expected>
+assert_eq() {
+  if [[ "$2" == "$3" ]]; then
+    pass_case "$1"
+  else
+    printf '  expected [%s], got [%s]\n' "$3" "$2" >&2
+    fail_case "$1"
+  fi
+}
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+fake_bin="${work_dir}/bin"
+gh_log="${work_dir}/gh.log"
+mkdir -p "${fake_bin}"
+
+# Fake gh. `gh pr view` applies the caller's --jq to the PR fixture; `gh stack view --json` prints the
+# stack fixture (or fails like gh does outside a stack); the merge commands log and exit as told.
+cat >"${fake_bin}/gh" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FAKE_GH_LOG}"
+case "$1 $2" in
+  'pr view')
+    filter='.'
+    args=("$@")
+    for ((i = 0; i < ${#args[@]}; i++)); do
+      if [[ "${args[$i]}" == '--jq' ]]; then filter="${args[$((i + 1))]}"; fi
+    done
+    exec jq -r "${filter}" "${FAKE_PR_FIXTURE}"
+    ;;
+  'stack view')
+    if [[ -n "${FAKE_NO_STACK:-}" ]]; then
+      printf 'current branch is not part of a stack\n' >&2
+      exit 2
+    fi
+    cat "${FAKE_STACK_FIXTURE}"
+    ;;
+  'stack merge')
+    printf 'stack merge output\n'
+    exit "${FAKE_STACK_MERGE_RC:-0}"
+    ;;
+  'pr merge')
+    printf 'pr merge output\n'
+    exit "${FAKE_PR_MERGE_RC:-0}"
+    ;;
+esac
+exit 0
+FAKE
+chmod +x "${fake_bin}/gh"
+
+pr_open='{"state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null}'
+pr_queued='{"state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":{"enabledAt":"x"},"mergedAt":null}'
+pr_merged='{"state":"MERGED","mergeStateStatus":"UNKNOWN","isDraft":false,"autoMergeRequest":null,"mergedAt":"2026-10-19T00:00:00Z"}'
+stack_json='{"branches":[{"name":"a","pr":{"number":10}},{"name":"b","pr":{"number":11}}]}'
+printf '%s' "${stack_json}" >"${work_dir}/stack.json"
+
+# run_merge <pr-json> [env assignments…] -- <merge-stack args…>
+run_merge() {
+  local -r pr_json="$1"
+  shift
+  local -a envs=()
+  while [[ "$1" != '--' ]]; do
+    envs+=("$1")
+    shift
+  done
+  shift
+  printf '%s' "${pr_json}" >"${work_dir}/pr.json"
+  : >"${gh_log}"
+  rc=0
+  out="$(env PATH="${fake_bin}:${PATH}" FAKE_GH_LOG="${gh_log}" FAKE_PR_FIXTURE="${work_dir}/pr.json" \
+    FAKE_STACK_FIXTURE="${work_dir}/stack.json" "${envs[@]+"${envs[@]}"}" \
+    bash "${merge_stack}" "$@" 2>&1)" || rc=$?
+}
+
+printf '\n=== a stacked PR is merged with gh stack merge ===\n'
+run_merge "${pr_open}" -- --pr 11
+assert_eq 'a stacked PR exits 0 once queued' "${rc}" '0'
+assert_contains 'the stack merge command is used' "$(<"${gh_log}")" 'stack merge 11 --yes --squash'
+assert_not_contains 'auto-merge is not attempted for a stacked PR' "$(<"${gh_log}")" 'pr merge'
+assert_contains 'the restack follow-up is printed' "${out}" 'gh stack rebase'
+
+printf '\n=== a PR outside a stack is auto-merged ===\n'
+run_merge "${pr_queued}" FAKE_NO_STACK=1 -- --pr 12
+assert_eq 'a plain PR exits 0 when auto-merge is set' "${rc}" '0'
+assert_contains 'gh pr merge --auto --squash is used' "$(<"${gh_log}")" 'pr merge 12 --auto --squash'
+assert_not_contains 'gh stack merge is not used outside a stack' "$(<"${gh_log}")" 'stack merge'
+
+printf '\n=== failures are errors, not silent successes ===\n'
+run_merge "${pr_open}" FAKE_STACK_MERGE_RC=1 -- --pr 11
+assert_eq 'a failed stack merge exits 2' "${rc}" '2'
+assert_contains 'the merge command output is shown, not hidden' "${out}" 'stack merge output'
+assert_contains 'the failure says nothing was queued' "${out}" 'nothing was queued'
+run_merge "${pr_open}" FAKE_NO_STACK=1 -- --pr 12
+assert_eq 'a plain PR with no auto-merge request after the command exits 2' "${rc}" '2'
+assert_contains 'the unconfirmed enqueue is named' "${out}" 'it was not queued'
+run_merge "$(printf '%s' "${pr_open}" | sed 's/CLEAN/BLOCKED/')" -- --pr 11
+assert_eq 'a PR that is not ready exits 2' "${rc}" '2'
+assert_contains 'the not-ready state is reported' "${out}" 'mergeStateStatus=BLOCKED'
+assert_not_contains 'no merge command runs for a PR that is not ready' "$(<"${gh_log}")" 'merge 11'
+run_merge "$(printf '%s' "${pr_open}" | sed 's/"isDraft":false/"isDraft":true/')" -- --pr 11
+assert_eq 'a draft PR exits 2' "${rc}" '2'
+run_merge "${pr_merged}" -- --pr 11
+assert_eq 'an already merged PR exits 0' "${rc}" '0'
+assert_not_contains 'nothing is run for an already merged PR' "$(<"${gh_log}")" 'merge 11'
+run_merge "${pr_open}" -- --pr abc
+assert_eq 'a non-numeric PR exits 1' "${rc}" '1'
+
+printf '\n=== --wait reports a merge or a machine-parseable timeout ===\n'
+run_merge "${pr_merged}" -- --pr 11 --wait
+assert_eq '--wait on a merged PR exits 0' "${rc}" '0'
+run_merge "${pr_open}" -- --pr 11 --wait --timeout 0
+assert_eq '--wait with an exhausted timeout exits 3' "${rc}" '3'
+assert_contains 'the timeout is one ERROR: WAIT_TIMEOUT line' "${out}" 'ERROR: WAIT_TIMEOUT merge-stack pr=11'
+
+printf '\n=== static: wiring ===\n'
+if grep -E 'gh (stack|pr) merge[^#]*\|[[:space:]]*(tail|head)' "${merge_stack}" >/dev/null; then
+  fail_case 'merge-stack does not pipe the merge command through tail or head'
+else
+  pass_case 'merge-stack does not pipe the merge command through tail or head'
+fi
+
+test_summary

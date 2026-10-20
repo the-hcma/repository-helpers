@@ -52,7 +52,7 @@ git config remote.pushDefault origin     # if multiple remotes exist (skips remo
 
 When switching a consumer repo to `gh-stack` via `.github/stacking-tool`:
 
-1. Update `AGENTS.md` stacking/merge docs (`gh stack` + `gh pr merge --auto --squash`; no `merge-it`).
+1. Update `AGENTS.md` stacking/merge docs (`gh stack` + `gh pr merge --auto --squash` for a PR outside a stack, `gh stack merge <pr> --yes --squash` for a stacked PR; no `merge-it`).
 2. Align `.agents/rules/pr-ship-and-review.md` submit block with the marker-aware template (copy via `github-repo-lint --apply-fix`, or from `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md` / https://github.com/the-hcma/repository-helpers/blob/main/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md; plus thin `.cursor/rules/pr-ship-and-review.mdc` shim).
 3. Delete root `GRAPHITE.md` (this skill is SSOT).
 4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) in sync with the consumer template.
@@ -180,6 +180,8 @@ Small, incidental fixes (e.g., fixing a typo you noticed) can go in the current 
 ---
 
 ## Workflows
+
+A worktree made by `scripts/dev/start-development --worktree <name>` is already registered as a one-branch stack, and `scripts/dev/submit-stack` registers the current branch (`gh stack init <branch>`) before it runs the pre-PR checks when it is not part of a stack, so `gh stack submit` no longer fails with `current branch is not part of a stack` (repository-helpers#744). Run `gh stack init <branch>` yourself only when you use plain `gh stack` outside those scripts.
 
 ### End-to-end: create a stack from scratch
 
@@ -348,6 +350,21 @@ gh stack view --json
 ```
 
 If `sync` hits a conflict during this process, it restores all branches to their pre-rebase state and exits with code 3. See [Handle rebase conflicts](#handle-rebase-conflicts-agent-workflow) for the resolution workflow.
+
+### Merging a stack
+
+GitHub refuses auto-merge for a pull request that belongs to a stack, so the org default `gh pr merge --auto --squash` fails for every stacked PR:
+
+```text
+$ gh pr merge 868 --auto --squash
+GraphQL: Auto-merge is not supported for stacked pull requests. (enablePullRequestAutoMerge)
+```
+
+Land a stacked PR with `gh stack merge <pr> --yes --squash` instead (or `scripts/dev/merge-stack --pr <n>`, which picks `gh stack merge` for a PR in a stack and `gh pr merge --auto --squash` for one outside it). It merges everything up to and including that PR as one atomic, bottom-up operation and adds it to the merge queue when the base branch has one (it prints that the merge method is ignored because of the queue). Afterwards `gh stack rebase` drops the merged branches and restacks the rest onto `main`, and the next PR retargets on its own. `gh pr merge --auto --squash` stays for PRs that are not in a stack and for Dependabot.
+
+- Read the command's exit status and output. Do not pipe it through `tail` or `head`: the error above was hidden that way once, the PR stayed open with `autoMergeRequest` null, and a watcher waited for a merge that was never queued. Confirm `autoMergeRequest` or the merge queue entry before waiting.
+- Reviewing a stack: CodeRabbit skips a PR whose base is not the default branch (`reviews are disabled for this base branch`), so only the bottom PR is reviewed until it merges and the next retargets to `main`. Its included allowance is about one review per hour per developer, and a `Review rate limited` status is not a review.
+- When `gh stack rebase` cannot be used, restack with `git rebase --onto <new-base> <old-base-tip> <branch>`, bottom to top.
 
 ### Merge queue and merged layers
 
