@@ -400,12 +400,12 @@ _worktree_commit() {
   local -r msg="$1"
   local -a sign_flags=()
   local gpg_sign gpg_format sign_key
-  gpg_sign="$(dep_runner_git_c_stdout "git repo" "$dir" -- config --bool commit.gpgsign 2>/dev/null || echo 'false')"
+  gpg_sign="$(dep_runner_git_c_stdout "git repo" "$dir" --probe -- config --bool commit.gpgsign 2>/dev/null || echo 'false')"
   if [[ "$gpg_sign" == 'true' ]]; then
     sign_flags+=('-c' 'commit.gpgsign=true')
-    gpg_format="$(dep_runner_git_c_stdout "git repo" "$dir" -- config gpg.format 2>/dev/null || true)"
+    gpg_format="$(dep_runner_git_c_stdout "git repo" "$dir" --probe -- config gpg.format 2>/dev/null || true)"
     [[ -n "$gpg_format" ]] && sign_flags+=('-c' "gpg.format=${gpg_format}")
-    sign_key="$(dep_runner_git_c_stdout "git repo" "$dir" -- config commit.signingkey 2>/dev/null || true)"
+    sign_key="$(dep_runner_git_c_stdout "git repo" "$dir" --probe -- config commit.signingkey 2>/dev/null || true)"
     [[ -n "$sign_key" ]] && sign_flags+=('-c' "commit.signingkey=${sign_key}")
     log "[commit] GPG signing enabled (format: ${gpg_format:-default}, key: ${sign_key:-(from agent)})"
   else
@@ -2406,7 +2406,9 @@ dep_runner_git_rev_parse() {
   return 0
 }
 
-# dep_runner_git_c_stdout <label> <git-dir> -- <git-args…>
+# dep_runner_git_c_stdout <label> <git-dir> [--probe] -- <git-args…>
+# --probe marks an expected non-zero exit (for example an unset `git config` key) so the
+# runner leaves it out of the failure report instead of presenting it as a root cause.
 # Line-oriented callers (while read over git ls-tree, etc.) must receive a trailing
 # newline on the final line — git often omits it and bash read drops that entry.
 # See detect_ecosystem nested npm discovery and issue #330.
@@ -2414,12 +2416,18 @@ dep_runner_git_c_stdout() {
   local -r label="$1"
   local -r git_dir="$2"
   shift 2
+  local exit_code out
+  local -a probe_opts=()
+
+  if [[ "${1:-}" == '--probe' ]]; then
+    probe_opts+=(--probe)
+    shift
+  fi
   [[ "${1:-}" == '--' ]] || return 2
   shift
-  local exit_code out
 
   exit_code=0
-  out="$(runner_exec_stdout "$label" -- git -C "$git_dir" "$@")" || exit_code=$?
+  out="$(runner_exec_stdout "$label" "${probe_opts[@]}" -- git -C "$git_dir" "$@")" || exit_code=$?
   if [[ -n "$out" && "$out" != *$'\n' ]]; then
     out+=$'\n'
   fi
@@ -2801,18 +2809,25 @@ dep_runner_sh() {
   return "$exit_code"
 }
 
-# dep_runner_uv_dir_stdout <label> <dir> -- <uv-args…>
+# dep_runner_uv_dir_stdout <label> <dir> [--probe] -- <uv-args…>
+# --probe marks an expected non-zero exit (pip-audit exits 1 when it finds vulnerabilities).
 dep_runner_uv_dir_stdout() {
   local -r label="$1"
   local -r uv_dir="$2"
   shift 2
+  local cmd_quoted exit_code out
+  local -a probe_opts=()
+
+  if [[ "${1:-}" == '--probe' ]]; then
+    probe_opts+=(--probe)
+    shift
+  fi
   [[ "${1:-}" == '--' ]] || return 2
   shift
-  local cmd_quoted exit_code out
 
   cmd_quoted="$(runner_quote_cmdline uv "$@")"
   exit_code=0
-  out="$(runner_sh_stdout "$label" -- "cd $(printf '%q' "$uv_dir") && ${cmd_quoted}")" || exit_code=$?
+  out="$(runner_sh_stdout "$label" "${probe_opts[@]}" -- "cd $(printf '%q' "$uv_dir") && ${cmd_quoted}")" || exit_code=$?
   printf '%s' "$out"
   return "$exit_code"
 }
@@ -4796,7 +4811,7 @@ py_audit() {
       # write uv.lock) before running pip-audit.  The audit is read-only: we
       # only need to inspect already-installed packages, not update them.
       # --no-progress: uv run writes spinners to stdout before pip-audit JSON.
-      raw="$(dep_runner_uv_dir_stdout "pip-audit uv" "$audit_dir" -- run --frozen --no-progress --with pip-audit pip-audit --format=json)"
+      raw="$(dep_runner_uv_dir_stdout "pip-audit uv" "$audit_dir" --probe -- run --frozen --no-progress --with pip-audit pip-audit --format=json)"
       exit_code=$?
       ;;
     *)
@@ -5989,16 +6004,20 @@ py_uv_parse_verify_filter_pkg() {
 
 # py_uv_parse_blame_direct_dep <logfile>
 # Prints a pyproject.toml direct dependency name blocking resolution (empty if unknown).
+# Understands the plain forms ("your project depends on <pkg>", "you require <pkg>") and
+# the extra-scoped form uv prints for optional dependencies ("<project>[<extra>] depends
+# on <pkg>"), where the project itself is the one asking for the package.
 py_uv_parse_blame_direct_dep() {
   local -r log_file="$1"
   local line blame
 
-  line="$(grep -E 'you require |your project depends on ' "$log_file" 2>/dev/null | head -n 1 || true)"
+  line="$(grep -E 'you require |your project depends on |\[[A-Za-z0-9._-]+\] depends on ' \
+    "$log_file" 2>/dev/null | head -n 1 || true)"
   if [[ -z "$line" ]]; then
     return 1
   fi
   blame="$(printf '%s' "$line" \
-    | sed -nE 's/.*(you require|your project depends on) ([A-Za-z0-9][A-Za-z0-9._-]*).*/\2/p' \
+    | sed -nE 's/.*(you require|your project depends on|\[[A-Za-z0-9._-]+\] depends on) ([A-Za-z0-9][A-Za-z0-9._-]*).*/\2/p' \
     | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
   if [[ -z "$blame" ]]; then
     return 1
@@ -6246,7 +6265,8 @@ py_uv_exclude_newer_cutoff_iso() {
 
 # py_uv_floor_lock <label> <dir> [pkg...]
 # uv lock with --exclude-newer-package for each pkg so a raised >= floor cannot
-# resolve a release still inside the 9-day window.
+# resolve a release still inside the 9-day window. Packages with a CVE fix reported by
+# pip-audit are not gated (same exemption as py_version_meets_minimum_release_age).
 py_uv_floor_lock() {
   local -r label="$1"
   local -r uv_dir="$2"
@@ -6258,6 +6278,11 @@ py_uv_floor_lock() {
   lock_args=(lock)
   for pkg in "$@"; do
     [[ -z "$pkg" ]] && continue
+    # A CVE fix is exempt from the release-age gate, so its fix version is usually newer
+    # than the cutoff: gating it here would make the floor unsatisfiable by construction.
+    if py_pkg_has_cve_fix_in_audit "$pkg"; then
+      continue
+    fi
     lock_args+=(--exclude-newer-package "${pkg}=${cutoff}")
   done
   dep_runner_uv_dir_capture "$label" "$uv_dir" -- "${lock_args[@]}"
