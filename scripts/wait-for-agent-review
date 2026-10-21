@@ -2200,7 +2200,7 @@ cmd_loop_configured_agents() {
   local -r pr="$2"
   local -r head="$3"
   local -r snapshot="$4"
-  local chain agent comments_json seen_rc seen_json
+  local chain agent comments_json seen_rc seen_json found=0 undecided=0
 
   chain="$(agent_review_reviewers_effective_chain "${repo}")"
   # A failed read is "cannot tell", never "no CodeRabbit comment": exit 13 must not rest on a transient API error.
@@ -2212,25 +2212,21 @@ cmd_loop_configured_agents() {
       coderabbit)
         seen_rc=0
         agent_review_coderabbit_seen_on_pr "${repo}" "${head}" "${comments_json}" || seen_rc=$?
-        if (( seen_rc == 2 )); then
-          return 2
-        fi
         if (( seen_rc == 1 )); then
           # Nothing on the PR yet: a CodeRabbit config in the repository still says it is set up.
           seen_rc=0
           agent_review_coderabbit_config_in_repo "${repo}" "${head}" || seen_rc=$?
-          if (( seen_rc == 2 )); then
-            return 2
-          fi
-          seen_rc=$(( seen_rc == 0 ? 0 : 1 ))
         fi
         if (( seen_rc == 0 )); then
+          found=1
           printf '%s\n' "${agent}"
+        elif (( seen_rc != 1 )); then
+          undecided=1
         fi
         ;;
       copilot | bugbot)
-        # shellcheck disable=SC2016  # jq program text, not shell expansion
         seen_json=''
+        # shellcheck disable=SC2016  # jq program text, not shell expansion
         if ! seen_json="$(ar_runner_jq_file "wait-for-agent-review ${agent} seen" "${snapshot}" --arg agent "${agent}" -r '
           (if $agent == "copilot" then "copilot" else "cursor|bugbot" end) as $re
           | .data.repository.pullRequest as $p
@@ -2238,19 +2234,24 @@ cmd_loop_configured_agents() {
               ($p.comments.nodes[]?.author.login // empty),
               ($p.reviewRequests.nodes[]?.requestedReviewer.login // empty) ]
           | any(.[]; test($re; "i"))')"; then
-          return 2
-        fi
-        if [[ "${seen_json}" == 'true' ]]; then
+          undecided=1
+        elif [[ "${seen_json}" == 'true' ]]; then
+          found=1
           printf '%s\n' "${agent}"
         elif [[ "${agent}" == 'bugbot' ]]; then
           # Bugbot reports through a check run and comments only on findings, so a clean PR shows nothing
           # here: its absence cannot be proven from the snapshot.
-          return 2
+          undecided=1
         fi
         ;;
       *) ;;
     esac
   done
+  # Positive evidence is kept: undecided only matters while nothing was found.
+  if (( undecided == 1 && found == 0 )); then
+    return 2
+  fi
+  return 0
 }
 
 # Exit 13 when no agent of the repo's chain has shown itself on the PR within the grace window, so a
