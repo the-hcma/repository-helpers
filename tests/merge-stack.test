@@ -51,9 +51,26 @@ case "$1 $2" in
     for ((i = 0; i < ${#args[@]}; i++)); do
       if [[ "${args[$i]}" == '--jq' ]]; then filter="${args[$((i + 1))]}"; fi
     done
+    if [[ "${filter}" == '.state' && -n "${FAKE_MERGED_AFTER_STATE_READS:-}" ]]; then
+      reads=$(( $(cat "${FAKE_GH_LOG}.reads" 2>/dev/null || printf 0) + 1 ))
+      printf '%s' "${reads}" >"${FAKE_GH_LOG}.reads"
+      if (( reads > FAKE_MERGED_AFTER_STATE_READS )); then
+        printf 'MERGED\n'
+        exit 0
+      fi
+    fi
     exec jq -r "${filter}" "${FAKE_PR_FIXTURE}"
     ;;
   'api graphql')
+    calls=$(( $(cat "${FAKE_GH_LOG}.queue" 2>/dev/null || printf 0) + 1 ))
+    printf '%s' "${calls}" >"${FAKE_GH_LOG}.queue"
+    if [[ -n "${FAKE_QUEUE_FAIL_AFTER:-}" ]] && (( calls > FAKE_QUEUE_FAIL_AFTER )); then
+      exit 1
+    fi
+    if [[ -n "${FAKE_IN_QUEUE_CALLS:-}" ]] && (( calls > FAKE_IN_QUEUE_CALLS )); then
+      printf 'false\n'
+      exit 0
+    fi
     printf '%s\n' "${FAKE_IN_QUEUE:-false}"
     exit 0
     ;;
@@ -104,7 +121,7 @@ run_merge() {
   shift
   printf '%s' "${pr_json}" >"${work_dir}/pr.json"
   : >"${gh_log}"
-  rm -f "${gh_log}.views"
+  rm -f "${gh_log}.views" "${gh_log}.reads" "${gh_log}.queue"
   rc=0
   out="$(cd "${fixture_repo}" && env PATH="${fake_bin}:${PATH}" MERGE_STACK_POLL_INTERVAL_S=0 MERGE_STACK_RETRY_SLEEP_S=0 FAKE_GH_LOG="${gh_log}" FAKE_PR_FIXTURE="${work_dir}/pr.json" \
     FAKE_STACK_FIXTURE="${work_dir}/stack.json" "${envs[@]+"${envs[@]}"}" \
@@ -183,6 +200,15 @@ assert_eq '--wait on a merged PR exits 0' "${rc}" '0'
 run_merge "${pr_open}" -- --pr 11 --wait --timeout 0
 assert_eq '--wait with an exhausted timeout exits 3' "${rc}" '3'
 assert_contains 'the timeout is one ERROR: WAIT_TIMEOUT line' "${out}" 'ERROR: WAIT_TIMEOUT merge-stack pr=11'
+run_merge "${pr_open}" FAKE_MERGED_AFTER_STATE_READS=3 -- --pr 11 --wait
+assert_eq '--wait polls an open PR until it merges and exits 0' "${rc}" '0'
+assert_contains '--wait reports the merge' "${out}" 'PR #11 merged'
+run_merge "${pr_open}" FAKE_NO_STACK=1 FAKE_IN_QUEUE=true FAKE_IN_QUEUE_CALLS=1 -- --pr 12 --wait
+assert_eq '--wait on a plain PR that left the queue exits 2' "${rc}" '2'
+assert_contains '--wait names the dropped PR' "${out}" 'is no longer queued'
+run_merge "${pr_open}" FAKE_NO_STACK=1 FAKE_IN_QUEUE=true FAKE_QUEUE_FAIL_AFTER=1 -- --pr 12 --wait --timeout 1
+assert_eq '--wait keeps polling when the queue read fails and ends in the timeout' "${rc}" '3'
+assert_not_contains '--wait does not call an unreadable queue dropped' "${out}" 'no longer queued'
 
 printf '\n=== static: wiring ===\n'
 if grep -E 'gh (stack|pr) merge[^#]*\|[[:space:]]*(tail|head)' "${merge_stack}" >/dev/null; then

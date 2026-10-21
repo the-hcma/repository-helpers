@@ -131,17 +131,22 @@ local_slug() {
 
 # in_merge_queue — true when the PR has an entry in the base branch's merge queue. Once GitHub moves a PR
 # into the queue, autoMergeRequest is null, so queue membership is a landing signal of its own (gh pr view has
-# no field for it, hence the GraphQL read). False when the repository slug cannot be resolved.
+# no field for it, hence the GraphQL read). Returns 0 when queued, 1 when the read succeeded and the PR is not
+# queued, and 2 when that is unknown (slug unresolved or the read failed), so a wait loop can poll again.
 in_merge_queue() {
   local slug owner name queued
 
   slug="${repo_arg:-$(local_slug)}"
-  [[ "$slug" == */* ]] || return 1
+  [[ "$slug" == */* ]] || return 2
   owner="${slug%%/*}"
   name="${slug#*/}"
   # shellcheck disable=SC2016  # $o, $n and $p are GraphQL variables, not shell expansions
-  queued="$(gh_read "merge-stack gh queue membership ${pr_number}" api graphql -f query='query($o: String!, $n: String!, $p: Int!) { repository(owner: $o, name: $n) { pullRequest(number: $p) { isInMergeQueue } } }' -f o="$owner" -f n="$name" -F p="$pr_number" --jq '.data.repository.pullRequest.isInMergeQueue')" || return 1
-  [[ "$queued" == 'true' ]]
+  queued="$(gh_read "merge-stack gh queue membership ${pr_number}" api graphql -f query='query($o: String!, $n: String!, $p: Int!) { repository(owner: $o, name: $n) { pullRequest(number: $p) { isInMergeQueue } } }' -f o="$owner" -f n="$name" -F p="$pr_number" --jq '.data.repository.pullRequest.isInMergeQueue')" || return 2
+  case "$queued" in
+    true) return 0 ;;
+    false) return 1 ;;
+    *) return 2 ;;
+  esac
 }
 
 # stack_branch_state <jq-filter> — runs a jq filter over `gh stack view --json` of the current directory with
@@ -242,7 +247,7 @@ confirm_landed() {
 }
 
 main() {
-  local state is_draft stacked=0 merge_rc=0 merge_out tool open_pr open_prs merge_state landed_rc
+  local state is_draft stacked=0 merge_rc=0 merge_out tool open_pr open_prs merge_state landed_rc queue_rc
   local -a repo_flags=()
 
   parse_args "$@"
@@ -336,8 +341,10 @@ main() {
       exit 2
     fi
     # Still OPEN with neither auto-merge nor a queue entry any more: the queue dropped it.
+    queue_rc=0
+    if [[ "$state" == 'OPEN' ]]; then in_merge_queue || queue_rc=$?; fi
     if [[ "$state" == 'OPEN' ]] && [[ "$(pr_field '(.autoMergeRequest != null) | tostring' || true)" == 'false' ]] \
-      && ! in_merge_queue; then
+      && (( queue_rc == 1 )); then
       landed_rc=1
       if (( stacked == 1 )); then
         landed_rc=0
