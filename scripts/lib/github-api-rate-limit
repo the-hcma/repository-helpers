@@ -26,6 +26,10 @@
 #     any non-read `gh` subcommand forwarded by scripts/gh-api) is never retried.
 #   GITHUB_API_TRANSIENT_NETWORK_BACKOFF_S     comma-separated backoff ladder by
 #     attempt for the above (default 2,5,15).
+#   GITHUB_API_ATTEMPT_TIMEOUT_S   per-attempt wall-clock cap on the wrapped command (default 300,
+#     long enough for a large --paginate read; 0 disables). A killed attempt counts as a transient
+#     failure: reads are retried under the transient-network bounds, a mutation is never repeated
+#     (repository-helpers#741).
 
 set -euo pipefail
 
@@ -245,6 +249,24 @@ _github_api_transient_network_backoff_s() {
   fi
 }
 
+# _github_api_attempt_timeout_s
+# Per-attempt wall-clock cap for the wrapped command, in seconds. A stalled request must not block a caller
+# forever (remote-timeouts-retries). GITHUB_API_ATTEMPT_TIMEOUT_S overrides the default, which is generous
+# enough for a large --paginate read; 0 turns the cap off, anything else that is not an integer falls back
+# to the default. Prints nothing when the cap is off or timeout(1) is unavailable.
+_github_api_attempt_timeout_s() {
+  local value timeout_bin
+
+  value="${GITHUB_API_ATTEMPT_TIMEOUT_S:-300}"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    value=300
+  fi
+  (( value > 0 )) || return 0
+  timeout_bin="$(runner_timeout_bin 2>/dev/null || true)"
+  [[ -n "$timeout_bin" ]] || return 0
+  printf '%s' "$value"
+}
+
 # github_api_exec_with_rate_limit_retry <label> [--probe] -- <cmd> [args…]
 # Runs via runner_exec (no mid-attempt stdout stream). On success, prints that
 # attempt's captured stdout once — avoids concatenating partial --paginate pages
@@ -255,6 +277,8 @@ github_api_exec_with_rate_limit_retry() {
   local exit_code attempt max_retries detail headers uuid should_wait wait_ec
   local final_quota_retry=0
   local net_attempt=1 net_max_retries net_sleep
+  local attempt_timeout_s timed_out timeout_bin
+  local -a exec_cmd=()
 
   label="${1:?github_api_exec_with_rate_limit_retry: label required}"
   shift
@@ -283,15 +307,22 @@ github_api_exec_with_rate_limit_retry() {
 
   max_retries="$(_github_api_rate_limit_effective_max_retries)"
   net_max_retries="$(_github_api_transient_network_effective_max_retries)"
+  # The cap wraps only what runs; the read/write classification below keeps looking at the caller's command.
+  exec_cmd=("${rl_cmd[@]}")
+  attempt_timeout_s="$(_github_api_attempt_timeout_s)"
+  if [[ -n "$attempt_timeout_s" ]]; then
+    timeout_bin="$(runner_timeout_bin)"
+    exec_cmd=("$timeout_bin" "--kill-after=${_runner_timeout_kill_after_sec:-5}" "${attempt_timeout_s}s" "${rl_cmd[@]}")
+  fi
 
   attempt=1
   while (( attempt <= max_retries || final_quota_retry == 1 )); do
     exit_code=0
     github_api_pace_gate "$label"
     if (( probe )); then
-      runner_exec "$label" --probe -- "${rl_cmd[@]}" || exit_code=$?
+      runner_exec "$label" --probe -- "${exec_cmd[@]}" || exit_code=$?
     else
-      runner_exec "$label" -- "${rl_cmd[@]}" || exit_code=$?
+      runner_exec "$label" -- "${exec_cmd[@]}" || exit_code=$?
     fi
     if (( exit_code == 0 )); then
       uuid="$(runner_last_id)"
@@ -301,12 +332,19 @@ github_api_exec_with_rate_limit_retry() {
       return 0
     fi
     detail="$(_github_api_last_stderr_summary)"
+    # A killed attempt (timeout(1) exits 124, or 137 once --kill-after escalates) is a transient failure like
+    # a dropped connection: the same bounded retry applies, and a mutation is still never repeated.
+    timed_out=0
+    if [[ -n "$attempt_timeout_s" ]] && (( exit_code == 124 || exit_code == 137 )); then
+      timed_out=1
+      detail="request timed out after ${attempt_timeout_s}s"
+    fi
     if ! github_api_detail_is_rate_limited "$detail"; then
       # Transient transport failure (DNS, connection, gateway 5xx): bounded retry
       # with backoff so a brief outage does not abort a nightly run (#617).
       # Read requests only — a 5xx / timeout on a mutation could mean the write
       # landed, and re-POSTing is not safe (remote-timeouts-retries.mdc).
-      if github_api_detail_is_transient_network "$detail"; then
+      if (( timed_out )) || github_api_detail_is_transient_network "$detail"; then
         if _github_api_rl_cmd_is_write "${rl_cmd[@]}"; then
           printf 'NOTE: GITHUB_API_TRANSIENT_NETWORK_NO_RETRY label=%s reason=mutation detail=%s\n' \
             "$label" "$detail" >&2
