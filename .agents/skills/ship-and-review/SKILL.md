@@ -277,3 +277,4 @@ Use `./scripts/wait-for-agent-review request --pr <n>` with `AGENT_REVIEW_AGENT=
 | 10 | Required CI failed — coding agent must fix and resume; no operator email (escalate only if unfixable) |
 | 11 | Permanent merge block (`DIRTY`/`CONFLICTING`/`DRAFT`) — human intervention |
 | 12 | A waiting protected environment could not be approved (`ERROR: ENVIRONMENT_APPROVAL_FAILED`) — the operator must approve it or grant this gh identity reviewer access |
+| 13 | No review agent has shown itself within `AGENT_REVIEW_NO_AGENT_GRACE_S` (`ERROR: NO_REVIEW_AGENT_CONFIGURED`) — configure an agent, set the `agent-reviewers` / `agent-review-enabled` properties, or skip the loop |
