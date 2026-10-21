@@ -4825,8 +4825,12 @@ py_audit() {
   set -e
 
   raw="$(py_audit_json_payload_from_stdout "$raw")"
-  [[ -z "$raw" ]] && return 0
-  if ! dep_runner_jq_with_args --probe "dep-updater py audit validate" "$raw" -e . >/dev/null 2>&1; then
+  # pip-audit exits 1 when it finds vulnerabilities (a probe, so not a runner failure), but a
+  # run that produced no valid JSON lost the audit and must stay visible.
+  if [[ -z "$raw" ]] \
+    || ! dep_runner_jq_with_args --probe "dep-updater py audit validate" "$raw" -e . >/dev/null 2>&1; then
+    log "WARNING: pip-audit (${tool}) produced no valid JSON (exit ${exit_code}); CVE exemptions skipped."
+    record_first_failure "pip-audit ${tool}: no valid JSON (exit ${exit_code})"
     return 0
   fi
 
@@ -6009,10 +6013,18 @@ py_uv_parse_verify_filter_pkg() {
 # on <pkg>"), where the project itself is the one asking for the package.
 py_uv_parse_blame_direct_dep() {
   local -r log_file="$1"
-  local line blame
+  local line blame project
 
-  line="$(grep -E 'you require |your project depends on |\[[A-Za-z0-9._-]+\] depends on ' \
+  # The extra-scoped form only blames a direct dependency when the project itself owns the
+  # extra: uv names it in "your project requires <project>[<extra>]". A line such as
+  # "other-package[extra] depends on socksio" is a transitive edge and is ignored.
+  project="$(sed -nE 's/.*your project requires ([A-Za-z0-9][A-Za-z0-9._-]*)\[.*/\1/p' \
     "$log_file" 2>/dev/null | head -n 1 || true)"
+  line="$(grep -E 'you require |your project depends on ' "$log_file" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$line" && -n "$project" ]]; then
+    line="$(grep -E "(^|[^A-Za-z0-9._-])${project//./\\.}\\[[A-Za-z0-9._-]+\\] depends on " \
+      "$log_file" 2>/dev/null | head -n 1 || true)"
+  fi
   if [[ -z "$line" ]]; then
     return 1
   fi
