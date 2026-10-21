@@ -109,6 +109,9 @@ Environment:
   AGENT_REVIEW_QUOTA_FALLBACK_CHAIN  Comma-separated quota escalation (default: coderabbit; the agent-reviewers property selects the set)
   AGENT_REVIEW_CODERABBIT_RESUME_PAUSED  0 leaves a CodeRabbit review that auto-paused on the head paused
                                          (default 1: the loop asks once per head for a full review, never while rate limited)
+  AGENT_REVIEW_NO_AGENT_GRACE_S  Seconds with no sign of any chain agent on the PR before the loop exits 13
+                                 (default 900; 0 disables). CodeRabbit is only ever asked for a full review once it
+                                 has been seen on the PR, and an unanswered ask is not repeated.
   AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE  Daily Copilot quota breadcrumb on the filesystem
                                          (default: ~/scratch/repository-helpers/copilot-review-quota.env;
                                          readable by other coding agents on this host — not posted to PRs)
@@ -143,6 +146,7 @@ Exit codes:
  10  required CI failed — coding agent must fix and resume (no operator email; escalate only if unfixable)
  11  permanent merge block (DIRTY/CONFLICTING/DRAFT) — human intervention required
  12  a waiting protected environment could not be approved (ERROR: ENVIRONMENT_APPROVAL_FAILED) — operator must approve it
+ 13  no review agent has shown itself on the PR within AGENT_REVIEW_NO_AGENT_GRACE_S (default 900s; ERROR: NO_REVIEW_AGENT_CONFIGURED) — set one up, or skip the loop
 
 Non-success loop exits email AGENT_REVIEW_REPORT_TO and post a PR comment when the loop
 command exits, except exit 3 (pending feedback) and exit 10 (CI failed): those are
@@ -289,6 +293,10 @@ agent_review_loop_default_stop_for_exit() {
       agent_review_loop_set_stop 'ENVIRONMENT_APPROVAL_FAILED' \
         'A waiting environment could not be approved (ENVIRONMENT_APPROVAL_FAILED) — the operator must approve it or grant this gh identity reviewer access.'
       ;;
+    13)
+      agent_review_loop_set_stop 'NO_REVIEW_AGENT_CONFIGURED' \
+        'No review agent has shown itself on the PR; none looks configured for the repository.'
+      ;;
     *)
       agent_review_loop_set_stop 'LOOP_STOPPED' \
         "Agent review loop stopped (exit ${exit_code})."
@@ -409,6 +417,11 @@ cmd_request_confirm_clean() {
       printf 'wait-for-agent-review: could not read the PR comments to place the full-review ask on PR #%s - retry shortly\n' \
         "${pr}" >&2
       return 2
+      ;;
+    3)
+      printf 'wait-for-agent-review: no full review requested for PR #%s - CodeRabbit is not set up on this repository (see above)\n' \
+        "${pr}" >&2
+      return 0
       ;;
     *)
       agent_review_die 'failed to request the full review'
@@ -1631,7 +1644,7 @@ cmd_loop_handle_coderabbit_rate_limit() {
   local snapshot="${4:-}"
   local saved_agent retry_after remaining sleep_s retry_epoch now_epoch grace_s grace_remaining
   local profiles_dir coderabbit_profile _owner _name sent_rc exhausted_reason give_exit snapshot_head
-  local poll_s pending_exit provisional_retry
+  local poll_s pending_exit provisional_retry request_rc
   local head_status head_state head_state_epoch fallback_wait_s fallback_epoch
 
   if [[ -n "${snapshot}" ]] \
@@ -1921,7 +1934,15 @@ cmd_loop_handle_coderabbit_rate_limit() {
     agent_review_use_agent "${saved_agent}"
     return 0
   fi
-  if ! agent_review_profile_request_last_resort_full_review "${repo}" "${pr}" "${head}"; then
+  request_rc=0
+  agent_review_profile_request_last_resort_full_review "${repo}" "${pr}" "${head}" || request_rc=$?
+  if (( request_rc == 3 )); then
+    # CodeRabbit has never been seen on this repository: nothing was asked and nothing is awaited (#759).
+    agent_review_loop_wait_remove 'coderabbit' || true
+    agent_review_use_agent "${saved_agent}"
+    return 1
+  fi
+  if (( request_rc != 0 )); then
     printf 'wait-for-agent-review: failed to request CodeRabbit full review; retrying\n' >&2
     agent_review_use_agent "${saved_agent}"
     return 0
@@ -2170,6 +2191,88 @@ cmd_complete_idle() {
   return 0
 }
 
+# Names of the agents in the repo's chain that are evidently set up on the PR (one per line): CodeRabbit
+# by a comment or commit status, Copilot and Bugbot by a review, review request or comment from their
+# accounts. Exit 2 when CodeRabbit cannot be judged (a failed read), so the caller never gives up on a guess.
+cmd_loop_configured_agents() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r snapshot="$4"
+  local chain agent comments_json seen_rc
+
+  chain="$(agent_review_reviewers_effective_chain "${repo}")"
+  comments_json="$(agent_review_pr_issue_comments_json "${repo}" "${pr}" 2>/dev/null || true)"
+  for agent in ${chain//,/ }; do
+    case "${agent}" in
+      coderabbit)
+        seen_rc=0
+        agent_review_coderabbit_seen_on_pr "${repo}" "${head}" "${comments_json}" || seen_rc=$?
+        if (( seen_rc == 2 )); then
+          return 2
+        fi
+        if (( seen_rc == 0 )); then
+          printf '%s\n' "${agent}"
+        fi
+        ;;
+      copilot | bugbot)
+        # shellcheck disable=SC2016  # jq program text, not shell expansion
+        if [[ "$(ar_runner_jq_file "wait-for-agent-review ${agent} seen" "${snapshot}" --arg agent "${agent}" -r '
+          (if $agent == "copilot" then "copilot" else "cursor|bugbot" end) as $re
+          | .data.repository.pullRequest as $p
+          | [ ($p.reviews.nodes[]?.author.login // empty),
+              ($p.comments.nodes[]?.author.login // empty),
+              ($p.reviewRequests.nodes[]?.requestedReviewer.login // empty) ]
+          | any(.[]; test($re; "i"))')" == 'true' ]]; then
+          printf '%s\n' "${agent}"
+        fi
+        ;;
+      *) ;;
+    esac
+  done
+}
+
+# Exit 13 when no agent of the repo's chain has shown itself on the PR within the grace window, so a
+# repository with no review agent set up errors out instead of waiting for one for the whole PR cap
+# (#759). Returns 0 to keep going: the window has not passed, an agent was seen, the check is disabled
+# (AGENT_REVIEW_NO_AGENT_GRACE_S=0), or the evidence could not be read.
+cmd_loop_abort_if_no_agent_configured() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r snapshot="$4"
+  local -r started="$5"
+  local grace now seen_rc=0 seen chain
+
+  grace="${AGENT_REVIEW_NO_AGENT_GRACE_S:-${agent_review_default_no_agent_grace_s}}"
+  if ! [[ "${grace}" =~ ^[0-9]+$ ]]; then
+    grace="${agent_review_default_no_agent_grace_s}"
+  fi
+  if (( 10#${grace} == 0 )) || [[ "${cmd_loop_agent_seen:-0}" == '1' ]]; then
+    return 0
+  fi
+  printf -v now '%(%s)T' -1
+  if (( now - started < 10#${grace} )); then
+    return 0
+  fi
+  seen="$(cmd_loop_configured_agents "${repo}" "${pr}" "${head}" "${snapshot}")" || seen_rc=$?
+  if (( seen_rc != 0 )); then
+    return 0
+  fi
+  if [[ -n "${seen}" ]]; then
+    cmd_loop_agent_seen=1
+    return 0
+  fi
+  chain="$(agent_review_reviewers_effective_chain "${repo}")"
+  printf 'ERROR: NO_REVIEW_AGENT_CONFIGURED repo=%s pr=%s chain=%s grace_s=%s\n' \
+    "${repo}" "${pr}" "${chain}" "${grace}" >&2
+  printf 'wait-for-agent-review: no review agent (%s) has shown itself on PR #%s after %ss, so none looks configured for %s. Set one up (a .coderabbit.yaml plus the CodeRabbit app, a Copilot review request, or a Bugbot check), set the agent-reviewers / agent-review-enabled=false properties to say so, or skip this loop. AGENT_REVIEW_NO_AGENT_GRACE_S=0 turns this check off.\n' \
+    "${chain}" "${pr}" "${grace}" "${repo}" >&2
+  agent_review_loop_set_stop 'NO_REVIEW_AGENT_CONFIGURED' \
+    'No review agent has shown itself on the PR; none looks configured for the repository.'
+  return 13
+}
+
 cmd_loop() {
   local repo pr pr_started last_head head now
   local pr_cap cycle_cap check_exit ci_exit pending_exit rate_exit status
@@ -2190,6 +2293,7 @@ cmd_loop() {
   agent_review_require_cmd gh
   agent_review_require_cmd jq
   pr_started="$(date +%s)"
+  cmd_loop_agent_seen=0
   last_head=''
   transient_retries=0
   agent_review_loop_wait_head=''
@@ -2261,6 +2365,8 @@ cmd_loop() {
     head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
     cmd_loop_observe_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}"
     agent_review_sync_active_probe_agent || true
+    cmd_loop_abort_if_no_agent_configured "${repo}" "${pr}" "${head}" "${snapshot}" "${pr_started}" \
+      || return $?
     # A repo that does not use CodeRabbit (agent-reviewers property) never waits on its checks or
     # rate limit; the CI and feedback gates still apply (#716).
     coderabbit_active=1

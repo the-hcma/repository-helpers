@@ -611,12 +611,14 @@ agent_review_coderabbit_full_review_exhausted() {
   fi
   IFS=$'\t' read -r status attempts ready asked <<<"${line}"
   : "${ready:=0}" "${asked:=0}"
-  if (( ${attempts:-0} < agent_review_default_coderabbit_full_review_max_attempts )); then
-    return 1
-  fi
   case "${status}" in
-    rate_limited) return 0 ;;
+    rate_limited)
+      if (( ${attempts:-0} >= agent_review_default_coderabbit_full_review_max_attempts )); then
+        return 0
+      fi
+      ;;
     pending)
+      # The single ask is never repeated, so an hour of silence is the end of the wait (#759).
       if (( now - asked >= agent_review_default_coderabbit_full_review_pending_ttl_s * 4 )); then
         return 0
       fi
@@ -645,7 +647,7 @@ agent_review_profile_request_last_resort_full_review() {
   local -r repo="$1"
   local -r pr="$2"
   local -r head="$3"
-  local body retry_after comments_json line now asked_status attempts ready_epoch asked_epoch
+  local body retry_after comments_json line now asked_status attempts ready_epoch asked_epoch seen_rc
 
   if [[ -z "${head}" ]]; then
     return 1
@@ -667,9 +669,23 @@ agent_review_profile_request_last_resort_full_review() {
       "${pr}" >&2
     return 2
   fi
+  # Never ask an agent nobody has seen on the repository: a repo without CodeRabbit would be asked
+  # forever (#759). Exit 3 tells the caller there is no agent to ask, which is not a failure to retry.
+  seen_rc=0
+  agent_review_coderabbit_seen_on_pr "${repo}" "${head}" "${comments_json}" || seen_rc=$?
+  if (( seen_rc == 1 )); then
+    printf 'wait-for-agent-review: not asking CodeRabbit for a full review on PR #%s — no CodeRabbit comment or commit status has been seen on it, so it does not look configured for %s\n' \
+      "${pr}" "${repo}" >&2
+    return 3
+  fi
+  if (( seen_rc != 0 )); then
+    printf 'wait-for-agent-review: could not tell whether CodeRabbit is configured for PR #%s — will retry\n' \
+      "${pr}" >&2
+    return 2
+  fi
   now="$(runner_exec_stdout "coderabbit full-review now epoch" -- date -u +%s)"
   if ! agent_review_coderabbit_full_review_may_post "${line}" "${now}"; then
-    printf 'wait-for-agent-review: coderabbit full review already requested for head %s on PR #%s\n' \
+    printf 'wait-for-agent-review: coderabbit full review already requested for head %s on PR #%s (one ask per head unless CodeRabbit answered "rate limited")\n' \
       "${head:0:7}" "${pr}" >&2
     return 0
   fi

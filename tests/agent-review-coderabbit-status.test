@@ -133,7 +133,9 @@ assert_contains "with no ask yet one may be posted" "$out" "may-post"
 out="$(may_post "pending${tab}1${tab}0${tab}${ask_epoch}" "$(( ask_epoch + 60 ))")"
 assert_contains "a fresh unanswered ask is waited on" "$out" "wait"
 out="$(may_post "pending${tab}1${tab}0${tab}${ask_epoch}" "$(( ask_epoch + 901 ))")"
-assert_contains "an ask CodeRabbit never answered is repeated after the pending TTL" "$out" "may-post"
+assert_contains "an ask CodeRabbit never answered is not repeated after the pending TTL" "$out" "wait"
+out="$(may_post "pending${tab}1${tab}0${tab}${ask_epoch}" "$(( ask_epoch + 99999 ))")"
+assert_contains "an ask CodeRabbit never answered is not repeated however long it has been" "$out" "wait"
 out="$(may_post "accepted${tab}1${tab}0${tab}${ask_epoch}" "$(( ask_epoch + 99999 ))")"
 assert_contains "an accepted ask is never repeated" "$out" "wait"
 out="$(may_post "rate_limited${tab}1${tab}${ready}${tab}${ask_epoch}" "$(( ready + 30 ))")"
@@ -543,5 +545,133 @@ assert_contains "the give-up waits for an outstanding fallback review" "$wait_te
 # shellcheck disable=SC2016  # literal source text to look for, not an expansion
 assert_contains "the give-up lets the loop pick up a new head" "$wait_text" 'if [[ "${snapshot_head}" != "${head}" ]]; then'
 assert_contains "the loop propagates that exit code" "$wait_text" 'if (( rate_exit == 7 )); then'
+
+printf '\n=== a lone unanswered ask is the end of the wait, and never repeated (#759) ===\n'
+single_pending="[$(mk_ask 1 '')]"
+ask1_epoch="$(epoch 2026-10-16T01:00:00Z)"
+out="$(exhausted "${single_pending}" "$(( ask1_epoch + 3599 ))")"
+assert_contains "a single ask just inside four pending TTLs is still in flight" "$out" "rc=1"
+out="$(exhausted "${single_pending}" "$(( ask1_epoch + 3601 ))")"
+assert_contains "a single ask unanswered for four pending TTLs is exhausted without more asks" "$out" "exhausted"
+
+printf '\n=== CodeRabbit must be seen on the repo before it is asked (#759) ===\n'
+operator_only='[{"user":{"login":"thehcma"},"created_at":"2026-10-16T01:00:00Z","body":"@coderabbitai full review"}]'
+bot_comment='[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-10-16T01:00:05Z","body":"walkthrough"}]'
+out="$(run_lib "agent_review_coderabbit_seen_in_comments '${operator_only}' && echo seen || echo not-seen")"
+assert_contains "the operator's own ask is not evidence that CodeRabbit exists" "$out" "not-seen"
+out="$(run_lib "agent_review_coderabbit_seen_in_comments '${bot_comment}' && echo seen || echo not-seen")"
+assert_contains "a CodeRabbit comment is evidence" "$out" "seen"
+assert_not_contains "a CodeRabbit comment is not reported unseen" "$out" "not-seen"
+out="$(run_lib "agent_review_coderabbit_seen_in_comments '' && echo seen || echo not-seen")"
+assert_contains "no comments means not seen" "$out" "not-seen"
+seen_on_pr() {
+  run_lib "agent_review_coderabbit_head_state() { printf '%s\n' '$1'; }; rc=0; agent_review_coderabbit_seen_on_pr o/r '${head_sha}' '$2' || rc=\$?; echo rc=\$rc"
+}
+out="$(seen_on_pr none "${operator_only}")"
+assert_contains "no status and no CodeRabbit comment means not set up" "$out" "rc=1"
+out="$(seen_on_pr unknown "${operator_only}")"
+assert_contains "an unreadable status with no comment is left undecided" "$out" "rc=2"
+out="$(seen_on_pr unknown "${bot_comment}")"
+assert_contains "a CodeRabbit comment settles it even when the status is unreadable" "$out" "rc=0"
+out="$(seen_on_pr completed "${operator_only}")"
+assert_contains "a CodeRabbit commit status means it is set up" "$out" "rc=0"
+out="$(seen_on_pr rate_limited '')"
+assert_contains "a rate-limited status means it is set up" "$out" "rc=0"
+
+printf '\n=== the loop does not post a full review to an agent it has not seen (#759) ===\n'
+: >"${work_dir}/posted.log"
+no_agent_post() {
+  run_lib "
+    agent_review_agent_quota_rate_limited_for_agent() { return 1; }
+    agent_review_pr_issue_comments_json() { printf '%s' '$1'; }
+    agent_review_coderabbit_head_state() { printf '%s\n' '$2'; }
+    runner_exec_stdout() { printf '%s\n' '1'; }
+    runner_exec() {
+      if [[ \"\$*\" == *'gh pr comment'* ]]; then printf 'POSTED\n'; return 0; fi
+      shift 2 || true
+      command \"\$@\"
+    }
+    rc=0; agent_review_profile_request_last_resort_full_review o/r 7 '${head_sha}' || rc=\$?; echo rc=\$rc"
+}
+out="$(no_agent_post "${operator_only}" none)"
+assert_contains "the helper exits 3 when CodeRabbit was never seen" "$out" "rc=3"
+assert_not_contains "nothing is posted to an agent that was never seen" "$out" "POSTED"
+assert_contains "the output says why no ask was made" "$out" "does not look configured"
+out="$(no_agent_post "${operator_only}" unknown)"
+assert_contains "an unreadable status is retried, not treated as absent" "$out" "rc=2"
+assert_not_contains "nothing is posted while the evidence is unreadable" "$out" "POSTED"
+out="$(no_agent_post "${operator_only}" completed)"
+assert_contains "a seen agent is still asked" "$out" "POSTED"
+
+printf '\n=== the loop exits 13 when no review agent is configured (#759) ===\n'
+abort_check() {
+  # $1 started offset in seconds before now, $2 grace env ("" = default), $3 stub body for configured_agents
+  bash -c "
+    set -uo pipefail
+    source '${lib}'
+    $(awk '/^cmd_loop_abort_if_no_agent_configured\(\)/,/^}/' "${wait_script}")
+    agent_review_reviewers_effective_chain() { printf 'coderabbit,copilot'; }
+    agent_review_loop_set_stop() { printf 'STOP %s\n' \"\$1\"; }
+    cmd_loop_configured_agents() { $3; }
+    $( [[ -n "$2" ]] && printf "export AGENT_REVIEW_NO_AGENT_GRACE_S=%s" "$2" )
+    now=\$(date +%s)
+    rc=0
+    cmd_loop_abort_if_no_agent_configured o/r 7 abc snap \$(( now - $1 )) || rc=\$?
+    echo rc=\$rc
+    echo seen=\${cmd_loop_agent_seen:-unset}" 2>&1
+}
+out="$(abort_check 60 '' 'return 0')"
+assert_contains "inside the grace window the loop keeps waiting" "$out" "rc=0"
+out="$(abort_check 1000 '' 'return 0')"
+assert_contains "past the grace window with no agent seen the loop exits 13" "$out" "rc=13"
+assert_contains "the exit is one machine-parseable line" "$out" "ERROR: NO_REVIEW_AGENT_CONFIGURED repo=o/r pr=7 chain=coderabbit,copilot"
+assert_contains "the loop records why it stopped" "$out" "STOP NO_REVIEW_AGENT_CONFIGURED"
+assert_contains "the message tells the operator how to fix it" "$out" "AGENT_REVIEW_NO_AGENT_GRACE_S=0 turns this check off"
+out="$(abort_check 1000 '' "printf 'coderabbit\n'")"
+assert_contains "an agent that showed itself keeps the loop going" "$out" "rc=0"
+assert_contains "the sighting is remembered so later passes skip the reads" "$out" "seen=1"
+out="$(abort_check 1000 '' 'return 2')"
+assert_contains "an unreadable check never gives up on a guess" "$out" "rc=0"
+assert_not_contains "an unreadable check does not print the error" "$out" "NO_REVIEW_AGENT_CONFIGURED"
+out="$(abort_check 1000 0 'return 0')"
+assert_contains "a grace of 0 turns the check off" "$out" "rc=0"
+out="$(abort_check 100 60 'return 0')"
+assert_contains "the grace window is configurable" "$out" "rc=13"
+out="$(abort_check 100 junk 'return 0')"
+assert_contains "a junk grace falls back to the default window" "$out" "rc=0"
+
+printf '\n=== configured agents are read from the PR (#759) ===\n'
+agents_snapshot='{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[{"author":{"login":"copilot-pull-request-reviewer"}}]},"comments":{"nodes":[{"author":{"login":"thehcma"}}]},"reviewRequests":{"nodes":[]}}}}}'
+empty_snapshot='{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[]},"comments":{"nodes":[{"author":{"login":"thehcma"}}]},"reviewRequests":{"nodes":[]}}}}}'
+configured() {
+  bash -c "
+    set -uo pipefail
+    source '${lib}'
+    source '${profile}'
+    $(awk '/^cmd_loop_configured_agents\(\)/,/^}/' "${wait_script}")
+    agent_review_reviewers_effective_chain() { printf 'coderabbit,copilot,bugbot'; }
+    agent_review_pr_issue_comments_json() { printf '[]'; }
+    agent_review_coderabbit_head_state() { printf '%s\n' '$2'; }
+    rc=0; cmd_loop_configured_agents o/r 7 abc '$1' || rc=\$?; echo rc=\$rc" 2>&1
+}
+out="$(configured "${agents_snapshot}" none)"
+assert_contains "a Copilot review marks Copilot as configured" "$out" "copilot"
+assert_not_contains "CodeRabbit with no status is not configured" "$out" "coderabbit"
+assert_not_contains "Bugbot with no sign is not configured" "$out" "bugbot"
+out="$(configured "${empty_snapshot}" completed)"
+assert_contains "a CodeRabbit status marks CodeRabbit as configured" "$out" "coderabbit"
+assert_not_contains "no Copilot account on the PR means Copilot is not configured" "$out" "copilot"
+out="$(configured "${empty_snapshot}" unknown)"
+assert_contains "an unreadable CodeRabbit status is reported undecided" "$out" "rc=2"
+out="$(configured "${empty_snapshot}" none)"
+assert_contains "a PR with no agents lists none" "$out" "rc=0"
+
+printf '\n=== docs: the exit code and the knob are documented (#759) ===\n'
+help_text="$(bash "${wait_script}" --help 2>&1 || true)"
+assert_contains "--help lists exit 13" "$help_text" "13  no review agent has shown itself"
+assert_contains "--help documents the grace knob" "$help_text" "AGENT_REVIEW_NO_AGENT_GRACE_S"
+assert_contains "the env example documents the grace knob" "$(<"${script_dir}/../etc/agent-review.env.example")" "AGENT_REVIEW_NO_AGENT_GRACE_S"
+assert_contains "the playbook documents exit 13" "$(<"${script_dir}/../.agents/skills/ship-and-review/SKILL.md")" "NO_REVIEW_AGENT_CONFIGURED"
+assert_contains "the loop calls the check after observing quota" "$wait_text" 'cmd_loop_abort_if_no_agent_configured "${repo}" "${pr}" "${head}" "${snapshot}" "${pr_started}"'
 
 test_summary
