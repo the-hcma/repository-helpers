@@ -60,7 +60,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 - Scripts live in `scripts/` (e.g. `scripts/dep-updater`, `scripts/setup-service`). Sub-directories are allowed (e.g. `scripts/dev/start-development`).
 - Tests live in `tests/` and mirror the script name (e.g. `tests/dep-updater.test`).
 - Target **bash ≥ 5.x** (every script declares `#!/usr/bin/env bash` and uses `set -euo pipefail`).
-- External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`, `rg` (ripgrep), `actionlint`, the optional CodeRabbit CLI (`coderabbit` / `cr`, see `scripts/dev/coderabbit-cli-review`), plus the ecosystem tools being managed (`pnpm`, `pip`, `uv`, `poetry`, `cargo` + `cargo-outdated` + the `clippy` component) as optional callees. Rust is required for any repo dep-updater detects as a Cargo project — it shells out to `cargo outdated` and `cargo add`, and the Rust post-bump clippy recovery invariant below assumes a toolchain.
+- External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`, `rg` (ripgrep), `timeout` (GNU coreutils; `gtimeout` also satisfies it — the shared GitHub API executor caps every `gh` attempt with it and refuses to run uncapped without it), `actionlint`, the optional CodeRabbit CLI (`coderabbit` / `cr`, see `scripts/dev/coderabbit-cli-review`), plus the ecosystem tools being managed (`pnpm`, `pip`, `uv`, `poetry`, `cargo` + `cargo-outdated` + the `clippy` component) as optional callees. Rust is required for any repo dep-updater detects as a Cargo project — it shells out to `cargo outdated` and `cargo add`, and the Rust post-bump clippy recovery invariant below assumes a toolchain.
 
  ```bash
   rustup component add clippy             # absent under rustup's minimal profile
