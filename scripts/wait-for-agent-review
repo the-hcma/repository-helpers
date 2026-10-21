@@ -107,6 +107,8 @@ Environment:
   AGENT_REVIEW_AGENT            Agent profile name (default: copilot)
   AGENT_REVIEW_FALLBACK_AGENT   Legacy; ignored when AGENT_REVIEW_QUOTA_FALLBACK_CHAIN is unset
   AGENT_REVIEW_QUOTA_FALLBACK_CHAIN  Comma-separated quota escalation (default: coderabbit; the agent-reviewers property selects the set)
+  AGENT_REVIEW_CODERABBIT_RESUME_PAUSED  0 leaves a CodeRabbit review that auto-paused on the head paused
+                                         (default 1: the loop asks once per head for a full review, never while rate limited)
   AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE  Daily Copilot quota breadcrumb on the filesystem
                                          (default: ~/scratch/repository-helpers/copilot-review-quota.env;
                                          readable by other coding agents on this host — not posted to PRs)
@@ -1564,6 +1566,50 @@ cmd_loop_sleep_abort_if_pending() {
   return 0
 }
 
+# Resume a CodeRabbit review that auto-paused on this head (#743). A paused head has no on-push
+# review due, so the loop would wait for nothing and every push needed a hand-posted ask. The
+# last-resort full review is the same gated ask: once per head with a marker, never while rate
+# limited (CodeRabbit's stated wait is honoured), and the early-complete gate stays closed until
+# CodeRabbit answers (cmd_loop_coderabbit_answer_outstanding). AGENT_REVIEW_CODERABBIT_RESUME_PAUSED=0
+# leaves a paused review paused. Returns 0 when an ask was just posted (the caller polls again), 1
+# when there is nothing to resume or to ask.
+cmd_loop_resume_paused_coderabbit() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r snapshot="${4:-}"
+  local sent_rc=0 helper_rc=0 saved_agent profiles_dir
+
+  if [[ "${AGENT_REVIEW_CODERABBIT_RESUME_PAUSED:-1}" == '0' ]]; then
+    return 1
+  fi
+  if [[ "$(agent_review_coderabbit_head_state "${repo}" "${head}")" != 'other' ]] \
+    || ! agent_review_coderabbit_head_paused "${repo}" "${head}"; then
+    return 1
+  fi
+  if [[ -n "${snapshot}" ]] \
+    && agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    return 1
+  fi
+  if agent_review_agent_quota_rate_limited_for_agent 'coderabbit'; then
+    return 1
+  fi
+  profiles_dir="$(cd "${script_dir}/lib/agent-review-profiles" && pwd)"
+  # shellcheck disable=SC1090,SC1091  # profile loaded at runtime for last-resort helpers
+  source "${profiles_dir}/coderabbit"
+  agent_review_coderabbit_full_review_already_sent "${repo}" "${pr}" "${head}" || sent_rc=$?
+  if (( sent_rc != 1 )); then
+    return 1
+  fi
+  saved_agent="${AGENT_REVIEW_AGENT:-copilot}"
+  agent_review_use_agent 'coderabbit'
+  printf 'wait-for-agent-review: CodeRabbit paused its review of head %s (PR #%s) — asking it to resume with a full review\n' \
+    "${head:0:7}" "${pr}" >&2
+  agent_review_profile_request_last_resort_full_review "${repo}" "${pr}" "${head}" || helper_rc=$?
+  agent_review_use_agent "${saved_agent}"
+  (( helper_rc == 0 ))
+}
+
 # Sleep until CodeRabbit retry_after (if any), then wait for automatic on-push review.
 # Ordinary "@coderabbitai review" is never posted. After cooldown +
 # AGENT_REVIEW_CODERABBIT_POST_COOLDOWN_GRACE (default 60s), if still no review on head,
@@ -2225,6 +2271,16 @@ cmd_loop() {
       pending_exit=0
       cmd_loop_sleep_abort_if_pending "${repo}" "${pr}" \
         "${agent_review_default_poll_interval_s}" 'CodeRabbit workflow' || pending_exit=$?
+      if (( pending_exit == 3 )); then
+        return 3
+      fi
+      continue
+    fi
+    if (( coderabbit_active == 1 )) \
+      && cmd_loop_resume_paused_coderabbit "${repo}" "${pr}" "${head}" "${snapshot}"; then
+      pending_exit=0
+      cmd_loop_sleep_abort_if_pending "${repo}" "${pr}" \
+        "${agent_review_default_poll_interval_s}" 'CodeRabbit resume reply' || pending_exit=$?
       if (( pending_exit == 3 )); then
         return 3
       fi
