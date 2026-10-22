@@ -10391,6 +10391,8 @@ rp_fetch_systemd_unit_names() {
 # last assignment of a key wins; other sections and comments are ignored; a line
 # ending in a backslash continues on the next line, as in systemd; booleans are
 # systemd's 1/yes/y/true/t/on):
+#   (none)            - a unit that mails through sendmail (a `mails-via-sendmail` comment, or a
+#                       [Service] line naming sendmail or SMTP_HOST=localhost) is exempt (#765)
 #   no_new_privileges - NoNewPrivileges is not a true boolean
 #   sandboxing        - none of ProtectSystem= / ProtectHome= / PrivateTmp= (enabled values),
 #                       RestrictAddressFamilies= (non-empty) or CapabilityBoundingSet= (any
@@ -10400,7 +10402,7 @@ rp_fetch_systemd_unit_names() {
 # an empty assignment resets them.
 rp_systemd_unit_hardening_gaps() {
   local text="$1"
-  local line key val in_service=0 pending=""
+  local line key val in_service=0 pending="" mails_via_sendmail=0
   local -A service_values=()
 
   while IFS= read -r line; do
@@ -10414,7 +10416,14 @@ rp_systemd_unit_hardening_gaps() {
     line="${pending}${line}"
     pending=""
     case "$line" in
-      '' | '#'* | ';'*) continue ;;
+      '#'* | ';'*)
+        # Opt-out marker for a unit that mails through setgid sendmail (repository-helpers#765).
+        if [[ "${line,,}" == *'mails-via-sendmail'* ]]; then
+          mails_via_sendmail=1
+        fi
+        continue
+        ;;
+      '') continue ;;
       '['*)
         if [[ "$line" == '[Service]'* ]]; then
           in_service=1
@@ -10426,6 +10435,10 @@ rp_systemd_unit_hardening_gaps() {
       *) ;;
     esac
     (( in_service == 1 )) || continue
+    # A directive that calls sendmail or selects local delivery marks a mailing unit.
+    if [[ "${line,,}" == *sendmail* || "${line,,}" == *smtp_host=localhost* ]]; then
+      mails_via_sendmail=1
+    fi
     [[ "$line" == *=* ]] || continue
     key="${line%%=*}"
     key="${key%"${key##*[![:space:]]}"}"
@@ -10437,6 +10450,14 @@ rp_systemd_unit_hardening_gaps() {
     service_values["$key"]="${val,,}"
   # The extra newline ends a continuation left open at EOF, which systemd still parses.
   done <<<"${text}"$'\n'
+
+  # A unit that mails through setgid sendmail(1) must not run with no_new_privs: the kernel then
+  # ignores the setgid bit and sendmail hangs. NoNewPrivileges= and the seccomp-style directives
+  # (RestrictAddressFamilies=, SystemCallFilter=, ...) all force it in a user manager, and the
+  # mount-namespace directives are untested there, so no hardening is suggested (#765).
+  if (( mails_via_sendmail == 1 )); then
+    return 0
+  fi
 
   case "${service_values[NoNewPrivileges]-}" in
     true | yes | y | t | on | 1) ;;
@@ -10525,7 +10546,7 @@ rp_check_systemd_unit_hardening() {
       rp_log_suggest "${slug}: add NoNewPrivileges=true to [Service] in etc/systemd/{$(
         IFS=,
         printf '%s' "${no_nnp_units[*]}"
-      )} (cheap and almost always safe)"
+      )} (cheap and almost always safe, but skip it for a unit that mails through setgid sendmail: add a 'mails-via-sendmail' comment to the unit; NoNewPrivileges=, RestrictAddressFamilies= and the other seccomp directives imply no_new_privs in a user manager)"
     fi
     if [[ "${#no_sandbox_units[@]}" -gt 0 ]]; then
       rp_log_suggest "${slug}: etc/systemd/{$(
