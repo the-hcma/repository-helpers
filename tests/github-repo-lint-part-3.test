@@ -636,7 +636,8 @@ if [[ "$args" == *'api repos/the-hcma/target --jq .default_branch'* ]]; then
   exit 0
 fi
 if [[ "${1:-}" == 'pr' && "${2:-}" == 'list' ]]; then
-  printf '42\n'
+  # url lookup (open candidate PR?) finds none; number lookup finds 42
+  [[ "$args" == *'--json url'* ]] || printf '42\n'
   exit 0
 fi
 if [[ "${1:-}" == 'pr' && "${2:-}" == 'edit' ]]; then
@@ -767,7 +768,8 @@ if [[ "$args" == *'stack init'* ]]; then
   exit 1
 fi
 if [[ "${1:-}" == 'pr' && "${2:-}" == 'list' ]]; then
-  printf '42\n'
+  # url lookup (open candidate PR?) finds none; number lookup finds 42
+  [[ "$args" == *'--json url'* ]] || printf '42\n'
   exit 0
 fi
 if [[ "${1:-}" == 'pr' && "${2:-}" == 'edit' ]]; then
@@ -1000,7 +1002,10 @@ case "$args" in
     exit 0 ;;
   *'api repos/the-hcma/target --jq'*) printf 'main\n'; exit 0 ;;
 esac
-if [[ "${1:-}" == 'pr' && "${2:-}" == 'list' ]]; then printf '42\n'; exit 0; fi
+if [[ "${1:-}" == 'pr' && "${2:-}" == 'list' ]]; then
+  [[ "$args" == *'--json url'* ]] || printf '42\n'
+  exit 0
+fi
 if [[ "${1:-}" == 'pr' && "${2:-}" == 'edit' ]]; then exit 0; fi
 printf 'unexpected gh call: %s\n' "$args" >&2
 exit 1
@@ -1242,6 +1247,111 @@ else
   printf '[FAIL] expected --probe on the apply-fix git exit-code probes\n'
   fail=$(( fail + 1 ))
 fi
+
+printf '\n=== functional: apply-fix leaves a clone untouched when a candidate PR is open or its lookup fails ===\n'
+for variant in open fail; do
+  mock_dir="$(mktemp -d)"
+  mock_bin="${mock_dir}/bin"
+  target_repo="${mock_dir}/target"
+  gh_log="${mock_dir}/gh.log"
+  mkdir -p "$mock_bin" "$target_repo"
+  git -C "$target_repo" init --initial-branch=main -q
+  git -C "$target_repo" config user.name repo-practices-test
+  git -C "$target_repo" config user.email repo-practices-test@example.com
+  printf 'target\n' >"${target_repo}/README.md"
+  git -C "$target_repo" add README.md
+  git -C "$target_repo" commit -q -m 'chore: init'
+  git -C "$target_repo" remote add origin https://github.com/the-hcma/target.git
+  git -C "$target_repo" update-ref refs/remotes/origin/main HEAD
+  cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+printf '%s\n' "$args" >>"${GH_LOG:?}"
+if [[ "$args" == *'auth status'* ]]; then exit 0; fi
+if [[ "${1:-}" == 'pr' && "${2:-}" == 'list' ]]; then
+  if [[ "${PR_LIST_MODE:?}" == 'open' ]]; then
+    printf 'https://github.com/the-hcma/target/pull/7\n'
+    exit 0
+  fi
+  printf 'boom\n' >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+  chmod +x "${mock_bin}/gh"
+  cat >"${mock_dir}/run-guard" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck disable=SC1091
+source "${lib}"
+rp_apply_fix=1
+rp_queue_candidate_file_fix 'the-hcma/target' '.agents/rules/new.md' 'body' 'x' 'chore: add new'
+rp_apply_candidate_fix_stack 'the-hcma/target'
+EOF
+  chmod +x "${mock_dir}/run-guard"
+  set +e
+  output="$(cd "$target_repo" && PATH="${mock_bin}:${PATH}" GH_LOG="$gh_log" PR_LIST_MODE="$variant" \
+    "${mock_dir}/run-guard" 2>&1)"
+  exit_code=$?
+  set -e
+  if [[ "$exit_code" -eq 0 ]] \
+    && [[ ! -d "${target_repo}/.worktrees" ]] \
+    && [[ -z "$(git -C "$target_repo" branch --list 'repo-practices/*')" ]] \
+    && ! grep -qE 'stack (init|submit)|api ' "$gh_log"; then
+    printf '[PASS] apply-fix (%s): no worktree, branch or push is made when the candidate PR state is open or unknown\n' "$variant"
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] apply-fix (%s): expected a no-op (exit=%s)\n%s\n' "$variant" "$exit_code" "$output"
+    fail=$(( fail + 1 ))
+  fi
+  rm -rf "$mock_dir"
+done
+
+printf '\n=== functional: API apply-fix does not replace the branch when the open-PR lookup fails ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+gh_log="${mock_dir}/gh.log"
+mkdir -p "$mock_bin" "${mock_dir}/empty-scan-root" "${mock_dir}/cwd"
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+printf '%s\n' "$args" >>"${GH_LOG:?}"
+case "$args" in
+  *'auth status'*) exit 0 ;;
+  *'repos/the-hcma/target --jq'*) printf 'main\n'; exit 0 ;;
+  *'git/ref/heads/main'*) printf 'basesha\n'; exit 0 ;;
+esac
+if [[ "${1:-}" == 'pr' && "${2:-}" == 'list' ]]; then exit 1; fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+cat >"${mock_dir}/run-lookup-fail" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck disable=SC1091
+source "${lib}"
+rp_apply_fix=1
+rp_queue_candidate_file_fix 'the-hcma/target' '.agents/rules/new.md' 'body' 'x' 'chore: add new'
+rp_apply_candidate_fix_stack 'the-hcma/target'
+EOF
+chmod +x "${mock_dir}/run-lookup-fail"
+set +e
+output="$(cd "${mock_dir}/cwd" && PATH="${mock_bin}:${PATH}" GH_LOG="$gh_log" \
+  GITHUB_REPO_LINT_SCAN_ROOT="${mock_dir}/empty-scan-root" "${mock_dir}/run-lookup-fail" 2>&1)"
+set -e
+if grep -qF 'could not check for an open PR on repo-practices/candidate-fixes' <<<"$output" \
+  && ! grep -qE 'DELETE|POST|PUT|pr create' "$gh_log"; then
+  printf '[PASS] API apply-fix: a failed open-PR lookup makes no ref delete, create or write\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] API apply-fix: expected no mutation after a failed lookup\n%s\ngh_log:\n%s\n' "$output" "$(cat "$gh_log" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
 
 printf '\n=== summary ===\n'
 printf '%s passed, %s failed\n' "$pass" "$fail"

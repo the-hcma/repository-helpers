@@ -5723,7 +5723,9 @@ rp_apply_file_pr_via_api() {
   set -e
   pr_url="${pr_url//$'\n'/}"
   if (( pr_list_exit_code != 0 )); then
-    pr_url=""
+    # Unknown PR state: replacing the branch below could close an open PR, so touch nothing.
+    rp_log_warn "${slug}: could not check for an open PR on ${branch_name}; leaving the branch untouched"
+    return 1
   fi
   if [[ -n "$pr_url" ]]; then
     # Every queued file shares this branch, so files queued after the PR opened are not added to it:
@@ -6261,7 +6263,12 @@ rp_prepare_candidate_worktree() {
     set -e
     status="${status//$'\n'/}"
     if [[ -n "$status" ]]; then
-      rp_die "candidate fix worktree has local changes: ${worktree_path}"
+      # Scratch worktree owned by this tool (a failed earlier run leaves it dirty): reset it.
+      rp_log_warn "resetting leftover changes in candidate fix worktree: ${worktree_path}"
+      runner_exec "repo-practices git reset leftover candidate" \
+        -- git -C "$worktree_path" reset --hard
+      runner_exec "repo-practices git clean leftover candidate" \
+        -- git -C "$worktree_path" clean --force -d
     fi
     printf '%s\n' "$worktree_path"
     return 0
@@ -6310,7 +6317,7 @@ rp_apply_candidate_fix_stack() {
   local branch created_any path_dir status
   local stacking_tool show_ref_exit_code diff_exit_code quoted_wt
   local pr_number pr_list_exit_code pr_edit_exit_code pr_body
-  local pr_body_file mktemp_exit_code
+  local pr_body_file mktemp_exit_code open_pr_url open_pr_exit_code
   local -a paths=()
 
   if [[ "$rp_apply_fix" -ne 1 ]]; then
@@ -6340,7 +6347,24 @@ rp_apply_candidate_fix_stack() {
     if rp_apply_candidate_fixes_via_api "$slug"; then
       return 0
     fi
-    rp_log_warn "${slug}: candidate workflow PRs require running --apply-fix from the local clone"
+    rp_log_warn "${slug}: not every candidate fix could be applied without a local clone; run --apply-fix from the clone"
+    return 0
+  fi
+
+  # An open candidate PR owns the branch: rebuilding it would force-push over review changes.
+  open_pr_url=''
+  open_pr_exit_code=0
+  open_pr_url="$(github_api_exec_with_rate_limit_retry "repo-practices gh pr list open candidate" \
+    -- gh pr list --repo "$slug" --head "$rp_candidate_batch_branch" --state open --json url \
+      --jq '.[0].url // empty')" \
+    || open_pr_exit_code=$?
+  open_pr_url="${open_pr_url//$'\n'/}"
+  if (( open_pr_exit_code != 0 )); then
+    rp_log_warn "${slug}: could not check for an open PR on ${rp_candidate_batch_branch}; skipping candidate fixes"
+    return 0
+  fi
+  if [[ -n "$open_pr_url" ]]; then
+    rp_log_warn "${slug}: candidate fixes PR already exists: ${open_pr_url}; not adding ${paths[*]} (merge or close it, then re-run --apply-fix)"
     return 0
   fi
 
