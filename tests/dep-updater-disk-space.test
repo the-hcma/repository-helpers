@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Tests for the dep-updater --batch --all free-disk preflight (repository-helpers#768).
+# shellcheck disable=SC2016  # bash -c programs are single-quoted so the child shell expands them
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/dep-updater"
+readonly script
+
+tmp="$(mktemp -d)"
+readonly tmp
+trap 'rm -rf "$tmp"' EXIT
+
+# Copies named top-level functions out of dep-updater (it runs main on source, so it cannot be sourced).
+extract_functions() {
+  local fn
+  for fn in "$@"; do
+    awk -v fn="$fn" '$0 == fn "() {" { on = 1 } on { print } on && $0 == "}" { exit }' "$script"
+  done
+}
+extract_functions batch_all_free_mb batch_all_min_free_mb batch_all_check_free_space >"${tmp}/functions"
+
+# run_case <df-avail-mb|unreadable> [env assignments...]: runs the check against /scratch with a
+# stubbed df and prints "rc=<n>" after the combined output. Nothing touches a real filesystem.
+run_case() {
+  local -r avail="$1"
+  shift
+  env "$@" AVAIL="$avail" bash -c '
+    set -euo pipefail
+    source "$1"
+    log() { printf "%s\n" "$*"; }
+    die() { printf "DIE: %s\n" "$*" >&2; exit 9; }
+    df() {
+      if [[ "$AVAIL" == unreadable ]]; then return 1; fi
+      printf "Avail\n%s\n" "$AVAIL"
+    }
+    rc=0
+    batch_all_check_free_space /scratch || rc=$?
+    printf "rc=%s\n" "$rc"
+  ' _ "${tmp}/functions" 2>&1
+}
+
+printf '\n=== free-space probe ===\n'
+out="$(AVAIL=4096 bash -c 'source "$1"; df() { printf "Avail\n 4096\n"; }; batch_all_free_mb /x' _ "${tmp}/functions")"
+assert_contains "free space is read in MiB from df --output=avail" "$out" "4096"
+out="$(bash -c 'source "$1"; df() { return 1; }; printf "[%s]" "$(batch_all_free_mb /x)"' _ "${tmp}/functions")"
+assert_contains "an unreadable df result gives an empty value" "$out" "[]"
+out="$(bash -c 'source "$1"; df() { printf "Avail\nnot-a-number\n"; }; printf "[%s]" "$(batch_all_free_mb /x)"' _ "${tmp}/functions")"
+assert_contains "a non-numeric df result gives an empty value" "$out" "[]"
+
+printf '\n=== threshold ===\n'
+out="$(run_case 3072)"
+assert_contains "exactly the default 3072 MiB passes" "$out" "rc=0"
+out="$(run_case 3071)"
+assert_contains "one MiB under the default 3072 fails" "$out" "rc=1"
+out="$(run_case 500 DEP_UPDATER_MIN_FREE_MB=400)"
+assert_contains "DEP_UPDATER_MIN_FREE_MB lowers the threshold" "$out" "rc=0"
+out="$(run_case 5000 DEP_UPDATER_MIN_FREE_MB=6000)"
+assert_contains "DEP_UPDATER_MIN_FREE_MB raises the threshold" "$out" "required_mb=6000"
+for bad in 0 abc -5 1.5; do
+  out="$(run_case 5000 DEP_UPDATER_MIN_FREE_MB="$bad")" || true
+  assert_contains "DEP_UPDATER_MIN_FREE_MB='${bad}' is an error" "$out" "DIE: DEP_UPDATER_MIN_FREE_MB must be a positive integer"
+done
+
+printf '\n=== preflight ===\n'
+out="$(run_case 100)"
+assert_contains "low disk prints the machine-parseable line" "$out" \
+  "ERROR: LOW_DISK_SPACE path=/scratch free_mb=100 required_mb=3072"
+assert_count_equals "low disk prints exactly one ERROR line" "$out" "ERROR:" 1
+assert_contains "low disk returns non-zero" "$out" "rc=1"
+out="$(run_case 100000)"
+assert_not_contains "enough disk prints no error" "$out" "ERROR:"
+assert_contains "enough disk returns zero" "$out" "rc=0"
+out="$(run_case unreadable)"
+assert_contains "an unreadable df result is a NOTE" "$out" "could not read free disk space under /scratch"
+assert_contains "an unreadable df result never blocks the run" "$out" "rc=0"
+assert_not_contains "an unreadable df result is not an ERROR" "$out" "ERROR:"
+
+printf '\n=== static: wiring ===\n'
+reap_line="$(grep -n 'batch_all_reap_stale_ephemeral_roots "\$ephemeral_base"' "$script" | tail -n 1 | cut -d: -f1)"
+check_line="$(grep -n 'batch_all_check_free_space "\$ephemeral_base" || return 1' "$script" | cut -d: -f1)"
+mktemp_line="$(grep -n 'mktemp -d "\${ephemeral_base}/dep-updater-batch-clones.XXXXXX"' "$script" | cut -d: -f1)"
+if [[ -n "$reap_line" && -n "$check_line" && -n "$mktemp_line" ]] \
+  && (( reap_line < check_line && check_line < mktemp_line )); then
+  pass_case "the preflight runs after the stale-clone reaper and before the clone root exists"
+else
+  fail_case "the preflight runs after the stale-clone reaper and before the clone root exists (reap=${reap_line:-?} check=${check_line:-?} mktemp=${mktemp_line:-?})"
+fi
+override="$(grep -n "No space left on device" "$script" | cut -d: -f1 | head -n 1)"
+fallback="$(grep -n "root_cause=\"\$(tail -n 1 \"\$child_clean\"" "$script" | cut -d: -f1 | head -n 1)"
+if [[ -n "$override" && -n "$fallback" ]] && (( override < fallback )); then
+  pass_case "a child log with 'No space left on device' sets the root cause before the log-tail fallback"
+else
+  fail_case "a child log with 'No space left on device' sets the root cause before the log-tail fallback"
+fi
+assert_contains "the child override names LOW_DISK_SPACE" "$(cat "$script")" 'root_cause="LOW_DISK_SPACE:'
+assert_contains "AGENTS.md documents the preflight" "$(cat "${script_dir}/../AGENTS.md")" "DEP_UPDATER_MIN_FREE_MB"
+assert_contains "dep-updater-batch-run explains a low-disk stop in the email" \
+  "$(cat "${script_dir}/../scripts/dep-updater-batch-run")" "ERROR: LOW_DISK_SPACE"
+
+test_summary

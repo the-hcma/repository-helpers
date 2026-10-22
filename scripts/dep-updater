@@ -10188,6 +10188,14 @@ batch_all_process_repo() {
     child_clean="$(mktemp)"
     sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' "$child_log" >"$child_clean" 2>/dev/null || cp "$child_log" "$child_clean"
 
+    # A full disk surfaces downstream as an unrelated error (e.g. an empty CI status), so name it
+    # as the root cause whenever the child log shows it (repository-helpers#768).
+    if grep -qF 'No space left on device' "$child_clean" 2>/dev/null; then
+      root_cause="LOW_DISK_SPACE: 'No space left on device' in the child log; free disk space on the batch host (temp dir: ${wt_tmpdir:-${TMPDIR:-/tmp}}) and re-run"
+      printf '%s\n' "$(basename "$repo"): ${root_cause}" >>"${prefix}.details"
+      detail_count=$((detail_count + 1))
+    fi
+
     if [[ -z "$root_cause" ]] \
       || dep_updater_primary_is_generic "$root_cause" "$child_exit"; then
       scraped=""
@@ -10360,6 +10368,52 @@ batch_all_stop_workers() {
     fi
     tries=$(( tries + 1 ))
   done
+}
+
+# batch_all_free_mb <dir>
+# Prints the free space, in MiB, on the filesystem that holds <dir>; empty when it cannot be read.
+batch_all_free_mb() {
+  local -r dir="$1"
+  local avail
+
+  avail="$(df --output=avail --block-size=1M -- "$dir" 2>/dev/null | tail -n 1 | tr -d '[:space:]' || true)"
+  if [[ "$avail" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$avail"
+  fi
+}
+
+# batch_all_min_free_mb
+# Minimum free MiB a --batch --all run needs under its temp directory: DEP_UPDATER_MIN_FREE_MB
+# (positive integer) or the default. A set but invalid value is an error, like DEP_UPDATER_JOBS.
+batch_all_min_free_mb() {
+  local -r default_mb=3072
+
+  if [[ -n "${DEP_UPDATER_MIN_FREE_MB:-}" && ! "${DEP_UPDATER_MIN_FREE_MB}" =~ ^[1-9][0-9]*$ ]]; then
+    die "DEP_UPDATER_MIN_FREE_MB must be a positive integer (got '${DEP_UPDATER_MIN_FREE_MB}')"
+  fi
+  printf '%s' "${DEP_UPDATER_MIN_FREE_MB:-$default_mb}"
+}
+
+# batch_all_check_free_space <dir>
+# A full temp filesystem used to surface as an unrelated "could not determine CI status" failure
+# after PRs were already open (repository-helpers#768). Fail up front instead, with one
+# machine-parseable line and before any clone root or PR exists. An unreadable df result is a
+# NOTE, not a failure: the check must never block a healthy host.
+batch_all_check_free_space() {
+  local -r dir="$1"
+  local free_mb required_mb
+
+  required_mb="$(batch_all_min_free_mb)" || return 1
+  free_mb="$(batch_all_free_mb "$dir")"
+  if [[ -z "$free_mb" ]]; then
+    log "[batch-all] NOTE: could not read free disk space under ${dir}; skipping the low-disk preflight"
+    return 0
+  fi
+  if (( free_mb < required_mb )); then
+    log "ERROR: LOW_DISK_SPACE path=${dir} free_mb=${free_mb} required_mb=${required_mb}"
+    return 1
+  fi
+  return 0
 }
 
 # batch_all_default_jobs
@@ -10642,6 +10696,7 @@ batch_all_dispatch() {
 
   ephemeral_base="${wt_tmpdir:-${TMPDIR:-/tmp}}"
   batch_all_reap_stale_ephemeral_roots "$ephemeral_base"
+  batch_all_check_free_space "$ephemeral_base" || return 1
   _batch_all_ephemeral_root=""
   _batch_all_ephemeral_root="$(runner_exec_stdout "batch-all mktemp ephemeral clone root" \
     -- mktemp -d "${ephemeral_base}/dep-updater-batch-clones.XXXXXX")"
