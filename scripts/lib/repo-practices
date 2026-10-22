@@ -10391,9 +10391,8 @@ rp_fetch_systemd_unit_names() {
 # last assignment of a key wins; other sections and comments are ignored; a line
 # ending in a backslash continues on the next line, as in systemd; booleans are
 # systemd's 1/yes/y/true/t/on):
-#   (none)            - a unit that mails through sendmail is exempt (#765): a `mails-via-sendmail`
-#                       comment, an Exec*= whose executable is sendmail, or an Environment= whose last SMTP_HOST is
-#                       exactly localhost
+#   (none)            - a unit carrying a `mails-via-sendmail` comment is exempt (#765): it mails
+#                       through setgid sendmail(1), which hangs under no_new_privs
 #   no_new_privileges - NoNewPrivileges is not a true boolean
 #   sandboxing        - none of ProtectSystem= / ProtectHome= / PrivateTmp= (enabled values),
 #                       RestrictAddressFamilies= (non-empty) or CapabilityBoundingSet= (any
@@ -10404,9 +10403,6 @@ rp_fetch_systemd_unit_names() {
 rp_systemd_unit_hardening_gaps() {
   local text="$1"
   local line key val in_service=0 pending="" mails_via_sendmail=0
-  local exec_word exec_is_first env_token env_name env_value env_rest flag
-  local -a env_tokens=() exec_words=()
-  local -A sendmail_by_exec_key=() smtp_host_by_var=()
   local -A service_values=()
 
   while IFS= read -r line; do
@@ -10448,63 +10444,6 @@ rp_systemd_unit_hardening_gaps() {
     val="${val#"${val%%[![:space:]]*}"}"
     val="${val%"${val##*[![:space:]]}"}"
     service_values["$key"]="${val,,}"
-    # A command that runs sendmail, or an Environment= that selects local delivery (the whole
-    # value, not localhost.example.com), marks a mailing unit.
-    case "$key" in
-      ExecStart | ExecStartPre | ExecStartPost | ExecCondition | ExecReload | ExecStop | ExecStopPost)
-        # The executable is the first word, after systemd's @-:+!| prefixes; its basename must be sendmail.
-        # An empty assignment resets that directive's command list (e.g. ExecStart=).
-        if [[ -z "$val" ]]; then
-          sendmail_by_exec_key["$key"]=0
-        fi
-        # One line can chain commands with a standalone `;` word (any whitespace around it): the
-        # first word of each command is its executable.
-        read -r -a exec_words <<<"$val"
-        exec_is_first=1
-        for exec_word in "${exec_words[@]}"; do
-          if [[ "$exec_word" == ';' ]]; then
-            exec_is_first=1
-            continue
-          fi
-          if (( exec_is_first == 0 )); then
-            continue
-          fi
-          exec_is_first=0
-          while [[ "$exec_word" =~ ^[@:+!|-] ]]; do
-            exec_word="${exec_word#?}"
-          done
-          if [[ "${exec_word##*/}" == 'sendmail' ]]; then
-            sendmail_by_exec_key["$key"]=1
-          fi
-        done
-        ;;
-      Environment)
-        # The later assignment of a variable wins, and an empty Environment= resets them all.
-        if [[ -z "$val" ]]; then
-          smtp_host_by_var=()
-        fi
-        # Split into systemd assignments: a double- or single-quoted word is one assignment.
-        env_tokens=()
-        env_rest="$val"
-        while [[ "$env_rest" =~ ^[[:space:]]*(\"([^\"]*)\"|\'([^\']*)\'|([^[:space:]\"\']+)) ]]; do
-          env_tokens+=("${BASH_REMATCH[2]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}")
-          env_rest="${env_rest:${#BASH_REMATCH[0]}}"
-        done
-        for env_token in "${env_tokens[@]}"; do
-          # Match the variable name case-insensitively but compare its value to the literal localhost.
-          env_name="${env_token%%=*}"
-          env_value="${env_token#*=}"
-          if [[ "$env_token" == *=* && "${env_name,,}" == *smtp_host ]]; then
-            if [[ "$env_value" == 'localhost' ]]; then
-              smtp_host_by_var["$env_name"]=1
-            else
-              smtp_host_by_var["$env_name"]=0
-            fi
-          fi
-        done
-        ;;
-      *) ;;
-    esac
   # The extra newline ends a continuation left open at EOF, which systemd still parses.
   done <<<"${text}"$'\n'
 
@@ -10512,11 +10451,6 @@ rp_systemd_unit_hardening_gaps() {
   # ignores the setgid bit and sendmail hangs. NoNewPrivileges= and the seccomp-style directives
   # (RestrictAddressFamilies=, SystemCallFilter=, ...) all force it in a user manager, and the
   # mount-namespace directives are untested there, so no hardening is suggested (#765).
-  for flag in "${sendmail_by_exec_key[@]}" "${smtp_host_by_var[@]}"; do
-    if (( flag == 1 )); then
-      mails_via_sendmail=1
-    fi
-  done
   if (( mails_via_sendmail == 1 )); then
     return 0
   fi
