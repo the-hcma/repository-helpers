@@ -10392,8 +10392,8 @@ rp_fetch_systemd_unit_names() {
 # ending in a backslash continues on the next line, as in systemd; booleans are
 # systemd's 1/yes/y/true/t/on):
 #   (none)            - a unit that mails through sendmail is exempt (#765): a `mails-via-sendmail`
-#                       comment, an Exec*= command running sendmail, or an Environment= that sets
-#                       SMTP_HOST=localhost exactly
+#                       comment, an Exec*= whose executable is sendmail, or an Environment= whose last SMTP_HOST is
+#                       exactly localhost
 #   no_new_privileges - NoNewPrivileges is not a true boolean
 #   sandboxing        - none of ProtectSystem= / ProtectHome= / PrivateTmp= (enabled values),
 #                       RestrictAddressFamilies= (non-empty) or CapabilityBoundingSet= (any
@@ -10404,6 +10404,8 @@ rp_fetch_systemd_unit_names() {
 rp_systemd_unit_hardening_gaps() {
   local text="$1"
   local line key val in_service=0 pending="" mails_via_sendmail=0
+  local exec_word env_token sendmail_exec=0 local_smtp_host=0
+  local -a env_tokens=()
   local -A service_values=()
 
   while IFS= read -r line; do
@@ -10449,14 +10451,29 @@ rp_systemd_unit_hardening_gaps() {
     # value, not localhost.example.com), marks a mailing unit.
     case "$key" in
       Exec*)
-        if [[ "${val,,}" =~ (^|[[:space:]/@:+!\-])sendmail([[:space:]]|$) ]]; then
-          mails_via_sendmail=1
+        # The executable is the first word, after systemd's @-:+! prefixes; its basename must be sendmail.
+        exec_word="${val%%[[:space:]]*}"
+        while [[ "$exec_word" =~ ^[@:+!-] ]]; do
+          exec_word="${exec_word#?}"
+        done
+        if [[ "${exec_word##*/}" == 'sendmail' ]]; then
+          sendmail_exec=1
         fi
         ;;
       Environment)
-        if [[ "${val,,}" =~ (^|[[:space:]\"\'])[a-z0-9_]*smtp_host=localhost([[:space:]\"\']|$) ]]; then
-          mails_via_sendmail=1
+        # The later assignment of a variable wins, and an empty Environment= resets them all.
+        if [[ -z "$val" ]]; then
+          local_smtp_host=0
         fi
+        read -r -a env_tokens <<<"$val"
+        for env_token in "${env_tokens[@]}"; do
+          env_token="${env_token//[\"\']/}"
+          case "${env_token,,}" in
+            *smtp_host=localhost) local_smtp_host=1 ;;
+            *smtp_host=*) local_smtp_host=0 ;;
+            *) ;;
+          esac
+        done
         ;;
       *) ;;
     esac
@@ -10467,7 +10484,7 @@ rp_systemd_unit_hardening_gaps() {
   # ignores the setgid bit and sendmail hangs. NoNewPrivileges= and the seccomp-style directives
   # (RestrictAddressFamilies=, SystemCallFilter=, ...) all force it in a user manager, and the
   # mount-namespace directives are untested there, so no hardening is suggested (#765).
-  if (( mails_via_sendmail == 1 )); then
+  if (( mails_via_sendmail == 1 || sendmail_exec == 1 || local_smtp_host == 1 )); then
     return 0
   fi
 
