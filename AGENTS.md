@@ -158,7 +158,8 @@ scripts/github-repo-lint --new-repo --repo OWNER/NAME       # checklist + SUGGES
 scripts/github-repo-lint --repo OWNER/NAME --suggest        # audit one repo with remediation lines
 scripts/github-repo-lint --all --org the-hcma               # every repo in the org
 scripts/github-repo-lint --all --org the-hcma --jobs 1      # force a serial audit (default: min(cores, 4) repos at a time)
-scripts/github-repo-lint --apply-fix --repo OWNER/NAME      # patch settings + candidate workflow PRs
+scripts/github-repo-lint --apply-fix --repo OWNER/NAME      # patch settings + one candidate PR
+scripts/github-repo-lint --apply-fix --dry-run --repo OWNER/NAME  # preview: log planned changes, write nothing
 ```
 
 `--jobs N` audits up to N repositories concurrently. Without it the count follows the host: the core count capped at 4 (more workers only queue behind the shared pacing gate), overridable with `GITHUB_REPO_LINT_JOBS` (a positive integer; anything else is an error, like `--jobs`); `--jobs 1` forces a serial run. Each repo's output is buffered and replayed in the original order and the `--compact` report is built from the same per-repo results, so the report and exit status match a serial run; output is not streamed, per-repo stdout precedes stderr, and per-process caches repeat per worker. `--apply-fix` stays serial, as does an unwritable `TMPDIR`; INT/TERM stops the workers and removes the buffers. Workers get private runner sub-sessions (`RUNNER_SESSION_DIR/worker-<n>`) because `runner_last_id` reads one shared `.order` file. All workers pace their `gh` calls through one shared state directory (`github_api_pace_gate` in `scripts/lib/github-api-rate-limit`: shared `blocked_until`, quota reserve, minimum call spacing; `flock` where available, `mkdir` lock otherwise), so one worker's rate limit pauses the others; `GITHUB_API_PACING=0` disables it. Every `gh api` / `gh pr` call in the library must go through `github_api_exec_with_rate_limit_retry` (enforced by `tests/github-api-pacing.test`).
@@ -276,7 +277,7 @@ Classic branch protection on **`main`** is also required (org standard). It comp
 | Force-push / delete | disabled |
 | `enforce_admins` | `false` (warn if enabled) |
 
-Create or repair ruleset + classic settings with `scripts/github-repo-lint --repo OWNER/NAME --apply-fix`. Run it from the target repository clone when you want candidate workflow fixes emitted as a stack under `.worktrees/repo-practices-candidate-fixes-wt`.
+Create or repair ruleset + classic settings with `scripts/github-repo-lint --repo OWNER/NAME --apply-fix`. Run it from the target repository clone when you want candidate fixes committed from a scratch worktree (`.worktrees/repo-practices-candidate-fixes-wt`); every queued file for a repo lands on one branch (`repo-practices/candidate-fixes`) as one PR per run, and the worktree and local branch are removed when the run ends. Without a clone the same single PR is built through the Contents API. Add `--dry-run` to preview: every settings write and every candidate file is logged as `[dry-run] …` and nothing is changed (repository-helpers#755).
 
 ### Org default: GitHub merge queue
 

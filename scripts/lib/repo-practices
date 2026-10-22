@@ -131,7 +131,34 @@ rp_runner_gh_api_input() {
   return "$exit_code"
 }
 
+# rp_gh_api_args_mutate [gh-api-args…]
+# True when the `gh api` arguments would write: an explicit -X/--method other than GET, or
+# field/body flags (-f, -F, --field, --raw-field, --input) with no explicit method (gh defaults to POST).
+rp_gh_api_args_mutate() {
+  local arg method='' has_body=0 take_method=0
+
+  for arg in "$@"; do
+    if (( take_method )); then
+      method="${arg^^}"
+      take_method=0
+      continue
+    fi
+    case "$arg" in
+      -X|--method) take_method=1 ;;
+      -X?*) method="${arg#-X}"; method="${method^^}" ;;
+      --method=*) method="${arg#--method=}"; method="${method^^}" ;;
+      -f|-F|--field|--raw-field|--input|-f?*|-F?*|--field=*|--raw-field=*|--input=*) has_body=1 ;;
+    esac
+  done
+  if [[ -n "$method" ]]; then
+    [[ "$method" != 'GET' ]]
+    return
+  fi
+  (( has_body ))
+}
+
 # rp_runner_gh_api_stream <label> [--probe] [gh-api-args…]
+# Under --dry-run a mutating call is logged and skipped (see rp_gh_api_args_mutate).
 # Waits and retries when GitHub returns a primary/secondary API rate limit.
 rp_runner_gh_api_stream() {
   local -r label="$1"
@@ -140,6 +167,11 @@ rp_runner_gh_api_stream() {
   if [[ "${1:-}" == '--probe' ]]; then
     probe=1
     shift
+  fi
+
+  if (( rp_dry_run )) && rp_gh_api_args_mutate "$@"; then
+    rp_log_warn "[dry-run] would call gh api ${*:1:3} (${label})"
+    return 0
   fi
 
   if (( probe )); then
@@ -201,6 +233,8 @@ rp_runner_jq_n() {
 
 rp_org="$rp_DEFAULT_ORG"
 rp_apply_fix=0
+# --dry-run (with --apply-fix): report every planned change, write nothing.
+rp_dry_run=0
 rp_suggest=0
 rp_new_repo=0
 rp_audit_all=0
@@ -227,8 +261,10 @@ declare -a rp_candidate_fix_keys=()
 declare -A rp_candidate_fix_seen=()
 declare -A rp_candidate_fix_paths=()
 declare -A rp_candidate_fix_contents=()
-declare -A rp_candidate_fix_branch_suffixes=()
 declare -A rp_candidate_fix_messages=()
+# Parallel arrays handed to rp_apply_file_pr_via_api (all files of one repo, one PR).
+declare -a rp_file_pr_paths=()
+declare -a rp_file_pr_contents=()
 declare -A rp_scan_root_clone_dirs=()
 rp_scan_root_clone_index_ready=0
 
@@ -241,7 +277,8 @@ Usage:
   scripts/${prog} --strict-onboarding --repo OWNER/NAME ...
   scripts/${prog} --all [--org ORG] [--include-private]
   scripts/${prog} --suggest [--repo OWNER/NAME ...] [--include-private]
-  scripts/${prog} --apply-fix [--repo ...]      # settings fixes + candidate workflow PRs
+  scripts/${prog} --apply-fix [--repo ...]      # settings fixes + one candidate PR per repo
+  scripts/${prog} --apply-fix --dry-run [--repo ...]  # preview: log planned changes, write nothing
 
 Audits GitHub conventions for org repositories:
 
@@ -291,6 +328,7 @@ otherwise discover org repos with release-please.yml, GitHub MQ, or merge-it lef
 --jobs N: audit up to N repositories concurrently. Default: the host core count capped at 4 (GITHUB_REPO_LINT_JOBS overrides and must be a positive integer; --jobs 1 forces a serial run). The report (including --compact), the failure summary and the
 exit status match a serial run: each repository's output is buffered and replayed in the original repo
 order. Output is not streamed, per-repo stdout precedes stderr, and per-process caches repeat per worker.
+--dry-run: with --apply-fix, log every planned settings change and candidate file instead of making it.
 Serial with --apply-fix, and when TMPDIR is not writable.
 
 Requires: gh (authenticated), jq.
@@ -5448,7 +5486,8 @@ rp_queue_candidate_file_fix() {
   local slug="$1"
   local path="$2"
   local content="$3"
-  local branch_suffix="$4"
+  # $4 (a per-file branch suffix) is accepted for call-site compatibility; every candidate for a
+  # repo now shares rp_candidate_batch_branch (repository-helpers#755).
   local message="$5"
   local key
 
@@ -5464,7 +5503,6 @@ rp_queue_candidate_file_fix() {
   rp_candidate_fix_keys+=("$key")
   rp_candidate_fix_paths[$key]="$path"
   rp_candidate_fix_contents[$key]="$content"
-  rp_candidate_fix_branch_suffixes[$key]="$branch_suffix"
   rp_candidate_fix_messages[$key]="$message"
 }
 
@@ -5636,15 +5674,15 @@ rp_candidate_fix_path_is_api_eligible() {
   return 1
 }
 
-# Create or update one file on a branch and open a PR (no local clone required).
+# Create or update the files in rp_file_pr_paths / rp_file_pr_contents (parallel arrays) on one
+# branch and open a single PR (no local clone required).
 rp_apply_file_pr_via_api() {
   local slug="$1"
-  local path="$2"
-  local content="$3"
-  local branch_name="$4"
-  local message="$5"
-  local title="$6"
-  local body="$7"
+  local branch_name="$2"
+  local message="$3"
+  local title="$4"
+  local body="$5"
+  local path content idx
   local default_branch base_sha pr_url encoded_content existing_sha existing_ref_sha
   local quoted_content
   local ref_exit_code=0 pr_list_exit_code=0 existing_exit_code=0
@@ -5661,7 +5699,7 @@ rp_apply_file_pr_via_api() {
   set -e
   default_branch="${default_branch//$'\n'/}"
   if (( default_exit_code != 0 )) || [[ -z "$default_branch" ]]; then
-    rp_log_warn "${slug}: failed to read default branch for API file PR (${path})"
+    rp_log_warn "${slug}: failed to read default branch for API file PR"
     return 1
   fi
 
@@ -5673,7 +5711,7 @@ rp_apply_file_pr_via_api() {
   set -e
   base_sha="${base_sha//$'\n'/}"
   if (( base_sha_exit_code != 0 )) || [[ -z "$base_sha" ]]; then
-    rp_log_warn "${slug}: failed to read ${default_branch} SHA for API file PR (${path})"
+    rp_log_warn "${slug}: failed to read ${default_branch} SHA for API file PR"
     return 1
   fi
 
@@ -5704,7 +5742,7 @@ rp_apply_file_pr_via_api() {
     set -e
     existing_ref_sha="${existing_ref_sha//$'\n'/}"
     if (( existing_ref_sha_exit_code != 0 )) || [[ -z "$existing_ref_sha" ]]; then
-      rp_log_warn "${slug}: failed to read existing ${branch_name} SHA for ${path}"
+      rp_log_warn "${slug}: failed to read existing ${branch_name} SHA"
       return 1
     fi
     if [[ "$existing_ref_sha" != "$base_sha" ]]; then
@@ -5713,7 +5751,7 @@ rp_apply_file_pr_via_api() {
         -X DELETE "repos/${slug}/git/refs/heads/${branch_name}" \
         >/dev/null || delete_exit_code=$?
       if (( delete_exit_code != 0 )); then
-        rp_log_warn "${slug}: failed to replace stale branch ${branch_name} for ${path}"
+        rp_log_warn "${slug}: failed to replace stale branch ${branch_name}"
         return 1
       fi
       ref_exit_code=1
@@ -5726,51 +5764,56 @@ rp_apply_file_pr_via_api() {
         -f "ref=refs/heads/${branch_name}" \
         -f "sha=${base_sha}" >/dev/null || create_ref_exit_code=$?
     if (( create_ref_exit_code != 0 )); then
-      rp_log_warn "${slug}: failed to create branch ${branch_name} for ${path}"
+      rp_log_warn "${slug}: failed to create branch ${branch_name}"
       return 1
     fi
   fi
 
-  quoted_content="$(printf '%q' "$content")"
-  encoded_content=""
-  set +e
-  encoded_content="$(runner_sh_stdout "repo-practices file-pr base64" -- \
-    "printf '%s' ${quoted_content} | base64 | tr -d '\\n'")"
-  encode_exit_code=$?
-  set -e
-  encoded_content="${encoded_content//$'\n'/}"
-  if (( encode_exit_code != 0 )) || [[ -z "$encoded_content" ]]; then
-    rp_log_warn "${slug}: failed to encode ${path} for API file PR"
-    return 1
-  fi
-  existing_sha=""
-  set +e
-  existing_sha="$(rp_runner_gh_api_stream "repo-practices gh file fix sha" --probe \
-    "repos/${slug}/contents/${path}?ref=${branch_name}" --jq '.sha')"
-  existing_exit_code=$?
-  set -e
-  existing_sha="${existing_sha//$'\n'/}"
-  if (( existing_exit_code != 0 )); then
+  for idx in "${!rp_file_pr_paths[@]}"; do
+    path="${rp_file_pr_paths[$idx]}"
+    content="${rp_file_pr_contents[$idx]}"
+    quoted_content="$(printf '%q' "$content")"
+    encoded_content=""
+    set +e
+    encoded_content="$(runner_sh_stdout "repo-practices file-pr base64" -- \
+      "printf '%s' ${quoted_content} | base64 | tr -d '\\n'")"
+    encode_exit_code=$?
+    set -e
+    encoded_content="${encoded_content//$'\n'/}"
+    if (( encode_exit_code != 0 )) || [[ -z "$encoded_content" ]]; then
+      rp_log_warn "${slug}: failed to encode ${path} for API file PR"
+      return 1
+    fi
     existing_sha=""
-  fi
+    set +e
+    existing_sha="$(rp_runner_gh_api_stream "repo-practices gh file fix sha" --probe \
+      "repos/${slug}/contents/${path}?ref=${branch_name}" --jq '.sha')"
+    existing_exit_code=$?
+    set -e
+    existing_sha="${existing_sha//$'\n'/}"
+    if (( existing_exit_code != 0 )); then
+      existing_sha=""
+    fi
 
-  put_args=(
-    -X PUT
-    "repos/${slug}/contents/${path}"
-    -f "message=${message}"
-    -f "content=${encoded_content}"
-    -f "branch=${branch_name}"
-  )
-  if [[ -n "$existing_sha" ]]; then
-    put_args+=(-f "sha=${existing_sha}")
-  fi
-  put_exit_code=0
-  rp_runner_gh_api_stream "repo-practices gh put file fix" "${put_args[@]}" \
-    >/dev/null || put_exit_code=$?
-  if (( put_exit_code != 0 )); then
-    rp_log_warn "${slug}: failed to write ${path} via Contents API"
-    return 1
-  fi
+    put_args=(
+      -X PUT
+      "repos/${slug}/contents/${path}"
+      -f "message=${message}"
+      -f "content=${encoded_content}"
+      -f "branch=${branch_name}"
+    )
+    if [[ -n "$existing_sha" ]]; then
+      put_args+=(-f "sha=${existing_sha}")
+    fi
+    put_exit_code=0
+    rp_runner_gh_api_stream "repo-practices gh put file fix" "${put_args[@]}" \
+      >/dev/null || put_exit_code=$?
+    if (( put_exit_code != 0 )); then
+      rp_log_warn "${slug}: failed to write ${path} via Contents API"
+      return 1
+    fi
+
+  done
 
   pr_url=""
   set +e
@@ -5785,18 +5828,50 @@ rp_apply_file_pr_via_api() {
   set -e
   pr_url="${pr_url//$'\n'/}"
   if (( create_pr_exit_code != 0 )) || [[ -z "$pr_url" ]]; then
-    rp_log_warn "${slug}: failed to open candidate file PR for ${path}"
+    rp_log_warn "${slug}: failed to open candidate fixes PR"
     return 1
   fi
   rp_log_warn "${slug}: created candidate file PR: ${pr_url}"
 }
 
-# Apply API-eligible queued fixes when no local clone is available.
+# Branch, commit message and PR title shared by both candidate-fix paths: every queued file for a
+# repo lands in one branch and one PR per run (repository-helpers#755).
+readonly rp_candidate_batch_branch='repo-practices/candidate-fixes'
+
+# rp_candidate_batch_message <slug> <file-count> <single-file-message>
+rp_candidate_batch_message() {
+  if (( $2 == 1 )); then
+    printf '%s' "$3"
+  else
+    printf 'chore: apply org repo-practices fixes (%s files)' "$2"
+  fi
+}
+
+# rp_candidate_batch_body <branch> <path>...
+rp_candidate_batch_body() {
+  local -r branch="$1"
+  shift
+  local path
+
+  rp_candidate_pr_rollout_notice
+  printf '\n## Summary\n'
+  printf -- '- Repository-practices remediation queued by `github-repo-lint --apply-fix` (branch `%s`).\n' "$branch"
+  for path in "$@"; do
+    printf -- '- `%s`\n' "$path"
+  done
+  printf '\n## Test plan\n'
+  printf -- '- Org cursor-rule / practices template sync only.\n'
+}
+
+# Apply API-eligible queued fixes when no local clone is available: one branch, one PR.
 rp_apply_candidate_fixes_via_api() {
   local slug="$1"
-  local key key_slug path content branch_suffix message branch_name title body
-  local applied=0 skipped_ineligible=0 apply_exit_code=0
+  local key key_slug path message title body
+  local skipped_ineligible=0 apply_exit_code=0 single_message=''
+  local -a paths=()
 
+  rp_file_pr_paths=()
+  rp_file_pr_contents=()
   for key in "${rp_candidate_fix_keys[@]}"; do
     key_slug="${key%%|*}"
     [[ "$key_slug" == "$slug" ]] || continue
@@ -5806,31 +5881,29 @@ rp_apply_candidate_fixes_via_api() {
       skipped_ineligible=1
       continue
     fi
-    content="${rp_candidate_fix_contents[$key]}"
-    branch_suffix="${rp_candidate_fix_branch_suffixes[$key]}"
-    message="${rp_candidate_fix_messages[$key]}"
-    branch_name="repo-practices/${branch_suffix}"
-    title="$message"
-    body="$(cat <<EOF
-$(rp_candidate_pr_rollout_notice)
-
-## Summary
-- Repository-practices remediation for \`${path}\`.
-
-## Test plan
-- Org cursor-rule / practices template sync only.
-EOF
-)"
-    apply_exit_code=0
-    rp_apply_file_pr_via_api "$slug" "$path" "$content" "$branch_name" \
-      "$message" "$title" "$body" || apply_exit_code=$?
-    if (( apply_exit_code != 0 )); then
-      continue
-    fi
-    applied=1
+    rp_file_pr_paths+=("$path")
+    rp_file_pr_contents+=("${rp_candidate_fix_contents[$key]}")
+    paths+=("$path")
+    single_message="${rp_candidate_fix_messages[$key]}"
   done
+  if (( ${#paths[@]} == 0 )); then
+    return 1
+  fi
 
-  if [[ "$applied" -eq 1 && "$skipped_ineligible" -eq 0 ]]; then
+  if (( rp_dry_run )); then
+    for path in "${paths[@]}"; do
+      rp_log_warn "[dry-run] ${slug}: would add or update ${path} in ${rp_candidate_batch_branch}"
+    done
+    rp_log_warn "[dry-run] ${slug}: would open one PR for ${#paths[@]} file(s)"
+    return 0
+  fi
+
+  message="$(rp_candidate_batch_message "$slug" "${#paths[@]}" "$single_message")"
+  title="$message"
+  body="$(rp_candidate_batch_body "$rp_candidate_batch_branch" "${paths[@]}")"
+  rp_apply_file_pr_via_api "$slug" "$rp_candidate_batch_branch" "$message" "$title" "$body" \
+    || apply_exit_code=$?
+  if (( apply_exit_code == 0 && skipped_ineligible == 0 )); then
     return 0
   fi
   return 1
@@ -6231,26 +6304,32 @@ rp_candidate_pr_rollout_notice() {
 
 rp_apply_candidate_fix_stack() {
   local slug="$1"
-  local repo_dir default_branch worktree_path key key_slug path content branch_suffix message
-  local branch parent_branch parent_ref created_any has_candidate path_dir status
-  local stacking_tool show_ref_exit_code diff_exit_code quoted_wt quoted_branches
-  local branch_pr_number branch_pr_list_exit_code branch_pr_edit_exit_code branch_pr_body
-  local branch_pr_body_file branch_mktemp_exit_code
-  local -a created_branches=()
+  local repo_dir default_branch worktree_path key key_slug path content message single_message
+  local branch created_any path_dir status
+  local stacking_tool show_ref_exit_code diff_exit_code quoted_wt
+  local pr_number pr_list_exit_code pr_edit_exit_code pr_body
+  local pr_body_file mktemp_exit_code
+  local -a paths=()
 
   if [[ "$rp_apply_fix" -ne 1 ]]; then
     return 0
   fi
 
-  has_candidate=0
   for key in "${rp_candidate_fix_keys[@]}"; do
     key_slug="${key%%|*}"
-    if [[ "$key_slug" == "$slug" ]]; then
-      has_candidate=1
-      break
-    fi
+    [[ "$key_slug" == "$slug" ]] || continue
+    paths+=("${rp_candidate_fix_paths[$key]}")
+    single_message="${rp_candidate_fix_messages[$key]}"
   done
-  if [[ "$has_candidate" -eq 0 ]]; then
+  if (( ${#paths[@]} == 0 )); then
+    return 0
+  fi
+
+  if (( rp_dry_run )); then
+    for path in "${paths[@]}"; do
+      rp_log_warn "[dry-run] ${slug}: would add or update ${path} in ${rp_candidate_batch_branch}"
+    done
+    rp_log_warn "[dry-run] ${slug}: would open one PR for ${#paths[@]} file(s)"
     return 0
   fi
 
@@ -6269,135 +6348,114 @@ rp_apply_candidate_fix_stack() {
 
   default_branch="$(rp_runner_gh_api_stream "repo-practices default branch" "repos/${slug}" --jq '.default_branch // "main"')"
   worktree_path="$(rp_prepare_candidate_worktree "$repo_dir" "$default_branch")"
-  parent_branch="$default_branch"
-  parent_ref="origin/${default_branch}"
+  branch="$rp_candidate_batch_branch"
+  message="$(rp_candidate_batch_message "$slug" "${#paths[@]}" "$single_message")"
+
+  # A branch left by an earlier run is stale by construction: rebuild it from the default branch.
+  show_ref_exit_code=0
+  runner_exec "repo-practices git show-ref branch" --probe \
+    -- git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${branch}" \
+    || show_ref_exit_code=$?
+  if (( show_ref_exit_code == 0 )); then
+    rp_log_warn "${slug}: replacing stale candidate branch ${branch}"
+    runner_exec "repo-practices git detach before stale branch delete" \
+      -- git -C "$worktree_path" checkout --detach "origin/${default_branch}"
+    runner_exec "repo-practices git branch delete stale" \
+      -- git -C "$worktree_path" branch -D "$branch"
+  fi
+  runner_exec "repo-practices git checkout candidate branch" \
+    -- git -C "$worktree_path" checkout -B "$branch" "origin/${default_branch}"
 
   for key in "${rp_candidate_fix_keys[@]}"; do
     key_slug="${key%%|*}"
     [[ "$key_slug" == "$slug" ]] || continue
     path="${rp_candidate_fix_paths[$key]}"
     content="${rp_candidate_fix_contents[$key]}"
-    branch_suffix="${rp_candidate_fix_branch_suffixes[$key]}"
-    message="${rp_candidate_fix_messages[$key]}"
-    branch="repo-practices/${branch_suffix}"
-
-    show_ref_exit_code=0
-    runner_exec "repo-practices git show-ref branch" \
-      -- git -C "$worktree_path" show-ref --verify --quiet "refs/heads/${branch}" \
-      || show_ref_exit_code=$?
-    if (( show_ref_exit_code == 0 )); then
-      if rp_candidate_branch_has_path "$worktree_path" "$branch" "$path"; then
-        rp_log_warn "${slug}: candidate branch already exists, skipping ${branch}"
-        parent_branch="$branch"
-        parent_ref="$branch"
-        continue
-      fi
-      rp_log_warn "${slug}: stale candidate branch ${branch} missing ${path}; recreating"
-      runner_exec "repo-practices git branch delete stale" \
-        -- git -C "$worktree_path" branch -D "$branch"
-    fi
-
-    runner_exec "repo-practices git checkout candidate branch" \
-      -- git -C "$worktree_path" checkout -B "$branch" "$parent_ref"
     path_dir="$(dirname "${worktree_path}/${path}")"
     mkdir -p "$path_dir"
     printf '%s\n' "$content" >"${worktree_path}/${path}"
     runner_exec "repo-practices git add candidate path" \
       -- git -C "$worktree_path" add "$path"
-    diff_exit_code=0
-    runner_exec "repo-practices git diff cached quiet" \
-      -- git -C "$worktree_path" diff --cached --quiet || diff_exit_code=$?
-    if (( diff_exit_code == 0 )); then
-      rp_log_warn "${slug}: candidate fix has no file changes for ${path}"
-      continue
-    fi
+  done
+  diff_exit_code=0
+  runner_exec "repo-practices git diff cached quiet" --probe \
+    -- git -C "$worktree_path" diff --cached --quiet || diff_exit_code=$?
+  if (( diff_exit_code != 0 )); then
     runner_exec "repo-practices git commit candidate fix" \
       -- git -C "$worktree_path" commit -m "$message"
     if [[ "$stacking_tool" == "$stacking_tool_value_graphite" ]]; then
       # Keep runner_sh label+script on one line for the runner-adoption ratchet.
-      runner_sh "repo-practices gt track" "cd \"${worktree_path}\" && gt track --parent \"${parent_branch}\""
+      runner_sh "repo-practices gt track" "cd \"${worktree_path}\" && gt track --parent \"${default_branch}\""
     fi
-    created_branches+=("$branch")
-    rp_log_warn "${slug}: created candidate branch ${branch} for ${path}"
-    parent_branch="$branch"
-    parent_ref="$branch"
+    rp_log_warn "${slug}: created candidate branch ${branch} for ${#paths[@]} file(s): ${paths[*]}"
     created_any=1
-  done
-
-  if [[ "$created_any" -eq 0 ]]; then
-    return 0
-  fi
-
-  if [[ "$stacking_tool" == "$stacking_tool_value_graphite" ]]; then
-    stacking_tool_submit_as "$stacking_tool_value_graphite" "$worktree_path"
   else
-    quoted_wt="$(printf '%q' "$worktree_path")"
-    quoted_branches=''
-    for branch in "${created_branches[@]}"; do
-      quoted_branches+=" $(printf '%q' "$branch")"
-    done
-    # Keep runner_sh label+script on one line for the runner-adoption ratchet.
-    runner_sh "repo-practices gh stack init" "cd ${quoted_wt} && gh stack init --base $(printf '%q' "$default_branch")${quoted_branches}"
-    stacking_tool_submit_as "$stacking_tool_value_gh_stack" "$worktree_path"
-  fi
-  status=""
-  set +e
-  status="$(rp_runner_exec_stdout "repo-practices git status after submit" \
-    -- git -C "$worktree_path" status --porcelain)"
-  set -e
-  status="${status//$'\n'/}"
-  if [[ -n "$status" ]]; then
-    rp_die "candidate fix worktree is dirty after submit: ${worktree_path}"
+    rp_log_warn "${slug}: candidate fixes produce no file changes (${paths[*]})"
   fi
 
-  # `gh stack submit` / `gt submit` generate their own minimal PR body (just a
-  # tool footer) — neither reads the commit message body. Overwrite each
-  # created branch's PR body directly so the rollout notice actually reaches
-  # the PR, not just the commit history.
-  for branch in "${created_branches[@]}"; do
-    branch_pr_number=''
-    branch_pr_list_exit_code=0
-    branch_pr_number="$(github_api_exec_with_rate_limit_retry "repo-practices gh pr list candidate stack branch" \
+  if [[ "$created_any" -eq 1 ]]; then
+    if [[ "$stacking_tool" == "$stacking_tool_value_graphite" ]]; then
+      stacking_tool_submit_as "$stacking_tool_value_graphite" "$worktree_path"
+    else
+      quoted_wt="$(printf '%q' "$worktree_path")"
+      # Keep runner_sh label+script on one line for the runner-adoption ratchet.
+      runner_sh "repo-practices gh stack init" "cd ${quoted_wt} && gh stack init --base $(printf '%q' "$default_branch") $(printf '%q' "$branch")"
+      stacking_tool_submit_as "$stacking_tool_value_gh_stack" "$worktree_path"
+    fi
+    status=""
+    set +e
+    status="$(rp_runner_exec_stdout "repo-practices git status after submit" \
+      -- git -C "$worktree_path" status --porcelain)"
+    set -e
+    status="${status//$'\n'/}"
+    if [[ -n "$status" ]]; then
+      rp_die "candidate fix worktree is dirty after submit: ${worktree_path}"
+    fi
+
+    # `gh stack submit` / `gt submit` generate their own minimal PR body (just a
+    # tool footer) — neither reads the commit message body. Overwrite the PR body
+    # directly so the rollout notice actually reaches the PR, not just the commit history.
+    pr_number=''
+    pr_list_exit_code=0
+    pr_number="$(github_api_exec_with_rate_limit_retry "repo-practices gh pr list candidate stack branch" \
       -- gh pr list --repo "$slug" --head "$branch" --state open --json number \
         --jq '.[0].number // empty')" \
-      || branch_pr_list_exit_code=$?
-    branch_pr_number="${branch_pr_number//$'\n'/}"
-    if (( branch_pr_list_exit_code != 0 )) || [[ -z "$branch_pr_number" ]]; then
+      || pr_list_exit_code=$?
+    pr_number="${pr_number//$'\n'/}"
+    if (( pr_list_exit_code != 0 )) || [[ -z "$pr_number" ]]; then
       rp_log_warn "${slug}: could not resolve PR number for candidate branch ${branch} — skipping rollout-notice body edit"
-      continue
+    else
+      pr_body="$(rp_candidate_batch_body "$branch" "${paths[@]}")"
+      pr_body_file=''
+      mktemp_exit_code=0
+      pr_body_file="$(rp_runner_exec_stdout "repo-practices mktemp candidate stack pr body" -- mktemp)" \
+        || mktemp_exit_code=$?
+      pr_body_file="${pr_body_file//$'\n'/}"
+      if (( mktemp_exit_code != 0 )) || [[ -z "$pr_body_file" ]]; then
+        rp_log_warn "${slug}: could not create a temp file for the rollout-notice body — skipping PR #${pr_number} (${branch})"
+      else
+        printf '%s' "$pr_body" >"$pr_body_file"
+        pr_edit_exit_code=0
+        github_api_exec_with_rate_limit_retry "repo-practices gh pr edit candidate stack rollout notice" \
+          -- gh pr edit "$pr_number" --repo "$slug" --body-file "$pr_body_file" \
+          >/dev/null || pr_edit_exit_code=$?
+        rm -f "$pr_body_file"
+        if (( pr_edit_exit_code != 0 )); then
+          rp_log_warn "${slug}: failed to set rollout-notice body on PR #${pr_number} (${branch})"
+        fi
+      fi
     fi
+    rp_log_warn "${slug}: submitted candidate fixes PR from ${worktree_path}"
+  fi
 
-    branch_pr_body="$(cat <<EOF
-$(rp_candidate_pr_rollout_notice)
-
-## Summary
-- Repository-practices remediation queued by \`github-repo-lint --apply-fix\` (branch \`${branch}\`).
-
-## Test plan
-- Org cursor-rule / practices template sync only.
-EOF
-)"
-    branch_pr_body_file=''
-    branch_mktemp_exit_code=0
-    branch_pr_body_file="$(rp_runner_exec_stdout "repo-practices mktemp candidate stack pr body" -- mktemp)" \
-      || branch_mktemp_exit_code=$?
-    branch_pr_body_file="${branch_pr_body_file//$'\n'/}"
-    if (( branch_mktemp_exit_code != 0 )) || [[ -z "$branch_pr_body_file" ]]; then
-      rp_log_warn "${slug}: could not create a temp file for the rollout-notice body — skipping PR #${branch_pr_number} (${branch})"
-      continue
-    fi
-    printf '%s' "$branch_pr_body" >"$branch_pr_body_file"
-    branch_pr_edit_exit_code=0
-    github_api_exec_with_rate_limit_retry "repo-practices gh pr edit candidate stack rollout notice" \
-      -- gh pr edit "$branch_pr_number" --repo "$slug" --body-file "$branch_pr_body_file" \
-      >/dev/null || branch_pr_edit_exit_code=$?
-    rm -f "$branch_pr_body_file"
-    if (( branch_pr_edit_exit_code != 0 )); then
-      rp_log_warn "${slug}: failed to set rollout-notice body on PR #${branch_pr_number} (${branch})"
-    fi
-  done
-
-  rp_log_warn "${slug}: submitted candidate workflow fix stack from ${worktree_path}"
+  # The PR lives on the remote now: drop the scratch worktree and local branch so the consumer
+  # clone is left as it was found.
+  runner_exec "repo-practices git worktree remove candidate" \
+    -- git -C "$repo_dir" worktree remove --force "$worktree_path" \
+    || rp_log_warn "${slug}: could not remove candidate worktree ${worktree_path}"
+  runner_exec "repo-practices git branch delete candidate" --probe \
+    -- git -C "$repo_dir" branch -D "$branch" \
+    || rp_log_warn "${slug}: could not delete local candidate branch ${branch}"
 }
 
 rp_apply_codeowners_pr() {
@@ -8114,6 +8172,10 @@ rp_parse_args() {
         rp_apply_fix=1
         shift
         ;;
+      --dry-run)
+        rp_dry_run=1
+        shift
+        ;;
       --suggest)
         rp_suggest=1
         shift
@@ -8160,6 +8222,10 @@ rp_parse_args() {
 
   if [[ "${GITHUB_REPO_LINT_INCLUDE_PRIVATE:-0}" == '1' ]]; then
     rp_include_private=1
+  fi
+
+  if [[ "$rp_dry_run" -eq 1 && "$rp_apply_fix" -ne 1 ]]; then
+    rp_die "--dry-run only previews --apply-fix (add --apply-fix)"
   fi
 
   if [[ "$rp_new_repo" -eq 1 ]]; then

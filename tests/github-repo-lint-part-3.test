@@ -658,6 +658,11 @@ cat >"${mock_bin}/gt" <<'MOCK_GT'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s :: %s\n' "$PWD" "$*" >>"${GT_LOG:?}"
+if [[ "${1:-}" == 'submit' ]]; then
+  # The worktree is removed after the run: record what was committed while it still exists.
+  git show --stat --format=%s HEAD >"${COMMIT_LOG:?}"
+  cp .github/workflows/cleanup-branch-on-merge.yml "${COMMIT_WORKFLOW:?}"
+fi
 MOCK_GT
 chmod +x "${mock_bin}/gt"
 
@@ -681,19 +686,21 @@ set +e
 output="$(
   cd "$target_repo" \
     && PATH="${mock_bin}:${PATH}" GT_LOG="$gt_log" PR_BODY_FILE="$pr_body_file" \
+      COMMIT_LOG="${mock_dir}/commit.log" COMMIT_WORKFLOW="${mock_dir}/committed.yml" \
       "${mock_dir}/run-candidate-stack" 2>&1
 )"
 exit_code=$?
 set -e
 
 if [[ "$exit_code" -eq 0 ]] \
-  && [[ -f "${target_wt}/.github/workflows/cleanup-branch-on-merge.yml" ]] \
-  && grep -qF 'Delete merged PR branch' \
-    "${target_wt}/.github/workflows/cleanup-branch-on-merge.yml" \
+  && grep -qF 'Delete merged PR branch' "${mock_dir}/committed.yml" \
+  && grep -qF 'chore: add branch cleanup workflow' "${mock_dir}/commit.log" \
   && grep -qF 'track --parent main' "$gt_log" \
   && grep -qF 'submit --publish --no-interactive' "$gt_log" \
-  && grep -qF 'created candidate branch repo-practices/add-cleanup-branch-on-merge' \
-    <<<"$output" \
+  && grep -qF 'created candidate branch repo-practices/candidate-fixes' <<<"$output" \
+  && [[ ! -d "$target_wt" ]] \
+  && ! git -C "$target_repo" show-ref --verify --quiet refs/heads/repo-practices/candidate-fixes \
+  && ! grep -qF '[FAIL]' <<<"$output" \
   && grep -qF 'Org rollout candidate' "$pr_body_file" \
   && grep -qF 'org-cursor-rule-rollout.md' "$pr_body_file"; then
   printf '[PASS] apply-fix: local clone gets candidate worktree and Graphite stack (ORG_DEFAULT)\n'
@@ -742,6 +749,7 @@ if [[ "$args" == 'stack --help' || "$args" == *'stack --help'* ]]; then
   exit 0
 fi
 if [[ "$args" == *'stack submit'* ]]; then
+  cp .github/workflows/cleanup-branch-on-merge.yml "${COMMIT_WORKFLOW:?}"
   exit 0
 fi
 if [[ "$args" == *'stack view --json'* ]]; then
@@ -797,19 +805,22 @@ set +e
 output="$(
   cd "$target_repo" \
     && PATH="${mock_bin}:${PATH}" GH_LOG="$gh_log" PR_BODY_FILE="$pr_body_file" \
+      COMMIT_WORKFLOW="${mock_dir}/committed.yml" \
       "${mock_dir}/run-candidate-stack" 2>&1
 )"
 exit_code=$?
 set -e
 
 if [[ "$exit_code" -eq 0 ]] \
-  && [[ -f "${target_wt}/.github/workflows/cleanup-branch-on-merge.yml" ]] \
-  && grep -qF 'stack init --base main repo-practices/add-cleanup-branch-on-merge' \
+  && grep -qF 'Delete merged PR branch' "${mock_dir}/committed.yml" \
+  && grep -qF 'stack init --base main repo-practices/candidate-fixes' \
     "$gh_log" \
   && grep -qF 'stack submit --auto --open' "$gh_log" \
   && ! grep -qF 'gt track' "$gh_log" \
-  && grep -qF 'created candidate branch repo-practices/add-cleanup-branch-on-merge' \
-    <<<"$output" \
+  && grep -qF 'created candidate branch repo-practices/candidate-fixes' <<<"$output" \
+  && [[ ! -d "$target_wt" ]] \
+  && ! git -C "$target_repo" show-ref --verify --quiet refs/heads/repo-practices/candidate-fixes \
+  && ! grep -qF '[FAIL]' <<<"$output" \
   && grep -qF 'Org rollout candidate' "$pr_body_file" \
   && grep -qF 'org-cursor-rule-rollout.md' "$pr_body_file"; then
   printf '[PASS] apply-fix: gh-stack marker uses gh stack init + submit\n'
@@ -951,6 +962,232 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$mock_dir"
+
+printf '\n=== functional: apply-fix batches every candidate file into one branch and one PR (local clone) ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+target_repo="${mock_dir}/target"
+gh_log="${mock_dir}/gh.log"
+mkdir -p "$mock_bin" "$target_repo/.github"
+
+git -C "$target_repo" init --initial-branch=main -q
+git -C "$target_repo" config user.name repo-practices-test
+git -C "$target_repo" config user.email repo-practices-test@example.com
+printf 'gh-stack\n' >"${target_repo}/.github/stacking-tool"
+printf 'target\n' >"${target_repo}/README.md"
+git -C "$target_repo" add README.md .github/stacking-tool
+git -C "$target_repo" commit -q -m 'chore: init'
+git -C "$target_repo" remote add origin https://github.com/the-hcma/target.git
+git -C "$target_repo" update-ref refs/remotes/origin/main HEAD
+mkdir -p "${target_repo}/.worktrees"
+git -C "$target_repo" worktree add -q "${target_repo}/.worktrees/repo-practices-candidate-fixes-wt" HEAD
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+printf '%s\n' "$args" >>"${GH_LOG:?}"
+case "$args" in
+  *'auth status'*|*'stack --help'*) exit 0 ;;
+  *'stack submit'*)
+    git log --format=%s -n 1 >"${COMMIT_SUBJECT:?}"
+    git show --name-only --format= HEAD >"${COMMIT_FILES:?}"
+    git rev-list --count origin/main..HEAD >"${COMMIT_COUNT:?}"
+    exit 0 ;;
+  *'stack init'*) exit 0 ;;
+  *'stack view --json'*)
+    printf '%s\n' '{"trunk":"main","currentBranch":"repo-practices/candidate-fixes","branches":[{"name":"repo-practices/candidate-fixes"}]}'
+    exit 0 ;;
+  *'api repos/the-hcma/target --jq'*) printf 'main\n'; exit 0 ;;
+esac
+if [[ "${1:-}" == 'pr' && "${2:-}" == 'list' ]]; then printf '42\n'; exit 0; fi
+if [[ "${1:-}" == 'pr' && "${2:-}" == 'edit' ]]; then exit 0; fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+cat >"${mock_dir}/run-batch" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck disable=SC1091
+source "${lib}"
+rp_apply_fix=1
+rp_queue_candidate_file_fix 'the-hcma/target' '.agents/rules/one.md' 'one body' 'one' 'chore: add one'
+rp_queue_candidate_file_fix 'the-hcma/target' '.cursor/rules/one.mdc' 'shim body' 'two' 'chore: add shim'
+rp_queue_candidate_file_fix 'the-hcma/target' 'CLAUDE.md' '@AGENTS.md' 'three' 'chore: add claude'
+rp_apply_candidate_fix_stack 'the-hcma/target'
+EOF
+chmod +x "${mock_dir}/run-batch"
+
+set +e
+output="$(
+  cd "$target_repo" \
+    && PATH="${mock_bin}:${PATH}" GH_LOG="$gh_log" \
+      COMMIT_SUBJECT="${mock_dir}/subject" COMMIT_FILES="${mock_dir}/files" \
+      COMMIT_COUNT="${mock_dir}/count" "${mock_dir}/run-batch" 2>&1
+)"
+exit_code=$?
+set -e
+
+if [[ "$exit_code" -eq 0 ]] \
+  && [[ "$(cat "${mock_dir}/count")" == '1' ]] \
+  && grep -qxF '.agents/rules/one.md' "${mock_dir}/files" \
+  && grep -qxF '.cursor/rules/one.mdc' "${mock_dir}/files" \
+  && grep -qxF 'CLAUDE.md' "${mock_dir}/files" \
+  && grep -qF 'chore: apply org repo-practices fixes (3 files)' "${mock_dir}/subject" \
+  && [[ "$(grep -c 'stack init' "$gh_log")" == '1' ]] \
+  && [[ "$(grep -c 'stack submit' "$gh_log")" == '1' ]] \
+  && [[ ! -d "${target_repo}/.worktrees/repo-practices-candidate-fixes-wt" ]] \
+  && [[ -z "$(git -C "$target_repo" branch --list 'repo-practices/*')" ]] \
+  && ! grep -qF '[FAIL]' <<<"$output"; then
+  printf '[PASS] apply-fix: three candidate files become one commit, one stack, one PR; no leftover worktree or branch; no [FAIL] probe noise\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] apply-fix: expected one batched candidate PR (exit=%s)\n%s\ngh_log:\n%s\n' \
+    "$exit_code" "$output" "$(cat "$gh_log" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
+printf '\n=== functional: apply-fix batches API-eligible files into one branch and one PR (no clone) ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+gh_log="${mock_dir}/gh.log"
+mkdir -p "$mock_bin" "${mock_dir}/empty-scan-root" "${mock_dir}/cwd"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+printf '%s\n' "$args" >>"${GH_LOG:?}"
+case "$args" in
+  *'auth status'*) exit 0 ;;
+  *'repos/the-hcma/target --jq'*) printf 'main\n'; exit 0 ;;
+  *'git/ref/heads/main'*) printf 'basesha\n'; exit 0 ;;
+  *'git/ref/heads/repo-practices/'*) exit 1 ;;
+  *'-X POST repos/the-hcma/target/git/refs'*) exit 0 ;;
+  *'contents/'*'-X PUT'*|*'-X PUT repos/the-hcma/target/contents/'*) exit 0 ;;
+  *'contents/'*) exit 1 ;;
+esac
+if [[ "${1:-}" == 'pr' && "${2:-}" == 'list' ]]; then exit 0; fi
+if [[ "${1:-}" == 'pr' && "${2:-}" == 'create' ]]; then
+  printf 'https://github.com/the-hcma/target/pull/7\n'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+cat >"${mock_dir}/run-api-batch" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck disable=SC1091
+source "${lib}"
+rp_apply_fix=1
+rp_queue_candidate_file_fix 'the-hcma/target' '.agents/rules/one.md' 'one body' 'one' 'chore: add one'
+rp_queue_candidate_file_fix 'the-hcma/target' '.cursor/rules/one.mdc' 'shim body' 'two' 'chore: add shim'
+rp_apply_candidate_fix_stack 'the-hcma/target'
+EOF
+chmod +x "${mock_dir}/run-api-batch"
+
+set +e
+output="$(
+  cd "${mock_dir}/cwd" \
+    && PATH="${mock_bin}:${PATH}" GH_LOG="$gh_log" \
+      GITHUB_REPO_LINT_SCAN_ROOT="${mock_dir}/empty-scan-root" "${mock_dir}/run-api-batch" 2>&1
+)"
+exit_code=$?
+set -e
+
+if [[ "$exit_code" -eq 0 ]] \
+  && [[ "$(grep -c 'pr create' "$gh_log")" == '1' ]] \
+  && [[ "$(grep -c -- '-X POST repos/the-hcma/target/git/refs' "$gh_log")" == '1' ]] \
+  && [[ "$(grep -c -- '-X PUT repos/the-hcma/target/contents/' "$gh_log")" == '2' ]] \
+  && grep -qF -- '--head repo-practices/candidate-fixes' "$gh_log"; then
+  printf '[PASS] apply-fix: two API-eligible files share one branch, two writes and a single PR\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] apply-fix: expected one API candidate PR (exit=%s)\n%s\ngh_log:\n%s\n' \
+    "$exit_code" "$output" "$(cat "$gh_log" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
+printf '\n=== unit: --dry-run skips every mutating gh api call and logs it ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+gh_log="${mock_dir}/gh.log"
+mkdir -p "$mock_bin"
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${GH_LOG:?}"
+exit 0
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+cat >"${mock_dir}/run-dry" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck disable=SC1091
+source "${lib}"
+rp_apply_fix=1
+rp_dry_run=1
+rp_runner_gh_api_stream 'dry patch' -X PATCH repos/o/r -f a=b
+rp_runner_gh_api_stream 'dry post fields' repos/o/r/labels -f name=x
+rp_runner_gh_api_stream 'dry put method equals' --method=PUT repos/o/r/topics
+rp_runner_gh_api_stream 'dry delete' -X DELETE repos/o/r/git/refs/heads/x
+rp_runner_gh_api_stream 'real read' repos/o/r --jq .name
+rp_runner_gh_api_stream 'explicit get with fields' -X GET search/issues -f q=x
+rp_queue_candidate_file_fix 'o/r' '.agents/rules/a.md' 'a' 'a' 'chore: a'
+rp_queue_candidate_file_fix 'o/r' '.agents/rules/b.md' 'b' 'b' 'chore: b'
+rp_apply_candidate_fix_stack 'o/r'
+EOF
+chmod +x "${mock_dir}/run-dry"
+set +e
+output="$(cd "$mock_dir" && PATH="${mock_bin}:${PATH}" GH_LOG="$gh_log" "${mock_dir}/run-dry" 2>&1)"
+exit_code=$?
+set -e
+if [[ "$exit_code" -eq 0 ]] \
+  && [[ "$(wc -l <"$gh_log" | tr -d ' ')" == '2' ]] \
+  && grep -qF 'repos/o/r --jq .name' "$gh_log" \
+  && grep -qF -- '-X GET search/issues' "$gh_log" \
+  && [[ "$(grep -c '\[dry-run\] would call gh api' <<<"$output")" == '4' ]] \
+  && grep -qF '[dry-run] o/r: would add or update .agents/rules/a.md' <<<"$output" \
+  && grep -qF '[dry-run] o/r: would open one PR for 2 file(s)' <<<"$output"; then
+  printf '[PASS] --dry-run: writes are logged and skipped, reads and explicit GETs still run, candidates are listed\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] --dry-run: expected 4 skipped writes and 2 real reads (exit=%s)\n%s\ngh_log:\n%s\n' \
+    "$exit_code" "$output" "$(cat "$gh_log" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
+printf '\n=== functional: --dry-run without --apply-fix is rejected ===\n'
+set +e
+output="$("$checker" --dry-run --repo the-hcma/target 2>&1)"
+exit_code=$?
+set -e
+if [[ "$exit_code" -ne 0 ]] && grep -qF -- '--dry-run only previews --apply-fix' <<<"$output"; then
+  printf '[PASS] --dry-run alone exits non-zero and says it needs --apply-fix\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] --dry-run alone should be rejected (exit=%s)\n%s\n' "$exit_code" "$output"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: expected non-zero git probes in apply-fix are marked --probe ===\n'
+# shellcheck disable=SC2016  # literal source fragments
+if grep -qF 'runner_exec "repo-practices git show-ref branch" --probe' "$lib" \
+  && grep -qF 'runner_exec "repo-practices git diff cached quiet" --probe' "$lib" \
+  && grep -qF 'runner_exec "repo-practices git branch delete candidate" --probe' "$lib"; then
+  printf '[PASS] show-ref, diff --cached --quiet and the local branch delete are runner probes, not failures\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected --probe on the apply-fix git exit-code probes\n'
+  fail=$(( fail + 1 ))
+fi
 
 printf '\n=== summary ===\n'
 printf '%s passed, %s failed\n' "$pass" "$fail"
