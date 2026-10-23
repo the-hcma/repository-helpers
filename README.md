@@ -52,7 +52,7 @@ With `--batch --all`, `--jobs N` runs up to N per-repository `dep-updater --batc
 
 #### Low-disk preflight
 
-`--batch --all` checks free space under its temp directory (`$TMPDIR`, else `/tmp`) before it creates the clone root. Below `DEP_UPDATER_MIN_FREE_MB` (a positive integer, default 3072) it logs one `ERROR: LOW_DISK_SPACE path=... free_mb=... required_mb=...` line and stops before any clone, worktree or PR exists; `dep-updater-batch-run` puts that line at the top of its email. A repo whose log shows `No space left on device` is reported with the root cause `LOW_DISK_SPACE` instead of a downstream symptom such as an empty CI status.
+`--batch --all` checks free space under its temp directory (`--tmpdir` when given, else `$TMPDIR`, else `/tmp`) before it creates the clone root. Below `DEP_UPDATER_MIN_FREE_MB` (a positive integer, default 3072) it logs one `ERROR: LOW_DISK_SPACE path=... free_mb=... required_mb=...` line and stops before any clone, worktree or PR exists; `dep-updater-batch-run` puts that line at the top of its email. A repo whose log shows `No space left on device` is reported with the root cause `LOW_DISK_SPACE` instead of a downstream symptom such as an empty CI status.
 
 ### `dep-updater-batch-run`
 
