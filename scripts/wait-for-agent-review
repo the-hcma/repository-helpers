@@ -1654,26 +1654,37 @@ cmd_loop_head_waited_s() {
   printf '%s\n' "$(( now - cmd_loop_head_seen_epoch ))"
 }
 
-# Prints an ISO retry_after of "now" once CodeRabbit has been silent on <head> for the silent-head
-# wait (it never reviewed, never set a status, never posted a rate-limit notice), so the caller's
-# grace + one-shot full review path runs. Returns 1 while the wait has not passed (#773).
+# Sets cmd_loop_silent_retry_after (an ISO time) and returns 0 once CodeRabbit has been silent on <head>
+# for the silent-head wait (it never reviewed, never set a status, never posted a rate-limit notice), so
+# the caller's grace + one-shot full review path runs. Returns 1 while the wait has not passed, logging the
+# reason and the time of the ask at most every cmd_loop_silent_log_every_s so a 15s poll does not flood
+# the output (#773). Call it directly, not inside $(...), so the log throttle state survives.
 # shellcheck disable=SC2154  # agent_review_default_coderabbit_silent_head_wait_s is assigned in scripts/lib/agent-review
 cmd_loop_silent_head_retry_after() {
   local -r head="$1"
   local -r pr="$2"
   local -r wait_s="${agent_review_default_coderabbit_silent_head_wait_s}"
-  local waited_s
+  local -r log_every_s=300
+  local waited_s ask_at now
 
   waited_s="$(cmd_loop_head_waited_s "${head}")"
+  # The moment the silent wait ends, not "now": a stable retry_after lets the post-cooldown grace run out
+  # on the next pass, where "now" would restart it forever.
+  ask_at="$(runner_exec_stdout "coderabbit silent head retry_after" -- \
+    date -u -d "@$(( cmd_loop_head_seen_epoch + wait_s ))" +%Y-%m-%dT%H:%M:%SZ)"
   if (( waited_s < wait_s )); then
+    now="$(runner_exec_stdout "silent head log epoch" -- date -u +%s)"
+    if (( now - ${cmd_loop_silent_logged_epoch:-0} >= log_every_s )); then
+      cmd_loop_silent_logged_epoch="${now}"
+      printf 'wait-for-agent-review: CodeRabbit has not reported on head %s for %ss (silent-head wait %ss) — a full review will be asked for on PR #%s at %s\n' \
+        "${head:0:7}" "${waited_s}" "${wait_s}" "${pr}" "${ask_at}" >&2
+    fi
     return 1
   fi
   printf 'wait-for-agent-review: CodeRabbit has not reported on head %s for %ss (silent-head wait %ss) — asking for a full review on PR #%s\n' \
     "${head:0:7}" "${waited_s}" "${wait_s}" "${pr}" >&2
-  # The moment the silent wait ended, not "now": a stable retry_after lets the post-cooldown grace
-  # run out on the next pass, where "now" would restart it forever.
-  runner_exec_stdout "coderabbit silent head retry_after" -- \
-    date -u -d "@$(( cmd_loop_head_seen_epoch + wait_s ))" +%Y-%m-%dT%H:%M:%SZ
+  cmd_loop_silent_retry_after="${ask_at}"
+  return 0
 }
 
 # Sleep until CodeRabbit retry_after (if any), then wait for automatic on-push review.
@@ -1719,7 +1730,8 @@ cmd_loop_handle_coderabbit_rate_limit() {
       if [[ "${head_state}" != 'none' ]]; then
         return 1
       fi
-      retry_after="$(cmd_loop_silent_head_retry_after "${head}" "${pr}")" || return 1
+      cmd_loop_silent_head_retry_after "${head}" "${pr}" || return 1
+      retry_after="${cmd_loop_silent_retry_after}"
     else
       # Rate limited with no cooldown on record (a push right after an earlier episode): wait a
       # bounded time from the status, then ask once, so the loop never idles with nothing to time
