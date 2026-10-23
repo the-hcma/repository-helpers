@@ -54,6 +54,16 @@ scripts/ensure-pr-conventional-title --pr <n>
 
 Multi-paragraph issue/PR bodies and comments: write a temp file, lint, then `--body-file` — see `.agents/rules/github-content-formatting.md` and `scripts/lint-github-markdown`. For issues use `scripts/gh-issue create|edit` (lint runs before the API call). Do not hand-wrap paragraphs across short physical lines — GitHub’s issue/PR UI hard-breaks on a lone newline.
 
+### Closing the issue
+
+Say in the PR description whether the merge should close the issue. Default, unless the repository's own `AGENTS.md` states a different convention (that wins):
+
+1. A PR that completes an issue puts `Closes #N.` in its description as its own sentence, so the merge closes the issue.
+2. A PR that is only one step of a larger issue says `Part of #N.` and does not close it. The last PR of the series closes the issue.
+3. A PR with a closing keyword is merged only after the user agrees the issue is done, because the merge closes it. The merge confirmation this workflow already requires covers that.
+
+Avoid applying a "no closing keywords" convention to every PR regardless of whether it finishes the issue: finished issues then stay open and need a manual close pass. Spell the keyword as `.agents/rules/github-content-formatting.md` item 3 requires.
+
 ## Agent review essentials
 
 > **Reply before resolve (required):** Post an on-thread human reply via **`reply-thread`** (or `reply-comment`) **before** **`resolve-thread`**. Exit **3** means threads lack a human reply. Pending feedback also includes operator-authored PR conversation comments until an explicit URL-citing reply + **`resolve-comment`**.

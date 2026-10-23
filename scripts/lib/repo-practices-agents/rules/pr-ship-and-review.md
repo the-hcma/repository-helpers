@@ -72,6 +72,16 @@ Patch title/body if stale. For multi-paragraph bodies use `--body-file` (see `${
 "${rh}/scripts/gh-issue" create --title '…' --body-file /tmp/issue.md
 ```
 
+### Closing the issue
+
+Say in the PR description whether the merge should close the issue. Default, unless the repository's own `AGENTS.md` states a different convention (that wins):
+
+1. A PR that completes an issue puts `Closes #N.` in its description as its own sentence, so the merge closes the issue.
+2. A PR that is only one step of a larger issue says `Part of #N.` and does not close it. The last PR of the series closes the issue.
+3. A PR with a closing keyword is merged only after the user agrees the issue is done, because the merge closes it. The merge confirmation this workflow already requires covers that.
+
+Avoid applying a "no closing keywords" convention to every PR regardless of whether it finishes the issue: finished issues then stay open and need a manual close pass. Spell the keyword as `${rh}/.agents/rules/github-content-formatting.md` item 3 requires.
+
 ## 3. Agent review loop
 
 > **Reply before resolve (required):** For every valid agent review thread (Copilot, Bugbot, CodeRabbit, …), post an **on-thread human reply** as the authenticated operator **before** resolving. Exit code **3** means threads **lack a human reply** — resolving without replying is non-compliant.
