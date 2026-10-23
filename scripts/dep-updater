@@ -10190,7 +10190,7 @@ batch_all_process_repo() {
 
     # A full disk surfaces downstream as an unrelated error (e.g. an empty CI status), so name it
     # as the root cause whenever the child log shows it (repository-helpers#768).
-    if [[ "$(<"$child_clean")" == *'No space left on device'* ]]; then
+    if batch_all_log_has_disk_full "$child_clean"; then
       root_cause="LOW_DISK_SPACE: 'No space left on device' in the child log; free disk space on the batch host (temp dir: ${wt_tmpdir:-${TMPDIR:-/tmp}}) and re-run"
       printf '%s\n' "$(basename "$repo"): ${root_cause}" >>"${prefix}.details"
       detail_count=$((detail_count + 1))
@@ -10370,19 +10370,37 @@ batch_all_stop_workers() {
   done
 }
 
-# batch_all_free_mb <dir>
-# Prints the free space, in MiB, on the filesystem that holds <dir>; empty when it cannot be read.
-batch_all_free_mb() {
+# batch_all_free_bytes <dir>
+# Prints the free space, in bytes, on the filesystem that holds <dir>; empty when it cannot be read.
+# Bytes, not 1M blocks: df rounds blocks up, so a MiB comparison could pass a filesystem that is
+# just under the threshold. Deliberately not through runner_exec_stdout: the runner keeps its capture
+# files under the temp filesystem this probe measures, so on a full disk the capture itself could fail
+# and hide the very condition being checked. A command substitution captures through a pipe.
+batch_all_free_bytes() {
   local -r dir="$1"
   local avail df_out
 
-  df_out="$(runner_exec_stdout "batch-all df free space" -- \
-    df --output=avail --block-size=1M -- "$dir" 2>/dev/null || true)"
+  df_out="$(df --output=avail --block-size=1 -- "$dir" 2>/dev/null || true)"
   avail="${df_out##*$'\n'}"
   avail="${avail//[[:space:]]/}"
   if [[ "$avail" =~ ^[0-9]+$ ]]; then
     printf '%s' "$avail"
   fi
+}
+
+# batch_all_log_has_disk_full <file>
+# Exit 0 when the log contains "No space left on device". Streams the file with builtins: no
+# external command, and a large child log is never loaded into memory whole.
+batch_all_log_has_disk_full() {
+  local -r file="$1"
+  local line
+
+  while IFS= read -r line; do
+    if [[ "$line" == *'No space left on device'* ]]; then
+      return 0
+    fi
+  done <"$file"
+  return 1
 }
 
 # batch_all_min_free_mb
@@ -10405,15 +10423,17 @@ batch_all_min_free_mb() {
 # NOTE, not a failure: the check must never block a healthy host.
 batch_all_check_free_space() {
   local -r dir="$1"
-  local free_mb required_mb
+  local free_bytes free_mb required_mb required_bytes
 
   required_mb="$(batch_all_min_free_mb)" || return 1
-  free_mb="$(batch_all_free_mb "$dir")"
-  if [[ -z "$free_mb" ]]; then
+  free_bytes="$(batch_all_free_bytes "$dir")"
+  if [[ -z "$free_bytes" ]]; then
     log "[batch-all] NOTE: could not read free disk space under ${dir}; skipping the low-disk preflight"
     return 0
   fi
-  if (( free_mb < required_mb )); then
+  required_bytes=$(( required_mb * 1048576 ))
+  if (( free_bytes < required_bytes )); then
+    free_mb=$(( free_bytes / 1048576 ))
     log "ERROR: LOW_DISK_SPACE path=${dir} free_mb=${free_mb} required_mb=${required_mb}"
     return 1
   fi
