@@ -248,6 +248,7 @@ handler() {
     run_command() { return 0; }
     # Limited for the first two checks (enter the wait, one poll chunk), then elapsed: no real sleeping.
     polls='$3'
+    ${HANDLER_PRE:-}
     agent_review_agent_quota_rate_limited_for_agent() {
       polls=\$((polls + 1))
       if (( polls <= 2 )); then return 0; fi
@@ -281,6 +282,44 @@ assert_not_contains "no ask is posted inside the bounded wait" "$(cat "${work_di
 out="$(handler "completed\\t$(date -u +%s)" '[]' 0)"
 assert_contains "a completed review needs no wait or ask" "$out" "nothing to wait for"
 assert_not_contains "no ask is posted for a completed review" "$(cat "${work_dir}/exec.log")" "gh pr comment"
+
+printf '\n=== the loop: a head CodeRabbit never reported on is asked after the silent-head wait (#773) ===\n'
+assert_contains "the silent-head wait defaults to 30 minutes" \
+  "$(run_lib "printf %s \${agent_review_default_coderabbit_silent_head_wait_s}")" "1800"
+seen_ago() {
+  # $1 seconds ago -> the loop-state assignment that makes the loop first have seen the head then
+  printf 'cmd_loop_head_seen_head=%s; cmd_loop_head_seen_epoch=%s' "${head_sha}" "$(( $(date -u +%s) - $1 ))"
+}
+cr_summary="{\"user\":{\"login\":\"coderabbitai[bot]\"},\"created_at\":\"$(date -u -d "3 hours ago" +%Y-%m-%dT%H:%M:%SZ)\",\"body\":\"walkthrough\"}"
+out="$(HANDLER_PRE="$(seen_ago 7200)" handler "unknown\\t0" "[${cr_summary}]" 2)"
+assert_contains "a head silent for two hours is reported as silent" "$out" "has not reported on head"
+assert_contains "the loop then posts the one full review" "$(cat "${work_dir}/exec.log")" "gh pr comment 5 --repo o/r"
+assert_contains "the post carries the head marker" "$(cat "${work_dir}/exec.log")" "coderabbit-full:${head_sha}"
+
+out="$(HANDLER_PRE="$(seen_ago 600)" handler "unknown\\t0" "[${cr_summary}]" 2)"
+assert_not_contains "a head silent for ten minutes is still inside the wait" "$out" "has not reported on head"
+assert_not_contains "no ask is posted inside the silent-head wait" "$(cat "${work_dir}/exec.log")" "gh pr comment"
+assert_contains "the handler hands back to the loop inside the wait" "$out" "handler-rc=1"
+
+out="$(handler "unknown\\t0" "[${cr_summary}]" 2)"
+assert_not_contains "a head the loop has not noted yet is not asked about" "$(cat "${work_dir}/exec.log")" "gh pr comment"
+
+out="$(HANDLER_PRE="$(seen_ago 7200)" handler "completed\\t$(date -u +%s)" '[]' 2)"
+assert_not_contains "a completed review is never treated as silent" "$out" "has not reported on head"
+
+ask_comment="{\"user\":{\"login\":\"thehcma\"},\"created_at\":\"$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)\",\"body\":\"@coderabbitai full review\\n\\n${ask_marker}\"}"
+out="$(HANDLER_PRE="$(seen_ago 7200)" handler "unknown\\t0" "[${cr_summary},${ask_comment}]" 2)"
+assert_not_contains "an ask already in flight for the head is not repeated" "$(cat "${work_dir}/exec.log")" "gh pr comment"
+
+# shellcheck disable=SC2016  # literal source text to look for, not an expansion
+note_line="$(grep -n 'cmd_loop_note_head "\${head}"' "${wait_script}" | tail -n 1 | cut -d: -f1)"
+# shellcheck disable=SC2016  # literal source text to look for, not an expansion
+rate_line="$(grep -n 'cmd_loop_handle_coderabbit_rate_limit "\${repo}"' "${wait_script}" | tail -n 1 | cut -d: -f1)"
+if [[ -n "$note_line" && -n "$rate_line" ]] && (( note_line < rate_line )); then
+  pass_case "the loop notes the head before it calls the CodeRabbit handler"
+else
+  fail_case "the loop notes the head before it calls the CodeRabbit handler (note=${note_line:-?} handler=${rate_line:-?})"
+fi
 
 # --- the loop: do not complete before CodeRabbit has answered an ask ---------------------------------------
 answer_outstanding() {
