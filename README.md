@@ -282,9 +282,9 @@ Invocation and flags: [`github-repo-lint`](#github-repo-lint). The audit covers 
 | --- | --- | --- | --- |
 | Release Please squash settings | yes | yes | Repos with `release-please.yml` use squash-only merges on `main` |
 | `protect-main` ruleset | yes | yes | Squash-only + GitHub `merge_queue` (`SQUASH`) + `required_signatures` + `pull_request` `require_code_owner_review` on `refs/heads/main` when GitHub MQ, Release Please, or strict onboarding |
-| `protect-main` `required_signatures` | yes* | yes | Ruleset rejects any push/merge with an unverified commit (*missing FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`; `--apply-fix` adds the rule — repository-helpers#609) |
+| `protect-main` `required_signatures` | yes | yes | Ruleset rejects any push/merge with an unverified commit; a missing rule FAILS in every mode (repository-helpers#782); `--apply-fix` adds the rule — repository-helpers#609 |
 | `protect-main` `require_code_owner_review` | yes* | yes | Ruleset enforces CODEOWNER review (matching classic protection), with an `OrganizationAdmin` bypass (`bypass_mode: pull_request`) so the org owner can still land PRs (*missing rule FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`; rule present without the bypass FAILS always; `--apply-fix` adds both — repository-helpers#626) |
-| Main HEAD commit verification | yes* | — | Default-branch HEAD reports `commit.verification.verified` (bot authors skipped) (*missing verification FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`; no `--apply-fix` — repository-helpers#609) |
+| Main HEAD commit verification | yes | — | Default-branch HEAD reports `commit.verification.verified` (bot authors skipped); an unverified HEAD FAILS in every mode, and unverified human commits among the last 20 are a SUGGEST; no `--apply-fix` — repository-helpers#609, #782 |
 | Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts; no Graphite-only push restrictions (GitHub MQ profile) |
 | GitHub merge queue wiring | yes | yes | `protect-main` `merge_queue`, `ci.yml` `merge_group`, dependabot auto-merge via `gh pr merge --auto` when `dependabot.yml` exists |
 | Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |
