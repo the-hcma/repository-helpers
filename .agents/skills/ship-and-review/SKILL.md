@@ -207,7 +207,7 @@ Two success paths:
 
 Both paths **email `AGENT_REVIEW_REPORT_TO`** when configured. They do **not** run `gh pr review --approve` (self-approve often fails for the PR author and is unnecessary).
 
-Do **not** add `merge-it` unless the user explicitly confirms. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge) when the operator asks to merge; for a PR in a gh stack use `gh stack merge --yes --squash` (from the stack's worktree) (see the gh-stack Skill, `Merging a stack`).
+Never add the `merge-it` label: it is ignored and the org no longer uses Graphite merge queue. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge) when the operator asks to merge; for a PR in a gh stack use `gh stack merge --yes --squash` (from the stack's worktree) (see the gh-stack Skill, `Merging a stack`).
 
 ### Failure (PR non-convergence timeout, exit 6)
 

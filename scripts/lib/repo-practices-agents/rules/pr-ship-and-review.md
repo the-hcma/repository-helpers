@@ -43,7 +43,7 @@ gt create <stack>/<topic> -m 'feat: …'   # or gt modify -m '…'
 gt submit --publish --no-interactive
 
 # When marker is gh-stack:
-# gh stack init <stack>/<topic>   # or gh stack add for a higher layer
+# gh stack init <stack>/<topic>   # or gh stack add <branch> for a higher layer (the branch argument keeps it non-interactive)
 # git add -A && git commit -m 'feat: …'
 # gh stack submit --auto --open --remote origin
 ```
@@ -80,7 +80,7 @@ Say in the PR description whether the merge should close the issue. Default, unl
 2. A PR that is only one step of a larger issue says `Part of #N.` and does not close it (for an issue in another repository write `Part of OWNER/REPOSITORY#N.`). The last PR of the series closes the issue, and it must target the default branch when it merges: GitHub ignores a closing keyword on a PR into any other branch (for example a lower layer of a stack), so close the issue explicitly after the work lands.
 3. A PR with a closing keyword is merged only after the user agrees the issue is done, because the merge closes it. The merge confirmation this workflow already requires covers that.
 
-Avoid applying a "no closing keywords" convention to every PR regardless of whether it finishes the issue: finished issues then stay open and need a manual close pass. Spell the keyword as `${rh}/.agents/rules/github-content-formatting.md` item 3 requires.
+Avoid applying a "no closing keywords" convention to every PR regardless of whether it finishes the issue: finished issues then stay open and need a manual close pass. Spell the keyword the way the "Unlinked closing keywords" failure mode in `${rh}/.agents/rules/github-content-formatting.md` requires.
 
 ## 3. Agent review loop
 
@@ -125,4 +125,4 @@ When `check` reports `complete_ready: true`:
 
 `complete_ready` requires an agent sign-off on the current head (not a bare CodeRabbit commit status / rate-limit stub). This emails `AGENT_REVIEW_REPORT_TO`. It does **not** run `gh pr review --approve` (self-approve is skipped; merge stays an explicit operator step).
 
-Do **not** add `merge-it` unless the user explicitly confirms. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge) when the operator asks to merge; a PR that belongs to a gh stack cannot use auto-merge (`Auto-merge is not supported for stacked pull requests`) and is landed with `gh stack merge --yes --squash` (from the stack's worktree). Check the command's exit status and output, never pipe it through `tail`, and confirm `autoMergeRequest` or the queue entry before waiting.
+Never add the `merge-it` label: it is ignored and the org no longer uses Graphite merge queue. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge) when the operator asks to merge; a PR that belongs to a gh stack cannot use auto-merge (`Auto-merge is not supported for stacked pull requests`) and is landed with `gh stack merge --yes --squash` with no argument (from the stack's worktree; it lands the whole stack bottom-up, so confirm the user wants every layer merged) or with `scripts/dev/merge-stack --pr <n>`. Check the command's exit status and output, never pipe it through `tail`, and confirm `autoMergeRequest` or the queue entry before waiting.
