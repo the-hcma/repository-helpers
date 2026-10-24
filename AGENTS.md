@@ -40,12 +40,12 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | Systemd | `scripts/setup-service`, `scripts/setup-github-repo-lint`, `scripts/setup-secret-audit`, `scripts/show-services` | Install timers/units; status summary. |
 | Deploy hook | `scripts/on-deploy` | Example hook; consumer repos implement their own. |
 | Agent review | `scripts/wait-for-agent-review`, `scripts/trigger-agent-review` | PR review loop, triage, operator email (no self-approve). |
-| Dev workflow | `scripts/dev/start-development` | Worktree + Graphite sync entry point. |
+| Dev workflow | `scripts/dev/start-development` | Worktree + session sync entry point. |
 | Dev workflow | `scripts/dev/pre-pr-checks` | Detect-first local CI gates (bash + Python/TS/Rust when present; secret-scan when adopted). |
 | Dev workflow | `scripts/dev/run-tests` | Run `tests/*.test` by file, optionally one CI shard (`--shard I/N`) and in parallel (`--jobs`); shared by CI and `pre-pr-checks`. |
 | Dev workflow | `scripts/dev/secret-scan` | Local gitleaks via canonical `ci-secret-scan` (same as CI / pre-pr secret-scan job). |
 | Dev workflow | `scripts/dev/coderabbit-cli-review` | Optional pre-push review with the CodeRabbit CLI (own allowance, never `--use-credits`, each head once, at most 2 per branch); runs as the `coderabbit-cli` job of `pre-pr-checks` when `cr` is installed. |
-| Dev workflow | `scripts/dev/submit-stack` | Register the branch as a gh stack (gh-stack marker), then `pre-pr-checks` → `gt submit` / `gh stack submit` → `post-pr-submission-checks`. |
+| Dev workflow | `scripts/dev/submit-stack` | Register the branch as a gh stack (gh-stack marker), then `pre-pr-checks` → `gh stack submit` → `post-pr-submission-checks`. |
 | Dev workflow | `scripts/dev/merge-stack` | Land a PR through the merge queue: `gh stack merge` for a PR in a gh stack (auto-merge is unavailable for stacked PRs), `gh pr merge --auto --squash` otherwise; confirms the enqueue. |
 | Dev workflow | `scripts/dev/approve-pending-deployments` | Approve WAITING environment jobs on the operator's behalf. |
 | Dev workflow | `scripts/dev/post-pr-submission-checks` | Wait for PR CI; print agent-friendly failure excerpts. |
@@ -126,7 +126,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 
 ## dep-updater Behavioral Invariants
 
-- **Stacking backend follows `.github/stacking-tool`.** Consumer repos declare `graphite` or `gh-stack` in `.github/stacking-tool`. dep-updater uses `gt track` / `gt submit` for Graphite and `gh stack submit` for gh-stack. **When the marker is absent, dep-updater selects `gh-stack`** (logged as the missing-marker default). Explicit `graphite` keeps the Graphite path; invalid markers still fail. Other helpers (`github-repo-lint --apply-fix`, `start-development`) also use `gh-stack` as the org default when the marker is missing: Graphite is retired org-wide (repository-helpers#772), and `scripts/lib/stacking-tool` refuses to run `gt` for a leftover `graphite` marker. Merge enqueue uses `gh pr merge --auto --squash` (GitHub native merge queue — org default). Leftover `merge-it` / `merge-mq` labels are ignored and must not select Graphite MQ enqueue.
+- **Stacking backend follows `.github/stacking-tool`.** Consumer repos declare `gh-stack` in `.github/stacking-tool`. dep-updater uses `gh stack submit`. **When the marker is absent, dep-updater selects `gh-stack`** (logged as the missing-marker default); invalid markers still fail. Other helpers (`github-repo-lint --apply-fix`, `start-development`) also use `gh-stack` as the org default when the marker is missing. Graphite is retired org-wide (repository-helpers#772): `scripts/lib/stacking-tool` and dep-updater refuse a leftover `graphite` marker, so migrate such a repo to `gh-stack` (the marker cutover checklist below) instead of running `gt` by hand. Merge enqueue uses `gh pr merge --auto --squash` (GitHub native merge queue — org default). Leftover `merge-it` / `merge-mq` labels are ignored and must not select Graphite MQ enqueue.
 - **Never introduce `==` pins (Python).** dep-updater always writes `>=` floor constraints when bumping a Python dependency. It must never lock a package to an exact version.
 - **Respect existing pins for pip / pipenv / poetry.** For these ecosystems, `==` signals a deliberate user decision to lock a specific version. dep-updater skips those packages entirely (`py_is_pinned`).
 - **uv `==` pins are not treated as intentional freezes.** dep-updater updates them and promotes the constraint to `>=` on bump. The transitive constraint check (`uv pip install --dry-run`) still gates upgrades that would violate real transitive constraints.
@@ -399,10 +399,10 @@ scripts/dev/start-development
 
 This script:
 - Prunes stale worktrees and merged branches
-- Syncs Graphite (`gt sync`)
+- Fetches the latest `main` (`git fetch --prune origin`)
 - Creates a new worktree under `.worktrees/` (or resumes an existing one with `--resume`)
 
-Do **not** manually create worktrees or run `gt sync` separately — `start-development` is the single entry point for all new work.
+Do **not** manually create worktrees or run `git fetch` / `gh stack sync` separately — `start-development` is the single entry point for all new work.
 
 After `start-development` finishes, **`cd` into the stack worktree** (`.worktrees/<stack-name>-wt`) before any other work. Do not stay in the primary clone.
 
@@ -415,7 +415,7 @@ The **primary clone** (repo root — first entry in `git worktree list`, usually
 - Edit, create, or delete source files, config, or lockfiles
 - Run dependency installs, tests, builds, or formatters
 - Run `dep-updater` with `--dir` pointing at the primary clone (it may fast-forward `main` and mutate git state)
-- Run `gt create`, `gt modify`, `gt submit`, `gt sync`, `gt restack`, or other Graphite/git write operations
+- Run `gh stack init`, `gh stack add`, `gh stack submit`, `gh stack sync`, `gh stack rebase`, or other stack/git write operations
 - Leave uncommitted changes, stray branches, or detached HEAD state
 
 **Always** do implementation, investigation that mutates state, and validation in a **stack worktree** under `.worktrees/<stack-name>-wt`. Pass that path to tools (`--dir`, `cd`, etc.).
@@ -502,9 +502,9 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 > See [`.agents/skills/graphite/SKILL.md`](.agents/skills/graphite/SKILL.md) for the full Graphite workflow reference when `.github/stacking-tool` is `graphite` (branch naming, stack creation, navigation, submission, troubleshooting, and advanced rebasing). For this repo (`gh-stack`), see [`.agents/skills/gh-stack/SKILL.md`](.agents/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc).
 
 - Stacking backend is selected by `.github/stacking-tool` (`graphite` or `gh-stack`). Prefer **`scripts/dev/submit-stack`** (dispatches via `scripts/lib/stacking-tool`).
-- Never work directly on `main`. Create stack layers with `gh stack init` / `gh stack add` when the marker is `gh-stack`, or `gt create` when it is `graphite`.
+- Never work directly on `main`. Create stack layers with `gh stack init` / `gh stack add <branch>`.
 - Keep each branch in the stack focused on exactly one logical change. Stacks should map 1-to-1 with milestones or sub-tasks from [dep-updater.plan.md](./dep-updater.plan.md).
-- Sync via `scripts/dev/start-development` (marker-aware). For `gh-stack`, use `gh stack sync` / `gh stack rebase` as needed; for Graphite, `gt sync` / `gt restack`.
+- Sync via `scripts/dev/start-development` (marker-aware). Use `gh stack sync` / `gh stack rebase` as needed.
 - **Before opening/submitting a PR**, run **`scripts/dev/pre-pr-checks`** from your feature worktree (or use **`scripts/dev/submit-stack`**). Do not submit without passing pre-pr-checks first.
 - **Apply formatters before the gate** when planned jobs include format checks: `uv run ruff format .` / `cargo fmt --all`, then `scripts/dev/pre-pr-checks` (or `scripts/dev/pre-pr-checks --fix` / `PRE_PR_CHECKS_FORMAT=apply`). Commit format-only diffs before submit. Do **not** pipe pre-pr-checks to `tail`/`head`; require exit 0 and `==> pre-pr-checks passed`. `pytest` / `ruff check` alone is not a pre-PR pass.
 - `pre-pr-checks` **detects the project type first** (filesystem markers only), then requires tools and runs **only planned jobs** in parallel:
