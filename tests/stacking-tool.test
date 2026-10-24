@@ -56,7 +56,8 @@ if grep -qF "stacking_tool_marker_relpath='.github/stacking-tool'" "$lib" \
   && grep -qF 'stacking_tool_restack_as' "$lib" \
   && grep -qF 'stacking_tool_session_sync' "$lib" \
   && grep -qF 'stacking_tool_session_sync_as' "$lib" \
-  && grep -qF 'stacking_tool_graphite_usable' "$lib"; then
+  && grep -qF 'stacking_tool_retired_message' "$lib" \
+  && ! grep -qF 'stacking_tool_graphite_usable' "$lib"; then
   pass_case 'stacking-tool defines marker constants and operation helpers'
 else
   fail_case 'stacking-tool defines marker constants and operation helpers'
@@ -65,34 +66,19 @@ fi
 printf '\n=== static: backends use runner helpers ===\n'
 # shellcheck disable=SC2016  # intentional literal match for source path in library
 if grep -qF 'source "${_stacking_tool_lib_dir}/runner-ensure"' "$lib" \
-  && grep -qF 'runner_sh "stacking-tool gt submit"' "$lib" \
   && grep -qF 'runner_sh "stacking-tool gh stack submit"' "$lib" \
   && grep -qF 'gh stack submit --auto --open' "$lib" \
-  && grep -qF 'gt submit --publish --no-interactive' "$lib"; then
-  pass_case 'stacking-tool dispatches via runner_sh for both backends'
+  && ! grep -qE '(runner_sh|exec) .*\bgt (submit|sync|restack|auth)' "$lib"; then
+  pass_case 'stacking-tool dispatches via runner_sh and never runs gt'
 else
-  fail_case 'stacking-tool dispatches via runner_sh for both backends'
+  fail_case 'stacking-tool dispatches via runner_sh and never runs gt'
 fi
 
 printf '\n=== static: session sync and restack use --timeout ===\n'
 if grep -qF 'runner_sh "stacking-tool session git fetch" --timeout 20' "$lib" \
-  && grep -qF 'runner_sh "stacking-tool session gt sync" --timeout 20' "$lib" \
-  && grep -qF 'runner_sh "stacking-tool gt sync" --timeout 20' "$lib" \
   && grep -qF 'runner_sh "stacking-tool gh stack sync" --timeout 20' "$lib" \
-  && grep -qF 'runner_sh "stacking-tool gt submit after restack" --timeout 120' "$lib" \
-  && grep -qF '&& exec gt sync' "$lib" \
   && grep -qF '&& exec git fetch --prune origin' "$lib" \
-  && grep -qF 'stacking_tool_graphite_usable' "$lib" \
-  && grep -qF 'skipping gt sync (git fetch only)' "$lib" \
-  && grep -qF 'stacking-tool probe gt auth" --probe --timeout 20' "$lib" \
-  && awk '
-    /^stacking_tool_session_sync_as\(\)/ { in_fn=1 }
-    in_fn && /skipping gt sync/ { skip=1 }
-    in_fn && skip && /session git fetch/ { fetch=1 }
-    in_fn && fetch && /return \$\?/ { ok=1 }
-    in_fn && /^}/ { exit }
-    END { exit(ok ? 0 : 1) }
-  ' "$lib"; then
+  && ! grep -qF 'gt sync' "$lib"; then
   pass_case 'session sync / restack envelope network calls with --timeout'
 else
   fail_case 'session sync / restack envelope network calls with --timeout'
@@ -202,8 +188,8 @@ assert_contains 'read_or_org_default returns gh-stack when valid' "$or_default_o
 rm -f "${tmp_repo}/.github/stacking-tool"
 or_default_log="$(stacking_tool_read_or_org_default "$tmp_repo" 2>&1)"
 or_default_value="$(stacking_tool_read_or_org_default "$tmp_repo" 2>/dev/null)"
-if printf '%s' "$or_default_log" | grep -qF "using org default 'graphite'" \
-  && [[ "$or_default_value" == 'graphite' ]]; then
+if printf '%s' "$or_default_log" | grep -qF "using org default 'gh-stack'" \
+  && [[ "$or_default_value" == 'gh-stack' ]]; then
   pass_case 'read_or_org_default logs and returns org default when marker missing'
 else
   fail_case 'read_or_org_default logs and returns org default when marker missing'
@@ -276,15 +262,16 @@ exit 0
 MOCK_GH
 chmod +x "${fake_bin}/gh"
 submit_as_exit=0
-(
+submit_as_out="$(
   PATH="${fake_bin}:${PATH}" GT_LOG="$gt_log" GH_LOG="$gh_log" \
-    stacking_tool_submit_as 'graphite' "$tmp_repo"
-) || submit_as_exit=$?
-if [[ "$submit_as_exit" -eq 0 ]] \
-  && grep -qF 'submit --publish --no-interactive' "$gt_log"; then
-  pass_case 'submit_as graphite invokes gt submit'
+    stacking_tool_submit_as 'graphite' "$tmp_repo" 2>&1
+)" || submit_as_exit=$?
+if [[ "$submit_as_exit" -ne 0 ]] \
+  && grep -qF 'Graphite is retired' <<<"$submit_as_out" \
+  && [[ ! -s "$gt_log" ]]; then
+  pass_case 'submit_as graphite is refused as retired and never runs gt'
 else
-  fail_case "submit_as graphite invokes gt submit (exit=${submit_as_exit})"
+  fail_case "submit_as graphite is refused as retired and never runs gt (exit=${submit_as_exit})"
 fi
 : >"$gt_log"
 : >"$gh_log"
@@ -538,7 +525,7 @@ fi
 
 rm -rf "$restack_repo" "$restack_fake_bin"
 
-printf '\n=== functional: session_sync_as skips gt sync when Graphite unusable ===\n'
+printf '\n=== functional: session_sync_as refuses Graphite and fetches for gh-stack ===\n'
 fake_bin="$(mktemp -d)"
 gt_log="${fake_bin}/gt.log"
 session_repo="$(mktemp -d)"
@@ -552,78 +539,30 @@ git -C "$session_remote" init --bare -q --initial-branch=main
 git -C "$session_repo" remote add origin "$session_remote"
 git -C "$session_repo" push -u origin main -q
 
+# An authenticated gt on PATH must still never be run.
 cat >"${fake_bin}/gt" <<'MOCK_GT'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"${GT_LOG:?}"
-# Simulate expired / unused Graphite auth.
-if [[ "${1:-}" == 'auth' ]]; then
-  printf 'ERROR: Your Graphite auth token is invalid/expired.\n' >&2
-  exit 1
-fi
-exit 0
-MOCK_GT
-chmod +x "${fake_bin}/gt"
-
-session_exit=0
-session_log="$(
-  PATH="${fake_bin}:${PATH}" GT_LOG="$gt_log" \
-    stacking_tool_session_sync_as 'graphite' "$session_repo" 2>&1
-)" || session_exit=$?
-if [[ "$session_exit" -eq 0 ]] \
-  && grep -qF 'skipping gt sync (git fetch only)' <<<"$session_log" \
-  && ! grep -qE '(^|[[:space:]])sync([[:space:]]|$)' "$gt_log" \
-  && grep -qF 'auth' "$gt_log"; then
-  pass_case 'session_sync_as graphite falls back to git fetch when gt auth fails'
-else
-  fail_case "session_sync_as graphite falls back to git fetch when gt auth fails (exit=${session_exit})"
-  printf '%s\n' "$session_log" >&2
-  cat "$gt_log" >&2 || true
-fi
-
-# Missing gt entirely → also fetch-only (no die).
-# Keep GNU timeout on PATH: session sync uses runner --timeout (needs timeout/gtimeout).
-# Do not add /opt/homebrew/bin or /usr/local/bin — a host `gt` would escape the hermetic PATH.
-rm -f "${fake_bin}/gt"
-session_exit=0
-session_log="$(
-  PATH="${fake_bin}:/opt/homebrew/opt/coreutils/libexec/gnubin:/usr/local/opt/coreutils/libexec/gnubin:/usr/bin:/bin" \
-    stacking_tool_session_sync_as 'graphite' "$session_repo" 2>&1
-)" || session_exit=$?
-if [[ "$session_exit" -eq 0 ]] \
-  && grep -qF 'skipping gt sync (git fetch only)' <<<"$session_log"; then
-  pass_case 'session_sync_as graphite falls back when gt is missing'
-else
-  fail_case "session_sync_as graphite falls back when gt is missing (exit=${session_exit})"
-fi
-
-# Authenticated Graphite path: gt auth succeeds → gt sync (not fetch-only).
-cat >"${fake_bin}/gt" <<'MOCK_GT'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >>"${GT_LOG:?}"
-if [[ "${1:-}" == 'auth' ]]; then
-  printf 'Authenticated as: test-user\n'
-  exit 0
-fi
 exit 0
 MOCK_GT
 chmod +x "${fake_bin}/gt"
 : >"$gt_log"
+
 session_exit=0
 session_log="$(
   PATH="${fake_bin}:${PATH}" GT_LOG="$gt_log" \
     stacking_tool_session_sync_as 'graphite' "$session_repo" 2>&1
 )" || session_exit=$?
-if [[ "$session_exit" -eq 0 ]] \
-  && ! grep -qF 'skipping gt sync' <<<"$session_log" \
-  && grep -qF 'sync --quiet --force' "$gt_log"; then
-  pass_case 'session_sync_as graphite runs gt sync when authenticated'
+if [[ "$session_exit" -ne 0 ]] \
+  && grep -qF 'Graphite is retired' <<<"$session_log" \
+  && [[ ! -s "$gt_log" ]]; then
+  pass_case 'session_sync_as graphite is refused as retired and never runs gt'
 else
-  fail_case "session_sync_as graphite runs gt sync when authenticated (exit=${session_exit})"
+  fail_case "session_sync_as graphite is refused as retired and never runs gt (exit=${session_exit})"
   printf '%s\n' "$session_log" >&2
-  cat "$gt_log" >&2 || true
 fi
+
 rm -rf "$fake_bin" "$session_repo" "$session_remote"
 
 rm -rf "$tmp_repo"
@@ -639,13 +578,15 @@ else
 fi
 
 fake_bin="$(mktemp -d)"
-# No gt on PATH → graphite prereq should fail. Run in a subshell: require_cli dies via exit.
+# Graphite is retired: require_cli refuses it even when gt is on PATH. Run in a subshell: it dies via exit.
+printf '#!/usr/bin/env bash\nexit 0\n' >"${fake_bin}/gt"
+chmod +x "${fake_bin}/gt"
 require_exit=0
-( PATH="${fake_bin}:/usr/bin:/bin" stacking_tool_require_cli 'graphite' ) 2>/dev/null || require_exit=$?
-if [[ "$require_exit" -ne 0 ]]; then
-  pass_case 'require_cli fails when gt is missing for graphite'
+require_out="$( PATH="${fake_bin}:${PATH}" stacking_tool_require_cli 'graphite' 2>&1 )" || require_exit=$?
+if [[ "$require_exit" -ne 0 ]] && grep -qF 'Graphite is retired' <<<"$require_out"; then
+  pass_case 'require_cli refuses graphite as retired even when gt is installed'
 else
-  fail_case 'require_cli fails when gt is missing for graphite'
+  fail_case 'require_cli refuses graphite as retired even when gt is installed'
 fi
 rm -rf "$fake_bin"
 
