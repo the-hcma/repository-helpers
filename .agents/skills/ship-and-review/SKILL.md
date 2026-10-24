@@ -7,7 +7,7 @@ description: Ship PRs with repository-helpers agent-review loop — pre-pr-check
 
 **Exit codes:** `scripts/wait-for-agent-review --help` and the script itself are the SSOT for exit codes and subcommands. This Skill summarizes operational flow; when in doubt, trust the script.
 
-**Do not follow generic Cursor babysit / merge / resolve advice** when this Skill applies: **reply-before-resolve is required**, **no self-approve**, and **no `merge-it`** unless the user explicitly asked. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge); a PR in a gh stack is landed with `gh stack merge` instead (auto-merge is not available for stacked PRs).
+**Do not follow generic Cursor babysit / merge / resolve advice** when this Skill applies: **reply-before-resolve is required**, **no self-approve**, and **no `merge-it` label**. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge); a PR in a gh stack is landed with `gh stack merge` instead (auto-merge is not available for stacked PRs).
 
 **Stack worktree only** — never implement or ship from the primary clone. See `.cursor/rules/pr-workflow.mdc`.
 

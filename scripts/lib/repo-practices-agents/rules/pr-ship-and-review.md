@@ -43,7 +43,8 @@ gt create <stack>/<topic> -m 'feat: …'   # or gt modify -m '…'
 gt submit --publish --no-interactive
 
 # When marker is gh-stack:
-# gh stack init <stack>/<topic>   # or gh stack add <branch> for a higher layer (the branch argument keeps it non-interactive)
+# gh stack init <stack>/<topic>   # or gh stack add <branch> for a higher layer
+#   (the branch argument keeps it non-interactive)
 # git add -A && git commit -m 'feat: …'
 # gh stack submit --auto --open --remote origin
 ```
