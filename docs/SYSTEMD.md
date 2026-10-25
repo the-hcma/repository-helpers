@@ -100,8 +100,8 @@ User **lingering** is enabled so scheduled (or manual) runs can execute without 
 ### Prerequisites
 
 - Linux with a systemd user session (`systemctl --user status` works)
-- `gh`, `gt`, `jq`, `rg`, and ecosystem tools (`pnpm`, `uv`, …) on `PATH` or under `~/.local/bin` / NVM as for interactive runs
-- `gh auth login` and `gt auth` completed for the service user
+- `gh` (with the `gh stack` extension), `jq`, `rg`, and ecosystem tools (`pnpm`, `uv`, …) on `PATH` or under `~/.local/bin` / NVM as for interactive runs
+- `gh auth login` completed for the service user
 - Target repositories are git clones under the scan root (default: `$(dirname "$(git rev-parse --show-toplevel)")`)
 - **`curl`** for SMTP email reports
 - **`~/.config/dep-updater.env`** (required; see below)
