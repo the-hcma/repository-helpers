@@ -16,10 +16,7 @@ From the **repository root** (not the primary clone for edits):
 ```bash
 scripts/dev/start-development --worktree <stack-name> --no-interactive
 cd .worktrees/<stack-name>-wt
-# graphite (org default — use when .github/stacking-tool is graphite):
-gt create <stack-name>/<topic> -m 'feat: …'
-# gh-stack (when .github/stacking-tool is gh-stack):
-# gh stack init <stack-name>/<topic>
+gh stack init <stack-name>/<topic>
 ```
 
 Never implement on the main worktree (see `main-worktree-off-limits.mdc`).
@@ -85,10 +82,10 @@ scripts/wait-for-agent-review complete --pr <number>   # when complete_ready
 
 Until merge-ready:
 
-1. Triage agent / Bugbot comments — fix valid issues, then push (`git commit` + `gh stack submit --auto` when the marker is `gh-stack`, or `gt modify` when it is `graphite`).
+1. Triage agent / Bugbot comments — fix valid issues, then push (`git commit` + `gh stack submit --auto`).
 2. Re-run `scripts/dev/pre-pr-checks` after fixes.
 3. Re-run `scripts/dev/post-pr-submission-checks --pr <number>` and fix any CI failures surfaced in the agent log report.
-4. Resolve merge conflicts if base moved (`gh stack rebase` / `gh stack sync` when `gh-stack`; `gt sync` / `gt restack` when `graphite`; or `scripts/wait-for-agent-review restack`).
+4. Resolve merge conflicts if base moved (`gh stack rebase` / `gh stack sync`, or `scripts/wait-for-agent-review restack`).
 
 Do not merge manually; org default is GitHub merge queue (Enable auto-merge / `gh pr merge --auto --squash`; for a PR in a gh stack use `gh stack merge --yes --squash` (from the stack's worktree), because auto-merge is not available for stacked PRs). Do not use `merge-it` to land PRs.
 

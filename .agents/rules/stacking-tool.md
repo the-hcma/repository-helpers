@@ -1,21 +1,17 @@
 ---
-description: Choose Graphite vs GitHub Stacked PRs from .github/stacking-tool
+description: Stack PRs with GitHub Stacked PRs (gh-stack) from .github/stacking-tool
 alwaysApply: true
 ---
 
 # Stacking tool preference
 
-Before creating branches or submitting/restacking PRs, **read** `.github/stacking-tool` (single line: `graphite` or `gh-stack`). Missing or invalid values: **stop and ask** — do not guess.
+Before creating branches or submitting/restacking PRs, **read** `.github/stacking-tool` (single line: `gh-stack`). Graphite is retired org-wide (its merge queue builds unsigned commits, repository-helpers#772): a `graphite` marker is refused by the tooling, so migrate it to `gh-stack` first. Missing or invalid values: **stop and ask** — do not guess.
 
-## `gh-stack` (this repo trial)
+## `gh-stack`
 
 - Follow `.agents/skills/gh-stack/SKILL.md` (non-interactive flags: `view --json`, `submit --auto --open`, named `init`/`add`).
 - Prefer `scripts/dev/submit-stack` / `scripts/dev/ship-and-review` (they dispatch via `scripts/lib/stacking-tool`).
-- **Do not** mix with `gt create` / `gt submit` / `gt restack` on the same stack.
-
-## `graphite`
-
-- Follow `.agents/skills/graphite/SKILL.md` and the Graphite flow in `.agents/rules/pr-workflow.md` (`gt`, `scripts/dev/submit-stack`).
+- **Do not** use `gt` on any stack: Graphite is retired.
 
 ## Marker cutover checklist
 
@@ -23,11 +19,9 @@ When flipping `.github/stacking-tool` (or landing an MQ/`gh-stack` cutover PR) i
 
 1. Update `AGENTS.md` stacking/merge guidance to match the new marker (GitHub auto-merge: `gh pr merge --auto --squash` for a PR outside a stack, `gh stack merge --yes --squash` (from the stack's worktree) for a stacked PR — not `merge-it`).
 2. Rewrite `.agents/rules/pr-ship-and-review.md` submit block to the marker-aware template (copy via `--apply-fix`, or from `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md` / https://github.com/the-hcma/repository-helpers/blob/main/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md; plus thin `.cursor/rules/pr-ship-and-review.mdc` shim).
-3. Delete root `GRAPHITE.md` when switching to `gh-stack` (skills here are SSOT).
+3. Delete root `GRAPHITE.md` when switching to `gh-stack`.
 4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) aligned with the consumer stacking-tool template.
 5. Run `scripts/github-repo-lint --repo OWNER/NAME --suggest --strict-onboarding` and fix stacking-docs consistency findings.
-
-This repo keeps dual skills (graphite + gh-stack) on purpose; consumers should not.
 
 ## Unchanged regardless of marker
 

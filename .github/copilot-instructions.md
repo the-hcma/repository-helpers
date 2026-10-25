@@ -2,7 +2,7 @@
 
 Rules live under [`.agents/rules/`](../.agents/rules/) (the `.cursor/rules/*.mdc` files are Cursor injection shims only); [`.github/instructions/agents-rules.instructions.md`](instructions/agents-rules.instructions.md) points Copilot at them.
 
-> Full coding standards, conventions, and CI requirements are in [AGENTS.md](../AGENTS.md). Stacking tool: [`.agents/rules/stacking-tool.md`](../.agents/rules/stacking-tool.md) (read `.github/stacking-tool`). Graphite skill: [`.agents/skills/graphite/SKILL.md`](../.agents/skills/graphite/SKILL.md). gh-stack skill: [`.agents/skills/gh-stack/SKILL.md`](../.agents/skills/gh-stack/SKILL.md). PR ship and agent review loop: [`.agents/skills/ship-and-review/SKILL.md`](../.agents/skills/ship-and-review/SKILL.md) (thin contract: [`.agents/rules/pr-ship-and-review.md`](../.agents/rules/pr-ship-and-review.md)).
+> Full coding standards, conventions, and CI requirements are in [AGENTS.md](../AGENTS.md). Stacking tool: [`.agents/rules/stacking-tool.md`](../.agents/rules/stacking-tool.md) (read `.github/stacking-tool`). gh-stack skill: [`.agents/skills/gh-stack/SKILL.md`](../.agents/skills/gh-stack/SKILL.md). PR ship and agent review loop: [`.agents/skills/ship-and-review/SKILL.md`](../.agents/skills/ship-and-review/SKILL.md) (thin contract: [`.agents/rules/pr-ship-and-review.md`](../.agents/rules/pr-ship-and-review.md)).
 
 ## Starting New Work
 
@@ -24,7 +24,7 @@ This is the single entry point for new work. It prunes stale worktrees, syncs pe
 - Declare `local` / `readonly` separately from command substitutions (SC2155).
 - Never declare `local -r` inside a loop body.
 - Every behaviour change or bug fix must have a test in `tests/`.
-- Never push directly to `main`. Create a stack layer per `.github/stacking-tool` (`gt create` when `graphite`, `gh stack init` / `gh stack add` when `gh-stack`), then `scripts/dev/submit-stack`.
+- Never push directly to `main`. Create a stack layer per `.github/stacking-tool` (`gh stack init` / `gh stack add`), then `scripts/dev/submit-stack`.
 - To merge a PR: `gh pr merge --auto --squash` (Enable auto-merge / GitHub merge queue — org default); a PR in a gh stack cannot use auto-merge, so use `gh stack merge --yes --squash` (from the stack's worktree). Do not use `merge-it` to land PRs.
 
 ## Submit and ship
