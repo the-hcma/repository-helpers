@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/the-hcma/repository-helpers/actions/workflows/ci.yml/badge.svg)](https://github.com/the-hcma/repository-helpers/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![Bash 5.x](https://img.shields.io/badge/bash-5.x-4EAA25?logo=gnu-bash&logoColor=white)
 
-Pure Bash helpers for keeping repositories maintained: dependency update PRs, repository practice audits, agent review automation, systemd user services, and stacked PR workflow support (`gh-stack` or Graphite, selected per repo).
+Pure Bash helpers for keeping repositories maintained: dependency update PRs, repository practice audits, agent review automation, systemd user services, and stacked PR workflow support (`gh-stack`; Graphite is retired).
 
 Headline tools: **`dep-updater`** (stacked dependency PRs), **`github-repo-lint`** (org repo practices audit), **secret scanning** (gitleaks via `scripts/dev/secret-scan` / CI), and **secret audit** (TruffleHog deep history via `scripts/secret-audit` — see [docs/secret-audit-trufflehog.md](docs/secret-audit-trufflehog.md)).
 
@@ -24,7 +24,7 @@ Run scripts from a clone of this repo (paths below are relative to the repo root
 
 ### `dep-updater`
 
-Creates **stacked dependency update PRs** for a single repository (or, with `--batch --all`, org repos from the GitHub API that have a local clone under configured scan roots). Supported ecosystems: npm/pnpm, Python (`pip`, `uv`, `poetry`, `pipenv`), Rust/Cargo, and GitHub Actions. Stacking follows the target repo’s `.github/stacking-tool` marker (`gh-stack` when absent; explicit `graphite` keeps Graphite). npm, PyPI, and GitHub Actions releases newer than **9 days** are skipped unless the bump fixes a CVE. Work runs in a throwaway worktree under `--tmpdir` — the primary clone is not used for stack submit.
+Creates **stacked dependency update PRs** for a single repository (or, with `--batch --all`, org repos from the GitHub API that have a local clone under configured scan roots). Supported ecosystems: npm/pnpm, Python (`pip`, `uv`, `poetry`, `pipenv`), Rust/Cargo, and GitHub Actions. Stacking follows the target repo’s `.github/stacking-tool` marker (`gh-stack` when absent; a leftover `graphite` marker is refused). npm, PyPI, and GitHub Actions releases newer than **9 days** are skipped unless the bump fixes a CVE. Work runs in a throwaway worktree under `--tmpdir` — the primary clone is not used for stack submit.
 
 ```bash
 # Preview the plan (no git / worktree changes)
@@ -272,7 +272,7 @@ See [dep-updater.plan.md](dep-updater.plan.md) for implementation details and [d
 
 Invocation and flags: [`github-repo-lint`](#github-repo-lint). The audit covers GitHub native merge queue wiring (org default), `protect-main`, classic branch protection, branch cleanup workflows, release-age policy, license/CODEOWNERS metadata, cursor rules, and uv Python CVE checks.
 
-`--apply-fix` can repair supported GitHub settings such as Release Please squash settings, the `protect-main` ruleset (squash-only + `merge_queue` SQUASH + `required_signatures` + `require_code_owner_review` with an `OrganizationAdmin` bypass), and classic `main` branch protection (GitHub MQ profile). When run from the target repository clone, it also prepares candidate workflow fixes in a dedicated `.worktrees/repo-practices-candidate-fixes-wt` worktree and submits them as a stack for review (`gt track` / `gt submit` when the marker is `graphite`, or `gh stack submit` when the marker is `gh-stack`). Candidate workflow templates live under `scripts/lib/repo-practices-workflows/` so they can be reviewed and linted directly. Disable org repos in Graphite’s merge-queue UI so Graphite does not also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
+`--apply-fix` can repair supported GitHub settings such as Release Please squash settings, the `protect-main` ruleset (squash-only + `merge_queue` SQUASH + `required_signatures` + `require_code_owner_review` with an `OrganizationAdmin` bypass), and classic `main` branch protection (GitHub MQ profile). When run from the target repository clone, it also prepares candidate workflow fixes in a dedicated `.worktrees/repo-practices-candidate-fixes-wt` worktree and submits them as a stack for review (`gh stack init` / `gh stack submit`, whatever the target's marker says). Candidate workflow templates live under `scripts/lib/repo-practices-workflows/` so they can be reviewed and linted directly. Disable org repos in Graphite’s merge-queue UI so Graphite does not also try to land PRs (Graphite stacking is retired; stacking is `gh-stack` via `.github/stacking-tool`).
 
 ### `github-repo-lint` checks
 
@@ -321,7 +321,7 @@ Invocation and flags: [`github-repo-lint`](#github-repo-lint). The audit covers 
 | Agent reviewers property | yes | — | Org custom properties `agent-reviewers` (multi-select: `coderabbit`, `copilot`, `bugbot`; unset means `coderabbit` only) and `agent-review-enabled` (true/false; `false` turns agent review off) pick which agent reviewers are active per repo (`scripts/lib/agent-review-reviewers`, repository-helpers#716). Undefined properties SUGGEST (`--apply-fix` defines both org schemas); a malformed value (unknown reviewer, or a non-boolean `agent-review-enabled`) FAILS |
 | Protection-mechanism consistency | yes | — | Advisory only: flags a genuine disagreement between classic `main` protection and the `protect-main` ruleset — this org runs both by design, so their coexistence is never itself flagged. `require_code_owner_reviews` is now enforced on both sides (repository-helpers#626), so this check is normally quiet (repository-helpers#588) |
 
-`--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via the stacking backend selected by `.github/stacking-tool` (`graphite` → `gt track` / `gt submit`; `gh-stack` → `gh stack init` / `gh stack submit`).
+`--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via the stacking backend selected by `.github/stacking-tool` (`gh stack init` / `gh stack submit`; a leftover `graphite` marker is flagged by the audit and refused by the tooling).
 
 Further detail (protect-main rules, branch hygiene, CVE workflow template): [AGENTS.md](AGENTS.md#repository-practices-new-and-existing-repos).
 
@@ -343,7 +343,7 @@ Use `scripts/lib/on-deploy-deps` from this repo for Python and pnpm dependency s
 
 ## Development
 
-Stacking backend is selected by `.github/stacking-tool` (`gh-stack` or `graphite`). **This repo trials `gh-stack`.** Never edit the primary clone directly — work in a stack worktree.
+Stacking backend is selected by `.github/stacking-tool` (`gh-stack`; Graphite is retired and a leftover `graphite` marker is refused). Never edit the primary clone directly — work in a stack worktree.
 
 ```bash
 scripts/dev/start-development --worktree my-change --no-interactive
@@ -353,12 +353,9 @@ cd .worktrees/my-change-wt
 gh stack init my-change/topic
 # … commit …
 # gh stack add my-change/next-layer   # optional extra layer
-
-# graphite (when .github/stacking-tool is graphite):
-# gt create my-change/topic -m 'feat: …'
 ```
 
-Local quality gates and submit (prefer these over bare `gh stack submit` / `gt submit`):
+Local quality gates and submit (prefer these over bare `gh stack submit`):
 
 ```bash
 scripts/dev/pre-pr-checks          # detect-first local CI mirror (includes secret-scan when adopted)
@@ -394,7 +391,7 @@ When `check` reports `complete_ready: true` (agent sign-off on the current head)
 scripts/wait-for-agent-review complete --pr <n>   # emails the operator; does not self-approve
 ```
 
-**Merging (org default):** use GitHub’s merge queue (`gh pr merge --auto --squash` / Enable auto-merge; a PR in a gh stack cannot use auto-merge — land it with `gh stack merge --yes --squash` (from the stack's worktree) or `scripts/dev/merge-stack --pr <n>`). Do **not** use the `merge-it` label to land PRs — leftover labels are ignored. Graphite stacking (`gt`) remains available via `.github/stacking-tool`; disable Graphite’s merge-queue UI for org repos.
+**Merging (org default):** use GitHub’s merge queue (`gh pr merge --auto --squash` / Enable auto-merge; a PR in a gh stack cannot use auto-merge — land it with `gh stack merge --yes --squash` (from the stack's worktree) or `scripts/dev/merge-stack --pr <n>`). Do **not** use the `merge-it` label to land PRs — leftover labels are ignored. Graphite is retired (its merge queue builds unsigned commits); disable Graphite’s merge-queue UI for org repos.
 
 Configure `~/.config/agent-review.env` from `etc/agent-review.env.example` (SMTP, `AGENT_REVIEW_REPORT_TO`, early-complete when nothing outstanding, **12h** PR non-convergence cap).
 

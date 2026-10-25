@@ -60,7 +60,7 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 - Scripts live in `scripts/` (e.g. `scripts/dep-updater`, `scripts/setup-service`). Sub-directories are allowed (e.g. `scripts/dev/start-development`).
 - Tests live in `tests/` and mirror the script name (e.g. `tests/dep-updater.test`).
 - Target **bash ≥ 5.x** (every script declares `#!/usr/bin/env bash` and uses `set -euo pipefail`).
-- External runtime dependencies: `git`, `gt` (Graphite CLI), `gh` (GitHub CLI), `jq`, `rg` (ripgrep), `timeout` (GNU coreutils; `gtimeout` also satisfies it — the shared GitHub API executor caps every `gh` attempt with it and refuses to run uncapped without it), `actionlint`, the optional CodeRabbit CLI (`coderabbit` / `cr`, see `scripts/dev/coderabbit-cli-review`), plus the ecosystem tools being managed (`pnpm`, `pip`, `uv`, `poetry`, `cargo` + `cargo-outdated` + the `clippy` component) as optional callees. Rust is required for any repo dep-updater detects as a Cargo project — it shells out to `cargo outdated` and `cargo add`, and the Rust post-bump clippy recovery invariant below assumes a toolchain.
+- External runtime dependencies: `git`, `gh` (GitHub CLI, with the `gh stack` extension), `jq`, `rg` (ripgrep), `timeout` (GNU coreutils; `gtimeout` also satisfies it — the shared GitHub API executor caps every `gh` attempt with it and refuses to run uncapped without it), `actionlint`, the optional CodeRabbit CLI (`coderabbit` / `cr`, see `scripts/dev/coderabbit-cli-review`), plus the ecosystem tools being managed (`pnpm`, `pip`, `uv`, `poetry`, `cargo` + `cargo-outdated` + the `clippy` component) as optional callees. Rust is required for any repo dep-updater detects as a Cargo project — it shells out to `cargo outdated` and `cargo add`, and the Rust post-bump clippy recovery invariant below assumes a toolchain.
 
  ```bash
   rustup component add clippy             # absent under rustup's minimal profile
@@ -228,7 +228,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 
 `--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via the stacking backend selected by `.github/stacking-tool` (`gh-stack`; org default `gh-stack` when the marker is missing; a leftover `graphite` marker is refused) in the target repo clone.
 
-See [`.agents/skills/graphite/SKILL.md`](.agents/skills/graphite/SKILL.md) for Graphite **stacking** (`gt`) when `.github/stacking-tool` is `graphite`. This repo trials **`gh-stack`** — see [`.agents/skills/gh-stack/SKILL.md`](.agents/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc). Stacking is separate from merge enqueue (GitHub MQ).
+Graphite is retired org-wide (repository-helpers#772), so stacking is `gh-stack` — see [`.agents/skills/gh-stack/SKILL.md`](.agents/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc). Stacking is separate from merge enqueue (GitHub MQ).
 
 ### Stacking-tool marker cutover checklist
 
@@ -289,7 +289,7 @@ Create or repair ruleset + classic settings with `scripts/github-repo-lint --rep
 - Merge with **Enable auto-merge** / **Merge when ready** (or `gh pr merge --auto --squash`); a PR in a gh stack cannot use auto-merge and is landed with `gh stack merge --yes --squash` (from the stack's worktree) (see `scripts/dev/merge-stack`)
 - Do **not** use the `merge-it` label to land PRs — leftover labels are harmless noise and are ignored by dep-updater
 
-Disable org repos in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue) so Graphite does not also try to land PRs. Graphite **stacking** (`gt`, `.github/stacking-tool`) remains supported and is unrelated to merge enqueue.
+Disable org repos in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue) so Graphite does not also try to land PRs. Graphite **stacking** (`gt`) is retired, and a leftover `graphite` marker in `.github/stacking-tool` is refused by the tooling and flagged by the audit.
 
 ### Branch hygiene
 
@@ -385,7 +385,7 @@ Org default is GitHub’s native merge queue. The checker validates `protect-mai
 | Classic `main` protection (org standard) | required (no Graphite-only push restrictions) |
 | Label `merge-it` / `merge-mq` | leftover only — harmless; do not use to land PRs |
 
-**Manual:** disable org repos in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue) so Graphite does not also try to land PRs. Keep using Graphite (or `gh-stack`) for **stacking** only — selected by `.github/stacking-tool`.
+**Manual:** disable org repos in [Graphite merge queue settings](https://app.graphite.com/settings/merge-queue) so Graphite does not also try to land PRs. Stacking is `gh-stack` only — selected by `.github/stacking-tool`; the audit flags a leftover `graphite` marker.
 
 ---
 
@@ -499,9 +499,9 @@ Service repositories install via `scripts/setup-service` and optionally implemen
 
 ## Commits, Stacking & Pull Requests
 
-> See [`.agents/skills/graphite/SKILL.md`](.agents/skills/graphite/SKILL.md) for the full Graphite workflow reference when `.github/stacking-tool` is `graphite` (branch naming, stack creation, navigation, submission, troubleshooting, and advanced rebasing). For this repo (`gh-stack`), see [`.agents/skills/gh-stack/SKILL.md`](.agents/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc).
+> Graphite is retired (repository-helpers#772). For stacking (`gh-stack`), see [`.agents/skills/gh-stack/SKILL.md`](.agents/skills/gh-stack/SKILL.md) and [`.cursor/rules/stacking-tool.mdc`](.cursor/rules/stacking-tool.mdc).
 
-- Stacking backend is selected by `.github/stacking-tool` (`graphite` or `gh-stack`). Prefer **`scripts/dev/submit-stack`** (dispatches via `scripts/lib/stacking-tool`).
+- Stacking backend is selected by `.github/stacking-tool` (`gh-stack`; a leftover `graphite` marker is refused). Prefer **`scripts/dev/submit-stack`** (dispatches via `scripts/lib/stacking-tool`).
 - Never work directly on `main`. Create stack layers with `gh stack init` / `gh stack add <branch>`.
 - Keep each branch in the stack focused on exactly one logical change. Stacks should map 1-to-1 with milestones or sub-tasks from [dep-updater.plan.md](./dep-updater.plan.md).
 - Sync via `scripts/dev/start-development` (marker-aware). Use `gh stack sync` / `gh stack rebase` as needed.
@@ -572,7 +572,7 @@ See the Skill for CodeRabbit on_push policy, early-complete loop semantics, per-
 - **Never declare `local -r` or plain `local` inside a loop body.** Hoist all `local` declarations to the top of the function. `local -r` inside a loop will crash on the second iteration with "readonly variable" because `local -r` both declares and sets, and re-entering the loop tries to re-declare an already-readonly name.
 - Do not use `A && B || C` as an if-then-else substitute (SC2015). Use a proper `if/then/else` block.
 - **Prefer long-form flags** for all command invocations (e.g. `--follow=name` not `-f`, `--all` not `-a`). Short flags are allowed only when no long form exists.
-- **Cron environment is minimal.** Any script designed to run under cron must not assume interactive shell init (e.g. PATH modifications that make `gt` visible). Prefer one (or both) of:
+- **Cron environment is minimal.** Any script designed to run under cron must not assume interactive shell init (e.g. PATH modifications that make `gh` or other tools visible). Prefer one (or both) of:
   - Setting a safe PATH at the top of the script (include at least `${HOME}/.local/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`).
   - Documenting a cron pattern like `bash -lc '<command>'` when shell init is required.
   
@@ -584,7 +584,7 @@ See the Skill for CodeRabbit on_push policy, early-complete loop semantics, per-
 
 - All file paths received from the CLI must be validated and resolved with `realpath`/`readlink -f` before any file system operation. Reject paths that escape the working directory.
 - No dynamic `eval` or command construction from user-controlled strings.
-- Do not log, store, or transmit credential tokens beyond what is needed to invoke `gh`/`gt`.
+- Do not log, store, or transmit credential tokens beyond what is needed to invoke `gh`.
 - Agents must follow `.cursor/rules/no-secret-exposure.mdc` (never print/paste secrets into logs, transcripts, PRs, or commits). Complements CI secret-scan: prevention vs detection.
 - Agents must follow `.cursor/rules/remote-timeouts-retries.mdc` (explicit timeouts and bounded retries on every remote/network call).
 - Agents must follow `.cursor/rules/github-api-throttle.mdc` (run every `gh` call site through `scripts/gh-api`, or `github_api_exec_with_rate_limit_retry` inside first-party bash libraries, so primary/secondary rate-limit backoff is automatic).
