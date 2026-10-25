@@ -28,7 +28,7 @@ Local clone (when `${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}` 
 When flipping `.github/stacking-tool` (or landing an MQ/`gh-stack` cutover PR):
 
 1. Update `AGENTS.md` stacking/merge guidance to match the new marker (and GitHub auto-merge: `gh pr merge --auto --squash` for a PR outside a stack, `gh stack merge --yes --squash` (from the stack's worktree) for a stacked PR — not `merge-it`).
-2. Rewrite `.agents/rules/pr-ship-and-review.md` submit block to the marker-aware template (copy via `github-repo-lint --apply-fix`, or from `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md` / https://github.com/the-hcma/repository-helpers/blob/main/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md; keep a thin `.cursor/rules/pr-ship-and-review.mdc` shim).
+2. Rewrite `.agents/rules/pr-ship-and-review.md` submit block to the gh-stack variant with `github-repo-lint --apply-fix`, which renders the marker-aware template. Do not copy the raw template by hand (`${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md`, https://github.com/the-hcma/repository-helpers/blob/main/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md): it still carries the `gt` snippets until rendered. Keep a thin `.cursor/rules/pr-ship-and-review.mdc` shim.
 3. Delete root `GRAPHITE.md` when switching to `gh-stack`.
 4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) in sync with the consumer template.
 5. Re-run `scripts/github-repo-lint --repo OWNER/NAME --suggest --strict-onboarding` and fix stacking-docs consistency findings.
