@@ -547,6 +547,84 @@ else
 fi
 rm -rf "$mock_dir"
 
+printf '\n=== functional: --apply-fix adds a missing required_signatures rule (#782) ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+mkdir -p "$mock_bin"
+body_log="${mock_dir}/put-body.json"
+
+# shellcheck disable=SC2016  # mock encodes base64 ci.yml containing merge_group:
+ci_b64="$(printf '%s' 'on:
+  pull_request:
+  merge_group:
+' | base64 -w0)"
+
+# The ruleset omits required_signatures; the PUT body becomes the next state.
+printf '%s' '{"id":11,"name":"protect-main","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/main"],"exclude":[]}},"bypass_actors":[],"rules":[{"type":"pull_request","parameters":{"allowed_merge_methods":["squash"]}},{"type":"merge_queue","parameters":{"merge_method":"SQUASH","grouping_strategy":"ALLGREEN","max_entries_to_build":5,"max_entries_to_merge":5,"min_entries_to_merge":1,"min_entries_to_merge_wait_minutes":0,"check_response_timeout_minutes":15}}]}' \
+  >"${mock_dir}/ruleset.state"
+
+cat >"${mock_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck disable=SC1091
+source "${script_dir}/lib/github-repo-lint-ci-mocks"
+grl_test_ci_secret_scan_init "${rh_root}"
+args="\$*"
+state_file="${mock_dir}/ruleset.state"
+if [[ "\$args" == *'auth status'* || "\$args" == *'release-please.yml'* ]]; then
+  exit 0
+fi
+if [[ "\$args" == *'/labels'* ]]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+if [[ "\$args" == *'contents/.github/workflows/ci.yml'* ]]; then
+  printf '%s\n' '{"content":"${ci_b64}"}'
+  exit 0
+fi
+if [[ "\$args" == *'-X PUT'* && "\$args" == *'/rulesets/'* ]]; then
+  input_path="\${args##*--input }"
+  input_path="\${input_path%% *}"
+  cp "\$input_path" "${body_log}"
+  cp "\$input_path" "\$state_file"
+  cat "\$state_file"
+  exit 0
+fi
+if [[ "\$args" == *'repos/the-hcma/unsigned-ruleset-repo/rulesets/'* ]]; then
+  cat "\$state_file"
+  exit 0
+fi
+if [[ "\$args" == *'repos/the-hcma/unsigned-ruleset-repo/rulesets'* ]]; then
+  printf '%s\n' '[{"id":11,"name":"protect-main"}]'
+  exit 0
+fi
+if [[ "\$args" == *'repos/the-hcma/unsigned-ruleset-repo'* && "\$args" != *contents* ]]; then
+  printf '%s\n' '{"allow_merge_commit":false,"allow_rebase_merge":false,"allow_squash_merge":true,"squash_merge_commit_message":"BLANK","squash_merge_commit_title":"PR_TITLE"}'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+write_mock_jq_passthrough "${mock_bin}"
+
+set +e
+output="$(PATH="${mock_bin}:${PATH}" bash "$checker" --repo the-hcma/unsigned-ruleset-repo --apply-fix 2>&1)"
+exit_code=$?
+set -e
+
+if [[ -s "$body_log" ]] \
+  && jq -e '[.rules[] | select(.type == "required_signatures")] | length == 1' "$body_log" >/dev/null; then
+  printf '[PASS] --apply-fix PUT payload adds the missing required_signatures rule\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected the apply-fix PUT body to include required_signatures (exit=%s)\n%s\nbody:\n%s\n' \
+    "$exit_code" "$output" "$(cat "$body_log" 2>/dev/null || true)"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
 printf '\n=== summary ===\n'
 printf '%s passed, %s failed\n' "$pass" "$fail"
 if [[ "$fail" -gt 0 ]]; then
