@@ -22,6 +22,10 @@ start_dev_stacking_tool=''
 start_dev_stacking_tool_value() {
   if [[ -z "$start_dev_stacking_tool" ]]; then
     start_dev_stacking_tool="$(stacking_tool_read_or_org_default "$main_repo" "start-development")"
+    if [[ "$start_dev_stacking_tool" == "$stacking_tool_value_graphite" ]]; then
+      echo "ERROR: $(stacking_tool_retired_message)" >&2
+      exit 1
+    fi
   fi
   printf '%s' "$start_dev_stacking_tool"
 }
@@ -211,101 +215,19 @@ gh_pr_info() {
   echo "NOT_FOUND"
 }
 
-# start_dev_consult_graphite_for_pr_state
-# Exit 0 when gt info should be consulted for merge/close detection.
-# Skip Graphite when START_DEV_SKIP_GRAPHITE=1, gt is missing, or the resolved
-# stacking tool is gh-stack (gh-stack branches are not Graphite-tracked).
-# Missing marker → org default (logged once); invalid marker → dies.
-start_dev_consult_graphite_for_pr_state() {
-  local tool
-
-  if [[ "${START_DEV_SKIP_GRAPHITE:-0}" == '1' ]]; then
-    return 1
-  fi
-  if ! command -v gt >/dev/null 2>&1; then
-    return 1
-  fi
-  tool="$(start_dev_stacking_tool_value)"
-  if [[ "$tool" == "$stacking_tool_value_gh_stack" ]]; then
-    return 1
-  fi
-  return 0
-}
-
 # resolve_pr_state_for_branch <branch>
 # Prints the same format as gh_pr_info: NOT_FOUND | <STATE> <NUMBER>.
-# For graphite (or org default when marker missing): Graphite is authoritative for
-# merge/close — gt info --branch reflects merged stacks immediately, while GitHub's
-# REST view can still list the PR as OPEN until caches catch up.
-# For gh-stack: use GitHub only (never call gt info).
-# Invalid marker aborts session setup (stacking_tool_read_or_org_default).
+# GitHub is the only source of merge/close state (Graphite is retired, #772).
 resolve_pr_state_for_branch() {
-  local -r branch="$1"
-  local gt_out first_line pr_from_gt gh_line gh_num
-
-  if ! start_dev_consult_graphite_for_pr_state; then
-    gh_pr_info "$branch"
-    return 0
-  fi
-
-  gt_out=""
-  if gt_out="$(runner_exec_stdout "start-development gt info" -- \
-      sh -c "cd \"${main_repo}\" && \"${timeout_cmd}\" 25 gt info --branch \"${branch}\" --no-interactive")"; then
-    :
-  else
-    gt_out=""
-  fi
-  first_line="$(printf '%s\n' "$gt_out" | head -1)"
-
-  if printf '%s' "$first_line" | grep -qiE ' \(merged\)$' \
-    || printf '%s\n' "$gt_out" | head -25 | grep -qE 'PR #[0-9]+ \(Merged\)'; then
-    pr_from_gt=""
-    pr_from_gt="$(printf '%s\n' "$gt_out" | grep -oiE 'PR #[0-9]+' | head -1 | sed 's/^PR #//')"
-    if [[ -z "$pr_from_gt" ]]; then
-      gh_line="$(gh_pr_info "$branch")"
-      if [[ "$gh_line" != "NOT_FOUND" ]]; then
-        read -r _gh_state gh_num <<< "$gh_line"
-        pr_from_gt="$gh_num"
-      fi
-    fi
-    if [[ -n "$pr_from_gt" ]]; then
-      printf 'MERGED %s\n' "$pr_from_gt"
-    else
-      printf 'MERGED\n'
-    fi
-    return 0
-  fi
-
-  if printf '%s\n' "$gt_out" | head -25 | grep -qE 'PR #[0-9]+ \(Closed\)'; then
-    pr_from_gt=""
-    pr_from_gt="$(printf '%s\n' "$gt_out" | grep -oiE 'PR #[0-9]+' | head -1 | sed 's/^PR #//')"
-    if [[ -z "$pr_from_gt" ]]; then
-      gh_line="$(gh_pr_info "$branch")"
-      if [[ "$gh_line" != "NOT_FOUND" ]]; then
-        read -r _gh_state gh_num <<< "$gh_line"
-        pr_from_gt="$gh_num"
-      fi
-    fi
-    if [[ -n "$pr_from_gt" ]]; then
-      printf 'CLOSED %s\n' "$pr_from_gt"
-    else
-      printf 'CLOSED\n'
-    fi
-    return 0
-  fi
-
-  gh_pr_info "$branch"
+  gh_pr_info "$1"
 }
 
-# print_pr_urls_github_graphite <pr_number>
-# Emits clickable GitHub URL; adds Graphite app URL when Graphite is in use.
-print_pr_urls_github_graphite() {
+# print_pr_urls_github <pr_number>
+# Emits the clickable GitHub URL of the PR.
+print_pr_urls_github() {
   local -r num="$1"
   [[ -z "$num" ]] && return 0
   printf '   GitHub:   https://github.com/%s/pull/%s\n' "$gh_repo" "$num"
-  if start_dev_consult_graphite_for_pr_state; then
-    printf '   Graphite: https://app.graphite.com/github/pr/%s/%s\n' "$gh_repo" "$num"
-  fi
 }
 
 # secondary_worktree_head_epoch <worktree_path>
@@ -555,9 +477,6 @@ handle_secondary_worktree() {
 
   if [[ "$mode" != 'post_sync_merged_only' ]]; then
     printf ' - Checking worktree: %s (%s)...\n' "$current_branch" "$current_path"
-    if start_dev_consult_graphite_for_pr_state; then
-      printf '   Querying Graphite: gt info --branch '\''%s'\''\n' "$current_branch"
-    fi
     printf '   Querying GitHub: gh pr list --head '\''%s'\'' --state all\n' "$current_branch"
   fi
 
@@ -588,11 +507,7 @@ handle_secondary_worktree() {
   fi
 
   if [[ "$pr_state" == "MERGED" || "$pr_state" == "CLOSED" ]]; then
-    if start_dev_consult_graphite_for_pr_state; then
-      printf '   PR status: %s (Graphite gt info when available; else GitHub mergedAt)\n' "$pr_label"
-    else
-      printf '   PR status: %s (GitHub)\n' "$pr_label"
-    fi
+    printf '   PR status: %s (GitHub)\n' "$pr_label"
     if [[ -n "$pr_number" ]]; then
       printf '   GitHub:   https://github.com/%s/pull/%s\n' "$gh_repo" "$pr_number"
     fi
@@ -608,7 +523,7 @@ handle_secondary_worktree() {
 
   if [[ "$pr_state" == "OPEN" ]]; then
     printf '   [+] PR is %s. Keeping worktree.\n' "$pr_label"
-    print_pr_urls_github_graphite "$pr_number"
+    print_pr_urls_github "$pr_number"
     pending_worktrees+=("$current_path|$current_branch")
     return 0
   fi
@@ -771,7 +686,7 @@ while IFS= read -r line; do
     fi
 done <<< "$wt_info"
 
-# 3. Synchronize stacking tool (Graphite or git fetch per .github/stacking-tool)
+# 3. Synchronize the stacking tool (git fetch per .github/stacking-tool)
 start_dev_tool="$(start_dev_stacking_tool_value)"
 echo "Synchronizing via stacking-tool (${start_dev_tool})..."
 
@@ -867,9 +782,6 @@ while IFS= read -r branch; do
     [[ "$in_worktree" == "true" ]] && continue
 
     echo " - Checking branch: $branch..."
-    if start_dev_consult_graphite_for_pr_state; then
-      echo "   Querying Graphite: gt info --branch '$branch'"
-    fi
     echo "   Querying GitHub: gh pr list --head '$branch' --state all"
     orphan_info="$(resolve_pr_state_for_branch "$branch")"
     orphan_state="$orphan_info"
@@ -902,7 +814,7 @@ while IFS= read -r branch; do
             echo "   [!] Deleting $branch (patch content already on main, no PR)..."
             sd_runner_git_c "$main_repo" "start-development patch branch delete" -- branch -D "$branch" || true
         elif [[ "$branch" =~ ^pr-[0-9]+-merge$ ]]; then
-            echo "   [!] Deleting $branch (Graphite merge-queue staging branch, no PR)..."
+            echo "   [!] Deleting $branch (stale merge-queue staging branch, no PR)..."
             sd_runner_git_c "$main_repo" "start-development mq branch delete" -- branch -D "$branch" || true
         else
             echo "   [+] Keeping $branch (unmerged, no remote PR)."
@@ -925,7 +837,7 @@ echo "=========================================="
 
 # --refresh mode: run setup-service (which runs on-deploy, handles build steps and restart),
 # or fall back to a direct start if setup-service is not available.
-# Cleanup (worktree/branch pruning, Graphite sync, main pull) has already run above.
+# Cleanup (worktree/branch pruning, session sync, main pull) has already run above.
 #
 # setup-service lives in the repository-helpers scripts/ directory (one level above this
 # script), not in the target repo.  Resolve it via BASH_SOURCE[0] so the correct binary
@@ -1051,42 +963,28 @@ if [[ -z "$selected_path" ]]; then
         exit 2
     fi
     sd_runner_git_c "$main_repo" "start-development worktree add" -- worktree add -b "$branch_name" "$selected_path" main
-    if [[ "$(start_dev_stacking_tool_value)" == "$stacking_tool_value_gh_stack" ]]; then
-      # Register the branch as a one-branch stack now, so submit-stack works without a manual
-      # gh stack init (#744). submit-stack retries this, so a failure here is only a warning.
-      start_dev_stack_registered=1
-      ( stacking_tool_ensure_registered "$stacking_tool_value_gh_stack" "$selected_path" ) || {
-        start_dev_stack_registered=0
-        echo "WARNING: could not register '$branch_name' as a gh stack; submit-stack will try again" >&2
-      }
-    else
-      runner_sh "start-development gt track" "cd \"${selected_path}\" && gt track --parent main"
-    fi
+    # Register the branch as a one-branch stack now, so submit-stack works without a manual
+    # gh stack init (#744). submit-stack retries this, so a failure here is only a warning.
+    start_dev_stack_registered=1
+    ( stacking_tool_ensure_registered "$stacking_tool_value_gh_stack" "$selected_path" ) || {
+      start_dev_stack_registered=0
+      echo "WARNING: could not register '$branch_name' as a gh stack; submit-stack will try again" >&2
+    }
 
     echo ""
-    if [[ "$(start_dev_stacking_tool_value)" == "$stacking_tool_value_gh_stack" ]]; then
-      if [[ "$start_dev_stack_registered" == '1' ]]; then
-        echo "Branch '${branch_name}' is registered as a one-branch gh stack. Commit, then:"
-      else
-        echo "Branch '${branch_name}' is not registered as a gh stack yet (submit-stack registers it). Commit, then:"
-      fi
-      echo "  scripts/dev/submit-stack            # pre-PR checks + gh stack submit"
-      echo "  # more layers: gh stack add <next-layer>"
+    if [[ "$start_dev_stack_registered" == '1' ]]; then
+      echo "Branch '${branch_name}' is registered as a one-branch gh stack. Commit, then:"
     else
-      echo "Start your first branch with:"
-      echo "  gt create $stack_name/<description> -m 'feat: ...'"
-      echo "  gt track --parent main   # reparent directly to main (required for gt submit)"
+      echo "Branch '${branch_name}' is not registered as a gh stack yet (submit-stack registers it). Commit, then:"
     fi
+    echo "  scripts/dev/submit-stack            # pre-PR checks + gh stack submit"
+    echo "  # more layers: gh stack add <next-layer>"
 fi
 
 echo ""
 echo "To work on this stack, run:"
 echo "  cd $selected_path"
 echo "=========================================="
-if [[ "$(start_dev_stacking_tool_value)" == "$stacking_tool_value_gh_stack" ]]; then
-  echo "Tip: Use 'gh stack view --json' to inspect GitHub Stacked PRs state."
-else
-  echo "Tip: Use 'gt state' to debug Graphite metadata issues."
-fi
+echo "Tip: Use 'gh stack view --json' to inspect GitHub Stacked PRs state."
 echo "    Initialization Complete               "
 echo "=========================================="
