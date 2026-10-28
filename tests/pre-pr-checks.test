@@ -259,6 +259,102 @@ else
 fi
 rm -rf "$other_repo"
 
+assert_contains "--help mentions the job cap" "$help_output" "PRE_PR_CHECKS_JOBS"
+
+printf '\n=== PRE_PR_CHECKS_JOBS caps the jobs that run together ===\n'
+cap_dir="$(mktemp -d)"
+trap 'rm -rf "$cap_dir"' EXIT
+# Pull the two functions out of the script, so the test runs the shipped code and not a copy.
+{
+  printf 'die() { printf "ERROR: %%s\\n" "$*" >&2; exit 1; }\n'
+  printf 'runner_session_begin() { :; }\nrunner_session_end() { :; }\n'
+  printf 'prec_pr_job_count=0\nprec_pr_max_jobs=0\n'
+  awk '/^prec_resolve_max_jobs\(\) \{/,/^}/' "$pre_pr_checks"
+  awk '/^start_parallel_job\(\) \{/,/^}/' "$pre_pr_checks"
+} >"${cap_dir}/functions.sh"
+
+# shellcheck disable=SC2016  # the probe is a bash -c program; $1 and $prec_pr_max_jobs expand in the child
+cap_probe='set -euo pipefail; source "$1"; prec_resolve_max_jobs; printf "%s" "$prec_pr_max_jobs"'
+cap_value() {
+  local -r value="$1"
+  PRE_PR_CHECKS_JOBS="$value" bash -c "$cap_probe" _ "${cap_dir}/functions.sh" 2>&1
+}
+cap_rc=0
+cap_out="$(env -u PRE_PR_CHECKS_JOBS bash -c "$cap_probe" _ "${cap_dir}/functions.sh" 2>&1)" || cap_rc=$?
+assert_exit_0 "an unset PRE_PR_CHECKS_JOBS means no cap" "$cap_out" "$cap_rc"
+assert_contains "an unset PRE_PR_CHECKS_JOBS means no cap (0)" "$cap_out" "0"
+cap_out="$(cap_value 3)"
+assert_contains "PRE_PR_CHECKS_JOBS=3 caps at 3" "$cap_out" "3"
+for bad in 0 -1 abc 1.5 1000 ' 2'; do
+  cap_rc=0
+  cap_out="$(cap_value "$bad")" || cap_rc=$?
+  assert_exit_nonzero "PRE_PR_CHECKS_JOBS='${bad}' is rejected" "$cap_out" "$cap_rc"
+  assert_contains "PRE_PR_CHECKS_JOBS='${bad}' names the variable" "$cap_out" "PRE_PR_CHECKS_JOBS must be a positive integer"
+done
+
+# Three jobs under a cap of two: the first two block until released, so the third can only start once one of
+# them has ended. Each job records how many jobs were running when it started; the third must see two, not three.
+cat >"${cap_dir}/case.sh" <<'CASE'
+set -euo pipefail
+d="$1"
+source "$d/functions.sh"
+prec_pr_jobs_dir="$d/jobs"
+mkdir -p "$prec_pr_jobs_dir"
+mkfifo "$d/started" "$d/rel-j1" "$d/rel-j2" "$d/rel-j3"
+job() {
+  local -r n="$1"
+  local s e
+  shopt -s nullglob
+  : >"$d/start-$n"
+  s=("$d"/start-*)
+  e=("$d"/end-*)
+  printf '%s' "$(( ${#s[@]} - ${#e[@]} ))" >"$d/running-$n"
+  printf '%s\n' "$n" >"$d/started"
+  read -r _ <"$d/rel-$n"
+  : >"$d/end-$n"
+}
+harness() {
+  PRE_PR_CHECKS_JOBS=2
+  prec_resolve_max_jobs
+  start_parallel_job j1 job j1
+  start_parallel_job j2 job j2
+  start_parallel_job j3 job j3
+  wait
+}
+exec 3<>"$d/started"
+harness &
+harness_pid=$!
+read -r first <&3
+read -r second <&3
+printf 'go\n' >"$d/rel-j1"
+read -r third <&3
+printf 'go\n' >"$d/rel-j2"
+printf 'go\n' >"$d/rel-j3"
+wait "$harness_pid"
+printf 'order=%s,%s,%s running-j3=%s\n' "$first" "$second" "$third" "$(<"$d/running-j3")"
+CASE
+cap_rc=0
+cap_out="$(timeout 60 bash "${cap_dir}/case.sh" "$cap_dir" 2>&1)" || cap_rc=$?
+assert_exit_0 "three jobs under a cap of two finish" "$cap_out" "$cap_rc"
+assert_contains "the third job starts only after one of the first two has ended" "$cap_out" "order=j1,j2,j3"
+assert_contains "no more than two jobs run together under a cap of two" "$cap_out" "running-j3=2"
+
+printf '\n=== static: the job cap is applied before each job starts ===\n'
+if awk '/^start_parallel_job\(\) \{/,/^}/' "$pre_pr_checks" | grep -qF 'wait -n'; then
+  pass_case 'start_parallel_job waits for a free slot before it starts a job'
+  pass=$(( pass + 1 ))
+else
+  fail_case 'start_parallel_job waits for a free slot before it starts a job'
+  fail=$(( fail + 1 ))
+fi
+if awk '/^start_planned_parallel_checks\(\) \{/,/^}/' "$pre_pr_checks" | grep -qF 'prec_resolve_max_jobs'; then
+  pass_case 'start_planned_parallel_checks validates PRE_PR_CHECKS_JOBS before it starts any job'
+  pass=$(( pass + 1 ))
+else
+  fail_case 'start_planned_parallel_checks validates PRE_PR_CHECKS_JOBS before it starts any job'
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== summary ===\n'
 printf 'passed: %d  failed: %d\n' "$pass" "$fail"
 if (( fail > 0 )); then
