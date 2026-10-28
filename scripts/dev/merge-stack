@@ -249,7 +249,7 @@ ready_state() {
 #                                    wrapper's job
 # An unreadable setup is also a refusal, never a guess. Returns 1 after printing the reason to stderr.
 plan_plain_merge() {
-  local slug base queue_rules allow_auto
+  local slug base base_path queue_rules queue_read allow_auto
 
   slug="${repo_arg:-$(local_slug)}"
   base="$(pr_field '.baseRefName // "main"' || true)"
@@ -258,14 +258,25 @@ plan_plain_merge() {
       "$pr_number" "${slug:-unknown}" "${base:-unknown}" >&2
     return 1
   fi
-  queue_rules="$(gh_read "merge-stack gh merge queue rule ${base}" api "repos/${slug}/rules/branches/${base}" \
-    --jq '[.[] | select(.type == "merge_queue")] | length')" || queue_rules=''
-  if [[ "$queue_rules" =~ ^[0-9]+$ ]] && (( queue_rules > 0 )); then
+  # A branch name can hold characters that mean something in a URL ("#" starts a fragment), so each path
+  # segment is percent-encoded; the "/" between segments stays literal. The rules come in pages of 30, so every
+  # page is read before deciding there is no queue. An empty answer from a successful read means no queue rule.
+  base_path="$(runner_exec_stdout "merge-stack jq encode base" -- jq --null-input --raw-output --arg b "$base" \
+    '$b | split("/") | map(@uri) | join("/")')" || base_path=''
+  if [[ -n "$base_path" ]]; then
+    queue_read=1
+    queue_rules="$(gh_read "merge-stack gh merge queue rule ${base}" api "repos/${slug}/rules/branches/${base_path}" --paginate \
+      --jq '.[] | select(.type == "merge_queue") | .type')" || queue_read=0
+  else
+    queue_read=0
+    queue_rules=''
+  fi
+  if (( queue_read == 1 )) && [[ -n "$queue_rules" ]]; then
     printf -- '--auto'
     return 0
   fi
   allow_auto="$(gh_read "merge-stack gh auto-merge setting" api "repos/${slug}" --jq '.allow_auto_merge')" || allow_auto=''
-  if [[ ! "$queue_rules" =~ ^[0-9]+$ || ! "$allow_auto" =~ ^(true|false)$ ]]; then
+  if (( queue_read == 0 )) || [[ ! "$allow_auto" =~ ^(true|false)$ ]]; then
     printf 'ERROR: merge-stack: could not read the merge setup of %s (base %s); nothing was merged\n' \
       "$slug" "$base" >&2
     return 1
