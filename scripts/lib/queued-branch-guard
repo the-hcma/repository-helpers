@@ -3,6 +3,7 @@
 #
 # Sourced by scripts/dev/submit-stack. A push to a queued PR's head branch makes GitHub drop the PR from
 # the queue (or build the queue entry on a stale head), so the submit stops before it pushes anything.
+# `gh stack submit` pushes every open layer of the stack, so every unmerged layer is checked, not only HEAD.
 
 if declare -F queued_branch_guard >/dev/null 2>&1; then
   return 0
@@ -16,35 +17,72 @@ source "${_qbg_lib_dir}/runner-ensure"
 source "${_qbg_lib_dir}/github-repo-slug"
 # shellcheck disable=SC1091
 source "${_qbg_lib_dir}/github-api-rate-limit"
+# shellcheck disable=SC1091  # the stacking-tool marker decides whether stacks exist
+source "${_qbg_lib_dir}/stacking-tool"
+
+# _qbg_stack_branches <repo_dir> — the unmerged branches of the current stack, one per line (empty when the
+# directory is not in a stack or the stack cannot be read: the caller still checks HEAD).
+_qbg_stack_branches() {
+  local -r repo_dir="$1"
+  local view_json tool
+
+  tool="$(stacking_tool_read "$repo_dir" 2>/dev/null)" || return 0
+  # shellcheck disable=SC2154  # assigned readonly in scripts/lib/stacking-tool
+  [[ "$tool" == "$stacking_tool_value_gh_stack" ]] || return 0
+  view_json="$(cd "$repo_dir" && github_api_exec_with_rate_limit_retry "queued-branch-guard gh stack view" --probe -- gh stack view --json)" || return 0
+  # shellcheck disable=SC2016  # $stack is a jq variable bound by --argjson, not a shell expansion
+  runner_exec_stdout "queued-branch-guard jq stack branches" --probe -- jq --null-input --raw-output --argjson stack "$view_json" '$stack.branches[]? | select(.isMerged != true) | .name // empty' || true
+}
+
+# _qbg_queued_pr <slug> <branch> — prints the number of an open PR from <slug> with head <branch> that is in the
+# merge queue (nothing when there is none). Returns non-zero when the queue state cannot be read.
+_qbg_queued_pr() {
+  local -r slug="$1"
+  local -r branch="$2"
+  local rows
+
+  # shellcheck disable=SC2016  # $o, $n and $h are GraphQL variables, not shell expansions
+  rows="$(GITHUB_API_ATTEMPT_TIMEOUT_S="${GITHUB_API_ATTEMPT_TIMEOUT_S:-60}" github_api_exec_with_rate_limit_retry "queued-branch-guard gh queue state ${branch}" -- gh api graphql \
+    -f query='query($o: String!, $n: String!, $h: String!) { repository(owner: $o, name: $n) { pullRequests(headRefName: $h, states: OPEN, first: 100) { nodes { number isInMergeQueue headRepository { nameWithOwner } } } } }' \
+    -f o="${slug%%/*}" -f n="${slug#*/}" -f h="$branch" \
+    --jq '.data.repository.pullRequests.nodes[] | select(.isInMergeQueue) | "\(.headRepository.nameWithOwner // "")\t\(.number)"')" || return 1
+  # Only a PR whose head lives in origin is affected by a push to origin (a fork PR may reuse the branch name).
+  printf '%s\n' "$rows" | awk -F'\t' -v s="$slug" 'tolower($1) == tolower(s) { print $2; exit }'
+}
 
 # queued_branch_guard <repo_dir>
-# Returns 1 (after one ERROR: QUEUED_BRANCH line) when an open PR with the current branch as its head is in
-# the merge queue. Returns 0 when it is not, when HEAD is detached or has no GitHub origin, and when the
-# queue state cannot be read: the read failure is a WARN line, so the submit is not blocked by an API outage
-# but the skipped check is never silent.
+# Returns 1 (after one ERROR: QUEUED_BRANCH line) when an open PR whose head is the current branch, or any
+# unmerged layer of its stack, is in the merge queue. Returns 0 when none is, when HEAD is detached or has no
+# GitHub origin, and when a queue state cannot be read: the read failure is a WARN line, so the submit is not
+# blocked by an API outage but the skipped check is never silent.
 queued_branch_guard() {
   local -r repo_dir="${1:?queued_branch_guard: repo_dir required}"
-  local branch origin_url slug queued
+  local head_branch origin_url slug branch queued branches
+  local -a to_check=()
 
-  branch="$(runner_exec_stdout "queued-branch-guard branch" --probe --timeout 20 -- git -C "$repo_dir" symbolic-ref --quiet --short HEAD)" || return 0
-  [[ -n "$branch" ]] || return 0
+  head_branch="$(runner_exec_stdout "queued-branch-guard branch" --probe --timeout 20 -- git -C "$repo_dir" symbolic-ref --quiet --short HEAD)" || return 0
+  [[ -n "$head_branch" ]] || return 0
   origin_url="$(runner_exec_stdout "queued-branch-guard origin" --probe --timeout 20 -- git -C "$repo_dir" remote get-url origin)" || return 0
   slug="$(gh_slug_from_origin_url "$origin_url")" || slug=""
   [[ "$slug" == */* ]] || return 0
 
-  # shellcheck disable=SC2016  # $o, $n and $h are GraphQL variables, not shell expansions
-  if ! queued="$(github_api_exec_with_rate_limit_retry "queued-branch-guard gh queue state ${branch}" -- timeout 60 gh api graphql \
-    -f query='query($o: String!, $n: String!, $h: String!) { repository(owner: $o, name: $n) { pullRequests(headRefName: $h, states: OPEN, first: 100) { nodes { number isInMergeQueue headRepository { nameWithOwner } } } } }' \
-    -f o="${slug%%/*}" -f n="${slug#*/}" -f h="$branch" \
-    --jq '.data.repository.pullRequests.nodes[] | select(.isInMergeQueue) | "\(.headRepository.nameWithOwner // "")\t\(.number)"')"; then
-    printf 'WARN: queued-branch-guard: could not read the merge queue state of %s; not checking\n' "$branch" >&2
-    return 0
-  fi
-  # Only a PR whose head lives in origin is affected by a push to origin (a fork PR may reuse the branch name).
-  queued="$(printf '%s\n' "$queued" | awk -F'\t' -v s="$slug" 'tolower($1) == tolower(s) { print $2; exit }')"
-  if [[ -n "$queued" ]]; then
-    printf 'ERROR: QUEUED_BRANCH branch=%s pr=#%s is in the merge queue; a push would drop it from the queue. Wait for it to merge, or remove it from the queue first. Nothing was pushed.\n' \
-      "$branch" "$queued" >&2
-    return 1
-  fi
+  to_check=("$head_branch")
+  branches="$(_qbg_stack_branches "$repo_dir")"
+  while IFS= read -r branch; do
+    if [[ -n "$branch" && "$branch" != "$head_branch" ]]; then
+      to_check+=("$branch")
+    fi
+  done <<<"$branches"
+
+  for branch in "${to_check[@]}"; do
+    if ! queued="$(_qbg_queued_pr "$slug" "$branch")"; then
+      printf 'WARN: queued-branch-guard: could not read the merge queue state of %s; not checking\n' "$branch" >&2
+      continue
+    fi
+    if [[ -n "$queued" ]]; then
+      printf 'ERROR: QUEUED_BRANCH branch=%s pr=#%s is in the merge queue; a push would drop it from the queue. Wait for it to merge, or remove it from the queue first. Nothing was pushed.\n' \
+        "$branch" "$queued" >&2
+      return 1
+    fi
+  done
 }

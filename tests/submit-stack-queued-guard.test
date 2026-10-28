@@ -22,13 +22,20 @@ git -C "$repo" init --quiet --initial-branch=main
 git -C "$repo" -c user.name=t -c user.email=t@example.invalid commit --quiet --allow-empty --no-gpg-sign -m init
 git -C "$repo" checkout --quiet -b feature-x
 git -C "$repo" remote add origin https://github.com/example-org/example-repo.git
+mkdir -p "$repo/.github"
+printf 'gh-stack\n' >"$repo/.github/stacking-tool"
 
 # Fake gh: the queue read prints FAKE_QUEUED (PR numbers), fails with FAKE_FAIL, and logs its variables.
 cat >"${bin}/gh" <<'MOCK_GH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${GH_LOG:?}"
 if [[ -n "${FAKE_FAIL:-}" ]]; then exit 1; fi
+if [[ "$1 $2" == 'stack view' ]]; then
+  if [[ -n "${FAKE_STACK:-}" ]]; then printf '%s\n' "${FAKE_STACK}"; exit 0; fi
+  exit 1
+fi
 if [[ "$1 $2" == 'api graphql' ]]; then
+  if [[ -n "${FAKE_QUEUED_FOR:-}" && "$*" != *"h=${FAKE_QUEUED_FOR}"* ]]; then exit 0; fi
   if [[ -n "${FAKE_QUEUED:-}" ]]; then printf '%b\n' "${FAKE_QUEUED}"; fi
   exit 0
 fi
@@ -81,6 +88,20 @@ if [[ "${out%%|*}" == '1' && "$out" == *'pr=#803'* ]]; then
 else
   fail_case "a fork PR is skipped and the queued PR from origin is still refused (${out})"
 fi
+stack_json='{"branches":[{"name":"base-layer","isMerged":false},{"name":"merged-layer","isMerged":true},{"name":"feature-x","isMerged":false}]}'
+out="$(guard FAKE_STACK="$stack_json" FAKE_QUEUED_FOR=base-layer FAKE_QUEUED="$q801")"
+if [[ "${out%%|*}" == '1' && "$out" == *'ERROR: QUEUED_BRANCH branch=base-layer pr=#801'* ]]; then
+  pass_case 'a queued lower layer is refused when submitting from an unqueued upper layer'
+else
+  fail_case "a queued lower layer is refused when submitting from an unqueued upper layer (${out})"
+fi
+: >"$log"
+out="$(guard FAKE_STACK="$stack_json" FAKE_QUEUED_FOR=merged-layer FAKE_QUEUED="$q801")"
+if [[ "${out%%|*}" == '0' && "$out" != *'ERROR'* ]] && ! grep -qF 'h=merged-layer' "$log"; then
+  pass_case 'a merged layer of the stack is not looked up'
+else
+  fail_case "a merged layer of the stack is not looked up (${out})"
+fi
 git -C "$repo" checkout --quiet --detach
 : >"$log"
 out="$(guard FAKE_QUEUED=$q801)"
@@ -97,6 +118,14 @@ if [[ "$submit_text" == *'queued_branch_guard "$repo_dir"'*'"${script_dir}/pre-p
   pass_case 'submit-stack runs the guard before pre-pr-checks and again right before the submit'
 else
   fail_case 'submit-stack runs the guard before pre-pr-checks and again right before the submit'
+fi
+
+printf '\n=== static: the per-call cap goes through the shared executor ===\n'
+guard_text="$(<"$lib")"
+if [[ "$guard_text" != *'-- timeout '* && "$guard_text" == *GITHUB_API_ATTEMPT_TIMEOUT_S* ]]; then
+  pass_case 'the guard caps the gh call through the executor, not a hardcoded timeout binary'
+else
+  fail_case 'the guard caps the gh call through the executor, not a hardcoded timeout binary'
 fi
 
 rm -rf "$repo" "$bin"
