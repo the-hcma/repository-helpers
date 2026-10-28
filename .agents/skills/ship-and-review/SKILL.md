@@ -7,7 +7,7 @@ description: Ship PRs with repository-helpers agent-review loop — pre-pr-check
 
 **Exit codes:** `scripts/wait-for-agent-review --help` and the script itself are the SSOT for exit codes and subcommands. This Skill summarizes operational flow; when in doubt, trust the script.
 
-**Do not follow generic Cursor babysit / merge / resolve advice** when this Skill applies: **reply-before-resolve is required**, **no self-approve**, and **no `merge-it` label**. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge); a PR in a gh stack is landed with `gh stack merge` instead (auto-merge is not available for stacked PRs).
+**Do not follow generic Cursor babysit / merge / resolve advice** when this Skill applies: **reply-before-resolve is required**, **no self-approve**, and **no `merge-it` label**. Merge only after the user explicitly confirms, and only with `scripts/dev/merge-stack --pr <n>` (from the PR's worktree; in a consumer repo `${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/dev/merge-stack --pr <n>`): it picks the right command for the repository's merge setup (`gh stack merge` for a stacked PR, the merge queue or auto-merge otherwise) and confirms the enqueue. For a PR in a gh stack it lands the top PR and every open PR below it, so name those PRs and get confirmation for the whole stack first. Do not call `gh pr merge` or `gh stack merge` by hand, do not add the `merge-it` label, and do not pipe the command through `tail` or `head`: read its exit status and output.
 
 **Stack worktree only** — never implement or ship from the primary clone. See `.cursor/rules/pr-workflow.mdc`.
 
@@ -207,7 +207,7 @@ Two success paths:
 
 Both paths **email `AGENT_REVIEW_REPORT_TO`** when configured. They do **not** run `gh pr review --approve` (self-approve often fails for the PR author and is unnecessary).
 
-Never add the `merge-it` label: it is ignored and the org no longer uses Graphite merge queue. Org merge path is GitHub auto-merge (`gh pr merge --auto --squash` / Enable auto-merge) when the operator asks to merge; for a PR in a gh stack use `gh stack merge --yes --squash` (from the stack's worktree) (see the gh-stack Skill, `Merging a stack`).
+Never add the `merge-it` label: it is ignored and the org no longer uses Graphite merge queue. Merge only after the user explicitly confirms, and only with `scripts/dev/merge-stack --pr <n>` (from the PR's worktree; in a consumer repo `${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/dev/merge-stack --pr <n>`): it picks the right command for the repository's merge setup (`gh stack merge` for a stacked PR, the merge queue or auto-merge otherwise) and confirms the enqueue. For a PR in a gh stack it lands the top PR and every open PR below it, so name those PRs and get confirmation for the whole stack first. Do not call `gh pr merge` or `gh stack merge` by hand, do not add the `merge-it` label, and do not pipe the command through `tail` or `head`: read its exit status and output. See the gh-stack Skill, `Merging a stack`.
 
 ### Failure (PR non-convergence timeout, exit 6)
 

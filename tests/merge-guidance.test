@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Static checks: the agent-facing merge guidance points at scripts/dev/merge-stack and nothing else
+# (repository-helpers#775): merge only after the user explicitly confirms, no hand-run `gh pr merge`,
+# no `merge-it` label, and no piping the merge command through tail/head.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+rh_root="${script_dir}/.."
+readonly rh_root
+
+# shellcheck source=tests/lib/test-assert
+source "${script_dir}/lib/test-assert"
+pass=0
+fail=0
+test_init
+
+# Files that tell an agent how to merge; the first group must state the whole contract.
+contract_files=(
+  .agents/rules/pr-workflow.md
+  .agents/rules/pr-ship-and-review.md
+  .agents/skills/ship-and-review/SKILL.md
+  .agents/skills/gh-stack/SKILL.md
+  scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md
+)
+# Files that mention merging in passing: they must point at the wrapper, not at a raw command.
+pointer_files=(
+  .agents/rules/org-cursor-rule-rollout.md
+  .agents/rules/stacking-tool.md
+  scripts/lib/repo-practices-agents/rules/stacking-tool.md
+  .agents/skills/gh-stack/SKILL.md
+)
+
+printf '\n=== static: the merge contract is stated in full ===\n'
+for rel in "${contract_files[@]}"; do
+  text="$(<"${rh_root}/${rel}")"
+  for needle in 'scripts/dev/merge-stack --pr' 'explicitly confirm' 'merge-it' 'tail' 'whole stack'; do
+    if [[ "$text" == *"$needle"* ]]; then
+      pass_case "${rel} mentions '${needle}'"
+    else
+      fail_case "${rel} mentions '${needle}'"
+    fi
+  done
+done
+
+# line_prescribes_bare_merge <line> — true when a sentence names `gh pr merge` without forbidding it or
+# explaining why the wrapper exists. Only the text of the same sentence before the mention counts, so a
+# prohibition elsewhere on the line cannot excuse "merge with `gh pr merge` or the wrapper".
+line_prescribes_bare_merge() {
+  local rest="$1" prefix
+  local -r allowed='([Dd]o not|[Nn]ever|not) (call|run|use|available)|(it|which) (picks|runs|uses)|[Aa]uto-merge is not'
+
+  [[ "$rest" == '$ '* ]] && return 1
+  while [[ "$rest" == *'gh pr merge'* ]]; do
+    prefix="${rest%%gh pr merge*}"
+    prefix="${prefix##*[.,;:] }"
+    if ! [[ "$prefix" =~ $allowed ]]; then
+      return 0
+    fi
+    rest="${rest#*gh pr merge}"
+  done
+  return 1
+}
+
+printf '\n=== static: the bare-merge detector flags mixed instructions ===\n'
+# shellcheck disable=SC2016  # the fixtures quote command names in backticks; nothing should expand
+mixed='Merge with `gh pr merge --auto --squash` or `scripts/dev/merge-stack --pr <n>` after the user explicitly confirms; never add `merge-it` or pipe through `tail`.'
+# shellcheck disable=SC2016  # fixture text, nothing should expand
+forbid='Do not call `gh pr merge` or `gh stack merge` by hand.'
+# shellcheck disable=SC2016  # fixture text, nothing should expand
+explain='Auto-merge is not available for a stacked PR (`gh pr merge --auto --squash` fails with an error).'
+if line_prescribes_bare_merge "$mixed"; then
+  pass_case 'a line offering gh pr merge as an alternative to the wrapper is flagged'
+else
+  fail_case 'a line offering gh pr merge as an alternative to the wrapper is flagged'
+fi
+if line_prescribes_bare_merge "Then, $forbid Merge with \`gh pr merge --auto\`."; then
+  pass_case 'a prohibition in an earlier sentence does not excuse a later instruction'
+else
+  fail_case 'a prohibition in an earlier sentence does not excuse a later instruction'
+fi
+# shellcheck disable=SC2016  # fixture text, nothing should expand
+if line_prescribes_bare_merge 'After CI runs successfully, merge with `gh pr merge --auto`.'; then
+  pass_case 'unrelated words earlier in the line do not excuse a bare gh pr merge'
+else
+  fail_case 'unrelated words earlier in the line do not excuse a bare gh pr merge'
+fi
+if ! line_prescribes_bare_merge "$forbid" && ! line_prescribes_bare_merge "$explain"; then
+  pass_case 'a prohibition and an explanation of the failure are not flagged'
+else
+  fail_case 'a prohibition and an explanation of the failure are not flagged'
+fi
+
+printf '\n=== static: no guidance tells an agent to run gh pr merge by hand ===\n'
+for rel in "${contract_files[@]}" "${pointer_files[@]}"; do
+  bad=''
+  while IFS= read -r line; do
+    if line_prescribes_bare_merge "$line"; then
+      bad+="${line:0:100}"$'\n'
+    fi
+  done < <(grep -F 'gh pr merge' "${rh_root}/${rel}" || true)
+  if [[ -z "$bad" ]]; then
+    pass_case "${rel} does not prescribe a bare gh pr merge"
+  else
+    fail_case "${rel} prescribes a bare gh pr merge: ${bad}"
+  fi
+done
+
+printf '\n=== static: AGENTS.md merge bullet ===\n'
+agents_text="$(<"${rh_root}/AGENTS.md")"
+merge_bullet="$(grep -F -- '- To merge a PR in **any org repo**' "${rh_root}/AGENTS.md" || true)"
+for needle in 'scripts/dev/merge-stack --pr' 'explicitly confirm' 'merge-it' 'tail' 'whole stack'; do
+  if [[ "$merge_bullet" == *"$needle"* ]]; then
+    pass_case "the AGENTS.md merge bullet mentions '${needle}'"
+  else
+    fail_case "the AGENTS.md merge bullet mentions '${needle}'"
+  fi
+done
+if [[ "$agents_text" != *'enable auto-merge / Merge when ready so'* ]]; then
+  pass_case 'the AGENTS.md merge bullet no longer sends agents to enable auto-merge by hand'
+else
+  fail_case 'the AGENTS.md merge bullet no longer sends agents to enable auto-merge by hand'
+fi
+
+test_summary

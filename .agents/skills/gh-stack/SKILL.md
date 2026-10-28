@@ -52,7 +52,7 @@ git config remote.pushDefault origin     # if multiple remotes exist (skips remo
 
 When switching a consumer repo to `gh-stack` via `.github/stacking-tool`:
 
-1. Update `AGENTS.md` stacking/merge docs (`gh stack` + `gh pr merge --auto --squash` for a PR outside a stack, `gh stack merge --yes --squash` (from the stack's worktree) for a stacked PR; no `merge-it`).
+1. Update `AGENTS.md` stacking/merge docs: merge with `${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/dev/merge-stack --pr <n>` from the consumer worktree (it uses `gh stack merge` for a stacked PR and the merge queue or auto-merge otherwise), only after the user explicitly confirms; do not use `merge-it` or run `gh pr merge` by hand.
 2. Align `.agents/rules/pr-ship-and-review.md` submit block with the marker-aware template (copy via `github-repo-lint --apply-fix`, or from `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md` / https://github.com/the-hcma/repository-helpers/blob/main/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md; plus thin `.cursor/rules/pr-ship-and-review.mdc` shim).
 3. Delete root `GRAPHITE.md` (this skill is SSOT).
 4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) in sync with the consumer template.
@@ -353,14 +353,14 @@ If `sync` hits a conflict during this process, it restores all branches to their
 
 ### Merging a stack
 
-GitHub refuses auto-merge for a pull request that belongs to a stack, so the org default `gh pr merge --auto --squash` fails for every stacked PR:
+GitHub refuses auto-merge for a pull request that belongs to a stack, so auto-merge is not available there (`gh pr merge --auto --squash` fails for every stacked PR):
 
 ```text
 $ gh pr merge 868 --auto --squash
 GraphQL: Auto-merge is not supported for stacked pull requests. (enablePullRequestAutoMerge)
 ```
 
-Land a stacked PR with `gh stack merge --yes --squash` from the stack's worktree instead (or `scripts/dev/merge-stack --pr <n>`, which picks `gh stack merge` for the top PR of a stack and `gh pr merge --auto --squash` for one outside it). Avoid the positional form `gh stack merge <number>`: gh reads a bare number as a stack number first and a PR number second, so a PR number that is also another stack's number would merge that stack. Without an argument it merges the whole current stack, which is exactly the top PR and everything below it; `merge-stack` therefore refuses a PR that is not the top of its stack. It merges everything up to and including that PR as one atomic, bottom-up operation and adds it to the merge queue when the base branch has one (it prints that the merge method is ignored because of the queue). Afterwards `gh stack rebase` drops the merged branches and restacks the rest onto `main`, and the next PR retargets on its own. `gh pr merge --auto --squash` stays for PRs that are not in a stack and for Dependabot.
+Land a stacked PR with `scripts/dev/merge-stack --pr <n>`, only after the user explicitly confirms: for the top PR of a stack it runs `gh stack merge --yes --squash` from the stack's worktree, and for a PR outside a stack it picks the queue-aware `gh pr merge`. Before it runs, name every open PR of the stack and get confirmation for the whole stack, because it merges the top PR and everything below it. Do not run `gh pr merge` or `gh stack merge` by hand, do not add `merge-it`, and do not pipe the command through `tail` or `head`. Background: avoid the positional form `gh stack merge <number>`: gh reads a bare number as a stack number first and a PR number second, so a PR number that is also another stack's number would merge that stack. Without an argument it merges the whole current stack, which is exactly the top PR and everything below it; `merge-stack` therefore refuses a PR that is not the top of its stack. It merges everything up to and including that PR as one atomic, bottom-up operation and adds it to the merge queue when the base branch has one (it prints that the merge method is ignored because of the queue). Afterwards `gh stack rebase` drops the merged branches and restacks the rest onto `main`, and the next PR retargets on its own. Dependabot PRs are still merged by Dependabot auto-merge.
 
 - Read the command's exit status and output. Do not pipe it through `tail` or `head`: the error above was hidden that way once, the PR stayed open with `autoMergeRequest` null, and a watcher waited for a merge that was never queued. Confirm `autoMergeRequest` or the merge queue entry before waiting.
 - Reviewing a stack: CodeRabbit skips a PR whose base is not the default branch (`reviews are disabled for this base branch`), so only the bottom PR is reviewed until it merges and the next retargets to `main`. Its included allowance is about one review per hour per developer, and a `Review rate limited` status is not a review.
@@ -915,6 +915,6 @@ gh stack unstack --local
 1. **Stacks are strictly linear.** Branching stacks (multiple children on a single parent) are not supported. Each branch has exactly one parent and at most one child. If you need parallel workstreams, use separate stacks.
 2. **Stack disambiguation cannot be bypassed.** If the current branch is the trunk of multiple stacks, commands error with code 6. Check out a non-shared branch first.
 3. **Multiple remotes require `--remote` or config.** If more than one remote is configured, pass `--remote <name>` or set `remote.pushDefault` in git config before running `push`, `sync`, or `rebase`.
-4. **Merging PRs:** auto-merge is not available for a stacked PR (`gh pr merge --auto --squash` fails with `Auto-merge is not supported for stacked pull requests`). Merge from the CLI with `gh stack merge` (see `Merging a stack` above, or `scripts/dev/merge-stack`), or have the operator open the PR URL in a browser.
+4. **Merging PRs:** auto-merge is not available for a stacked PR (`gh pr merge --auto --squash` fails with `Auto-merge is not supported for stacked pull requests`). Merge with `scripts/dev/merge-stack --pr <n>` after the user explicitly confirms (see `Merging a stack` above), or have the operator open the PR URL in a browser.
 5. **Remote stack checkout requires a PR number.** `checkout` with a branch name only works with locally tracked stacks. Use a PR number (e.g. `gh stack checkout 123`) to pull stacks from GitHub.
 6. **PR title and body are auto-generated.** There is no flag to set a custom PR title or body during `submit`. The title and body are generated from commit messages plus a footer. Use `gh pr edit` to modify PR title and body after creation.
