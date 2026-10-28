@@ -56,7 +56,7 @@ If pilot (or helpers) review finds a substantive problem in the template, `rp_ch
    - Workflow stacks still need a local clone under `GITHUB_REPO_LINT_SCAN_ROOT` (default: parent of repository-helpers) or run `--apply-fix` from each target repo.
    - Tailor the copied template to each repo's real remote surface (shared HTTP client, config knob, default timeout). A too-generic copy still passes the validator but is weaker guidance — see `blumkin` for a product-specific copy.
 
-2. Drive **each** consumer PR to the acceptance gate above (not fire-and-forget), then enable auto-merge (`gh pr merge --auto --squash`, or `gh stack merge --yes --squash` (from the stack's worktree) for a PR that is part of a gh stack — never `merge-it`).
+2. Drive **each** consumer PR to the acceptance gate above (not fire-and-forget), then, once the user explicitly confirms, merge it with `scripts/dev/merge-stack --pr <n>` (never by hand, never `merge-it`).
 
 3. **Merge order.** All consumer PRs land **first**. Merge the repository-helpers enforcement PR **last**, once every consumer — the pilot included, plus any repo that already carried the rule (re-verify it still validates) — is merged. This keeps the nightly `github-repo-lint --enforcer` green at every step.
 
