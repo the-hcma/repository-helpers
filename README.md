@@ -152,7 +152,7 @@ Daily timer (optional): `scripts/setup-secret-audit` installs `secret-audit.serv
 | `scripts/dev/coderabbit-cli-review` | Optional pre-push review with the CodeRabbit CLI (`cr`): own allowance, findings fail, each head once (max 2 per branch), never `--use-credits`; also the `coderabbit-cli` job of `pre-pr-checks` when `cr` is installed | `scripts/dev/coderabbit-cli-review` (after committing) |
 | `scripts/dev/start-development` | Prune/sync; create or resume a stack worktree | `scripts/dev/start-development --worktree my-change --no-interactive` |
 | `scripts/dev/submit-stack` | Register the branch as a gh stack, `pre-pr-checks` → stack submit → CI wait | `scripts/dev/submit-stack` |
-| `scripts/dev/merge-stack` | Land a PR through the merge queue: `gh stack merge` for a stacked PR, `gh pr merge --auto --squash` otherwise | `scripts/dev/merge-stack --pr <n> [--wait]` |
+| `scripts/dev/merge-stack` | Land a PR through the merge queue: `gh stack merge` for a stacked PR, `gh pr merge --auto` when the base branch has a merge queue, `--auto --squash` with auto-merge only, a refusal with neither (or a `graphite` marker) | `scripts/dev/merge-stack --pr <n> [--wait]` |
 
 Never implement on the primary clone — always `cd` into the stack worktree first. See [Development](#development).
 

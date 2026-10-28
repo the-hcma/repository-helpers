@@ -46,7 +46,7 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | Dev workflow | `scripts/dev/secret-scan` | Local gitleaks via canonical `ci-secret-scan` (same as CI / pre-pr secret-scan job). |
 | Dev workflow | `scripts/dev/coderabbit-cli-review` | Optional pre-push review with the CodeRabbit CLI (own allowance, never `--use-credits`, each head once, at most 2 per branch); runs as the `coderabbit-cli` job of `pre-pr-checks` when `cr` is installed. |
 | Dev workflow | `scripts/dev/submit-stack` | Register the branch as a gh stack (gh-stack marker), then `pre-pr-checks` → `gh stack submit` → `post-pr-submission-checks`. |
-| Dev workflow | `scripts/dev/merge-stack` | Land a PR through the merge queue: `gh stack merge` for a PR in a gh stack (auto-merge is unavailable for stacked PRs), `gh pr merge --auto --squash` otherwise; confirms the enqueue. |
+| Dev workflow | `scripts/dev/merge-stack` | Land a PR through the merge queue: `gh stack merge` for a PR in a gh stack (auto-merge is unavailable for stacked PRs), `gh pr merge --auto` (merge queue on the base branch) or `gh pr merge --auto --squash` (auto-merge only) otherwise, and refuses when neither exists or the marker is `graphite`; confirms the enqueue. |
 | Dev workflow | `scripts/dev/approve-pending-deployments` | Approve WAITING environment jobs on the operator's behalf. |
 | Dev workflow | `scripts/dev/post-pr-submission-checks` | Wait for PR CI; print agent-friendly failure excerpts. |
 | Dev workflow | `scripts/dev/ship-and-review` | Submit + CI wait + `wait-for-agent-review loop`. |

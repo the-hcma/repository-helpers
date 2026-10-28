@@ -6,7 +6,10 @@
 # helper picks the right command:
 #
 #   PR is in a gh stack  → gh stack merge --yes --squash   (current stack, no argument; atomic, bottom-up, queue-aware)
-#   PR is not in a stack → gh pr merge <pr> --auto --squash
+#   PR is not in a stack → gh pr merge <pr> --auto           (the base branch has a merge queue: it picks the method)
+#                          gh pr merge <pr> --auto --squash  (auto-merge allowed, no merge queue)
+#                          refused                           (neither: nothing to enqueue into; nothing is merged)
+#   .github/stacking-tool is graphite → refused (Graphite is retired, repository-helpers#772)
 #
 # It never pipes the merge command through tail/head: the command's own exit status and output are shown,
 # and it confirms the PR is merged or queued (autoMergeRequest / merge queue entry) before reporting
@@ -38,7 +41,7 @@ source "${script_dir}/../lib/github-repo-slug"
 source "${script_dir}/../lib/github-api-rate-limit"
 # Referenced below; assigned readonly in scripts/lib/stacking-tool.
 # shellcheck disable=SC2154
-: "${stacking_tool_value_gh_stack}"
+: "${stacking_tool_value_gh_stack}" "${stacking_tool_value_graphite}"
 
 pr_number=""
 repo_arg=""
@@ -117,7 +120,7 @@ pr_field() {
   if [[ -n "$repo_arg" ]]; then
     repo_flags=(--repo "$repo_arg")
   fi
-  gh_read "merge-stack gh pr view ${pr_number}" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json state,mergeStateStatus,isDraft,autoMergeRequest,mergedAt --jq "$jq_filter"
+  gh_read "merge-stack gh pr view ${pr_number}" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json state,mergeStateStatus,isDraft,autoMergeRequest,mergedAt,baseRefName --jq "$jq_filter"
 }
 
 # local_slug — OWNER/NAME of the current directory's origin (empty when it cannot be resolved).
@@ -238,6 +241,44 @@ ready_state() {
   printf '%s' "${state:-UNKNOWN}"
 }
 
+# plan_plain_merge — prints the gh pr merge flags that fit how the repository enqueues, read from GitHub:
+#   merge queue on the base branch → "--auto" (the queue decides the method; GitHub ignores a method flag there
+#                                    and only prints that the strategy is set by the queue)
+#   auto-merge allowed, no queue   → "--auto --squash"
+#   neither                        → refuses: there is nothing to enqueue into, and merging directly is not the
+#                                    wrapper's job
+# An unreadable setup is also a refusal, never a guess. Returns 1 after printing the reason to stderr.
+plan_plain_merge() {
+  local slug base queue_rules allow_auto
+
+  slug="${repo_arg:-$(local_slug)}"
+  base="$(pr_field '.baseRefName // "main"' || true)"
+  if [[ "$slug" != */* || -z "$base" ]]; then
+    printf 'ERROR: merge-stack: could not read the merge setup of PR #%s (repository %s, base %s); nothing was merged\n' \
+      "$pr_number" "${slug:-unknown}" "${base:-unknown}" >&2
+    return 1
+  fi
+  queue_rules="$(gh_read "merge-stack gh merge queue rule ${base}" api "repos/${slug}/rules/branches/${base}" \
+    --jq '[.[] | select(.type == "merge_queue")] | length')" || queue_rules=''
+  if [[ "$queue_rules" =~ ^[0-9]+$ ]] && (( queue_rules > 0 )); then
+    printf -- '--auto'
+    return 0
+  fi
+  allow_auto="$(gh_read "merge-stack gh auto-merge setting" api "repos/${slug}" --jq '.allow_auto_merge')" || allow_auto=''
+  if [[ ! "$queue_rules" =~ ^[0-9]+$ || ! "$allow_auto" =~ ^(true|false)$ ]]; then
+    printf 'ERROR: merge-stack: could not read the merge setup of %s (base %s); nothing was merged\n' \
+      "$slug" "$base" >&2
+    return 1
+  fi
+  if [[ "$allow_auto" == 'true' ]]; then
+    printf -- '--auto --squash'
+    return 0
+  fi
+  printf 'ERROR: merge-stack: %s has no merge queue on %s and auto-merge is disabled, so there is nothing to enqueue PR #%s into; enable a merge queue in the protect-main ruleset (scripts/github-repo-lint --apply-fix) or allow auto-merge in the repository settings; nothing was merged\n' \
+    "$slug" "$base" "$pr_number" >&2
+  return 1
+}
+
 # confirm_landed <stacked> — true once the PR shows as merged, auto-merge requested, or (stacked) merged or
 # queued in the stack. GitHub's view can lag the merge command by a few seconds, so this re-reads a bounded
 # number of times before it gives up.
@@ -265,7 +306,7 @@ confirm_landed() {
 }
 
 main() {
-  local state is_draft stacked=0 merge_rc=0 merge_out tool open_pr open_prs merge_state landed_rc queue_rc
+  local state is_draft stacked=0 merge_rc=0 merge_out tool open_pr open_prs merge_state landed_rc queue_rc plain_flags
   local -a repo_flags=()
 
   parse_args "$@"
@@ -275,6 +316,10 @@ main() {
 
   # An invalid marker is a configuration error to surface, not something to read as "not in a stack".
   tool="$(stacking_tool_read_or_default "" "$stacking_tool_value_gh_stack" 'merge-stack')" || exit 1
+  if [[ "$tool" == "$stacking_tool_value_graphite" ]]; then
+    printf 'ERROR: merge-stack: %s; nothing was merged\n' "$(stacking_tool_retired_message)" >&2
+    exit 1
+  fi
 
   state="$(pr_field '.state')"
   if [[ "$state" == 'MERGED' ]]; then
@@ -320,8 +365,9 @@ main() {
       "$pr_number" >&2
     exit 1
   else
-    printf 'merge-stack: PR #%s is not in a stack: gh pr merge --auto --squash\n' "$pr_number"
-    merge_out="$(runner_sh_stdout "merge-stack gh pr merge ${pr_number}" --timeout 180 -- "exec gh pr merge $(printf '%q' "$pr_number") ${repo_arg:+--repo $(printf '%q' "$repo_arg")} --auto --squash 2>&1")" || merge_rc=$?
+    plain_flags="$(plan_plain_merge)" || exit 1
+    printf 'merge-stack: PR #%s is not in a stack: gh pr merge %s\n' "$pr_number" "$plain_flags"
+    merge_out="$(runner_sh_stdout "merge-stack gh pr merge ${pr_number}" --timeout 180 -- "exec gh pr merge $(printf '%q' "$pr_number") ${repo_arg:+--repo $(printf '%q' "$repo_arg")} ${plain_flags} 2>&1")" || merge_rc=$?
     printf '%s\n' "$merge_out"
     if (( merge_rc != 0 )) && [[ "$merge_out" == *'not supported for stacked pull requests'* ]]; then
       printf 'ERROR: merge-stack: PR #%s belongs to a gh stack, but it is not in the stack of the current directory (or the marker is not gh-stack); run merge-stack from that stack'\''s worktree (gh stack checkout %s)\n' \
