@@ -1,0 +1,51 @@
+# shellcheck shell=bash
+# queued-branch-guard — refuse to re-push a branch whose PR already sits in the merge queue.
+#
+# Sourced by scripts/dev/submit-stack. A push to a queued PR's head branch makes GitHub drop the PR from
+# the queue (or build the queue entry on a stale head), so the submit stops before it pushes anything.
+
+if declare -F queued_branch_guard >/dev/null 2>&1; then
+  return 0
+fi
+
+_qbg_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _qbg_lib_dir
+# shellcheck disable=SC1091  # sibling libs: runner helpers, OWNER/NAME from a remote URL, throttled gh
+source "${_qbg_lib_dir}/runner-ensure"
+# shellcheck disable=SC1091
+source "${_qbg_lib_dir}/github-repo-slug"
+# shellcheck disable=SC1091
+source "${_qbg_lib_dir}/github-api-rate-limit"
+
+# queued_branch_guard <repo_dir>
+# Returns 1 (after one ERROR: QUEUED_BRANCH line) when an open PR with the current branch as its head is in
+# the merge queue. Returns 0 when it is not, when HEAD is detached or has no GitHub origin, and when the
+# queue state cannot be read: the read failure is a WARN line, so the submit is not blocked by an API outage
+# but the skipped check is never silent.
+queued_branch_guard() {
+  local -r repo_dir="${1:?queued_branch_guard: repo_dir required}"
+  local branch origin_url slug queued
+
+  branch="$(runner_exec_stdout "queued-branch-guard git branch" --probe --timeout 20 -- \
+    git -C "$repo_dir" symbolic-ref --quiet --short HEAD)" || return 0
+  [[ -n "$branch" ]] || return 0
+  origin_url="$(runner_exec_stdout "queued-branch-guard git remote origin" --probe --timeout 20 -- \
+    git -C "$repo_dir" remote get-url origin)" || return 0
+  slug="$(gh_slug_from_origin_url "$origin_url")" || slug=""
+  [[ "$slug" == */* ]] || return 0
+
+  # shellcheck disable=SC2016  # $o, $n and $h are GraphQL variables, not shell expansions
+  if ! queued="$(github_api_exec_with_rate_limit_retry "queued-branch-guard gh queue state ${branch}" -- \
+    timeout 60 gh api graphql \
+    -f query='query($o: String!, $n: String!, $h: String!) { repository(owner: $o, name: $n) { pullRequests(headRefName: $h, states: OPEN, first: 5) { nodes { number isInMergeQueue } } } }' \
+    -f o="${slug%%/*}" -f n="${slug#*/}" -f h="$branch" \
+    --jq '.data.repository.pullRequests.nodes[] | select(.isInMergeQueue) | .number')"; then
+    printf 'WARN: queued-branch-guard: could not read the merge queue state of %s; not checking\n' "$branch" >&2
+    return 0
+  fi
+  if [[ -n "$queued" ]]; then
+    printf 'ERROR: QUEUED_BRANCH branch=%s pr=#%s is in the merge queue; a push would drop it from the queue. Wait for it to merge, or remove it from the queue first. Nothing was pushed.\n' \
+      "$branch" "$(printf '%s' "$queued" | head --lines=1)" >&2
+    return 1
+  fi
+}
