@@ -39,6 +39,7 @@ check_root=""
 restore_done=0
 prec_pr_jobs_dir=""
 prec_pr_job_count=0
+prec_pr_max_jobs=0
 prec_pr_test_isolate_dir=""
 
 usage() {
@@ -75,6 +76,9 @@ Jobs (parallel where independent; skip with PRE_PR_CHECKS_SKIP=job1,job2):
     TMPDIR + per-test RUNNER_SESSION_ROOT; PRE_PR_CHECKS_TEST_JOBS sets the job count (default:
     half the cores here, 1 in consumer repos); each parallel job also gets its own runner
     session so runner_exec_stdout cannot race siblings — #556)
+  - PRE_PR_CHECKS_JOBS caps how many of these jobs run at once (default: all of them). Set it
+    (for example 3) on a host that runs short of memory, together with PRE_PR_CHECKS_TEST_JOBS;
+    the whole gate still runs, only later. A value that is not a positive integer is an error.
   - python-static — .github/ci/python-static or uv ruff/pyright fallback
   - pytest-hermetic — when `.github/ci/pytest-hermetic` exists (same hermetic
     subset CI runs; not live / network Graph tests). Skip with
@@ -182,6 +186,10 @@ start_parallel_job() {
   local log_file="${prec_pr_jobs_dir}/${job_name}.log"
   local rc_file="${prec_pr_jobs_dir}/${job_name}.rc"
   local job_session_root="${prec_pr_jobs_dir}/runner-sessions/${job_name}"
+  # PRE_PR_CHECKS_JOBS: start this job only once fewer than the cap are still running.
+  while (( prec_pr_max_jobs > 0 )) && (( $(jobs -rp | wc -l) >= prec_pr_max_jobs )); do
+    wait -n || true
+  done
   prec_pr_job_count=$(( prec_pr_job_count + 1 ))
   (
     set +e
@@ -282,8 +290,24 @@ job_all_tests() {
   TMPDIR="$prec_pr_test_isolate_dir" "$BASH" "${script_dir}/run-tests" --dir "$check_root" --jobs "$test_jobs"
 }
 
+# PRE_PR_CHECKS_JOBS: unset means every planned job starts at once; otherwise a positive integer of at most
+# three digits caps the number running together. Anything else is an error rather than a silent fallback.
+prec_resolve_max_jobs() {
+  local -r value="${PRE_PR_CHECKS_JOBS:-}"
+
+  if [[ -z "$value" ]]; then
+    prec_pr_max_jobs=0
+    return 0
+  fi
+  if [[ ! "$value" =~ ^[1-9][0-9]{0,2}$ ]]; then
+    die "PRE_PR_CHECKS_JOBS must be a positive integer (got '${value}')"
+  fi
+  prec_pr_max_jobs="$value"
+}
+
 start_planned_parallel_checks() {
   local job
+  prec_resolve_max_jobs
   init_parallel_jobs
 
   for job in "${prec_planned_jobs[@]+"${prec_planned_jobs[@]}"}"; do
