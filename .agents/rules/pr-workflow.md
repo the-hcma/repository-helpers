@@ -87,7 +87,7 @@ Until merge-ready:
 3. Re-run `scripts/dev/post-pr-submission-checks --pr <number>` and fix any CI failures surfaced in the agent log report.
 4. Resolve merge conflicts if base moved (`gh stack rebase --remote origin` / `gh stack sync --remote origin`, or `scripts/wait-for-agent-review restack`).
 
-Do not merge manually. Merge only after the user explicitly confirms, and only with `scripts/dev/merge-stack --pr <n>` (from the PR's worktree; in a consumer repo `${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/dev/merge-stack --pr <n>`): it picks the right command for the repository's merge setup (`gh stack merge` for a stacked PR, the merge queue or auto-merge otherwise) and confirms the enqueue. Do not call `gh pr merge` or `gh stack merge` by hand, do not add the `merge-it` label, and do not pipe the command through `tail` or `head`: read its exit status and output.
+Do not merge manually. Merge only after the user explicitly confirms, and only with `scripts/dev/merge-stack --pr <n>` (from the PR's worktree; in a consumer repo `${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/dev/merge-stack --pr <n>`): it picks the right command for the repository's merge setup (`gh stack merge` for a stacked PR, the merge queue or auto-merge otherwise) and confirms the enqueue. For a PR in a gh stack it lands the top PR and every open PR below it, so name those PRs and get confirmation for the whole stack first. Do not call `gh pr merge` or `gh stack merge` by hand, do not add the `merge-it` label, and do not pipe the command through `tail` or `head`: read its exit status and output.
 
 ### Closing the issue
 
