@@ -92,9 +92,11 @@ mock_dir="$(mktemp -d)"
 mock_bin="${mock_dir}/bin"
 mkdir -p "$mock_bin"
 state_file="${mock_dir}/license-attempts"
+codeowners_state_file="${mock_dir}/codeowners-attempts"
 printf '0\n' >"$state_file"
+printf '0\n' >"$codeowners_state_file"
 
-# shellcheck disable=SC2016  # mock embeds state file path
+# shellcheck disable=SC2016  # mock embeds state file paths
 cat >"${mock_bin}/gh" <<MOCK_GH
 #!/usr/bin/env bash
 set -euo pipefail
@@ -114,9 +116,15 @@ if [[ "\$args" == *'/commits --jq'* ]]; then
   printf '%s\\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
   exit 0
 fi
-if [[ "\$args" == *'contents/LICENSE'* || "\$args" == *'CODEOWNERS'* ]]; then
+if [[ "\$args" == *'contents/LICENSE'* ]]; then
   n="\$(cat '${state_file}')"
   printf '%s\\n' "\$(( n + 1 ))" >'${state_file}'
+  echo 'error connecting to api.github.com' >&2
+  exit 1
+fi
+if [[ "\$args" == *'CODEOWNERS'* ]]; then
+  n="\$(cat '${codeowners_state_file}')"
+  printf '%s\\n' "\$(( n + 1 ))" >'${codeowners_state_file}'
   echo 'error connecting to api.github.com' >&2
   exit 1
 fi
@@ -140,9 +148,13 @@ output="$(
 exit_code=$?
 set -e
 attempts="$(cat "$state_file")"
+codeowners_attempts="$(cat "$codeowners_state_file")"
 
 if [[ "$exit_code" -ne 0 ]] \
   && [[ "$attempts" -ge 2 ]] \
+  && [[ "$codeowners_attempts" -ge 2 ]] \
+  && grep -qF 'could not verify the copyright notice (LICENSE unreadable)' <<<"$output" \
+  && ! grep -qF 'add Copyright (c) YEAR OWNER' <<<"$output" \
   && grep -qF 'could not read the license file (GitHub API: error connecting to api.github.com)' \
     <<<"$output" \
   && grep -qF 'could not read CODEOWNERS (GitHub API: error connecting to api.github.com)' \
@@ -153,8 +165,70 @@ if [[ "$exit_code" -ne 0 ]] \
   printf '[PASS] connection failure on LICENSE and CODEOWNERS is retried and reported as an API error\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] expected retried API errors, not missing-file findings (attempts=%s exit=%s)\n%s\n' \
-    "$attempts" "$exit_code" "$output"
+  printf '[FAIL] expected retried API errors, not missing-file findings (attempts=%s/%s exit=%s)\n%s\n' \
+    "$attempts" "$codeowners_attempts" "$exit_code" "$output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
+printf '\n=== functional: a connection failure reading the copyright notice is an API error (#800) ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+mkdir -p "$mock_bin"
+
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'auth status'* ]]; then
+  exit 0
+fi
+if [[ "$args" == *'/labels'* ]]; then
+  printf '%s\n' '[[]]'
+  exit 0
+fi
+if [[ "$args" == *'rulesets'* ]]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
+fi
+if [[ "$args" == *'contents/NOTICE'* ]]; then
+  echo 'error connecting to api.github.com' >&2
+  exit 1
+fi
+if [[ "$args" == *'/contents/'* ]]; then
+  echo 'gh: Not Found (HTTP 404)' >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+write_mock_jq_passthrough "${mock_bin}"
+
+set +e
+output="$(
+  RP_GH_API_MAX_ATTEMPTS=2 RP_GH_API_RETRY_SLEEP_SECS=0 \
+    PATH="${mock_bin}:${PATH}" bash "$checker" \
+    --repo the-hcma/example-repo --suggest 2>&1
+)"
+exit_code=$?
+set -e
+
+if [[ "$exit_code" -ne 0 ]] \
+  && grep -qF 'add top-level LICENSE' <<<"$output" \
+  && grep -qF 'could not read the copyright notice (GitHub API: error connecting to api.github.com)' \
+    <<<"$output" \
+  && ! grep -qF 'add Copyright (c) YEAR OWNER' <<<"$output"; then
+  printf '[PASS] connection failure on a copyright source is an API error, not a missing notice\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected an API error for the copyright notice, not a missing notice (exit=%s)\n%s\n' \
+    "$exit_code" "$output"
   fail=$(( fail + 1 ))
 fi
 rm -rf "$mock_dir"
