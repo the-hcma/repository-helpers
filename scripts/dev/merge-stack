@@ -289,6 +289,26 @@ plan_plain_merge() {
   return 1
 }
 
+# enqueue_directly — puts the PR into the base branch's merge queue with the enqueuePullRequest mutation. Used
+# only when `gh pr merge --auto` is refused with "Auto merge is not allowed for this repository" in a repository
+# that has a merge queue but no repository auto-merge: gh then calls enablePullRequestAutoMerge instead of
+# enqueuing (cli/cli#13398). Like the merge command, the mutation runs once and is never retried; the caller
+# still reads the queue entry back through confirm_landed before reporting success.
+enqueue_directly() {
+  local -a repo_flags=()
+  local node_id
+
+  if [[ -n "$repo_arg" ]]; then
+    repo_flags=(--repo "$repo_arg")
+  fi
+  node_id="$(gh_read "merge-stack gh pr node id ${pr_number}" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json id --jq '.id')" || return 1
+  [[ -n "$node_id" && "$node_id" != 'null' ]] || return 1
+  # shellcheck disable=SC2016  # $id is a GraphQL variable, not a shell expansion
+  runner_exec "merge-stack gh enqueue ${pr_number}" --timeout 60 -- gh api graphql \
+    -f query='mutation($id: ID!) { enqueuePullRequest(input: {pullRequestId: $id}) { mergeQueueEntry { id } } }' \
+    -f id="$node_id"
+}
+
 # confirm_landed <stacked> — true once the PR shows as merged, auto-merge requested, or (stacked) merged or
 # queued in the stack. GitHub's view can lag the merge command by a few seconds, so this re-reads a bounded
 # number of times before it gives up.
@@ -379,6 +399,12 @@ main() {
     printf 'merge-stack: PR #%s is not in a stack: gh pr merge %s\n' "$pr_number" "$plain_flags"
     merge_out="$(runner_sh_stdout "merge-stack gh pr merge ${pr_number}" --timeout 180 -- "exec gh pr merge $(printf '%q' "$pr_number") ${repo_arg:+--repo $(printf '%q' "$repo_arg")} ${plain_flags} 2>&1")" || merge_rc=$?
     printf '%s\n' "$merge_out"
+    if (( merge_rc != 0 )) && [[ "$plain_flags" == '--auto' && "$merge_out" == *'Auto merge is not allowed for this repository'* ]]; then
+      printf 'merge-stack: auto-merge is off in this repository, so gh could not enqueue; enqueueing PR #%s directly (cli/cli#13398)\n' \
+        "$pr_number"
+      merge_rc=0
+      enqueue_directly || merge_rc=$?
+    fi
     if (( merge_rc != 0 )) && [[ "$merge_out" == *'not supported for stacked pull requests'* ]]; then
       printf 'ERROR: merge-stack: PR #%s belongs to a gh stack, but it is not in the stack of the current directory (or the marker is not gh-stack); run merge-stack from that stack'\''s worktree (gh stack checkout %s)\n' \
         "$pr_number" "$pr_number" >&2
