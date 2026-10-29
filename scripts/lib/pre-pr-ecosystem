@@ -355,24 +355,37 @@ prec_relpath_is_repo_practices_sensitive() {
   esac
 }
 
-# True when the branch diff adds or changes org-wide cursor-rule enforcement.
-prec_branch_touches_org_cursor_rule_enforcement() {
+# Print the first changed path that alters what the org-wide audit enforces; return 1 when none does.
+# Only repository-helpers owns those templates: `.agents/rules/*` is an org template here and the
+# repo's own agent content anywhere else, so it counts only in a helpers-style checkout. The
+# template directories exist only in repository-helpers. `.agents/skills/*` and `.cursor/rules/*`
+# never trigger the org-wide run; the per-repo lint still covers them.
+prec_org_wide_lint_trigger() {
   local -r root="$1"
   local -a touched=()
+  local relpath
 
   prec_collect_repo_practices_sensitive_from_diff "$root" touched
-  if [[ "${#touched[@]}" -eq 0 ]]; then
-    return 1
-  fi
-  local relpath
-  for relpath in "${touched[@]}"; do
+  for relpath in "${touched[@]+"${touched[@]}"}"; do
     case "$relpath" in
-      .agents/rules/*|.agents/skills/*|.cursor/rules/*|scripts/lib/repo-practices-agents/*|scripts/lib/repo-practices-cursor/*|scripts/lib/repo-practices)
+      scripts/lib/repo-practices-agents/*|scripts/lib/repo-practices-cursor/*|scripts/lib/repo-practices)
+        printf '%s\n' "$relpath"
         return 0
+        ;;
+      .agents/rules/*)
+        if prec_is_helpers_style "$root"; then
+          printf '%s\n' "$relpath"
+          return 0
+        fi
         ;;
     esac
   done
   return 1
+}
+
+# True when the branch diff adds or changes org-wide cursor-rule enforcement.
+prec_branch_touches_org_cursor_rule_enforcement() {
+  prec_org_wide_lint_trigger "$1" >/dev/null
 }
 
 # Append unique repo-practices-sensitive paths from a git diff name-only stream.
@@ -551,7 +564,8 @@ prec_resolve_secret_scan_dev_script() {
 
 prec_run_repo_practices_lint() {
   local -r root="$1"
-  local slug org lint_script lint_exit_code=0
+  local slug org lint_script trigger lint_exit_code=0
+  local -r org_timeout="${PRE_PR_CHECKS_ORG_LINT_TIMEOUT:-3600}"
 
   slug="$(gh_slug_from_repo_dir "$root")" || {
     printf '==> warn: repo-practices-lint skipped (origin is not a GitHub OWNER/NAME remote)\n' >&2
@@ -563,12 +577,18 @@ prec_run_repo_practices_lint() {
   }
 
   org="${slug%%/*}"
-  if prec_branch_touches_org_cursor_rule_enforcement "$root"; then
-    run_command "pre-pr org repo-practices lint (${org})" env NO_COLOR=1 "$lint_script" \
+  if trigger="$(prec_org_wide_lint_trigger "$root")"; then
+    printf '==> running org-wide: %s changed (timeout %ss)\n' "$trigger" "$org_timeout"
+    run_command "pre-pr org repo-practices lint (${org})" env NO_COLOR=1 \
+      timeout --kill-after=30 "$org_timeout" "$lint_script" \
       --org "$org" --all --strict-onboarding --compact || lint_exit_code=$?
+    if (( lint_exit_code == 124 )); then
+      printf 'ERROR: WAIT_TIMEOUT org-wide repo-practices lint exceeded %ss\n' "$org_timeout" >&2
+    fi
     return "$lint_exit_code"
   fi
 
+  printf '==> running per-repo lint only: no org-wide template changed\n'
   run_command "pre-pr repo-practices lint (${slug})" env NO_COLOR=1 "$lint_script" \
     --repo "$slug" --suggest --strict-onboarding || lint_exit_code=$?
   return "$lint_exit_code"
