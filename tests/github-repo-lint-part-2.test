@@ -87,6 +87,78 @@ else
 fi
 rm -rf "$mock_dir"
 
+printf '\n=== functional: connection failures are API errors, not missing license files (#800) ===\n'
+mock_dir="$(mktemp -d)"
+mock_bin="${mock_dir}/bin"
+mkdir -p "$mock_bin"
+state_file="${mock_dir}/license-attempts"
+printf '0\n' >"$state_file"
+
+# shellcheck disable=SC2016  # mock embeds state file path
+cat >"${mock_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+if [[ "\$args" == *'auth status'* ]]; then
+  exit 0
+fi
+if [[ "\$args" == *'/labels'* ]]; then
+  printf '%s\\n' '[[]]'
+  exit 0
+fi
+if [[ "\$args" == *'rulesets'* ]]; then
+  printf '%s\\n' '[]'
+  exit 0
+fi
+if [[ "\$args" == *'/commits --jq'* ]]; then
+  printf '%s\\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
+fi
+if [[ "\$args" == *'contents/LICENSE'* || "\$args" == *'CODEOWNERS'* ]]; then
+  n="\$(cat '${state_file}')"
+  printf '%s\\n' "\$(( n + 1 ))" >'${state_file}'
+  echo 'error connecting to api.github.com' >&2
+  exit 1
+fi
+if [[ "\$args" == *'/contents/'* ]]; then
+  echo 'gh: Not Found (HTTP 404)' >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+write_mock_jq_passthrough "${mock_bin}"
+
+set +e
+output="$(
+  RP_GH_API_MAX_ATTEMPTS=2 RP_GH_API_RETRY_SLEEP_SECS=0 \
+    PATH="${mock_bin}:${PATH}" bash "$checker" \
+    --repo the-hcma/example-repo --suggest 2>&1
+)"
+exit_code=$?
+set -e
+attempts="$(cat "$state_file")"
+
+if [[ "$exit_code" -ne 0 ]] \
+  && [[ "$attempts" -ge 2 ]] \
+  && grep -qF 'could not read the license file (GitHub API: error connecting to api.github.com)' \
+    <<<"$output" \
+  && grep -qF 'could not read CODEOWNERS (GitHub API: error connecting to api.github.com)' \
+    <<<"$output" \
+  && ! grep -qF 'add top-level LICENSE' <<<"$output" \
+  && ! grep -qF 'add .github/CODEOWNERS' <<<"$output" \
+  && ! grep -qF 'add a top-level LICENSE file' <<<"$output"; then
+  printf '[PASS] connection failure on LICENSE and CODEOWNERS is retried and reported as an API error\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected retried API errors, not missing-file findings (attempts=%s exit=%s)\n%s\n' \
+    "$attempts" "$exit_code" "$output"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$mock_dir"
+
 printf '\n=== static: CODEOWNERS apply creates a PR ===\n'
 if grep -qF 'rp_apply_codeowners_pr' "$lib" \
   && grep -qF 'gh pr create' "$lib" \
