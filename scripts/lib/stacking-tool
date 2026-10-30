@@ -344,24 +344,22 @@ stacking_tool_title_normalize() {
   printf '%s' "${words[*]}"
 }
 
-# stacking_tool_title_looks_like_branch <title> [branch]
-# Exit 0 when a PR title is a placeholder rather than a readable title: words made only of
-# letters, digits and separators that end in "wt" (the suffix start-development adds to every
-# worktree branch), or the branch name itself with or without that suffix (#810).
+# stacking_tool_title_looks_like_branch <title> <branch>
+# Exit 0 when a PR title is the placeholder `gh stack submit --auto` derives from the branch name:
+# the branch name with hyphens, underscores and slashes turned into spaces, with or without the
+# "-wt" suffix start-development adds to every worktree branch. A title that merely ends in "wt"
+# is a real title and is left alone (#810). Exit 1 when the branch is unknown.
 stacking_tool_title_looks_like_branch() {
   local -r branch="${2:-}"
   local norm branch_norm
 
-  norm="$(stacking_tool_title_normalize "$1")"
-  if [[ "$norm" =~ ^[a-z0-9]+(\ [a-z0-9]+)*\ wt$ ]]; then
-    return 0
+  if [[ -z "$branch" ]]; then
+    return 1
   fi
-  if [[ -n "$branch" ]]; then
-    branch_norm="$(stacking_tool_title_normalize "$branch")"
-    branch_norm="${branch_norm% wt}"
-    if [[ -n "$branch_norm" && ( "$norm" == "$branch_norm" || "$norm" == "${branch_norm} wt" ) ]]; then
-      return 0
-    fi
+  norm="$(stacking_tool_title_normalize "$1")"
+  branch_norm="$(stacking_tool_title_normalize "$branch")"
+  if [[ -n "$norm" && ( "$norm" == "$branch_norm" || "$norm" == "${branch_norm% wt}" ) ]]; then
+    return 0
   fi
   return 1
 }
@@ -393,34 +391,43 @@ stacking_tool_default_pr_title() {
 # stacking_tool_apply_pr_text <repo_dir> <title> <body_file>
 # After `gh stack submit`, puts the final text on the current branch's PR: an explicit title and
 # body file when given; otherwise a title that is still a branch-name placeholder is replaced by
-# stacking_tool_default_pr_title. A readable title is never touched (#810). Returns non-zero on
-# a gh failure.
+# stacking_tool_default_pr_title. A readable title is never touched (#810). When an explicit title
+# or body was requested, any failure to apply it is an error (non-zero); the automatic
+# replacement is best effort and only warns, so other callers of stacking_tool_submit (dep-updater,
+# repo-practices --apply-fix) never fail on it.
 stacking_tool_apply_pr_text() {
   local -r st_dir="$1"
   local title="${2:-}"
   local -r body_file="${3:-}"
-  local origin_url slug pr_json number current branch
+  local origin_url slug pr_json number current branch explicit=0
+
+  if [[ -n "$title" || -n "$body_file" ]]; then
+    explicit=1
+  fi
 
   origin_url="$(runner_exec_stdout "stacking-tool git remote origin (pr text)" \
     --probe -- git -C "$st_dir" remote get-url origin)" || {
     printf 'stacking-tool: NOTE: could not resolve origin — leaving the PR title and body alone\n' >&2
-    return 0
+    return "$explicit"
   }
   slug="$(gh_slug_from_origin_url "$origin_url")" || slug=''
   if [[ -z "$slug" ]]; then
     printf 'stacking-tool: NOTE: could not parse OWNER/NAME from origin — leaving the PR title and body alone\n' >&2
-    return 0
+    return "$explicit"
   fi
 
-  pr_json="$(cd "$st_dir" && github_api_exec_with_rate_limit_retry "stacking-tool gh pr view ${slug} (pr text)" -- gh pr view --json number,title)" || {
-    printf 'stacking-tool: ERROR: could not read the PR for the current branch in %s\n' "$slug" >&2
-    return 1
+  pr_json="$(cd "$st_dir" && github_api_exec_with_rate_limit_retry \
+    "stacking-tool gh pr view ${slug} (pr text)" -- gh pr view --json number,title)" || {
+    printf 'stacking-tool: %s: could not read the PR for the current branch in %s\n' \
+      "$([[ "$explicit" -eq 1 ]] && echo ERROR || echo NOTE)" "$slug" >&2
+    return "$explicit"
   }
   number="$(pr_cc_jq_r "stacking-tool jq pr number" "$pr_json" '.number // empty')" || number=''
   current="$(pr_cc_jq_r "stacking-tool jq pr title" "$pr_json" '.title // empty')" || current=''
   if [[ -z "$number" ]]; then
-    printf 'stacking-tool: ERROR: no PR number for the current branch in %s\n' "$slug" >&2
-    return 1
+    printf 'stacking-tool: %s: no PR number for the current branch in %s\n' \
+      "$([[ "$explicit" -eq 1 ]] && echo ERROR || echo NOTE)" "$slug" >&2
+    return "$explicit"
   fi
 
   if [[ -z "$title" ]]; then
@@ -433,10 +440,14 @@ stacking_tool_apply_pr_text() {
     fi
   fi
   if [[ -n "$title" && "$title" != "$current" ]]; then
-    pr_cc_pr_set_title "$slug" "$number" "$title" || return 1
+    if ! pr_cc_pr_set_title "$slug" "$number" "$title"; then
+      printf 'stacking-tool: could not set the title of PR #%s\n' "$number" >&2
+      return "$explicit"
+    fi
   fi
   if [[ -n "$body_file" ]]; then
-    github_api_exec_with_rate_limit_retry "stacking-tool pr edit body ${slug}#${number}" -- gh pr edit "$number" --repo "$slug" --body-file "$body_file" >/dev/null || return 1
+    github_api_exec_with_rate_limit_retry "stacking-tool pr edit body ${slug}#${number}" \
+      -- gh pr edit "$number" --repo "$slug" --body-file "$body_file" >/dev/null || return 1
   fi
 }
 
@@ -472,7 +483,7 @@ stacking_tool_submit_as() {
       while [[ ${#extras[@]} -gt 0 ]]; do
         case "${extras[0]}" in
           --title|--body-file)
-            if [[ ${#extras[@]} -lt 2 || -z "${extras[1]}" ]]; then
+            if [[ ${#extras[@]} -lt 2 || -z "${extras[1]}" || "${extras[1]}" == --* ]]; then
               stacking_tool_die "${extras[0]} needs a value"
             fi
             if [[ "${extras[0]}" == '--title' ]]; then
@@ -489,7 +500,9 @@ stacking_tool_submit_as() {
             ;;
         esac
       done
-      if [[ -n "$pr_title" ]] && stacking_tool_title_looks_like_branch "$pr_title"; then
+      if [[ -n "$pr_title" ]] && stacking_tool_title_looks_like_branch "$pr_title" \
+        "$(runner_exec_stdout "stacking-tool git branch (title check)" \
+          --probe -- git -C "$st_dir" branch --show-current)"; then
         stacking_tool_die "title \"${pr_title}\" looks like a branch name; give a readable title"
       fi
       if [[ -n "$pr_body_file" && ! -s "$pr_body_file" ]]; then
