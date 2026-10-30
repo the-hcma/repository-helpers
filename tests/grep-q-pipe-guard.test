@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Guard: tests must not end a pipeline in `grep -q` (use grep_q_all from tests/lib/grep-q-all, #803).
+#
+# `cmd | grep -q PAT` lets grep exit on its first match while cmd is still writing; cmd then dies of
+# SIGPIPE and `set -o pipefail` reports a failed pipeline although the text matched. That was an
+# intermittent failure in tests/runner.test that reproduced about 7% of the time under load.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck source=tests/lib/test-assert
+source "${script_dir}/lib/test-assert"
+pass=0
+fail=0
+test_init
+
+printf '\n=== static: no test pipes into grep -q (#803) ===\n'
+offenders="$(
+  awk '
+    FNR == 1 { heredoc = "" }
+    heredoc != "" { if ($0 ~ "^[ \t]*" heredoc "[ \t]*$") heredoc = ""; next }
+    /^[ \t]*#/ { next }
+    match($0, /<<-?[ \t]*["'\'']?[A-Za-z_][A-Za-z0-9_]*/) && substr($0, RSTART, 3) != "<<<" {
+      tag = substr($0, RSTART, RLENGTH); sub(/^<<-?[ \t]*["'\'']?/, "", tag); heredoc = tag
+    }
+    /\|[ \t]*grep[ \t]+-[a-zA-Z]*q/ { print FILENAME ":" FNR ": " $0 }
+  ' "${script_dir}"/*.test
+)"
+if [[ -z "$offenders" ]]; then
+  pass_case 'no test file pipes a command into grep -q'
+else
+  fail_case "tests pipe into grep -q; use grep_q_all (tests/lib/grep-q-all): $(head -n 5 <<<"$offenders")"
+fi
+
+printf '\n=== functional: grep_q_all survives an upstream that outlives the match (#803) ===\n'
+# shellcheck source=tests/lib/grep-q-all
+source "${script_dir}/lib/grep-q-all"
+big_failures=0
+for _ in $(seq 1 20); do
+  if ! { printf 'needle\n'; head -c 400000 /dev/zero | tr '\0' 'x'; } | grep_q_all -F 'needle'; then
+    big_failures=$(( big_failures + 1 ))
+  fi
+done
+if (( big_failures == 0 )); then
+  pass_case 'a match on the first line of a 400 KB stream is found every time'
+else
+  fail_case "a match on the first line of a 400 KB stream is found every time (${big_failures}/20 failed)"
+fi
+if printf 'abc\n' | grep_q_all -F 'zzz'; then
+  fail_case 'a missing pattern returns non-zero'
+else
+  pass_case 'a missing pattern returns non-zero'
+fi
+if printf 'ABC\n' | grep_q_all -iF 'abc'; then
+  pass_case 'flags are passed through to grep'
+else
+  fail_case 'flags are passed through to grep'
+fi
+
+printf '\n=== results ===\n'
+printf 'Passed: %d  Failed: %d\n' "$pass" "$fail"
+test_summary

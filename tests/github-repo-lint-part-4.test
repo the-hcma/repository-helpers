@@ -1168,6 +1168,124 @@ else
 fi
 rm -rf "$sysd_mock"
 
+printf '\n=== unit: path probes that fail with an API error are not absent (#800) ===\n'
+probe_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${probe_dir}/runner-sessions"
+probe_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    rp_compact=0; rp_suggest=1; rp_apply_fix=1; rp_strict_onboarding=0; rp_new_repo=0
+    slug=the-hcma/example-repo
+
+    # Stubs: a per-path exit code table for rp_gh_path_check.
+    declare -A probe_ec=()
+    rp_gh_path_check() { return "${probe_ec[$2]:-1}"; }
+    puts="$(mktemp)"
+    rp_runner_gh_api_input() { printf "PUT\n" >>"$puts"; }
+
+    # release-please: an API error still counts as "maybe" for discovery; the check itself reports it.
+    probe_ec=([".github/workflows/release-please.yml"]=2)
+    rp_repo_may_have_release_please "$slug" || { echo "discovery-should-audit-on-error"; exit 1; }
+    if rp_repo_has_release_please "$slug"; then echo "error-is-not-exists"; exit 1; fi
+    # An API error must not make protect-main "required" (that path can write a ruleset): unknown -> 2.
+    rp_repo_has_merge_it_label() { return 1; }
+    rp_repo_uses_github_merge_queue() { return 1; }
+    rc=0; rp_repo_requires_protect_main_ruleset the-hcma/repository-helpers || rc=$?
+    [[ "$rc" == 2 ]] || { printf "requires-on-error: rc=%s\n" "$rc"; exit 1; }
+    probe_ec=([".github/workflows/release-please.yml"]=0)
+    rc=0; rp_repo_requires_protect_main_ruleset the-hcma/repository-helpers || rc=$?
+    [[ "$rc" == 0 ]] || { printf "requires-with-release-please: rc=%s\n" "$rc"; exit 1; }
+    probe_ec=([".github/workflows/release-please.yml"]=1)
+    rc=0; rp_repo_requires_protect_main_ruleset the-hcma/repository-helpers || rc=$?
+    [[ "$rc" == 1 ]] || { printf "requires-absent: rc=%s\n" "$rc"; exit 1; }
+    probe_ec=([".github/workflows/release-please.yml"]=2)
+    rc=0; out="$(rp_check_release_please "$slug" 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] && grep -qF "could not read .github/workflows/release-please.yml (GitHub API:" <<<"$out"; } \
+      || { printf "release-please-error: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    probe_ec=([".github/workflows/release-please.yml"]=1)
+    if rp_repo_has_release_please "$slug"; then echo "absent-release-please-found"; exit 1; fi
+
+    # bypass apps: exit 2 on an API error, the app when present, [] when absent.
+    probe_ec=([".github/dependabot.yml"]=2)
+    rc=0; out="$(rp_classic_protection_bypass_apps_json "$slug")" || rc=$?
+    { [[ "$rc" == 2 && -z "$out" ]]; } || { printf "bypass-error: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+    probe_ec=([".github/dependabot.yml"]=0)
+    out="$(rp_classic_protection_bypass_apps_json "$slug")"
+    grep -qF "${rp_DEPENDABOT_APP_SLUG}" <<<"$out" || { printf "bypass-present: %s\n" "$out"; exit 1; }
+    probe_ec=([".github/dependabot.yml"]=1)
+    out="$(rp_classic_protection_bypass_apps_json "$slug")"
+    [[ "$out" == "[]" ]] || { printf "bypass-absent: %s\n" "$out"; exit 1; }
+
+    # ci.yml: exit 2 on an API error, 1 when absent.
+    probe_ec=([".github/workflows/ci.yml"]=2)
+    rc=0; rp_fetch_ci_workflow_text "$slug" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" == 2 ]] || { printf "ci-text-error: rc=%s\n" "$rc"; exit 1; }
+    rc=0; rp_discover_ci_status_contexts "$slug" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" == 2 ]] || { printf "ci-contexts-error: rc=%s\n" "$rc"; exit 1; }
+    probe_ec=([".github/workflows/ci.yml"]=1)
+    rc=0; rp_fetch_ci_workflow_text "$slug" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" == 1 ]] || { printf "ci-text-absent: rc=%s\n" "$rc"; exit 1; }
+    rc=0; rp_discover_ci_status_contexts "$slug" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" == 0 ]] || { printf "ci-contexts-absent: rc=%s\n" "$rc"; exit 1; }
+
+    # apply: never writes protection after an API error on ci.yml or dependabot.yml.
+    : >"$puts"
+    rp_discover_ci_status_contexts() { return 2; }
+    rc=0; out="$(rp_apply_classic_main_protection "$slug" 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] && grep -qF "could not read .github/workflows/ci.yml" <<<"$out" \
+      && grep -qF "not changing branch protection" <<<"$out" && [[ ! -s "$puts" ]]; } \
+      || { printf "apply-ci-error: rc=%s puts=%s out=%s\n" "$rc" "$(cat "$puts")" "$out"; exit 1; }
+    rp_discover_ci_status_contexts() { printf "build\n"; }
+    probe_ec=([".github/dependabot.yml"]=2)
+    rc=0; out="$(rp_apply_classic_main_protection "$slug" 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] && grep -qF "could not read .github/dependabot.yml" <<<"$out" && [[ ! -s "$puts" ]]; } \
+      || { printf "apply-dependabot-error: rc=%s puts=%s out=%s\n" "$rc" "$(cat "$puts")" "$out"; exit 1; }
+    probe_ec=([".github/dependabot.yml"]=1)
+    rp_repo_uses_github_merge_queue() { return 0; }
+    rc=0; out="$(rp_apply_classic_main_protection "$slug" 2>&1)" || rc=$?
+    { [[ "$rc" == 0 ]] && grep -qF PUT "$puts"; } \
+      || { printf "apply-clean-still-writes: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    # validate: the same two errors are reported, not treated as nothing to check.
+    protection="{\"required_status_checks\":{\"strict\":true,\"contexts\":[\"build\"]},\"required_pull_request_reviews\":{\"require_code_owner_reviews\":true}}"
+    rp_discover_ci_status_contexts() { return 2; }
+    probe_ec=([".github/dependabot.yml"]=2)
+    rc=0; out="$(rp_validate_classic_main_protection_json "$slug" "$protection" 2>&1)" || rc=$?
+    { [[ "$rc" != 0 ]] && grep -qF "could not read .github/workflows/ci.yml (GitHub API:" <<<"$out" \
+      && grep -qF "could not read .github/dependabot.yml (GitHub API:" <<<"$out"; } \
+      || { printf "validate-errors: rc=%s out=%s\n" "$rc" "$out"; exit 1; }
+
+    # dependabot auto-merge workflow path: first name, second name, none, API error.
+    probe_ec=([".github/workflows/dependabot-auto-merge.yml"]=0)
+    [[ "$(rp_dependabot_auto_merge_workflow_path "$slug")" == ".github/workflows/dependabot-auto-merge.yml" ]] \
+      || { echo "workflow-first"; exit 1; }
+    probe_ec=([".github/workflows/dependabot-auto-merge.yml"]=1 [".github/workflows/auto-merge-dependabot.yml"]=0)
+    [[ "$(rp_dependabot_auto_merge_workflow_path "$slug")" == ".github/workflows/auto-merge-dependabot.yml" ]] \
+      || { echo "workflow-second"; exit 1; }
+    probe_ec=([".github/workflows/dependabot-auto-merge.yml"]=1 [".github/workflows/auto-merge-dependabot.yml"]=1)
+    rc=0; rp_dependabot_auto_merge_workflow_path "$slug" >/dev/null || rc=$?
+    [[ "$rc" == 1 ]] || { printf "workflow-none: rc=%s\n" "$rc"; exit 1; }
+    probe_ec=([".github/workflows/dependabot-auto-merge.yml"]=1 [".github/workflows/auto-merge-dependabot.yml"]=2)
+    rc=0; rp_dependabot_auto_merge_workflow_path "$slug" >/dev/null || rc=$?
+    [[ "$rc" == 2 ]] || { printf "workflow-error: rc=%s\n" "$rc"; exit 1; }
+
+    printf "ok\n"
+  ' bash "$runner_bootstrap" "$lib"
+)" || probe_out="fail:${probe_out}"
+rm -rf "$probe_dir"
+unset RUNNER_SESSION_ROOT
+if [[ "$probe_out" == 'ok' ]]; then
+  printf '[PASS] path probe API errors are reported or propagated, and absent files are unchanged\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] path probe API errors (%s)\n' "$probe_out"
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== summary ===\n'
 printf '%s passed, %s failed\n' "$pass" "$fail"
 
