@@ -17,7 +17,7 @@ source "${script_dir}/../lib/queued-branch-guard"
 usage() {
   cat >&2 <<'USAGE'
 Usage:
-  scripts/dev/submit-stack [--no-wait-ci] [SUBMIT_EXTRA_ARGS...]
+  scripts/dev/submit-stack [--no-wait-ci] [--title TITLE] [--body-file FILE] [SUBMIT_EXTRA_ARGS...]
 
 Refuses (ERROR: QUEUED_BRANCH) when the branch's PR is already in the merge queue, since a push would drop it.
 Then runs scripts/dev/pre-pr-checks, then scripts/dev/ensure-submit-clean-tree, then
@@ -29,16 +29,25 @@ marker is refused, Graphite is retired):
 Then runs scripts/dev/post-pr-submission-checks (waits for CI by default and
 prints agent-actionable failure log excerpts when checks fail).
 
+--title and --body-file put the final PR title and body on the PR as soon as it opens (before CI and
+reviewers see it), and are checked before the pre-PR run starts: the body file must exist, be
+non-empty and pass scripts/lint-github-markdown, and the title must not look like a branch name.
+Without --title, a title that is still a branch-name placeholder (for example "strict mode wt") is
+replaced by the commit subject when the branch has one commit, else by the branch name without its
+"-wt" suffix. A readable title is never changed.
+
 Run from the feature worktree branch you are submitting — the target repo is
 resolved from the current working directory (git rev-parse --show-toplevel), not
 from this script's own location, so invoking it via an absolute path (e.g.
 ~/work/ai/repository-helpers/scripts/dev/submit-stack from a different repo's
-worktree) still operates on the caller's repo. SUBMIT_EXTRA_ARGS are accepted for
+worktree) still operates on the caller's repo. Other SUBMIT_EXTRA_ARGS are accepted for
 compatibility and ignored.
 USAGE
 }
 
 no_wait_ci=0
+pr_title=''
+pr_body_file=''
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
@@ -51,12 +60,40 @@ parse_args() {
         no_wait_ci=1
         shift
         ;;
+      --title|--body-file)
+        if [[ $# -lt 2 || -z "$2" ]]; then
+          printf 'ERROR: %s needs a value\n' "$1" >&2
+          exit 2
+        fi
+        if [[ "$1" == '--title' ]]; then
+          pr_title="$2"
+        else
+          pr_body_file="$2"
+        fi
+        shift 2
+        ;;
       *)
         submit_args+=("$1")
         shift
         ;;
     esac
   done
+}
+
+# validate_pr_text: refuse a bad --title or --body-file before ten minutes of checks.
+validate_pr_text() {
+  if [[ -n "$pr_title" ]] && stacking_tool_title_looks_like_branch "$pr_title"; then
+    printf 'ERROR: title "%s" looks like a branch name; give a readable title\n' "$pr_title" >&2
+    exit 2
+  fi
+  if [[ -n "$pr_body_file" ]]; then
+    if [[ ! -s "$pr_body_file" ]]; then
+      printf 'ERROR: body file not found or empty: %s\n' "$pr_body_file" >&2
+      exit 2
+    fi
+    runner_exec "submit-stack lint PR body" -- "${script_dir}/../lint-github-markdown" "$pr_body_file" \
+      || exit 2
+  fi
 }
 
 main() {
@@ -66,6 +103,13 @@ main() {
   local repo_dir
 
   parse_args "$@"
+  validate_pr_text
+  if [[ -n "$pr_title" ]]; then
+    submit_args+=(--title "$pr_title")
+  fi
+  if [[ -n "$pr_body_file" ]]; then
+    submit_args+=(--body-file "$pr_body_file")
+  fi
 
   repo_dir="$(dev_resolve_target_repo_dir 'submit-stack')" || exit 1
 

@@ -332,11 +332,122 @@ stacking_tool_ensure_stack_conventional_titles() {
   return "$rc"
 }
 
-# stacking_tool_submit_as <tool> <repo_dir> [extra args…]
-# Submits using an explicit backend (gh-stack; graphite dies as retired). Used when the marker is
+# stacking_tool_title_normalize <text>
+# Lowercases, turns hyphens, underscores and slashes into spaces and squeezes whitespace, so a branch
+# name and the title `gh stack submit --auto` derives from it compare equal (#810).
+stacking_tool_title_normalize() {
+  local text="${1,,}"
+  local -a words=()
+
+  text="${text//[-_\/]/ }"
+  read -r -a words <<<"$text" || true
+  printf '%s' "${words[*]}"
+}
+
+# stacking_tool_title_looks_like_branch <title> [branch]
+# Exit 0 when a PR title is a placeholder rather than a readable title: words made only of
+# letters, digits and separators that end in "wt" (the suffix start-development adds to every
+# worktree branch), or the branch name itself with or without that suffix (#810).
+stacking_tool_title_looks_like_branch() {
+  local -r branch="${2:-}"
+  local norm branch_norm
+
+  norm="$(stacking_tool_title_normalize "$1")"
+  if [[ "$norm" =~ ^[a-z0-9]+(\ [a-z0-9]+)*\ wt$ ]]; then
+    return 0
+  fi
+  if [[ -n "$branch" ]]; then
+    branch_norm="$(stacking_tool_title_normalize "$branch")"
+    branch_norm="${branch_norm% wt}"
+    if [[ -n "$branch_norm" && ( "$norm" == "$branch_norm" || "$norm" == "${branch_norm} wt" ) ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# stacking_tool_default_pr_title <repo_dir> <branch>
+# The title for a PR whose title is only a placeholder: the commit subject when the branch has
+# exactly one commit ahead of main, else the branch name without its "-wt" suffix (#810).
+stacking_tool_default_pr_title() {
+  local -r st_dir="$1"
+  local -r branch="$2"
+  local base count norm
+
+  base='origin/main'
+  if ! runner_exec_stdout "stacking-tool git origin/main (default title)" \
+    --probe -- git -C "$st_dir" rev-parse --verify --quiet "$base" >/dev/null; then
+    base='main'
+  fi
+  count="$(runner_exec_stdout "stacking-tool git commit count (default title)" \
+    --probe -- git -C "$st_dir" rev-list --count "${base}..HEAD")" || count=''
+  if [[ "$count" == '1' ]]; then
+    runner_exec_stdout "stacking-tool git commit subject (default title)" \
+      --probe -- git -C "$st_dir" log -1 --format=%s
+    return 0
+  fi
+  norm="$(stacking_tool_title_normalize "$branch")"
+  printf '%s' "${norm% wt}"
+}
+
+# stacking_tool_apply_pr_text <repo_dir> <title> <body_file>
+# After `gh stack submit`, puts the final text on the current branch's PR: an explicit title and
+# body file when given; otherwise a title that is still a branch-name placeholder is replaced by
+# stacking_tool_default_pr_title. A readable title is never touched (#810). Returns non-zero on
+# a gh failure.
+stacking_tool_apply_pr_text() {
+  local -r st_dir="$1"
+  local title="${2:-}"
+  local -r body_file="${3:-}"
+  local origin_url slug pr_json number current branch
+
+  origin_url="$(runner_exec_stdout "stacking-tool git remote origin (pr text)" \
+    --probe -- git -C "$st_dir" remote get-url origin)" || {
+    printf 'stacking-tool: NOTE: could not resolve origin — leaving the PR title and body alone\n' >&2
+    return 0
+  }
+  slug="$(gh_slug_from_origin_url "$origin_url")" || slug=''
+  if [[ -z "$slug" ]]; then
+    printf 'stacking-tool: NOTE: could not parse OWNER/NAME from origin — leaving the PR title and body alone\n' >&2
+    return 0
+  fi
+
+  pr_json="$(cd "$st_dir" && github_api_exec_with_rate_limit_retry "stacking-tool gh pr view ${slug} (pr text)" -- gh pr view --json number,title)" || {
+    printf 'stacking-tool: ERROR: could not read the PR for the current branch in %s\n' "$slug" >&2
+    return 1
+  }
+  number="$(pr_cc_jq_r "stacking-tool jq pr number" "$pr_json" '.number // empty')" || number=''
+  current="$(pr_cc_jq_r "stacking-tool jq pr title" "$pr_json" '.title // empty')" || current=''
+  if [[ -z "$number" ]]; then
+    printf 'stacking-tool: ERROR: no PR number for the current branch in %s\n' "$slug" >&2
+    return 1
+  fi
+
+  if [[ -z "$title" ]]; then
+    branch="$(runner_exec_stdout "stacking-tool git branch (pr text)" \
+      --probe -- git -C "$st_dir" branch --show-current)" || branch=''
+    if stacking_tool_title_looks_like_branch "$current" "$branch"; then
+      title="$(stacking_tool_default_pr_title "$st_dir" "$branch")"
+      printf 'stacking-tool: NOTE: PR #%s title "%s" looks like a branch name; using "%s"\n' \
+        "$number" "$current" "$title" >&2
+    fi
+  fi
+  if [[ -n "$title" && "$title" != "$current" ]]; then
+    pr_cc_pr_set_title "$slug" "$number" "$title" || return 1
+  fi
+  if [[ -n "$body_file" ]]; then
+    github_api_exec_with_rate_limit_retry "stacking-tool pr edit body ${slug}#${number}" -- gh pr edit "$number" --repo "$slug" --body-file "$body_file" >/dev/null || return 1
+  fi
+}
+
+# stacking_tool_submit_as <tool> <repo_dir> [--title TITLE] [--body-file FILE]
+# Submits using an explicit backend (gh-stack; graphite dies as retired). --title and --body-file
+# are applied to the PR right after it opens, before the Conventional Commits title check; any
+# other extra arg is ignored with a warning. Used when the marker is
 # not yet on disk (e.g. repo-practices --apply-fix creating the marker).
 stacking_tool_submit_as() {
   local tool st_dir quoted_repo
+  local pr_title='' pr_body_file=''
   local -a extras=()
 
   tool="${1:-}"
@@ -358,20 +469,44 @@ stacking_tool_submit_as() {
       stacking_tool_die "$(stacking_tool_retired_message)"
       ;;
     "$stacking_tool_value_gh_stack")
-      if [[ ${#extras[@]} -gt 0 ]]; then
-        printf 'stacking-tool: warning: ignoring extra submit args for gh-stack: %s\n' \
-          "${extras[*]}" >&2
+      while [[ ${#extras[@]} -gt 0 ]]; do
+        case "${extras[0]}" in
+          --title|--body-file)
+            if [[ ${#extras[@]} -lt 2 || -z "${extras[1]}" ]]; then
+              stacking_tool_die "${extras[0]} needs a value"
+            fi
+            if [[ "${extras[0]}" == '--title' ]]; then
+              pr_title="${extras[1]}"
+            else
+              pr_body_file="${extras[1]}"
+            fi
+            extras=("${extras[@]:2}")
+            ;;
+          *)
+            printf 'stacking-tool: warning: ignoring extra submit arg for gh-stack: %s\n' \
+              "${extras[0]}" >&2
+            extras=("${extras[@]:1}")
+            ;;
+        esac
+      done
+      if [[ -n "$pr_title" ]] && stacking_tool_title_looks_like_branch "$pr_title"; then
+        stacking_tool_die "title \"${pr_title}\" looks like a branch name; give a readable title"
+      fi
+      if [[ -n "$pr_body_file" && ! -s "$pr_body_file" ]]; then
+        stacking_tool_die "body file not found or empty: ${pr_body_file}"
       fi
       runner_sh "stacking-tool gh stack submit" "cd ${quoted_repo} && gh stack submit --auto --open --remote origin"
+      stacking_tool_apply_pr_text "$st_dir" "$pr_title" "$pr_body_file" \
+        || stacking_tool_die 'could not set the PR title or body (see the error above)'
       stacking_tool_ensure_stack_conventional_titles "$st_dir" \
         || stacking_tool_die 'one or more stack PR titles are not Conventional Commits headers (see ERROR: PR_CC_TITLE_* above) — fix with scripts/ensure-pr-conventional-title --pr <n>'
       ;;
   esac
 }
 
-# stacking_tool_submit <repo_dir> [extra args…]
+# stacking_tool_submit <repo_dir> [--title TITLE] [--body-file FILE]
 # Submits the current stack using the marker-selected backend.
-# gh-stack: gh stack submit --auto --open --remote origin (extras ignored for now)
+# gh-stack: gh stack submit --auto --open --remote origin, then the PR title and body (#810).
 stacking_tool_submit() {
   local st_dir tool
 

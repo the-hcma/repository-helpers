@@ -859,6 +859,156 @@ else
   fail_case 'the pre-pr-checks template must not point at a Graphite skill'
 fi
 
+printf '\n=== functional: stacking_tool_title_looks_like_branch (#810) ===\n'
+for t in 'merge stack enqueue fallback wt' 'Strict Mode WT' 'repo-lint-connection-errors-wt' 'runner test sigpipe'; do
+  rc=0
+  stacking_tool_title_looks_like_branch "$t" 'runner-test-sigpipe-wt' || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    pass_case "title '${t}' looks like a branch name"
+  else
+    fail_case "title '${t}' looks like a branch name"
+  fi
+done
+for t in 'fix(repo-lint): report connection failures as API errors' 'Make submit-stack set a readable title' 'docs: explain the wt suffix'; do
+  rc=0
+  stacking_tool_title_looks_like_branch "$t" 'runner-test-sigpipe-wt' || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    pass_case "title '${t}' is not mistaken for a branch name"
+  else
+    fail_case "title '${t}' is not mistaken for a branch name"
+  fi
+done
+
+printf '\n=== functional: stacking_tool_submit_as sets the PR title and body (#810) ===\n'
+title_repo="$(mktemp -d)"
+git -C "$title_repo" init -q -b main
+git -C "$title_repo" config user.name test
+git -C "$title_repo" config user.email test@example.com
+git -C "$title_repo" config commit.gpgsign false
+git -C "$title_repo" remote add origin 'https://github.com/the-hcma/title-repo.git'
+printf 'base\n' >"${title_repo}/f"
+git -C "$title_repo" add f
+git -C "$title_repo" commit -q -m 'chore: base'
+git -C "$title_repo" update-ref refs/remotes/origin/main HEAD
+git -C "$title_repo" checkout -q -b some-branch-wt
+printf 'one\n' >>"${title_repo}/f"
+git -C "$title_repo" commit -q -am 'fix(thing): the only commit'
+
+title_fake_bin="$(mktemp -d)"
+title_edit_log="${title_fake_bin}/edit.log"
+title_pr_title_file="${title_fake_bin}/pr-title"
+printf '%s\n' 'some branch wt' >"$title_pr_title_file"
+cat >"${title_fake_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+args="\$*"
+if [[ "\$args" == *'stack --help'* ]]; then
+  exit 0
+fi
+if [[ "\$args" == 'stack submit'* ]]; then
+  exit 0
+fi
+if [[ "\$args" == *'stack view --json'* ]]; then
+  printf '%s\n' '{"trunk":"main","currentBranch":"some-branch-wt","branches":[{"name":"some-branch-wt","pr":{"number":801}}]}'
+  exit 0
+fi
+if [[ "\$args" == 'pr view --json number,title'* ]]; then
+  printf '{"number":801,"title":"%s"}\n' "\$(cat '${title_pr_title_file}')"
+  exit 0
+fi
+if [[ "\$args" == *'api repos/the-hcma/title-repo'* ]]; then
+  printf '%s\n' '{"allow_squash_merge":true,"squash_merge_commit_title":"COMMIT_OR_PR_TITLE","squash_merge_commit_message":"BLANK"}'
+  exit 0
+fi
+if [[ "\$args" == 'pr edit 801 '* ]]; then
+  printf '%s\n' "\$args" >>'${title_edit_log}'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "\$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${title_fake_bin}/gh"
+title_body="${title_fake_bin}/body.md"
+printf '## Summary\n\nbody\n' >"$title_body"
+run_title_submit() {
+  : >"$title_edit_log"
+  PATH="${title_fake_bin}:${PATH}" stacking_tool_submit_as 'gh-stack' "$title_repo" "$@" 2>&1
+}
+
+title_rc=0
+title_out="$(run_title_submit --title 'feat: an explicit title' --body-file "$title_body")" || title_rc=$?
+assert_exit_0 'submit_as with --title and --body-file succeeds' "$title_out" "$title_rc"
+if grep -qF -- '--title feat: an explicit title' "$title_edit_log" \
+  && grep -qF -- "--body-file ${title_body}" "$title_edit_log"; then
+  pass_case 'an explicit title and body file are applied to the PR'
+else
+  fail_case "an explicit title and body file are applied to the PR ($(cat "$title_edit_log"))"
+fi
+
+title_rc=0
+title_out="$(run_title_submit)" || title_rc=$?
+assert_exit_0 'submit_as without a title succeeds' "$title_out" "$title_rc"
+if grep -qF -- '--title fix(thing): the only commit' "$title_edit_log" \
+  && ! grep -qF -- '--body-file' "$title_edit_log"; then
+  pass_case 'a branch-looking title becomes the only commit subject, with no body edit'
+else
+  fail_case "a branch-looking title becomes the only commit subject ($(cat "$title_edit_log"))"
+fi
+
+printf 'two\n' >>"${title_repo}/f"
+git -C "$title_repo" commit -q -am 'fix(thing): the second commit'
+title_rc=0
+title_out="$(run_title_submit)" || title_rc=$?
+if [[ "$title_rc" -eq 0 ]] && grep -qF -- '--title some branch' "$title_edit_log" \
+  && ! grep -qF -- '--title some branch wt' "$title_edit_log"; then
+  pass_case 'with several commits a branch-looking title is the branch name without -wt'
+else
+  fail_case "with several commits a branch-looking title is the branch name without -wt ($(cat "$title_edit_log"))"
+fi
+
+printf '%s\n' 'feat: already readable' >"$title_pr_title_file"
+title_rc=0
+title_out="$(run_title_submit)" || title_rc=$?
+if [[ "$title_rc" -eq 0 ]] && [[ ! -s "$title_edit_log" ]]; then
+  pass_case 'a readable title is left alone'
+else
+  fail_case "a readable title is left alone ($(cat "$title_edit_log"))"
+fi
+
+title_rc=0
+title_out="$(run_title_submit --title 'branch name wt')" || title_rc=$?
+if [[ "$title_rc" -ne 0 ]] && grep -qF 'looks like a branch name' <<<"$title_out" \
+  && [[ ! -s "$title_edit_log" ]]; then
+  pass_case 'an explicit title that looks like a branch name is refused'
+else
+  fail_case "an explicit title that looks like a branch name is refused (exit=${title_rc})"
+fi
+rm -rf "$title_repo" "$title_fake_bin"
+
+printf '\n=== functional: submit-stack validates --title and --body-file before any work (#810) ===\n'
+submit_stack="${rh_root}/scripts/dev/submit-stack"
+ss_rc=0
+ss_out="$(timeout 20 "$submit_stack" --body-file /nonexistent/body.md 2>&1)" || ss_rc=$?
+if [[ "$ss_rc" -ne 0 ]] && grep -qF 'body file' <<<"$ss_out" && grep -qF '/nonexistent/body.md' <<<"$ss_out"; then
+  pass_case 'a missing --body-file is refused before the gate runs'
+else
+  fail_case "a missing --body-file is refused before the gate runs (exit=${ss_rc})"
+fi
+ss_rc=0
+ss_out="$(timeout 20 "$submit_stack" --title 2>&1)" || ss_rc=$?
+if [[ "$ss_rc" -ne 0 ]] && grep -qF -- '--title needs a value' <<<"$ss_out"; then
+  pass_case '--title without a value is refused'
+else
+  fail_case "--title without a value is refused (exit=${ss_rc})"
+fi
+ss_rc=0
+ss_out="$(timeout 20 "$submit_stack" --title 'branch name wt' 2>&1)" || ss_rc=$?
+if [[ "$ss_rc" -ne 0 ]] && grep -qF 'looks like a branch name' <<<"$ss_out"; then
+  pass_case 'a branch-looking --title is refused before the gate runs'
+else
+  fail_case "a branch-looking --title is refused before the gate runs (exit=${ss_rc})"
+fi
+
 printf '\n=== summary ===\n'
 printf 'pass=%s fail=%s\n' "$pass" "$fail"
 if [[ "$fail" -ne 0 ]]; then
