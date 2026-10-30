@@ -29,6 +29,20 @@ assert_lib_grep() {
     fail_case "$label"
   fi
 }
+# lib_fn_body_has_in <file> <function> <grep-args…>: grep a function body of <file>. The body is
+# captured first: piping awk straight into `grep -q` lets grep exit on its first match while awk
+# is still writing, and awk then dies of SIGPIPE, which `set -o pipefail` reports as a failed
+# test even though the text matched (#803).
+lib_fn_body_has_in() {
+  local -r file="$1" fn="$2"
+  shift 2
+  local body
+  body="$(awk -v fn="$fn" '$0 ~ "^" fn "\\(\\) \\{" {f=1} f && /^\}$/{exit} f' "$file")"
+  grep -q "$@" <<<"$body"
+}
+lib_fn_body_has() {
+  lib_fn_body_has_in "$lib" "$@"
+}
 assert_lib_grep "declares run_command"           "run_command()"
 assert_lib_grep "declares run_command_or_die"    "run_command_or_die()"
 assert_lib_grep "declares record_first_failure"  "record_first_failure()"
@@ -37,8 +51,7 @@ assert_lib_grep "declares runner_session_begin"  "runner_session_begin()"
 assert_lib_grep "declares runner_session_end" "runner_session_end()"
 # shellcheck disable=SC2016  # static assert matches literal source text
 assert_lib_grep "session_end rm is best-effort (#540)" 'WARNING: runner_session_end: failed to remove'
-if awk '/^runner_session_end\(\) \{/{f=1; next} f && /^\}$/{exit} f' "$lib" \
-  | grep -qF 'return 0'; then
+if lib_fn_body_has runner_session_end -F 'return 0'; then
   pass_case 'session_end always returns 0 (#540)'
 else
   fail_case 'session_end always returns 0 (#540)'
@@ -69,21 +82,18 @@ assert_lib_grep "prune surfaces an incomplete sweep" "RUNNER_SESSION_PRUNE_INCOM
 assert_lib_grep "prune captures the enumeration exit status" "enum_rc"
 assert_lib_grep "prune folds timeout + overflow into the NOTE" "_runner_rc_is_timeout"
 assert_lib_grep "timeout classifier covers the SIGKILL escalation" "128 + SIGKILL"
-if awk '/^runner_session_prune_stale\(\) \{/{f=1} f && /^\}$/{exit} f' "$lib" \
-  | grep -qF -- '--kill-after='; then
+if lib_fn_body_has runner_session_prune_stale -F -- '--kill-after='; then
   pass_case "prune escalates timeout(1) with --kill-after"
 else
   fail_case "prune escalates timeout(1) with --kill-after"
 fi
 assert_lib_grep "prune shares one budget across enumerate and remove" "budget_s - (SECONDS - started)"
-if awk '/^runner_session_prune_stale\(\) \{/{f=1} f && /^\}$/{exit} f' "$lib" \
-  | grep -qF 'there is no way to cap the find walk'; then
+if lib_fn_body_has runner_session_prune_stale -F 'there is no way to cap the find walk'; then
   pass_case "prune returns early when no timeout(1) is available"
 else
   fail_case "prune returns early when no timeout(1) is available"
 fi
-if awk '/^runner_session_prune_stale\(\) \{/{f=1} f && /^\}$/{exit} f' "$lib" \
-  | grep -qE '^\s+while IFS= read -r old_dir; do'; then
+if lib_fn_body_has runner_session_prune_stale -E '^\s+while IFS= read -r old_dir; do'; then
   fail_case "prune no longer uses the unbounded serial while-loop"
 else
   pass_case "prune no longer uses the unbounded serial while-loop"
@@ -802,6 +812,38 @@ else
   rm -f "$int_log"
 fi
 
+
+# ---------------------------------------------------------------------------
+# Static: function-body helper survives a match that is not at the end (#803)
+# ---------------------------------------------------------------------------
+
+printf '\n=== static: function-body greps do not race awk against grep -q (#803) ===\n'
+
+big_lib="$(mktemp)"
+{
+  printf 'big_fn() {\n  # needle on the first line\n'
+  for _ in $(seq 1 4000); do
+    printf '  : filler filler filler filler filler filler filler filler\n'
+  done
+  printf '}\n'
+} >"$big_lib"
+big_failures=0
+for _ in $(seq 1 20); do
+  if ! lib_fn_body_has_in "$big_lib" big_fn -F 'needle on the first line'; then
+    big_failures=$(( big_failures + 1 ))
+  fi
+done
+rm -f "$big_lib"
+if (( big_failures == 0 )); then
+  pass_case "a body larger than the pipe buffer is matched on its first line every time"
+else
+  fail_case "a body larger than the pipe buffer is matched on its first line every time (${big_failures}/20 failed)"
+fi
+if grep -nE '^[[:space:]]*\| *grep -q' "${BASH_SOURCE[0]}" >/dev/null; then
+  fail_case "runner.test pipes no command into grep -q"
+else
+  pass_case "runner.test pipes no command into grep -q"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary
