@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# Tests for reading CodeRabbit's outcome on a head from its check run (#817). CodeRabbit publishes a
+# `CodeRabbit` check run (titles "Finished", "Review in progress", "Review rate limited") and no commit
+# status on current repositories, so the loop must read the check run, or it never sees a rate-limited head.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+lib="${script_dir}/../scripts/lib/agent-review"
+profile="${script_dir}/../scripts/lib/agent-review-profiles/coderabbit"
+skill="${script_dir}/../.agents/skills/ship-and-review/SKILL.md"
+rule="${script_dir}/../.agents/rules/pr-ship-and-review.md"
+readonly lib profile skill rule
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+export HOME="${work_dir}/home"
+mkdir -p "${HOME}"
+export AGENT_REVIEW_ENV_FILE=/dev/null
+export AGENT_REVIEW_REVIEWERS_CACHE_DIR="${work_dir}/reviewers-cache"
+unset AGENT_REVIEW_AGENT AGENT_REVIEW_QUOTA_FALLBACK_CHAIN AGENT_REVIEW_GITHUB_REPO
+
+head_sha='0123456789abcdef0123456789abcdef01234567'
+repo='org/repo'
+readonly head_sha repo
+
+# run_lib <snippet> — runs a snippet with the lib and the CodeRabbit profile loaded.
+run_lib() {
+  bash -c "set -uo pipefail; source '${lib}'; source '${profile}'; $1" 2>&1
+}
+
+# run_json <json> — one CodeRabbit run as a JSON object: run_json <title> <status> <conclusion|null> <start> <end>
+run_json() {
+  jq -cn --arg title "$1" --arg status "$2" --arg conclusion "$3" --arg start "$4" --arg end "$5" '
+    {name: "CodeRabbit", status: $status, started_at: $start, completed_at: ($end | if . == "" then null else . end),
+     conclusion: ($conclusion | if . == "null" then null else . end),
+     app: {slug: "coderabbitai"}, output: {title: $title, summary: ("Result: " + $title)}}'
+}
+
+# runs <run-json>… — a check-runs response holding those runs.
+runs() {
+  printf '%s\n' "$@" | jq -cs '{total_count: length, check_runs: .}'
+}
+
+t0='2026-10-30T21:50:00Z'
+t1='2026-10-30T21:51:20Z'
+t2='2026-10-30T22:00:00Z'
+t3='2026-10-30T22:30:00Z'
+
+finished="$(runs "$(run_json 'Finished' completed success "$t0" "$t1")")"
+limited="$(runs "$(run_json 'Review rate limited' completed neutral "$t0" "$t1")")"
+progress="$(runs "$(run_json 'Review in progress' in_progress null "$t0" '')")"
+paused="$(runs "$(run_json 'Review paused' completed neutral "$t0" "$t1")")"
+skipped="$(runs "$(run_json 'Review skipped' completed success "$t0" "$t1")")"
+failed="$(runs "$(run_json 'Review failed' completed failure "$t0" "$t1")")"
+unfinished="$(runs "$(run_json 'Unfinished business' completed success "$t0" "$t1")")"
+foreign='{"total_count":1,"check_runs":[{"name":"build","status":"completed","conclusion":"success",
+  "app":{"slug":"github-actions"},"output":{"title":"Finished","summary":""}}]}'
+empty='{"total_count":0,"check_runs":[]}'
+rerun_ok="$(runs "$(run_json 'Review rate limited' completed neutral "$t0" "$t1")" \
+  "$(run_json 'Finished' completed success "$t2" "$t3")")"
+rerun_running="$(runs "$(run_json 'Review rate limited' completed neutral "$t0" "$t1")" \
+  "$(run_json 'Review in progress' in_progress null "$t2" '')")"
+rerun_limited="$(runs "$(run_json 'Finished' completed success "$t0" "$t1")" \
+  "$(run_json 'Review rate limited' completed neutral "$t2" "$t3")")"
+
+# from_runs <json> — the state the check-run reader prints for a payload.
+from_runs() {
+  run_lib "agent_review_coderabbit_head_status_from_check_runs '$1'"
+}
+
+printf '\n=== head status: the CodeRabbit check run decides ===\n'
+assert_contains "'Finished' is completed" "$(from_runs "$finished")" 'completed'
+assert_contains "'Review rate limited' is rate_limited" "$(from_runs "$limited")" 'rate_limited'
+assert_contains "'Review in progress' is in_progress" "$(from_runs "$progress")" 'in_progress'
+assert_contains "'Review paused' is other" "$(from_runs "$paused")" 'other'
+assert_contains "'Review skipped' is other" "$(from_runs "$skipped")" 'other'
+assert_contains 'a failed run is failed' "$(from_runs "$failed")" 'failed'
+assert_contains 'a title that merely contains finished is not completed' "$(from_runs "$unfinished")" 'other'
+assert_contains "another app's check run is none" "$(from_runs "$foreign")" 'none'
+assert_contains 'no check runs is none' "$(from_runs "$empty")" 'none'
+assert_contains 'the check run time becomes the state epoch' "$(from_runs "$finished")" "$(date -u -d "$t1" +%s)"
+
+printf '\n=== head status: several CodeRabbit runs on one head, the newest start wins ===\n'
+assert_contains 'a finished re-run after a rate-limited run is completed' "$(from_runs "$rerun_ok")" 'completed'
+assert_contains 'a running re-run after a rate-limited run is in_progress' "$(from_runs "$rerun_running")" 'in_progress'
+assert_contains 'a rate-limited run after a finished one is rate_limited' "$(from_runs "$rerun_limited")" 'rate_limited'
+
+printf '\n=== head paused: a paused check run is told apart from a skipped one ===\n'
+if run_lib "agent_review_coderabbit_head_paused_from_check_runs '${paused}'" >/dev/null; then
+  pass_case 'a paused check run is paused'
+else
+  fail_case 'a paused check run is paused'
+fi
+if run_lib "agent_review_coderabbit_head_paused_from_check_runs '${skipped}'" >/dev/null; then
+  fail_case 'a skipped check run is not paused'
+else
+  pass_case 'a skipped check run is not paused'
+fi
+
+# head_snippet <statuses|FAIL> <check_runs|FAIL> <expr> — runs <expr> with the two GitHub reads mocked
+# and a fresh head-status cache.
+head_snippet() {
+  local -r statuses="$1" check_runs_response="$2" expr="$3"
+  local cache
+  cache="$(mktemp -d)"
+  run_lib "
+    export AGENT_REVIEW_CODERABBIT_STATE_CACHE_DIR='${cache}'
+    ar_runner_gh_api_stream() {
+      case \"\$2\" in
+        */statuses*) [[ '${statuses}' == FAIL ]] && return 1; printf '%s' '${statuses}' ;;
+        */check-runs*) [[ '${check_runs_response}' == FAIL ]] && return 1; printf '%s' '${check_runs_response}' ;;
+        *) return 1 ;;
+      esac
+    }
+    ${expr}"
+}
+
+state_of="agent_review_coderabbit_head_state ${repo} ${head_sha}"
+paused_of="agent_review_coderabbit_head_paused ${repo} ${head_sha}"
+statuses_completed='[{"context":"CodeRabbit","state":"success","description":"Review completed",
+  "updated_at":"2026-10-30T20:00:00Z"}]'
+
+printf '\n=== head state: check run and commit status are combined ===\n'
+assert_contains 'a rate-limited check run with no commit status is rate_limited, not none' \
+  "$(head_snippet '[]' "$limited" "$state_of")" 'rate_limited'
+assert_contains 'a finished check run with no commit status is completed' \
+  "$(head_snippet '[]' "$finished" "$state_of")" 'completed'
+assert_contains 'the check run wins when both exist' \
+  "$(head_snippet "$statuses_completed" "$limited" "$state_of")" 'rate_limited'
+assert_contains 'a stale Review completed status does not hide a running check run' \
+  "$(head_snippet "$statuses_completed" "$progress" "$state_of")" 'in_progress'
+assert_contains 'the commit status still counts when there is no check run' \
+  "$(head_snippet "$statuses_completed" "$empty" "$state_of")" 'completed'
+assert_contains 'neither signal on the head is none' \
+  "$(head_snippet '[]' "$empty" "$state_of")" 'none'
+assert_contains 'a failed status read does not hide the check run' \
+  "$(head_snippet FAIL "$limited" "$state_of")" 'rate_limited'
+assert_contains 'a failed check-run read does not hide the commit status' \
+  "$(head_snippet "$statuses_completed" FAIL "$state_of")" 'completed'
+assert_contains 'both reads failing is unknown' \
+  "$(head_snippet FAIL FAIL "$state_of")" 'unknown'
+assert_contains 'one failed read and nothing on the other is unknown, not none' \
+  "$(head_snippet FAIL "$empty" "$state_of")" 'unknown'
+
+printf '\n=== head paused: either signal can say paused ===\n'
+if head_snippet '[]' "$paused" "$paused_of" >/dev/null; then
+  pass_case 'a paused check run is paused through the live read'
+else
+  fail_case 'a paused check run is paused through the live read'
+fi
+if head_snippet FAIL "$paused" "$paused_of" >/dev/null; then
+  pass_case 'a paused check run is paused even when the status read fails'
+else
+  fail_case 'a paused check run is paused even when the status read fails'
+fi
+if head_snippet '[]' "$limited" "$paused_of" >/dev/null; then
+  fail_case 'a rate-limited check run is not paused'
+else
+  pass_case 'a rate-limited check run is not paused'
+fi
+
+printf '\n=== seen on the PR: a check run alone shows CodeRabbit is set up ===\n'
+seen_of="agent_review_coderabbit_seen_on_pr ${repo} ${head_sha} ''"
+if head_snippet '[]' "$limited" "$seen_of" >/dev/null; then
+  pass_case 'a CodeRabbit check run with no comments counts as seen'
+else
+  fail_case 'a CodeRabbit check run with no comments counts as seen'
+fi
+
+printf '\n=== head status: the check-runs read asks for CodeRabbit by name (no paging past 100 runs) ===\n'
+url_log="${work_dir}/requested-urls"
+: >"$url_log"
+run_lib "
+  export AGENT_REVIEW_CODERABBIT_STATE_CACHE_DIR='$(mktemp -d)'
+  ar_runner_gh_api_stream() { printf '%s\\n' \"\$2\" >>'${url_log}'; printf '[]'; }
+  agent_review_coderabbit_head_status ${repo} ${head_sha} >/dev/null" >/dev/null
+requested="$(cat "$url_log")"
+assert_contains 'the check-runs request filters on the CodeRabbit check name' \
+  "$requested" 'check-runs?check_name=CodeRabbit&per_page=100'
+
+printf '\n=== docs: the Skill and the rule name the check run ===\n'
+# The dots stand for the markdown backticks around the names.
+if grep -qE 'Current CodeRabbit installs publish a .CodeRabbit. check run' "$skill" \
+  && grep -qE 'commit status or .Finished. check run' "$rule"; then
+  pass_case 'the Skill and the rule say CodeRabbit reports through a check run'
+else
+  fail_case 'the Skill and the rule say CodeRabbit reports through a check run'
+fi
+
+printf '\n=== results ===\n'
+test_summary
