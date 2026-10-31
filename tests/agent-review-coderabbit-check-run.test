@@ -12,10 +12,11 @@ source "${script_dir}/lib/test-assert"
 test_init
 
 lib="${script_dir}/../scripts/lib/agent-review"
+wait_script="${script_dir}/../scripts/wait-for-agent-review"
 profile="${script_dir}/../scripts/lib/agent-review-profiles/coderabbit"
 skill="${script_dir}/../.agents/skills/ship-and-review/SKILL.md"
 rule="${script_dir}/../.agents/rules/pr-ship-and-review.md"
-readonly lib profile skill rule
+readonly lib wait_script profile skill rule
 
 work_dir="$(mktemp -d)"
 readonly work_dir
@@ -24,6 +25,9 @@ export HOME="${work_dir}/home"
 mkdir -p "${HOME}"
 export AGENT_REVIEW_ENV_FILE=/dev/null
 export AGENT_REVIEW_REVIEWERS_CACHE_DIR="${work_dir}/reviewers-cache"
+export AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE="${work_dir}/coderabbit-quota.env"
+export AGENT_REVIEW_COPILOT_QUOTA_STATE_FILE="${work_dir}/copilot-quota.env"
+export AGENT_REVIEW_BUGBOT_QUOTA_STATE_FILE="${work_dir}/bugbot-quota.env"
 unset AGENT_REVIEW_AGENT AGENT_REVIEW_QUOTA_FALLBACK_CHAIN AGENT_REVIEW_GITHUB_REPO
 
 head_sha='0123456789abcdef0123456789abcdef01234567'
@@ -179,6 +183,19 @@ else
   pass_case 'a rate-limited check run is not paused'
 fi
 
+statuses_paused='[{"context":"CodeRabbit","state":"success","description":"Review paused",
+  "updated_at":"2026-10-30T20:00:00Z"}]'
+if head_snippet "$statuses_paused" "$skipped" "$paused_of" >/dev/null; then
+  fail_case 'an older paused status does not override a newer skipped check run'
+else
+  pass_case 'an older paused status does not override a newer skipped check run'
+fi
+if head_snippet "$statuses_paused" "$empty" "$paused_of" >/dev/null; then
+  pass_case 'a paused commit status still counts when there is no check run'
+else
+  fail_case 'a paused commit status still counts when there is no check run'
+fi
+
 printf '\n=== seen on the PR: a check run alone shows CodeRabbit is set up ===\n'
 seen_of="agent_review_coderabbit_seen_on_pr ${repo} ${head_sha} ''"
 if head_snippet '[]' "$limited" "$seen_of" >/dev/null; then
@@ -186,6 +203,66 @@ if head_snippet '[]' "$limited" "$seen_of" >/dev/null; then
 else
   fail_case 'a CodeRabbit check run with no comments counts as seen'
 fi
+
+# drive_handler <check-runs-json> — runs the loop's real rate-limit handler with only the GitHub reads
+# mocked (the head status code is the real one) and prints what it says; no sleeping, no posting.
+drive_handler() {
+  local -r check_runs_response="$1"
+  local cache
+  cache="$(mktemp -d --tmpdir="${work_dir}")"
+  rm -f "${AGENT_REVIEW_CODERABBIT_QUOTA_STATE_FILE}"
+  timeout 30 bash -c "
+    set -uo pipefail
+    source '${wait_script}'
+    export AGENT_REVIEW_CODERABBIT_STATE_CACHE_DIR='${cache}'
+    ar_runner_gh_api_stream() {
+      case \"\$2\" in
+        */statuses*) printf '[]' ;;
+        */check-runs*) printf '%s' '${check_runs_response}' ;;
+        *) return 1 ;;
+      esac
+    }
+    agent_review_agent_signed_off_on_head() { return 1; }
+    agent_review_use_agent() { return 0; }
+    agent_review_loop_wait_add() { return 0; }
+    agent_review_loop_wait_remove() { return 0; }
+    agent_review_pr_is_merged() { return 1; }
+    agent_review_abort_if_pending_threads() { return 0; }
+    agent_review_repo_parts() { printf 'o r\n'; }
+    agent_review_graphql_pr_snapshot() { printf '{}\n'; }
+    agent_review_named_pr_check_is_pending() { return 1; }
+    agent_review_pr_issue_comments_json() { printf '[]'; }
+    cmd_loop_agent_response_seen() { return 1; }
+    cmd_loop_maybe_request_agents_on_head() { return 0; }
+    cmd_loop_sleep_abort_if_pending() { return 0; }
+    cmd_loop_silent_head_retry_after() {
+      printf 'SILENT-HEAD-WAIT %ss\n' \"\${agent_review_default_coderabbit_silent_head_wait_s}\" >&2
+      return 1
+    }
+    run_command() { return 0; }
+    agent_review_agent_quota_rate_limited_for_agent() { return 1; }
+    runner_exec() {
+      if [[ \"\$*\" == *'gh pr comment'* ]]; then return 0; fi
+      shift 2 || true
+      command \"\$@\"
+    }
+    rc=0
+    cmd_loop_handle_coderabbit_rate_limit o/r 5 '${head_sha}' || rc=\$?
+    echo handler-rc=\$rc" 2>&1
+}
+
+now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+live_limited="$(runs "$(run_json 'Review rate limited' completed neutral "$now_iso" "$now_iso")")"
+
+printf '\n=== the loop: a live rate-limited check run gets the short wait, not the silent-head wait (#817) ===\n'
+out="$(drive_handler "$live_limited")"
+assert_contains 'the real head status sees the rate-limited check run and waits the short time' \
+  "$out" 'is rate limited with no cooldown on record'
+assert_contains 'the wait is the 30 seconds the Skill documents' "$out" 'asking after 30s'
+assert_not_contains 'the silent-head wait is not used' "$out" 'SILENT-HEAD-WAIT'
+out="$(drive_handler "$empty")"
+assert_contains 'with no check run and no status the head is silent and takes the long path' \
+  "$out" 'SILENT-HEAD-WAIT 1800s'
 
 printf '\n=== head status: the check-runs read asks for CodeRabbit by name (no paging past 100 runs) ===\n'
 url_log="${work_dir}/requested-urls"
