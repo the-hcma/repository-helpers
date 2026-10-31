@@ -6851,28 +6851,51 @@ rust_outdated() {
       done
 }
 
-# rust_revert_post_bump_workdir <worktree_dir>
-# Drop Cargo.toml / Cargo.lock / *.rs changes from a failed bump+clippy attempt
-# (including workspace-member manifests) so other ecosystems can continue.
-# Leaves package.json / lockfiles for other ecosystems alone.
-# dep-updater Rust bumps always run in a fresh worktree (clean HEAD), so
-# reverting these paths does not discard unrelated WIP.
-rust_revert_post_bump_workdir() {
+# _rust_dirty_paths <worktree_dir>
+# The Cargo.toml / Cargo.lock / *.rs paths (workspace members included) that differ from HEAD, staged or not.
+_rust_dirty_paths() {
   local -r cargo_dir="$1"
   local f
 
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     case "$f" in
-      *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|*/Cargo.lock) ;;
+      *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|*/Cargo.lock) printf '%s\n' "$f" ;;
       *) continue ;;
     esac
-    run_command "git worktree" git -C "$cargo_dir" restore --source=HEAD --staged --worktree -- "$f" \
-      2>/dev/null || true
   done < <({
     dep_runner_git_c_stdout "git worktree" "$cargo_dir" -- diff --name-only HEAD 2>/dev/null || true
     dep_runner_git_c_stdout "git worktree" "$cargo_dir" -- diff --cached --name-only 2>/dev/null || true
   } | sort -u)
+}
+
+# rust_revert_post_bump_workdir <worktree_dir>
+# Drop Cargo.toml / Cargo.lock / *.rs changes from a failed bump+clippy attempt
+# (including workspace-member manifests) so other ecosystems can continue.
+# Leaves package.json / lockfiles for other ecosystems alone.
+# dep-updater Rust bumps always run in a fresh worktree (clean HEAD), so
+# reverting these paths does not discard unrelated WIP.
+# Returns 1 with one machine-parseable ERROR: RUST_REVERT_INCOMPLETE line when a Rust path still differs from
+# HEAD afterwards: a later `git add -u` would stage that leftover edit into a PR as an unreported Rust change,
+# so the callers abort instead of carrying on (#813).
+rust_revert_post_bump_workdir() {
+  local -r cargo_dir="$1"
+  local f leftover=''
+
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    run_command "git worktree" git -C "$cargo_dir" restore --source=HEAD --staged --worktree -- "$f" \
+      2>/dev/null || true
+  done < <(_rust_dirty_paths "$cargo_dir")
+
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    leftover="${leftover:+${leftover},}${f}"
+  done < <(_rust_dirty_paths "$cargo_dir")
+  if [[ -n "$leftover" ]]; then
+    log "ERROR: RUST_REVERT_INCOMPLETE dir=${cargo_dir} paths=${leftover}"
+    return 1
+  fi
 }
 
 # _rust_log_output_tail <text> <n>
@@ -6971,11 +6994,11 @@ rust_recover_post_bump_clippy() {
 
 # rust_sibling_declarations <worktree> <crate>
 # Every direct declaration of <crate> in the manifests under <worktree>, from `cargo metadata`, as TSV:
-#   package<TAB>kind<TAB>target<TAB>rename<TAB>req
+#   package<TAB>kind<TAB>target<TAB>rename<TAB>req<TAB>path
 # kind is normal, dev or build; target is the cfg/triple of a [target.<cfg>.dependencies] table or "-";
 # rename is the dependency key when it differs from the crate name, else "-"; req is the version
-# requirement cargo resolved for that declaration (so a workspace-inherited one shows the inherited value).
-# Exit 1 when cargo metadata cannot be read.
+# requirement cargo resolved for that declaration (so a workspace-inherited one shows the inherited value);
+# path is the local path of a `path = "..."` source, else "-". Exit 1 when cargo metadata cannot be read.
 rust_sibling_declarations() {
   local -r cargo_dir="$1"
   local -r crate="$2"
@@ -6988,7 +7011,7 @@ rust_sibling_declarations() {
   dep_runner_jq_with_args "cargo metadata declarations" "$metadata_json" -r --arg crate "$crate" '
     .packages[]? | .name as $pkg
     | .dependencies[]? | select(.name == $crate)
-    | [$pkg, (.kind // "normal"), (.target // "-"), (.rename // "-"), (.req // "-")]
+    | [$pkg, (.kind // "normal"), (.target // "-"), (.rename // "-"), (.req // "-"), (.path // "-")]
     | join("\t")'
 }
 
@@ -6999,14 +7022,15 @@ rust_sibling_declarations() {
 # E0464 (#813). After the row's own `cargo add`, bump every direct declaration of the crate the same way.
 # Returns 1 with one machine-parseable ERROR line (RUST_DUAL_PIN_UNREADABLE / RUST_DUAL_PIN_DIVERGED) when
 # the declarations cannot be listed, one cannot be bumped, or they do not all end on the same requirement:
-# the caller refuses the whole bump. A renamed dependency is not bumped (`cargo add` cannot target it by crate
-# name) and a workspace-inherited one depends on how cargo rewrites it, so the final re-read is the check
-# that either is not left behind on the old major.
+# the caller refuses the whole bump. Two kinds of declaration are refused before anything is changed: a renamed
+# dependency (`cargo add` cannot target it by crate name, so it would stay on the old major) and one with a
+# `path` source (`cargo add crate@version` would replace the path with the registry). What `cargo add` does to
+# a workspace-inherited dependency is not assumed: the final re-read is the check that none is left behind.
 rust_bump_sibling_declarations() {
   local -r cargo_dir="$1"
   local -r crate="$2"
   local -r new_ver="$3"
-  local declarations after_declarations pkg kind target rename req reqs
+  local declarations after_declarations pkg kind target rename req path reqs
   local -a add_args=()
   local -A seen_reqs=()
 
@@ -7015,13 +7039,24 @@ rust_bump_sibling_declarations() {
     dep_updater_append_ecosystem_failure "rust|cannot list the declarations of ${crate} (cargo metadata failed)"
     return 1
   fi
-  while IFS=$'\t' read -r pkg kind target rename req; do
+  # Refuse first, so nothing is half bumped: a declaration `cargo add` would leave behind or rewrite.
+  while IFS=$'\t' read -r pkg kind target rename req path; do
     [[ -n "$pkg" ]] || continue
     if [[ "$rename" != '-' ]]; then
-      log "[rust] ${crate}: leaving the renamed dependency '${rename}' in ${pkg} alone" \
-        "(renamed declarations are not bumped)"
-      continue
+      log "ERROR: RUST_DUAL_PIN_DIVERGED crate=${crate} package=${pkg} kind=${kind} target=${target}" \
+        "reason=renamed as ${rename}, which cargo add cannot bump"
+      dep_updater_append_ecosystem_failure "rust|${crate} ${new_ver}: ${pkg} declares it renamed as ${rename}"
+      return 1
     fi
+    if [[ "$path" != '-' ]]; then
+      log "ERROR: RUST_DUAL_PIN_DIVERGED crate=${crate} package=${pkg} kind=${kind} target=${target}" \
+        "reason=path source ${path}, which cargo add would replace with the registry"
+      dep_updater_append_ecosystem_failure "rust|${crate} ${new_ver}: ${pkg} declares it with a path source"
+      return 1
+    fi
+  done <<<"$declarations"
+  while IFS=$'\t' read -r pkg kind target _ _ _; do
+    [[ -n "$pkg" ]] || continue
     add_args=("${crate}@${new_ver}")
     case "$kind" in
       dev)   add_args=(--dev "${add_args[@]}") ;;
@@ -7049,7 +7084,7 @@ rust_bump_sibling_declarations() {
     return 1
   fi
   reqs=''
-  while IFS=$'\t' read -r _ _ _ _ req; do
+  while IFS=$'\t' read -r _ _ _ _ req _; do
     [[ -n "$req" ]] || continue
     if [[ -z "${seen_reqs[$req]:-}" ]]; then
       seen_reqs[$req]=1
@@ -7128,7 +7163,8 @@ rust_update_one() {
   # The row's own declaration is bumped; follow the crate to every other declaration of it (#813).
   if ! rust_bump_sibling_declarations "$worktree_path" "$pkg" "$new_ver"; then
     log "[rust] Skipping ${pkg} ${old_ver}→${new_ver}: not every declaration of the crate could be bumped."
-    rust_revert_post_bump_workdir "$worktree_path"
+    rust_revert_post_bump_workdir "$worktree_path" \
+      || die "Rust revert incomplete after refusing ${pkg} (RUST_REVERT_INCOMPLETE above)"
     return 0
   fi
 
@@ -7141,7 +7177,8 @@ rust_update_one() {
 
   if ! rust_recover_post_bump_clippy "$worktree_path"; then
     log "[rust] Skipping ${pkg} ${old_ver}→${new_ver}: unrecovered clippy after bump."
-    rust_revert_post_bump_workdir "$worktree_path"
+    rust_revert_post_bump_workdir "$worktree_path" \
+      || die "Rust revert incomplete after the clippy failure of ${pkg} (RUST_REVERT_INCOMPLETE above)"
     return 0
   fi
   run_command "git worktree" git -C "$worktree_path" add -u
@@ -8018,14 +8055,16 @@ batch_update_all() {
     if [[ "$rust_batch_diverged" == '1' ]]; then
       log "[rust] Reverting Rust batch bumps: a crate's declarations could not all be bumped;" \
         "continuing other ecosystems."
-      rust_revert_post_bump_workdir "$worktree_path"
+      rust_revert_post_bump_workdir "$worktree_path" \
+        || die "Rust revert incomplete after the dual-pin refusal (RUST_REVERT_INCOMPLETE above)"
     fi
     run_command "git worktree" git -C "$worktree_path" add -u
     if [[ "$rust_batch_diverged" != '1' ]] && ! git -C "$worktree_path" diff --cached --quiet; then
       any_rust=1
       if ! rust_recover_post_bump_clippy "$worktree_path"; then
         log "[rust] Reverting Rust batch bumps after unrecovered clippy; continuing other ecosystems."
-        rust_revert_post_bump_workdir "$worktree_path"
+        rust_revert_post_bump_workdir "$worktree_path" \
+          || die "Rust revert incomplete after the clippy failure (RUST_REVERT_INCOMPLETE above)"
         any_rust=0
       else
         run_command "git worktree" git -C "$worktree_path" add -u

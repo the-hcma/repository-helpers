@@ -19,15 +19,15 @@ work_dir="$(mktemp -d)"
 readonly work_dir
 trap 'rm -rf "${work_dir}"' EXIT
 
-# metadata <package>:<kind>:<target>:<rename>[:<req>]… — a `cargo metadata --no-deps` payload. kind is normal,
-# dev or build; target and rename are "-" when absent; req defaults to ^0.39. Every package declares sysinfo
-# plus one unrelated crate.
+# metadata <package>:<kind>:<target>:<rename>[:<req>[:<path>]]… — a `cargo metadata --no-deps` payload. kind is
+# normal, dev or build; target and rename are "-" when absent; req defaults to ^0.39 and path to none. Every
+# package declares sysinfo plus one unrelated crate.
 metadata() {
-  local spec pkg kind target rename req p
+  local spec pkg kind target rename req path p
   local -a packages=()
   local -A seen=()
   for spec in "$@"; do
-    IFS=':' read -r pkg kind target rename req <<<"$spec"
+    IFS=':' read -r pkg kind target rename req path <<<"$spec"
     if [[ -z "${seen[$pkg]:-}" ]]; then
       seen[$pkg]=1
       packages+=("$pkg")
@@ -39,15 +39,16 @@ metadata() {
     deps=''
     first_dep=1
     for spec in "$@"; do
-      IFS=':' read -r p kind target rename req <<<"$spec"
+      IFS=':' read -r p kind target rename req path <<<"$spec"
       [[ "$p" == "$pkg" ]] || continue
       [[ $first_dep -eq 1 ]] || deps+=','
       first_dep=0
       deps+="$(jq -cn --arg kind "$kind" --arg target "$target" --arg rename "$rename" \
-        --arg req "${req:-^0.39}" '
+        --arg req "${req:-^0.39}" --arg path "${path:--}" '
         {name: "sysinfo", req: $req, kind: (if $kind == "normal" then null else $kind end),
          target: (if $target == "-" then null else $target end),
-         rename: (if $rename == "-" then null else $rename end)}')"
+         rename: (if $rename == "-" then null else $rename end),
+         path: (if $path == "-" then null else $path end)}')"
     done
     deps+=',{"name":"serde","req":"^1","kind":null,"target":null,"rename":null}'
     [[ $first_pkg -eq 1 ]] || out+=','
@@ -131,13 +132,26 @@ assert_contains 'the error names the crate, package, kind and target' \
   "$out" "ERROR: RUST_DUAL_PIN_DIVERGED crate=sysinfo package=app kind=normal target=${macos}"
 assert_contains 'the failure is recorded for the batch report' "$out" 'FAILURE rust|'
 
-printf '\n=== a renamed dependency cannot be bumped, so the bump is refused instead of reported as done ===\n'
+printf '\n=== a renamed dependency refuses the bump before anything is changed ===\n'
 out="$(run_bump "$(metadata "app:normal:-:-" "app:normal:-:sys2")" 0)"
-assert_contains 'the plain declaration is bumped' "$out" 'add sysinfo@0.40.0'
-assert_contains 'the rename is skipped with a note' "$out" 'renamed'
-assert_contains 'the left-behind rename makes the bump fail' "$out" 'rc=1'
-assert_contains 'the divergence names both requirements' \
-  "$out" 'ERROR: RUST_DUAL_PIN_DIVERGED crate=sysinfo reqs=^0.40.0,^0.39'
+assert_contains 'a left-behind rename makes the bump fail' "$out" 'rc=1'
+assert_contains 'the refusal names the rename and the reason' \
+  "$out" 'ERROR: RUST_DUAL_PIN_DIVERGED crate=sysinfo package=app kind=normal target=- reason=renamed as sys2'
+assert_not_contains 'no cargo add ran before the refusal' "$out" 'add sysinfo@'
+out="$(run_bump "$(metadata "app:normal:-:-:^0.40.0" "app:normal:-:sys2:^0.40.0")" 0)"
+assert_contains 'a rename already on the new requirement is refused too' "$out" 'rc=1'
+assert_contains 'the refusal says it was renamed' "$out" 'reason=renamed as sys2'
+
+printf '\n=== a path source refuses the bump: cargo add would replace it with the registry ===\n'
+out="$(run_bump "$(metadata "app:normal:-:-" "app:normal:-:-:^0.39:../sysinfo")" 0)"
+assert_contains 'a declaration with a path source fails the bump' "$out" 'rc=1'
+assert_contains 'the refusal names the path' "$out" 'reason=path source ../sysinfo'
+assert_not_contains 'no cargo add ran before the refusal' "$out" 'add sysinfo@'
+
+printf '\n=== an unreadable manifest is an error ===\n'
+out="$(run_bump FAIL 0)"
+assert_contains 'unreadable cargo metadata fails' "$out" 'rc=1'
+assert_contains 'the unreadable manifest has a parseable error' "$out" 'ERROR: RUST_DUAL_PIN_UNREADABLE crate=sysinfo'
 
 printf '\n=== a member that cargo leaves on the old requirement (workspace inheritance) refuses the bump ===\n'
 stale_after="$(metadata "core:normal:-:-:^0.40.0" "cli:normal:-:-:^0.39")"
@@ -155,6 +169,48 @@ assert_contains 'the unreadable re-read has a parseable error' "$out" 'ERROR: RU
 out="$(run_bump FAIL 0)"
 assert_contains 'unreadable cargo metadata fails' "$out" 'rc=1'
 assert_contains 'the unreadable manifest has a parseable error' "$out" 'ERROR: RUST_DUAL_PIN_UNREADABLE crate=sysinfo'
+
+# run_revert <fail-restores 0|1> — a throwaway git repo with two modified Rust files and one modified notes file,
+# reverted by rust_revert_post_bump_workdir; prints rc, the log lines and `git status --porcelain`.
+run_revert() {
+  local -r fail_restores="$1"
+  local -r repo="${work_dir}/revert-repo" logs="${work_dir}/revert.log"
+  rm -rf "$repo"
+  mkdir -p "$repo/src"
+  git -C "$repo" init -q
+  printf 'a\n' >"$repo/Cargo.toml"
+  printf 'a\n' >"$repo/src/lib.rs"
+  printf 'a\n' >"$repo/notes.txt"
+  git -C "$repo" add -A
+  git -C "$repo" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false commit -q -m init
+  printf 'b\n' >"$repo/Cargo.toml"
+  printf 'b\n' >"$repo/src/lib.rs"
+  printf 'b\n' >"$repo/notes.txt"
+  : >"$logs"
+  bash -c "
+    set -uo pipefail
+    log() { printf '%s\\n' \"\$*\" >>'${logs}'; }
+    run_command() { [[ '${fail_restores}' == 1 ]] && return 1; shift; \"\$@\"; }
+    dep_runner_git_c_stdout() { local d=\"\$2\"; shift 3; git -C \"\$d\" \"\$@\"; }
+    eval \"\$(awk '/^_rust_dirty_paths\\(\\)/{p=1} p{print} p && /^}/{exit}' '${script}')\"
+    eval \"\$(awk '/^rust_revert_post_bump_workdir\\(\\)/{p=1} p{print} p && /^}/{exit}' '${script}')\"
+    rc=0
+    rust_revert_post_bump_workdir '${repo}' || rc=\$?
+    echo rc=\$rc" 2>&1
+  cat "$logs"
+  git -C "$repo" status --porcelain
+}
+
+printf '\n=== the revert restores every Rust path and says so loudly when it cannot ===\n'
+out="$(run_revert 0)"
+assert_contains 'a clean revert succeeds' "$out" 'rc=0'
+assert_not_contains 'the Rust files are restored' "$out" 'Cargo.toml'
+assert_contains 'files that are not Rust are left alone' "$out" 'notes.txt'
+out="$(run_revert 1)"
+assert_contains 'a revert that cannot restore a file fails' "$out" 'rc=1'
+assert_contains 'the failure lists the leftover Rust paths in a parseable line' \
+  "$out" 'ERROR: RUST_REVERT_INCOMPLETE dir='
+assert_contains 'the leftover paths are named' "$out" 'paths=Cargo.toml,src/lib.rs'
 
 printf '\n=== static: both bump paths follow the crate to every declaration ===\n'
 single="$(awk '/^rust_update_one\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"
@@ -175,6 +231,13 @@ assert_contains 'the batch path stops the Rust loop when a sibling cannot be bum
 assert_contains 'the batch path reverts all Rust bumps only when the flag is set' \
   "$(awk "/rust_batch_diverged\" == '1' \]\]; then/{p=1} p{print} p && /fi/{exit}" <<<"$batch")" \
   'rust_revert_post_bump_workdir'
+
+printf '\n=== static: every caller aborts when the Rust revert is incomplete ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars
+callers="$(grep -c 'rust_revert_post_bump_workdir "\$worktree_path" \\$' "$script")"
+assert_contains 'all four revert callers abort on an incomplete revert' "$callers" '4'
+assert_contains 'the abort message names the marker' \
+  "$(grep -c 'RUST_REVERT_INCOMPLETE above' "$script")" '4'
 
 printf '\n=== results ===\n'
 test_summary
