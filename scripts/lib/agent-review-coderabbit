@@ -3,9 +3,10 @@
 #
 # Two pure readers, kept out of the CodeRabbit profile so the loop can use them without switching the
 # active agent profile:
-#   * the head's commit status ("Review completed" vs "Review rate limited"), the reliable signal
-#     that a review ran (rate-limited heads end "success" with no review, and CodeRabbit also posts
-#     empty stub reviews and thread replies);
+#   * the head's CodeRabbit outcome ("Review completed" / "Finished" vs "Review rate limited"), the
+#     reliable signal that a review ran (rate-limited heads end green with no review, and CodeRabbit also
+#     posts empty stub reviews and thread replies). Older installs publish it as a commit status; current
+#     ones publish only a `CodeRabbit` check run (#817), so both are read and the check run wins;
 #   * the loop's "@coderabbitai full review" asks on a PR and CodeRabbit's replies to them, so a
 #     rate-limited ask is repeated after the wait CodeRabbit stated instead of being counted as sent.
 # The agent_review_default_coderabbit_* constants are assigned in scripts/lib/agent-review, which
@@ -133,16 +134,53 @@ agent_review_coderabbit_full_review_status_from_comments() {
     | @tsv'
 }
 
-# agent_review_coderabbit_head_paused <repo> <head_sha> — live read of the head's statuses; exit 1
-# when the read fails so a caller never resumes on a guess.
+# agent_review_coderabbit_head_paused <repo> <head_sha> — live read of the head's statuses and check
+# runs; exit 1 when neither read succeeds so a caller never resumes on a guess.
 agent_review_coderabbit_head_paused() {
   local -r repo="$1"
   local -r head="$2"
-  local statuses_json
+  local statuses_json check_runs_json check_runs_line
+  local statuses_ok=0 check_runs_ok=0
 
-  statuses_json="$(ar_runner_gh_api_stream "agent-review coderabbit head paused statuses" \
-    "repos/${repo}/commits/${head}/statuses?per_page=50" 2>/dev/null)" || return 1
-  agent_review_coderabbit_head_paused_from_statuses "${statuses_json}"
+  if statuses_json="$(ar_runner_gh_api_stream "agent-review coderabbit head paused statuses" \
+    "repos/${repo}/commits/${head}/statuses?per_page=50" 2>/dev/null)"; then
+    statuses_ok=1
+  fi
+  if check_runs_json="$(ar_runner_gh_api_stream "agent-review coderabbit head paused check runs" \
+    "repos/${repo}/commits/${head}/check-runs?check_name=CodeRabbit&per_page=100" 2>/dev/null)"; then
+    check_runs_ok=1
+  fi
+  if (( statuses_ok == 0 && check_runs_ok == 0 )); then
+    return 1
+  fi
+  # A CodeRabbit check run is the current outcome: decide from it alone, so an older "paused" commit status
+  # cannot override a newer skipped, running or finished run. Statuses count only when there is no run.
+  if (( check_runs_ok == 1 )); then
+    check_runs_line="$(agent_review_coderabbit_head_status_from_check_runs "${check_runs_json}")" || check_runs_line=''
+    if [[ -n "${check_runs_line}" && "${check_runs_line%%$'\t'*}" != 'none' ]]; then
+      agent_review_coderabbit_head_paused_from_check_runs "${check_runs_json}"
+      return $?
+    fi
+  fi
+  (( statuses_ok == 1 )) && agent_review_coderabbit_head_paused_from_statuses "${statuses_json}"
+}
+
+# agent_review_coderabbit_head_paused_from_check_runs <check-runs-json>
+# Exit 0 when the newest CodeRabbit check run on the head says the review is paused, 1 otherwise.
+agent_review_coderabbit_head_paused_from_check_runs() {
+  local -r check_runs_json="${1:-}"
+  local paused
+
+  if [[ -z "${check_runs_json}" || "${check_runs_json}" == 'null' ]]; then
+    return 1
+  fi
+  # shellcheck disable=SC2016  # jq program text, not shell expansion
+  paused="$(ar_runner_jq_file "coderabbit head paused check run" "${check_runs_json}" -r '
+    (if type == "object" then (.check_runs // []) elif type == "array" then . else [] end)
+    | map(select((.app.slug // "") | test("^coderabbitai$"; "i")))
+    | sort_by([(.id // 0), (.started_at // .completed_at // "")]) | last
+    | if . == null then false else ((.output.title // "") | test("paused"; "i")) end')" || return 1
+  [[ "${paused}" == 'true' ]]
 }
 
 # agent_review_coderabbit_head_paused_from_statuses <statuses-json>
@@ -176,13 +214,17 @@ agent_review_coderabbit_head_state() {
 }
 
 # agent_review_coderabbit_head_status <repo> <head_sha>
-# Same output as agent_review_coderabbit_head_status_from_statuses, read from the API and reused
-# for agent_review_default_coderabbit_head_state_cache_ttl_s. Prints "unknown 0" when the read
-# fails so callers can fall back to the older comment-based checks.
+# Same output as agent_review_coderabbit_head_status_from_statuses, read from the API (the head's commit
+# statuses and its CodeRabbit check run) and reused for agent_review_default_coderabbit_head_state_cache_ttl_s.
+# The check run wins when it says anything, then the commit status; "none" needs both reads to succeed
+# and say nothing. Prints "unknown 0" when no read can settle it so callers can fall back to the older
+# comment-based checks.
 agent_review_coderabbit_head_status() {
   local -r repo="$1"
   local -r head="$2"
-  local cache_dir cache_file now mtime statuses_json out
+  local cache_dir cache_file now mtime statuses_json check_runs_json out
+  local statuses_out='none'$'\t''0' check_runs_out='none'$'\t''0'
+  local statuses_ok=0 check_runs_ok=0
 
   cache_dir="${AGENT_REVIEW_CODERABBIT_STATE_CACHE_DIR:-${HOME}/scratch/repository-helpers/coderabbit-head-state}"
   cache_file="${cache_dir}/${repo//\//__}__${head}"
@@ -195,12 +237,23 @@ agent_review_coderabbit_head_status() {
       return 0
     fi
   fi
-  if ! statuses_json="$(ar_runner_gh_api_stream "agent-review coderabbit head statuses" \
-    "repos/${repo}/commits/${head}/statuses?per_page=50" 2>/dev/null)"; then
-    printf 'unknown\t0\n'
-    return 0
+  if statuses_json="$(ar_runner_gh_api_stream "agent-review coderabbit head statuses" \
+    "repos/${repo}/commits/${head}/statuses?per_page=50" 2>/dev/null)" \
+    && statuses_out="$(agent_review_coderabbit_head_status_from_statuses "${statuses_json}")"; then
+    statuses_ok=1
   fi
-  if ! out="$(agent_review_coderabbit_head_status_from_statuses "${statuses_json}")"; then
+  if check_runs_json="$(ar_runner_gh_api_stream "agent-review coderabbit head check runs" \
+    "repos/${repo}/commits/${head}/check-runs?check_name=CodeRabbit&per_page=100" 2>/dev/null)" \
+    && check_runs_out="$(agent_review_coderabbit_head_status_from_check_runs "${check_runs_json}")"; then
+    check_runs_ok=1
+  fi
+  if (( check_runs_ok == 1 )) && [[ "${check_runs_out%%$'\t'*}" != 'none' ]]; then
+    out="${check_runs_out}"
+  elif (( statuses_ok == 1 )) && [[ "${statuses_out%%$'\t'*}" != 'none' ]]; then
+    out="${statuses_out}"
+  elif (( statuses_ok == 1 && check_runs_ok == 1 )); then
+    out="none"$'\t'"0"
+  else
     printf 'unknown\t0\n'
     return 0
   fi
@@ -208,6 +261,42 @@ agent_review_coderabbit_head_status() {
     printf '%s\n' "${out}" >"${cache_file}"
   fi
   printf '%s\n' "${out}"
+}
+
+# agent_review_coderabbit_head_status_from_check_runs <check-runs-json>
+# The same "<state> <epoch>" line as agent_review_coderabbit_head_status_from_statuses, read from the
+# CodeRabbit check run on the head (the response of commits/<sha>/check-runs?check_name=CodeRabbit, which
+# holds only CodeRabbit's latest run, so a busy CI matrix cannot push it off the first page). Its output title is the
+# signal: a failed run is failed whatever its title, "Finished" (success) is completed, "Review rate
+# limited" is rate_limited, a run that has not completed is in_progress, "Review paused" / "Review
+# skipped" are other. Only the CodeRabbit app's runs count (its exact slug), never a same-named run or a
+# lookalike slug. The newest run is the one with the highest check-run id (a queued run has no timestamps yet).
+agent_review_coderabbit_head_status_from_check_runs() {
+  local -r check_runs_json="${1:-}"
+
+  if [[ -z "${check_runs_json}" || "${check_runs_json}" == 'null' ]]; then
+    printf 'none\t0\n'
+    return 0
+  fi
+  # shellcheck disable=SC2016  # jq program text, not shell expansion
+  ar_runner_jq_file "coderabbit head check run" "${check_runs_json}" -r '
+    (if type == "object" then (.check_runs // []) elif type == "array" then . else [] end)
+    | map(select((.app.slug // "") | test("^coderabbitai$"; "i")))
+    | sort_by([(.id // 0), (.started_at // .completed_at // "")]) | last
+    | if . == null then ["none", 0]
+      else
+        ((.output.title // "") | ascii_downcase) as $t
+        | (.status // "") as $st
+        | (.conclusion // "") as $c
+        | (if ($c | test("^(failure|timed_out|cancelled|action_required|startup_failure|stale)$")) then "failed"
+           elif ($t | test("rate[ -]?limit")) then "rate_limited"
+           elif ($t | test("paus|skip")) then "other"
+           elif ($st != "completed" or ($t | test("in progress|reviewing"))) then "in_progress"
+           elif ($c == "success" and ($t | test("^(review )?(finished|completed)"))) then "completed"
+           else "other" end) as $s
+        | [$s, ((.completed_at // .started_at // "") | if . == "" then 0 else fromdateiso8601 end)]
+      end
+    | @tsv'
 }
 
 # agent_review_coderabbit_head_status_from_statuses <statuses-json>
@@ -264,8 +353,8 @@ agent_review_coderabbit_seen_in_comments() {
 }
 
 # agent_review_coderabbit_seen_on_pr <repo> <head_sha> <comments-json>
-# Exit 0 when CodeRabbit is evidently set up on the repository (a commit status on the head, or a comment
-# on the PR), 1 when neither exists, 2 when the head's statuses cannot be read and no comment settles it.
+# Exit 0 when CodeRabbit is evidently set up on the repository (a commit status or check run on the head,
+# or a comment on the PR), 1 when none exists, 2 when the head cannot be read and no comment settles it.
 agent_review_coderabbit_seen_on_pr() {
   local -r repo="$1"
   local -r head="$2"
