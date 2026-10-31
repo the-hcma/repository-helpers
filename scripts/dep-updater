@@ -7015,31 +7015,22 @@ rust_sibling_declarations() {
     | join("\t")'
 }
 
-# rust_bump_sibling_declarations <worktree> <crate> <new_ver>
-# `cargo outdated` reports one row per crate, so bumping that row leaves a second declaration of the same
-# crate (a [target.'cfg(...)'.dependencies] pin next to the root pin, or the same crate in another
-# workspace member) on the old major, the lockfile then holds two majors and the target's CI fails with
-# E0464 (#813). After the row's own `cargo add`, bump every direct declaration of the crate the same way.
-# Returns 1 with one machine-parseable ERROR line (RUST_DUAL_PIN_UNREADABLE / RUST_DUAL_PIN_DIVERGED) when
-# the declarations cannot be listed, one cannot be bumped, or they do not all end on the same requirement:
-# the caller refuses the whole bump. Two kinds of declaration are refused before anything is changed: a renamed
-# dependency (`cargo add` cannot target it by crate name, so it would stay on the old major) and one with a
-# `path` source (`cargo add crate@version` would replace the path with the registry). What `cargo add` does to
-# a workspace-inherited dependency is not assumed: the final re-read is the check that none is left behind.
-rust_bump_sibling_declarations() {
+# rust_preflight_declarations <worktree> <crate> <new_ver>
+# The refusals that must happen before the row's own `cargo add` touches a manifest (#813): a declaration of
+# <crate> that is renamed (`cargo add` cannot bump it by crate name, so it would stay on the old major) or has a
+# `path` source (`cargo add crate@version` would replace the path with the registry). Returns 1 with one
+# machine-parseable ERROR: RUST_DUAL_PIN_DIVERGED (or RUST_DUAL_PIN_UNREADABLE) line; changes nothing.
+rust_preflight_declarations() {
   local -r cargo_dir="$1"
   local -r crate="$2"
   local -r new_ver="$3"
-  local declarations after_declarations pkg kind target rename req path reqs
-  local -a add_args=()
-  local -A seen_reqs=()
+  local declarations pkg kind target rename req path
 
   if ! declarations="$(rust_sibling_declarations "$cargo_dir" "$crate")"; then
     log "ERROR: RUST_DUAL_PIN_UNREADABLE crate=${crate} dir=${cargo_dir}"
     dep_updater_append_ecosystem_failure "rust|cannot list the declarations of ${crate} (cargo metadata failed)"
     return 1
   fi
-  # Refuse first, so nothing is half bumped: a declaration `cargo add` would leave behind or rewrite.
   while IFS=$'\t' read -r pkg kind target rename req path; do
     [[ -n "$pkg" ]] || continue
     if [[ "$rename" != '-' ]]; then
@@ -7055,6 +7046,35 @@ rust_bump_sibling_declarations() {
       return 1
     fi
   done <<<"$declarations"
+}
+
+# rust_bump_sibling_declarations <worktree> <crate> <new_ver>
+# `cargo outdated` reports one row per crate, so bumping that row leaves a second declaration of the same
+# crate (a [target.'cfg(...)'.dependencies] pin next to the root pin, or the same crate in another
+# workspace member) on the old major, the lockfile then holds two majors and the target's CI fails with
+# E0464 (#813). After the row's own `cargo add`, bump every direct declaration of the crate the same way.
+# Returns 1 with one machine-parseable ERROR line (RUST_DUAL_PIN_UNREADABLE / RUST_DUAL_PIN_DIVERGED) when
+# the declarations cannot be listed, one cannot be bumped, or they do not all end on the same requirement:
+# the caller refuses the whole bump. Two kinds of declaration are refused before anything is changed: a renamed
+# dependency (`cargo add` cannot target it by crate name, so it would stay on the old major) and one with a
+# `path` source (`cargo add crate@version` would replace the path with the registry). What `cargo add` does to
+# a workspace-inherited dependency is not assumed: the final re-read is the check that none is left behind.
+rust_bump_sibling_declarations() {
+  local -r cargo_dir="$1"
+  local -r crate="$2"
+  local -r new_ver="$3"
+  local declarations after_declarations pkg kind target req reqs
+  local -a add_args=()
+  local -A seen_reqs=()
+
+  if ! declarations="$(rust_sibling_declarations "$cargo_dir" "$crate")"; then
+    log "ERROR: RUST_DUAL_PIN_UNREADABLE crate=${crate} dir=${cargo_dir}"
+    dep_updater_append_ecosystem_failure "rust|cannot list the declarations of ${crate} (cargo metadata failed)"
+    return 1
+  fi
+  # Callers run rust_preflight_declarations before the row's own `cargo add`; repeat it here so this helper is
+  # safe on its own.
+  rust_preflight_declarations "$cargo_dir" "$crate" "$new_ver" || return 1
   while IFS=$'\t' read -r pkg kind target _ _ _; do
     [[ -n "$pkg" ]] || continue
     add_args=("${crate}@${new_ver}")
@@ -7138,6 +7158,12 @@ rust_update_one() {
 
   log "[rust] ${pkg}: ${old_ver} → ${new_ver}"
 
+  # Refuse a crate with a renamed or path-sourced declaration before `cargo add` edits anything (#813).
+  if ! rust_preflight_declarations "$worktree_path" "$pkg" "$new_ver"; then
+    log "[rust] Skipping ${pkg} ${old_ver}→${new_ver}: a declaration of the crate cannot be bumped."
+    return 0
+  fi
+
   case "$dep_kind" in
     Development) cargo_add_args=(--dev "${cargo_add_args[@]}") ;;
     Build)       cargo_add_args=(--build "${cargo_add_args[@]}") ;;
@@ -7157,6 +7183,9 @@ rust_update_one() {
     log "[rust] Skipping ${pkg} ${new_ver}: cargo add failed."
     log "$cargo_out"
     dep_updater_append_ecosystem_failure "rust|crate add failed for ${pkg} (exit ${cargo_exit})"
+    # cargo add can fail after editing a manifest or the lockfile: drop it so a later bump cannot stage it.
+    rust_revert_post_bump_workdir "$worktree_path" \
+      || die "Rust revert incomplete after the failed cargo add of ${pkg} (RUST_REVERT_INCOMPLETE above)"
     return 0
   fi
 
@@ -8032,6 +8061,11 @@ batch_update_all() {
     while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
       [[ -z "$pkg" ]] && continue
       log "[rust] Batch update: ${pkg} ${old_ver} → ${new_ver}"
+      # Nothing has been touched for this crate yet: a refusal here skips just this crate.
+      if ! rust_preflight_declarations "$worktree_path" "$pkg" "$new_ver"; then
+        log "[rust] Skipping ${pkg} ${old_ver}→${new_ver}: a declaration of the crate cannot be bumped."
+        continue
+      fi
       cargo_add_args=("${pkg}@${new_ver}")
       case "${dep_kind:-Normal}" in
         Development) cargo_add_args=(--dev "${cargo_add_args[@]}") ;;
@@ -8046,6 +8080,10 @@ batch_update_all() {
       fi
       if ! dep_runner_cargo_dir "cargo batch add" "$worktree_path" -- add "${cargo_add_args[@]}"; then
         dep_updater_append_ecosystem_failure "rust|batch crate add failed for ${pkg}"
+        # A failed cargo add may have half edited a manifest, and the earlier rows of the batch share the
+        # worktree: refuse every Rust bump of the batch rather than stage a stray edit.
+        rust_batch_diverged=1
+        break
       elif ! rust_bump_sibling_declarations "$worktree_path" "$pkg" "$new_ver"; then
         # Some declarations of this crate are bumped and some are not: refuse every Rust bump of the batch.
         rust_batch_diverged=1

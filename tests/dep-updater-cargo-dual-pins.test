@@ -66,6 +66,7 @@ run_bump() {
   local -r meta="$1" workspace="$2" failing="${3:-}"
   local -r calls="${work_dir}/calls.log" logs="${work_dir}/log.out" meta_file="${work_dir}/meta.json"
   local -r after_file="${work_dir}/meta-after.json" read_count="${work_dir}/meta-reads"
+  local -r fn="${5:-rust_bump_sibling_declarations}"
   local after="${4:-}"
   if [[ "$meta" != FAIL && -z "$after" ]]; then
     after="$(jq -c '.packages[].dependencies[] |= (if .name == "sysinfo" and .rename == null
@@ -94,9 +95,10 @@ run_bump() {
       [[ -z '${failing}' || \"\$*\" != *'${failing}'* ]]
     }
     eval \"\$(awk '/^rust_sibling_declarations\\(\\)/{p=1} p{print} p && /^}/{exit}' '${script}')\"
+    eval \"\$(awk '/^rust_preflight_declarations\\(\\)/{p=1} p{print} p && /^}/{exit}' '${script}')\"
     eval \"\$(awk '/^rust_bump_sibling_declarations\\(\\)/{p=1} p{print} p && /^}/{exit}' '${script}')\"
     rc=0
-    rust_bump_sibling_declarations /tmp/wt sysinfo 0.40.0 || rc=\$?
+    ${fn} /tmp/wt sysinfo 0.40.0 || rc=\$?
     echo rc=\$rc" 2>&1
   cat "$calls"
   cat "$logs"
@@ -141,6 +143,17 @@ assert_not_contains 'no cargo add ran before the refusal' "$out" 'add sysinfo@'
 out="$(run_bump "$(metadata "app:normal:-:-:^0.40.0" "app:normal:-:sys2:^0.40.0")" 0)"
 assert_contains 'a rename already on the new requirement is refused too' "$out" 'rc=1'
 assert_contains 'the refusal says it was renamed' "$out" 'reason=renamed as sys2'
+
+printf '\n=== the preflight refuses before anything is changed, and itself changes nothing ===\n'
+out="$(run_bump "$(metadata "app:normal:-:-" "app:normal:-:sys2")" 0 '' '' rust_preflight_declarations)"
+assert_contains 'the preflight refuses a renamed declaration' "$out" 'rc=1'
+assert_contains 'the preflight names the reason' "$out" 'reason=renamed as sys2'
+assert_not_contains 'the preflight never runs cargo add' "$out" 'add sysinfo@'
+out="$(run_bump "$(metadata "app:normal:-:-" "app:normal:${macos}:-")" 0 '' '' rust_preflight_declarations)"
+assert_contains 'the preflight passes a plain pair of declarations' "$out" 'rc=0'
+assert_not_contains 'a passing preflight still never runs cargo add' "$out" 'add sysinfo@'
+out="$(run_bump FAIL 0 '' '' rust_preflight_declarations)"
+assert_contains 'the preflight reports an unreadable manifest' "$out" 'ERROR: RUST_DUAL_PIN_UNREADABLE crate=sysinfo'
 
 printf '\n=== a path source refuses the bump: cargo add would replace it with the registry ===\n'
 out="$(run_bump "$(metadata "app:normal:-:-" "app:normal:-:-:^0.39:../sysinfo")" 0)"
@@ -232,12 +245,24 @@ assert_contains 'the batch path reverts all Rust bumps only when the flag is set
   "$(awk "/rust_batch_diverged\" == '1' \]\]; then/{p=1} p{print} p && /fi/{exit}" <<<"$batch")" \
   'rust_revert_post_bump_workdir'
 
+printf '\n=== static: the refusal comes before the primary cargo add, and a failed primary add is contained ===\n'
+assert_not_contains 'rust_update_one runs the preflight before its own cargo add' \
+  "${single%%rust_preflight_declarations*}" 'dep_runner_cargo_dir_capture "cargo add"'
+assert_not_contains 'the batch path runs the preflight before its own cargo add' \
+  "${batch%%rust_preflight_declarations*}" 'dep_runner_cargo_dir "cargo batch add"'
+assert_contains 'rust_update_one reverts when the primary cargo add fails' \
+  "$(awk '/crate add failed for/{p=1} p{print} p && /return 0/{exit}' <<<"$single")" \
+  'rust_revert_post_bump_workdir'
+assert_contains 'the batch path stops and reverts when the primary cargo add fails' \
+  "$(awk '/batch crate add failed for/{p=1} p{print} p && /break/{exit}' <<<"$batch")" \
+  'rust_batch_diverged=1'
+
 printf '\n=== static: every caller aborts when the Rust revert is incomplete ===\n'
 # shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars
 callers="$(grep -c 'rust_revert_post_bump_workdir "\$worktree_path" \\$' "$script")"
-assert_contains 'all four revert callers abort on an incomplete revert' "$callers" '4'
+assert_contains 'all five revert callers abort on an incomplete revert' "$callers" '5'
 assert_contains 'the abort message names the marker' \
-  "$(grep -c 'RUST_REVERT_INCOMPLETE above' "$script")" '4'
+  "$(grep -c 'RUST_REVERT_INCOMPLETE above' "$script")" '5'
 
 printf '\n=== results ===\n'
 test_summary
