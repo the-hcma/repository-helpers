@@ -410,16 +410,27 @@ stacking_tool_title_looks_like_branch() {
 
 # stacking_tool_default_pr_title <repo_dir> <branch>
 # The title for a PR whose title is only a placeholder: the commit subject when the branch has
-# exactly one commit ahead of main, else the branch name without its "-wt" suffix (#810).
+# exactly one commit above its parent (the previous layer of the stack, else main), else the branch
+# name without its "-wt" suffix (#810).
 stacking_tool_default_pr_title() {
   local -r st_dir="$1"
   local -r branch="$2"
-  local base count norm
+  local base count norm view_json parent
 
   base='origin/main'
   if ! runner_exec_stdout "stacking-tool git origin/main (default title)" \
     --probe -- git -C "$st_dir" rev-parse --verify --quiet "$base" >/dev/null; then
     base='main'
+  fi
+  # In a multi-layer stack the layer's own commits start at the base `gh stack view` reports for it.
+  view_json="$(cd "$st_dir" && github_api_exec_with_rate_limit_retry \
+    "stacking-tool gh stack view (default title)" -- gh stack view --json)" || view_json=''
+  if [[ -n "$view_json" ]]; then
+    parent="$(pr_cc_jq_r "stacking-tool jq stack parent" "$view_json" \
+      '.branches[] | select(.isCurrent == true) | .base // empty')" || parent=''
+    if [[ "$parent" =~ ^[0-9a-f]{7,40}$ ]]; then
+      base="$parent"
+    fi
   fi
   count="$(runner_exec_stdout "stacking-tool git commit count (default title)" \
     --probe -- git -C "$st_dir" rev-list --count "${base}..HEAD")" || count=''
@@ -445,7 +456,7 @@ stacking_tool_apply_pr_text() {
   local title="${3:-}"
   local -r body_file="${4:-}"
   local -r replace="${5:-0}"
-  local origin_url slug pr_json number current explicit=0 level
+  local origin_url slug pr_json number current pr_state explicit=0 level strict=0 lookup_level
 
   if [[ -n "$title" || -n "$body_file" ]]; then
     explicit=1
@@ -453,6 +464,15 @@ stacking_tool_apply_pr_text() {
   level='NOTE'
   if [[ "$explicit" -eq 1 ]]; then
     level='ERROR'
+  fi
+  # `gh stack submit` exits 0 even when it could not create the PR, so a submit-stack run (explicit
+  # text or the placeholder replacement) treats a missing PR as the error it is (#810).
+  if [[ "$explicit" -eq 1 || "$replace" == '1' ]]; then
+    strict=1
+  fi
+  lookup_level='NOTE'
+  if [[ "$strict" -eq 1 ]]; then
+    lookup_level='ERROR'
   fi
 
   origin_url="$(runner_exec_stdout "stacking-tool git remote origin (pr text)" \
@@ -470,15 +490,24 @@ stacking_tool_apply_pr_text() {
 
   pr_json="$(github_api_exec_with_rate_limit_retry \
     "stacking-tool gh pr view ${slug} ${branch} (pr text)" \
-    -- gh pr view "$branch" --repo "$slug" --json number,title)" || {
-    printf 'stacking-tool: %s: could not read the PR for %s in %s\n' "$level" "$branch" "$slug" >&2
-    return "$explicit"
+    -- gh pr view "$branch" --repo "$slug" --json number,title,state)" || {
+    printf 'stacking-tool: %s: could not read the PR for %s in %s (did gh stack submit fail to create it?)\n' \
+      "$lookup_level" "$branch" "$slug" >&2
+    return "$strict"
   }
   number="$(pr_cc_jq_r "stacking-tool jq pr number" "$pr_json" '.number // empty')" || number=''
   current="$(pr_cc_jq_r "stacking-tool jq pr title" "$pr_json" '.title // empty')" || current=''
+  pr_state="$(pr_cc_jq_r "stacking-tool jq pr state" "$pr_json" '.state // empty')" || pr_state=''
   if [[ -z "$number" ]]; then
-    printf 'stacking-tool: %s: no PR number for %s in %s\n' "$level" "$branch" "$slug" >&2
-    return "$explicit"
+    printf 'stacking-tool: %s: no PR number for %s in %s\n' "$lookup_level" "$branch" "$slug" >&2
+    return "$strict"
+  fi
+  # `gh pr view <branch>` finds the newest PR for the branch even when it is closed or merged; editing
+  # that would report success for a submit that created no PR (#810).
+  if [[ "$pr_state" != 'OPEN' ]]; then
+    printf 'stacking-tool: %s: the newest PR for %s in %s is #%s (%s), not an open PR (did gh stack submit fail to create one?)\n' \
+      "$lookup_level" "$branch" "$slug" "$number" "${pr_state:-unknown state}" >&2
+    return "$strict"
   fi
 
   if [[ -z "$title" && "$replace" == '1' ]] \

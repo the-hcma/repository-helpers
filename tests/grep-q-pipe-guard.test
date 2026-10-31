@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Guard: tests must not end a pipeline in `grep -q` (use grep_q_all from tests/lib/grep-q-all, #803).
+#
+# `cmd | grep -q PAT` lets grep exit on its first match while cmd is still writing; cmd then dies of
+# SIGPIPE and `set -o pipefail` reports a failed pipeline although the text matched. That was an
+# intermittent failure in tests/runner.test that reproduced about 7% of the time under load.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck source=tests/lib/test-assert
+source "${script_dir}/lib/test-assert"
+pass=0
+fail=0
+test_init
+
+# find_offenders FILE… prints "file:line: text" for every code line that pipes into `grep -q…`.
+# Heredoc bodies and comments are skipped; `<<<` here-strings and `||` alternations are not pipes
+# or heredocs (a here-string such as <<<"x" must not open a heredoc that hides later lines).
+find_offenders() {
+  awk '
+    FNR == 1 { heredoc = "" }
+    heredoc != "" { if ($0 ~ "^[ \t]*" heredoc "[ \t]*$") heredoc = ""; next }
+    /^[ \t]*#/ { next }
+    match($0, /<<-?[ \t]*["'\'']?[A-Za-z_][A-Za-z0-9_]*/) {
+      starts_here_string = (RSTART > 1 && substr($0, RSTART - 1, 1) == "<") || substr($0, RSTART, 3) == "<<<"
+      if (!starts_here_string) {
+        tag = substr($0, RSTART, RLENGTH); sub(/^<<-?[ \t]*["'\'']?/, "", tag); heredoc = tag
+      }
+    }
+    /(^|[^|])\|[ \t]*grep[ \t]+-[a-zA-Z]*q/ { print FILENAME ":" FNR ": " $0 }
+  ' "$@"
+}
+
+printf '\n=== static: no test pipes into grep -q (#803) ===\n'
+scanned=()
+for test_file in "${script_dir}"/*.test; do
+  # This file's own fixtures contain the pattern as text.
+  [[ "$test_file" != "${BASH_SOURCE[0]}" && "$(basename "$test_file")" != 'grep-q-pipe-guard.test' ]] || continue
+  scanned+=("$test_file")
+done
+offenders="$(find_offenders "${scanned[@]}")"
+if [[ -z "$offenders" ]]; then
+  pass_case 'no test file pipes a command into grep -q'
+else
+  fail_case "tests pipe into grep -q; use grep_q_all (tests/lib/grep-q-all): $(head -n 5 <<<"$offenders")"
+fi
+
+printf '\n=== functional: the scanner is not fooled by here-strings (#803) ===\n'
+fixture="$(mktemp)"
+{
+  printf 'grep -F a <<<"payload"\n'
+  printf 'printf "%%s\\n" y | grep -qF y\n'
+  printf 'cat <<EOF\n'
+  printf 'inside | grep -q hidden\n'
+  printf 'EOF\n'
+  printf 'a || grep -qF b file\n'
+} >"$fixture"
+found="$(find_offenders "$fixture")"
+rm -f "$fixture"
+if [[ "$(grep -c . <<<"$found")" == 1 ]] && grep -qF 'printf "%s\n" y | grep -qF y' <<<"$found"; then
+  pass_case 'a pipe after a here-string is found, heredoc bodies and || alternations are not'
+else
+  fail_case "the scanner result was wrong: ${found}"
+fi
+
+printf '\n=== functional: grep_q_all survives an upstream that outlives the match (#803) ===\n'
+# shellcheck source=tests/lib/grep-q-all
+source "${script_dir}/lib/grep-q-all"
+big_failures=0
+for _ in $(seq 1 20); do
+  if ! { printf 'needle\n'; head -c 400000 /dev/zero | tr '\0' 'x'; } | grep_q_all -F 'needle'; then
+    big_failures=$(( big_failures + 1 ))
+  fi
+done
+if (( big_failures == 0 )); then
+  pass_case 'a match on the first line of a 400 KB stream is found every time'
+else
+  fail_case "a match on the first line of a 400 KB stream is found every time (${big_failures}/20 failed)"
+fi
+if printf 'abc\n' | grep_q_all -F 'zzz'; then
+  fail_case 'a missing pattern returns non-zero'
+else
+  pass_case 'a missing pattern returns non-zero'
+fi
+if printf 'ABC\n' | grep_q_all -iF 'abc'; then
+  pass_case 'flags are passed through to grep'
+else
+  fail_case 'flags are passed through to grep'
+fi
+# Input reaches grep byte for byte: empty input has no line, and trailing blank lines are kept.
+if printf '' | grep_q_all -x ''; then
+  fail_case 'empty input has no empty line to match'
+else
+  pass_case 'empty input has no empty line to match'
+fi
+if printf 'a\n\n' | grep_q_all -x ''; then
+  pass_case 'a trailing blank line is kept and matches'
+else
+  fail_case 'a trailing blank line is kept and matches'
+fi
+
+printf '\n=== results ===\n'
+printf 'Passed: %d  Failed: %d\n' "$pass" "$fail"
+test_summary

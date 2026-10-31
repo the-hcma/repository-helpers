@@ -6639,9 +6639,25 @@ EOF
   rp_log_warn "${slug}: created CODEOWNERS remediation PR: ${pr_url}"
 }
 
+# Exit 0 only when release-please.yml exists. An API error is not "exists": decisions that write
+# (rp_repo_requires_protect_main_ruleset) must not act on it.
 rp_repo_has_release_please() {
-  local slug="$1"
-  rp_gh_path_exists "$slug" '.github/workflows/release-please.yml'
+  local -r slug="$1"
+  local path_ec=0
+
+  rp_gh_path_check "$slug" '.github/workflows/release-please.yml' || path_ec=$?
+  (( path_ec == 0 ))
+}
+
+# Exit 0 unless release-please.yml is definitely absent. For default repo discovery only: an API error
+# counts as "maybe", so the repo is still audited and rp_check_release_please reports the error,
+# instead of the repo silently dropping out of the audit (#800).
+rp_repo_may_have_release_please() {
+  local -r slug="$1"
+  local path_ec=0
+
+  rp_gh_path_check "$slug" '.github/workflows/release-please.yml' || path_ec=$?
+  (( path_ec != 1 ))
 }
 
 # rp_repo_merge_it_label_check <slug>
@@ -6679,7 +6695,7 @@ rp_repo_has_merge_it_label() {
 rp_repo_should_audit_default() {
   local slug="$1"
   local mq_exit=0
-  if rp_repo_has_release_please "$slug"; then
+  if rp_repo_may_have_release_please "$slug"; then
     return 0
   fi
   if rp_repo_has_merge_it_label "$slug"; then
@@ -6904,13 +6920,16 @@ rp_repo_uses_github_merge_queue() {
 
 # Exit 0 when protect-main is required, 1 when not, 2 on GitHub API failure
 # (do not treat API errors as "not required").
+# Exit 0 required, 1 not required, 2 when a GitHub API error left the answer unknown (#800).
 rp_repo_requires_protect_main_ruleset() {
   local slug="$1"
   local mq_exit=0
+  local release_please_ec=0
   if [[ "$rp_merge_only" -eq 0 ]] && rp_is_strict_repo "$slug"; then
     return 0
   fi
-  if rp_repo_has_release_please "$slug"; then
+  rp_gh_path_check "$slug" '.github/workflows/release-please.yml' || release_please_ec=$?
+  if (( release_please_ec == 0 )); then
     return 0
   fi
   if rp_repo_has_merge_it_label "$slug"; then
@@ -6920,7 +6939,7 @@ rp_repo_requires_protect_main_ruleset() {
   if (( mq_exit == 0 )); then
     return 0
   fi
-  if (( mq_exit == 2 )); then
+  if (( mq_exit == 2 || release_please_ec == 2 )); then
     return 2
   fi
   return 1
@@ -7024,13 +7043,20 @@ rp_repo_has_dependabot() {
   rp_gh_path_exists "$1" '.github/dependabot.yml'
 }
 
+# Prints ci.yml. Exit 1 when it is absent, 2 on a GitHub API error (#800).
 rp_fetch_ci_workflow_text() {
   local slug="$1"
-  if ! rp_gh_path_exists "$slug" '.github/workflows/ci.yml'; then
-    return 1
+  local path_ec=0
+  local encoded
+  rp_gh_path_check "$slug" '.github/workflows/ci.yml' || path_ec=$?
+  if (( path_ec != 0 )); then
+    return "$path_ec"
   fi
-  rp_runner_gh_api_stream "repo-practices ci.yml content" --probe \
-    "repos/${slug}/contents/.github/workflows/ci.yml" --jq '.content' | base64 -d
+  # The probe just succeeded, so a failing content request is an API error, not an absent file: map it
+  # to 2 instead of leaking gh's raw status or an empty text (#800).
+  encoded="$(rp_runner_gh_api_stream "repo-practices ci.yml content" --probe \
+    "repos/${slug}/contents/.github/workflows/ci.yml" --jq '.content')" || return 2
+  printf '%s' "$encoded" | base64 -d
 }
 
 rp_ci_workflow_restricts_pr_branches() {
@@ -7162,7 +7188,12 @@ rp_fix_ci_workflow_add_merge_group() {
 rp_discover_ci_status_contexts() {
   local slug="$1"
   local text
-  text="$(rp_fetch_ci_workflow_text "$slug" 2>/dev/null || true)"
+  local fetch_ec=0
+  # Exit 2 (nothing printed) when ci.yml cannot be read: callers must not treat that as "no contexts".
+  text="$(rp_fetch_ci_workflow_text "$slug" 2>/dev/null)" || fetch_ec=$?
+  if (( fetch_ec == 2 )); then
+    return 2
+  fi
   if [[ -z "$text" ]]; then
     return 0
   fi
@@ -7261,12 +7292,19 @@ rp_fetch_classic_main_protection_json() {
   return 0
 }
 
+# Prints the bypass apps JSON; exit 2 (nothing printed) when dependabot.yml cannot be read, so the
+# apply path never writes protection without the Dependabot bypass because of an API error (#800).
 rp_classic_protection_bypass_apps_json() {
   local slug="$1"
   local apps
+  local path_ec=0
   # Org default is GitHub merge queue — do not grant graphite-app review bypass.
   apps='[]'
-  if rp_repo_has_dependabot "$slug"; then
+  rp_gh_path_check "$slug" '.github/dependabot.yml' || path_ec=$?
+  if (( path_ec == 2 )); then
+    return 2
+  fi
+  if (( path_ec == 0 )); then
     apps='["'"${rp_DEPENDABOT_APP_SLUG}"'"]'
   fi
   printf '%s' "$apps"
@@ -7278,6 +7316,7 @@ rp_validate_classic_main_protection_json() {
   local fail=0
   local expected
   local -a expected_contexts=()
+  local dependabot_ec=0 contexts_ec=0 discovered_contexts
   local ctx
   # Org default is GitHub MQ: no Graphite-only push restrictions / review bypass.
   local github_mq=1
@@ -7317,7 +7356,12 @@ rp_validate_classic_main_protection_json() {
     rp_log_fail "${slug}: classic main protection must require CODEOWNERS review"
     fail=1
   fi
-  if rp_repo_has_dependabot "$slug"; then
+  dependabot_ec=0
+  rp_gh_path_check "$slug" '.github/dependabot.yml' || dependabot_ec=$?
+  if (( dependabot_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/dependabot.yml'
+    fail=1
+  elif (( dependabot_ec == 0 )); then
     jq_exit_code=0
     rp_runner_jq_file "repo-practices dependabot review bypass" "$protection_json" \
       --arg slug "${rp_DEPENDABOT_APP_SLUG}" \
@@ -7352,12 +7396,16 @@ rp_validate_classic_main_protection_json() {
     fail=1
   fi
 
+  discovered_contexts="$(rp_discover_ci_status_contexts "$slug")" || contexts_ec=$?
   while IFS= read -r expected; do
     [[ -n "$expected" ]] || continue
     expected_contexts+=("$expected")
-  done < <(rp_discover_ci_status_contexts "$slug")
+  done <<<"$discovered_contexts"
 
-  if [[ "${#expected_contexts[@]}" -eq 0 ]]; then
+  if (( contexts_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/workflows/ci.yml'
+    fail=1
+  elif [[ "${#expected_contexts[@]}" -eq 0 ]]; then
     if rp_gh_path_exists "$slug" '.github/workflows/ci.yml'; then
       rp_log_fail "${slug}: could not discover CI status contexts from ci.yml"
       fail=1
@@ -7396,13 +7444,23 @@ rp_apply_classic_main_protection() {
   local bypass_apps_json payload
   local restrictions_json
   local mq_exit=0
+  local contexts_ec=0 bypass_ec=0 discovered_contexts
 
+  discovered_contexts="$(rp_discover_ci_status_contexts "$slug")" || contexts_ec=$?
+  if (( contexts_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/workflows/ci.yml; not changing branch protection'
+    return 1
+  fi
   while IFS= read -r ctx; do
     [[ -n "$ctx" ]] || continue
     contexts+=("$ctx")
-  done < <(rp_discover_ci_status_contexts "$slug")
+  done <<<"$discovered_contexts"
 
-  bypass_apps_json="$(rp_classic_protection_bypass_apps_json "$slug")"
+  bypass_apps_json="$(rp_classic_protection_bypass_apps_json "$slug")" || bypass_ec=$?
+  if (( bypass_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/dependabot.yml; not changing branch protection'
+    return 1
+  fi
   mq_exit=0
   rp_repo_uses_github_merge_queue "$slug" || mq_exit=$?
   if (( mq_exit == 2 )); then
@@ -7469,16 +7527,22 @@ rp_apply_classic_main_protection() {
     -X PUT "repos/${slug}/branches/main/protection"
 }
 
+# Prints the workflow path. Exit 1 when neither workflow exists, 2 on a GitHub API error (#800).
 rp_dependabot_auto_merge_workflow_path() {
   local slug="$1"
-  if rp_gh_path_exists "$slug" '.github/workflows/dependabot-auto-merge.yml'; then
-    printf '%s' '.github/workflows/dependabot-auto-merge.yml'
-    return 0
-  fi
-  if rp_gh_path_exists "$slug" '.github/workflows/auto-merge-dependabot.yml'; then
-    printf '%s' '.github/workflows/auto-merge-dependabot.yml'
-    return 0
-  fi
+  local name path_ec
+
+  for name in dependabot-auto-merge.yml auto-merge-dependabot.yml; do
+    path_ec=0
+    rp_gh_path_check "$slug" ".github/workflows/${name}" || path_ec=$?
+    if (( path_ec == 0 )); then
+      printf '%s' ".github/workflows/${name}"
+      return 0
+    fi
+    if (( path_ec == 2 )); then
+      return 2
+    fi
+  done
   return 1
 }
 
@@ -8608,6 +8672,7 @@ rp_validate_graphite_workflows() {
   local labels_json="$3"
   local fail=0
   local ci_text ci_fixed closer_text dependabot_workflow dependabot_auto_text
+  local workflow_ec=0
   local path_ec=0
   local fetch_ec=0
   local secret_scan_script
@@ -8766,8 +8831,12 @@ rp_validate_graphite_workflows() {
     rp_log_gh_api_fail "$slug" 'could not read .github/dependabot.yml'
     fail=1
   elif (( path_ec == 0 )); then
-    dependabot_workflow="$(rp_dependabot_auto_merge_workflow_path "$slug" || true)"
-    if [[ -z "$dependabot_workflow" ]]; then
+    workflow_ec=0
+    dependabot_workflow="$(rp_dependabot_auto_merge_workflow_path "$slug")" || workflow_ec=$?
+    if (( workflow_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" 'could not read the dependabot auto-merge workflow'
+      fail=1
+    elif [[ -z "$dependabot_workflow" ]]; then
       if [[ "$strict" == '1' ]]; then
         rp_log_fail "${slug}: dependabot.yml present but no dependabot auto-merge workflow"
         if [[ "$rp_apply_fix" -eq 1 ]]; then
@@ -9058,8 +9127,14 @@ rp_check_release_please() {
   local slug="$1"
   local repo_fail=0
   local settings_json
+  local path_ec=0
 
-  if ! rp_repo_has_release_please "$slug"; then
+  rp_gh_path_check "$slug" '.github/workflows/release-please.yml' || path_ec=$?
+  if (( path_ec == 2 )); then
+    rp_log_gh_api_fail "$slug" 'could not read .github/workflows/release-please.yml'
+    return 1
+  fi
+  if (( path_ec != 0 )); then
     if [[ "$rp_new_repo" -eq 1 ]] && [[ "$rp_suggest" -eq 1 ]]; then
       rp_log_suggest "${slug}: add release-please.yml only if you publish versioned releases"
     fi
@@ -9391,6 +9466,7 @@ rp_check_github_merge_queue() {
   local fetch_ec=0
   local path_ec=0
   local dependabot_workflow dependabot_auto_text
+  local workflow_ec=0
   local strict=0
 
   if rp_is_strict_repo "$slug"; then
@@ -9438,8 +9514,12 @@ rp_check_github_merge_queue() {
     rp_log_gh_api_fail "$slug" 'could not read .github/dependabot.yml'
     repo_fail=1
   elif (( path_ec == 0 )); then
-    dependabot_workflow="$(rp_dependabot_auto_merge_workflow_path "$slug" || true)"
-    if [[ -z "$dependabot_workflow" ]]; then
+    workflow_ec=0
+    dependabot_workflow="$(rp_dependabot_auto_merge_workflow_path "$slug")" || workflow_ec=$?
+    if (( workflow_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" 'could not read the dependabot auto-merge workflow'
+      repo_fail=1
+    elif [[ -z "$dependabot_workflow" ]]; then
       if [[ "$strict" -eq 1 ]]; then
         rp_log_fail "${slug}: dependabot.yml present but no dependabot auto-merge workflow"
         if [[ "$rp_apply_fix" -eq 1 ]]; then
