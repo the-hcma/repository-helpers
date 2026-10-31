@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# Tests for bumping every direct declaration of a crate (#813). `cargo outdated` reports one row per
+# crate, so a bump of the root pin used to leave a matching [target.'cfg(...)'.dependencies] pin on the old
+# major, the lockfile then held two majors and macOS CI failed with E0464. The bump now follows
+# `cargo metadata` to every declaration of the crate and refuses the bump when one cannot be updated.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/dep-updater"
+readonly script
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+
+# metadata <package>:<kind>:<target>:<rename>[:<req>]… — a `cargo metadata --no-deps` payload. kind is normal,
+# dev or build; target and rename are "-" when absent; req defaults to ^0.39. Every package declares sysinfo
+# plus one unrelated crate.
+metadata() {
+  local spec pkg kind target rename req p
+  local -a packages=()
+  local -A seen=()
+  for spec in "$@"; do
+    IFS=':' read -r pkg kind target rename req <<<"$spec"
+    if [[ -z "${seen[$pkg]:-}" ]]; then
+      seen[$pkg]=1
+      packages+=("$pkg")
+    fi
+  done
+  local out='{"packages":['
+  local first_pkg=1 deps first_dep
+  for pkg in "${packages[@]}"; do
+    deps=''
+    first_dep=1
+    for spec in "$@"; do
+      IFS=':' read -r p kind target rename req <<<"$spec"
+      [[ "$p" == "$pkg" ]] || continue
+      [[ $first_dep -eq 1 ]] || deps+=','
+      first_dep=0
+      deps+="$(jq -cn --arg kind "$kind" --arg target "$target" --arg rename "$rename" \
+        --arg req "${req:-^0.39}" '
+        {name: "sysinfo", req: $req, kind: (if $kind == "normal" then null else $kind end),
+         target: (if $target == "-" then null else $target end),
+         rename: (if $rename == "-" then null else $rename end)}')"
+    done
+    deps+=',{"name":"serde","req":"^1","kind":null,"target":null,"rename":null}'
+    [[ $first_pkg -eq 1 ]] || out+=','
+    first_pkg=0
+    out+="{\"name\":\"${pkg}\",\"dependencies\":[${deps}]}"
+  done
+  printf '%s]}' "$out"
+}
+
+# run_bump <metadata-json> <workspace 0|1> [failing-cargo-add-substring] [after-json] — runs the helper with
+# cargo stubbed; prints the `cargo add` argument lines it ran, then "rc=<n>", then the log lines. The first
+# `cargo metadata` read returns the given payload and the re-read after the bumps returns [after-json], by
+# default the same payload with every non-renamed sysinfo declaration moved to ^0.40.0, as `cargo add` does.
+run_bump() {
+  local -r meta="$1" workspace="$2" failing="${3:-}"
+  local -r calls="${work_dir}/calls.log" logs="${work_dir}/log.out" meta_file="${work_dir}/meta.json"
+  local -r after_file="${work_dir}/meta-after.json" read_count="${work_dir}/meta-reads"
+  local after="${4:-}"
+  if [[ "$meta" != FAIL && -z "$after" ]]; then
+    after="$(jq -c '.packages[].dependencies[] |= (if .name == "sysinfo" and .rename == null
+      then .req = "^0.40.0" else . end)' <<<"$meta")"
+  fi
+  printf '%s' "$meta" >"$meta_file"
+  printf '%s' "$after" >"$after_file"
+  : >"$read_count"
+  : >"$calls"
+  : >"$logs"
+  bash -c "
+    set -uo pipefail
+    log() { printf '%s\\n' \"\$*\" >>'${logs}'; }
+    rust_workspace_enabled() { return $((1 - workspace)); }
+    dep_updater_append_ecosystem_failure() { printf 'FAILURE %s\\n' \"\$*\" >>'${logs}'; }
+    dep_runner_cargo_dir_stdout() {
+      [[ \"\$*\" == *'-- metadata --no-deps --format-version 1' ]] || return 1
+      [[ '${meta}' != FAIL ]] || return 1
+      printf x >>'${read_count}'
+      if (( \$(wc -c <'${read_count}') == 1 )); then cat '${meta_file}'; else cat '${after_file}'; fi
+    }
+    dep_runner_jq_with_args() { local json=\"\$2\"; shift 2; jq \"\$@\" <<<\"\$json\"; }
+    dep_runner_cargo_dir() {
+      shift 3
+      printf '%s\\n' \"\$*\" >>'${calls}'
+      [[ -z '${failing}' || \"\$*\" != *'${failing}'* ]]
+    }
+    eval \"\$(awk '/^rust_sibling_declarations\\(\\)/{p=1} p{print} p && /^}/{exit}' '${script}')\"
+    eval \"\$(awk '/^rust_bump_sibling_declarations\\(\\)/{p=1} p{print} p && /^}/{exit}' '${script}')\"
+    rc=0
+    rust_bump_sibling_declarations /tmp/wt sysinfo 0.40.0 || rc=\$?
+    echo rc=\$rc" 2>&1
+  cat "$calls"
+  cat "$logs"
+}
+
+printf '\n=== a root pin and a target-specific pin of one crate are both bumped (#813) ===\n'
+macos='cfg(target_os = "macos")'
+out="$(run_bump "$(metadata "app:normal:-:-" "app:normal:${macos}:-")" 0)"
+assert_contains 'the root declaration is bumped' "$out" 'add sysinfo@0.40.0'
+assert_contains 'the macOS target declaration is bumped with --target' "$out" "add --target ${macos} sysinfo@0.40.0"
+assert_contains 'the helper reports success' "$out" 'rc=0'
+assert_not_contains 'a single package never gets --package' "$out" '--package'
+assert_not_contains 'an unrelated crate is left alone' "$out" 'serde'
+
+printf '\n=== dev, build and target-specific dev declarations ===\n'
+out="$(run_bump "$(metadata "app:normal:-:-" "app:dev:-:-" "app:build:-:-" "app:dev:${macos}:-")" 0)"
+assert_contains 'the dev declaration uses --dev' "$out" 'add --dev sysinfo@0.40.0'
+assert_contains 'the build declaration uses --build' "$out" 'add --build sysinfo@0.40.0'
+assert_contains 'a target-specific dev declaration uses --dev and --target' \
+  "$out" "add --target ${macos} --dev sysinfo@0.40.0"
+
+printf '\n=== workspace members each get their own --package ===\n'
+out="$(run_bump "$(metadata "core:normal:-:-" "cli:normal:-:-" "cli:normal:${macos}:-")" 1)"
+assert_contains 'the first member is bumped with --package' "$out" 'add --package core sysinfo@0.40.0'
+assert_contains 'the second member is bumped with --package' "$out" 'add --package cli sysinfo@0.40.0'
+assert_contains "the second member's target pin is bumped too" \
+  "$out" "add --package cli --target ${macos} sysinfo@0.40.0"
+
+printf '\n=== a declaration that cannot be bumped refuses the whole bump with a parseable error ===\n'
+out="$(run_bump "$(metadata "app:normal:-:-" "app:normal:${macos}:-")" 0 'cfg(')"
+assert_contains 'the helper fails' "$out" 'rc=1'
+assert_contains 'the error names the crate, package, kind and target' \
+  "$out" "ERROR: RUST_DUAL_PIN_DIVERGED crate=sysinfo package=app kind=normal target=${macos}"
+assert_contains 'the failure is recorded for the batch report' "$out" 'FAILURE rust|'
+
+printf '\n=== a renamed dependency cannot be bumped, so the bump is refused instead of reported as done ===\n'
+out="$(run_bump "$(metadata "app:normal:-:-" "app:normal:-:sys2")" 0)"
+assert_contains 'the plain declaration is bumped' "$out" 'add sysinfo@0.40.0'
+assert_contains 'the rename is skipped with a note' "$out" 'renamed'
+assert_contains 'the left-behind rename makes the bump fail' "$out" 'rc=1'
+assert_contains 'the divergence names both requirements' \
+  "$out" 'ERROR: RUST_DUAL_PIN_DIVERGED crate=sysinfo reqs=^0.40.0,^0.39'
+
+printf '\n=== a member that cargo leaves on the old requirement (workspace inheritance) refuses the bump ===\n'
+stale_after="$(metadata "core:normal:-:-:^0.40.0" "cli:normal:-:-:^0.39")"
+out="$(run_bump "$(metadata "core:normal:-:-" "cli:normal:-:-")" 1 '' "$stale_after")"
+assert_contains 'a declaration still on the old requirement fails the bump' "$out" 'rc=1'
+assert_contains 'the divergence is reported' "$out" 'RUST_DUAL_PIN_DIVERGED crate=sysinfo reqs=^0.40.0,^0.39'
+
+printf '\n=== when every declaration agrees after the bump it succeeds, and the re-read is checked ===\n'
+out="$(run_bump "$(metadata "core:normal:-:-" "cli:normal:-:-")" 1)"
+assert_contains 'agreeing declarations succeed' "$out" 'rc=0'
+assert_not_contains 'no divergence is reported' "$out" 'RUST_DUAL_PIN_DIVERGED'
+out="$(run_bump "$(metadata "app:normal:-:-")" 0 '' 'FAIL')"
+assert_contains 'an unreadable re-read fails the bump' "$out" 'rc=1'
+assert_contains 'the unreadable re-read has a parseable error' "$out" 'ERROR: RUST_DUAL_PIN_UNREADABLE crate=sysinfo'
+out="$(run_bump FAIL 0)"
+assert_contains 'unreadable cargo metadata fails' "$out" 'rc=1'
+assert_contains 'the unreadable manifest has a parseable error' "$out" 'ERROR: RUST_DUAL_PIN_UNREADABLE crate=sysinfo'
+
+printf '\n=== static: both bump paths follow the crate to every declaration ===\n'
+single="$(awk '/^rust_update_one\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"
+# shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars
+assert_contains 'rust_update_one bumps the sibling declarations after cargo add' \
+  "$single" 'rust_bump_sibling_declarations "$worktree_path" "$pkg" "$new_ver"'
+assert_contains 'rust_update_one reverts the bump when a sibling cannot be bumped' \
+  "$single" 'not every declaration of the crate could be bumped'
+assert_contains 'rust_update_one reverts only after the sibling bump failed' \
+  "$(awk '/not every declaration of the crate could be bumped/{p=1} p{print} p && /return 0/{exit}' <<<"$single")" \
+  'rust_revert_post_bump_workdir'
+batch="$(awk '/# ── Rust \/ Cargo ──/{p=1} p{print} p && /# ── GitHub Actions ──/{exit}' "$script")"
+# shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars
+assert_contains 'the batch path bumps the sibling declarations after cargo add' \
+  "$batch" 'rust_bump_sibling_declarations "$worktree_path" "$pkg" "$new_ver"'
+assert_contains 'the batch path stops the Rust loop when a sibling cannot be bumped' \
+  "$batch" 'rust_batch_diverged=1'
+assert_contains 'the batch path reverts all Rust bumps only when the flag is set' \
+  "$(awk "/rust_batch_diverged\" == '1' \]\]; then/{p=1} p{print} p && /fi/{exit}" <<<"$batch")" \
+  'rust_revert_post_bump_workdir'
+
+printf '\n=== results ===\n'
+test_summary

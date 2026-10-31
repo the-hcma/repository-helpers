@@ -6969,6 +6969,101 @@ rust_recover_post_bump_clippy() {
   return 1
 }
 
+# rust_sibling_declarations <worktree> <crate>
+# Every direct declaration of <crate> in the manifests under <worktree>, from `cargo metadata`, as TSV:
+#   package<TAB>kind<TAB>target<TAB>rename<TAB>req
+# kind is normal, dev or build; target is the cfg/triple of a [target.<cfg>.dependencies] table or "-";
+# rename is the dependency key when it differs from the crate name, else "-"; req is the version
+# requirement cargo resolved for that declaration (so a workspace-inherited one shows the inherited value).
+# Exit 1 when cargo metadata cannot be read.
+rust_sibling_declarations() {
+  local -r cargo_dir="$1"
+  local -r crate="$2"
+  local metadata_json
+
+  metadata_json="$(dep_runner_cargo_dir_stdout "cargo metadata" "$cargo_dir" -- \
+    metadata --no-deps --format-version 1 2>/dev/null)" || return 1
+  [[ -n "$metadata_json" ]] || return 1
+  # shellcheck disable=SC2016  # jq filter uses jq variables, not shell expansion
+  dep_runner_jq_with_args "cargo metadata declarations" "$metadata_json" -r --arg crate "$crate" '
+    .packages[]? | .name as $pkg
+    | .dependencies[]? | select(.name == $crate)
+    | [$pkg, (.kind // "normal"), (.target // "-"), (.rename // "-"), (.req // "-")]
+    | join("\t")'
+}
+
+# rust_bump_sibling_declarations <worktree> <crate> <new_ver>
+# `cargo outdated` reports one row per crate, so bumping that row leaves a second declaration of the same
+# crate (a [target.'cfg(...)'.dependencies] pin next to the root pin, or the same crate in another
+# workspace member) on the old major, the lockfile then holds two majors and the target's CI fails with
+# E0464 (#813). After the row's own `cargo add`, bump every direct declaration of the crate the same way.
+# Returns 1 with one machine-parseable ERROR line (RUST_DUAL_PIN_UNREADABLE / RUST_DUAL_PIN_DIVERGED) when
+# the declarations cannot be listed, one cannot be bumped, or they do not all end on the same requirement:
+# the caller refuses the whole bump. A renamed dependency is not bumped (`cargo add` cannot target it by crate
+# name) and a workspace-inherited one depends on how cargo rewrites it, so the final re-read is the check
+# that either is not left behind on the old major.
+rust_bump_sibling_declarations() {
+  local -r cargo_dir="$1"
+  local -r crate="$2"
+  local -r new_ver="$3"
+  local declarations after_declarations pkg kind target rename req reqs
+  local -a add_args=()
+  local -A seen_reqs=()
+
+  if ! declarations="$(rust_sibling_declarations "$cargo_dir" "$crate")"; then
+    log "ERROR: RUST_DUAL_PIN_UNREADABLE crate=${crate} dir=${cargo_dir}"
+    dep_updater_append_ecosystem_failure "rust|cannot list the declarations of ${crate} (cargo metadata failed)"
+    return 1
+  fi
+  while IFS=$'\t' read -r pkg kind target rename req; do
+    [[ -n "$pkg" ]] || continue
+    if [[ "$rename" != '-' ]]; then
+      log "[rust] ${crate}: leaving the renamed dependency '${rename}' in ${pkg} alone" \
+        "(renamed declarations are not bumped)"
+      continue
+    fi
+    add_args=("${crate}@${new_ver}")
+    case "$kind" in
+      dev)   add_args=(--dev "${add_args[@]}") ;;
+      build) add_args=(--build "${add_args[@]}") ;;
+      *)     : ;;
+    esac
+    if [[ "$target" != '-' ]]; then
+      add_args=(--target "$target" "${add_args[@]}")
+    fi
+    if rust_workspace_enabled "$cargo_dir"; then
+      add_args=(--package "$pkg" "${add_args[@]}")
+    fi
+    if ! dep_runner_cargo_dir "cargo sibling add" "$cargo_dir" -- add "${add_args[@]}"; then
+      log "ERROR: RUST_DUAL_PIN_DIVERGED crate=${crate} package=${pkg} kind=${kind} target=${target}"
+      dep_updater_append_ecosystem_failure \
+        "rust|${crate} ${new_ver}: could not bump the ${kind} declaration in ${pkg} (target ${target})"
+      return 1
+    fi
+  done <<<"$declarations"
+
+  # Re-read what cargo wrote: every declaration, renamed or inherited ones included, must now agree.
+  if ! after_declarations="$(rust_sibling_declarations "$cargo_dir" "$crate")"; then
+    log "ERROR: RUST_DUAL_PIN_UNREADABLE crate=${crate} dir=${cargo_dir}"
+    dep_updater_append_ecosystem_failure "rust|cannot re-read the declarations of ${crate} (cargo metadata failed)"
+    return 1
+  fi
+  reqs=''
+  while IFS=$'\t' read -r _ _ _ _ req; do
+    [[ -n "$req" ]] || continue
+    if [[ -z "${seen_reqs[$req]:-}" ]]; then
+      seen_reqs[$req]=1
+      reqs="${reqs:+${reqs},}${req}"
+    fi
+  done <<<"$after_declarations"
+  if [[ "$reqs" == *,* ]]; then
+    log "ERROR: RUST_DUAL_PIN_DIVERGED crate=${crate} reqs=${reqs} (declarations still disagree after the bump)"
+    dep_updater_append_ecosystem_failure \
+      "rust|${crate} ${new_ver}: declarations still disagree after the bump (${reqs})"
+    return 1
+  fi
+}
+
 # Bump one direct dependency and open a stacked PR.
 # Args: $1=crate, $2=current version, $3=target version, $4=dependency kind,
 #       $5=workspace package, $6=platform (cargo --target cfg/triple, or "-")
@@ -7027,6 +7122,13 @@ rust_update_one() {
     log "[rust] Skipping ${pkg} ${new_ver}: cargo add failed."
     log "$cargo_out"
     dep_updater_append_ecosystem_failure "rust|crate add failed for ${pkg} (exit ${cargo_exit})"
+    return 0
+  fi
+
+  # The row's own declaration is bumped; follow the crate to every other declaration of it (#813).
+  if ! rust_bump_sibling_declarations "$worktree_path" "$pkg" "$new_ver"; then
+    log "[rust] Skipping ${pkg} ${old_ver}→${new_ver}: not every declaration of the crate could be bumped."
+    rust_revert_post_bump_workdir "$worktree_path"
     return 0
   fi
 
@@ -7888,6 +7990,7 @@ batch_update_all() {
 
   # ── Rust / Cargo ─────────────────────────────────────────────────────────
   local any_rust=0
+  local rust_batch_diverged=0
   if [[ "$has_rust" == '1' && -n "$rust_lines_arg" && "$security_only" == '0' ]]; then
     while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
       [[ -z "$pkg" ]] && continue
@@ -7906,10 +8009,19 @@ batch_update_all() {
       fi
       if ! dep_runner_cargo_dir "cargo batch add" "$worktree_path" -- add "${cargo_add_args[@]}"; then
         dep_updater_append_ecosystem_failure "rust|batch crate add failed for ${pkg}"
+      elif ! rust_bump_sibling_declarations "$worktree_path" "$pkg" "$new_ver"; then
+        # Some declarations of this crate are bumped and some are not: refuse every Rust bump of the batch.
+        rust_batch_diverged=1
+        break
       fi
     done <<< "$rust_lines_arg"
+    if [[ "$rust_batch_diverged" == '1' ]]; then
+      log "[rust] Reverting Rust batch bumps: a crate's declarations could not all be bumped;" \
+        "continuing other ecosystems."
+      rust_revert_post_bump_workdir "$worktree_path"
+    fi
     run_command "git worktree" git -C "$worktree_path" add -u
-    if ! git -C "$worktree_path" diff --cached --quiet; then
+    if [[ "$rust_batch_diverged" != '1' ]] && ! git -C "$worktree_path" diff --cached --quiet; then
       any_rust=1
       if ! rust_recover_post_bump_clippy "$worktree_path"; then
         log "[rust] Reverting Rust batch bumps after unrecovered clippy; continuing other ecosystems."
