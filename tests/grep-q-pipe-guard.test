@@ -15,22 +15,54 @@ pass=0
 fail=0
 test_init
 
-printf '\n=== static: no test pipes into grep -q (#803) ===\n'
-offenders="$(
+# find_offenders FILE… prints "file:line: text" for every code line that pipes into `grep -q…`.
+# Heredoc bodies and comments are skipped; `<<<` here-strings and `||` alternations are not pipes
+# or heredocs (a here-string such as <<<"x" must not open a heredoc that hides later lines).
+find_offenders() {
   awk '
     FNR == 1 { heredoc = "" }
     heredoc != "" { if ($0 ~ "^[ \t]*" heredoc "[ \t]*$") heredoc = ""; next }
     /^[ \t]*#/ { next }
-    match($0, /<<-?[ \t]*["'\'']?[A-Za-z_][A-Za-z0-9_]*/) && substr($0, RSTART, 3) != "<<<" {
-      tag = substr($0, RSTART, RLENGTH); sub(/^<<-?[ \t]*["'\'']?/, "", tag); heredoc = tag
+    match($0, /<<-?[ \t]*["'\'']?[A-Za-z_][A-Za-z0-9_]*/) {
+      starts_here_string = (RSTART > 1 && substr($0, RSTART - 1, 1) == "<") || substr($0, RSTART, 3) == "<<<"
+      if (!starts_here_string) {
+        tag = substr($0, RSTART, RLENGTH); sub(/^<<-?[ \t]*["'\'']?/, "", tag); heredoc = tag
+      }
     }
     /(^|[^|])\|[ \t]*grep[ \t]+-[a-zA-Z]*q/ { print FILENAME ":" FNR ": " $0 }
-  ' "${script_dir}"/*.test
-)"
+  ' "$@"
+}
+
+printf '\n=== static: no test pipes into grep -q (#803) ===\n'
+scanned=()
+for test_file in "${script_dir}"/*.test; do
+  # This file's own fixtures contain the pattern as text.
+  [[ "$test_file" != "${BASH_SOURCE[0]}" && "$(basename "$test_file")" != 'grep-q-pipe-guard.test' ]] || continue
+  scanned+=("$test_file")
+done
+offenders="$(find_offenders "${scanned[@]}")"
 if [[ -z "$offenders" ]]; then
   pass_case 'no test file pipes a command into grep -q'
 else
   fail_case "tests pipe into grep -q; use grep_q_all (tests/lib/grep-q-all): $(head -n 5 <<<"$offenders")"
+fi
+
+printf '\n=== functional: the scanner is not fooled by here-strings (#803) ===\n'
+fixture="$(mktemp)"
+{
+  printf 'grep -F a <<<"payload"\n'
+  printf 'printf "%%s\\n" y | grep -qF y\n'
+  printf 'cat <<EOF\n'
+  printf 'inside | grep -q hidden\n'
+  printf 'EOF\n'
+  printf 'a || grep -qF b file\n'
+} >"$fixture"
+found="$(find_offenders "$fixture")"
+rm -f "$fixture"
+if [[ "$(grep -c . <<<"$found")" == 1 ]] && grep -qF 'printf "%s\n" y | grep -qF y' <<<"$found"; then
+  pass_case 'a pipe after a here-string is found, heredoc bodies and || alternations are not'
+else
+  fail_case "the scanner result was wrong: ${found}"
 fi
 
 printf '\n=== functional: grep_q_all survives an upstream that outlives the match (#803) ===\n'
@@ -67,14 +99,6 @@ if printf 'a\n\n' | grep_q_all -x ''; then
   pass_case 'a trailing blank line is kept and matches'
 else
   fail_case 'a trailing blank line is kept and matches'
-fi
-# A `||` alternation is not a pipe and must not be flagged by the static check.
-rc=0
-offenders_probe="$(printf 'x || grep -qF y file\n' | awk '/(^|[^|])\|[ \t]*grep[ \t]+-[a-zA-Z]*q/ { print }')" || rc=$?
-if [[ -z "$offenders_probe" ]]; then
-  pass_case 'a || grep -q alternation is not mistaken for a pipe'
-else
-  fail_case 'a || grep -q alternation is not mistaken for a pipe'
 fi
 
 printf '\n=== results ===\n'
