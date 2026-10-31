@@ -39,10 +39,15 @@ run_lib() {
   bash -c "set -uo pipefail; source '${lib}'; source '${profile}'; $1" 2>&1
 }
 
-# run_json <json> — one CodeRabbit run as a JSON object: run_json <title> <status> <conclusion|null> <start> <end>
+# run_json <title> <status> <conclusion|null> <start> <end> [id] — one CodeRabbit run as a JSON object. An empty
+# start or end is a null timestamp (a queued run); the id defaults to the start time, as check-run ids grow.
 run_json() {
-  jq -cn --arg title "$1" --arg status "$2" --arg conclusion "$3" --arg start "$4" --arg end "$5" '
-    {name: "CodeRabbit", status: $status, started_at: $start, completed_at: ($end | if . == "" then null else . end),
+  jq -cn --arg title "$1" --arg status "$2" --arg conclusion "$3" --arg start "$4" --arg end "$5" \
+    --argjson id "${6:-0}" '
+    (if $id > 0 then $id elif $start == "" then 0 else ($start | fromdateiso8601) end) as $run_id
+    | {name: "CodeRabbit", status: $status, id: $run_id,
+     started_at: ($start | if . == "" then null else . end),
+     completed_at: ($end | if . == "" then null else . end),
      conclusion: ($conclusion | if . == "null" then null else . end),
      app: {slug: "coderabbitai"}, output: {title: $title, summary: ("Result: " + $title)}}'
 }
@@ -66,6 +71,12 @@ failed="$(runs "$(run_json 'Review failed' completed failure "$t0" "$t1")")"
 unfinished="$(runs "$(run_json 'Unfinished business' completed success "$t0" "$t1")")"
 failed_paused="$(runs "$(run_json 'Review paused' completed failure "$t0" "$t1")")"
 failed_skipped="$(runs "$(run_json 'Review skipped' completed failure "$t0" "$t1")")"
+other_slug='.app.slug = "coderabbitai-unrelated"'
+prefix_lookalike="$(runs "$(run_json 'Finished' completed success "$t0" "$t1" | jq -c "$other_slug")")"
+queued_after_finished="$(runs "$(run_json 'Finished' completed success "$t0" "$t1")" \
+  "$(run_json '' queued null '' '' 9999999999)")"
+queued_after_paused="$(runs "$(run_json 'Review paused' completed neutral "$t0" "$t1")" \
+  "$(run_json '' queued null '' '' 9999999999)")"
 lookalike="$(runs "$(run_json 'Finished' completed success "$t0" "$t1" | jq -c '.app.slug = "some-other-app"')")"
 foreign='{"total_count":1,"check_runs":[{"name":"build","status":"completed","conclusion":"success",
   "app":{"slug":"github-actions"},"output":{"title":"Finished","summary":""}}]}'
@@ -92,6 +103,8 @@ assert_contains 'a failed run is failed' "$(from_runs "$failed")" 'failed'
 assert_contains 'a failed run with a paused title is still failed' "$(from_runs "$failed_paused")" 'failed'
 assert_contains 'a failed run with a skipped title is still failed' "$(from_runs "$failed_skipped")" 'failed'
 assert_contains "a run named CodeRabbit by another app is none" "$(from_runs "$lookalike")" 'none'
+assert_contains 'a run by an app whose slug only starts with coderabbitai is none' \
+  "$(from_runs "$prefix_lookalike")" 'none'
 assert_contains 'a title that merely contains finished is not completed' "$(from_runs "$unfinished")" 'other'
 assert_contains "another app's check run is none" "$(from_runs "$foreign")" 'none'
 assert_contains 'no check runs is none' "$(from_runs "$empty")" 'none'
@@ -102,6 +115,17 @@ assert_contains 'a finished re-run after a rate-limited run is completed' "$(fro
 assert_contains 'a running re-run after a rate-limited run is in_progress' "$(from_runs "$rerun_running")" 'in_progress'
 assert_contains 'a rate-limited run after a finished one is rate_limited' "$(from_runs "$rerun_limited")" 'rate_limited'
 
+printf '\n=== head status: a newer queued run beats an older finished or paused one ===\n'
+assert_contains 'a queued run after a finished one is in_progress, not completed' \
+  "$(from_runs "$queued_after_finished")" 'in_progress'
+assert_contains 'a queued run after a paused one is in_progress, not other' \
+  "$(from_runs "$queued_after_paused")" 'in_progress'
+if run_lib "agent_review_coderabbit_head_paused_from_check_runs '${queued_after_paused}'" >/dev/null; then
+  fail_case 'a queued run after a paused one is not paused'
+else
+  pass_case 'a queued run after a paused one is not paused'
+fi
+
 printf '\n=== head paused: a paused check run is told apart from a skipped one ===\n'
 if run_lib "agent_review_coderabbit_head_paused_from_check_runs '${paused}'" >/dev/null; then
   pass_case 'a paused check run is paused'
@@ -110,6 +134,12 @@ else
 fi
 other_app_paused="$(run_json 'Review paused' completed neutral "$t0" "$t1" | jq -c '.app.slug = "some-other-app"')"
 lookalike_paused="$(runs "$other_app_paused")"
+prefix_paused="$(runs "$(run_json 'Review paused' completed neutral "$t0" "$t1" | jq -c "$other_slug")")"
+if run_lib "agent_review_coderabbit_head_paused_from_check_runs '${prefix_paused}'" >/dev/null; then
+  fail_case 'a paused run whose app slug only starts with coderabbitai is not CodeRabbit paused'
+else
+  pass_case 'a paused run whose app slug only starts with coderabbitai is not CodeRabbit paused'
+fi
 if run_lib "agent_review_coderabbit_head_paused_from_check_runs '${lookalike_paused}'" >/dev/null; then
   fail_case 'a paused run of another app is not CodeRabbit paused'
 else
