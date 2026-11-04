@@ -23,11 +23,11 @@ trap 'rm -rf "${work_dir}"' EXIT
 # normal, dev or build; target and rename are "-" when absent; req defaults to ^0.39 and path to none. Every
 # package declares sysinfo plus one unrelated crate.
 metadata() {
-  local spec pkg kind target rename req path p
+  local spec pkg kind target rename req path source p
   local -a packages=()
   local -A seen=()
   for spec in "$@"; do
-    IFS=':' read -r pkg kind target rename req path <<<"$spec"
+    IFS=':' read -r pkg kind target rename req path source <<<"$spec"
     if [[ -z "${seen[$pkg]:-}" ]]; then
       seen[$pkg]=1
       packages+=("$pkg")
@@ -39,16 +39,17 @@ metadata() {
     deps=''
     first_dep=1
     for spec in "$@"; do
-      IFS=':' read -r p kind target rename req path <<<"$spec"
+      IFS=':' read -r p kind target rename req path source <<<"$spec"
       [[ "$p" == "$pkg" ]] || continue
       [[ $first_dep -eq 1 ]] || deps+=','
       first_dep=0
       deps+="$(jq -cn --arg kind "$kind" --arg target "$target" --arg rename "$rename" \
-        --arg req "${req:-^0.39}" --arg path "${path:--}" '
+        --arg req "${req:-^0.39}" --arg path "${path:--}" --arg source "${source:--}" '
         {name: "sysinfo", req: $req, kind: (if $kind == "normal" then null else $kind end),
          target: (if $target == "-" then null else $target end),
          rename: (if $rename == "-" then null else $rename end),
-         path: (if $path == "-" then null else $path end)}')"
+         path: (if $path == "-" then null else $path end),
+         source: (if $source == "-" then null else $source end)}')"
     done
     deps+=',{"name":"serde","req":"^1","kind":null,"target":null,"rename":null}'
     [[ $first_pkg -eq 1 ]] || out+=','
@@ -60,7 +61,7 @@ metadata() {
 
 # run_bump <metadata-json> <workspace 0|1> [failing-cargo-add-substring] [after-json] — runs the helper with
 # cargo stubbed; prints the `cargo add` argument lines it ran, then "rc=<n>", then the log lines. The first
-# `cargo metadata` read returns the given payload and the re-read after the bumps returns [after-json], by
+# `cargo metadata` read returns the given payload until a `cargo add` has run, and the re-read after the bumps returns [after-json], by
 # default the same payload with every non-renamed sysinfo declaration moved to ^0.40.0, as `cargo add` does.
 run_bump() {
   local -r meta="$1" workspace="$2" failing="${3:-}"
@@ -86,7 +87,7 @@ run_bump() {
       [[ \"\$*\" == *'-- metadata --no-deps --format-version 1' ]] || return 1
       [[ '${meta}' != FAIL ]] || return 1
       printf x >>'${read_count}'
-      if (( \$(wc -c <'${read_count}') == 1 )); then cat '${meta_file}'; else cat '${after_file}'; fi
+      if [[ -s '${calls}' ]]; then cat '${after_file}'; else cat '${meta_file}'; fi
     }
     dep_runner_jq_with_args() { local json=\"\$2\"; shift 2; jq \"\$@\" <<<\"\$json\"; }
     dep_runner_cargo_dir() {
@@ -161,6 +162,25 @@ assert_contains 'a declaration with a path source fails the bump' "$out" 'rc=1'
 assert_contains 'the refusal names the path' "$out" 'reason=path source ../sysinfo'
 assert_not_contains 'no cargo add ran before the refusal' "$out" 'add sysinfo@'
 
+printf '\n=== a git source refuses the bump too, wherever another declaration uses the registry ===\n'
+out="$(run_bump "$(metadata "app:normal:-:-" "cli:normal:-:-:^0.39:-:git+https://example.com/sysinfo?branch=x")" 1)"
+assert_contains 'a git-sourced declaration fails the bump' "$out" 'rc=1'
+assert_contains 'the refusal says git source' "$out" 'reason=git source'
+assert_not_contains 'no cargo add ran before the refusal' "$out" 'add --package'
+
+printf '\n=== an exact pin in any member leaves the crate alone without recording a failure ===\n'
+out="$(run_bump "$(metadata "app:normal:-:-" "cli:normal:-:-:=0.39.1")" 1)"
+assert_contains 'an exact-pinned declaration stops the bump' "$out" 'rc=1'
+assert_contains 'the skip names the pin' "$out" 'pins it exactly (=0.39.1)'
+assert_not_contains 'no cargo add ran' "$out" 'add --package'
+assert_not_contains 'an intentional pin is not recorded as a failure' "$out" 'FAILURE'
+
+printf '\n=== a requirement that itself contains a comma is not a divergence ===\n'
+comma_after="$(metadata "core:normal:-:-:>=0.40.0, <1.0.0" "cli:normal:-:-:>=0.40.0, <1.0.0")"
+out="$(run_bump "$(metadata "core:normal:-:-" "cli:normal:-:-")" 1 '' "$comma_after")"
+assert_contains 'identical comma requirements succeed' "$out" 'rc=0'
+assert_not_contains 'no divergence is reported for them' "$out" 'RUST_DUAL_PIN_DIVERGED'
+
 printf '\n=== an unreadable manifest is an error ===\n'
 out="$(run_bump FAIL 0)"
 assert_contains 'unreadable cargo metadata fails' "$out" 'rc=1'
@@ -186,7 +206,7 @@ assert_contains 'the unreadable manifest has a parseable error' "$out" 'ERROR: R
 # run_revert <fail-restores 0|1> — a throwaway git repo with two modified Rust files and one modified notes file,
 # reverted by rust_revert_post_bump_workdir; prints rc, the log lines and `git status --porcelain`.
 run_revert() {
-  local -r fail_restores="$1"
+  local -r fail_restores="$1" fail_probe="${2:-0}"
   local -r repo="${work_dir}/revert-repo" logs="${work_dir}/revert.log"
   rm -rf "$repo"
   mkdir -p "$repo/src"
@@ -204,7 +224,7 @@ run_revert() {
     set -uo pipefail
     log() { printf '%s\\n' \"\$*\" >>'${logs}'; }
     run_command() { [[ '${fail_restores}' == 1 ]] && return 1; shift; \"\$@\"; }
-    dep_runner_git_c_stdout() { local d=\"\$2\"; shift 3; git -C \"\$d\" \"\$@\"; }
+    dep_runner_git_c_stdout() { [[ '${fail_probe}' == 1 ]] && return 1; local d=\"\$2\"; shift 3; git -C \"\$d\" \"\$@\"; }
     eval \"\$(awk '/^_rust_dirty_paths\\(\\)/{p=1} p{print} p && /^}/{exit}' '${script}')\"
     eval \"\$(awk '/^rust_revert_post_bump_workdir\\(\\)/{p=1} p{print} p && /^}/{exit}' '${script}')\"
     rc=0
@@ -224,6 +244,11 @@ assert_contains 'a revert that cannot restore a file fails' "$out" 'rc=1'
 assert_contains 'the failure lists the leftover Rust paths in a parseable line' \
   "$out" 'ERROR: RUST_REVERT_INCOMPLETE dir='
 assert_contains 'the leftover paths are named' "$out" 'paths=Cargo.toml,src/lib.rs'
+out="$(run_revert 0 1)"
+assert_contains 'a revert whose git probe fails is not mistaken for clean' "$out" 'rc=1'
+assert_contains 'the unreadable probe is reported in the parseable line' \
+  "$out" 'ERROR: RUST_REVERT_INCOMPLETE dir='
+assert_contains 'the line says the paths were unreadable' "$out" 'paths=unreadable'
 
 printf '\n=== static: both bump paths follow the crate to every declaration ===\n'
 single="$(awk '/^rust_update_one\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"
@@ -256,6 +281,19 @@ assert_contains 'rust_update_one reverts when the primary cargo add fails' \
 assert_contains 'the batch path stops and reverts when the primary cargo add fails' \
   "$(awk '/batch crate add failed for/{p=1} p{print} p && /break/{exit}' <<<"$batch")" \
   'rust_batch_diverged=1'
+
+printf '\n=== static: conflicting workspace targets are refused first, and only accepted rows are reported ===\n'
+assert_not_contains 'the target conflict is logged before the first batch cargo add' \
+  "${batch%%RUST_DUAL_PIN_DIVERGED crate=\$\{pkg\} targets=*}" 'dep_runner_cargo_dir "cargo batch add"'
+assert_contains 'a crate with conflicting targets is skipped in the batch loop' \
+  "$batch" 'rust_row_conflict[$pkg]:-}" ]] || continue'
+after_rust="$(awk '/# ── GitHub Actions ──/{p=1} p{print}' "$script")"
+assert_not_contains 'the report loops no longer read every planned Rust row' \
+  "$after_rust" 'done <<< "$rust_lines_arg"'
+assert_not_contains 'the batch summary no longer reads every planned Rust row' \
+  "$after_rust" 'done <<< "${rust_lines_arg:-}"'
+assert_contains 'the cached-diff check needs an accepted Rust row' \
+  "$batch" "-n \"\$rust_accepted_lines\" ]]"
 
 printf '\n=== static: every caller aborts when the Rust revert is incomplete ===\n'
 # shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars

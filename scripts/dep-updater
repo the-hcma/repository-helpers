@@ -6853,20 +6853,20 @@ rust_outdated() {
 
 # _rust_dirty_paths <worktree_dir>
 # The Cargo.toml / Cargo.lock / *.rs paths (workspace members included) that differ from HEAD, staged or not.
+# Returns 1 when either git probe fails, so a caller never mistakes an unreadable worktree for a clean one.
 _rust_dirty_paths() {
   local -r cargo_dir="$1"
-  local f
+  local f unstaged staged
 
+  unstaged="$(dep_runner_git_c_stdout "git worktree" "$cargo_dir" -- diff --name-only HEAD)" || return 1
+  staged="$(dep_runner_git_c_stdout "git worktree" "$cargo_dir" -- diff --cached --name-only)" || return 1
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     case "$f" in
       *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|*/Cargo.lock) printf '%s\n' "$f" ;;
       *) continue ;;
     esac
-  done < <({
-    dep_runner_git_c_stdout "git worktree" "$cargo_dir" -- diff --name-only HEAD 2>/dev/null || true
-    dep_runner_git_c_stdout "git worktree" "$cargo_dir" -- diff --cached --name-only 2>/dev/null || true
-  } | sort -u)
+  done < <(printf '%s\n%s\n' "$unstaged" "$staged" | sort -u)
 }
 
 # rust_revert_post_bump_workdir <worktree_dir>
@@ -6880,18 +6880,26 @@ _rust_dirty_paths() {
 # so the callers abort instead of carrying on (#813).
 rust_revert_post_bump_workdir() {
   local -r cargo_dir="$1"
-  local f leftover=''
+  local f dirty leftover=''
 
+  if ! dirty="$(_rust_dirty_paths "$cargo_dir")"; then
+    log "ERROR: RUST_REVERT_INCOMPLETE dir=${cargo_dir} paths=unreadable (git could not list the changed paths)"
+    return 1
+  fi
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     run_command "git worktree" git -C "$cargo_dir" restore --source=HEAD --staged --worktree -- "$f" \
       2>/dev/null || true
-  done < <(_rust_dirty_paths "$cargo_dir")
+  done <<<"$dirty"
 
+  if ! dirty="$(_rust_dirty_paths "$cargo_dir")"; then
+    log "ERROR: RUST_REVERT_INCOMPLETE dir=${cargo_dir} paths=unreadable (git could not list the changed paths)"
+    return 1
+  fi
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     leftover="${leftover:+${leftover},}${f}"
-  done < <(_rust_dirty_paths "$cargo_dir")
+  done <<<"$dirty"
   if [[ -n "$leftover" ]]; then
     log "ERROR: RUST_REVERT_INCOMPLETE dir=${cargo_dir} paths=${leftover}"
     return 1
@@ -6994,11 +7002,12 @@ rust_recover_post_bump_clippy() {
 
 # rust_sibling_declarations <worktree> <crate>
 # Every direct declaration of <crate> in the manifests under <worktree>, from `cargo metadata`, as TSV:
-#   package<TAB>kind<TAB>target<TAB>rename<TAB>req<TAB>path
+#   package<TAB>kind<TAB>target<TAB>rename<TAB>req<TAB>path<TAB>source
 # kind is normal, dev or build; target is the cfg/triple of a [target.<cfg>.dependencies] table or "-";
 # rename is the dependency key when it differs from the crate name, else "-"; req is the version
 # requirement cargo resolved for that declaration (so a workspace-inherited one shows the inherited value);
-# path is the local path of a `path = "..."` source, else "-". Exit 1 when cargo metadata cannot be read.
+# path is the local path of a `path = "..."` source, else "-"; source is cargo's source id (a `git+...` one for
+# a git dependency, the registry for crates.io), else "-". Exit 1 when cargo metadata cannot be read.
 rust_sibling_declarations() {
   local -r cargo_dir="$1"
   local -r crate="$2"
@@ -7011,28 +7020,35 @@ rust_sibling_declarations() {
   dep_runner_jq_with_args "cargo metadata declarations" "$metadata_json" -r --arg crate "$crate" '
     .packages[]? | .name as $pkg
     | .dependencies[]? | select(.name == $crate)
-    | [$pkg, (.kind // "normal"), (.target // "-"), (.rename // "-"), (.req // "-"), (.path // "-")]
+    | [$pkg, (.kind // "normal"), (.target // "-"), (.rename // "-"), (.req // "-"), (.path // "-"),
+       (.source // "-")]
     | join("\t")'
 }
 
 # rust_preflight_declarations <worktree> <crate> <new_ver>
 # The refusals that must happen before the row's own `cargo add` touches a manifest (#813): a declaration of
 # <crate> that is renamed (`cargo add` cannot bump it by crate name, so it would stay on the old major) or has a
-# `path` source (`cargo add crate@version` would replace the path with the registry). Returns 1 with one
-# machine-parseable ERROR: RUST_DUAL_PIN_DIVERGED (or RUST_DUAL_PIN_UNREADABLE) line; changes nothing.
+# `path` or git source (`cargo add crate@version` would replace it with the registry), or an exact `=x.y.z`
+# requirement (an intentional pin, wherever in the workspace it sits). Returns 1 with one machine-parseable
+# ERROR: RUST_DUAL_PIN_DIVERGED (or RUST_DUAL_PIN_UNREADABLE) line, or a plain skip log for an exact pin;
+# changes nothing.
 rust_preflight_declarations() {
   local -r cargo_dir="$1"
   local -r crate="$2"
   local -r new_ver="$3"
-  local declarations pkg kind target rename req path
+  local declarations pkg kind target rename req path source
 
   if ! declarations="$(rust_sibling_declarations "$cargo_dir" "$crate")"; then
     log "ERROR: RUST_DUAL_PIN_UNREADABLE crate=${crate} dir=${cargo_dir}"
     dep_updater_append_ecosystem_failure "rust|cannot list the declarations of ${crate} (cargo metadata failed)"
     return 1
   fi
-  while IFS=$'\t' read -r pkg kind target rename req path; do
+  while IFS=$'\t' read -r pkg kind target rename req path source; do
     [[ -n "$pkg" ]] || continue
+    if [[ "$req" == =* ]]; then
+      log "[rust] ${crate}: ${pkg} pins it exactly (${req}), an intentional pin; leaving the crate alone."
+      return 1
+    fi
     if [[ "$rename" != '-' ]]; then
       log "ERROR: RUST_DUAL_PIN_DIVERGED crate=${crate} package=${pkg} kind=${kind} target=${target}" \
         "reason=renamed as ${rename}, which cargo add cannot bump"
@@ -7043,6 +7059,12 @@ rust_preflight_declarations() {
       log "ERROR: RUST_DUAL_PIN_DIVERGED crate=${crate} package=${pkg} kind=${kind} target=${target}" \
         "reason=path source ${path}, which cargo add would replace with the registry"
       dep_updater_append_ecosystem_failure "rust|${crate} ${new_ver}: ${pkg} declares it with a path source"
+      return 1
+    fi
+    if [[ "$source" == git+* ]]; then
+      log "ERROR: RUST_DUAL_PIN_DIVERGED crate=${crate} package=${pkg} kind=${kind} target=${target}" \
+        "reason=git source, which cargo add would replace with the registry"
+      dep_updater_append_ecosystem_failure "rust|${crate} ${new_ver}: ${pkg} declares it with a git source"
       return 1
     fi
   done <<<"$declarations"
@@ -7057,7 +7079,7 @@ rust_preflight_declarations() {
 # the declarations cannot be listed, one cannot be bumped, or they do not all end on the same requirement:
 # the caller refuses the whole bump. Two kinds of declaration are refused before anything is changed: a renamed
 # dependency (`cargo add` cannot target it by crate name, so it would stay on the old major) and one with a
-# `path` source (`cargo add crate@version` would replace the path with the registry). What `cargo add` does to
+# `path` or git source (`cargo add crate@version` would replace it with the registry). What `cargo add` does to
 # a workspace-inherited dependency is not assumed: the final re-read is the check that none is left behind.
 rust_bump_sibling_declarations() {
   local -r cargo_dir="$1"
@@ -7075,7 +7097,7 @@ rust_bump_sibling_declarations() {
   # Callers run rust_preflight_declarations before the row's own `cargo add`; repeat it here so this helper is
   # safe on its own.
   rust_preflight_declarations "$cargo_dir" "$crate" "$new_ver" || return 1
-  while IFS=$'\t' read -r pkg kind target _ _ _; do
+  while IFS=$'\t' read -r pkg kind target _; do
     [[ -n "$pkg" ]] || continue
     add_args=("${crate}@${new_ver}")
     case "$kind" in
@@ -7111,7 +7133,7 @@ rust_bump_sibling_declarations() {
       reqs="${reqs:+${reqs},}${req}"
     fi
   done <<<"$after_declarations"
-  if [[ "$reqs" == *,* ]]; then
+  if (( ${#seen_reqs[@]} > 1 )); then
     log "ERROR: RUST_DUAL_PIN_DIVERGED crate=${crate} reqs=${reqs} (declarations still disagree after the bump)"
     dep_updater_append_ecosystem_failure \
       "rust|${crate} ${new_ver}: declarations still disagree after the bump (${reqs})"
@@ -8057,9 +8079,29 @@ batch_update_all() {
   # ── Rust / Cargo ─────────────────────────────────────────────────────────
   local any_rust=0
   local rust_batch_diverged=0
+  local rust_accepted_lines=''
+  local -A rust_row_target=()
+  local -A rust_row_conflict=()
   if [[ "$has_rust" == '1' && -n "$rust_lines_arg" && "$security_only" == '0' ]]; then
+    # Two workspace members can yield rows for one crate with different targets, and each row's sibling bump
+    # moves every declaration: refuse such a crate before the first `cargo add` (#813).
+    while IFS=$'\t' read -r pkg old_ver new_ver _; do
+      [[ -z "$pkg" ]] && continue
+      if [[ -z "${rust_row_target[$pkg]:-}" ]]; then
+        rust_row_target[$pkg]="$new_ver"
+      elif [[ "${rust_row_target[$pkg]}" != "$new_ver" ]]; then
+        rust_row_conflict[$pkg]="${rust_row_conflict[$pkg]:-${rust_row_target[$pkg]}},${new_ver}"
+      fi
+    done <<< "$rust_lines_arg"
+    for pkg in "${!rust_row_conflict[@]}"; do
+      log "ERROR: RUST_DUAL_PIN_DIVERGED crate=${pkg} targets=${rust_row_conflict[$pkg]}" \
+        "(workspace rows disagree on the target version)"
+      dep_updater_append_ecosystem_failure \
+        "rust|${pkg}: workspace rows propose different targets (${rust_row_conflict[$pkg]})"
+    done
     while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
       [[ -z "$pkg" ]] && continue
+      [[ -z "${rust_row_conflict[$pkg]:-}" ]] || continue
       log "[rust] Batch update: ${pkg} ${old_ver} → ${new_ver}"
       # Nothing has been touched for this crate yet: a refusal here skips just this crate.
       if ! rust_preflight_declarations "$worktree_path" "$pkg" "$new_ver"; then
@@ -8089,21 +8131,27 @@ batch_update_all() {
         rust_batch_diverged=1
         break
       fi
+      rust_accepted_lines="${rust_accepted_lines:+${rust_accepted_lines}$'\n'}"
+      rust_accepted_lines+="${pkg}"$'\t'"${old_ver}"$'\t'"${new_ver}"$'\t'"${dep_kind}"$'\t'
+      rust_accepted_lines+="${dep_package}"$'\t'"${dep_platform}"
     done <<< "$rust_lines_arg"
     if [[ "$rust_batch_diverged" == '1' ]]; then
       log "[rust] Reverting Rust batch bumps: a crate's declarations could not all be bumped;" \
         "continuing other ecosystems."
       rust_revert_post_bump_workdir "$worktree_path" \
         || die "Rust revert incomplete after the dual-pin refusal (RUST_REVERT_INCOMPLETE above)"
+      rust_accepted_lines=''
     fi
     run_command "git worktree" git -C "$worktree_path" add -u
-    if [[ "$rust_batch_diverged" != '1' ]] && ! git -C "$worktree_path" diff --cached --quiet; then
+    if [[ "$rust_batch_diverged" != '1' && -n "$rust_accepted_lines" ]] \
+      && ! git -C "$worktree_path" diff --cached --quiet; then
       any_rust=1
       if ! rust_recover_post_bump_clippy "$worktree_path"; then
         log "[rust] Reverting Rust batch bumps after unrecovered clippy; continuing other ecosystems."
         rust_revert_post_bump_workdir "$worktree_path" \
           || die "Rust revert incomplete after the clippy failure (RUST_REVERT_INCOMPLETE above)"
         any_rust=0
+        rust_accepted_lines=''
       else
         run_command "git worktree" git -C "$worktree_path" add -u
       fi
@@ -8234,11 +8282,11 @@ batch_update_all() {
           printf "| python/%s | \`%s\` | \`%s\` | \`%s\` | no | - |\n" "$py_tool" "$pkg" "$old_ver" "$new_ver"
         done <<< "$report_py_lines"
       fi
-      if [[ "$any_rust" == '1' && -n "$rust_lines_arg" ]]; then
+      if [[ "$any_rust" == '1' && -n "$rust_accepted_lines" ]]; then
         while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
           [[ -z "$pkg" ]] && continue
           printf "| rust/cargo | \`%s\` | \`%s\` | \`%s\` | no | - |\n" "$pkg" "$old_ver" "$new_ver"
-        done <<< "$rust_lines_arg"
+        done <<< "$rust_accepted_lines"
       fi
       if [[ "$any_gha" == '1' && -n "$gha_lines_arg" ]]; then
         while IFS=$'\t' read -r action cur_ref new_ref; do
@@ -8291,14 +8339,14 @@ batch_update_all() {
           printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$pkg" "$old_ver" "$new_ver"
         done <<< "$report_py_lines"
       fi
-      if [[ "$any_rust" == '1' && -n "$rust_lines_arg" ]]; then
+      if [[ "$any_rust" == '1' && -n "$rust_accepted_lines" ]]; then
         printf '## Rust updates\n\n'
         printf '| Crate | From | To |\n'
         printf '|---|---|---|\n'
         while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
           [[ -z "$pkg" ]] && continue
           printf "| \`%s\` | \`%s\` | \`%s\` |\n" "$pkg" "$old_ver" "$new_ver"
-        done <<< "$rust_lines_arg"
+        done <<< "$rust_accepted_lines"
         printf '\n'
       fi
       if [[ "$any_gha" == '1' && -n "$gha_lines_arg" ]]; then
@@ -8352,7 +8400,7 @@ batch_update_all() {
     while IFS=$'\t' read -r pkg old_ver new_ver dep_kind dep_package dep_platform; do
       [[ -z "$pkg" ]] && continue
       add_summary_line "rust/cargo" "$pkg" "$old_ver" "$new_ver" "$branch" "$pr_num" "no" "-"
-    done <<< "${rust_lines_arg:-}"
+    done <<< "$rust_accepted_lines"
   fi
   if [[ "$any_gha" == '1' ]]; then
     while IFS=$'\t' read -r action cur_ref new_ref; do
