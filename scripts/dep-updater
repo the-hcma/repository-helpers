@@ -6788,10 +6788,32 @@ rust_is_pinned() {
   return 1
 }
 
+# _rust_version_gt <a> <b>
+# True when version a is newer than b. `sort -V` ranks 1.0.0-rc.1 above 1.0.0, so a prerelease is compared by
+# its base version and then ranked below the release of the same base, as semver orders them. Build metadata
+# (+...) is ignored.
+_rust_version_gt() {
+  local -r a="${1%%+*}" b="${2%%+*}"
+  local -r a_base="${a%%-*}" b_base="${b%%-*}"
+  local -r a_pre="${a#"$a_base"}" b_pre="${b#"$b_base"}"
+
+  if [[ "$a_base" != "$b_base" ]]; then
+    [[ "$(printf '%s\n%s\n' "$a_base" "$b_base" | sort -V | tail -1)" == "$a_base" ]]
+    return
+  fi
+  [[ "$a_pre" != "$b_pre" ]] || return 1
+  [[ -n "$a_pre" ]] || return 0
+  [[ -n "$b_pre" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$a_pre" "$b_pre" | sort -V | tail -1)" == "$a_pre" ]]
+}
+
 # _crates_io_versions_json <crate> [cache_dir]
 # Prints the crates.io versions payload (num, created_at, yanked per version), or nothing when it cannot be
 # read. crates.io rejects requests without a User-Agent. A cache directory shares one fetch between the rows
-# of a crate (a workspace yields one row per member). DEP_UPDATER_SKIP_CRATES_REGISTRY=1 skips the lookup.
+# of a crate (a workspace yields one row per member). Only the first page is read: the newest 100 versions by
+# semver, which holds every version between a current and a proposed one; a crate whose current version is
+# older than that page is skipped with a log line rather than waved through. DEP_UPDATER_SKIP_CRATES_REGISTRY=1
+# skips the lookup.
 _crates_io_versions_json() {
   local -r crate="$1"
   local -r cache_dir="${2:-}"
@@ -6807,7 +6829,7 @@ _crates_io_versions_json() {
   exit_code=0
   runner_exec "crates.io versions ${crate}" -- curl --silent --fail --max-time 15 --retry 2 --retry-delay 2 \
     --user-agent 'repository-helpers-dep-updater (https://github.com/the-hcma/repository-helpers)' \
-    "https://crates.io/api/v1/crates/${crate}/versions" || exit_code=$?
+    "https://crates.io/api/v1/crates/${crate}/versions?per_page=100&sort=semver" || exit_code=$?
   body="$(dep_runner_last_stdout)"
   [[ "$exit_code" == 0 && -n "$body" ]] || return 1
   if [[ -n "$cache_dir" ]]; then
@@ -6845,7 +6867,7 @@ rust_pick_eligible_new_version() {
   local -r target="$3"
   local -r cache_dir="${4:-}"
   local body versions ver created created_epoch now_epoch age_minutes
-  local picked='' newest_age=''
+  local picked='' oldest_age='' in_range=0
 
   if ! body="$(_crates_io_versions_json "$crate" "$cache_dir")"; then
     printf '%s' "$target"
@@ -6860,21 +6882,21 @@ rust_pick_eligible_new_version() {
   while IFS=$'\t' read -r ver created; do
     [[ -n "$ver" ]] || continue
     # Newer than the proposed target: not ours to propose. Not newer than the current one: nothing left.
-    if [[ "$ver" != "$target" && "$(printf '%s\n%s\n' "$ver" "$target" | sort -V | tail -1)" == "$ver" ]]; then
+    if _rust_version_gt "$ver" "$target"; then
       continue
     fi
-    if [[ "$ver" == "$current" || "$(printf '%s\n%s\n' "$ver" "$current" | sort -V | tail -1)" == "$current" ]]; then
+    if ! _rust_version_gt "$ver" "$current"; then
       break
     fi
+    in_range=1
+    # An unknown publish time allows the version, like the other registries.
     created_epoch="$(npm_parse_iso8601_to_epoch "$created" 2>/dev/null || true)"
     if [[ -z "$created_epoch" ]]; then
       picked="$ver"
       break
     fi
     age_minutes=$(( (now_epoch - created_epoch) / 60 ))
-    if [[ -z "$newest_age" ]]; then
-      newest_age="$age_minutes"
-    fi
+    oldest_age="$age_minutes"
     if (( age_minutes >= dep_updater_minimum_release_age_minutes )); then
       picked="$ver"
       break
@@ -6882,10 +6904,13 @@ rust_pick_eligible_new_version() {
   done <<<"$versions"
 
   if [[ -z "$picked" ]]; then
-    if [[ -n "$newest_age" ]]; then
-      log "[rust] Skipping ${crate} ${current}→${target}: the newest candidate was published ${newest_age}m ago;" \
-        "$(( (dep_updater_minimum_release_age_minutes - newest_age + 1439) / 1440 )) day(s) until it is old" \
+    if [[ -n "$oldest_age" ]]; then
+      # The oldest candidate in range is the first to become eligible.
+      log "[rust] Skipping ${crate} ${current}→${target}: the oldest candidate was published ${oldest_age}m ago;" \
+        "$(( (dep_updater_minimum_release_age_minutes - oldest_age + 1439) / 1440 )) day(s) until it is old" \
         "enough (minimum release age is ${dep_updater_minimum_release_age_minutes}m)."
+    elif (( in_range == 0 )); then
+      log "[rust] Skipping ${crate} ${current}→${target}: no version between them in the newest 100 on crates.io."
     fi
     return 1
   fi
@@ -6904,7 +6929,7 @@ rust_pick_eligible_new_version() {
 rust_outdated() {
   local -r target_dir="${1:-$dir}"
   local -a outdated_args=(--root-deps-only --format json)
-  local json_out dep_name cur target dep_kind dep_package dep_platform eligible crates_cache
+  local json_out dep_name cur target dep_kind dep_package dep_platform eligible crates_cache rows_rc=0
 
   if rust_workspace_enabled "$target_dir"; then
     outdated_args+=(--workspace)
@@ -6959,8 +6984,9 @@ rust_outdated() {
         [[ -z "$dep_platform" ]] && dep_platform="-"
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
           "$dep_name" "$cur" "$target" "$dep_kind" "$dep_package" "$dep_platform"
-      done
+      done || rows_rc=$?
   rm -rf "$crates_cache"
+  return "$rows_rc"
 }
 
 # _rust_dirty_paths <worktree_dir>

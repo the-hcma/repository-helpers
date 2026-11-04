@@ -55,7 +55,7 @@ run_pick() {
       if [[ '${payload}' == EMPTY ]]; then printf '{\"versions\":[]}'; else cat '${payload_file}'; fi
     }
     for fn in _npm_version_is_stable_release npm_parse_iso8601_to_epoch _crates_stable_versions_desc_from_body \\
-      rust_pick_eligible_new_version; do
+      _rust_version_gt rust_pick_eligible_new_version; do
       eval \"\$(awk -v f=\"\$fn\" '\$0 ~ \"^\" f \"\\\\(\\\\)\"{p=1} p{print} p && /^}/{exit}' '${script}')\"
     done
     rc=0
@@ -89,7 +89,20 @@ printf '\n=== a crate whose newer versions are all too new is skipped, saying fo
 out="$(run_pick "$(fixture 0.40.0:1:false 0.39.9:3:false 0.39.0:60:false)" 0.39.0 0.40.0)"
 assert_contains 'the row is skipped' "$out" 'rc=1'
 assert_contains 'the log names the crate and versions' "$out" '[rust] Skipping sysinfo 0.39.0→0.40.0'
-assert_contains 'the log says how many days remain' "$out" '8 day(s) until it is old enough'
+assert_contains 'the log counts from the oldest candidate, the first to become eligible' "$out" '6 day(s) until it is old enough'
+
+printf '\n=== a prerelease current version does not block its own release ===\n'
+out="$(run_pick "$(fixture 1.0.0:30:false 1.0.0-rc.1:60:false)" 1.0.0-rc.1 1.0.0)"
+assert_contains 'the release is proposed over its release candidate' "$out" 'out=1.0.0 rc=0'
+
+printf '\n=== an unparseable publish time allows the version, like the other registries ===\n'
+out="$(run_pick '{"versions":[{"num":"0.40.0","created_at":"","yanked":false}]}' 0.39.0 0.40.0)"
+assert_contains 'a version with no usable created_at is proposed' "$out" 'out=0.40.0 rc=0'
+
+printf '\n=== no version between current and target on the page is skipped with a log line ===\n'
+out="$(run_pick "$(fixture 0.50.0:30:false 0.49.0:30:false)" 0.30.0 0.40.0)"
+assert_contains 'the row is skipped' "$out" 'rc=1'
+assert_contains 'the log says why' "$out" 'no version between them in the newest 100 on crates.io'
 
 printf '\n=== the proposal stays within the target and above the current version ===\n'
 out="$(run_pick "$(fixture 0.42.0:30:false 0.41.0:30:false 0.40.0:30:false)" 0.40.0 0.41.0)"
@@ -103,12 +116,40 @@ assert_contains 'an unreadable registry keeps the target' "$out" 'out=0.40.0 rc=
 out="$(run_pick EMPTY 0.39.0 0.40.0)"
 assert_contains 'a crate crates.io does not list keeps the target' "$out" 'out=0.40.0 rc=0'
 
+printf '\n=== version ordering follows semver, not sort -V ===\n'
+gt() {
+  bash -c "
+    eval \"\$(awk '/^_rust_version_gt\\(\\)/{p=1} p{print} p && /^}/{exit}' '${script}')\"
+    if _rust_version_gt '$1' '$2'; then echo yes; else echo no; fi"
+}
+assert_contains 'a release is newer than its prerelease' "$(gt 1.0.0 1.0.0-rc.1)" 'yes'
+assert_contains 'a prerelease is older than its release' "$(gt 1.0.0-rc.1 1.0.0)" 'no'
+assert_contains '0.10.0 is newer than 0.9.0' "$(gt 0.10.0 0.9.0)" 'yes'
+assert_contains 'a later prerelease of the same base is newer' "$(gt 1.0.0-rc.2 1.0.0-rc.1)" 'yes'
+assert_contains 'build metadata is ignored' "$(gt 1.0.0+build5 1.0.0)" 'no'
+assert_contains 'a version is not newer than itself' "$(gt 0.40.0 0.40.0)" 'no'
+
+printf '\n=== one fetch serves every row of a crate ===\n'
+fetches="$(bash -c "
+  set -uo pipefail
+  count=0
+  runner_exec() { count=\$((count + 1)); return 0; }
+  dep_runner_last_stdout() { printf '%s' '{\"versions\":[]}'; }
+  eval \"\$(awk '/^_crates_io_versions_json\\(\\)/{p=1} p{print} p && /^}/{exit}' '${script}')\"
+  cache=\$(mktemp -d)
+  _crates_io_versions_json sysinfo \"\$cache\" >/dev/null
+  _crates_io_versions_json sysinfo \"\$cache\" >/dev/null
+  echo fetches=\$count
+  rm -rf \"\$cache\"")"
+assert_contains 'the second row of a crate reuses the cached payload' "$fetches" 'fetches=1'
+
 printf '\n=== the registry lookup can be switched off, and sends a User-Agent ===\n'
 fetch_fn="$(awk '/^_crates_io_versions_json\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"
 assert_contains 'the lookup honors DEP_UPDATER_SKIP_CRATES_REGISTRY' \
   "$fetch_fn" 'DEP_UPDATER_SKIP_CRATES_REGISTRY:-0}" == '"'1'"
 assert_contains 'the request identifies dep-updater, as crates.io requires' "$fetch_fn" '--user-agent'
 assert_contains 'the request is bounded by a timeout' "$fetch_fn" '--max-time 15'
+assert_contains 'the request asks for the newest 100 versions by semver' "$fetch_fn" 'versions?per_page=100&sort=semver'
 
 printf '\n=== static: rust_outdated applies the gate after the pin check and drops skipped rows ===\n'
 outdated_fn="$(awk '/^rust_outdated\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"
@@ -118,7 +159,10 @@ assert_contains 'the picker runs per row and a skipped row is dropped' \
 assert_not_contains 'the picker runs after the exact-pin check, not before' \
   "${outdated_fn%%rust_is_pinned*}" 'rust_pick_eligible_new_version'
 assert_contains 'the emitted target is the eligible version' "$outdated_fn" 'target="$eligible"'
-assert_contains 'the per-run cache directory is removed' "$outdated_fn" 'rm -rf "$crates_cache"'
+assert_contains 'the per-run cache directory is removed even when the row pipeline fails' \
+  "$outdated_fn" 'done || rows_rc=$?'
+assert_contains 'the cache directory is removed before the status is returned' \
+  "${outdated_fn#*rows_rc=\$?}" 'rm -rf "$crates_cache"'
 
 printf '\n=== static: AGENTS.md documents the Rust gate and its lack of a CVE exemption ===\n'
 agents="$(cat "${script_dir}/../AGENTS.md")"
