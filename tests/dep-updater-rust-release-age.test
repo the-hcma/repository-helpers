@@ -91,6 +91,15 @@ assert_contains 'the row is skipped' "$out" 'rc=1'
 assert_contains 'the log names the crate and versions' "$out" '[rust] Skipping sysinfo 0.39.0→0.40.0'
 assert_contains 'the log counts from the oldest candidate, the first to become eligible' "$out" '6 day(s) until it is old enough'
 
+printf '\n=== the skip log counts from the oldest candidate even when publication order differs ===\n'
+out="$(run_pick "$(fixture 0.40.0:8:false 0.39.5:1:false 0.39.0:60:false)" 0.39.0 0.40.0)"
+assert_contains 'the 8-day-old 0.40.0 sets the wait, not the 1-day-old 0.39.5' "$out" '1 day(s) until it is old enough'
+
+printf '\n=== a page with versions but none stable and live is skipped, not waved through ===\n'
+out="$(run_pick "$(fixture 0.40.0-rc.2:30:false 0.40.0-rc.1:40:false 0.39.9:30:true)" 0.40.0-rc.1 0.40.0-rc.2)"
+assert_contains 'a prerelease target with no stable version to fall back to is skipped' "$out" 'rc=1'
+assert_contains 'the log says there is nothing stable to propose' "$out" 'no stable, non-yanked version on crates.io to propose'
+
 printf '\n=== a prerelease current version does not block its own release ===\n'
 out="$(run_pick "$(fixture 1.0.0:30:false 1.0.0-rc.1:60:false)" 1.0.0-rc.1 1.0.0)"
 assert_contains 'the release is proposed over its release candidate' "$out" 'out=1.0.0 rc=0'
@@ -142,6 +151,72 @@ fetches="$(bash -c "
   echo fetches=\$count
   rm -rf \"\$cache\"")"
 assert_contains 'the second row of a crate reuses the cached payload' "$fetches" 'fetches=1'
+
+# run_pin <lock-versions space separated|NONE> <stub: moves|stuck> — rust_pin_locked_version against a throwaway
+# Cargo.lock for 0.39.5; `cargo update --precise` is stubbed to rewrite the matching lock entry (moves) or to do
+# nothing (stuck). Prints rc, the cargo calls and the log lines.
+run_pin() {
+  local -r versions="$1" stub="$2"
+  local -r dir="${work_dir}/pin" logs="${work_dir}/pin.log" calls="${work_dir}/pin.calls"
+  local v
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  if [[ "$versions" != NONE ]]; then
+    for v in $versions; do
+      printf '[[package]]\nname = "sysinfo"\nversion = "%s"\n\n' "$v" >>"$dir/Cargo.lock"
+    done
+  fi
+  : >"$logs"
+  : >"$calls"
+  bash -c "
+    set -uo pipefail
+    log() { printf '%s\\n' \"\$*\" >>'${logs}'; }
+    dep_updater_append_ecosystem_failure() { printf 'FAILURE %s\\n' \"\$*\" >>'${logs}'; }
+    dep_runner_cargo_dir() {
+      shift 3
+      printf '%s\\n' \"\$*\" >>'${calls}'
+      [[ '${stub}' == moves ]] || return 0
+      local spec=\"\$3\" precise=\"\$5\"
+      sed -i \"s/^version = \\\"\${spec#*@}\\\"/version = \\\"\${precise}\\\"/\" '${dir}/Cargo.lock'
+    }
+    for fn in _npm_version_is_stable_release _rust_version_gt _rust_semver_compat_key _rust_locked_drift \\
+      rust_pin_locked_version; do
+      eval \"\$(awk -v f=\"\$fn\" '\$0 ~ \"^\" f \"\\\\(\\\\)\"{p=1} p{print} p && /^}/{exit}' '${script}')\"
+    done
+    rc=0
+    rust_pin_locked_version '${dir}' sysinfo 0.39.5 || rc=\$?
+    echo rc=\$rc" 2>&1
+  cat "$calls"
+  cat "$logs"
+}
+
+printf '\n=== the lockfile is held at the version that passed the gate ===\n'
+out="$(run_pin '0.39.9' moves)"
+assert_contains 'a lock that resolved past the gated version is pinned back' \
+  "$out" 'update --package sysinfo@0.39.9 --precise 0.39.5'
+assert_contains 'the pin succeeds' "$out" 'rc=0'
+out="$(run_pin '0.39.5' moves)"
+assert_contains 'a lock already on the version needs no update' "$out" 'rc=0'
+assert_not_contains 'no cargo update ran' "$out" 'update --package'
+out="$(run_pin NONE moves)"
+assert_contains 'no lockfile is fine' "$out" 'rc=0'
+out="$(run_pin '0.38.2 0.39.5' moves)"
+assert_not_contains 'a transitive version of another caret range is left alone' "$out" 'update --package'
+out="$(run_pin '0.39.9' stuck)"
+assert_contains 'a lock that cannot be held at the version refuses the bump' "$out" 'rc=1'
+assert_contains 'the refusal is one parseable line naming both versions' \
+  "$out" 'ERROR: RUST_LOCK_DRIFT crate=sysinfo wanted=0.39.5 locked=0.39.9'
+assert_contains 'the failure is recorded for the report' "$out" 'FAILURE rust|sysinfo 0.39.5'
+
+printf '\n=== static: the lock pin runs after the sibling bump in both paths ===\n'
+single_fn="$(awk '/^rust_update_one\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"
+# shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars
+assert_contains 'rust_update_one pins the lock after the declarations are bumped' \
+  "${single_fn#*rust_bump_sibling_declarations \"\$worktree_path\"}" 'rust_pin_locked_version "$worktree_path" "$pkg" "$new_ver"'
+batch_block="$(awk '/# ── Rust \/ Cargo ──/{p=1} p{print} p && /# ── GitHub Actions ──/{exit}' "$script")"
+# shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars
+assert_contains 'the batch path pins the lock after the declarations are bumped' \
+  "${batch_block#*rust_bump_sibling_declarations \"\$worktree_path\"}" 'rust_pin_locked_version "$worktree_path" "$pkg" "$new_ver"'
 
 printf '\n=== the registry lookup can be switched off, and sends a User-Agent ===\n'
 fetch_fn="$(awk '/^_crates_io_versions_json\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"

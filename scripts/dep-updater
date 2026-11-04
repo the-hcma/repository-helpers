@@ -6811,9 +6811,8 @@ _rust_version_gt() {
 # Prints the crates.io versions payload (num, created_at, yanked per version), or nothing when it cannot be
 # read. crates.io rejects requests without a User-Agent. A cache directory shares one fetch between the rows
 # of a crate (a workspace yields one row per member). Only the first page is read: the newest 100 versions by
-# semver, which holds every version between a current and a proposed one; a crate whose current version is
-# older than that page is skipped with a log line rather than waved through. DEP_UPDATER_SKIP_CRATES_REGISTRY=1
-# skips the lookup.
+# semver; the picker works over that page, and the row is skipped with a log line only when no version on it
+# qualifies. DEP_UPDATER_SKIP_CRATES_REGISTRY=1 skips the lookup.
 _crates_io_versions_json() {
   local -r crate="$1"
   local -r cache_dir="${2:-}"
@@ -6875,6 +6874,13 @@ rust_pick_eligible_new_version() {
   fi
   versions="$(_crates_stable_versions_desc_from_body "$body" || true)"
   if [[ -z "$versions" ]]; then
+    # A page that lists versions but no stable, non-yanked one must not wave the target through unchecked (a
+    # prerelease target, say); a body with no versions at all is a crate crates.io does not know.
+    if [[ "$(dep_runner_jq_string "crates.io version count" "$body" '.versions | length' 2>/dev/null || true)" \
+      =~ ^[1-9] ]]; then
+      log "[rust] Skipping ${crate} ${current}→${target}: no stable, non-yanked version on crates.io to propose."
+      return 1
+    fi
     printf '%s' "$target"
     return 0
   fi
@@ -6896,7 +6902,10 @@ rust_pick_eligible_new_version() {
       break
     fi
     age_minutes=$(( (now_epoch - created_epoch) / 60 ))
-    oldest_age="$age_minutes"
+    # Keep the largest age: publication order can differ from version order (backports).
+    if [[ -z "$oldest_age" ]] || (( age_minutes > oldest_age )); then
+      oldest_age="$age_minutes"
+    fi
     if (( age_minutes >= dep_updater_minimum_release_age_minutes )); then
       picked="$ver"
       break
@@ -7208,6 +7217,70 @@ rust_preflight_declarations() {
   done <<<"$declarations"
 }
 
+# _rust_semver_compat_key <version>
+# The part of a version that Cargo's caret requirement holds fixed: the major, or 0.minor below 1.0, or the
+# whole version below 0.1 (so ^0.39.5 and 0.39.9 share the key 0.39).
+_rust_semver_compat_key() {
+  local -r base="${1%%[-+]*}"
+  local major minor patch
+
+  IFS=. read -r major minor patch <<<"$base"
+  if [[ "$major" != 0 ]]; then
+    printf '%s' "$major"
+  elif [[ "$minor" != 0 ]]; then
+    printf '0.%s' "$minor"
+  else
+    printf '0.0.%s' "${patch:-0}"
+  fi
+}
+
+# _rust_locked_drift <worktree> <crate> <ver>
+# Prints every version of <crate> in Cargo.lock that is newer than <ver> within the same caret-compatible range.
+_rust_locked_drift() {
+  local -r cargo_dir="$1"
+  local -r crate="$2"
+  local -r ver="$3"
+  local key lock_ver
+
+  [[ -f "${cargo_dir}/Cargo.lock" ]] || return 0
+  key="$(_rust_semver_compat_key "$ver")"
+  while IFS= read -r lock_ver; do
+    [[ -n "$lock_ver" ]] || continue
+    if [[ "$(_rust_semver_compat_key "$lock_ver")" == "$key" ]] && _rust_version_gt "$lock_ver" "$ver"; then
+      printf '%s\n' "$lock_ver"
+    fi
+  done < <(awk -v crate="$crate" '
+    $0 == "name = \"" crate "\"" { found = 1; next }
+    found && /^version = / { gsub(/^version = "|"$/, ""); print; found = 0 }' "${cargo_dir}/Cargo.lock")
+}
+
+# rust_pin_locked_version <worktree> <crate> <new_ver>
+# `cargo add crate@X` writes the requirement ^X, and when the lockfile holds an older version Cargo re-resolves
+# to the newest matching one, which can be a release still inside the release-age window (#819). Pin the lock
+# to exactly <new_ver> with `cargo update --precise` and verify. Returns 1 with one parseable ERROR:
+# RUST_LOCK_DRIFT line when the lock cannot be held at <new_ver>; the caller refuses the bump. No lockfile, or a
+# lock already at <new_ver>, is fine.
+rust_pin_locked_version() {
+  local -r cargo_dir="$1"
+  local -r crate="$2"
+  local -r new_ver="$3"
+  local drift lock_ver
+
+  drift="$(_rust_locked_drift "$cargo_dir" "$crate" "$new_ver")"
+  while IFS= read -r lock_ver; do
+    [[ -n "$lock_ver" ]] || continue
+    dep_runner_cargo_dir "cargo lock pin" "$cargo_dir" -- update --package "${crate}@${lock_ver}" \
+      --precise "$new_ver" || true
+  done <<<"$drift"
+  drift="$(_rust_locked_drift "$cargo_dir" "$crate" "$new_ver")"
+  if [[ -n "$drift" ]]; then
+    log "ERROR: RUST_LOCK_DRIFT crate=${crate} wanted=${new_ver} locked=${drift//$'\n'/,}" \
+      "(the lockfile resolved to a newer release than the one that passed the release-age gate)"
+    dep_updater_append_ecosystem_failure "rust|${crate} ${new_ver}: Cargo.lock resolved to ${drift//$'\n'/,}"
+    return 1
+  fi
+}
+
 # rust_bump_sibling_declarations <worktree> <crate> <new_ver>
 # `cargo outdated` reports one row per crate, so bumping that row leaves a second declaration of the same
 # crate (a [target.'cfg(...)'.dependencies] pin next to the root pin, or the same crate in another
@@ -7354,6 +7427,14 @@ rust_update_one() {
     log "[rust] Skipping ${pkg} ${old_ver}→${new_ver}: not every declaration of the crate could be bumped."
     rust_revert_post_bump_workdir "$worktree_path" \
       || die "Rust revert incomplete after refusing ${pkg} (RUST_REVERT_INCOMPLETE above)"
+    return 0
+  fi
+
+  # Hold the lockfile at exactly the version that passed the release-age gate (#819).
+  if ! rust_pin_locked_version "$worktree_path" "$pkg" "$new_ver"; then
+    log "[rust] Skipping ${pkg} ${old_ver}→${new_ver}: the lockfile did not stay on ${new_ver}."
+    rust_revert_post_bump_workdir "$worktree_path" \
+      || die "Rust revert incomplete after the lock drift of ${pkg} (RUST_REVERT_INCOMPLETE above)"
     return 0
   fi
 
@@ -8266,6 +8347,10 @@ batch_update_all() {
         break
       elif ! rust_bump_sibling_declarations "$worktree_path" "$pkg" "$new_ver"; then
         # Some declarations of this crate are bumped and some are not: refuse every Rust bump of the batch.
+        rust_batch_diverged=1
+        break
+      elif ! rust_pin_locked_version "$worktree_path" "$pkg" "$new_ver"; then
+        # The lockfile resolved past the version that passed the release-age gate (#819).
         rust_batch_diverged=1
         break
       fi
