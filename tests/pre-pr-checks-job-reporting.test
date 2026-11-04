@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Tests for how pre-pr-checks reports its parallel jobs (#793). Two runs hit their timeout with exit 124 and no
+# output at all, because the per-job results were printed only after every job had finished. Each job is now
+# reported as it finishes, a failure shows its log at once, and a TERM (the signal `timeout` sends) names the jobs
+# that had not finished. The real functions are extracted from the script and run with fake jobs.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/dev/pre-pr-checks"
+readonly script
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+
+# run_scenario <name> — runs the extracted job functions for one scenario in a child shell; stderr goes to
+# ${work_dir}/<name>.out, the child's exit status to ${work_dir}/<name>.rc. A fake job that has to wait for another
+# job's report polls the output file with a hard cap, so a regression fails the test instead of hanging it.
+run_scenario() {
+  local -r name="$1"
+  local -r out="${work_dir}/${name}.out"
+  local scenario_rc=0
+  : >"$out"
+  (
+    set -uo pipefail
+    export out scenario="$name" flag="${work_dir}/${name}.flag" jobs_dir="${work_dir}/${name}.jobs"
+    mkdir -p "$jobs_dir"
+    prec_pr_jobs_dir="$jobs_dir"
+    prec_pr_job_count=0
+    prec_pr_fail_count=0
+    prec_pr_max_jobs=0
+    prec_pr_job_names=()
+    runner_session_begin() { :; }
+    runner_session_end() { :; }
+    prec_print_skip_notes() { :; }
+    die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+    for fn in log_step start_parallel_job report_finished_jobs report_running_jobs_on_signal wait_parallel_checks; do
+      eval "$(awk -v fn="$fn" '$0 ~ "^"fn"\\(\\)"{p=1} p{print} p && /^}/{exit}' "$script")"
+    done
+    # wait_for <text> — poll the output file for text, at most about 20 s.
+    wait_for() {
+      local i=0
+      until grep --quiet --fixed-strings -- "$1" "$out"; do
+        sleep 0.05
+        i=$((i + 1))
+        (( i < 400 )) || return 1
+      done
+    }
+    job_fast() { :; }
+    job_bad() { echo 'boom from the failing job'; return 3; }
+    job_after_fast() { wait_for 'passed: fast'; }
+    job_after_bad() { wait_for 'FAILED: bad'; }
+    job_quick() { :; }
+    job_hang() {
+      local i=0
+      until [[ -e "$flag" ]]; do
+        sleep 0.05
+        i=$((i + 1))
+        (( i < 400 )) || return 1
+      done
+    }
+    case "$scenario" in
+      early-pass)
+        start_parallel_job fast job_fast
+        start_parallel_job slow job_after_fast
+        ;;
+      early-fail)
+        start_parallel_job bad job_bad
+        start_parallel_job slow job_after_bad
+        ;;
+      term)
+        start_parallel_job quick job_quick
+        start_parallel_job hang job_hang
+        ;;
+    esac
+    prec_pr_job_count="${#prec_pr_job_names[@]}"
+    wait_parallel_checks
+  ) 2>"$out" || scenario_rc=$?
+  printf '%s\n' "$scenario_rc" >"${work_dir}/${name}.rc"
+}
+
+printf '\n=== a job is reported as soon as it finishes, not after the slowest one ===\n'
+run_scenario early-pass || true
+out="$(<"${work_dir}/early-pass.out")"
+assert_contains 'the fast job is reported' "$out" 'passed: fast'
+assert_contains 'the slow job, which waits for the fast job report, then passes' "$out" 'passed: slow'
+assert_contains 'the run exits 0' "rc=$(<"${work_dir}/early-pass.rc")" 'rc=0'
+first_line="$(grep --max-count=1 'passed: ' "${work_dir}/early-pass.out")"
+assert_contains 'the fast job is the first one reported' "$first_line" 'passed: fast'
+
+printf '\n=== a failure shows its log at once and the run still fails ===\n'
+run_scenario early-fail || true
+out="$(<"${work_dir}/early-fail.out")"
+assert_contains 'the failing job is reported with its exit status' "$out" 'FAILED: bad (exit 3)'
+assert_contains 'the failing job log follows the report' "$out" 'boom from the failing job'
+assert_contains 'the job that waited for the failure report was not left behind' "$out" 'passed: slow'
+assert_contains 'the run fails with a count of the failed checks' "$out" 'ERROR: 1 parallel check(s) failed'
+assert_not_contains 'the run does not exit 0' "rc=$(<"${work_dir}/early-fail.rc")" 'rc=0'
+
+printf '\n=== a TERM names the jobs that had not finished ===\n'
+(
+  run_scenario term
+) &
+scenario_pid=$!
+# The scenario shell is the child of the subshell above; find it by the file it is writing to.
+i=0
+until grep --quiet --fixed-strings 'passed: quick' "${work_dir}/term.out" 2>/dev/null; do
+  sleep 0.05
+  i=$((i + 1))
+  (( i < 400 )) || break
+done
+term_target="$(pgrep --newest --parent "$scenario_pid" || true)"
+if [[ -n "$term_target" ]]; then
+  kill -TERM "$term_target" 2>/dev/null || true
+fi
+wait "$scenario_pid" || true
+: >"${work_dir}/term.flag"
+out="$(<"${work_dir}/term.out")"
+assert_contains 'the job that finished before the signal was reported' "$out" 'passed: quick'
+assert_contains 'the signal report names the job that was still running' "$out" 'interrupted by TERM; still running: hang'
+assert_contains 'the run exits with the TERM status' "rc=$(<"${work_dir}/term.rc")" 'rc=143'
+
+printf '\n=== static: the report is not deferred behind a blanket wait ===\n'
+waiter="$(awk '/^wait_parallel_checks\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"
+assert_contains 'wait_parallel_checks reports after each finished job' "$waiter" 'wait -n'
+assert_contains 'wait_parallel_checks reports finished jobs inside the loop' "$waiter" 'report_finished_jobs'
+starter="$(awk '/^start_parallel_job\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"
+assert_contains 'a job that finishes while later jobs are still starting is reported too' \
+  "$starter" 'report_finished_jobs'
+
+test_summary

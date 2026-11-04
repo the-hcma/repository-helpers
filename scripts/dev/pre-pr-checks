@@ -39,6 +39,8 @@ check_root=""
 restore_done=0
 prec_pr_jobs_dir=""
 prec_pr_job_count=0
+prec_pr_fail_count=0
+prec_pr_job_names=()
 prec_pr_max_jobs=0
 prec_pr_test_isolate_dir=""
 
@@ -189,8 +191,10 @@ start_parallel_job() {
   # PRE_PR_CHECKS_JOBS: start this job only once fewer than the cap are still running.
   while (( prec_pr_max_jobs > 0 )) && (( $(jobs -rp | wc -l) >= prec_pr_max_jobs )); do
     wait -n || true
+    report_finished_jobs
   done
   prec_pr_job_count=$(( prec_pr_job_count + 1 ))
+  prec_pr_job_names+=("$job_name")
   (
     set +e
     unset RUNNER_SESSION_DIR RUNNER_SESSION_KEEP
@@ -340,20 +344,19 @@ start_planned_parallel_checks() {
   log_step "Running ${prec_pr_job_count} checks in parallel (test files in parallel, isolated TMPDIR)…"
 }
 
-wait_parallel_checks() {
-  local rc_file job_name rc failed=0 fail_count=0
-
-  if [[ "$prec_pr_job_count" -eq 0 ]]; then
-    return 0
-  fi
-
-  set +e
-  wait
-  set -e
+# report_finished_jobs
+# Prints the result of every job that has finished and was not reported yet, in the order they finished, so a run
+# that is cut short (a timeout, a TERM) still shows which jobs passed and a failure appears when it happens, not
+# after the slowest job (repository-helpers#793). A failed job's log follows its FAILED line.
+report_finished_jobs() {
+  local rc_file job_name rc
 
   shopt -s nullglob
   for rc_file in "${prec_pr_jobs_dir}"/*.rc; do
-    job_name="$(basename "$rc_file" .rc)"
+    job_name="${rc_file##*/}"
+    job_name="${job_name%.rc}"
+    [[ -e "${prec_pr_jobs_dir}/${job_name}.reported" ]] && continue
+    : >"${prec_pr_jobs_dir}/${job_name}.reported"
     rc="$(<"$rc_file")"
     if [[ "$rc" -eq 0 ]]; then
       log_step "passed: ${job_name}"
@@ -361,16 +364,51 @@ wait_parallel_checks() {
       # still say why, or a skip is indistinguishable from a clean pass.
       prec_print_skip_notes "${prec_pr_jobs_dir}/${job_name}.log"
     else
-      failed=1
-      fail_count=$(( fail_count + 1 ))
+      prec_pr_fail_count=$(( prec_pr_fail_count + 1 ))
       log_step "FAILED: ${job_name} (exit ${rc})"
       cat "${prec_pr_jobs_dir}/${job_name}.log" >&2
     fi
   done
   shopt -u nullglob
+}
 
-  if [[ "$failed" == '1' ]]; then
-    die "${fail_count} parallel check(s) failed (see logs above)"
+# report_running_jobs_on_signal
+# TERM / INT (including the TERM `timeout` sends): name the jobs that had not finished, then stop with the
+# conventional 128+signal status, so a timeout is never a silent exit 124 with no clue which job hung.
+report_running_jobs_on_signal() {
+  local -r signal_name="$1"
+  local job_name running=''
+
+  report_finished_jobs
+  for job_name in "${prec_pr_job_names[@]}"; do
+    [[ -e "${prec_pr_jobs_dir}/${job_name}.rc" ]] || running="${running:+${running}, }${job_name}"
+  done
+  log_step "interrupted by ${signal_name}; still running: ${running:-none}"
+  if [[ "$signal_name" == 'TERM' ]]; then
+    exit 143
+  fi
+  exit 130
+}
+
+wait_parallel_checks() {
+  if [[ "$prec_pr_job_count" -eq 0 ]]; then
+    return 0
+  fi
+
+  trap 'report_running_jobs_on_signal TERM' TERM
+  trap 'report_running_jobs_on_signal INT' INT
+  set +e
+  while (( $(jobs -rp | wc -l) > 0 )); do
+    wait -n
+    report_finished_jobs
+  done
+  wait
+  set -e
+  trap - TERM INT
+  report_finished_jobs
+
+  if (( prec_pr_fail_count > 0 )); then
+    die "${prec_pr_fail_count} parallel check(s) failed (see logs above)"
   fi
 }
 

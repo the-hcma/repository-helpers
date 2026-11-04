@@ -45,6 +45,8 @@ source "${_github_api_rl_lib_dir}/runner-ensure"
 github_api_rate_limit_max_retries="${GITHUB_API_RATE_LIMIT_MAX_RETRIES:-3}"
 github_api_rate_limit_max_wait_s="${GITHUB_API_RATE_LIMIT_MAX_WAIT_S:-3600}"
 github_api_rate_limit_poll_s="${GITHUB_API_RATE_LIMIT_POLL_S:-30}"
+# A caller that keeps waiting on the shared block repeats its GITHUB_API_PACE_WAIT note this often (seconds).
+github_api_pace_wait_note_every_s="${GITHUB_API_PACE_WAIT_NOTE_EVERY_S:-300}"
 github_api_rate_limit_retry_sleep_s="${GITHUB_API_RATE_LIMIT_RETRY_SLEEP_S:-60}"
 github_api_rate_limit_reset_cushion_s=2
 
@@ -879,7 +881,7 @@ github_api_pace_publish_block() {
 # quota reserve (waiting for the reset), then claims the next minimum-spacing slot.
 github_api_pace_gate() {
   local -r label="${1:-gh}"
-  local state_dir now until_epoch claim_ec sleep_s waited=0 max_wait poll noted=0 probe_waits=0
+  local state_dir now until_epoch claim_ec sleep_s waited=0 max_wait poll note_every next_note=0 probe_waits=0
 
   github_api_pacing_enabled || return 0
   if ! _github_api_pace_dir; then
@@ -892,6 +894,8 @@ github_api_pace_gate() {
   poll="${github_api_rate_limit_poll_s}"
   [[ "$max_wait" =~ ^[0-9]+$ ]] || max_wait=3600
   [[ "$poll" =~ ^[1-9][0-9]*$ ]] || poll=30
+  note_every="${github_api_pace_wait_note_every_s}"
+  [[ "$note_every" =~ ^[1-9][0-9]*$ ]] || note_every=300
 
   while :; do
     now="$EPOCHSECONDS"
@@ -906,10 +910,11 @@ github_api_pace_gate() {
         printf 'NOTE: GITHUB_API_PACE_GIVE_UP label=%s waited=%ss\n' "$label" "$waited" >&2
         return 0
       fi
-      if (( noted == 0 )); then
-        printf 'NOTE: GITHUB_API_PACE_WAIT label=%s until=%s remaining=%ss\n' \
-          "$label" "$until_epoch" "$(( until_epoch - now ))" >&2
-        noted=1
+      if (( waited >= next_note )); then
+        _github_api_pace_clock "$until_epoch"
+        printf 'NOTE: GITHUB_API_PACE_WAIT label=%s until=%s remaining=%ss wake=%s\n' \
+          "$label" "$until_epoch" "$(( until_epoch - now ))" "$_github_api_pace_clock_value" >&2
+        next_note=$(( waited + note_every ))
       fi
       run_command "github-api pace wait" sleep "$sleep_s"
       waited=$(( waited + sleep_s ))
@@ -1115,6 +1120,17 @@ _github_api_secondary_backoff_s() {
     2) printf '180' ;;
     *) printf '300' ;;
   esac
+}
+
+# _github_api_pace_clock <epoch>
+# Sets _github_api_pace_clock_value to the UTC wall clock (HH:MM:SSZ) of <epoch> without an external command, so a
+# wait notice says when the caller wakes up and not only how many seconds remain. A non-epoch is passed through.
+_github_api_pace_clock() {
+  local -r epoch="$1"
+
+  _github_api_pace_clock_value="$epoch"
+  [[ "$epoch" =~ ^[0-9]+$ ]] || return 0
+  TZ=UTC printf -v _github_api_pace_clock_value '%(%H:%M:%SZ)T' "$epoch"
 }
 
 # _github_api_pace_dir
@@ -1342,8 +1358,9 @@ _github_api_pace_claim() {
   if [[ "$remaining" =~ ^[0-9]+$ && "$reset" =~ ^[0-9]+$ && "$observed" =~ ^[0-9]+$ ]]; then
     if (( remaining <= reserve && now < reset )); then
       _github_api_pace_write "${state_dir}/quota" "${remaining} ${reset} ${observed}"
-      printf 'NOTE: GITHUB_API_PACE_RESERVE label=%s remaining=%s reserve=%s reset=%s\n' \
-        "$label" "$remaining" "$reserve" "$reset" >&2
+      _github_api_pace_clock "$(( reset + cushion ))"
+      printf 'NOTE: GITHUB_API_PACE_RESERVE label=%s remaining=%s reserve=%s reset=%s wake=%s\n' \
+        "$label" "$remaining" "$reserve" "$reset" "$_github_api_pace_clock_value" >&2
       # Only ever raise the shared block (another caller may have published a later deadline).
       current_block="$(_github_api_pace_read "${state_dir}/blocked_until")"
       if [[ ! "$current_block" =~ ^[0-9]+$ ]] || (( reset + cushion > current_block )); then
