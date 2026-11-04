@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Tests for the Rust release-age gate (#819): dep-updater proposes a crate version only when it is at least
+# the release-age window old, walking back from a too-new `cargo outdated` target to the newest eligible,
+# non-yanked, stable version, and skipping the row when none is eligible. crates.io is mocked.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/dep-updater"
+readonly script
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+
+# A fixed "now" so ages are deterministic: 2026-11-04T00:00:00Z.
+now_epoch=1793750400
+readonly now_epoch
+
+# fixture <num>:<age_days>:<yanked true|false> … — a crates.io versions payload, newest listed first.
+fixture() {
+  local spec num age yanked created_epoch created out='{"versions":[' first=1
+  for spec in "$@"; do
+    IFS=':' read -r num age yanked <<<"$spec"
+    created_epoch="$(awk -v n="$now_epoch" -v a="$age" 'BEGIN { printf "%d", n - a * 86400 }')"
+    created="$(date -u -d "@${created_epoch}" +%Y-%m-%dT%H:%M:%S.123456+00:00)"
+    [[ $first -eq 1 ]] || out+=','
+    first=0
+    out+="{\"num\":\"${num}\",\"created_at\":\"${created}\",\"yanked\":${yanked}}"
+  done
+  printf '%s]}' "$out"
+}
+
+# run_pick <payload|FAIL|EMPTY> <current> <target> — runs the picker with crates.io mocked; prints
+# "out=<picked> rc=<n>" then the log lines.
+run_pick() {
+  local -r payload="$1" current="$2" target="$3"
+  local -r logs="${work_dir}/log.out" payload_file="${work_dir}/payload.json"
+  printf '%s' "$payload" >"$payload_file"
+  : >"$logs"
+  bash -c "
+    set -uo pipefail
+    source '${script_dir}/../scripts/lib/time-log'
+    log() { printf '%s\\n' \"\$*\" >>'${logs}'; }
+    dep_updater_minimum_release_age_minutes=12960
+    time_log_now_utc_epoch() { printf '%s' '${now_epoch}'; }
+    dep_runner_jq_string() { jq -r \"\$3\" <<<\"\$2\"; }
+    _crates_io_versions_json() {
+      [[ '${payload}' != FAIL ]] || return 1
+      if [[ '${payload}' == EMPTY ]]; then printf '{\"versions\":[]}'; else cat '${payload_file}'; fi
+    }
+    for fn in _npm_version_is_stable_release npm_parse_iso8601_to_epoch _crates_stable_versions_desc_from_body \\
+      rust_pick_eligible_new_version; do
+      eval \"\$(awk -v f=\"\$fn\" '\$0 ~ \"^\" f \"\\\\(\\\\)\"{p=1} p{print} p && /^}/{exit}' '${script}')\"
+    done
+    rc=0
+    out=\$(rust_pick_eligible_new_version sysinfo '${current}' '${target}') || rc=\$?
+    echo \"out=\${out} rc=\$rc\"" 2>&1
+  cat "$logs"
+}
+
+printf '\n=== a too-new latest falls back to the newest eligible older version ===\n'
+out="$(run_pick "$(fixture 0.40.0:1.5:false 0.39.5:12:false 0.39.1:30:false 0.39.0:60:false)" 0.39.0 0.40.0)"
+assert_contains 'the newest version older than the window is proposed' "$out" 'out=0.39.5 rc=0'
+assert_contains 'the log says why the latest was not proposed' \
+  "$out" '[rust] sysinfo: proposing 0.39.5 (newest eligible; 0.40.0 is too new).'
+
+printf '\n=== a target that is old enough is proposed unchanged ===\n'
+out="$(run_pick "$(fixture 0.40.0:20:false 0.39.5:30:false)" 0.39.5 0.40.0)"
+assert_contains 'the target stays the target' "$out" 'out=0.40.0 rc=0'
+assert_not_contains 'nothing is logged about a fallback' "$out" 'proposing'
+
+printf '\n=== a yanked version is never picked ===\n'
+out="$(run_pick "$(fixture 0.41.0:30:true 0.40.1:20:false 0.40.0:40:false)" 0.40.0 0.41.0)"
+assert_contains 'the old yanked version is skipped' "$out" 'out=0.40.1 rc=0'
+out="$(run_pick "$(fixture 0.41.0:30:true 0.40.0:40:false)" 0.40.0 0.41.0)"
+assert_contains 'when only a yanked version is newer the row is skipped' "$out" 'rc=1'
+
+printf '\n=== a prerelease is never picked ===\n'
+out="$(run_pick "$(fixture 0.41.0:1:false 0.40.1-rc.1:30:false 0.40.0:20:false)" 0.39.0 0.41.0)"
+assert_contains 'the release candidate is passed over' "$out" 'out=0.40.0 rc=0'
+
+printf '\n=== a crate whose newer versions are all too new is skipped, saying for how long ===\n'
+out="$(run_pick "$(fixture 0.40.0:1:false 0.39.9:3:false 0.39.0:60:false)" 0.39.0 0.40.0)"
+assert_contains 'the row is skipped' "$out" 'rc=1'
+assert_contains 'the log names the crate and versions' "$out" '[rust] Skipping sysinfo 0.39.0→0.40.0'
+assert_contains 'the log says how many days remain' "$out" '8 day(s) until it is old enough'
+
+printf '\n=== the proposal stays within the target and above the current version ===\n'
+out="$(run_pick "$(fixture 0.42.0:30:false 0.41.0:30:false 0.40.0:30:false)" 0.40.0 0.41.0)"
+assert_contains 'a version newer than the target is not proposed' "$out" 'out=0.41.0 rc=0'
+out="$(run_pick "$(fixture 0.40.0:1:false 0.39.0:60:false)" 0.39.0 0.40.0)"
+assert_contains 'the current version is never proposed as a bump' "$out" 'rc=1'
+
+printf '\n=== crates.io unreadable or silent: the target is kept, like the other registries ===\n'
+out="$(run_pick FAIL 0.39.0 0.40.0)"
+assert_contains 'an unreadable registry keeps the target' "$out" 'out=0.40.0 rc=0'
+out="$(run_pick EMPTY 0.39.0 0.40.0)"
+assert_contains 'a crate crates.io does not list keeps the target' "$out" 'out=0.40.0 rc=0'
+
+printf '\n=== the registry lookup can be switched off, and sends a User-Agent ===\n'
+fetch_fn="$(awk '/^_crates_io_versions_json\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"
+assert_contains 'the lookup honors DEP_UPDATER_SKIP_CRATES_REGISTRY' \
+  "$fetch_fn" 'DEP_UPDATER_SKIP_CRATES_REGISTRY:-0}" == '"'1'"
+assert_contains 'the request identifies dep-updater, as crates.io requires' "$fetch_fn" '--user-agent'
+assert_contains 'the request is bounded by a timeout' "$fetch_fn" '--max-time 15'
+
+printf '\n=== static: rust_outdated applies the gate after the pin check and drops skipped rows ===\n'
+outdated_fn="$(awk '/^rust_outdated\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"
+# shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars
+assert_contains 'the picker runs per row and a skipped row is dropped' \
+  "$outdated_fn" 'eligible="$(rust_pick_eligible_new_version "$dep_name" "$cur" "$target" "$crates_cache")" || continue'
+assert_not_contains 'the picker runs after the exact-pin check, not before' \
+  "${outdated_fn%%rust_is_pinned*}" 'rust_pick_eligible_new_version'
+assert_contains 'the emitted target is the eligible version' "$outdated_fn" 'target="$eligible"'
+assert_contains 'the per-run cache directory is removed' "$outdated_fn" 'rm -rf "$crates_cache"'
+
+printf '\n=== static: AGENTS.md documents the Rust gate and its lack of a CVE exemption ===\n'
+agents="$(cat "${script_dir}/../AGENTS.md")"
+assert_contains 'the release-age bullet names Rust' "$agents" 'Python/PyPI, GitHub Actions and Rust (crates.io) bumps'
+assert_contains 'the Rust picker is documented' "$agents" '**Rust picks the newest eligible version'
+
+printf '\n=== results ===\n'
+test_summary

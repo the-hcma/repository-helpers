@@ -6788,6 +6788,113 @@ rust_is_pinned() {
   return 1
 }
 
+# _crates_io_versions_json <crate> [cache_dir]
+# Prints the crates.io versions payload (num, created_at, yanked per version), or nothing when it cannot be
+# read. crates.io rejects requests without a User-Agent. A cache directory shares one fetch between the rows
+# of a crate (a workspace yields one row per member). DEP_UPDATER_SKIP_CRATES_REGISTRY=1 skips the lookup.
+_crates_io_versions_json() {
+  local -r crate="$1"
+  local -r cache_dir="${2:-}"
+  local body exit_code
+
+  if [[ "${DEP_UPDATER_SKIP_CRATES_REGISTRY:-0}" == '1' ]]; then
+    return 1
+  fi
+  if [[ -n "$cache_dir" && -s "${cache_dir}/${crate}.json" ]]; then
+    cat "${cache_dir}/${crate}.json"
+    return 0
+  fi
+  exit_code=0
+  runner_exec "crates.io versions ${crate}" -- curl --silent --fail --max-time 15 --retry 2 --retry-delay 2 \
+    --user-agent 'repository-helpers-dep-updater (https://github.com/the-hcma/repository-helpers)' \
+    "https://crates.io/api/v1/crates/${crate}/versions" || exit_code=$?
+  body="$(dep_runner_last_stdout)"
+  [[ "$exit_code" == 0 && -n "$body" ]] || return 1
+  if [[ -n "$cache_dir" ]]; then
+    printf '%s' "$body" >"${cache_dir}/${crate}.json"
+  fi
+  printf '%s' "$body"
+}
+
+# _crates_stable_versions_desc_from_body <json_body>
+# Prints "num<TAB>created_at" for every stable (no prerelease suffix), non-yanked version, newest first.
+_crates_stable_versions_desc_from_body() {
+  local -r body="$1"
+  local num created
+
+  [[ -n "$body" ]] || return 1
+  while IFS=$'\t' read -r num created; do
+    [[ -n "$num" ]] || continue
+    _npm_version_is_stable_release "$num" || continue
+    printf '%s\t%s\n' "$num" "$created"
+  done < <(dep_runner_jq_string "crates.io stable versions" "$body" \
+    '.versions[]? | select((.yanked // false) | not) | [.num, (.created_at // "")] | join("\t")' \
+    2>/dev/null | sort -V -r -t $'\t' -k1,1)
+}
+
+# rust_pick_eligible_new_version <crate> <current> <target> [cache_dir]
+# <target> is the version `cargo outdated` proposed (its in-range compat version, else the latest). Prints the
+# newest stable, non-yanked crates.io version that is newer than <current>, no newer than <target> and at least
+# the release-age window old (the way py_pick_eligible_new_version and the npm picker walk back from a too-new
+# latest). Returns 1, after logging how long remains, when none is eligible. Fails open (prints <target>) when
+# crates.io cannot be read or knows nothing of the crate, like the other registries. There is no CVE exemption:
+# dep-updater has no cargo-audit data for Rust (#819).
+rust_pick_eligible_new_version() {
+  local -r crate="$1"
+  local -r current="$2"
+  local -r target="$3"
+  local -r cache_dir="${4:-}"
+  local body versions ver created created_epoch now_epoch age_minutes
+  local picked='' newest_age=''
+
+  if ! body="$(_crates_io_versions_json "$crate" "$cache_dir")"; then
+    printf '%s' "$target"
+    return 0
+  fi
+  versions="$(_crates_stable_versions_desc_from_body "$body" || true)"
+  if [[ -z "$versions" ]]; then
+    printf '%s' "$target"
+    return 0
+  fi
+  now_epoch="$(time_log_now_utc_epoch)"
+  while IFS=$'\t' read -r ver created; do
+    [[ -n "$ver" ]] || continue
+    # Newer than the proposed target: not ours to propose. Not newer than the current one: nothing left.
+    if [[ "$ver" != "$target" && "$(printf '%s\n%s\n' "$ver" "$target" | sort -V | tail -1)" == "$ver" ]]; then
+      continue
+    fi
+    if [[ "$ver" == "$current" || "$(printf '%s\n%s\n' "$ver" "$current" | sort -V | tail -1)" == "$current" ]]; then
+      break
+    fi
+    created_epoch="$(npm_parse_iso8601_to_epoch "$created" 2>/dev/null || true)"
+    if [[ -z "$created_epoch" ]]; then
+      picked="$ver"
+      break
+    fi
+    age_minutes=$(( (now_epoch - created_epoch) / 60 ))
+    if [[ -z "$newest_age" ]]; then
+      newest_age="$age_minutes"
+    fi
+    if (( age_minutes >= dep_updater_minimum_release_age_minutes )); then
+      picked="$ver"
+      break
+    fi
+  done <<<"$versions"
+
+  if [[ -z "$picked" ]]; then
+    if [[ -n "$newest_age" ]]; then
+      log "[rust] Skipping ${crate} ${current}→${target}: the newest candidate was published ${newest_age}m ago;" \
+        "$(( (dep_updater_minimum_release_age_minutes - newest_age + 1439) / 1440 )) day(s) until it is old" \
+        "enough (minimum release age is ${dep_updater_minimum_release_age_minutes}m)."
+    fi
+    return 1
+  fi
+  if [[ "$picked" != "$target" ]]; then
+    log "[rust] ${crate}: proposing ${picked} (newest eligible; ${target} is too new)."
+  fi
+  printf '%s' "$picked"
+}
+
 # List direct outdated crates as TSV:
 #   name<TAB>current<TAB>target<TAB>kind<TAB>package<TAB>platform
 # platform is cargo-outdated's target cfg/triple (e.g. cfg(target_os = "macos")),
@@ -6797,7 +6904,7 @@ rust_is_pinned() {
 rust_outdated() {
   local -r target_dir="${1:-$dir}"
   local -a outdated_args=(--root-deps-only --format json)
-  local json_out dep_name cur target dep_kind dep_package dep_platform
+  local json_out dep_name cur target dep_kind dep_package dep_platform eligible crates_cache
 
   if rust_workspace_enabled "$target_dir"; then
     outdated_args+=(--workspace)
@@ -6805,6 +6912,7 @@ rust_outdated() {
 
   json_out="$(dep_runner_cargo_dir_stdout "cargo outdated" "$target_dir" -- outdated "${outdated_args[@]}" 2>/dev/null)" || json_out=""
   [[ -z "$json_out" ]] && return 0
+  crates_cache="$(mktemp -d)"
 
   # Prefer compat (in-range) when cargo-outdated reports one. When compat is the
   # sentinel "---" (no newer version within the caret/range), fall through to
@@ -6843,12 +6951,16 @@ rust_outdated() {
           log "[rust] Skipping exactly-pinned crate: ${dep_name} (${cur})"
           continue
         fi
+        # The release-age gate: propose the newest eligible version, or skip the row (#819).
+        eligible="$(rust_pick_eligible_new_version "$dep_name" "$cur" "$target" "$crates_cache")" || continue
+        target="$eligible"
         [[ -z "$dep_kind" ]] && dep_kind="Normal"
         [[ -z "$dep_package" ]] && dep_package="-"
         [[ -z "$dep_platform" ]] && dep_platform="-"
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
           "$dep_name" "$cur" "$target" "$dep_kind" "$dep_package" "$dep_platform"
       done
+  rm -rf "$crates_cache"
 }
 
 # _rust_dirty_paths <worktree_dir>
