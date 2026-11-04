@@ -204,7 +204,10 @@ start_parallel_job() {
     mkdir -p "$RUNNER_SESSION_ROOT"
     runner_session_begin
     "$@" >"$log_file" 2>&1
-    printf '%s\n' "$?" >"$rc_file"
+    # Written atomically: a plain redirect creates the file empty first, and a report that ran in that
+    # instant would read the empty status as 0 and call a failed job passed.
+    printf '%s\n' "$?" >"${rc_file}.tmp"
+    mv -- "${rc_file}.tmp" "$rc_file"
     runner_session_end
   ) &
 }
@@ -356,8 +359,10 @@ report_finished_jobs() {
     job_name="${rc_file##*/}"
     job_name="${job_name%.rc}"
     [[ -e "${prec_pr_jobs_dir}/${job_name}.reported" ]] && continue
-    : >"${prec_pr_jobs_dir}/${job_name}.reported"
     rc="$(<"$rc_file")"
+    # An empty or partial status is not a result yet: leave the job unreported for the next pass.
+    [[ "$rc" =~ ^[0-9]+$ ]] || continue
+    : >"${prec_pr_jobs_dir}/${job_name}.reported"
     if [[ "$rc" -eq 0 ]]; then
       log_step "passed: ${job_name}"
       # A job that passed by skipping (e.g. coderabbit-cli without a CLI or allowance) must
@@ -395,8 +400,6 @@ wait_parallel_checks() {
     return 0
   fi
 
-  trap 'report_running_jobs_on_signal TERM' TERM
-  trap 'report_running_jobs_on_signal INT' INT
   set +e
   while (( $(jobs -rp | wc -l) > 0 )); do
     wait -n
@@ -469,6 +472,10 @@ main() {
     prec_apply_formatters "$check_root"
     warn_if_format_left_dirty "$before_porcelain"
   fi
+  # Before the first job starts, so a TERM that lands while start_parallel_job waits on the
+  # PRE_PR_CHECKS_JOBS cap is reported too.
+  trap 'report_running_jobs_on_signal TERM' TERM
+  trap 'report_running_jobs_on_signal INT' INT
   start_planned_parallel_checks
   wait_parallel_checks
 

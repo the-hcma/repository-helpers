@@ -65,6 +65,9 @@ run_scenario() {
         (( i < 400 )) || return 1
       done
     }
+    # main installs these before the first job starts (asserted statically below); the scenario mirrors it.
+    trap 'report_running_jobs_on_signal TERM' TERM
+    trap 'report_running_jobs_on_signal INT' INT
     case "$scenario" in
       early-pass)
         start_parallel_job fast job_fast
@@ -73,6 +76,16 @@ run_scenario() {
       early-fail)
         start_parallel_job bad job_bad
         start_parallel_job slow job_after_bad
+        ;;
+      empty-rc)
+        # A status file that exists but is still empty (its writer is between open and write) is not a result.
+        : >"${jobs_dir}/ghost.rc"
+        report_finished_jobs
+        [[ -e "${jobs_dir}/ghost.reported" ]] && echo 'EMPTY_MARKED' >&2
+        printf '3\n' >"${jobs_dir}/ghost.rc"
+        report_finished_jobs
+        echo "FAILCOUNT=${prec_pr_fail_count}" >&2
+        exit 0
         ;;
       term)
         start_parallel_job quick job_quick
@@ -103,6 +116,14 @@ assert_contains 'the job that waited for the failure report was not left behind'
 assert_contains 'the run fails with a count of the failed checks' "$out" 'ERROR: 1 parallel check(s) failed'
 assert_not_contains 'the run does not exit 0' "rc=$(<"${work_dir}/early-fail.rc")" 'rc=0'
 
+printf '\n=== an empty status file is not read as a passed job ===\n'
+run_scenario empty-rc || true
+out="$(<"${work_dir}/empty-rc.out")"
+assert_not_contains 'an empty status file is not reported as passed' "$out" 'passed: ghost'
+assert_not_contains 'an empty status file does not mark the job reported' "$out" 'EMPTY_MARKED'
+assert_contains 'the job is reported as failed once its status is written' "$out" 'FAILED: ghost (exit 3)'
+assert_contains 'the failure is counted' "$out" 'FAILCOUNT=1'
+
 printf '\n=== a TERM names the jobs that had not finished ===\n'
 (
   run_scenario term
@@ -130,6 +151,14 @@ printf '\n=== static: the report is not deferred behind a blanket wait ===\n'
 waiter="$(awk '/^wait_parallel_checks\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"
 assert_contains 'wait_parallel_checks reports after each finished job' "$waiter" 'wait -n'
 assert_contains 'wait_parallel_checks reports finished jobs inside the loop' "$waiter" 'report_finished_jobs'
+main_body="$(awk '/^main\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"
+before_start="${main_body%%start_planned_parallel_checks*}"
+assert_contains 'the TERM report is installed before any job starts, so the cap loop is covered' \
+  "$before_start" "trap 'report_running_jobs_on_signal TERM' TERM"
+assert_contains 'the INT report is installed before any job starts' \
+  "$before_start" "trap 'report_running_jobs_on_signal INT' INT"
+assert_contains 'a job status is written to a temp file and moved into place' \
+  "$(awk '/^start_parallel_job\(\)/{p=1} p{print} p && /^}/{exit}' "$script")" 'mv -- "${rc_file}.tmp" "$rc_file"'
 starter="$(awk '/^start_parallel_job\(\)/{p=1} p{print} p && /^}/{exit}' "$script")"
 assert_contains 'a job that finishes while later jobs are still starting is reported too' \
   "$starter" 'report_finished_jobs'
