@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Tests for dep-updater keeping its PRs open when a child fails with a full disk (repository-helpers#770): the disk
+# is a host problem, not a problem with the update, so closing the PR only creates churn on the retry.
+# shellcheck disable=SC2016  # bash -c programs are single-quoted so the child shell expands them
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/dep-updater"
+runner_bootstrap="${script_dir}/../scripts/lib/runner-bootstrap"
+readonly script runner_bootstrap
+
+tmp="$(mktemp -d)"
+readonly tmp
+trap 'rm -rf "$tmp"' EXIT
+
+printf '\n=== the runner names a full disk wherever it shows in stderr ===\n'
+# run_failing <label> <stderr program>: prints the first-failure reason the runner records.
+run_failing() {
+  local -r label="$1" program="$2"
+  local first_failure="${tmp}/first-failure.$RANDOM"
+  RUNNER_FIRST_FAILURE_FILE="$first_failure" bash -c '
+    source "$1"
+    runner_exec "$2" -- bash -c "$3" 2>/dev/null || true
+    cat "$RUNNER_FIRST_FAILURE_FILE"
+  ' bash "$runner_bootstrap" "$label" "$program"
+}
+assert_eq() {
+  if [[ "$2" == "$3" ]]; then
+    pass_case "$1"
+  else
+    printf '%s\n' '---- output ----' "$2" '--------------' >&2
+    fail_case "$1"
+  fi
+}
+assert_eq 'a disk-full line that is not the first stderr line is named, and the first line is kept' \
+  "$(run_failing 'build step' \
+    'echo first line >&2; echo more >&2; echo "write error: No space left on device" >&2; exit 1')" \
+  'build step: first line (No space left on device)'
+assert_eq 'a first line that already says it is left as it was' \
+  "$(run_failing 'build step' 'echo "tar: No space left on device" >&2; echo more >&2; exit 1')" \
+  'build step: tar: No space left on device'
+assert_eq 'any other failure keeps the first-line reason' \
+  "$(run_failing 'other step' 'echo boom >&2; echo "disk is fine" >&2; exit 1')" \
+  'other step: boom'
+assert_eq 'a failure with no stderr keeps the exit-code reason' \
+  "$(run_failing 'quiet step' 'exit 3')" \
+  'quiet step (exit 3)'
+
+printf '\n=== cleanup_on_error keeps the PRs open on a full disk and closes them otherwise ===\n'
+awk '$0 == "cleanup_on_error() {" { on = 1 } on { print } on && $0 == "}" { exit }' "$script" >"${tmp}/cleanup-fn"
+assert_contains 'the cleanup function was extracted' "$(head -n 1 "${tmp}/cleanup-fn")" 'cleanup_on_error() {'
+
+# run_cleanup <reason> -> prints what cleanup_on_error did to PR 7 (one `gh pr ...` line per call)
+run_cleanup() {
+  local -r reason="$1"
+  : >"${tmp}/gh-calls"
+  GH_CALLS="${tmp}/gh-calls" bash -c '
+    set -euo pipefail
+    source "$1"
+    log() { :; }
+    primary_repo_recover() { :; }
+    state_get() { printf "7"; }
+    csv_pretty() { printf "%s" "$1"; }
+    gh_pr_merged_for_number() { printf "false"; }
+    gh_pr_state_for_number() { printf "open"; }
+    run_command() { :; }
+    dep_runner_gh_stdout() {
+      shift 2
+      printf "%s\n" "$*" >>"$GH_CALLS"
+    }
+    state_file="$2"; repo_owner=o; repo_name=r; worktree_path=""; wt_base_branch=""; dir="$3"
+    cleanup_on_error "$4"
+  ' bash "${tmp}/cleanup-fn" "${tmp}/state-file" "$tmp" "$reason"
+  cat "${tmp}/gh-calls"
+}
+: >"${tmp}/state-file"
+
+disk_calls="$(run_cleanup 'git commit: error: No space left on device')"
+assert_contains 'a full disk comments on the PR' "$disk_calls" 'pr comment 7'
+assert_contains 'the comment says it was left open for retry' "$disk_calls" 'left this PR open for retry'
+assert_not_contains 'a full disk does not close the PR' "$disk_calls" 'pr close'
+disk_second="$(run_cleanup 'pnpm install: first line (No space left on device)')"
+assert_not_contains 'the reason the runner records for a later stderr line also keeps the PR' "$disk_second" 'pr close'
+other_calls="$(run_cleanup 'pnpm: no matching version')"
+assert_contains 'any other error still closes the PR' "$other_calls" 'pr close 7'
+assert_contains 'the close comment keeps its wording' "$other_calls" 'Closed by dep-updater after error'
+merge_calls="$(run_cleanup 'gh merge failed: pr=#7: nope')"
+assert_not_contains 'the existing merge-failure case still keeps the PR' "$merge_calls" 'pr close'
+
+test_summary
