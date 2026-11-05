@@ -61,10 +61,19 @@ set -euo pipefail
 source "$1"
 source "$2"
 rp_jobs="$3"; rp_compact=1; rp_apply_fix=0; rp_track_failures=0
+live_file="$LIVE_FILE"
 rp_repo_slugs=(o/a o/b)
 rp_check_one_repo() {
+  local spin=0
   printf 'out:%s\n' "$1"
   _github_api_pace_note "NOTE: GITHUB_API_PACE_WAIT label=gh until=1 remaining=5s wake=00:00:05Z"
+  # Hold the worker until the live line is readable from the parent's stderr file (bounded, no sleep): the
+  # notice must be visible while the worker is still running, not only before the replay.
+  until [[ "$(<"$live_file")" == *"[$1] NOTE: GITHUB_API_PACE_WAIT"* ]]; do
+    spin=$(( spin + 1 ))
+    if (( spin > 20000 )); then printf 'live-missing:%s\n' "$1"; break; fi
+  done
+  if (( spin <= 20000 )); then printf 'live-seen:%s\n' "$1"; fi
   printf 'err:%s\n' "$1" >&2
   return 0
 }
@@ -72,7 +81,8 @@ rp_audit_repos "${#rp_repo_slugs[@]}"
 DRIVER
 
 printf '\n=== the parallel audit shows notices while workers run ===\n'
-bash -c "$driver" bash "$lib" "$rate_limit_lib" 2 >"${tmp}/par.out" 2>"${tmp}/par.err" || true
+# shellcheck disable=SC2094  # the stub reads this file on purpose to see its own live notice
+LIVE_FILE="${tmp}/par.err" bash -c "$driver" bash "$lib" "$rate_limit_lib" 2 >"${tmp}/par.out" 2>"${tmp}/par.err" || true
 par_err="$(cat "${tmp}/par.err")"
 assert_contains 'worker o/a notice is on stderr with its repo label' "$par_err" "[o/a] ${note}"
 assert_contains 'worker o/b notice is on stderr with its repo label' "$par_err" "[o/b] ${note}"
@@ -82,10 +92,19 @@ assert_contains 'the live notice comes before the buffered replay' "before=$(( l
 assert_contains 'the buffered replay still has the unprefixed notice' \
   "$(grep -c -x -F "$note" "${tmp}/par.err")" '2'
 assert_contains 'the buffered stdout replay is unchanged' "$(cat "${tmp}/par.out")" 'out:o/a'
+assert_contains 'worker o/a saw its live notice while it was still running' "$(cat "${tmp}/par.out")" 'live-seen:o/a'
+assert_contains 'worker o/b saw its live notice while it was still running' "$(cat "${tmp}/par.out")" 'live-seen:o/b'
+assert_not_contains 'no worker missed its live notice' "$(cat "${tmp}/par.out")" 'live-missing'
 
 printf '\n=== a serial audit has no live channel ===\n'
-bash -c "$driver" bash "$lib" "$rate_limit_lib" 1 >"${tmp}/ser.out" 2>"${tmp}/ser.err" || true
+# shellcheck disable=SC2094  # the stub reads this file on purpose to see its own live notice
+LIVE_FILE="${tmp}/ser.err" bash -c "$driver" bash "$lib" "$rate_limit_lib" 1 >"${tmp}/ser.out" 2>"${tmp}/ser.err" || true
 assert_not_contains 'serial notices carry no repo prefix' "$(cat "${tmp}/ser.err")" '[o/a]'
 assert_contains 'serial notices are still printed' "$(cat "${tmp}/ser.err")" "$note"
+
+printf '\n=== a closed stderr does not stop the parallel audit ===\n'
+LIVE_FILE=/dev/null bash -c "$driver" bash "$lib" "$rate_limit_lib" 2 >"${tmp}/closed.out" 2>&- || true
+# (the replay itself cannot write to a closed stderr, so only the start of the workers is asserted)
+assert_contains 'the audit still runs its workers with stderr closed' "$(cat "${tmp}/closed.out")" 'out:o/a'
 
 test_summary
