@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# Tests for scripts/dev/model-review (repository-helpers#761): a pre-push review by a model other than the author.
+# The reviewer is a stub command that records the prompt it was given and prints a canned review.
+# shellcheck disable=SC2016  # fixture scripts are single-quoted so the child shell expands them
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+review="${script_dir}/../scripts/dev/model-review"
+readonly review
+
+tmp="$(mktemp -d)"
+readonly tmp
+trap 'rm -rf "$tmp"' EXIT
+
+repo="${tmp}/repo"
+stub="${tmp}/stub-reviewer"
+state="${tmp}/state"
+calls="${tmp}/calls"
+mkdir -p "$repo" "$calls"
+
+# Reviewer stub: saves the prompt as calls/<n>, then answers according to $STUB_MODE.
+cat >"$stub" <<'STUB'
+#!/usr/bin/env bash
+n=$(( $(find "$STUB_CALLS" -type f | wc -l) + 1 ))
+cat >"${STUB_CALLS}/${n}"
+case "${STUB_MODE:-clean}" in
+  clean) printf 'Looks fine.\nVERDICT: CLEAN\n' ;;
+  findings) printf 'FINDING: a.txt: off by one\nFINDING: b.txt: missing test\nVERDICT: FINDINGS\n' ;;
+  noverdict) printf 'I read it and it seems okay.\n' ;;
+  fail) exit 7 ;;
+esac
+STUB
+chmod +x "$stub"
+
+(
+  cd "$repo"
+  git init -q -b main
+  git config user.email 'test@example.com'
+  git config user.name 'Test'
+  printf 'base\n' >base.txt
+  git add -A
+  git commit -q -m 'base'
+  git checkout -q -b feature
+  printf 'first change\n' >a.txt
+  git add -A
+  git commit -q -m 'add a'
+)
+
+export STUB_CALLS="$calls"
+export MODEL_REVIEW_STATE_DIR="$state"
+export MODEL_REVIEW_CMD="$stub"
+unset ANTHROPIC_MODEL MODEL_REVIEW_AUTHOR_MODEL MODEL_REVIEW_MODEL
+
+# run_review [args…] -> review_out (stdout+stderr) and review_rc
+run_review() {
+  review_rc=0
+  review_out="$(bash "$review" --dir "$repo" "$@" 2>&1)" || review_rc=$?
+}
+call_count() { find "$calls" -type f | wc -l | tr -d ' '; }
+
+printf '\n=== detect ===\n'
+detect_rc=0
+bash "$review" --detect || detect_rc=$?
+assert_contains 'a resolvable reviewer command is detected' "rc=${detect_rc}" 'rc=0'
+detect_rc=0
+MODEL_REVIEW_CMD=/nonexistent/reviewer bash "$review" --detect || detect_rc=$?
+assert_contains 'a missing reviewer command is not detected' "rc=${detect_rc}" 'rc=1'
+
+printf '\n=== a clean review passes and is recorded ===\n'
+run_review
+assert_contains 'a clean review exits 0' "rc=${review_rc}" 'rc=0'
+assert_contains 'the clean verdict is reported' "$review_out" 'clean (0 findings)'
+assert_contains 'the reviewer was called once' "calls=$(call_count)" 'calls=1'
+assert_contains 'the prompt carries the diff of the first commit' "$(cat "${calls}/1")" 'first change'
+assert_contains 'the prompt asks for a verdict line' "$(cat "${calls}/1")" 'VERDICT: CLEAN'
+assert_contains 'an unknown author model is noted' "$review_out" 'author model unknown'
+
+printf '\n=== the same head is replayed at no cost ===\n'
+run_review
+assert_contains 'the replay exits 0' "rc=${review_rc}" 'rc=0'
+assert_contains 'the replay says so' "$review_out" 'already reviewed'
+assert_contains 'the reviewer was not called again' "calls=$(call_count)" 'calls=1'
+
+printf '\n=== a later head sends only the new commits ===\n'
+(
+  cd "$repo"
+  printf 'second change\n' >b.txt
+  git add -A
+  git commit -q -m 'add b'
+)
+run_review
+assert_contains 'the incremental review passes' "rc=${review_rc}" 'rc=0'
+assert_contains 'the new commit is in the prompt' "$(cat "${calls}/2")" 'second change'
+assert_not_contains 'the already reviewed commit is not sent again' "$(cat "${calls}/2")" 'first change'
+
+printf '\n=== findings gate the push ===\n'
+(
+  cd "$repo"
+  printf 'third change\n' >c.txt
+  git add -A
+  git commit -q -m 'add c'
+)
+STUB_MODE=findings run_review
+assert_contains 'findings exit 2' "rc=${review_rc}" 'rc=2'
+assert_contains 'the findings line is machine parseable' "$review_out" 'ERROR: MODEL_REVIEW_FINDINGS count=2 head='
+assert_contains 'each finding is printed' "$review_out" 'FINDING: b.txt: missing test'
+before_replay="$(call_count)"
+run_review
+assert_contains 'the replay of findings still exits 2' "rc=${review_rc}" 'rc=2'
+assert_contains 'the replayed findings are printed' "$review_out" 'FINDING: a.txt: off by one'
+assert_contains 'the replay did not call the reviewer' "calls=$(call_count)" "calls=${before_replay}"
+
+printf '\n=== a decline is logged and lets the head through ===\n'
+run_review --decline 'both are false positives'
+assert_contains 'the decline exits 0' "rc=${review_rc}" 'rc=0'
+assert_contains 'the decline is logged with its reason' "$review_out" \
+  'NOTE: MODEL_REVIEW_DECLINED head='
+assert_contains 'the reason is in the log line' "$review_out" 'reason=both are false positives'
+run_review
+assert_contains 'a declined head passes afterwards' "rc=${review_rc}" 'rc=0'
+assert_contains 'the decline is logged again on replay' "$review_out" 'MODEL_REVIEW_DECLINED'
+
+printf '\n=== no verdict, or a failing reviewer, is an error and is not recorded ===\n'
+(
+  cd "$repo"
+  printf 'fourth change\n' >d.txt
+  git add -A
+  git commit -q -m 'add d'
+)
+STUB_MODE=noverdict run_review
+assert_contains 'a review with no verdict exits 1' "rc=${review_rc}" 'rc=1'
+assert_contains 'it says it is not a clean pass' "$review_out" 'not a clean pass'
+before_retry="$(call_count)"
+STUB_MODE=fail run_review
+assert_contains 'a failing reviewer exits 1' "rc=${review_rc}" 'rc=1'
+assert_contains 'the failing exit status is reported' "$review_out" 'exited 7'
+assert_contains 'neither error was recorded, so each run called the reviewer' "calls=$(( $(call_count) - before_retry ))" 'calls=1'
+
+printf '\n=== the reviewer must differ from the author ===\n'
+same_before="$(call_count)"
+MODEL_REVIEW_CMD="${stub} --model opus" MODEL_REVIEW_AUTHOR_MODEL=opus run_review
+assert_contains 'a same-model review is skipped with exit 3' "rc=${review_rc}" 'rc=3'
+assert_contains 'the skip is logged' "$review_out" 'SKIPPED: model-review: the author model (opus) is the reviewer model'
+assert_contains 'the reviewer was not called for the same model' "calls=$(( $(call_count) - same_before ))" 'calls=0'
+MODEL_REVIEW_CMD="${stub} --model opus" MODEL_REVIEW_AUTHOR_MODEL=sonnet run_review
+assert_contains 'a different author model is reviewed' "rc=${review_rc}" 'rc=0'
+assert_not_contains 'a known author model has no unknown-author note' "$review_out" 'author model unknown'
+
+printf '\n=== other skips are logged, never silent ===\n'
+(
+  cd "$repo"
+  printf 'fifth change\n' >e.txt
+  git add -A
+  git commit -q -m 'add e'
+)
+MODEL_REVIEW_CMD=/nonexistent/reviewer run_review
+assert_contains 'a missing reviewer is skipped with exit 3' "rc=${review_rc}" 'rc=3'
+assert_contains 'the missing reviewer is logged' "$review_out" 'SKIPPED: model-review: no reviewer command'
+run_review --max-runs 1
+assert_contains 'the run cap is skipped with exit 3' "rc=${review_rc}" 'rc=3'
+assert_contains 'the run cap is logged' "$review_out" 'SKIPPED: model-review: run cap reached'
+(cd "$repo" && git checkout -q main)
+run_review
+assert_contains 'no commits ahead is skipped with exit 3' "rc=${review_rc}" 'rc=3'
+assert_contains 'no commits ahead is logged' "$review_out" 'SKIPPED: model-review: no commits ahead'
+(cd "$repo" && git checkout -q feature)
+
+printf '\n=== uncommitted changes are noted, not reviewed ===\n'
+printf 'dirty\n' >>"${repo}/a.txt"
+run_review
+git -C "$repo" checkout -q -- a.txt
+assert_contains 'uncommitted changes are noted' "$review_out" 'uncommitted changes are not reviewed'
+
+printf '\n=== argument handling ===\n'
+run_review --max-runs 0
+assert_contains 'a bad --max-runs is an error' "rc=${review_rc}" 'rc=1'
+run_review --bogus
+assert_contains 'an unknown flag is an error' "rc=${review_rc}" 'rc=1'
+
+printf '\n=== wiring into pre-pr-checks ===\n'
+checks_src="$(cat "${script_dir}/../scripts/dev/pre-pr-checks")"
+eco_src="$(cat "${script_dir}/../scripts/lib/pre-pr-ecosystem")"
+assert_contains 'pre-pr-checks starts the model-review job' "$checks_src" \
+  "model-review) start_parallel_job 'model-review' prec_run_model_review"
+assert_contains 'pre-pr-checks documents the skip' "$checks_src" 'PRE_PR_CHECKS_SKIP=model-review'
+assert_contains 'the ecosystem planner adds the job' "$eco_src" "prec_plan_add_job 'model-review'"
+
+test_summary

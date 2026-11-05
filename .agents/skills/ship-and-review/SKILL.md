@@ -47,6 +47,14 @@ When the CodeRabbit CLI (`coderabbit` / `cr`) is installed and signed in, `pre-p
 - Findings are always reported, even if the CLI also errors. A review with no findings that has no `complete` event, an error event or a nonzero CLI exit is an **error**, never a clean pass. Uncommitted changes are not reviewed (a `NOTE:` says so), and a shallow clone with no merge-base is a skip. Run directly with `scripts/dev/coderabbit-cli-review --help` for options; skip the job with `PRE_PR_CHECKS_SKIP=coderabbit-cli`.
 - The binary auto-updates and is not version-pinned here (optional tool; `thehcma/init-files` provisions it with an optional `INIT_FILES_CODERABBIT_VERSION` pin). The wrapper logs the version it ran and refuses to guess when a needed flag disappears.
 
+### Different-model review before every push (`model-review` job, #761)
+
+A model that wrote a change shares its blind spots, and a review after the push costs another head, another CI run and another PR review. `pre-pr-checks` therefore plans a `model-review` job (when a reviewer command resolves: `MODEL_REVIEW_CMD`, else `claude`) that runs `scripts/dev/model-review` on the **committed** changes since the last reviewed head and sends them to a reviewer model that differs from the author. Commit first, then run the gate.
+
+- **Findings gate the push** (`ERROR: MODEL_REVIEW_FINDINGS count=N head=...`, one `FINDING: <file>: <problem>` line each). Fix the real ones and commit. A finding that is wrong is declined with a logged reason: `scripts/dev/model-review --decline "<reason>"` prints `NOTE: MODEL_REVIEW_DECLINED head=... reason=...` and lets that head through; say the same rebuttal in the PR description.
+- **The reviewer must differ from the author.** Set `MODEL_REVIEW_AUTHOR_MODEL` (else `ANTHROPIC_MODEL` is read) and a reviewer that names the same model is refused with a `SKIPPED:` line. With the author unknown a `NOTE:` says so and the review goes ahead. The reviewer is `MODEL_REVIEW_MODEL` (default `opus`) through `claude -p`, or any command in `MODEL_REVIEW_CMD` that reads the prompt on stdin and ends its answer with `VERDICT: CLEAN` or `VERDICT: FINDINGS`; no verdict is an error, never a clean pass.
+- **Cost is bounded.** Only the commits since the last clean or declined head are sent (the whole branch the first time or after a rewrite), each head is reviewed once (the result, findings included, is replayed from `~/scratch/repository-helpers/model-review/`), and at most 8 heads per branch are reviewed (`--max-runs`); the next gate is the PR review. A missing reviewer, a same-model author, the run cap and no commits ahead are `SKIPPED:` lines, never silent. Skip the job with `PRE_PR_CHECKS_SKIP=model-review`; run directly with `scripts/dev/model-review --help`.
+
 ## 2. Commit, submit, and monitor CI (required after every push)
 
 Preferred (submit + **CI wait** + agent review loop):

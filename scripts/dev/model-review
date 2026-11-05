@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# Pre-push review of the committed changes by a model other than the author (repository-helpers#761).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+# shellcheck disable=SC1091  # sibling lib resolved at runtime
+source "${script_dir}/../lib/runner-bootstrap"
+
+usage() {
+  cat <<'EOF_USAGE'
+Usage:
+  scripts/dev/model-review [--dir DIR] [--base REF] [--max-runs N] [--timeout SECONDS] [--state-dir DIR]
+  scripts/dev/model-review --decline REASON [--dir DIR] [--base REF] [--state-dir DIR]
+  scripts/dev/model-review --detect
+  scripts/dev/model-review --help
+
+Send the committed changes of the current branch to a reviewer model that differs from the model that wrote
+them, and gate on its findings before a push. Only the commits since the last reviewed head are sent (the whole
+branch the first time, or when history was rewritten). Run it after committing: uncommitted changes are not
+reviewed (a NOTE says so). It runs from scripts/dev/pre-pr-checks as the `model-review` job when a reviewer
+command is available.
+
+The reviewer is a command that reads the prompt on stdin and prints its review on stdout, split into words
+(no shell is involved). Default: `claude -p --model <MODEL_REVIEW_MODEL>`. The review must end with a verdict:
+`VERDICT: CLEAN`, or one `FINDING: <file>: <problem>` line per finding followed by `VERDICT: FINDINGS`. Anything
+else is an error, never a clean pass.
+
+Guard rails:
+  - The reviewer must differ from the author: when MODEL_REVIEW_AUTHOR_MODEL (else ANTHROPIC_MODEL) is set and
+    names the reviewer model, the review is skipped with a `SKIPPED:` line instead of a same-model pass. An
+    unknown author model is reported in a NOTE and the review goes ahead.
+  - Each head+base is reviewed once; the recorded result, findings included, is replayed at no cost.
+  - At most --max-runs (default 8) distinct heads are reviewed per repository branch.
+  - Findings gate the push (exit 2). Fix them and commit, or record a decline with
+    `model-review --decline "<reason>"`, which is logged and lets this head through.
+  - A missing reviewer, an author that is the reviewer, no commits ahead, or the run cap are `SKIPPED:` lines
+    (exit 3), never silent and never a failure. PRE_PR_CHECKS_SKIP=model-review skips the pre-pr-checks job.
+
+Exit status:
+  0  clean (or replayed clean, or a recorded decline)
+  1  error (the review could not be completed)
+  2  findings (printed; address them and commit, or --decline)
+  3  skipped (reason on a `SKIPPED:` line)
+
+Environment:
+  MODEL_REVIEW_CMD                Reviewer command (default: claude -p --model $MODEL_REVIEW_MODEL)
+  MODEL_REVIEW_MODEL              Reviewer model for the default command (default: opus)
+  MODEL_REVIEW_AUTHOR_MODEL       The author's model (default: $ANTHROPIC_MODEL); used to refuse a same-model review
+  MODEL_REVIEW_MAX_DIFF_BYTES     Diff size sent to the reviewer before it is cut (default: 200000)
+  MODEL_REVIEW_STATE_DIR          State directory (default: ~/scratch/repository-helpers/model-review)
+EOF_USAGE
+}
+
+skip() {
+  printf 'SKIPPED: model-review: %s\n' "$*" >&2
+  exit 3
+}
+
+fail() {
+  printf 'ERROR: model-review: %s\n' "$*" >&2
+  exit 1
+}
+
+# git_out <label> <repo> <git args…>: stdout of a git command; non-zero when it fails.
+git_out() {
+  local -r label="$1"
+  local -r repo="$2"
+  shift 2
+  runner_exec_stdout "model-review ${label}" --probe -- git -C "$repo" "$@"
+}
+
+# reviewer_words — prints the reviewer command, one word per line.
+reviewer_words() {
+  local model words
+  if [[ -n "${MODEL_REVIEW_CMD:-}" ]]; then
+    read -r -a words <<<"$MODEL_REVIEW_CMD"
+    printf '%s\n' "${words[@]}"
+    return 0
+  fi
+  model="${MODEL_REVIEW_MODEL:-opus}"
+  printf '%s\n' claude -p --model "$model"
+}
+
+# reviewer_resolvable — true when the first word of the reviewer command is an executable.
+reviewer_resolvable() {
+  local first
+  first="$(reviewer_words | head --lines=1)"
+  [[ -n "$first" ]] || return 1
+  if [[ "$first" == */* ]]; then
+    [[ -x "$first" ]]
+  else
+    command -v "$first" >/dev/null 2>&1
+  fi
+}
+
+# same_model — true when the author model is known and the reviewer command names it.
+same_model() {
+  local author reviewer
+  author="${MODEL_REVIEW_AUTHOR_MODEL:-${ANTHROPIC_MODEL:-}}"
+  [[ -n "$author" ]] || return 1
+  reviewer="${MODEL_REVIEW_CMD:-${MODEL_REVIEW_MODEL:-opus}}"
+  [[ "${reviewer,,}" == *"${author,,}"* || "${author,,}" == *"${reviewer,,}"* ]]
+}
+
+# encode_key <text>: reversible, collision-free file-name fragment ('%' and '/' escaped).
+encode_key() {
+  local text="$1"
+  text="${text//%/%25}"
+  text="${text//\//%2F}"
+  printf '%s' "$text"
+}
+
+# state_lookup <state_file> <head> <base>: the last "<head> <base> <result> <count> <detail>" for this pair.
+state_lookup() {
+  local -r state_file="$1"
+  [[ -f "$state_file" ]] || return 1
+  awk -v head="$2" -v base="$3" \
+    '$1 == head && $2 == base { line = $0 } END { if (line != "") print line; else exit 1 }' "$state_file"
+}
+
+# state_run_count <state_file>: distinct head+base pairs already reviewed.
+state_run_count() {
+  local -r state_file="$1"
+  [[ -f "$state_file" ]] || { printf '0\n'; return 0; }
+  awk '!seen[$1 ":" $2]++ { n++ } END { print n + 0 }' "$state_file"
+}
+
+# state_last_reviewed_head <state_file>: the newest head with a clean or declined result, for the incremental diff.
+state_last_reviewed_head() {
+  local -r state_file="$1"
+  [[ -f "$state_file" ]] || return 1
+  awk '$3 == "clean" || $3 == "declined" { line = $1 } END { if (line != "") print line; else exit 1 }' "$state_file"
+}
+
+# record_result <state_file> <head> <base> <result> <count> [detail…]
+record_result() {
+  local -r state_file="$1" head="$2" base="$3" result="$4" count="$5"
+  shift 5
+  if ! printf '%s %s %s %s %s\n' "$head" "$base" "$result" "$count" "$*" >>"$state_file" 2>/dev/null; then
+    printf 'WARN: model-review: could not write %s; this result will not be replayed\n' "$state_file" >&2
+  fi
+}
+
+main() {
+  local dir="$PWD" base_ref="" max_runs=8 timeout_s=900 state_dir="" decline="" detect=0
+  local top branch head base_commit range_from key key_hash state_file findings_file dirty recorded runs
+  local diff_file prompt_file out_file max_bytes diff_bytes review_rc findings_count word author_note
+  local result count detail
+  local -a cmd=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir) dir="${2:?--dir needs a value}"; shift 2 ;;
+      --base) base_ref="${2:?--base needs a value}"; shift 2 ;;
+      --max-runs) max_runs="${2:?--max-runs needs a value}"; shift 2 ;;
+      --timeout) timeout_s="${2:?--timeout needs a value}"; shift 2 ;;
+      --state-dir) state_dir="${2:?--state-dir needs a value}"; shift 2 ;;
+      --decline) decline="${2:?--decline needs a reason}"; shift 2 ;;
+      --detect) detect=1; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *) usage >&2; exit 1 ;;
+    esac
+  done
+
+  if [[ "$detect" -eq 1 ]]; then
+    reviewer_resolvable
+    exit $?
+  fi
+
+  [[ "$max_runs" =~ ^[1-9][0-9]*$ ]] || fail "--max-runs must be a positive integer"
+  [[ "$timeout_s" =~ ^[1-9][0-9]*$ ]] || fail "--timeout must be a positive integer"
+  max_bytes="${MODEL_REVIEW_MAX_DIFF_BYTES:-200000}"
+  [[ "$max_bytes" =~ ^[1-9][0-9]*$ ]] || fail "MODEL_REVIEW_MAX_DIFF_BYTES must be a positive integer"
+
+  top="$(git_out 'show-toplevel' "$dir" rev-parse --show-toplevel)" || fail "not a git repository: ${dir}"
+  branch="$(git_out 'branch' "$top" rev-parse --abbrev-ref HEAD)" || skip "cannot read the current branch"
+  head="$(git_out 'head' "$top" rev-parse HEAD)" || skip "cannot read HEAD (repository without commits?)"
+  [[ "$branch" != "HEAD" ]] || skip "detached HEAD"
+
+  if [[ -z "$base_ref" ]]; then
+    if git_out 'origin/main' "$top" rev-parse --verify --quiet origin/main >/dev/null; then
+      base_ref="origin/main"
+    elif git_out 'main' "$top" rev-parse --verify --quiet main >/dev/null; then
+      base_ref="main"
+    else
+      skip "no origin/main or main to compare against"
+    fi
+  fi
+  base_commit="$(git_out 'merge-base' "$top" merge-base HEAD "$base_ref")" \
+    || skip "cannot compute a merge-base with ${base_ref}"
+  [[ "$base_commit" != "$head" ]] || skip "no commits ahead of ${base_ref}"
+
+  state_dir="${state_dir:-${MODEL_REVIEW_STATE_DIR:-${HOME}/scratch/repository-helpers/model-review}}"
+  mkdir -p "$state_dir" || fail "cannot create the state directory ${state_dir}"
+  key="$(encode_key "$top")__$(encode_key "$branch")"
+  if (( ${#key} > 180 )); then
+    key_hash="$(printf '%s' "$key" | cksum | awk '{ print $1 "-" $2 }')"
+    key="${key:0:120}__${key_hash}"
+  fi
+  state_file="${state_dir}/${key}.log"
+  findings_file="${state_dir}/${key}.${head:0:12}.${base_commit:0:12}.findings"
+
+  if [[ -n "$decline" ]]; then
+    decline="${decline//$'\n'/ }"
+    record_result "$state_file" "$head" "$base_commit" declined 0 "$decline"
+    printf 'NOTE: MODEL_REVIEW_DECLINED head=%s reason=%s\n' "${head:0:7}" "$decline" >&2
+    exit 0
+  fi
+
+  dirty="$(git_out 'status' "$top" status --porcelain --untracked-files=no || true)"
+  if [[ -n "$dirty" ]]; then
+    printf 'NOTE: model-review: uncommitted changes are not reviewed (committed diff only)\n' >&2
+  fi
+
+  # Replay: this exact head against this exact base was already reviewed or declined.
+  if recorded="$(state_lookup "$state_file" "$head" "$base_commit")"; then
+    read -r _ _ result count detail <<<"$recorded"
+    printf 'model-review: head %s already reviewed (%s); replaying\n' "${head:0:7}" "$result" >&2
+    case "$result" in
+      findings)
+        printf 'ERROR: MODEL_REVIEW_FINDINGS count=%s head=%s (replayed; fix and commit, or --decline "<reason>")\n' \
+          "$count" "${head:0:7}" >&2
+        [[ ! -f "$findings_file" ]] || cat -- "$findings_file" >&2
+        exit 2
+        ;;
+      declined)
+        printf 'NOTE: MODEL_REVIEW_DECLINED head=%s reason=%s\n' "${head:0:7}" "${detail:-}" >&2
+        exit 0
+        ;;
+    esac
+    exit 0
+  fi
+
+  reviewer_resolvable || skip "no reviewer command (set MODEL_REVIEW_CMD, or install claude for the default)"
+  if same_model; then
+    skip "the author model (${MODEL_REVIEW_AUTHOR_MODEL:-${ANTHROPIC_MODEL:-}}) is the reviewer model;" \
+      "set MODEL_REVIEW_MODEL or MODEL_REVIEW_CMD to a different one"
+  fi
+  author_note=""
+  if [[ -z "${MODEL_REVIEW_AUTHOR_MODEL:-${ANTHROPIC_MODEL:-}}" ]]; then
+    author_note=" (author model unknown: set MODEL_REVIEW_AUTHOR_MODEL so a same-model review is refused)"
+  fi
+
+  runs="$(state_run_count "$state_file")"
+  if (( runs >= max_runs )); then
+    skip "run cap reached (${runs} of ${max_runs} heads already reviewed on ${branch}); the PR review is the next gate"
+  fi
+
+  # Incremental: only the commits since the last reviewed head, when it is still an ancestor of this one.
+  range_from="$base_commit"
+  if recorded="$(state_last_reviewed_head "$state_file")" \
+    && git_out 'ancestor' "$top" merge-base --is-ancestor "$recorded" "$head" >/dev/null 2>&1; then
+    range_from="$recorded"
+  fi
+
+  diff_file="${RUNNER_SESSION_DIR}/diff.patch"
+  prompt_file="${RUNNER_SESSION_DIR}/prompt.txt"
+  out_file="${RUNNER_SESSION_DIR}/review.txt"
+  git_out 'diff' "$top" diff --no-color "${range_from}..${head}" >"$diff_file" \
+    || fail "cannot read the diff ${range_from:0:7}..${head:0:7}"
+  diff_bytes="$(wc --bytes <"$diff_file" | tr -d ' ')"
+  # shellcheck disable=SC2016  # the backticks are literal Markdown in the prompt text, not command substitution
+  {
+    printf 'You are reviewing commits written by a different model, before they are pushed.\n'
+    printf 'Review only for correctness bugs, missing tests, unsafe shell, and wrong claims in comments or docs.\n'
+    printf 'Do not edit anything. List each real problem on its own line as `FINDING: <file>: <problem>`.\n'
+    printf 'End with exactly one line: `VERDICT: CLEAN` when there is nothing to fix, else `VERDICT: FINDINGS`.\n\n'
+    printf 'Commits (%s..%s):\n' "${range_from:0:7}" "${head:0:7}"
+    git_out 'log' "$top" log --format='- %h %s' "${range_from}..${head}" || true
+    printf '\nDiff:\n'
+    head --bytes="$max_bytes" "$diff_file"
+    if (( diff_bytes > max_bytes )); then
+      printf '\n[diff cut at %s of %s bytes]\n' "$max_bytes" "$diff_bytes"
+    fi
+  } >"$prompt_file"
+
+  while IFS= read -r word; do
+    cmd+=("$word")
+  done < <(reviewer_words)
+  printf 'model-review: reviewing %s (%s..%s, %s bytes of diff) with %s%s\n' \
+    "$branch" "${range_from:0:7}" "${head:0:7}" "$diff_bytes" "${cmd[*]}" "$author_note" >&2
+
+  review_rc=0
+  runner_exec 'model-review review' --probe --stream-stdout --timeout "$timeout_s" -- \
+    "${cmd[@]}" <"$prompt_file" >"$out_file" || review_rc=$?
+  if (( review_rc == 124 )); then
+    fail "the reviewer timed out after ${timeout_s}s (no result recorded)"
+  fi
+  if (( review_rc != 0 )); then
+    fail "the reviewer command exited ${review_rc} (no result recorded)"
+  fi
+
+  findings_count="$(grep -c '^FINDING: ' "$out_file" || true)"
+  if grep -q '^VERDICT: FINDINGS[[:space:]]*$' "$out_file" || (( findings_count > 0 )); then
+    (( findings_count > 0 )) || findings_count=1
+    grep '^FINDING: ' "$out_file" >"$findings_file" 2>/dev/null || cp -- "$out_file" "$findings_file"
+    record_result "$state_file" "$head" "$base_commit" findings "$findings_count"
+    printf 'ERROR: MODEL_REVIEW_FINDINGS count=%s head=%s\n' "$findings_count" "${head:0:7}" >&2
+    cat -- "$findings_file" >&2
+    exit 2
+  fi
+  if ! grep -q '^VERDICT: CLEAN[[:space:]]*$' "$out_file"; then
+    fail "the reviewer gave no 'VERDICT: CLEAN' or 'VERDICT: FINDINGS' line; treating it as an error, not a clean pass"
+  fi
+
+  record_result "$state_file" "$head" "$base_commit" clean 0
+  printf 'model-review: clean (0 findings) on %s\n' "${head:0:7}" >&2
+  exit 0
+}
+
+main "$@"
