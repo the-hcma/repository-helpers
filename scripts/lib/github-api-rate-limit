@@ -797,6 +797,9 @@ github_api_wait_for_rate_limit() {
 #   GITHUB_API_QUOTA_RESERVE      stop admitting calls at this many remaining and wait for the
 #                                 reset instead (default 200)
 #   GITHUB_API_QUOTA_TTL_S        re-probe the quota when the cached value is older (default 30)
+#   GITHUB_API_POLL_BACKOFF_BELOW polling loops lengthen their interval once the cached quota is below this
+#                                 many remaining (default 1000; 0 turns the backoff off)
+#   GITHUB_API_POLL_BACKOFF_MAX_S ceiling for a backed-off polling interval (default 60)
 #   GITHUB_API_PACE_LOCK          mkdir forces the portable mkdir lock even when flock exists
 #                                 (default: flock when available)
 
@@ -1167,6 +1170,43 @@ _github_api_pace_dir() {
   fi
   [[ -d "$state_dir" && -w "$state_dir" ]] || return 1
   _github_api_pace_dir_value="$state_dir"
+}
+
+# github_api_poll_interval <base_s>
+# Sets github_api_poll_interval_value to the interval a polling loop should use: <base_s> while the cached core
+# quota is comfortable, longer once it falls below GITHUB_API_POLL_BACKOFF_BELOW (default 1000) remaining, in
+# proportion to how far below it is (base * ceil(below / remaining)), never past GITHUB_API_POLL_BACKOFF_MAX_S
+# (default 60). Reads only the shared quota cache, never the network, so a loop can ask on every tick. A missing
+# or stale (past its reset) figure, a disabled gate or GITHUB_API_POLL_BACKOFF_BELOW=0 keeps <base_s>.
+github_api_poll_interval() {
+  local -r base="$1"
+  local below max remaining reset observed quota factor interval
+
+  # shellcheck disable=SC2034  # results read by the polling callers
+  github_api_poll_interval_value="$base"
+  github_api_pacing_enabled || return 0
+  below="${GITHUB_API_POLL_BACKOFF_BELOW:-1000}"
+  max="${GITHUB_API_POLL_BACKOFF_MAX_S:-60}"
+  [[ "$below" =~ ^[0-9]{1,9}$ ]] || below=1000
+  [[ "$max" =~ ^[0-9]{1,9}$ ]] || max=60
+  (( below > 0 )) || return 0
+  _github_api_pace_dir || return 0
+  quota="$(_github_api_pace_read "${_github_api_pace_dir_value}/quota")"
+  remaining='' reset='' observed=''
+  read -r remaining reset observed <<<"$quota" || true
+  [[ "$remaining" =~ ^[0-9]+$ && "$reset" =~ ^[0-9]+$ ]] || return 0
+  (( EPOCHSECONDS < reset && remaining < below )) || return 0
+  factor=$(( (below + (remaining > 0 ? remaining : 1) - 1) / (remaining > 0 ? remaining : 1) ))
+  interval=$(( base * factor ))
+  if (( interval > max )); then
+    interval="$max"
+  fi
+  if (( interval > base )); then
+    # shellcheck disable=SC2034  # results read by the polling callers
+    github_api_poll_interval_value="$interval"
+    # shellcheck disable=SC2034  # read by the polling callers
+    github_api_poll_interval_remaining="$remaining"
+  fi
 }
 
 # _github_api_pace_lock <state_dir>
