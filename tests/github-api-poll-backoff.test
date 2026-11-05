@@ -19,6 +19,7 @@ tmp="$(mktemp -d)"
 readonly tmp
 trap 'rm -rf "$tmp"' EXIT
 
+unset GITHUB_API_POLL_BACKOFF_BELOW GITHUB_API_POLL_BACKOFF_MAX_S
 export GITHUB_API_PACING=1
 export GITHUB_API_STATE_DIR="${tmp}/state"
 mkdir -p "$GITHUB_API_STATE_DIR"
@@ -34,43 +35,53 @@ interval_for() {
   printf '%s' "$github_api_poll_interval_value"
 }
 
+# assert_eq <label> <actual> <expected> — exact comparison, so 'interval=5' cannot pass for 'interval=50'.
+assert_eq() {
+  if [[ "$2" == "$3" ]]; then
+    pass_case "$1"
+  else
+    printf '%s\n' '---- output ----' "$2" '--------------' >&2
+    fail_case "$1"
+  fi
+}
+
 printf '\n=== a comfortable quota keeps the base interval ===\n'
-assert_contains 'plenty of quota keeps 5s' "interval=$(interval_for 4000 5)" 'interval=5'
-assert_contains 'exactly at the threshold keeps 5s' "interval=$(interval_for 1000 5)" 'interval=5'
+assert_eq 'plenty of quota keeps 5s' "interval=$(interval_for 4000 5)" 'interval=5'
+assert_eq 'exactly at the threshold keeps 5s' "interval=$(interval_for 1000 5)" 'interval=5'
 
 printf '\n=== a low quota lengthens the interval in proportion ===\n'
-assert_contains 'half the threshold doubles the interval' "interval=$(interval_for 500 5)" 'interval=10'
-assert_contains 'a quarter of the threshold quadruples it' "interval=$(interval_for 250 5)" 'interval=20'
-assert_contains 'a nearly empty quota is capped at 60s' "interval=$(interval_for 10 5)" 'interval=60'
-assert_contains 'an empty quota is capped at 60s' "interval=$(interval_for 0 5)" 'interval=60'
-assert_contains 'the cap follows GITHUB_API_POLL_BACKOFF_MAX_S' \
+assert_eq 'half the threshold doubles the interval' "interval=$(interval_for 500 5)" 'interval=10'
+assert_eq 'a quarter of the threshold quadruples it' "interval=$(interval_for 250 5)" 'interval=20'
+assert_eq 'a nearly empty quota is capped at 60s' "interval=$(interval_for 10 5)" 'interval=60'
+assert_eq 'an empty quota is capped at 60s' "interval=$(interval_for 0 5)" 'interval=60'
+assert_eq 'the cap follows GITHUB_API_POLL_BACKOFF_MAX_S' \
   "interval=$(GITHUB_API_POLL_BACKOFF_MAX_S=30 interval_for 10 5)" 'interval=30'
-assert_contains 'the threshold follows GITHUB_API_POLL_BACKOFF_BELOW' \
+assert_eq 'the threshold follows GITHUB_API_POLL_BACKOFF_BELOW' \
   "interval=$(GITHUB_API_POLL_BACKOFF_BELOW=100 interval_for 400 5)" 'interval=5'
-assert_contains 'a base interval above the cap is never shortened' \
+assert_eq 'a base interval above the cap is never shortened' \
   "interval=$(GITHUB_API_POLL_BACKOFF_MAX_S=3 interval_for 10 5)" 'interval=5'
 
 printf '\n=== a leading zero is read as decimal ===\n'
-assert_contains 'BELOW=0800 is decimal 800, not an octal error' \
+assert_eq 'BELOW=0800 is decimal 800, not an octal error' \
   "interval=$(GITHUB_API_POLL_BACKOFF_BELOW=0800 interval_for 400 5)" 'interval=10'
-assert_contains 'MAX_S=09 is decimal 9' "interval=$(GITHUB_API_POLL_BACKOFF_MAX_S=09 interval_for 10 5)" 'interval=9'
+assert_eq 'MAX_S=09 is decimal 9' "interval=$(GITHUB_API_POLL_BACKOFF_MAX_S=09 interval_for 10 5)" 'interval=9'
 
 printf '\n=== no usable quota figure keeps the base interval ===\n'
 printf '300 %s %s\n' "$(( EPOCHSECONDS - 5 ))" "$(( EPOCHSECONDS - 600 ))" >"${GITHUB_API_STATE_DIR}/quota"
 github_api_poll_interval 5
-assert_contains 'a figure past its reset is ignored' "interval=${github_api_poll_interval_value}" 'interval=5'
+assert_eq 'a figure past its reset is ignored' "interval=${github_api_poll_interval_value}" 'interval=5'
 printf '? ? %s\n' "$EPOCHSECONDS" >"${GITHUB_API_STATE_DIR}/quota"
 github_api_poll_interval 5
-assert_contains 'a failed probe (?) is ignored' "interval=${github_api_poll_interval_value}" 'interval=5'
+assert_eq 'a failed probe (?) is ignored' "interval=${github_api_poll_interval_value}" 'interval=5'
 rm -f -- "${GITHUB_API_STATE_DIR}/quota"
 github_api_poll_interval 5
-assert_contains 'a missing cache is ignored' "interval=${github_api_poll_interval_value}" 'interval=5'
+assert_eq 'a missing cache is ignored' "interval=${github_api_poll_interval_value}" 'interval=5'
 
 printf '\n=== the backoff can be turned off ===\n'
-assert_contains 'BELOW=0 keeps the base interval' \
+assert_eq 'BELOW=0 keeps the base interval' \
   "interval=$(GITHUB_API_POLL_BACKOFF_BELOW=0 interval_for 10 5)" 'interval=5'
-assert_contains 'a disabled gate keeps the base interval' "interval=$(GITHUB_API_PACING=0 interval_for 10 5)" 'interval=5'
-assert_contains 'an invalid threshold falls back to the default' \
+assert_eq 'a disabled gate keeps the base interval' "interval=$(GITHUB_API_PACING=0 interval_for 10 5)" 'interval=5'
+assert_eq 'an invalid threshold falls back to the default' \
   "interval=$(GITHUB_API_POLL_BACKOFF_BELOW=lots interval_for 500 5)" 'interval=10'
 
 printf '\n=== the review loop wait uses the backed-off interval ===\n'
@@ -78,8 +89,9 @@ fn_file="${tmp}/wait-fn"
 awk '/^cmd_loop_sleep_abort_if_pending\(\) \{/{p=1} p{print} p&&/^}/{exit}' "$review_script" >"$fn_file"
 assert_contains 'the wait function was extracted' "$(head -n 1 "$fn_file")" 'cmd_loop_sleep_abort_if_pending() {'
 sleeps_file="${tmp}/sleeps"
-# run_wait <remaining-quota> — runs a 20s wait, leaving its stderr in wait_err and the sleeps in the sleeps file.
+# run_wait <remaining-quota> [total-seconds] — runs a wait (default 20s), leaving its stderr in wait_err and the sleeps in the sleeps file.
 run_wait() {
+  local -r total_s="${2:-20}"
   : >"$sleeps_file"
   printf '%s %s %s\n' "$1" "$(( EPOCHSECONDS + 600 ))" "$EPOCHSECONDS" >"${GITHUB_API_STATE_DIR}/quota"
   wait_err="$(
@@ -93,17 +105,20 @@ run_wait() {
     agent_review_abort_if_pending_threads() { return 0; }
     # shellcheck disable=SC1090  # extracted from the script under test
     source "$fn_file"
-    cmd_loop_sleep_abort_if_pending the-hcma/repository-helpers 7 20 'CI pending' 2>&1
+    cmd_loop_sleep_abort_if_pending the-hcma/repository-helpers 7 "$total_s" 'CI pending' 2>&1
   )"
 }
 run_wait 4000
-assert_contains 'a full quota polls every 5s (four chunks)' "sleeps=$(wc -l <"$sleeps_file" | tr -d ' ')" 'sleeps=4'
+assert_eq 'a full quota polls every 5s (four chunks)' "sleeps=$(wc -l <"$sleeps_file" | tr -d ' ')" 'sleeps=4'
 assert_not_contains 'no backoff note at a full quota' "$wait_err" 'GITHUB_API_POLL_BACKOFF'
 run_wait 250
-assert_contains 'a low quota polls every 20s (one chunk)' "sleeps=$(wc -l <"$sleeps_file" | tr -d ' ')" 'sleeps=1'
-assert_contains 'the low-quota chunk is 20s' "sleep=$(cat "$sleeps_file")" 'sleep=20'
+assert_eq 'a low quota polls every 20s (one chunk)' "sleeps=$(wc -l <"$sleeps_file" | tr -d ' ')" 'sleeps=1'
+assert_eq 'the low-quota chunk is 20s' "sleep=$(cat "$sleeps_file")" 'sleep=20'
 assert_contains 'one machine-parseable backoff note is printed' "$wait_err" \
   'NOTE: GITHUB_API_POLL_BACKOFF label=CI pending remaining=250 interval=20s base=5s'
-assert_contains 'the note appears once' "notes=$(grep -c GITHUB_API_POLL_BACKOFF <<<"$wait_err")" 'notes=1'
+assert_eq 'the note appears once' "notes=$(grep -c GITHUB_API_POLL_BACKOFF <<<"$wait_err")" 'notes=1'
+run_wait 250 60
+assert_eq 'a 60s low-quota wait polls in three backed-off chunks' "sleeps=$(wc -l <"$sleeps_file" | tr -d ' ')" 'sleeps=3'
+assert_eq 'the note appears once across three chunks' "notes=$(grep -c GITHUB_API_POLL_BACKOFF <<<"$wait_err")" 'notes=1'
 
 test_summary
