@@ -594,7 +594,7 @@ prec_org_lint_fingerprint() {
   local -r root="$1"
   local -r org="$2"
   local -r lint_script="$3"
-  local gh_api_script tree_listing remote_listing
+  local gh_api_script tree_listing remote_listing audit_root audit_roots=("$root") audit_paths
   # shellcheck disable=SC2016  # GraphQL variables ($org, $endCursor), not shell expansions
   local -r query='query($org: String!, $endCursor: String) { organization(login: $org) {
     repositories(first: 100, after: $endCursor) { nodes { nameWithOwner defaultBranchRef { target { oid } } }
@@ -602,9 +602,23 @@ prec_org_lint_fingerprint() {
 
   gh_api_script="${lint_script%/*}/gh-api"
   [[ -x "$gh_api_script" ]] || return 1
-  tree_listing="$(runner_exec_stdout "prec org-lint fingerprint templates" -- git -C "$root" ls-tree -r HEAD -- \
-    scripts/github-repo-lint scripts/lib/repo-practices scripts/lib/repo-practices-agents \
-    scripts/lib/repo-practices-cursor scripts/lib/repo-practices-workflows .agents/rules)" || return 1
+  audit_paths=(scripts/github-repo-lint scripts/lib/repo-practices scripts/lib/repo-practices-agents
+    scripts/lib/repo-practices-cursor scripts/lib/repo-practices-workflows .agents/rules)
+  # A consumer repo runs the audit from a separate helpers clone: key on that clone's files too.
+  audit_root="$(cd -- "${lint_script%/*}/.." 2>/dev/null && pwd -P)" || return 1
+  if [[ "$audit_root" != "$(cd -- "$root" && pwd -P)" ]]; then
+    audit_roots+=("$audit_root")
+  fi
+  tree_listing=''
+  for audit_root in "${audit_roots[@]}"; do
+    # HEAD tree, plus uncommitted edits and untracked files, because the audit reads the working tree
+    tree_listing+="$(runner_exec_stdout "prec org-lint fingerprint templates" -- git -C "$audit_root" ls-tree -r HEAD \
+      -- "${audit_paths[@]}")" || return 1
+    tree_listing+="$(runner_exec_stdout "prec org-lint fingerprint edits" -- git -C "$audit_root" diff HEAD \
+      -- "${audit_paths[@]}")" || return 1
+    tree_listing+="$(runner_exec_stdout "prec org-lint fingerprint untracked" -- git -C "$audit_root" ls-files \
+      --others --exclude-standard -- "${audit_paths[@]}")" || return 1
+  done
   remote_listing="$(runner_exec_stdout "prec org-lint fingerprint remote SHAs" -- "$gh_api_script" api graphql \
     --paginate -f query="$query" -f org="$org" \
     --jq '.data.organization.repositories.nodes[] | "\(.nameWithOwner) \(.defaultBranchRef.target.oid // "-")"')" \
@@ -618,7 +632,7 @@ prec_org_lint_fingerprint() {
 prec_org_lint_cache_ttl() {
   local -r ttl="${PRE_PR_CHECKS_ORG_LINT_CACHE_TTL:-21600}"
   [[ "$ttl" =~ ^[0-9]{1,7}$ ]] || return 1
-  printf '%s\n' "$ttl"
+  printf '%s\n' "$((10#$ttl))"
 }
 
 # prec_org_lint_cache_hit <fingerprint> <org> — true when the last passing audit has this fingerprint and is
@@ -633,7 +647,7 @@ prec_org_lint_cache_hit() {
   [[ -f "$file" ]] || return 1
   read -r cached_fp cached_at <"$file" || return 1
   [[ "$cached_fp" == "$fingerprint" && "$cached_at" =~ ^[0-9]+$ ]] || return 1
-  (( EPOCHSECONDS - cached_at < ttl ))
+  (( cached_at <= EPOCHSECONDS && EPOCHSECONDS - cached_at < ttl ))
 }
 
 # prec_org_lint_cache_store <fingerprint> <org> — record a passing audit (atomic, best effort).
