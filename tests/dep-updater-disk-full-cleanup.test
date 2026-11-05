@@ -105,4 +105,47 @@ assert_contains 'the close comment keeps its wording' "$other_calls" 'Closed by 
 merge_calls="$(run_cleanup 'gh merge failed: pr=#7: nope')"
 assert_not_contains 'the existing merge-failure case still keeps the PR' "$merge_calls" 'pr close'
 
+printf '\n=== a reason that cannot be written on a full disk still reaches cleanup ===\n'
+# /dev/full fails every write with ENOSPC, like a full disk; a symlink puts it at the first-failure path.
+ln -s /dev/full "${tmp}/first-failure-full"
+RUNNER_FIRST_FAILURE_FILE="${tmp}/first-failure-full" bash -c '
+  source "$1"
+  record_first_failure "git commit: error: No space left on device"
+  record_first_failure "pnpm: no matching version"
+' bash "$runner_bootstrap"
+assert_contains 'a disk-full reason that cannot be written leaves a marker' \
+  "marker=$([[ -e "${tmp}/first-failure-full.disk-full" ]] && echo yes || echo no)" 'marker=yes'
+rm -f "${tmp}/first-failure-nomarker.disk-full"
+ln -s /dev/full "${tmp}/first-failure-nomarker"
+RUNNER_FIRST_FAILURE_FILE="${tmp}/first-failure-nomarker" bash -c '
+  source "$1"
+  record_first_failure "pnpm: no matching version"
+' bash "$runner_bootstrap"
+assert_contains 'another reason that cannot be written leaves no marker' \
+  "marker=$([[ -e "${tmp}/first-failure-nomarker.disk-full" ]] && echo yes || echo no)" 'marker=no'
+
+awk '$0 == "_on_exit() {" { on = 1 } on { print } on && $0 == "}" { exit }' "$script" >"${tmp}/on-exit-fn"
+# run_on_exit <first-failure-file>: runs _on_exit after a failed command and prints the reason cleanup got
+run_on_exit() {
+  RUNNER_FIRST_FAILURE_FILE="$1" bash -c '
+    source "$2"
+    cleanup_on_error() { printf "reason=%s\n" "$1"; }
+    dep_updater_write_batch_child_report_json() { :; }
+    _cleanup_trap_active=1
+    _primary_preserve_active=0
+    set +e
+    ( exit 5 )
+    _on_exit
+  ' bash "$runner_bootstrap" "${tmp}/on-exit-fn" 2>&1 || true
+}
+: >"${tmp}/ff-empty"
+touch "${tmp}/ff-empty.disk-full"
+assert_contains 'cleanup gets a disk-full reason when only the marker exists' "$(run_on_exit "${tmp}/ff-empty")" \
+  'reason=No space left on device'
+consumed="$([[ -e "${tmp}/ff-empty.disk-full" ]] && echo yes || echo no)"
+assert_contains 'the marker is consumed' "marker=${consumed}" 'marker=no'
+: >"${tmp}/ff-none"
+assert_contains 'without a marker or a reason the generic exit reason is kept' "$(run_on_exit "${tmp}/ff-none")" \
+  'script exited unexpectedly'
+
 test_summary
