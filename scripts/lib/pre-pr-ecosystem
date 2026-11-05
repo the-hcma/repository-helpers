@@ -578,9 +578,80 @@ prec_announce_repo_practices_scope() {
   fi
 }
 
+# prec_org_lint_cache_file <org>
+# Where the last passing org-wide audit is recorded (one line: "<fingerprint> <epoch>").
+prec_org_lint_cache_file() {
+  local -r org="$1"
+  printf '%s/org-lint-pass.%s\n' "${PRE_PR_CHECKS_CACHE_DIR:-${HOME}/scratch/repository-helpers}" "$org"
+}
+
+# prec_org_lint_fingerprint <root> <org> <lint_script>
+# Prints a hash of everything the org-wide audit reads that a branch can change or that moves with the org:
+# this checkout's audit script and org-wide templates at HEAD, plus every org repository's default-branch SHA
+# (one paginated GraphQL listing, so the cost is a few calls however many worktrees ask). Returns non-zero
+# when any part cannot be read, so the caller runs the audit instead of trusting a partial key.
+prec_org_lint_fingerprint() {
+  local -r root="$1"
+  local -r org="$2"
+  local -r lint_script="$3"
+  local gh_api_script tree_listing remote_listing
+  # shellcheck disable=SC2016  # GraphQL variables ($org, $endCursor), not shell expansions
+  local -r query='query($org: String!, $endCursor: String) { organization(login: $org) {
+    repositories(first: 100, after: $endCursor) { nodes { nameWithOwner defaultBranchRef { target { oid } } }
+    pageInfo { hasNextPage endCursor } } } }'
+
+  gh_api_script="${lint_script%/*}/gh-api"
+  [[ -x "$gh_api_script" ]] || return 1
+  tree_listing="$(runner_exec_stdout "prec org-lint fingerprint templates" -- git -C "$root" ls-tree -r HEAD -- \
+    scripts/github-repo-lint scripts/lib/repo-practices scripts/lib/repo-practices-agents \
+    scripts/lib/repo-practices-cursor scripts/lib/repo-practices-workflows .agents/rules)" || return 1
+  remote_listing="$(runner_exec_stdout "prec org-lint fingerprint remote SHAs" -- "$gh_api_script" api graphql \
+    --paginate -f query="$query" -f org="$org" \
+    --jq '.data.organization.repositories.nodes[] | "\(.nameWithOwner) \(.defaultBranchRef.target.oid // "-")"')" \
+    || return 1
+  [[ -n "$remote_listing" ]] || return 1
+  printf '%s\n%s\n%s\n' "$org" "$tree_listing" "$(LC_ALL=C sort <<<"$remote_listing")" | sha256sum | cut -d' ' -f1
+}
+
+# prec_org_lint_cache_ttl — seconds a passing audit stays valid; 0 turns the cache off. Prints nothing and
+# returns non-zero for an invalid value.
+prec_org_lint_cache_ttl() {
+  local -r ttl="${PRE_PR_CHECKS_ORG_LINT_CACHE_TTL:-21600}"
+  [[ "$ttl" =~ ^[0-9]{1,7}$ ]] || return 1
+  printf '%s\n' "$ttl"
+}
+
+# prec_org_lint_cache_hit <fingerprint> <org> — true when the last passing audit has this fingerprint and is
+# younger than the TTL.
+prec_org_lint_cache_hit() {
+  local -r fingerprint="$1"
+  local -r org="$2"
+  local file ttl cached_fp cached_at
+  file="$(prec_org_lint_cache_file "$org")"
+  ttl="$(prec_org_lint_cache_ttl)" || return 1
+  (( ttl > 0 )) || return 1
+  [[ -f "$file" ]] || return 1
+  read -r cached_fp cached_at <"$file" || return 1
+  [[ "$cached_fp" == "$fingerprint" && "$cached_at" =~ ^[0-9]+$ ]] || return 1
+  (( EPOCHSECONDS - cached_at < ttl ))
+}
+
+# prec_org_lint_cache_store <fingerprint> <org> — record a passing audit (atomic, best effort).
+prec_org_lint_cache_store() {
+  local -r fingerprint="$1"
+  local -r org="$2"
+  local file dir
+  file="$(prec_org_lint_cache_file "$org")"
+  dir="${file%/*}"
+  mkdir -p -- "$dir" 2>/dev/null || return 0
+  printf '%s %s\n' "$fingerprint" "$EPOCHSECONDS" >"${file}.$$.tmp" 2>/dev/null || return 0
+  mv -- "${file}.$$.tmp" "$file" 2>/dev/null || rm -f -- "${file}.$$.tmp"
+  return 0
+}
+
 prec_run_repo_practices_lint() {
   local -r root="$1"
-  local slug org lint_script trigger lint_exit_code=0
+  local slug org lint_script trigger lint_exit_code=0 cache_ttl fingerprint=''
   local -r org_timeout="${PRE_PR_CHECKS_ORG_LINT_TIMEOUT:-3600}"
 
   slug="$(gh_slug_from_repo_dir "$root")" || {
@@ -600,10 +671,27 @@ prec_run_repo_practices_lint() {
 
   org="${slug%%/*}"
   if trigger="$(prec_org_wide_lint_trigger "$root")"; then
+    if ! cache_ttl="$(prec_org_lint_cache_ttl)"; then
+      printf 'ERROR: PRE_PR_CHECKS_ORG_LINT_CACHE_TTL must be a non-negative integer (got: %s)\n' \
+        "${PRE_PR_CHECKS_ORG_LINT_CACHE_TTL:-}" >&2
+      return 2
+    fi
+    if (( cache_ttl > 0 )) && fingerprint="$(prec_org_lint_fingerprint "$root" "$org" "$lint_script")"; then
+      if prec_org_lint_cache_hit "$fingerprint" "$org"; then
+        printf '==> skipped org-wide audit: %s changed, but the templates and every %s default-branch SHA\n' \
+          "$trigger" "$org"
+        printf '    match a passing run in the last %ss (PRE_PR_CHECKS_ORG_LINT_CACHE_TTL=0 forces the audit)\n' \
+          "$cache_ttl"
+        return 0
+      fi
+    fi
     printf '==> running org-wide: %s changed (timeout %ss)\n' "$trigger" "$org_timeout"
     run_command "pre-pr org repo-practices lint (${org})" --timeout "$org_timeout" \
       -- env NO_COLOR=1 "$lint_script" \
       --org "$org" --all --strict-onboarding --compact || lint_exit_code=$?
+    if (( lint_exit_code == 0 )) && [[ -n "$fingerprint" ]]; then
+      prec_org_lint_cache_store "$fingerprint" "$org"
+    fi
     return "$lint_exit_code"
   fi
 
