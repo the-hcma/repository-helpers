@@ -671,10 +671,57 @@ prec_org_lint_cache_store() {
   return 0
 }
 
+# prec_org_lint_lock_file <org>
+# The host-wide lock that lets one org-wide audit run at a time (they share one API budget).
+prec_org_lint_lock_file() {
+  local -r org="$1"
+  printf '%s/org-lint.%s.lock\n' "${PRE_PR_CHECKS_CACHE_DIR:-${HOME}/scratch/repository-helpers}" "$org"
+}
+
+# prec_org_lint_lock_acquire <org> <wait_s>
+# Takes the exclusive org-audit lock (flock on the lock file, released by the kernel when the holder dies, so it
+# is never stale), keeping the descriptor in prec_org_lint_lock_fd. When another audit holds it, prints one
+# `NOTE: ORG_AUDIT_WAIT ...` line and waits up to <wait_s>; the caller then re-reads the audit cache, because the
+# audit that just finished usually left a pass to reuse. Returns 0 when held or when no lock can be used (no
+# flock, unwritable directory: the audit then runs unguarded, as before), 1 after printing one
+# `ERROR: WAIT_TIMEOUT ...` line when the wait ran out.
+prec_org_lint_lock_acquire() {
+  local -r org="$1"
+  local -r wait_s="$2"
+  local lock_file
+
+  prec_org_lint_lock_fd=''
+  command -v flock >/dev/null 2>&1 || return 0
+  lock_file="$(prec_org_lint_lock_file "$org")"
+  mkdir -p -- "${lock_file%/*}" 2>/dev/null || return 0
+  # the 2>/dev/null belongs to a group: on a bare `exec` it would redirect this shell's stderr for good
+  { exec {prec_org_lint_lock_fd}>>"$lock_file"; } 2>/dev/null || { prec_org_lint_lock_fd=''; return 0; }
+  if flock --exclusive --nonblock "$prec_org_lint_lock_fd"; then
+    return 0
+  fi
+  printf 'NOTE: ORG_AUDIT_WAIT org=%s lock=%s timeout=%ss reason=another org-wide audit is running on this host\n' \
+    "$org" "$lock_file" "$wait_s" >&2
+  if flock --exclusive --timeout "$wait_s" "$prec_org_lint_lock_fd"; then
+    return 0
+  fi
+  printf 'ERROR: WAIT_TIMEOUT what=org-audit-lock org=%s waited=%ss lock=%s\n' "$org" "$wait_s" "$lock_file" >&2
+  prec_org_lint_lock_release
+  return 1
+}
+
+# prec_org_lint_lock_release — drops the org-audit lock if this process holds it.
+prec_org_lint_lock_release() {
+  if [[ -n "${prec_org_lint_lock_fd:-}" ]]; then
+    exec {prec_org_lint_lock_fd}>&-
+    prec_org_lint_lock_fd=''
+  fi
+}
+
 prec_run_repo_practices_lint() {
   local -r root="$1"
   local slug org lint_script trigger lint_exit_code=0 cache_ttl fingerprint=''
   local -r org_timeout="${PRE_PR_CHECKS_ORG_LINT_TIMEOUT:-3600}"
+  local -r lock_wait="${PRE_PR_CHECKS_ORG_LINT_LOCK_WAIT:-3600}"
 
   slug="$(gh_slug_from_repo_dir "$root")" || {
     printf '==> warn: repo-practices-lint skipped (origin is not a GitHub OWNER/NAME remote)\n' >&2
@@ -691,6 +738,12 @@ prec_run_repo_practices_lint() {
     return 2
   fi
 
+  if [[ ! "$lock_wait" =~ ^[1-9][0-9]{0,5}$ ]]; then
+    printf 'ERROR: PRE_PR_CHECKS_ORG_LINT_LOCK_WAIT must be a positive integer without leading zeros (got: %s)\n' \
+      "$lock_wait" >&2
+    return 2
+  fi
+
   org="${slug%%/*}"
   if trigger="$(prec_org_wide_lint_trigger "$root")"; then
     if ! cache_ttl="$(prec_org_lint_cache_ttl)"; then
@@ -698,12 +751,15 @@ prec_run_repo_practices_lint() {
         "${PRE_PR_CHECKS_ORG_LINT_CACHE_TTL:-}" >&2
       return 2
     fi
+    # One audit per host at a time; a waiter re-reads the cache below, so it reuses the pass it waited for.
+    prec_org_lint_lock_acquire "$org" "$lock_wait" || return 1
     if (( cache_ttl > 0 )) && fingerprint="$(prec_org_lint_fingerprint "$root" "$org" "$lint_script")"; then
       if prec_org_lint_cache_hit "$fingerprint" "$org"; then
         printf '==> skipped org-wide audit: %s changed, but the templates and every %s default-branch SHA\n' \
           "$trigger" "$org"
         printf '    match a passing run in the last %ss (PRE_PR_CHECKS_ORG_LINT_CACHE_TTL=0 forces the audit)\n' \
           "$cache_ttl"
+        prec_org_lint_lock_release
         return 0
       fi
     fi
@@ -719,6 +775,7 @@ prec_run_repo_practices_lint() {
         rm -f -- "$(prec_org_lint_cache_file "$org")"
       fi
     fi
+    prec_org_lint_lock_release
     return "$lint_exit_code"
   fi
 
