@@ -47,7 +47,7 @@ Environment:
   MODEL_REVIEW_CMD                Reviewer command (default: claude -p --model $MODEL_REVIEW_MODEL)
   MODEL_REVIEW_MODEL              Reviewer model for the default command (default: opus)
   MODEL_REVIEW_AUTHOR_MODEL       The author's model (default: $ANTHROPIC_MODEL); used to refuse a same-model review
-  MODEL_REVIEW_MAX_DIFF_BYTES     Diff size sent to the reviewer before it is cut (default: 200000)
+  MODEL_REVIEW_MAX_DIFF_BYTES     Largest diff sent; a bigger one is skipped, never cut (default: 200000)
   MODEL_REVIEW_STATE_DIR          State directory (default: ~/scratch/repository-helpers/model-review)
 EOF_USAGE
 }
@@ -116,14 +116,22 @@ state_lookup() {
   local -r state_file="$1"
   [[ -f "$state_file" ]] || return 1
   awk -v head="$2" -v base="$3" \
-    '$1 == head && $2 == base { line = $0 } END { if (line != "") print line; else exit 1 }' "$state_file"
+    '$1 == head && $2 == base && $3 != "error" { line = $0 } END { if (line != "") print line; else exit 1 }' \
+    "$state_file"
 }
 
 # state_run_count <state_file>: distinct head+base pairs already reviewed.
 state_run_count() {
   local -r state_file="$1"
   [[ -f "$state_file" ]] || { printf '0\n'; return 0; }
-  awk '!seen[$1 ":" $2]++ { n++ } END { print n + 0 }' "$state_file"
+  awk '$3 != "error" && !seen[$1 ":" $2]++ { n++ } END { print n + 0 }' "$state_file"
+}
+
+# state_error_count <state_file> <head> <base>: failed attempts (timeout, bad exit, no verdict) on this head.
+state_error_count() {
+  local -r state_file="$1"
+  [[ -f "$state_file" ]] || { printf '0\n'; return 0; }
+  awk -v head="$2" -v base="$3" '$1 == head && $2 == base && $3 == "error" { n++ } END { print n + 0 }' "$state_file"
 }
 
 # state_last_reviewed_head <state_file>: the newest head with a clean or declined result, for the incremental diff.
@@ -143,10 +151,10 @@ record_result() {
 }
 
 main() {
-  local dir="$PWD" base_ref="" max_runs=8 timeout_s=900 state_dir="" decline="" detect=0
+  local dir="$PWD" base_ref="" max_runs=8 timeout_s=540 state_dir="" decline="" detect=0
   local top branch head base_commit range_from key key_hash state_file findings_file dirty recorded runs
   local diff_file prompt_file out_file max_bytes diff_bytes review_rc findings_count word author_note
-  local result count detail
+  local result count detail last_line attempts
   local -a cmd=()
 
   while [[ $# -gt 0 ]]; do
@@ -242,6 +250,10 @@ main() {
     author_note=" (author model unknown: set MODEL_REVIEW_AUTHOR_MODEL so a same-model review is refused)"
   fi
 
+  attempts="$(state_error_count "$state_file" "$head" "$base_commit")"
+  if (( attempts >= 2 )); then
+    skip "the reviewer failed ${attempts} times on this head (see ${state_file}); fix the reviewer or review it by hand"
+  fi
   runs="$(state_run_count "$state_file")"
   if (( runs >= max_runs )); then
     skip "run cap reached (${runs} of ${max_runs} heads already reviewed on ${branch}); the PR review is the next gate"
@@ -260,6 +272,10 @@ main() {
   git_out 'diff' "$top" diff --no-color "${range_from}..${head}" >"$diff_file" \
     || fail "cannot read the diff ${range_from:0:7}..${head:0:7}"
   diff_bytes="$(wc --bytes <"$diff_file" | tr -d ' ')"
+  if (( diff_bytes > max_bytes )); then
+    skip "the diff is ${diff_bytes} bytes, over MODEL_REVIEW_MAX_DIFF_BYTES=${max_bytes}; a cut diff would leave code" \
+      "unreviewed, so nothing is sent. Raise the limit or commit and review smaller steps"
+  fi
   # shellcheck disable=SC2016  # the backticks are literal Markdown in the prompt text, not command substitution
   {
     printf 'You are reviewing commits written by a different model, before they are pushed.\n'
@@ -269,10 +285,7 @@ main() {
     printf 'Commits (%s..%s):\n' "${range_from:0:7}" "${head:0:7}"
     git_out 'log' "$top" log --format='- %h %s' "${range_from}..${head}" || true
     printf '\nDiff:\n'
-    head --bytes="$max_bytes" "$diff_file"
-    if (( diff_bytes > max_bytes )); then
-      printf '\n[diff cut at %s of %s bytes]\n' "$max_bytes" "$diff_bytes"
-    fi
+    cat -- "$diff_file"
   } >"$prompt_file"
 
   while IFS= read -r word; do
@@ -282,17 +295,24 @@ main() {
     "$branch" "${range_from:0:7}" "${head:0:7}" "$diff_bytes" "${cmd[*]}" "$author_note" >&2
 
   review_rc=0
+  # The runner starts its command in the background, where a plain `<file` on this call would not reach it:
+  # a fixed wrapper opens the prompt as the reviewer's stdin itself.
+  # shellcheck disable=SC2016  # the wrapper's $1/$@ expand in the child shell, not here
   runner_exec 'model-review review' --probe --stream-stdout --timeout "$timeout_s" -- \
-    "${cmd[@]}" <"$prompt_file" >"$out_file" || review_rc=$?
+    bash -c 'prompt="$1"; shift; exec "$@" <"$prompt"' model-review-stdin "$prompt_file" "${cmd[@]}" \
+    >"$out_file" || review_rc=$?
   if (( review_rc == 124 )); then
-    fail "the reviewer timed out after ${timeout_s}s (no result recorded)"
+    record_result "$state_file" "$head" "$base_commit" error 0 timeout
+    fail "the reviewer timed out after ${timeout_s}s"
   fi
   if (( review_rc != 0 )); then
-    fail "the reviewer command exited ${review_rc} (no result recorded)"
+    record_result "$state_file" "$head" "$base_commit" error 0 "exit-${review_rc}"
+    fail "the reviewer command exited ${review_rc}"
   fi
 
   findings_count="$(grep -c '^FINDING: ' "$out_file" || true)"
-  if grep -q '^VERDICT: FINDINGS[[:space:]]*$' "$out_file" || (( findings_count > 0 )); then
+  last_line="$(awk 'NF { line = $0 } END { print line }' "$out_file")"
+  if [[ "$last_line" =~ ^VERDICT:\ FINDINGS[[:space:]]*$ ]] || (( findings_count > 0 )); then
     (( findings_count > 0 )) || findings_count=1
     grep '^FINDING: ' "$out_file" >"$findings_file" 2>/dev/null || cp -- "$out_file" "$findings_file"
     record_result "$state_file" "$head" "$base_commit" findings "$findings_count"
@@ -300,8 +320,11 @@ main() {
     cat -- "$findings_file" >&2
     exit 2
   fi
-  if ! grep -q '^VERDICT: CLEAN[[:space:]]*$' "$out_file"; then
-    fail "the reviewer gave no 'VERDICT: CLEAN' or 'VERDICT: FINDINGS' line; treating it as an error, not a clean pass"
+  # The verdict is the last non-empty line: a quoted `VERDICT: CLEAN` earlier in the text decides nothing.
+  last_line="$(awk 'NF { line = $0 } END { print line }' "$out_file")"
+  if [[ ! "$last_line" =~ ^VERDICT:\ CLEAN[[:space:]]*$ ]]; then
+    record_result "$state_file" "$head" "$base_commit" error 0 no-verdict
+    fail "the reviewer did not end with 'VERDICT: CLEAN' or 'VERDICT: FINDINGS'; an error, not a clean pass"
   fi
 
   record_result "$state_file" "$head" "$base_commit" clean 0
