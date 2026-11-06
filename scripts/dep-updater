@@ -2147,6 +2147,28 @@ dep_updater_primary_is_generic() {
   runner_primary_is_generic_exit "$1" "dep-updater" "$2"
 }
 
+# dep_updater_rerun_failed_ci <pr_num>
+# Re-queue failed jobs on the newest failed Actions run for the PR head (one
+# flake retry before closing). Returns 0 when a re-run was requested.
+dep_updater_rerun_failed_ci() {
+  local -r pr_num="$1"
+  local run_id exit_code
+
+  exit_code=0
+  run_id="$(ci_failed_workflow_run_id_for_pr "$pr_num" "${repo_owner}/${repo_name}")" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$run_id" ]]; then
+    return 1
+  fi
+  exit_code=0
+  dep_runner_gh "gh run rerun failed" -- run rerun --failed "$run_id" \
+    --repo "${repo_owner}/${repo_name}" || exit_code=$?
+  if (( exit_code != 0 )); then
+    return 1
+  fi
+  log "NOTE: CI_FLAKE_RETRY pr=#${pr_num} run=${run_id} — re-running failed jobs once"
+  return 0
+}
+
 # dep_updater_actionable_primary_from_report <report_file> <exit_code>
 # Prefer structured runner failures over generic exit-code placeholders.
 dep_updater_actionable_primary_from_report() {
@@ -8728,6 +8750,13 @@ wait_for_ci() {
   local approval_due=0
   local status raw merge_state already_merged
   local cancelled_diag rollup_diag latest_diag
+  # One automatic re-run of failed jobs absorbs xdist worker crashes and similar
+  # flakes (domesti-bot#935 closed a green pytest 9.2 bump on a single crash).
+  local -r max_ci_flake_retries=1
+  local ci_flake_retries=0
+  # After requesting a re-run, ignore a lingering failure rollup for a few polls
+  # until GitHub flips checks back to pending (~90s at poll_sec=15).
+  local ignore_failure_polls=0
 
   if [[ -n "$target_sha" ]]; then
     log "Waiting for CI: pr=#${pr_num} branch='${branch}' head=${target_sha:0:8}"
@@ -8764,16 +8793,31 @@ wait_for_ci() {
         return 0
         ;;
       failure)
-        dep_updater_handle_ci_failure "$pr_num" "$branch"
+        if (( ignore_failure_polls > 0 )); then
+          ignore_failure_polls=$(( ignore_failure_polls - 1 ))
+          log "Still waiting for CI re-run to start: pr=#${pr_num} branch='${branch}' ${wait_suffix}"
+          approval_due=1
+        elif (( ci_flake_retries < max_ci_flake_retries )) \
+          && dep_updater_rerun_failed_ci "$pr_num"; then
+          ci_flake_retries=$(( ci_flake_retries + 1 ))
+          ignore_failure_polls=6
+          # Fresh wait budget for the re-run; the first attempt already used some.
+          elapsed_sec=0
+          approval_due=1
+        else
+          dep_updater_handle_ci_failure "$pr_num" "$branch"
+        fi
         ;;
       missing)
         # GitHub hasn't scheduled CI yet — this is normal right after a push.
         # Keep polling; the 20-minute timeout guards against CI never being scheduled.
+        ignore_failure_polls=0
         log "Still waiting for CI scheduling: pr=#${pr_num} branch='${branch}' status=${status} ${wait_suffix}"
         approval_due=1
         ;;
       *)
         # CI is running — log progress and break down per-workflow status.
+        ignore_failure_polls=0
         log "Still waiting for CI completion: pr=#${pr_num} branch='${branch}' status=${status} ${wait_suffix}"
         approval_due=1
         ;;
