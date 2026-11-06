@@ -524,17 +524,19 @@ ci_failed_workflow_run_ids_for_pr() {
   # Newest-first; keep enough history that a busy branch still sees this head.
   runs_json="$(github_api_exec_with_rate_limit_retry "ci-rollup list failed runs" -- gh run list \
     "${repo_args[@]}" --branch "$branch" --limit 50 \
-    --json databaseId,headSha,conclusion,workflowDatabaseId)" \
+    --json databaseId,headSha,conclusion,status,workflowDatabaseId)" \
     || exit_code=$?
   if (( exit_code != 0 )) || [[ -z "$head_sha" || -z "$branch" || -z "$runs_json" ]]; then
+    printf 'NOTE: CI_FAILED_RUN_LIST_UNAVAILABLE pr=%s exit=%s\n' "$pr" "$exit_code" >&2
     return 1
   fi
   # Per workflow (newest-first): emit the newest failure unless a newer success
-  # already superseded it. A newer cancelled/skipped run must not hide an older
-  # failure (concurrency cancel). Missing workflowDatabaseId falls back to the
-  # run id so each entry stays its own group. Emitted ids are ordered by the
-  # failure's position in the newest-first list so the singular helper returns
-  # the newest failure overall. Do not use jq `unique` (sorts ascending).
+  # or in-progress/queued run already superseded it. A newer cancelled/skipped
+  # run must not hide an older failure (concurrency cancel). Missing
+  # workflowDatabaseId falls back to the run id so each entry stays its own
+  # group. Emitted ids are ordered by the failure's position in the newest-first
+  # list so the singular helper returns the newest failure overall. Do not use
+  # jq `unique` (sorts ascending).
   ids="$(ci_rollup_jq_file "ci-rollup pick failed runs" "$runs_json" -r --arg head "$head_sha" '
     [ .[]? | select(.headSha == $head) ] as $all
     | ($all
@@ -547,9 +549,13 @@ ci_failed_workflow_run_ids_for_pr() {
       | map(
           .value as $runs
           | ($runs | map(.conclusion // "") | index("success")) as $si
+          | ($runs | map(.status // "")
+              | (index("in_progress") // index("queued") // index("waiting")
+                 // index("requested") // index("pending"))) as $li
           | ($runs | map(.conclusion // "") | index("failure")) as $fi
           | if $fi == null then empty
             elif $si != null and $si < $fi then empty
+            elif $li != null and $li < $fi then empty
             else
               ($all | map(.databaseId) | index($runs[$fi].databaseId)) as $pos
               | {pos: $pos, id: $runs[$fi].databaseId}
