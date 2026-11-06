@@ -521,23 +521,27 @@ ci_failed_workflow_run_ids_for_pr() {
     "${repo_args[@]}" --json headRefOid --jq '.headRefOid // empty')" || exit_code=$?
   branch="$(github_api_exec_with_rate_limit_retry "ci-rollup pr head branch" -- gh pr view "$pr" \
     "${repo_args[@]}" --json headRefName --jq '.headRefName // empty')" || exit_code=$?
+  # Newest-first; keep enough history that a busy branch still sees this head.
   runs_json="$(github_api_exec_with_rate_limit_retry "ci-rollup list failed runs" -- gh run list \
-    "${repo_args[@]}" --branch "$branch" --limit 15 --json databaseId,headSha,conclusion)" \
+    "${repo_args[@]}" --branch "$branch" --limit 50 \
+    --json databaseId,headSha,conclusion,workflowDatabaseId)" \
     || exit_code=$?
   if (( exit_code != 0 )) || [[ -z "$head_sha" || -z "$branch" || -z "$runs_json" ]]; then
     return 1
   fi
-  # Preserve gh run list order (newest first). Do not use `unique` — it sorts
-  # ascending and would make the singular helper return the oldest failure.
+  # Per workflow, keep the newest run for this head (first in gh's newest-first
+  # list), then emit its id only when that newest run failed. Older failures
+  # superseded by a later success must not be re-queued. Do not use jq `unique`
+  # (it sorts ascending and would make the singular helper return the oldest).
   ids="$(ci_rollup_jq_file "ci-rollup pick failed runs" "$runs_json" -r --arg head "$head_sha" '
-    [ .[]?
-      | select(.headSha == $head and (.conclusion // "") == "failure")
-      | .databaseId
-    ]
-    | reduce .[] as $id (
+    [ .[]? | select(.headSha == $head) ]
+    | reduce .[] as $run (
         [];
-        if any(.[]; . == $id) then . else . + [$id] end
+        if any(.[]; .workflowDatabaseId == $run.workflowDatabaseId) then .
+        else . + [$run]
+        end
       )
+    | map(select((.conclusion // "") == "failure") | .databaseId)
     | .[]
   ' 2>/dev/null || printf '')"
   if [[ -z "$ids" ]]; then
