@@ -6,10 +6,11 @@
 #   $TMPDIR/<project>/<branch>/<tool>        e.g. /tmp/domesti-bot/feat/foo/pytest
 #
 # <branch> is the current branch; on a detached HEAD it is detached-head/<short-sha>.
-# A test tool's runs each get their own subdirectory (tmp_layout_run_dir), so concurrent runs on one branch
+# A test tool's runs each get their own marked subdirectory (tmp_layout_run_dir), so concurrent runs on one branch
 # never touch each other. tmp_layout_finish removes a run's directory after a passing run and keeps it
 # after a failing one. A package-manager cache uses the tool directory itself and is never finished.
-# Every prepared tool directory carries a marker file, and tmp_layout_prepare first removes any marked
+# Every run directory (and every package-manager cache, via tmp_layout_mark) carries a marker file, and
+# tmp_layout_prepare first removes any marked
 # directory of the project older than TMP_LAYOUT_RETENTION_DAYS (default 3), so a failed run's leftovers
 # cannot pile up. Only marked directories are ever removed, never anything else under $TMPDIR.
 #
@@ -149,45 +150,53 @@ tmp_layout_sweep_stale() {
   done < <(find "$root" -type f -name "$tmp_layout_marker" -mtime "+$((days - 1))" -print0 2>/dev/null)
 }
 
-# tmp_layout_prepare <tool> [dir] — sweep stale directories, create and (re)mark the tool directory, print it.
+# tmp_layout_prepare <tool> [dir] — sweep stale directories, create the tool directory, print it.
 tmp_layout_prepare() {
   local -r tool="$1" dir="${2:-.}"
   local target
   target="$(tmp_layout_dir "$tool" "$dir")" || return 1
   tmp_layout_sweep_stale "$dir" || return 1
   mkdir -p -- "$target"
-  : >"${target}/${tmp_layout_marker}"
   printf '%s\n' "$target"
 }
 
-# tmp_layout_run_dir <tool-dir> — a fresh directory for one run inside a prepared tool directory.
+# tmp_layout_mark <dir> — (re)stamp a directory so the stale sweep may remove it once it goes unused for the
+# retention. A package-manager cache is stamped on every use, so it expires only after it sits idle.
+tmp_layout_mark() {
+  : >"${1}/${tmp_layout_marker}"
+}
+
+# tmp_layout_run_dir <tool-dir> — a fresh, marked directory for one run inside a tool directory. The marker
+# is written once, so a failed run's leftovers age from that run and are swept however busy the branch is.
+# A concurrent run may remove an empty tool directory between the mkdir and the mktemp, so retry.
 tmp_layout_run_dir() {
   local -r target="$1"
-  [[ -f "${target}/${tmp_layout_marker}" ]] || { printf 'ERROR: %s is not a tmp-layout directory\n' "$target" >&2; return 1; }
-  mktemp -d "${target}/run.XXXXXX"
+  local run
+
+  for _ in 1 2 3 4 5; do
+    mkdir -p -- "$target"
+    if run="$(mktemp -d "${target}/run.XXXXXX" 2>/dev/null)"; then
+      tmp_layout_mark "$run"
+      printf '%s\n' "$run"
+      return 0
+    fi
+  done
+  printf 'ERROR: cannot create a run directory under %s\n' "$target" >&2
+  return 1
 }
 
 # tmp_layout_finish <run-dir> <exit-code> — remove the run directory after a passing run (exit 0), then the
-# tool directory and empty parents when no other run is using them; keep it, and say where, after a failing
-# one. Never fails because of cleanup: the caller's exit status is the run's.
+# tool directory and empty parents when no other run is using them (rmdir only ever removes an empty
+# directory); keep it, and say where, after a failing one. Never fails because of cleanup: the caller's
+# exit status is the run's.
 tmp_layout_finish() {
   local -r run="$1" rc="$2"
-  local tool_dir branch_dir
 
   if [[ "$rc" != 0 ]]; then
     printf 'tmp-layout: run failed (exit %s); keeping %s for debugging\n' "$rc" "$run" >&2
     return 0
   fi
-  tool_dir="$(dirname "$run")"
-  [[ -f "${tool_dir}/${tmp_layout_marker}" ]] || return 0
   rm -rf -- "$run"
-  # Drop the marker and the tool directory only when this was the last run; put the marker back otherwise.
-  rm -f -- "${tool_dir}/${tmp_layout_marker}"
-  if rmdir "$tool_dir" 2>/dev/null; then
-    branch_dir="$(dirname "$tool_dir")"
-    tmp_layout_prune_empty "$branch_dir" "$(tmp_layout_tmpdir)"
-  else
-    : >"${tool_dir}/${tmp_layout_marker}"
-  fi
+  tmp_layout_prune_empty "$(dirname "$run")" "$(tmp_layout_tmpdir)"
   return 0
 }
