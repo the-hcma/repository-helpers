@@ -55,7 +55,7 @@ assert_contains 'a concurrent run keeps the tool directory' "$(test -d "$dir" &&
 assert_contains 'a run directory is marked' "$(test -f "${run_b}/.tmp-layout-marker" && echo yes)" 'yes'
 tmp_layout_finish "$run_b" 0
 assert_contains 'the last passing run removes the tool directory' "$(test -e "$dir" && echo present || echo gone)" 'gone'
-assert_contains 'the last passing run removes the empty project directory too' "$(test -e "${TMPDIR}/widget" && echo present || echo gone)" 'gone'
+assert_contains 'the last passing run leaves the private project directory empty, not removed' "$(test -d "${TMPDIR}/widget" && find "${TMPDIR}/widget" -mindepth 1 | wc -l | tr -d ' ')" '0'
 dir="$(tmp_layout_prepare pytest "$repo")"
 run_a="$(tmp_layout_run_dir "$dir")"
 err="$(tmp_layout_finish "$run_a" 1 2>&1)"
@@ -74,6 +74,8 @@ assert_contains 'a TMPDIR with a trailing slash is never removed by the cleanup'
 rm -rf "${TMPDIR:?}/widget"
 
 printf '\n=== functional: stale sweep ===\n'
+mkdir -p "${TMPDIR}/widget"
+chmod 700 "${TMPDIR}/widget"
 old="${TMPDIR}/widget/feat/old/pytest"
 mkdir -p "$old"
 : >"${old}/.tmp-layout-marker"
@@ -112,7 +114,7 @@ run_reported="$(head -n 1 <<<"$out")"
 addopts="$(tail -n 1 <<<"$out")"
 assert_contains 'the run directory is inside the tool directory of the branch' "$run_reported" "${TMPDIR}/widget/feat/foo/pytest/run."
 assert_contains 'pytest gets --basetemp pointing inside the reported run directory' "$addopts" "--basetemp=${run_reported}/basetemp"
-assert_contains 'a passing command leaves nothing behind' "$(test -e "${TMPDIR}/widget" && echo present || echo gone)" 'gone'
+assert_contains 'a passing command leaves nothing behind inside the project directory' "$(find "${TMPDIR}/widget" -mindepth 1 | wc -l | tr -d ' ')" '0'
 rc=0
 (cd "$repo" && "$wrapper" pytest -- bash -c 'exit 7') >/dev/null 2>&1 || rc=$?
 assert_contains 'the command exit status is returned' "rc=${rc}" 'rc=7'
@@ -164,12 +166,40 @@ printf '#!/usr/bin/env bash\nexit 1\n' >"${plain}/tests/bad.test"
 (cd "$plain" && "${script_dir}/../scripts/dev/run-tests" --dir "$plain") >/dev/null 2>&1 || true
 assert_contains 'a failing run-tests outside git leaves no job directory behind' "$(find "$TMPDIR" -maxdepth 1 -name 'run-tests-job.*' | wc -l | tr -d ' ')" '0'
 
+printf '\n=== functional: private project directory, quoting and the disposable gate TMPDIR ===\n'
+rm -rf "${TMPDIR:?}/widget"
+mkdir -m 700 "${TMPDIR}/widget"
+chmod 770 "${TMPDIR}/widget"
+rc=0
+err="$(tmp_layout_prepare pytest "$repo" 2>&1)" || rc=$?
+assert_contains 'a group-writable project directory is refused' "rc=${rc}" 'rc=1'
+assert_contains 'the refusal says the directory must be private' "$err" 'private (not group/world-writable)'
+rm -rf "${TMPDIR:?}/widget"
+git -C "$repo" checkout --quiet -b 'feat/é'
+# shellcheck disable=SC2016  # the variable must expand in the child, not here
+addopts="$(cd "$repo" && LC_ALL=C "$wrapper" pytest -- bash -c 'printf "%s" "$PYTEST_ADDOPTS"')"
+assert_contains 'a non-ASCII branch is single-quoted for shlex, not written in the dollar-quote form' "$addopts" "'--basetemp="
+assert_contains 'the quoted option never uses the bash dollar-quote form' "$(case "$addopts" in *'$'"'"*) echo dollar-quoted ;; *) echo plain ;; esac)" 'plain'
+git -C "$repo" checkout --quiet feat/foo
+git -C "$repo" branch --quiet -D 'feat/é'
+rm -rf "${TMPDIR:?}/widget"
+disposable="${fixture}/disposable"
+mkdir -p "$disposable"
+mkdir -p "${repo}/tests"
+printf '#!/usr/bin/env bash\nexit 1\n' >"${repo}/tests/bad.test"
+gate_tmpdir="$TMPDIR"
+(cd "$repo" && TMP_LAYOUT_TMPDIR="$gate_tmpdir" TMPDIR="$disposable" "${script_dir}/../scripts/dev/run-tests" --dir "$repo") >/dev/null 2>&1 || true
+assert_contains 'a failing gate run keeps its artifacts under TMP_LAYOUT_TMPDIR, not the disposable TMPDIR' "$(test -d "${TMPDIR}/widget/feat/foo/bash-tests" && echo kept)" 'kept'
+assert_contains 'nothing is left under the disposable TMPDIR' "$(find "$disposable" -mindepth 1 | wc -l | tr -d ' ')" '0'
+rm -rf "${TMPDIR:?}/widget" "${repo}/tests/bad.test"
+
 printf '\n=== functional: run-tests in a git repository ===\n'
 mkdir -p "${repo}/tests"
 printf '#!/usr/bin/env bash\nexit 0\n' >"${repo}/tests/ok.test"
 rm -rf "${TMPDIR:?}/widget"
 (cd "$repo" && "${script_dir}/../scripts/dev/run-tests" --dir "$repo") >/dev/null 2>&1
-assert_contains 'a passing run-tests leaves no layout directory behind' "$(test -e "${TMPDIR}/widget" && echo present || echo gone)" 'gone'
+assert_contains 'a passing run-tests leaves nothing behind inside the project directory' "$(find "${TMPDIR}/widget" -mindepth 1 | wc -l | tr -d ' ')" '0'
+mkdir -p "${repo}/tests"
 printf '#!/usr/bin/env bash\nexit 1\n' >"${repo}/tests/bad.test"
 rc=0
 (cd "$repo" && "${script_dir}/../scripts/dev/run-tests" --dir "$repo") >/dev/null 2>&1 || rc=$?
