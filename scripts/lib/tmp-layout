@@ -1,0 +1,157 @@
+# shellcheck shell=bash
+# tmp-layout — per-run temp layout $TMPDIR/<project>/<branch>/<tool> (#832).
+#
+# Every test framework and package manager keeps its temp files under one predictable directory:
+#
+#   $TMPDIR/<project>/<branch>/<tool>        e.g. /tmp/domesti-bot/feat/foo/pytest
+#
+# <branch> is the current branch; on a detached HEAD it is detached-head/<short-sha>.
+# Test tools are removed right after a passing run (tmp_layout_finish) and kept after a failing one.
+# Every prepared directory carries a marker file, and tmp_layout_prepare first removes any marked
+# directory of the project older than TMP_LAYOUT_RETENTION_DAYS (default 3), so a failed run's leftovers
+# cannot pile up. Only marked directories are ever removed, never anything else under $TMPDIR.
+#
+# Sourced by scripts/dev/run-tests and scripts/dev/with-tmp-layout.
+
+if declare -F tmp_layout_prepare >/dev/null 2>&1; then
+  return 0
+fi
+
+readonly tmp_layout_marker='.tmp-layout-marker'
+readonly tmp_layout_default_retention_days=3
+
+# tmp_layout_project [dir] — project name: the origin repository name, else the primary clone's directory
+# name (a worktree shares its primary clone's name). Fails when neither can be determined.
+tmp_layout_project() {
+  local -r dir="${1:-.}"
+  local url name common
+
+  url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+  if [[ -n "$url" ]]; then
+    name="${url##*/}"
+    name="${name%.git}"
+    name="${name##*:}"
+  else
+    common="$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    [[ -n "$common" ]] || return 1
+    name="$(basename "$(dirname "$common")")"
+  fi
+  tmp_layout_component_ok "$name" || return 1
+  printf '%s\n' "$name"
+}
+
+# tmp_layout_branch [dir] — current branch, or detached-head/<short-sha> on a detached HEAD.
+tmp_layout_branch() {
+  local -r dir="${1:-.}"
+  local branch sha
+
+  branch="$(git -C "$dir" symbolic-ref --short --quiet HEAD 2>/dev/null || true)"
+  if [[ -z "$branch" ]]; then
+    sha="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)" || return 1
+    branch="detached-head/${sha}"
+  fi
+  tmp_layout_path_ok "$branch" || return 1
+  printf '%s\n' "$branch"
+}
+
+# tmp_layout_component_ok <name> — one safe path component: non-empty, not "." / "..", no slash or NUL.
+tmp_layout_component_ok() {
+  local -r name="$1"
+  [[ -n "$name" && "$name" != . && "$name" != .. && "$name" != */* ]]
+}
+
+# tmp_layout_path_ok <relative-path> — slash-separated safe components only (no empty, ".", ".." parts, not absolute).
+tmp_layout_path_ok() {
+  local -r rel="$1"
+  local part
+  local -a parts=()
+
+  [[ -n "$rel" && "$rel" != /* ]] || return 1
+  IFS=/ read -r -a parts <<<"$rel"
+  for part in "${parts[@]}"; do
+    tmp_layout_component_ok "$part" || return 1
+  done
+}
+
+# tmp_layout_retention_days — TMP_LAYOUT_RETENTION_DAYS or 3; anything but a positive integer is an error.
+tmp_layout_retention_days() {
+  local -r value="${TMP_LAYOUT_RETENTION_DAYS:-$tmp_layout_default_retention_days}"
+  if [[ ! "$value" =~ ^[1-9][0-9]{0,3}$ ]]; then
+    printf 'ERROR: TMP_LAYOUT_RETENTION_DAYS must be a positive integer (got %s)\n' "$value" >&2
+    return 1
+  fi
+  printf '%s\n' "$value"
+}
+
+# tmp_layout_project_root <dir> — $TMPDIR/<project>.
+tmp_layout_project_root() {
+  local project
+  project="$(tmp_layout_project "${1:-.}")" || return 1
+  printf '%s/%s\n' "${TMPDIR:-/tmp}" "$project"
+}
+
+# tmp_layout_dir <tool> [dir] — $TMPDIR/<project>/<branch>/<tool>; nothing is created.
+tmp_layout_dir() {
+  local -r tool="$1" dir="${2:-.}"
+  local root branch
+  tmp_layout_component_ok "$tool" || { printf 'ERROR: invalid tool name: %s\n' "$tool" >&2; return 1; }
+  root="$(tmp_layout_project_root "$dir")" || { printf 'ERROR: cannot determine the project for %s\n' "$dir" >&2; return 1; }
+  branch="$(tmp_layout_branch "$dir")" || { printf 'ERROR: cannot determine a safe branch for %s\n' "$dir" >&2; return 1; }
+  printf '%s/%s/%s\n' "$root" "$branch" "$tool"
+}
+
+# tmp_layout_prune_empty <dir> <stop-at> — rmdir empty directories from <dir> up to, not including, <stop-at>.
+tmp_layout_prune_empty() {
+  local current="$1"
+  local -r stop="$2"
+  while [[ "$current" == "$stop"/* ]]; do
+    rmdir "$current" 2>/dev/null || return 0
+    current="$(dirname "$current")"
+  done
+}
+
+# tmp_layout_sweep_stale [dir] — remove this project's marked directories older than the retention.
+tmp_layout_sweep_stale() {
+  local -r dir="${1:-.}"
+  local root days marker stale
+  root="$(tmp_layout_project_root "$dir")" || return 1
+  days="$(tmp_layout_retention_days)" || return 1
+  [[ -d "$root" ]] || return 0
+  while IFS= read -r -d '' marker; do
+    stale="$(dirname "$marker")"
+    printf 'tmp-layout: removing stale %s (older than %s days)\n' "$stale" "$days" >&2
+    rm -rf -- "$stale"
+    tmp_layout_prune_empty "$(dirname "$stale")" "$root"
+  done < <(find "$root" -type f -name "$tmp_layout_marker" -mtime "+$((days - 1))" -print0 2>/dev/null)
+}
+
+# tmp_layout_prepare <tool> [dir] — sweep stale directories, create and mark the tool directory, print it.
+tmp_layout_prepare() {
+  local -r tool="$1" dir="${2:-.}"
+  local target
+  target="$(tmp_layout_dir "$tool" "$dir")" || return 1
+  tmp_layout_sweep_stale "$dir" || return 1
+  mkdir -p -- "$target"
+  : >"${target}/${tmp_layout_marker}"
+  printf '%s\n' "$target"
+}
+
+# tmp_layout_finish <tool-dir> <exit-code> — remove the directory after a passing run (exit 0); keep it,
+# and say where, after a failing one. Package-manager directories are never finished (they are caches).
+tmp_layout_finish() {
+  local -r target="$1" rc="$2"
+  local root
+
+  [[ -f "${target}/${tmp_layout_marker}" ]] || { printf 'ERROR: %s is not a tmp-layout directory\n' "$target" >&2; return 1; }
+  if [[ "$rc" == 0 ]]; then
+    rm -rf -- "$target"
+    root="${target%/*}"
+    # Climb to the project directory: <project>/<branch...>/<tool>; stop below $TMPDIR.
+    while [[ "$root" != "${TMPDIR:-/tmp}" && "$root" != / && "$root" != . ]]; do
+      rmdir "$root" 2>/dev/null || break
+      root="${root%/*}"
+    done
+  else
+    printf 'tmp-layout: run failed (exit %s); keeping %s for debugging\n' "$rc" "$target" >&2
+  fi
+}

@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# with-tmp-layout — run a command with its temp files under $TMPDIR/<project>/<branch>/<tool> (#832).
+#
+# Test tools (the default) have their directory removed after a passing run and kept after a failing one.
+# Package-manager caches (uv, pnpm) use the same layout but are never removed on success, because that
+# would throw the cache away; the 3-day stale sweep (TMP_LAYOUT_RETENTION_DAYS) reclaims them.
+# Known tools get their environment set: pytest (PYTEST_ADDOPTS --basetemp), uv (UV_CACHE_DIR) and pnpm
+# (npm_config_store_dir). Every tool sees TMP_LAYOUT_DIR.
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+# shellcheck disable=SC1091  # tmp-layout is a sibling lib resolved at runtime
+source "${script_dir}/../lib/tmp-layout"
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/dev/with-tmp-layout [--dir PATH] [--keep] <tool> -- <command> [args...]
+
+Run <command> with its temp files under $TMPDIR/<project>/<branch>/<tool>.
+
+  --dir PATH   Repository whose project and branch name the directory (default: current directory).
+  --keep       Never remove the directory on success (default for the uv and pnpm tools).
+  -h, --help   Show this help.
+
+Tools: pytest, uv, pnpm get their environment set; any other name is a test tool that only sees
+TMP_LAYOUT_DIR. The command's exit status is returned.
+USAGE
+}
+
+die_usage() {
+  printf 'ERROR: %s\n' "$1" >&2
+  usage >&2
+  exit 2
+}
+
+main() {
+  local dir='.' keep=0 tool target rc=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --dir)
+        [[ $# -ge 2 && -d "$2" ]] || die_usage '--dir needs an existing directory'
+        dir="$2"
+        shift 2
+        ;;
+      --keep) keep=1; shift ;;
+      -h | --help) usage; exit 0 ;;
+      --) break ;;
+      -*) die_usage "unknown argument: $1" ;;
+      *) break ;;
+    esac
+  done
+  (( $# >= 1 )) || die_usage 'a tool name is required'
+  tool="$1"
+  shift
+  [[ "${1:-}" == -- ]] || die_usage 'expected -- before the command'
+  shift
+  (( $# >= 1 )) || die_usage 'a command is required'
+
+  target="$(tmp_layout_prepare "$tool" "$dir")"
+  export TMP_LAYOUT_DIR="$target"
+  case "$tool" in
+    pytest) export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }--basetemp=${target}/basetemp" ;;
+    pnpm) keep=1; export npm_config_store_dir="${target}/store" ;;
+    uv) keep=1; export UV_CACHE_DIR="${target}/cache" ;;
+    *) ;;
+  esac
+
+  "$@" || rc=$?
+  if (( keep == 0 )); then
+    tmp_layout_finish "$target" "$rc"
+  fi
+  return "$rc"
+}
+
+main "$@"

@@ -154,6 +154,7 @@ Daily timer (optional): `scripts/setup-secret-audit` installs `secret-audit.serv
 | `scripts/dev/start-development` | Prune/sync; create or resume a stack worktree | `scripts/dev/start-development --worktree my-change --no-interactive` |
 | `scripts/dev/submit-stack` | Register the branch as a gh stack, refuse a branch whose PR is already queued, `pre-pr-checks` → stack submit → CI wait | `scripts/dev/submit-stack` |
 | `scripts/dev/merge-stack` | Land a PR through the merge queue: `gh stack merge` for a stacked PR, `gh pr merge --auto` when the base branch has a merge queue, `--auto --squash` with auto-merge only, a refusal with neither (or a `graphite` marker) | `scripts/dev/merge-stack --pr <n> [--wait]` |
+| `scripts/dev/with-tmp-layout` | Run a command with its temp files under `$TMPDIR/<project>/<branch>/<tool>` (detached HEAD: `detached-head/<sha>`): test tools are removed after a passing run and kept after a failing one, uv and pnpm caches are kept, and marked directories older than 3 days (`TMP_LAYOUT_RETENTION_DAYS`) are swept at the next run; `run-tests` uses the same layout (#832) | `scripts/dev/with-tmp-layout pytest -- uv run pytest` |
 
 Never implement on the primary clone — always `cd` into the stack worktree first. See [Development](#development).
 

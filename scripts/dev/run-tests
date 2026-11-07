@@ -28,6 +28,13 @@ source "${script_dir}/../lib/tooling-path"
 tooling_path_ensure_gnu_userland \
   || { printf 'ERROR: GNU userland tools required on macOS (brew install coreutils gnu-sed grep util-linux)\n' >&2; exit 1; }
 
+# shellcheck disable=SC1091  # tmp-layout is a sibling lib resolved at runtime
+source "${script_dir}/../lib/tmp-layout"
+
+# Base directory for per-job temp dirs and logs: $TMPDIR/<project>/<branch>/bash-tests when the repository
+# resolves (#832), else plain $TMPDIR. Set by main.
+tmp_base="${TMPDIR:-/tmp}"
+
 usage() {
   cat <<'EOF'
 Usage: scripts/dev/run-tests [--shard I/N] [--jobs J] [--list] [--verbose] [--dir PATH]
@@ -75,7 +82,7 @@ run_one() {
   local base test_tmp rc start end test_pid
 
   base="$(basename "$test_path" .test)"
-  test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/run-tests-job.XXXXXX")"
+  test_tmp="$(mktemp -d "${tmp_base}/run-tests-job.XXXXXX")"
   test_pid=''
   # Interrupt: stop the test process itself (not just this worker), then drop its temp dir.
   trap 'if [[ -n "$test_pid" ]]; then kill "$test_pid" 2>/dev/null || true; wait "$test_pid" 2>/dev/null || true; fi; rm -rf "$test_tmp"; exit 143' INT TERM
@@ -90,7 +97,10 @@ run_one() {
   wait "$test_pid" || rc=$?
   trap - INT TERM
   end="${EPOCHREALTIME//,/.}"
-  rm -rf "$test_tmp"
+  # A failing test keeps its temp dir for debugging; the stale sweep removes it after the retention (#832).
+  if (( rc == 0 )); then
+    rm -rf "$test_tmp"
+  fi
   LC_ALL=C awk -v rc="$rc" -v s="$start" -v e="$end" 'BEGIN { printf "%d %.1f\n", rc, e - s }' \
     >"${log_dir}/${base}.result"
   return 0
@@ -99,7 +109,7 @@ run_one() {
 main() {
   local shard=1 shards=1 max_jobs=1 list_only=0 verbose=0 root="$repo_dir"
   local -a selected=()
-  local log_dir path base rc secs failed=0 running=0 total_secs=0
+  local log_dir layout_dir path base rc secs failed=0 running=0 total_secs=0
   local in_ci="${GITHUB_ACTIONS:-}"
 
   while (( $# > 0 )); do
@@ -143,7 +153,12 @@ main() {
     return 0
   fi
 
-  log_dir="$(mktemp -d "${TMPDIR:-/tmp}/run-tests-logs.XXXXXX")"
+  layout_dir=''
+  layout_dir="$(tmp_layout_prepare bash-tests "$root" 2>/dev/null)" || layout_dir=''
+  if [[ -n "$layout_dir" ]]; then
+    tmp_base="$layout_dir"
+  fi
+  log_dir="$(mktemp -d "${tmp_base}/run-tests-logs.XXXXXX")"
   # Ctrl-C / TERM must not orphan background tests or leave temp dirs behind.
   trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$log_dir"; exit 130' INT TERM
   printf '==> run-tests: shard %s/%s, %s file(s), %s job(s)\n' "$shard" "$shards" "${#selected[@]}" "$max_jobs"
@@ -188,6 +203,9 @@ main() {
   write_summary "$log_dir" "$shard" "$shards" "$total_secs" "${selected[@]}"
   rm -rf "$log_dir"
 
+  if [[ -n "$layout_dir" ]]; then
+    tmp_layout_finish "$layout_dir" "$failed"
+  fi
   if (( failed > 0 )); then
     printf 'ERROR: TESTS_FAILED shard=%s/%s failed=%s\n' "$shard" "$shards" "$failed" >&2
     return 1

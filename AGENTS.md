@@ -51,6 +51,7 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | Dev workflow | `scripts/dev/approve-pending-deployments` | Approve WAITING environment jobs on the operator's behalf. |
 | Dev workflow | `scripts/dev/post-pr-submission-checks` | Wait for PR CI; print agent-friendly failure excerpts. |
 | Dev workflow | `scripts/dev/ship-and-review` | Submit + CI wait + `wait-for-agent-review loop`. |
+| Dev workflow | `scripts/dev/with-tmp-layout` | Run a command with temp files under `$TMPDIR/<project>/<branch>/<tool>` (test tools removed on success, kept on failure; uv/pnpm caches kept; 3-day stale sweep); shared lib `scripts/lib/tmp-layout`. |
 
 Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review, on-deploy-deps, release-age-defaults, …).
 
