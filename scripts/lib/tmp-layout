@@ -63,6 +63,11 @@ tmp_layout_path_ok() {
   done
 }
 
+# tmp_layout_in_git [dir] — true inside a git work tree (the layout then applies, and its errors are real).
+tmp_layout_in_git() {
+  [[ "$(tmp_layout_git "${1:-.}" rev-parse --is-inside-work-tree || true)" == true ]]
+}
+
 # tmp_layout_project [dir] — project name: the origin repository name, else the primary clone's directory
 # name (a worktree shares its primary clone's name). Fails when neither can be determined.
 tmp_layout_project() {
@@ -71,6 +76,7 @@ tmp_layout_project() {
 
   url="$(tmp_layout_git "$dir" remote get-url origin || true)"
   if [[ -n "$url" ]]; then
+    url="${url%"${url##*[!/]}"}"
     name="${url##*/}"
     name="${name%.git}"
     name="${name##*:}"
@@ -153,17 +159,39 @@ tmp_layout_sweep_stale() {
 # tmp_layout_prepare <tool> [dir] — sweep stale directories, create the tool directory, print it.
 tmp_layout_prepare() {
   local -r tool="$1" dir="${2:-.}"
-  local target
+  local target root
   target="$(tmp_layout_dir "$tool" "$dir")" || return 1
+  root="$(tmp_layout_project_root "$dir")" || return 1
+  tmp_layout_secure_root "$root" || return 1
   tmp_layout_sweep_stale "$dir" || return 1
   mkdir -p -- "$target"
   printf '%s\n' "$target"
 }
 
+# tmp_layout_secure_root <project-root> — create the project directory private (0700) and refuse one that
+# is a symlink or belongs to someone else, which on a shared /tmp would let another user redirect our
+# marker and cache writes.
+tmp_layout_secure_root() {
+  local -r root="$1"
+  if [[ ! -e "$root" && ! -L "$root" ]]; then
+    mkdir -m 700 -- "$root" 2>/dev/null || true
+  fi
+  if [[ -L "$root" || ! -d "$root" || ! -O "$root" ]]; then
+    printf 'ERROR: %s must be a directory you own (not a symlink); refusing to use it\n' "$root" >&2
+    return 1
+  fi
+}
+
 # tmp_layout_mark <dir> — (re)stamp a directory so the stale sweep may remove it once it goes unused for the
 # retention. A package-manager cache is stamped on every use, so it expires only after it sits idle.
+# A marker that is a symlink is refused rather than written through.
 tmp_layout_mark() {
-  : >"${1}/${tmp_layout_marker}"
+  local -r marker="${1}/${tmp_layout_marker}"
+  if [[ -L "$marker" ]]; then
+    printf 'ERROR: %s is a symlink; refusing to write through it\n' "$marker" >&2
+    return 1
+  fi
+  : >"$marker"
 }
 
 # tmp_layout_run_dir <tool-dir> — a fresh, marked directory for one run inside a tool directory. The marker
@@ -176,7 +204,11 @@ tmp_layout_run_dir() {
   for _ in 1 2 3 4 5; do
     mkdir -p -- "$target"
     if run="$(mktemp -d "${target}/run.XXXXXX" 2>/dev/null)"; then
-      tmp_layout_mark "$run"
+      # An unmarked directory could never be swept, so a run that cannot be marked is not handed out.
+      if ! tmp_layout_mark "$run"; then
+        rm -rf -- "$run"
+        return 1
+      fi
       printf '%s\n' "$run"
       return 0
     fi
