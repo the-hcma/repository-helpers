@@ -2,6 +2,8 @@
 
 Installs a pinned actionlint release into `/usr/local/bin` for CI jobs that lint workflows.
 
+Supported runners: Linux on amd64 or arm64 only. The installer fails with an `ERROR:` line on macOS, Windows and other architectures. It installs with `sudo -n` (it never waits for a password), or directly when running as root.
+
 The unpinned `curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash` pattern runs a branch-tip script and has no retry, so one bad response from github.com fails the job (a dep-updater PR was dropped that way, repository-helpers#842). This action pins the version, verifies the archive with a recorded SHA-256 before extracting it, and retries the download with linear backoff: the backoff sleeps add up to about five minutes, each transfer is capped at 60 seconds, and an overall 480-second budget bounds the whole install (about eight minutes), so give the job a timeout above that.
 
 ## Usage
