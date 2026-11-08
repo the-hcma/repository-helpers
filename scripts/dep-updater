@@ -831,25 +831,27 @@ gh_pr_merged_for_number() {
   printf '%s' "${raw:-}"
 }
 
-# Prints "<removals>|<last reason>" for the PR: how many times GitHub has removed it from the merge queue
-# and why the latest removal happened (failed_checks, merge_conflict, ...). Empty output when the lookup
-# fails, so a caller never mistakes an API blip for a removal. The removals are counted from the filtered
-# timeline nodes, not from totalCount (which counts every timeline item, whatever itemTypes says), and the
-# removal GitHub records when the PR merges (reason "merged") is not a removal.
+# Prints "<id of the latest removal>|<its reason>" for the PR: the latest time GitHub removed it from the
+# merge queue and why (failed_checks, merge_conflict, ...), or "none|" when it never was. A caller compares
+# the id with the one it saw before, so a newer removal is noticed however many earlier ones there are (a
+# count would stop growing once the page of 50 events is full). Empty output when the lookup fails, so a
+# caller never mistakes an API blip for a removal. Only the filtered timeline nodes are read (totalCount
+# counts every timeline item, whatever itemTypes says), and the removal GitHub records when the PR merges
+# (reason "merged") is not a removal.
 gh_pr_merge_queue_removals() {
   local -r pr_number="$1"
   # GraphQL variables ($owner, ...) are escaped so the query stays a plain double-quoted string.
   local -r query="query(\$owner:String!,\$name:String!,\$number:Int!){\
 repository(owner:\$owner,name:\$name){pullRequest(number:\$number){\
 timelineItems(last:50,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){\
-totalCount nodes{... on RemovedFromMergeQueueEvent{reason}}}}}}"
+nodes{... on RemovedFromMergeQueueEvent{id reason}}}}}}"
   local raw
 
   raw="$(dep_runner_gh_stdout "gh pr merge queue removals" -- api graphql \
     -f query="$query" \
     -f owner="$repo_owner" -f name="$repo_name" -F number="$pr_number" \
     --jq '[.data.repository.pullRequest.timelineItems.nodes[] | select(.reason != null and .reason != "merged")]
-      | "\(length)|\(.[-1].reason // "")"' \
+      | "\(.[-1].id // "none")|\(.[-1].reason // "")"' \
     2>/dev/null || true)"
   printf '%s' "${raw:-}"
 }
@@ -9670,12 +9672,14 @@ cleanup() {
 }
 
 # Enable auto-merge again after the merge queue dropped the PR. Returns gh's exit status and never dies, so
-# the caller can report one MERGE_QUEUE_REMOVED line instead of an unrelated gh error.
+# the caller can report one MERGE_QUEUE_REMOVED line instead of an unrelated gh error. It goes through the
+# shared rate-limit executor (pacing, backoff, a timeout on every attempt) so a stalled or rate-limited call
+# cannot hang the merge wait; enabling auto-merge twice is harmless, so a retry is safe.
 dep_updater_reenqueue_auto_merge() {
   local -r pr_number="$1"
   local out rc=0
 
-  out="$(dep_runner_gh_stdout "gh pr" -- pr merge "$pr_number" \
+  out="$(github_api_exec_with_rate_limit_retry "gh pr merge re-enqueue" -- gh pr merge "$pr_number" \
     --repo "${repo_owner}/${repo_name}" \
     --auto --squash 2>&1)" || rc=$?
   if [[ -n "$out" ]]; then
@@ -9691,7 +9695,7 @@ merge_pr_via_gh_single() {
   local -r queue_check_sec=30
   local merged ci_status merge_out merge_exit elapsed elapsed_fmt
   local merge_branch merge_head
-  local queue_info removals_before removals_now removal_reason reenqueued
+  local queue_info removal_id_before removal_id_now removal_reason reenqueued
 
   merged="$(gh_pr_merged_for_number "$pr_num")"
   if [[ "$merged" == 'true' ]]; then
@@ -9722,13 +9726,15 @@ merge_pr_via_gh_single() {
   # cleanup workflows. Keep in sync with dep_enqueue_pr_for_merge_queue
   # (--auto --squash only). Org default is GitHub MQ (issue #466) — never
   # enqueue via leftover merge-it labels.
-  # Count the merge-queue removals that already exist, so only a removal that happens after this enqueue
-  # (a failed merge-group run, a conflict) ends the wait below.
-  # A failed lookup leaves the baseline unknown (empty), never zero: zero would turn an old removal from an
-  # earlier run into a "new" one at the first successful check. The first successful check adopts its count.
+  # Remember the latest merge-queue removal that already exists ("none" when there is none), so only a removal
+  # that happens after this enqueue (a failed merge-group run, a conflict) ends the wait below.
+  # A failed lookup leaves the baseline unknown (empty): treating it as "none" would turn an old removal from
+  # an earlier run into a "new" one at the first successful check, which adopts what it sees instead.
   queue_info="$(gh_pr_merge_queue_removals "$pr_num")"
-  removals_before="${queue_info%%|*}"
-  [[ "$removals_before" =~ ^[0-9]+$ ]] || removals_before=''
+  removal_id_before=''
+  if [[ "$queue_info" == *'|'* ]]; then
+    removal_id_before="${queue_info%%|*}"
+  fi
   reenqueued=0
 
   log "Enabling auto-merge for PR #${pr_num} via gh (squash)…"
@@ -9755,16 +9761,21 @@ merge_pr_via_gh_single() {
     # download outage). Without this check the wait would run out its whole timeout and report nothing useful.
     if (( elapsed > 0 && elapsed % queue_check_sec == 0 )); then
       queue_info="$(gh_pr_merge_queue_removals "$pr_num")"
-      removals_now="${queue_info%%|*}"
+      removal_id_now=''
       removal_reason="${queue_info#*|}"
-      if [[ -z "$removals_before" && "$removals_now" =~ ^[0-9]+$ ]]; then
-        removals_before="$removals_now"
-      elif [[ "$removals_now" =~ ^[0-9]+$ ]] && (( removals_now > removals_before )); then
+      if [[ "$queue_info" == *'|'* ]]; then
+        removal_id_now="${queue_info%%|*}"
+      fi
+      if [[ -z "$removal_id_now" ]]; then
+        : # The lookup failed: there is nothing to compare, so keep waiting.
+      elif [[ -z "$removal_id_before" ]]; then
+        removal_id_before="$removal_id_now"
+      elif [[ "$removal_id_now" != "$removal_id_before" ]]; then
         if [[ "$removal_reason" == 'failed_checks' && "$reenqueued" == '0' ]]; then
           log "NOTE: MERGE_QUEUE_REENQUEUE pr=#${pr_num} repo=${repo_owner}/${repo_name} reason=${removal_reason}"
           if dep_updater_reenqueue_auto_merge "$pr_num"; then
             reenqueued=1
-            removals_before="$removals_now"
+            removal_id_before="$removal_id_now"
           else
             merge_queue_removed_error \
               "pr=#${pr_num} repo=${repo_owner}/${repo_name} reason=${removal_reason} reenqueued=failed"

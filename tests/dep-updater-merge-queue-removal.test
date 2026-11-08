@@ -21,8 +21,9 @@ readonly work_dir
 trap 'rm -rf "${work_dir}"' EXIT
 
 # run_merge <removals sequence> <merged-at poll> <timeout minutes> [gh fail from call] -> the function's output,
-# then "rc=<n>". The removals sequence is space separated "<count>|<reason>" answers of the queue lookup (the
-# first one is the baseline read before the enqueue; the last one repeats; "-" is an empty answer). The PR
+# then "rc=<n>". The removals sequence is space separated "<latest removal id>|<reason>" answers of the queue
+# lookup ("none|" = never removed; the first one is the baseline read before the enqueue; the last one
+# repeats; "-" is an empty answer). The PR
 # reads as merged from poll number <merged-at> on (0 = never). gh fails from call number [gh fail from call].
 run_merge() {
   local -r sequence="$1" merged_at="$2" timeout_min="$3" gh_fail_from="${4:-0}"
@@ -61,7 +62,9 @@ run_merge() {
       (( idx < \${#answers[@]} )) || idx=\$(( \${#answers[@]} - 1 ))
       if [[ \"\${answers[idx]}\" == '-' ]]; then printf ''; else printf '%s' \"\${answers[idx]}\"; fi
     }
-    dep_runner_gh_stdout() {
+    # Both entry points count into one log: the first enqueue goes through dep_runner_gh_stdout and the
+    # re-enqueue through the shared rate-limit executor.
+    stub_gh() {
       local n
       n=\$(( \$(cat '${work_dir}/gh.n') + 1 ))
       printf '%s' \"\$n\" >'${work_dir}/gh.n'
@@ -72,6 +75,8 @@ run_merge() {
       fi
       return 0
     }
+    dep_runner_gh_stdout() { stub_gh \"\$@\"; }
+    github_api_exec_with_rate_limit_retry() { stub_gh \"\$@\"; }
     rc=0
     merge_pr_via_gh_single 7 || rc=\$?
     echo \"rc=\$rc\"" 2>&1 || true
@@ -82,7 +87,7 @@ gh_calls() {
 }
 
 printf '\n=== a failed merge-group run is re-enqueued once and the PR then merges ===\n'
-out="$(run_merge '0| 1|failed_checks' 14 3)"
+out="$(run_merge 'none| id1|failed_checks' 14 3)"
 assert_contains "the wait ends successfully" "$out" "rc=0"
 assert_contains "the PR is reported merged" "$out" "PR #7 merged."
 assert_contains "the re-enqueue is announced with a parseable note" "$out" \
@@ -92,7 +97,7 @@ assert_count_equals "gh enables auto-merge twice: the first enqueue and the re-e
   "$(cat "${work_dir}/gh.log")" "GH " 2
 
 printf '\n=== a second removal ends the wait with one parseable error ===\n'
-out="$(run_merge '0| 1|failed_checks 2|failed_checks' 0 3)"
+out="$(run_merge 'none| id1|failed_checks id2|failed_checks' 0 3)"
 assert_contains "the wait fails" "$out" "rc=1"
 assert_contains "the error names the PR, repository, reason and the one re-enqueue" "$out" \
   "ERROR: MERGE_QUEUE_REMOVED pr=#7 repo=the-hcma/repository-helpers reason=failed_checks reenqueued=1"
@@ -101,7 +106,7 @@ assert_not_contains "it is not reported as a timeout" "$out" "WAIT_TIMEOUT"
 assert_count_equals "gh enables auto-merge only twice" "$(cat "${work_dir}/gh.log")" "GH " 2
 
 printf '\n=== a removal for another reason is not re-enqueued ===\n'
-out="$(run_merge '0| 1|merge_conflict' 0 3)"
+out="$(run_merge 'none| id1|merge_conflict' 0 3)"
 assert_contains "the wait fails" "$out" "rc=1"
 assert_contains "the error carries the reason and no re-enqueue" "$out" \
   "ERROR: MERGE_QUEUE_REMOVED pr=#7 repo=the-hcma/repository-helpers reason=merge_conflict reenqueued=0"
@@ -109,37 +114,37 @@ assert_not_contains "no re-enqueue note" "$out" "MERGE_QUEUE_REENQUEUE"
 assert_count_equals "gh enables auto-merge once" "$(cat "${work_dir}/gh.log")" "GH " 1
 
 printf '\n=== a failing re-enqueue is reported, not hidden behind a gh error ===\n'
-out="$(run_merge '0| 1|failed_checks' 0 3 2)"
+out="$(run_merge 'none| id1|failed_checks' 0 3 2)"
 assert_contains "the wait fails" "$out" "rc=1"
 assert_contains "the error says the re-enqueue failed" "$out" \
   "ERROR: MERGE_QUEUE_REMOVED pr=#7 repo=the-hcma/repository-helpers reason=failed_checks reenqueued=failed"
 assert_contains "gh's own message is logged" "$out" "gh: boom"
 
 printf '\n=== removals that already existed before the enqueue are ignored ===\n'
-out="$(run_merge '2|failed_checks 2|failed_checks' 0 1)"
+out="$(run_merge 'id9|failed_checks id9|failed_checks' 0 1)"
 assert_contains "the wait ends in the usual timeout" "$out" "ERROR: WAIT_TIMEOUT merge pr=#7 via=gh"
 assert_not_contains "no removal error" "$out" "MERGE_QUEUE_REMOVED"
 assert_not_contains "no re-enqueue" "$out" "MERGE_QUEUE_REENQUEUE"
 
 printf '\n=== a failed lookup is never mistaken for a removal ===\n'
-out="$(run_merge '0| -' 0 1)"
+out="$(run_merge 'none| -' 0 1)"
 assert_contains "an empty queue answer leaves the usual timeout" "$out" "ERROR: WAIT_TIMEOUT merge pr=#7 via=gh"
 assert_not_contains "no removal error for an empty answer" "$out" "MERGE_QUEUE_REMOVED"
 
 printf '\n=== a failed baseline lookup does not turn an old removal into a new one ===\n'
-out="$(run_merge '- 1|failed_checks 1|failed_checks' 0 3)"
+out="$(run_merge '- id1|failed_checks id1|failed_checks' 0 3)"
 assert_contains "the wait ends in the usual timeout" "$out" "ERROR: WAIT_TIMEOUT merge pr=#7 via=gh"
 assert_not_contains "the old removal is not reported" "$out" "MERGE_QUEUE_REMOVED"
 assert_not_contains "the old removal is not re-enqueued" "$out" "MERGE_QUEUE_REENQUEUE"
 assert_count_equals "gh enables auto-merge once" "$(cat "${work_dir}/gh.log")" "GH " 1
 
 printf '\n=== a failed baseline still catches a removal that happens afterwards ===\n'
-out="$(run_merge '- 1|failed_checks 2|failed_checks' 0 3)"
+out="$(run_merge '- id1|failed_checks id2|failed_checks' 0 3)"
 assert_contains "the first successful check becomes the baseline and the next removal is re-enqueued" "$out" \
   "NOTE: MERGE_QUEUE_REENQUEUE pr=#7 repo=the-hcma/repository-helpers reason=failed_checks"
 assert_count_equals "gh enables auto-merge twice" "$(cat "${work_dir}/gh.log")" "GH " 2
 
-# run_lookup <graphql response json> -> the lookup's "<removals>|<last reason>" answer, with the real jq filter
+# run_lookup <graphql response json> -> the lookup's "<latest removal id>|<reason>" answer, with the real jq filter
 # applied to the fixture by a stub of the gh api executor.
 run_lookup() {
   local -r fixture="$1"
@@ -176,14 +181,25 @@ lookup_for() {
   run_lookup "{\"data\":{\"repository\":{\"pullRequest\":{\"timelineItems\":{\"totalCount\":$1,\"nodes\":$2}}}}}"
 }
 
-printf '\n=== the lookup counts filtered removals, not totalCount, and skips the merge-time removal ===\n'
-assert_equals "no removal events answers zero removals" "$(lookup_for 74 '[]')" "0|"
-assert_equals "totalCount counts every timeline item and is ignored; the last reason is reported" \
-  "$(lookup_for 74 '[{"reason":"failed_checks"},{"reason":"merge_conflict"}]')" "2|merge_conflict"
+printf '\n=== the lookup names the latest removal by id and skips the merge-time removal ===\n'
+assert_equals "no removal events answers none" "$(lookup_for 74 '[]')" "none|"
+assert_equals "totalCount counts every timeline item and is ignored; the latest removal and its reason are reported" \
+  "$(lookup_for 74 '[{"id":"A","reason":"failed_checks"},{"id":"B","reason":"merge_conflict"}]')" \
+  "B|merge_conflict"
 assert_equals "the removal GitHub records when the PR merges is not a removal" \
-  "$(lookup_for 9 '[{"reason":"failed_checks"},{"reason":"merged"}]')" "1|failed_checks"
-assert_equals "nodes of another event type (no reason) are not counted" \
-  "$(lookup_for 3 '[{},{"reason":"failed_checks"}]')" "1|failed_checks"
+  "$(lookup_for 9 '[{"id":"A","reason":"failed_checks"},{"id":"B","reason":"merged"}]')" "A|failed_checks"
+assert_equals "nodes of another event type (no reason) are not removals" \
+  "$(lookup_for 3 '[{},{"id":"A","reason":"failed_checks"}]')" "A|failed_checks"
+
+printf '\n=== a full page of 50 removals still shows the newest one (page-boundary regression) ===\n'
+page_old="$(jq -nc '[range(1;51) | {id: "R\(.)", reason: "failed_checks"}]')"
+page_new="$(jq -nc '[range(2;52) | {id: "R\(.)", reason: "failed_checks"}]')"
+assert_equals "a full page names its newest removal" "$(lookup_for 90 "$page_old")" "R50|failed_checks"
+assert_equals "the next removal pushes the oldest out and changes the answer although the page length is 50" \
+  "$(lookup_for 91 "$page_new")" "R51|failed_checks"
+out="$(run_merge 'R50|failed_checks R51|failed_checks' 0 3)"
+assert_contains "the wait re-enqueues a removal that arrives when the page is already full" "$out" \
+  "NOTE: MERGE_QUEUE_REENQUEUE pr=#7 repo=the-hcma/repository-helpers reason=failed_checks"
 
 printf '\n=== static: the failure keeps the PR open and reaches the batch summary ===\n'
 cleanup_body="$(awk '/^cleanup_on_error\(\) \{/,/^\}/' "${dep_updater}")"
@@ -195,5 +211,8 @@ assert_contains "the batch summary scrapes the removal line" "$scrape_body" \
 lookup_body="$(awk '/^gh_pr_merge_queue_removals\(\) \{/,/^\}/' "${dep_updater}")"
 assert_contains "the lookup goes through the rate-limited gh api executor" "$lookup_body" \
   "dep_runner_gh_stdout \"gh pr merge queue removals\" -- api graphql"
+reenqueue_body="$(awk '/^dep_updater_reenqueue_auto_merge\(\) \{/,/^\}/' "${dep_updater}")"
+assert_contains "the re-enqueue goes through the shared rate-limit executor with pacing and a timeout" \
+  "$reenqueue_body" "github_api_exec_with_rate_limit_retry \"gh pr merge re-enqueue\" -- gh pr merge"
 
 test_summary
