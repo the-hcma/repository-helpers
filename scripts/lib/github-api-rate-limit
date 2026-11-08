@@ -1232,6 +1232,14 @@ _github_api_pace_note() {
   ( trap '' PIPE; printf '%s%s\n' "$prefix" "$line" >&"$live_fd" ) 2>/dev/null || true
 }
 
+# _github_api_pace_trace <event> [detail]
+# Debug aid (repository-helpers#838): with GITHUB_API_PACE_TRACE=<file> every lock and claim step appends one
+# "time pid event detail" line there, so a rare scheduling-dependent failure can be replayed from its log.
+_github_api_pace_trace() {
+  [[ -n "${GITHUB_API_PACE_TRACE:-}" ]] || return 0
+  printf '%s pid=%s %s %s\n' "$EPOCHREALTIME" "$BASHPID" "$1" "${2:-}" >>"$GITHUB_API_PACE_TRACE" 2>/dev/null || true
+}
+
 # _github_api_pace_lock <state_dir>
 # Takes the state lock. Primary path is flock(1) on <state_dir>/lock.file (released by the kernel when
 # the holder dies, so no stale locks); hosts without flock fall back to an atomic mkdir lock. The
@@ -1257,9 +1265,12 @@ _github_api_pace_lock() {
   for attempt in 1 2 3 4 5; do
     _github_api_pace_lock_mkdir "$lockdir" || return 1
     if _github_api_pace_stamp_lock "$lockdir"; then
+      _github_api_pace_trace lock-acquired
       return 0
     fi
+    _github_api_pace_trace lock-vanished
   done
+  _github_api_pace_trace lock-failed
   return 1
 }
 
@@ -1320,6 +1331,7 @@ _github_api_pace_break_stale() {
   local -r grave="${lockdir}.stale.${BASHPID}"
   local actual=''
 
+  _github_api_pace_trace lock-break-stale "seen=${seen}"
   mv -- "$lockdir" "$grave" 2>/dev/null || return 0
   { read -r actual <"${grave}/since"; } 2>/dev/null || true
   if [[ "$actual" == "$seen" ]]; then
@@ -1339,6 +1351,7 @@ _github_api_pace_unlock() {
     _github_api_pace_lock_fd=''
     return 0
   fi
+  _github_api_pace_trace lock-released
   rm -rf -- "${1}/lock"
 }
 
@@ -1431,8 +1444,10 @@ _github_api_pace_claim() {
     # long, and the network call happens with the state lock released.
     probe_marker="$(( now + 10 ))"
     _github_api_pace_write "${state_dir}/probing_until" "$probe_marker"
+    _github_api_pace_trace probe-claimed "label=${label} observed=${observed:-none}"
     _github_api_pace_unlock "$state_dir"
     probed="$(_github_api_pace_probe_quota)"
+    _github_api_pace_trace probe-done "label=${label} probed=${probed:-none}"
     if ! _github_api_pace_lock "$state_dir"; then
       # Best effort: one more try so a lock hiccup does not leave the marker up for its full expiry.
       if _github_api_pace_lock "$state_dir"; then
@@ -1450,6 +1465,7 @@ _github_api_pace_claim() {
       remaining='?' reset='?'
     fi
     observed="$now"
+    _github_api_pace_trace quota-written-after-probe "label=${label} remaining=${remaining}"
     _github_api_pace_write "${state_dir}/quota" "${remaining} ${reset} ${observed}"
     _github_api_pace_clear_probe_marker "$state_dir" "$probe_marker"
     until_epoch="$(_github_api_pace_read "${state_dir}/blocked_until")"
@@ -1491,6 +1507,7 @@ _github_api_pace_claim() {
   calls="$(_github_api_pace_read "${state_dir}/calls")"
   [[ "$calls" =~ ^[0-9]+$ ]] || calls=0
   _github_api_pace_write "${state_dir}/calls" "$(( calls + 1 ))"
+  _github_api_pace_trace claimed "label=${label} remaining=${remaining} calls=$(( calls + 1 ))"
   _github_api_pace_unlock "$state_dir"
 
   wait_us=$(( slot - now_us ))
