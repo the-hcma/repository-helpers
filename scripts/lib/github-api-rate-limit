@@ -1262,8 +1262,8 @@ _github_api_pace_trace_lockdir() {
 # milliseconds, so that is a crashed holder). It deliberately does not judge staleness by owner
 # pid liveness: a waiter can read an owner that has since exited normally and then remove the
 # lock of the next holder, which admits two callers at once. The flock path waits up to ~5 s. The mkdir path
-# waits up to ~5 s per attempt and makes up to 5 attempts, so a lock that keeps vanishing under it can take
-# about 25 s to give up; it then fails and the caller stands the gate down.
+# waits up to ~5 s per attempt and makes up to 100 attempts (10 ms apart when it keeps losing the stamp), so a lock
+# that keeps being lost to others can take long to give up; it then fails and the caller stands the gate down.
 _github_api_pace_lock() {
   local -r lockdir="${1}/lock"
   local attempt
@@ -1279,11 +1279,11 @@ _github_api_pace_lock() {
     _github_api_pace_trace lock-failed flock
     return 1
   fi
-  # The directory can be removed again between our mkdir and our stamp (the stamp then fails). We never held the
-  # lock then, so try again instead of standing the gate down (repository-helpers#838). A directory that was
-  # removed and re-created by someone else cannot be told apart from ours (the inode number is reused at once);
-  # the mkdir fallback is best-effort, the flock path is the real mutual exclusion.
-  for attempt in 1 2 3 4 5; do
+  # A successful mkdir does not prove we hold the lock: on a CI runner (ext4 on an Azure 7.0 kernel) two
+  # concurrent mkdirs of the same name were seen to both return success (repository-helpers#838). The proof is
+  # the stamp, created with O_EXCL (noclobber), which only one caller can win. A caller that loses it, or whose
+  # directory vanished before it could stamp, never held the lock and waits for the real holder and tries again.
+  for (( attempt = 1; attempt <= 100; attempt++ )); do
     _github_api_pace_lock_mkdir "$lockdir" || return 1
     if _github_api_pace_stamp_lock "$lockdir"; then
       if [[ -n "${GITHUB_API_PACE_TRACE:-}" ]]; then
@@ -1291,16 +1291,18 @@ _github_api_pace_lock() {
       fi
       return 0
     fi
-    _github_api_pace_trace lock-vanished "attempt=${attempt}"
+    _github_api_pace_trace lock-lost "attempt=${attempt}"
+    run_command "github-api pace lock retry" sleep 0.01
   done
   _github_api_pace_trace lock-failed mkdir
   return 1
 }
 
 # _github_api_pace_stamp_lock <lockdir>
-# Records when the lock was taken; fails when the directory is already gone.
+# Records when the lock was taken. The file is created exclusively (noclobber, O_EXCL), so of several callers
+# that all saw their mkdir succeed only one stamps; it also fails when the directory is already gone.
 _github_api_pace_stamp_lock() {
-  printf '%s\n' "$EPOCHSECONDS" >"${1}/since" 2>/dev/null
+  ( set -o noclobber; printf '%s\n' "$EPOCHSECONDS" >"${1}/since" ) 2>/dev/null
 }
 
 # _github_api_pace_lock_mkdir <lockdir>

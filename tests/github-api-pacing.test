@@ -469,10 +469,38 @@ assert_contains "the acquire trace lists the since file" "$trace_text" "entries=
 assert_contains "the release trace names the inode and entries" "$trace_text" "lock-released ino="
 assert_contains "a lock that was already removed is traced as gone" "$trace_text" "lock-released gone"
 
+new_case mkdirliar
+mkdir -p "$case_state"
+pace_lock_mode='mkdir'
+# On a CI runner (ext4 on an Azure 7.0 kernel) two concurrent mkdirs of one name were seen to both return success,
+# so two callers believed they held the mkdir lock (repository-helpers#838). Simulate a mkdir that reports success
+# for an existing directory: the exclusive stamp must still let only one caller in at a time.
+out="$(run_lib '
+  mkdir() { command mkdir -- "$@" 2>/dev/null || [[ -d "${!#}" ]]; }
+  inside="${GITHUB_API_STATE_DIR}/inside"
+  for i in 1 2 3 4 5 6; do
+    (
+      _github_api_pace_lock "$GITHUB_API_STATE_DIR" || { echo "NOLOCK ${i}"; exit 0; }
+      held="$(( $(cat "$inside" 2>/dev/null || echo 0) + 1 ))"
+      printf "%s" "$held" >"$inside"
+      [[ "$held" == 1 ]] || echo "OVERLAP ${i} held=${held}"
+      run_command "hold the lock" sleep 0.05
+      printf "%s" "$(( $(cat "$inside") - 1 ))" >"$inside"
+      _github_api_pace_unlock "$GITHUB_API_STATE_DIR"
+    ) &
+  done
+  wait
+  echo finished
+' 2>&1)"
+assert_not_contains "no two callers hold the mkdir lock at once when mkdir reports success for an existing directory" \
+  "$out" "OVERLAP"
+assert_not_contains "every caller still gets the lock in turn when mkdir always reports success" "$out" "NOLOCK"
+assert_contains "all callers finish" "$out" "finished"
+
 new_case lockvanish-always
 mkdir -p "$case_state"
 pace_lock_mode='mkdir'
-# A lock that keeps vanishing is given up after five attempts, not retried forever.
+# A lock that keeps vanishing is given up after a hundred attempts, not retried forever.
 out="$(run_lib '
   stamps=0
   _github_api_pace_stamp_lock() {
@@ -484,7 +512,7 @@ out="$(run_lib '
   _github_api_pace_lock "$GITHUB_API_STATE_DIR" || lock_ec=$?
   printf "lock_ec=%s stamps=%s\n" "$lock_ec" "$stamps"
 ' 2>&1)"
-assert_contains "a lock that vanishes five times in a row is given up" "$out" "lock_ec=1 stamps=5"
+assert_contains "a lock that vanishes a hundred times in a row is given up" "$out" "lock_ec=1 stamps=100"
 assert_contains "the trace records the give-up" "$(cat "${case_dir}/trace")" "lock-failed mkdir"
 
 new_case tracefifo
