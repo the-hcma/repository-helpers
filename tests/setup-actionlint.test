@@ -74,7 +74,9 @@ if grep -qF "actionlint_version='1.7.12'" "$installer" \
   && grep -qE "\[linux_amd64\]='[0-9a-f]{64}'" "$installer" \
   && grep -qE "\[linux_arm64\]='[0-9a-f]{64}'" "$installer" \
   && grep -qF 'gzip --test' "$installer" \
-  && grep -qF -- '--connect-timeout 20 --max-time 180' "$installer" \
+  && grep -qF -- '--connect-timeout 20 --max-time 60' "$installer" \
+  && ! grep -qF -- '--retry 2' "$installer" \
+  && grep -qF 'actionlint_deadline=480' "$installer" \
   && grep -qF '400 | 401 | 404 | 410) break' "$installer" \
   && grep -qF 'checksum mismatch' "$installer" \
   && grep -qF 'ERROR: actionlint download failed' "$installer" \
@@ -134,11 +136,41 @@ out="$(run_installer "$work" CURL_HTTP_CODE=200 CURL_BODY_FILE="${work}/body" AC
 calls="$(cat "${work}/calls")"
 if [[ "$rc" -ne 0 && "$calls" == '2' && ! -e "${work}/bin/actionlint" ]] \
   && grep -qF 'ERROR: actionlint download failed after 2 attempts' <<<"$out" \
+  && grep -qF 'body=body is not a valid gzip archive' <<<"$out" \
   && ! grep -qF 'not in gzip format' <<<"$out"; then
-  printf '[PASS] an HTML error body served as 200 is rejected before tar and retried\n'
+  printf '[PASS] an HTML error body served as 200 is rejected before tar, retried, and named in the error\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] expected a non-gzip body to be retried (rc=%s calls=%s)\n%s\n' "$rc" "$calls" "$out"
+  fail=$(( fail + 1 ))
+fi
+
+: >"${work}/body"
+out=""
+rc=0
+out="$(run_installer "$work" CURL_HTTP_CODE=200 CURL_BODY_FILE="${work}/body" ACTIONLINT_DOWNLOAD_RETRIES=2)" || rc=$?
+if [[ "$rc" -ne 0 ]] && grep -qF 'body=empty body' <<<"$out"; then
+  printf '[PASS] an empty body served as 200 is named in the final error\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected body=empty body in the final error (rc=%s)\n%s\n' "$rc" "$out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$work"
+
+printf '\n=== functional: the overall budget stops the retries before a backoff that would pass it ===\n'
+work="$(mktemp -d)"
+make_curl_stub "${work}/stub-bin"
+out=""
+rc=0
+out="$(run_installer "$work" CURL_HTTP_CODE=503 CURL_RC=22 \
+  ACTIONLINT_DOWNLOAD_RETRIES=5 ACTIONLINT_RETRY_DELAY=500)" || rc=$?
+calls="$(cat "${work}/calls")"
+if [[ "$rc" -ne 0 && "$calls" == '1' ]] && grep -qF 'after 1 attempt (' <<<"$out"; then
+  printf '[PASS] a backoff longer than the budget ends the install after one attempt, without sleeping\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected one attempt when the backoff exceeds the budget (rc=%s calls=%s)\n%s\n' "$rc" "$calls" "$out"
   fail=$(( fail + 1 ))
 fi
 rm -rf "$work"
@@ -187,6 +219,32 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$work"
+
+printf '\n=== functional: a failing install step cleans up and reports an ERROR line ===\n'
+work="$(mktemp -d)"
+make_curl_stub "${work}/stub-bin"
+printf '#!/bin/sh\necho actionlint-fixture\n' >"${work}/actionlint"
+tar --create --gzip --file "${work}/body" --directory "$work" actionlint
+fixture_sha="$(sha256sum "${work}/body" | cut -d' ' -f1)"
+sed -E "s/(\[linux_(amd64|arm64)\]=')[0-9a-f]{64}'/\1${fixture_sha}'/" "$installer" >"${work}/ci-actionlint-fixture"
+# A regular file where the install directory's parent should be makes mkdir -p fail.
+printf 'not a directory\n' >"${work}/blocker"
+tmp_before="$(mktemp -d)"
+out=""
+rc=0
+installer_under_test="${work}/ci-actionlint-fixture"
+out="$(run_installer "$work" CURL_HTTP_CODE=200 CURL_BODY_FILE="${work}/body" TMPDIR="$tmp_before" \
+  ACTIONLINT_BIN_DIR="${work}/blocker/bin")" || rc=$?
+installer_under_test=''
+leftover="$(find "$tmp_before" -mindepth 1 -maxdepth 1 | wc -l)"
+if [[ "$rc" -ne 0 && "$leftover" == '0' ]] && grep -qF 'ERROR: actionlint install failed' <<<"$out"; then
+  printf '[PASS] an unwritable install directory fails with an ERROR line and leaves no temp files\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected cleanup and an ERROR line (rc=%s leftover=%s)\n%s\n' "$rc" "$leftover" "$out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$work" "$tmp_before"
 
 printf '\n=== functional: invalid retry settings are rejected ===\n'
 work="$(mktemp -d)"
