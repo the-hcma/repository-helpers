@@ -8258,6 +8258,170 @@ rp_check_pnpm_corepack_ci() {
   return "$repo_fail"
 }
 
+# --- Temp layout CI (repository-helpers#832) ---------------------------------------------
+# CI wrappers and workflows that run pytest, uv or pnpm must put their temp files and caches under
+# $TMPDIR/<project>/<branch>/<tool> through scripts/dev/with-tmp-layout, which a workflow reaches with the
+# composite action actions/setup-tmp-layout (pinned to a full SHA on main).
+#
+# Severity ratchet: SUGGEST while the rollout is in progress (also under --strict-onboarding, because the CI
+# audit runs that mode over every org repo); FAIL under --new-repo; flip rp_tmp_layout_enforce_existing to 1
+# (FAIL for every repo) once every consumer has the layout.
+rp_tmp_layout_enforce_existing=0
+
+# True when the text runs a tool whose temp files belong in the layout (uv, pnpm, pytest).
+rp_tmp_layout_text_needs_layout() {
+  local -r text="$1"
+  local tool_pattern
+  for tool_pattern in 'uv[[:space:]]+(sync|run|build|lock)' 'pnpm[[:space:]]+(install|run|exec)' 'pytest'; do
+    if grep -Eq "(^|[[:space:];&(\"'])${tool_pattern}" <<<"$text"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Print each distinct `.github/ci/<name>` wrapper name a workflow runs.
+rp_tmp_layout_workflow_wrappers() {
+  local -r text="$1"
+  local found
+  found="$(grep -oE '\.github/ci/[A-Za-z0-9._-]+' <<<"$text" || true)"
+  [[ -n "$found" ]] || return 0
+  sort --unique <<<"${found//.github\/ci\//}"
+}
+
+# Print each ref after @ of an active `uses:` of the repository-helpers setup-tmp-layout action.
+rp_tmp_layout_action_pins() {
+  local -r text="$1"
+  local line trimmed uses_ref
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+    if [[ "$trimmed" =~ ^-?[[:space:]]*uses:[[:space:]]*([^[:space:]#]+) ]]; then
+      uses_ref="${BASH_REMATCH[1]}"
+      uses_ref="${uses_ref#[\"\']}"
+      uses_ref="${uses_ref%[\"\']}"
+      if [[ "$uses_ref" == *'/repository-helpers/actions/setup-tmp-layout@'* ]]; then
+        printf '%s\n' "${uses_ref##*@}"
+      fi
+    fi
+  done <<<"$text"
+}
+
+# rp_tmp_layout_report <slug> <message> <suggestion>
+# FAIL when the mode enforces the rule, otherwise a SUGGEST. Returns 1 for a FAIL.
+rp_tmp_layout_report() {
+  local -r slug="$1" message="$2" suggestion="$3"
+  if [[ "$rp_new_repo" -eq 1 || "$rp_tmp_layout_enforce_existing" -eq 1 ]]; then
+    rp_log_fail "${slug}: ${message}"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: ${suggestion}"
+    fi
+    return 1
+  fi
+  if [[ "$rp_suggest" -eq 1 || "$rp_compact" -eq 1 ]]; then
+    rp_log_suggest "${slug}: ${message} — ${suggestion}"
+  fi
+  return 0
+}
+
+rp_check_tmp_layout_ci() {
+  local -r slug="$1"
+  local fail=0 applicable=0
+  local workflow_name workflow_path workflow_text wrapper wrapper_text pin
+  local fetch_ec=0 reach_ec=0 needs_layout has_pin
+  local -a wrappers=()
+
+  while IFS= read -r workflow_name; do
+    [[ -n "$workflow_name" ]] || continue
+    workflow_path=".github/workflows/${workflow_name}"
+    fetch_ec=0
+    workflow_text="$(rp_fetch_github_text_file "$slug" "$workflow_path")" || fetch_ec=$?
+    if (( fetch_ec == 2 )); then
+      rp_log_gh_api_fail "$slug" "could not read ${workflow_path}"
+      fail=1
+      continue
+    fi
+    [[ -n "$workflow_text" ]] || continue
+
+    needs_layout=0
+    if rp_tmp_layout_text_needs_layout "$workflow_text"; then
+      needs_layout=1
+      if ! grep -Fq 'with-tmp-layout' <<<"$workflow_text"; then
+        applicable=1
+        rp_tmp_layout_report "$slug" \
+          "${workflow_path} runs uv, pnpm or pytest directly outside with-tmp-layout" \
+          "run it through \"\$REPOSITORY_HELPERS_DIR/scripts/dev/with-tmp-layout\" <tool> -- <command> (see actions/setup-tmp-layout/README.md)" \
+          || fail=1
+      fi
+    fi
+    mapfile -t wrappers < <(rp_tmp_layout_workflow_wrappers "$workflow_text")
+    for wrapper in "${wrappers[@]}"; do
+      [[ -n "$wrapper" ]] || continue
+      fetch_ec=0
+      wrapper_text="$(rp_fetch_github_text_file "$slug" ".github/ci/${wrapper}")" || fetch_ec=$?
+      if (( fetch_ec == 2 )); then
+        rp_log_gh_api_fail "$slug" "could not read .github/ci/${wrapper}"
+        fail=1
+        continue
+      fi
+      [[ -n "$wrapper_text" ]] || continue
+      # A wrapper another wrapper calls (setup-python) inherits the caller's layout, so only the entry
+      # wrappers a workflow runs are checked, and a wrapper that only delegates is not flagged.
+      if rp_tmp_layout_text_needs_layout "$wrapper_text"; then
+        needs_layout=1
+        if ! grep -Fq 'with-tmp-layout' <<<"$wrapper_text" \
+          && ! grep -Eq 'bash[[:space:]]+\.github/ci/' <<<"$wrapper_text"; then
+          applicable=1
+          rp_tmp_layout_report "$slug" \
+            ".github/ci/${wrapper} runs uv, pnpm or pytest outside with-tmp-layout" \
+            "re-exec the wrapper through \"\$REPOSITORY_HELPERS_DIR/scripts/dev/with-tmp-layout\" (see actions/setup-tmp-layout/README.md)" \
+            || fail=1
+        fi
+      fi
+    done
+
+    (( needs_layout == 1 )) || continue
+    applicable=1
+    has_pin=0
+    while IFS= read -r pin || [[ -n "$pin" ]]; do
+      [[ -z "$pin" ]] && continue
+      if [[ ! "$pin" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        rp_tmp_layout_report "$slug" \
+          "${workflow_path} setup-tmp-layout must pin a full 40-char SHA on main (got @${pin})" \
+          "use ${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}/actions/setup-tmp-layout@<full-sha-on-main>" \
+          || fail=1
+        continue
+      fi
+      has_pin=1
+      reach_ec=0
+      rp_helpers_commit_reachable_from_main "$pin" || reach_ec=$?
+      if (( reach_ec == 2 )); then
+        rp_log_gh_api_fail "$slug" \
+          "could not verify setup-tmp-layout@${pin} is on ${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME} main"
+        fail=1
+      elif (( reach_ec != 0 )); then
+        rp_tmp_layout_report "$slug" \
+          "${workflow_path} setup-tmp-layout@${pin} is not reachable on ${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME} main" \
+          "retarget the pin to a merge commit SHA that is on main" \
+          || fail=1
+      fi
+    done < <(rp_tmp_layout_action_pins "$workflow_text")
+    if (( has_pin == 0 )) && [[ -z "$(rp_tmp_layout_action_pins "$workflow_text")" ]]; then
+      rp_tmp_layout_report "$slug" \
+        "${workflow_path} runs uv, pnpm or pytest without the setup-tmp-layout action" \
+        "add ${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}/actions/setup-tmp-layout@<full-sha-on-main> before the step that runs it" \
+        || fail=1
+    fi
+  done < <(rp_fetch_workflow_file_names "$slug")
+
+  if (( fail == 0 && applicable == 1 )); then
+    rp_log_check_ok "$slug" 'temp layout CI (setup-tmp-layout + with-tmp-layout)' \
+      "$(rp_github_url "$slug" '/tree/main/.github/ci')"
+  fi
+  return "$fail"
+}
+
 rp_print_new_repo_checklist() {
   local slug="$1"
   cat >&2 <<CHECKLIST
@@ -11160,6 +11324,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_pnpm_corepack_ci "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_tmp_layout_ci "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_github_security_settings "$slug"; then

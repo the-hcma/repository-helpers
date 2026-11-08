@@ -1098,6 +1098,116 @@ else
 fi
 rm -rf "$mock_dir"
 
+printf '\n=== unit: rp_check_tmp_layout_ci (repository-helpers#832) ===\n'
+tl_dir="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${tl_dir}/runner-sessions"
+tl_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    # shellcheck disable=SC1091
+    source "$2"
+    rp_compact=0; rp_suggest=1; rp_apply_fix=0; rp_strict_onboarding=0; rp_new_repo=0
+    slug=the-hcma/example-repo
+    sha=0123456789abcdef0123456789abcdef01234567
+    expect() { # label, expected rc, regex that must match, regex that must not match
+      local label="$1" want="$2" yes="$3" no="${4:-}"
+      rc=0; out="$(rp_check_tmp_layout_ci "$slug" 2>&1)" || rc=$?
+      { [[ "$rc" == "$want" ]] && { [[ -z "$yes" ]] || grep -qE "$yes" <<<"$out"; } \
+        && { [[ -z "$no" ]] || ! grep -qE "$no" <<<"$out"; }; } \
+        || { printf "%s: rc=%s want=%s out=%s\n" "$label" "$rc" "$want" "$out"; exit 1; }
+    }
+
+    # Pure helpers.
+    rp_tmp_layout_text_needs_layout "run: uv sync --frozen" || { echo needs-uv; exit 1; }
+    rp_tmp_layout_text_needs_layout "run: pnpm install --frozen-lockfile" || { echo needs-pnpm; exit 1; }
+    rp_tmp_layout_text_needs_layout "run: uv run pytest -q" || { echo needs-pytest; exit 1; }
+    ! rp_tmp_layout_text_needs_layout "run: bash .github/ci/shellcheck" || { echo needs-none; exit 1; }
+    [[ "$(rp_tmp_layout_workflow_wrappers $'"'"'run: bash .github/ci/ruff\nrun: bash .github/ci/web-build\nrun: bash .github/ci/ruff'"'"')" == $'"'"'ruff\nweb-build'"'"' ]] \
+      || { echo wrappers; exit 1; }
+    [[ "$(rp_tmp_layout_action_pins $'"'"'steps:\n  - uses: the-hcma/repository-helpers/actions/setup-tmp-layout@abc\n  # - uses: the-hcma/repository-helpers/actions/setup-tmp-layout@old'"'"')" == abc ]] \
+      || { echo pins; exit 1; }
+
+    tl_wf_ok="  - uses: the-hcma/repository-helpers/actions/setup-tmp-layout@${sha}
+  - run: bash .github/ci/pytest-hermetic"
+    tl_wrapper_ok="exec with-tmp-layout uv -- bash \"\$0\"
+uv run pytest"
+    helpers_on_main=0
+    rp_fetch_workflow_file_names() { printf "ci.yml\n"; }
+    rp_helpers_commit_reachable_from_main() { return "$helpers_on_main"; }
+    tl_wf="$tl_wf_ok"; tl_wrapper="$tl_wrapper_ok"
+    rp_fetch_github_text_file() {
+      case "$2" in
+        .github/workflows/ci.yml) printf "%s\n" "$tl_wf" ;;
+        .github/ci/pytest-hermetic) printf "%s\n" "$tl_wrapper" ;;
+        *) return 1 ;;
+      esac
+    }
+
+    expect compliant 0 "OK: .*temp layout CI" "SUGGEST|FAIL"
+
+    tl_wf="  - run: bash .github/ci/shellcheck"
+    expect no-tooling 0 "" "OK|SUGGEST|FAIL"
+
+    tl_wf="  - run: bash .github/ci/pytest-hermetic"
+    expect missing-action-routine 0 "SUGGEST: .*without the setup-tmp-layout action" "FAIL"
+    rp_suggest=0
+    expect missing-action-silent 0 "" "SUGGEST|FAIL"
+    rp_suggest=1
+    rp_strict_onboarding=1
+    expect missing-action-strict-still-suggests 0 "SUGGEST: .*without the setup-tmp-layout action" "FAIL"
+    rp_strict_onboarding=0
+    rp_new_repo=1
+    expect missing-action-new-repo 1 "FAIL: .*without the setup-tmp-layout action"
+    rp_new_repo=0
+    rp_tmp_layout_enforce_existing=1
+    expect missing-action-enforced 1 "FAIL: .*without the setup-tmp-layout action"
+    rp_tmp_layout_enforce_existing=0
+
+    tl_wf="$tl_wf_ok"; tl_wrapper="uv run pytest"
+    expect wrapper-outside-layout 0 "SUGGEST: .*pytest-hermetic runs uv, pnpm or pytest outside with-tmp-layout" "FAIL"
+    rp_new_repo=1
+    expect wrapper-outside-layout-new-repo 1 "FAIL: .*pytest-hermetic runs uv, pnpm or pytest outside with-tmp-layout"
+    rp_new_repo=0
+
+    # A wrapper that only delegates to another wrapper is not flagged.
+    tl_wrapper="bash .github/ci/setup-python
+uv run pytest"
+    expect delegating-wrapper 0 "OK: " "SUGGEST|FAIL"
+    tl_wrapper="$tl_wrapper_ok"
+
+    tl_wf="  - uses: the-hcma/repository-helpers/actions/setup-tmp-layout@main
+  - run: bash .github/ci/pytest-hermetic"
+    rp_new_repo=1
+    expect mutable-pin 1 "FAIL: .*pin a full 40-char SHA on main \(got @main\)"
+    rp_new_repo=0
+
+    tl_wf="$tl_wf_ok"; helpers_on_main=1
+    rp_new_repo=1
+    expect pin-off-main 1 "FAIL: .*is not reachable on .* main"
+    rp_new_repo=0
+    helpers_on_main=2
+    expect pin-api-error 1 "could not verify setup-tmp-layout@"
+    helpers_on_main=0
+
+    tl_wf="  - run: uv sync --frozen"
+    expect direct-uv 0 "SUGGEST: .*runs uv, pnpm or pytest directly outside with-tmp-layout"
+    tl_wf="  - run: \"\$REPOSITORY_HELPERS_DIR/scripts/dev/with-tmp-layout\" uv -- uv sync --frozen
+  - uses: the-hcma/repository-helpers/actions/setup-tmp-layout@${sha}"
+    expect direct-uv-wrapped 0 "OK: " "SUGGEST|FAIL"
+    printf "ok\n"
+  ' _ "$runner_bootstrap" "$lib" 2>&1
+)" || true
+if [[ "$tl_out" == 'ok' ]]; then
+  printf '[PASS] temp layout CI check suggests during rollout, fails when enforced, and validates the action pin\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] temp layout CI check: %s\n' "$tl_out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$tl_dir"
+
 printf '\n=== summary ===\n'
 printf '%s passed, %s failed\n' "$pass" "$fail"
 
