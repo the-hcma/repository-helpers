@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# Tests for scripts/lib/ci-actionlint, the installer behind actions/setup-actionlint (repository-helpers#842).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+rh_root="${script_dir}/.."
+readonly rh_root
+
+installer="${rh_root}/scripts/lib/ci-actionlint"
+action_yml="${rh_root}/actions/setup-actionlint/action.yml"
+readonly installer action_yml
+
+# No test may really sleep: the production delay is 30s per attempt step.
+export ACTIONLINT_RETRY_DELAY=0
+
+pass=0
+fail=0
+
+make_stub_bin() {
+  local -r dir="$1"
+  local -r name="$2"
+  local -r body="$3"
+  mkdir -p "$dir"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' "$body" >"${dir}/${name}"
+  chmod +x "${dir}/${name}"
+}
+
+# curl stub: writes $CURL_BODY_FILE to the -o file (if set), prints $CURL_HTTP_CODE, exits $CURL_RC,
+# and counts calls in $CURL_CALLS_FILE.
+make_curl_stub() {
+  local -r dir="$1"
+  # shellcheck disable=SC2016  # stub body is literal for the generated script
+  make_stub_bin "$dir" curl '
+  outfile=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o) outfile="$2"; shift 2 ;;
+      -w | --retry | --retry-delay) shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  n=$(( $(cat "$CURL_CALLS_FILE" 2>/dev/null || echo 0) + 1 ))
+  printf "%s" "$n" >"$CURL_CALLS_FILE"
+  if [[ -n "${CURL_BODY_FILE:-}" && -n "$outfile" ]]; then cp "$CURL_BODY_FILE" "$outfile"; fi
+  if [[ "${CURL_RC:-0}" -ne 0 ]]; then
+    printf "curl: (22) The requested URL returned error: %s\n" "$CURL_HTTP_CODE" >&2
+  fi
+  printf "%s" "$CURL_HTTP_CODE"
+  exit "${CURL_RC:-0}"
+'
+  # shellcheck disable=SC2016  # stub body is literal for the generated script
+  make_stub_bin "$dir" uname '
+  case "${1:-}" in
+    -m) printf "x86_64\n" ;;
+    *) printf "Linux\n" ;;
+  esac
+'
+  make_stub_bin "$dir" sudo 'exit 1'
+}
+
+run_installer() {
+  local -r work="$1"
+  shift
+  (
+    cd "$work"
+    env PATH="${work}/stub-bin:${PATH}" CURL_CALLS_FILE="${work}/calls" ACTIONLINT_BIN_DIR="${work}/bin" \
+      "$@" bash "${installer_under_test:-$installer}" 2>&1
+  )
+}
+
+printf '\n=== static: pinned, verified, retried install ===\n'
+if grep -qF "actionlint_version='1.7.12'" "$installer" \
+  && grep -qE "\[linux_amd64\]='[0-9a-f]{64}'" "$installer" \
+  && grep -qE "\[linux_arm64\]='[0-9a-f]{64}'" "$installer" \
+  && grep -qF 'gzip --test' "$installer" \
+  && grep -qF -- '--connect-timeout 20 --max-time 180' "$installer" \
+  && grep -qF '400 | 401 | 404 | 410) break' "$installer" \
+  && grep -qF 'checksum mismatch' "$installer" \
+  && grep -qF 'ERROR: actionlint download failed' "$installer" \
+  && [[ -z "$(grep -vE '^[[:space:]]*#' "$installer" | grep -E 'raw.githubusercontent.com|[|] bash' || true)" ]] \
+  && grep -qF 'scripts/lib/ci-actionlint' "$action_yml"; then
+  printf '[PASS] installer pins the version, records digests, checks gzip and digest, runs no piped script\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected pinned and verified actionlint install contract\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== functional: a persistent 503 exhausts the retries with one ERROR line ===\n'
+work="$(mktemp -d)"
+make_curl_stub "${work}/stub-bin"
+out=""
+rc=0
+out="$(run_installer "$work" CURL_HTTP_CODE=503 CURL_RC=22 ACTIONLINT_DOWNLOAD_RETRIES=3)" || rc=$?
+calls="$(cat "${work}/calls")"
+error_lines="$(grep -c '^ERROR: actionlint download failed' <<<"$out" || true)"
+if [[ "$rc" -ne 0 && "$calls" == '3' && "$error_lines" == '1' ]] \
+  && grep -qF 'after 3 attempts' <<<"$out" \
+  && grep -qF 'http_code=503 curl_exit=22' <<<"$out" \
+  && grep -qF 'returned error: 503' <<<"$out"; then
+  printf '[PASS] three 503 attempts fail with the attempts, HTTP status and curl error in one line\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected 3 calls and one ERROR line (rc=%s calls=%s)\n%s\n' "$rc" "$calls" "$out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$work"
+
+printf '\n=== functional: a permanent 404 fails on the first attempt ===\n'
+work="$(mktemp -d)"
+make_curl_stub "${work}/stub-bin"
+out=""
+rc=0
+out="$(run_installer "$work" CURL_HTTP_CODE=404 CURL_RC=22 ACTIONLINT_DOWNLOAD_RETRIES=5)" || rc=$?
+calls="$(cat "${work}/calls")"
+if [[ "$rc" -ne 0 && "$calls" == '1' ]] && grep -qF 'http_code=404' <<<"$out" \
+  && grep -qF 'after 1 attempt (' <<<"$out"; then
+  printf '[PASS] a 404 fails after one attempt instead of waiting out the retry window\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected one attempt for a 404 (rc=%s calls=%s)\n%s\n' "$rc" "$calls" "$out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$work"
+
+printf '\n=== functional: a 200 with a non-gzip body is retried, never handed to tar ===\n'
+work="$(mktemp -d)"
+make_curl_stub "${work}/stub-bin"
+printf '<html>Bad gateway, not a gzip, 92 bytes of error page</html>\n' >"${work}/body"
+out=""
+rc=0
+out="$(run_installer "$work" CURL_HTTP_CODE=200 CURL_BODY_FILE="${work}/body" ACTIONLINT_DOWNLOAD_RETRIES=2)" || rc=$?
+calls="$(cat "${work}/calls")"
+if [[ "$rc" -ne 0 && "$calls" == '2' && ! -e "${work}/bin/actionlint" ]] \
+  && grep -qF 'ERROR: actionlint download failed after 2 attempts' <<<"$out" \
+  && ! grep -qF 'not in gzip format' <<<"$out"; then
+  printf '[PASS] an HTML error body served as 200 is rejected before tar and retried\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected a non-gzip body to be retried (rc=%s calls=%s)\n%s\n' "$rc" "$calls" "$out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$work"
+
+printf '\n=== functional: a valid gzip with the wrong digest aborts at once (supply chain) ===\n'
+work="$(mktemp -d)"
+make_curl_stub "${work}/stub-bin"
+printf '#!/bin/sh\necho tampered\n' >"${work}/actionlint"
+tar --create --gzip --file "${work}/body" --directory "$work" actionlint
+out=""
+rc=0
+out="$(run_installer "$work" CURL_HTTP_CODE=200 CURL_BODY_FILE="${work}/body" ACTIONLINT_DOWNLOAD_RETRIES=4)" || rc=$?
+calls="$(cat "${work}/calls")"
+if [[ "$rc" -ne 0 && "$calls" == '1' && ! -e "${work}/bin/actionlint" ]] \
+  && grep -qF 'actionlint checksum mismatch' <<<"$out"; then
+  printf '[PASS] a tampered archive fails the SHA-256 check on the first attempt and installs nothing\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected an immediate checksum-mismatch abort (rc=%s calls=%s)\n%s\n' "$rc" "$calls" "$out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$work"
+
+printf '\n=== functional: a valid archive with a matching digest is extracted and installed ===\n'
+work="$(mktemp -d)"
+make_curl_stub "${work}/stub-bin"
+printf '#!/bin/sh\necho actionlint-fixture\n' >"${work}/actionlint"
+tar --create --gzip --file "${work}/body" --directory "$work" actionlint
+fixture_sha="$(sha256sum "${work}/body" | cut -d' ' -f1)"
+# Run a copy whose recorded digests are the fixture's, so the production pins stay readonly and unmodified.
+sed -E "s/(\[linux_(amd64|arm64)\]=')[0-9a-f]{64}'/\1${fixture_sha}'/" "$installer" >"${work}/ci-actionlint-fixture"
+out=""
+rc=0
+installer_under_test="${work}/ci-actionlint-fixture"
+out="$(run_installer "$work" CURL_HTTP_CODE=200 CURL_BODY_FILE="${work}/body")" || rc=$?
+installer_under_test=''
+mode="$(stat --format='%a' "${work}/bin/actionlint" 2>/dev/null || echo none)"
+calls="$(cat "${work}/calls")"
+if [[ "$rc" -eq 0 && "$mode" == '755' && "$calls" == '1' ]] \
+  && grep -qF 'Installed actionlint v1.7.12' <<<"$out" \
+  && [[ "$("${work}/bin/actionlint")" == 'actionlint-fixture' ]]; then
+  printf '[PASS] a matching archive installs actionlint with mode 0755 on the first attempt\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected a successful install (rc=%s mode=%s calls=%s)\n%s\n' "$rc" "$mode" "$calls" "$out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "$work"
+
+printf '\n=== functional: invalid retry settings are rejected ===\n'
+work="$(mktemp -d)"
+make_curl_stub "${work}/stub-bin"
+out=""
+rc=0
+out="$(run_installer "$work" CURL_HTTP_CODE=200 ACTIONLINT_DOWNLOAD_RETRIES=0)" || rc=$?
+rm -rf "$work"
+if [[ "$rc" -eq 2 ]] && grep -qF 'invalid ACTIONLINT_DOWNLOAD_RETRIES' <<<"$out"; then
+  printf '[PASS] a zero retry count is rejected with exit 2\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected exit 2 for an invalid retry count (rc=%s)\n%s\n' "$rc" "$out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== summary ===\n'
+printf '%s passed, %s failed\n' "$pass" "$fail"
+if [[ "$fail" -gt 0 ]]; then
+  exit 1
+fi
