@@ -8273,8 +8273,19 @@ rp_tmp_layout_flagged=0
 # Print the text without comments, labels and echo lines, so a mention there is neither a use nor a wrapper.
 rp_tmp_layout_strip_comments() {
   # Also drop YAML name:/description: labels and echo lines: prose like "Install pnpm dependencies" is no run.
-  local -r prose='-?[[:space:]]*(name|description):|(-[[:space:]]+)?run:[[:space:]]+echo[[:space:]]|echo[[:space:]]'
-  grep -Ev "^[[:space:]]*(#|${prose})" <<<"$1" || true
+  local -r label='-?[[:space:]]*(name|description):'
+  local -r echo_line='(-[[:space:]]+)?(run:[[:space:]]+)?echo[[:space:]]'
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*# ]] || [[ "$line" =~ ^[[:space:]]*${label} ]]; then
+      continue
+    fi
+    # An echo that chains another command (`echo x && uv sync`) is kept, so the chained command still counts.
+    if [[ "$line" =~ ^[[:space:]]*${echo_line} ]] && [[ "$line" != *'&&'* && "$line" != *';'* ]]; then
+      continue
+    fi
+    printf '%s\n' "$line"
+  done <<<"$1"
 }
 
 # True when the text runs a tool whose temp files belong in the layout (uv, pnpm, pytest).
@@ -8288,6 +8299,7 @@ rp_tmp_layout_text_needs_layout() {
     '(^|[[:space:];&(])uvx([[:space:]]|$)' \
     '(^|[[:space:];&(])pnpm[[:space:]]+[a-z]' \
     '(^|[;&(]|run:)[[:space:]]*pytest([[:space:]]|$)' \
+    '(^|[[:space:];&(])env[[:space:]]+([A-Za-z_]+=[^[:space:]]*[[:space:]]+)*pytest([[:space:]]|$)' \
     'uv[[:space:]]+run[[:space:]]+(--[^[:space:]]+[[:space:]]+)*pytest([[:space:]]|$)' \
     'python[0-9.]*[[:space:]]+-m[[:space:]]+pytest([[:space:]]|$)'; do
     if grep -Eq "$tool_pattern" <<<"$text"; then
@@ -8301,7 +8313,7 @@ rp_tmp_layout_text_needs_layout() {
 rp_tmp_layout_workflow_wrappers() {
   local text found
   text="$(rp_tmp_layout_strip_comments "$1")"
-  found="$(grep -oE '\.github/ci/[A-Za-z0-9._-]+' <<<"$text" || true)"
+  found="$(grep -oE '\.github/ci/[A-Za-z0-9._/-]+' <<<"$text" || true)"
   [[ -n "$found" ]] || return 0
   sort --unique <<<"${found//.github\/ci\//}"
 }
@@ -8347,7 +8359,7 @@ rp_check_tmp_layout_ci() {
   local -r slug="$1"
   local fail=0 applicable=0
   local workflow_name workflow_path workflow_text wrapper wrapper_text pin
-  local fetch_ec=0 reach_ec=0 needs_layout has_pin
+  local fetch_ec=0 reach_ec=0 needs_layout has_pin wrapper_via_layout action_ec=0 action_text
   local -a wrappers=()
   local -A wrapper_seen=()
   local -r layout_cmd="\"\$REPOSITORY_HELPERS_DIR/scripts/dev/with-tmp-layout\""
@@ -8405,7 +8417,12 @@ rp_check_tmp_layout_ci() {
       if rp_tmp_layout_text_needs_layout "$wrapper_text"; then
         needs_layout=1
         wrapper_seen[$wrapper]=1
-        if ! grep -Fq 'with-tmp-layout' <<<"$wrapper_text"; then
+        # A workflow line that runs the wrapper through with-tmp-layout hands it the layout environment.
+        wrapper_via_layout=0
+        if grep -F ".github/ci/${wrapper}" <<<"$workflow_text" | grep -Fq 'with-tmp-layout'; then
+          wrapper_via_layout=1
+        fi
+        if (( wrapper_via_layout == 0 )) && ! grep -Fq 'with-tmp-layout' <<<"$wrapper_text"; then
           applicable=1
           rp_tmp_layout_report "$slug" \
             ".github/ci/${wrapper} runs uv, pnpm or pytest but never uses with-tmp-layout" \
@@ -8439,6 +8456,20 @@ rp_check_tmp_layout_ci() {
           "${workflow_path} setup-tmp-layout@${pin} is not reachable on ${rp_THIS_REPO_NAME} main" \
           "retarget the pin to a merge commit SHA that is on main" \
           || fail=1
+      else
+        # A SHA on main can predate the action, in which case the step cannot load.
+        action_ec=0
+        action_text="$(rp_fetch_github_text_file "${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}" \
+          'actions/setup-tmp-layout/action.yml' "$pin")" || action_ec=$?
+        if (( action_ec == 2 )); then
+          rp_log_gh_api_fail "$slug" "could not read ${action_ref}/action.yml at ${pin}"
+          fail=1
+        elif [[ -z "$action_text" ]]; then
+          rp_tmp_layout_report "$slug" \
+            "${workflow_path} setup-tmp-layout@${pin} predates the action (no action.yml at that commit)" \
+            "retarget the pin to a merge commit SHA on main that contains actions/setup-tmp-layout" \
+            || fail=1
+        fi
       fi
     done < <(rp_tmp_layout_action_pins "$workflow_text")
     if (( has_pin == 0 )) && [[ -z "$(rp_tmp_layout_action_pins "$workflow_text")" ]]; then
