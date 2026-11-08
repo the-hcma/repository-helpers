@@ -1241,7 +1241,7 @@ _github_api_pace_note() {
 # lock of the next holder, which admits two callers at once. ~5 s budget either way, then fails.
 _github_api_pace_lock() {
   local -r lockdir="${1}/lock"
-  local tries=0 since nosince=0 now
+  local tries=0 since nosince=0 now lock_mtime
 
   if [[ "${GITHUB_API_PACE_LOCK:-}" != 'mkdir' ]] && command -v flock >/dev/null 2>&1; then
     exec {_github_api_pace_lock_fd}>"${1}/lock.file" || return 1
@@ -1263,13 +1263,19 @@ _github_api_pace_lock() {
         continue
       fi
     else
-      # A holder writes "since" microseconds after mkdir; only a long, unbroken absence means it
-      # crashed in between.
+      # A holder writes "since" microseconds after mkdir, but on a starved runner it can be descheduled
+      # for well over a second in between (repository-helpers#838), so a count of missed reads alone
+      # must not break a live lock: break one only when the directory itself is also older than 30 s,
+      # as a crashed holder's would be. A directory that vanished meanwhile is simply retried.
       nosince=$(( nosince + 1 ))
       if (( nosince > 100 )); then
-        _github_api_pace_break_stale "$lockdir" ''
-        nosince=0
-        continue
+        lock_mtime=''
+        lock_mtime="$(stat --format=%Y -- "$lockdir" 2>/dev/null)" || lock_mtime=''
+        if [[ "$lock_mtime" =~ ^[0-9]+$ ]] && (( now - lock_mtime > 30 )); then
+          _github_api_pace_break_stale "$lockdir" ''
+          nosince=0
+          continue
+        fi
       fi
     fi
     tries=$(( tries + 1 ))
