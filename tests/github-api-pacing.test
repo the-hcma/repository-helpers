@@ -442,10 +442,42 @@ out="$(run_lib '
     fi
     printf "%s\n" "$EPOCHSECONDS" >"${1}/since"
   }
-  _github_api_pace_lock "$GITHUB_API_STATE_DIR"; lock_ec=$?
-  printf "lock_ec=%s stamps=%s since=%s\n" "$lock_ec" "$stamps" "$([[ -s "${GITHUB_API_STATE_DIR}/lock/since" ]] && echo present || echo missing)"
+  lock_ec=0
+  _github_api_pace_lock "$GITHUB_API_STATE_DIR" || lock_ec=$?
+  since_state="$([[ -s "${GITHUB_API_STATE_DIR}/lock/since" ]] && echo present || echo missing)"
+  printf "lock_ec=%s stamps=%s since=%s\n" "$lock_ec" "$stamps" "$since_state"
 ' 2>&1)"
 assert_contains "a caller whose lock directory vanished before the stamp retries and gets the lock" "$out" "lock_ec=0 stamps=2 since=present"
+assert_contains "the trace records the acquisition" "$(cat "${case_dir}/trace")" "lock-acquired mkdir"
+
+new_case lockvanish-always
+mkdir -p "$case_state"
+pace_lock_mode='mkdir'
+# A lock that keeps vanishing is given up after five attempts, not retried forever.
+out="$(run_lib '
+  stamps=0
+  _github_api_pace_stamp_lock() {
+    stamps=$(( stamps + 1 ))
+    rm -rf -- "$1"
+    return 1
+  }
+  lock_ec=0
+  _github_api_pace_lock "$GITHUB_API_STATE_DIR" || lock_ec=$?
+  printf "lock_ec=%s stamps=%s\n" "$lock_ec" "$stamps"
+' 2>&1)"
+assert_contains "a lock that vanishes five times in a row is given up" "$out" "lock_ec=1 stamps=5"
+assert_contains "the trace records the give-up" "$(cat "${case_dir}/trace")" "lock-failed mkdir"
+
+new_case tracefifo
+mkdir -p "$case_state"
+pace_lock_mode='mkdir'
+# A trace target that is a FIFO without a reader must not block the lock holder.
+mkfifo "${case_dir}/trace"
+out="$(timeout 20 env PATH="${mock_bin}:${PATH}" GITHUB_API_PACING=1 GITHUB_API_STATE_DIR="$case_state" \
+  GITHUB_API_PACE_LOCK=mkdir GITHUB_API_PACE_TRACE="${case_dir}/trace" MOCK_SLEEP_LOG="$case_sleep_log" \
+  bash -c 'source "$1"; source "$2"; _github_api_pace_lock "$3"; printf "lock_ec=%s\n" "$?"' \
+  bash "$runner_bootstrap" "$lib" "$case_state" 2>&1)"
+assert_contains "a FIFO trace target never blocks taking the lock" "$out" "lock_ec=0"
 
 pace_lock_mode=
 printf '\n=== pacing: the quota probe never runs while the state lock is held ===\n'

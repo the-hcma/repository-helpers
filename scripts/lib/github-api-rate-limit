@@ -1233,11 +1233,15 @@ _github_api_pace_note() {
 }
 
 # _github_api_pace_trace <event> [detail]
-# Debug aid (repository-helpers#838): with GITHUB_API_PACE_TRACE=<file> every lock and claim step appends one
-# "time pid event detail" line there, so a rare scheduling-dependent failure can be replayed from its log.
+# Debug aid (repository-helpers#838): with GITHUB_API_PACE_TRACE=<file> the lock steps (flock and mkdir) and the
+# claim steps append one "time pid event detail" line there, so a rare scheduling-dependent failure can be
+# replayed from its log. The target must be a regular file path: a FIFO is ignored, because opening one without a
+# reader would block the lock holder, and any write error is silent.
 _github_api_pace_trace() {
-  [[ -n "${GITHUB_API_PACE_TRACE:-}" ]] || return 0
-  printf '%s pid=%s %s %s\n' "$EPOCHREALTIME" "$BASHPID" "$1" "${2:-}" >>"$GITHUB_API_PACE_TRACE" 2>/dev/null || true
+  [[ -n "${GITHUB_API_PACE_TRACE:-}" && ! -p "$GITHUB_API_PACE_TRACE" ]] || return 0
+  {
+    printf '%s pid=%s %s %s\n' "$EPOCHREALTIME" "$BASHPID" "$1" "${2:-}" >>"$GITHUB_API_PACE_TRACE"
+  } 2>/dev/null || true
 }
 
 # _github_api_pace_lock <state_dir>
@@ -1246,7 +1250,9 @@ _github_api_pace_trace() {
 # fallback only breaks a lock that has been held for more than 30 s (critical sections last
 # milliseconds, so that is a crashed holder). It deliberately does not judge staleness by owner
 # pid liveness: a waiter can read an owner that has since exited normally and then remove the
-# lock of the next holder, which admits two callers at once. ~5 s budget either way, then fails.
+# lock of the next holder, which admits two callers at once. The flock path waits up to ~5 s. The mkdir path
+# waits up to ~5 s per attempt and makes up to 5 attempts, so a lock that keeps vanishing under it can take
+# about 25 s to give up; it then fails and the caller stands the gate down.
 _github_api_pace_lock() {
   local -r lockdir="${1}/lock"
   local attempt
@@ -1254,23 +1260,27 @@ _github_api_pace_lock() {
   if [[ "${GITHUB_API_PACE_LOCK:-}" != 'mkdir' ]] && command -v flock >/dev/null 2>&1; then
     exec {_github_api_pace_lock_fd}>"${1}/lock.file" || return 1
     if flock --exclusive --timeout 5 "$_github_api_pace_lock_fd"; then
+      _github_api_pace_trace lock-acquired flock
       return 0
     fi
     exec {_github_api_pace_lock_fd}>&-
     _github_api_pace_lock_fd=''
+    _github_api_pace_trace lock-failed flock
     return 1
   fi
-  # The directory can be removed again between the mkdir and the stamp (the stamp then fails); that
-  # caller never held a lock, so it simply tries again instead of standing down (repository-helpers#838).
+  # The directory can be removed again between our mkdir and our stamp (the stamp then fails). We never held the
+  # lock then, so try again instead of standing the gate down (repository-helpers#838). A directory that was
+  # removed and re-created by someone else cannot be told apart from ours (the inode number is reused at once);
+  # the mkdir fallback is best-effort, the flock path is the real mutual exclusion.
   for attempt in 1 2 3 4 5; do
     _github_api_pace_lock_mkdir "$lockdir" || return 1
     if _github_api_pace_stamp_lock "$lockdir"; then
-      _github_api_pace_trace lock-acquired
+      _github_api_pace_trace lock-acquired mkdir
       return 0
     fi
-    _github_api_pace_trace lock-vanished
+    _github_api_pace_trace lock-vanished "attempt=${attempt}"
   done
-  _github_api_pace_trace lock-failed
+  _github_api_pace_trace lock-failed mkdir
   return 1
 }
 
