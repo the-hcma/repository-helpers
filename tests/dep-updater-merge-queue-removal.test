@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# Tests for dep-updater's merge wait when GitHub removes the PR from the merge queue (#844): the wait used to
+# run out its whole timeout and report a vague WAIT_TIMEOUT. It now notices the removal, re-enqueues once when
+# the queue's own checks failed, and otherwise ends with one ERROR: MERGE_QUEUE_REMOVED line. Hermetic:
+# merge_pr_via_gh_single is extracted from the script and every dependency (the merged check, the queue
+# lookup, gh, sleep) is stubbed.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+dep_updater="${script_dir}/../scripts/dep-updater"
+readonly dep_updater
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+
+# run_merge <removals sequence> <merged-at poll> <timeout minutes> [gh fail from call] -> the function's output,
+# then "rc=<n>". The removals sequence is space separated "<count>|<reason>" answers of the queue lookup (the
+# first one is the baseline read before the enqueue; the last one repeats; "-" is an empty answer). The PR
+# reads as merged from poll number <merged-at> on (0 = never). gh fails from call number [gh fail from call].
+run_merge() {
+  local -r sequence="$1" merged_at="$2" timeout_min="$3" gh_fail_from="${4:-0}"
+
+  : >"${work_dir}/gh.log"
+  printf 0 >"${work_dir}/merged.n"
+  printf 0 >"${work_dir}/removals.n"
+  printf 0 >"${work_dir}/gh.n"
+  timeout 60 bash -c "
+    set -uo pipefail
+    repo_owner='the-hcma'
+    repo_name='repository-helpers'
+    merge_timeout_min=${timeout_min}
+    no_wait_ci=0
+    $(awk '/^merge_queue_removed_error\(\) \{/,/^\}/' "${dep_updater}")
+    $(awk '/^wait_timeout_error\(\) \{/,/^\}/' "${dep_updater}")
+    $(awk '/^dep_updater_reenqueue_auto_merge\(\) \{/,/^\}/' "${dep_updater}")
+    $(awk '/^merge_pr_via_gh_single\(\) \{/,/^\}/' "${dep_updater}")
+    log() { printf '%s\n' \"\$*\"; }
+    die() { printf 'ERROR: %s\n' \"\$*\"; exit 1; }
+    record_first_failure() { printf 'RECORDED: %s\n' \"\$*\"; }
+    sleep() { :; }
+    ci_conclusion_for_pr() { printf 'success'; }
+    # The counters live in files: these run inside command substitutions, which are subshells.
+    gh_pr_merged_for_number() {
+      local n
+      n=\$(( \$(cat '${work_dir}/merged.n') + 1 ))
+      printf '%s' \"\$n\" >'${work_dir}/merged.n'
+      if (( ${merged_at} > 0 && n >= ${merged_at} )); then printf 'true'; else printf 'false'; fi
+    }
+    read -r -a answers <<<'${sequence}'
+    gh_pr_merge_queue_removals() {
+      local idx
+      idx=\$(cat '${work_dir}/removals.n')
+      printf '%s' \"\$(( idx + 1 ))\" >'${work_dir}/removals.n'
+      (( idx < \${#answers[@]} )) || idx=\$(( \${#answers[@]} - 1 ))
+      if [[ \"\${answers[idx]}\" == '-' ]]; then printf ''; else printf '%s' \"\${answers[idx]}\"; fi
+    }
+    dep_runner_gh_stdout() {
+      local n
+      n=\$(( \$(cat '${work_dir}/gh.n') + 1 ))
+      printf '%s' \"\$n\" >'${work_dir}/gh.n'
+      printf 'GH %s\n' \"\$*\" >>'${work_dir}/gh.log'
+      if (( ${gh_fail_from} > 0 && n >= ${gh_fail_from} )); then
+        printf 'gh: boom'
+        return 1
+      fi
+      return 0
+    }
+    rc=0
+    merge_pr_via_gh_single 7 || rc=\$?
+    echo \"rc=\$rc\"" 2>&1 || true
+}
+
+gh_calls() {
+  grep -c '^GH ' "${work_dir}/gh.log" || true
+}
+
+printf '\n=== a failed merge-group run is re-enqueued once and the PR then merges ===\n'
+out="$(run_merge '0| 1|failed_checks' 14 3)"
+assert_contains "the wait ends successfully" "$out" "rc=0"
+assert_contains "the PR is reported merged" "$out" "PR #7 merged."
+assert_contains "the re-enqueue is announced with a parseable note" "$out" \
+  "NOTE: MERGE_QUEUE_REENQUEUE pr=#7 repo=the-hcma/repository-helpers reason=failed_checks"
+assert_not_contains "no error line is printed" "$out" "ERROR: MERGE_QUEUE_REMOVED"
+assert_count_equals "gh enables auto-merge twice: the first enqueue and the re-enqueue" \
+  "$(cat "${work_dir}/gh.log")" "GH " 2
+
+printf '\n=== a second removal ends the wait with one parseable error ===\n'
+out="$(run_merge '0| 1|failed_checks 2|failed_checks' 0 3)"
+assert_contains "the wait fails" "$out" "rc=1"
+assert_contains "the error names the PR, repository, reason and the one re-enqueue" "$out" \
+  "ERROR: MERGE_QUEUE_REMOVED pr=#7 repo=the-hcma/repository-helpers reason=failed_checks reenqueued=1"
+assert_contains "the failure is recorded for the batch report" "$out" "RECORDED: MERGE_QUEUE_REMOVED pr=#7"
+assert_not_contains "it is not reported as a timeout" "$out" "WAIT_TIMEOUT"
+assert_count_equals "gh enables auto-merge only twice" "$(cat "${work_dir}/gh.log")" "GH " 2
+
+printf '\n=== a removal for another reason is not re-enqueued ===\n'
+out="$(run_merge '0| 1|merge_conflict' 0 3)"
+assert_contains "the wait fails" "$out" "rc=1"
+assert_contains "the error carries the reason and no re-enqueue" "$out" \
+  "ERROR: MERGE_QUEUE_REMOVED pr=#7 repo=the-hcma/repository-helpers reason=merge_conflict reenqueued=0"
+assert_not_contains "no re-enqueue note" "$out" "MERGE_QUEUE_REENQUEUE"
+assert_count_equals "gh enables auto-merge once" "$(cat "${work_dir}/gh.log")" "GH " 1
+
+printf '\n=== a failing re-enqueue is reported, not hidden behind a gh error ===\n'
+out="$(run_merge '0| 1|failed_checks' 0 3 2)"
+assert_contains "the wait fails" "$out" "rc=1"
+assert_contains "the error says the re-enqueue failed" "$out" \
+  "ERROR: MERGE_QUEUE_REMOVED pr=#7 repo=the-hcma/repository-helpers reason=failed_checks reenqueued=failed"
+assert_contains "gh's own message is logged" "$out" "gh: boom"
+
+printf '\n=== removals that already existed before the enqueue are ignored ===\n'
+out="$(run_merge '2|failed_checks 2|failed_checks' 0 1)"
+assert_contains "the wait ends in the usual timeout" "$out" "ERROR: WAIT_TIMEOUT merge pr=#7 via=gh"
+assert_not_contains "no removal error" "$out" "MERGE_QUEUE_REMOVED"
+assert_not_contains "no re-enqueue" "$out" "MERGE_QUEUE_REENQUEUE"
+
+printf '\n=== a failed lookup is never mistaken for a removal ===\n'
+out="$(run_merge '0| -' 0 1)"
+assert_contains "an empty queue answer leaves the usual timeout" "$out" "ERROR: WAIT_TIMEOUT merge pr=#7 via=gh"
+assert_not_contains "no removal error for an empty answer" "$out" "MERGE_QUEUE_REMOVED"
+
+# run_lookup <graphql response json> -> the lookup's "<removals>|<last reason>" answer, with the real jq filter
+# applied to the fixture by a stub of the gh api executor.
+run_lookup() {
+  local -r fixture="$1"
+
+  timeout 30 bash -c "
+    set -uo pipefail
+    repo_owner='the-hcma'
+    repo_name='repository-helpers'
+    $(awk '/^gh_pr_merge_queue_removals\(\) \{/,/^\}/' "${dep_updater}")
+    dep_runner_gh_stdout() {
+      local filter=''
+      while [[ \$# -gt 0 ]]; do
+        if [[ \"\$1\" == '--jq' ]]; then filter=\"\$2\"; fi
+        shift
+      done
+      jq -r \"\$filter\" <<<'${fixture}'
+    }
+    gh_pr_merge_queue_removals 845" 2>&1 || true
+}
+
+assert_equals() {
+  local -r label="$1" actual="$2" expected="$3"
+
+  if [[ "$actual" == "$expected" ]]; then
+    pass_case "$label"
+  else
+    printf 'expected [%s], got [%s]\n' "$expected" "$actual" >&2
+    fail_case "$label"
+  fi
+}
+
+# lookup_for <totalCount> <nodes json> -> the lookup's answer for a GraphQL response with those timeline items.
+lookup_for() {
+  run_lookup "{\"data\":{\"repository\":{\"pullRequest\":{\"timelineItems\":{\"totalCount\":$1,\"nodes\":$2}}}}}"
+}
+
+printf '\n=== the lookup counts filtered removals, not totalCount, and skips the merge-time removal ===\n'
+assert_equals "no removal events answers zero removals" "$(lookup_for 74 '[]')" "0|"
+assert_equals "totalCount counts every timeline item and is ignored; the last reason is reported" \
+  "$(lookup_for 74 '[{"reason":"failed_checks"},{"reason":"merge_conflict"}]')" "2|merge_conflict"
+assert_equals "the removal GitHub records when the PR merges is not a removal" \
+  "$(lookup_for 9 '[{"reason":"failed_checks"},{"reason":"merged"}]')" "1|failed_checks"
+assert_equals "nodes of another event type (no reason) are not counted" \
+  "$(lookup_for 3 '[{},{"reason":"failed_checks"}]')" "1|failed_checks"
+
+printf '\n=== static: the failure keeps the PR open and reaches the batch summary ===\n'
+cleanup_body="$(awk '/^cleanup_on_error\(\) \{/,/^\}/' "${dep_updater}")"
+assert_contains "cleanup_on_error leaves the PR open for a queue removal" "$cleanup_body" \
+  "MERGE_QUEUE_REMOVED*"
+scrape_body="$(awk '/^batch_all_scrape_actionable_from_log\(\) \{/,/^\}/' "${dep_updater}")"
+assert_contains "the batch summary scrapes the removal line" "$scrape_body" \
+  "(WAIT_TIMEOUT|MERGE_QUEUE_REMOVED)"
+lookup_body="$(awk '/^gh_pr_merge_queue_removals\(\) \{/,/^\}/' "${dep_updater}")"
+assert_contains "the lookup goes through the rate-limited gh api executor" "$lookup_body" \
+  "dep_runner_gh_stdout \"gh pr merge queue removals\" -- api graphql"
+
+test_summary
