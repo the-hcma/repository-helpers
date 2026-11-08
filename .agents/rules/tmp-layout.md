@@ -16,4 +16,4 @@ Temp files from test runs, `uv` and `pnpm` go under `$TMPDIR/<project>/<branch>/
 
 ## CI
 
-Workflows add the composite action `the-hcma/repository-helpers/actions/setup-tmp-layout@<full SHA on main>` before the first step that runs `uv`, `pnpm` or `pytest`, and the `.github/ci` wrappers re-exec themselves through `with-tmp-layout`. `scripts/github-repo-lint` fails a repo that does not (see the "Temp layout CI" row in `AGENTS.md`).
+Workflows add the composite action `the-hcma/repository-helpers/actions/setup-tmp-layout@<full SHA on main>` in **each job** that runs `uv`, `pnpm` or `pytest`, before its first such step (every job gets its own runner, so a step in another job does not configure it), and the `.github/ci` wrappers re-exec themselves through `with-tmp-layout`. `scripts/github-repo-lint` fails a repo that does not (see the "Temp layout CI" row in `AGENTS.md`).
