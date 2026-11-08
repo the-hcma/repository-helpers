@@ -32,8 +32,8 @@ lives in the run directory: removed with it after a passing run, kept after a fa
 For uv and pnpm it is removed right after the run, pass or fail, even with --keep (the cache is kept).
 A nonempty UV_CACHE_DIR or npm_config_store_dir is kept, not replaced;
 an empty or unset one uses the layout.
-The command's exit status is returned. A TERM or INT sent to the wrapper itself is forwarded to the command, which is
-waited for before the run directory is cleaned up (kept after the non-zero exit that follows).
+The command's exit status is returned. A TERM or INT sent to the wrapper itself is forwarded to the command as TERM, which
+is waited for before the run directory is cleaned up (kept after a non-zero exit).
 
 Note: pnpm asks to purge an existing node_modules when its store changes (an error without a TTY), so
 run a project's pnpm commands consistently through the layout, or delete node_modules once.
@@ -47,7 +47,7 @@ die_usage() {
 }
 
 main() {
-  local dir='.' keep=0 cache=0 tool target run quoted sq rc=0 layout_root scratch child
+  local dir='.' keep=0 cache=0 tool target run quoted sq rc=0 layout_root scratch child got_signal
 
   while (( $# > 0 )); do
     case "$1" in
@@ -114,14 +114,28 @@ main() {
 
   # Run the command as a child we can signal: a TERM or INT that reaches only this wrapper (a timeout that does
   # not signal the whole process group, say) is forwarded to it, and we still wait for it and clean up below
-  # (repository-helpers#837). stdin stays the caller's (a background job would otherwise read /dev/null).
+  # (repository-helpers#837). The traps come first, and a signal that lands before the child exists is replayed
+  # once it does. A background job of a non-interactive shell starts with INT ignored, so INT is forwarded as TERM.
+  # stdin stays the caller's (a background job would otherwise read /dev/null).
+  child=''
+  got_signal=0
+  on_signal() {
+    got_signal=1
+    if [[ -n "$child" ]]; then
+      kill -s TERM "$child" 2>/dev/null || true
+    fi
+  }
+  trap on_signal TERM INT
   "$@" <&0 &
   child=$!
-  trap 'kill -s TERM "$child" 2>/dev/null || true' TERM
-  trap 'kill -s INT "$child" 2>/dev/null || true' INT
+  if (( got_signal == 1 )); then
+    kill -s TERM "$child" 2>/dev/null || true
+  fi
   wait "$child" || rc=$?
-  # A trapped signal interrupts wait with a status above 128 while the child may still be running: wait again.
+  # A trapped signal interrupts wait with a status above 128 while the child may still be running: wait again
+  # and take the status of that final wait, which is the child's own.
   while kill -0 "$child" 2>/dev/null; do
+    rc=0
     wait "$child" || rc=$?
   done
   trap - TERM INT
