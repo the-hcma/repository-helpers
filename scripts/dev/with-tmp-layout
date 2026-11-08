@@ -32,7 +32,8 @@ lives in the run directory: removed with it after a passing run, kept after a fa
 For uv and pnpm it is removed right after the run, pass or fail, even with --keep (the cache is kept).
 A nonempty UV_CACHE_DIR or npm_config_store_dir is kept, not replaced;
 an empty or unset one uses the layout.
-The command's exit status is returned.
+The command's exit status is returned. A TERM or INT sent to the wrapper itself is forwarded to the command, which is
+waited for before the run directory is cleaned up (kept after the non-zero exit that follows).
 
 Note: pnpm asks to purge an existing node_modules when its store changes (an error without a TTY), so
 run a project's pnpm commands consistently through the layout, or delete node_modules once.
@@ -46,7 +47,7 @@ die_usage() {
 }
 
 main() {
-  local dir='.' keep=0 cache=0 tool target run quoted sq rc=0 layout_root scratch
+  local dir='.' keep=0 cache=0 tool target run quoted sq rc=0 layout_root scratch child
 
   while (( $# > 0 )); do
     case "$1" in
@@ -111,7 +112,19 @@ main() {
     *) ;;
   esac
 
-  "$@" || rc=$?
+  # Run the command as a child we can signal: a TERM or INT that reaches only this wrapper (a timeout that does
+  # not signal the whole process group, say) is forwarded to it, and we still wait for it and clean up below
+  # (repository-helpers#837). stdin stays the caller's (a background job would otherwise read /dev/null).
+  "$@" <&0 &
+  child=$!
+  trap 'kill -s TERM "$child" 2>/dev/null || true' TERM
+  trap 'kill -s INT "$child" 2>/dev/null || true' INT
+  wait "$child" || rc=$?
+  # A trapped signal interrupts wait with a status above 128 while the child may still be running: wait again.
+  while kill -0 "$child" 2>/dev/null; do
+    wait "$child" || rc=$?
+  done
+  trap - TERM INT
   if (( keep == 0 && cache == 0 )); then
     tmp_layout_finish "$run" "$rc" || true
   elif (( cache == 1 )); then

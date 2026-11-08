@@ -320,4 +320,34 @@ assert_contains 'the Cursor shim links a canonical rule target' "$shim_target" '
 assert_contains 'the Cursor shim link target resolves to the agents rule file' \
   "$([[ -f "$(dirname "$shim_file")/${shim_target}" ]] && echo present || echo missing)" 'present'
 
+printf '\n=== functional: TERM reaches the wrapped command and the run is kept (repository-helpers#837) ===\n'
+sig_pidfile="${fixture}/sig-child.pid"
+rm -f -- "$sig_pidfile"
+# shellcheck disable=SC2016  # the variables must expand in the child, not here
+( cd "$repo" && exec "$wrapper" pytest -- bash -c 'printf "%s" "$$" >"$1"; exec sleep 60' _ "$sig_pidfile" ) >/dev/null 2>&1 &
+sig_wrapper=$!
+# Wait (bounded) until the child has started and written its pid.
+for _ in $(seq 1 200); do
+  [[ -s "$sig_pidfile" ]] && break
+  /bin/sleep 0.05
+done
+sig_child="$(cat "$sig_pidfile" 2>/dev/null || true)"
+assert_contains 'the wrapped command started and recorded its pid' "$([[ -n "$sig_child" ]] && echo yes || echo no)" 'yes'
+kill -s TERM "$sig_wrapper"
+sig_rc=0
+wait "$sig_wrapper" || sig_rc=$?
+assert_contains 'a TERM sent only to the wrapper ends it with the command status 143' "rc=${sig_rc}" 'rc=143'
+sig_alive=no
+if [[ -n "$sig_child" ]] && kill -0 "$sig_child" 2>/dev/null; then
+  sig_alive=yes
+  kill -s KILL "$sig_child" 2>/dev/null || true
+fi
+assert_contains 'the wrapped command is gone after the wrapper is terminated' "alive=${sig_alive}" 'alive=no'
+sig_kept="$(find "${TMPDIR}/widget/feat/foo/pytest" -maxdepth 1 -name 'run.*' 2>/dev/null | head -n 1)"
+assert_contains 'the run directory is kept after a terminated run' "$([[ -d "$sig_kept" ]] && echo yes || echo no)" 'yes'
+assert_contains 'the wrapper installs the TERM and INT forwarding traps' \
+  "$(grep -cE "^  trap 'kill -s (TERM|INT) " "$wrapper")" '2'
+echo piped-input | { cd "$repo" && "$wrapper" pytest -- cat >"${fixture}/stdin-out"; }
+assert_contains 'the wrapped command still reads the caller stdin' "$(cat "${fixture}/stdin-out")" 'piped-input'
+
 test_summary
