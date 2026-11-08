@@ -8277,10 +8277,17 @@ rp_tmp_layout_strip_comments() {
 
 # True when the text runs a tool whose temp files belong in the layout (uv, pnpm, pytest).
 rp_tmp_layout_text_needs_layout() {
-  local -r text="$(rp_tmp_layout_strip_comments "$1")"
-  local tool_pattern
-  for tool_pattern in 'uv[[:space:]]+(sync|run|build|lock)' 'pnpm[[:space:]]+(install|run|exec)' 'pytest'; do
-    if grep -Eq "(^|[[:space:];&(\"'])${tool_pattern}" <<<"$text"; then
+  local text tool_pattern
+  text="$(rp_tmp_layout_strip_comments "$1")"
+  # pytest only counts in command position (`pytest ...`, `uv run pytest`, `python -m pytest`), so `pip install
+  # pytest-cov` or `echo pytest` does not make a workflow need the layout.
+  for tool_pattern in \
+    '(^|[[:space:];&(])uv[[:space:]]+(sync|run|build|lock)([[:space:]]|$)' \
+    '(^|[[:space:];&(])pnpm[[:space:]]+(install|run|exec)([[:space:]]|$)' \
+    '(^|[;&(]|run:)[[:space:]]*pytest([[:space:]]|$)' \
+    'uv[[:space:]]+run[[:space:]]+(--[^[:space:]]+[[:space:]]+)*pytest([[:space:]]|$)' \
+    'python[0-9.]*[[:space:]]+-m[[:space:]]+pytest([[:space:]]|$)'; do
+    if grep -Eq "$tool_pattern" <<<"$text"; then
       return 0
     fi
   done
@@ -8289,8 +8296,8 @@ rp_tmp_layout_text_needs_layout() {
 
 # Print each distinct `.github/ci/<name>` wrapper name a workflow runs.
 rp_tmp_layout_workflow_wrappers() {
-  local -r text="$(rp_tmp_layout_strip_comments "$1")"
-  local found
+  local text found
+  text="$(rp_tmp_layout_strip_comments "$1")"
   found="$(grep -oE '\.github/ci/[A-Za-z0-9._-]+' <<<"$text" || true)"
   [[ -n "$found" ]] || return 0
   sort --unique <<<"${found//.github\/ci\//}"
@@ -8308,7 +8315,7 @@ rp_tmp_layout_action_pins() {
       uses_ref="${BASH_REMATCH[1]}"
       uses_ref="${uses_ref#[\"\']}"
       uses_ref="${uses_ref%[\"\']}"
-      if [[ "$uses_ref" == *'/repository-helpers/actions/setup-tmp-layout@'* ]]; then
+      if [[ "$uses_ref" == *"/${rp_THIS_REPO_NAME}/actions/setup-tmp-layout@"* ]]; then
         printf '%s\n' "${uses_ref##*@}"
       fi
     fi
@@ -8339,6 +8346,10 @@ rp_check_tmp_layout_ci() {
   local workflow_name workflow_path workflow_text wrapper wrapper_text pin
   local fetch_ec=0 reach_ec=0 needs_layout has_pin
   local -a wrappers=()
+  local -A wrapper_seen=()
+  local -r layout_cmd="\"\$REPOSITORY_HELPERS_DIR/scripts/dev/with-tmp-layout\""
+  local -r readme_ref='see actions/setup-tmp-layout/README.md'
+  local -r action_ref="${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}/actions/setup-tmp-layout"
 
   rp_tmp_layout_flagged=0
 
@@ -8361,14 +8372,17 @@ rp_check_tmp_layout_ci() {
       if ! grep -Fq 'with-tmp-layout' <<<"$workflow_text"; then
         applicable=1
         rp_tmp_layout_report "$slug" \
-          "${workflow_path} runs uv, pnpm or pytest directly outside with-tmp-layout" \
-          "run it through \"\$REPOSITORY_HELPERS_DIR/scripts/dev/with-tmp-layout\" <tool> -- <command> (see actions/setup-tmp-layout/README.md)" \
+          "${workflow_path} runs uv, pnpm or pytest but never uses with-tmp-layout" \
+          "run it through ${layout_cmd} <tool> -- <command> (${readme_ref})" \
           || fail=1
       fi
     fi
     mapfile -t wrappers < <(rp_tmp_layout_workflow_wrappers "$workflow_text")
     for wrapper in "${wrappers[@]}"; do
       [[ -n "$wrapper" ]] || continue
+      # A wrapper several workflows run is read and reported once.
+      [[ -z "${wrapper_seen[$wrapper]+x}" ]] || continue
+      wrapper_seen[$wrapper]=1
       fetch_ec=0
       wrapper_text="$(rp_fetch_github_text_file "$slug" ".github/ci/${wrapper}")" || fetch_ec=$?
       if (( fetch_ec == 2 )); then
@@ -8385,8 +8399,8 @@ rp_check_tmp_layout_ci() {
         if ! grep -Fq 'with-tmp-layout' <<<"$wrapper_text"; then
           applicable=1
           rp_tmp_layout_report "$slug" \
-            ".github/ci/${wrapper} runs uv, pnpm or pytest outside with-tmp-layout" \
-            "re-exec the wrapper through \"\$REPOSITORY_HELPERS_DIR/scripts/dev/with-tmp-layout\" (see actions/setup-tmp-layout/README.md)" \
+            ".github/ci/${wrapper} runs uv, pnpm or pytest but never uses with-tmp-layout" \
+            "re-exec the wrapper through ${layout_cmd} (${readme_ref})" \
             || fail=1
         fi
       fi
@@ -8400,7 +8414,7 @@ rp_check_tmp_layout_ci() {
       if [[ ! "$pin" =~ ^[0-9a-fA-F]{40}$ ]]; then
         rp_tmp_layout_report "$slug" \
           "${workflow_path} setup-tmp-layout must pin a full 40-char SHA on main (got @${pin})" \
-          "use ${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}/actions/setup-tmp-layout@<full-sha-on-main>" \
+          "use ${action_ref}@<full-sha-on-main>" \
           || fail=1
         continue
       fi
@@ -8413,7 +8427,7 @@ rp_check_tmp_layout_ci() {
         fail=1
       elif (( reach_ec != 0 )); then
         rp_tmp_layout_report "$slug" \
-          "${workflow_path} setup-tmp-layout@${pin} is not reachable on ${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME} main" \
+          "${workflow_path} setup-tmp-layout@${pin} is not reachable on ${rp_THIS_REPO_NAME} main" \
           "retarget the pin to a merge commit SHA that is on main" \
           || fail=1
       fi
@@ -8421,7 +8435,7 @@ rp_check_tmp_layout_ci() {
     if (( has_pin == 0 )) && [[ -z "$(rp_tmp_layout_action_pins "$workflow_text")" ]]; then
       rp_tmp_layout_report "$slug" \
         "${workflow_path} runs uv, pnpm or pytest without the setup-tmp-layout action" \
-        "add ${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}/actions/setup-tmp-layout@<full-sha-on-main> before the step that runs it" \
+        "add ${action_ref}@<full-sha-on-main> before the step that runs it" \
         || fail=1
     fi
   done < <(rp_fetch_workflow_file_names "$slug")
