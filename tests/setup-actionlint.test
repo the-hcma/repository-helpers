@@ -92,27 +92,48 @@ else
 fi
 
 printf '\n=== functional: missing curl/gzip/tar fails once before any download (#852) ===\n'
-work="$(mktemp -d)"
-# Isolate PATH to stubs only so the real curl/gzip/tar are not found. Use /bin/sh in the
-# uname stub so it does not need bash on that PATH (#!/usr/bin/env bash would fail).
-mkdir -p "${work}/stub-bin"
-cat >"${work}/stub-bin/uname" <<'STUB'
+# Shared helpers for PATH-isolated prereq failures. Invoke bash by absolute path so PATH can
+# omit system curl/gzip/tar. Use /bin/sh stubs so they do not need bash on that PATH.
+bash_bin="$(command -v bash)"
+readonly bash_bin
+make_prereq_uname_stub() {
+  local -r dir="$1"
+  mkdir -p "$dir"
+  cat >"${dir}/uname" <<'STUB'
 #!/bin/sh
 case "${1:-}" in
   -m) printf 'x86_64\n' ;;
   *) printf 'Linux\n' ;;
 esac
 STUB
-chmod +x "${work}/stub-bin/uname"
+  chmod +x "${dir}/uname"
+}
+# Present-tool stubs: succeed without doing real work (never called for downloads when a
+# prereq is missing, but must satisfy command -v).
+make_prereq_present_stub() {
+  local -r dir="$1"
+  local -r name="$2"
+  cat >"${dir}/${name}" <<'STUB'
+#!/bin/sh
+exit 0
+STUB
+  chmod +x "${dir}/${name}"
+}
+run_prereq_isolated() {
+  local -r work="$1"
+  shift
+  (
+    cd "$work"
+    env PATH="${work}/stub-bin" CURL_CALLS_FILE="${work}/calls" ACTIONLINT_BIN_DIR="${work}/bin" \
+      ACTIONLINT_DOWNLOAD_RETRIES=5 "$@" "$bash_bin" "$installer" 2>&1
+  )
+}
+
+work="$(mktemp -d)"
+make_prereq_uname_stub "${work}/stub-bin"
 out=""
 rc=0
-# Invoke bash by absolute path so PATH can be stubs-only (no system curl/gzip/tar).
-bash_bin="$(command -v bash)"
-out="$(
-  cd "$work"
-  env PATH="${work}/stub-bin" CURL_CALLS_FILE="${work}/calls" ACTIONLINT_BIN_DIR="${work}/bin" \
-    ACTIONLINT_DOWNLOAD_RETRIES=5 "$bash_bin" "$installer" 2>&1
-)" || rc=$?
+out="$(run_prereq_isolated "$work")" || rc=$?
 calls="$(cat "${work}/calls" 2>/dev/null || echo 0)"
 error_lines="$(grep -c '^ERROR: actionlint prerequisites missing:' <<<"$out" || true)"
 if [[ "$rc" -ne 0 && "$calls" == '0' && "$error_lines" == '1' ]] \
@@ -126,6 +147,32 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$work"
+
+printf '\n=== functional: each missing prerequisite is named alone (#852) ===\n'
+for missing in curl gzip tar; do
+  work="$(mktemp -d)"
+  make_prereq_uname_stub "${work}/stub-bin"
+  for present in curl gzip tar; do
+    if [[ "$present" != "$missing" ]]; then
+      make_prereq_present_stub "${work}/stub-bin" "$present"
+    fi
+  done
+  out=""
+  rc=0
+  out="$(run_prereq_isolated "$work")" || rc=$?
+  calls="$(cat "${work}/calls" 2>/dev/null || echo 0)"
+  if [[ "$rc" -ne 0 && "$calls" == '0' ]] \
+    && grep -qE "^ERROR: actionlint prerequisites missing: ${missing} \\(need " <<<"$out" \
+    && ! grep -qF 'download failed after' <<<"$out"; then
+    printf '[PASS] missing only %s fails with one ERROR naming that tool\n' "$missing"
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] expected one ERROR naming only %s (rc=%s calls=%s)\n%s\n' \
+      "$missing" "$rc" "$calls" "$out"
+    fail=$(( fail + 1 ))
+  fi
+  rm -rf "$work"
+done
 
 printf '\n=== functional: a persistent 503 exhausts the retries with one ERROR line ===\n'
 work="$(mktemp -d)"
