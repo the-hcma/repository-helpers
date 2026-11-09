@@ -116,9 +116,14 @@ ci_rollup_conclusion_for_gating() {
   required_json="$(printf '%s\n' "$required_contexts" \
     | ci_rollup_jq_lines "ci-rollup required contexts" -R -s 'split("\n") | map(select(length > 0))')"
 
-  # SKIPPED/NEUTRAL are non-fatal but must not alone satisfy merge gating
-  # (tsp-maximizer#128 / repository-helpers#430: push workflows skip jobs when a
-  # PR already exists, which previously looked "green").
+  # Required checks: GitHub branch protection treats a completed SKIPPED/NEUTRAL job
+  # (path-filter / job-level `if:`) as satisfied. Match that for required contexts
+  # (repository-helpers#857 / blumkin Rust path-filter WAIT_TIMEOUT).
+  # SKIPPED/NEUTRAL must still not alone satisfy gating when nothing required
+  # succeeded (tsp-maximizer#128 / repository-helpers#430: push workflows skip
+  # jobs when a PR already exists, which previously looked "green") — when a
+  # required list is present, demand at least one required SUCCESS (an optional
+  # non-external SUCCESS must not greenlight an all-SKIPPED required set).
   # CANCELLED is not a hard failure: cancel-in-progress concurrency often leaves
   # CANCELLED rows beside a green sibling run for the same check name on the same
   # head (repository-helpers#454). Bare CANCELLED after latest-by-name stays
@@ -136,12 +141,16 @@ ci_rollup_conclusion_for_gating() {
       ($c // "") == "SUCCESS";
     def is_external($n):
       ($n // "") as $v
+      # Unexpanded ${{ ... }} matrix display names never get a real check (#733);
+      # a CANCELLED/FAILURE placeholder from cancel-in-progress must not keep empty-
+      # required gating pending forever (same idea as skipping them in discovery).
       | ($v | startswith("Graphite /"))
         or $v == "label"
         or ($v | startswith("label-"))
         or $v == "cleanup-merged-branch"
         or $v == "close-merged-prs"
-        or ($v | test("(?i)dependabot"));
+        or ($v | test("(?i)dependabot"))
+        or ($v | index("${{") != null);
     def is_incomplete:
       ((.conclusion // "") == "")
         or ((.status // "") != "" and (.status // "") != "COMPLETED")
@@ -155,14 +164,27 @@ ci_rollup_conclusion_for_gating() {
         );
     def rollup_entry($r; $ctx):
       ($r | map(select((.name // .context // "") == $ctx)) | .[0] // null);
+    def has_non_external_success($r):
+      ([$r[]
+          | select(is_external(.name // .context // "") | not)
+          | select(is_success(.conclusion))] | length) > 0;
+    def has_required_success($r):
+      any($required[]; rollup_entry($r; .) as $e | is_success($e.conclusion));
 
     (. // []) as $r
     | if ($r | length) == 0 then "missing"
-      elif any($r[]; is_failure(.conclusion)) then "failure"
+      # Ignore external-style failures unless the caller explicitly required that name
+      # (otherwise a required check whose name matches is_external would sit pending).
+      elif any($r[];
+          ((.name // .context // "") as $n
+            | (is_external($n) | not) or (($required | index($n)) != null))
+          and is_failure(.conclusion))
+        then "failure"
       elif ($required | length) > 0 then
         if any($required[]; rollup_entry($r; .) == null) then "pending"
-        elif any($required[]; rollup_entry($r; .) as $e | is_success($e.conclusion) | not)
+        elif any($required[]; rollup_entry($r; .) as $e | is_ok($e.conclusion) | not)
           then "pending"
+        elif (has_required_success($r) | not) then "pending"
         elif any($r[]; (is_external(.name // .context // "") | not) and (. | is_incomplete))
           then "pending"
         else "success"
@@ -171,10 +193,7 @@ ci_rollup_conclusion_for_gating() {
         then "pending"
       elif ([$r[] | select(is_external(.name // .context // "") | not)] | length) == 0
         then "pending"
-      elif ([$r[]
-              | select(is_external(.name // .context // "") | not)
-              | select(is_success(.conclusion))] | length) == 0
-        then "pending"
+      elif (has_non_external_success($r) | not) then "pending"
       elif all($r[] | select(is_external(.name // .context // "") | not); is_ok(.conclusion))
         then "success"
       else "pending"
