@@ -20,18 +20,20 @@ work_dir="$(mktemp -d)"
 readonly work_dir
 trap 'rm -rf "${work_dir}"' EXIT
 
-# run_merge <removals sequence> <merged-at poll> <timeout minutes> [gh fail from call] -> the function's output,
-# then "rc=<n>". The removals sequence is space separated "<latest removal id>|<reason>" answers of the queue
-# lookup ("none|" = never removed; the first one is the baseline read before the enqueue; the last one
-# repeats; "-" is an empty answer). The PR
-# reads as merged from poll number <merged-at> on (0 = never). gh fails from call number [gh fail from call].
+# run_merge <removals sequence> <merged-at poll> <timeout minutes> [gh fail from call] [lookup burn secs]
+# -> the function's output, then "rc=<n>". The removals sequence is space separated
+# "<latest removal id>|<reason>" answers of the queue lookup ("none|" = never removed; the first one is the
+# baseline read before the enqueue; the last one repeats; "-" is an empty answer). The PR reads as merged
+# from poll number <merged-at> on (0 = never). gh fails from call number [gh fail from call]. Each queue
+# lookup after the baseline advances the synthetic clock by [lookup burn secs] (default 0).
 run_merge() {
-  local -r sequence="$1" merged_at="$2" timeout_min="$3" gh_fail_from="${4:-0}"
+  local -r sequence="$1" merged_at="$2" timeout_min="$3" gh_fail_from="${4:-0}" lookup_burn_sec="${5:-0}"
 
   : >"${work_dir}/gh.log"
   printf 0 >"${work_dir}/merged.n"
   printf 0 >"${work_dir}/removals.n"
   printf 0 >"${work_dir}/gh.n"
+  printf 0 >"${work_dir}/clock"
   timeout 60 bash -c "
     set -uo pipefail
     repo_owner='the-hcma'
@@ -40,12 +42,19 @@ run_merge() {
     no_wait_ci=0
     $(awk '/^merge_queue_removed_error\(\) \{/,/^\}/' "${dep_updater}")
     $(awk '/^wait_timeout_error\(\) \{/,/^\}/' "${dep_updater}")
+    $(awk '/^dep_updater_now_epoch\(\) \{/,/^\}/' "${dep_updater}")
     $(awk '/^dep_updater_reenqueue_auto_merge\(\) \{/,/^\}/' "${dep_updater}")
     $(awk '/^merge_pr_via_gh_single\(\) \{/,/^\}/' "${dep_updater}")
     log() { printf '%s\n' \"\$*\"; }
     die() { printf 'ERROR: %s\n' \"\$*\"; exit 1; }
     record_first_failure() { printf 'RECORDED: %s\n' \"\$*\"; }
-    sleep() { :; }
+    # Advance a synthetic wall clock so a no-op sleep still spends the merge budget the way a real
+    # sleep would, and so a slow queue lookup (below) can burn time without a real wait.
+    dep_updater_now_epoch() { cat '${work_dir}/clock'; }
+    sleep() {
+      local -r secs=\"\${1:-0}\"
+      printf '%s' \"\$(( \$(cat '${work_dir}/clock') + secs ))\" >'${work_dir}/clock'
+    }
     ci_conclusion_for_pr() { printf 'success'; }
     # The counters live in files: these run inside command substitutions, which are subshells.
     gh_pr_merged_for_number() {
@@ -59,6 +68,10 @@ run_merge() {
       local idx
       idx=\$(cat '${work_dir}/removals.n')
       printf '%s' \"\$(( idx + 1 ))\" >'${work_dir}/removals.n'
+      # Burn wall-clock time on every lookup after the baseline (idx 0), matching a rate-limited gh call.
+      if (( idx > 0 && ${lookup_burn_sec} > 0 )); then
+        printf '%s' \"\$(( \$(cat '${work_dir}/clock') + ${lookup_burn_sec} ))\" >'${work_dir}/clock'
+      fi
       (( idx < \${#answers[@]} )) || idx=\$(( \${#answers[@]} - 1 ))
       if [[ \"\${answers[idx]}\" == '-' ]]; then printf ''; else printf '%s' \"\${answers[idx]}\"; fi
     }
@@ -144,6 +157,15 @@ assert_contains "the first successful check becomes the baseline and the next re
   "NOTE: MERGE_QUEUE_REENQUEUE pr=#7 repo=the-hcma/repository-helpers reason=failed_checks"
 assert_count_equals "gh enables auto-merge twice" "$(cat "${work_dir}/gh.log")" "GH " 2
 
+printf '\n=== a slow queue lookup counts against the merge deadline ===\n'
+# timeout=1m; the first mid-wait lookup burns 50s. Sleep-only accounting would still report waited≈1m0s and
+# keep polling; wall-clock accounting ends once the lookup pushes past the deadline and reports the real elapsed.
+out="$(run_merge 'none| none|' 0 1 0 50)"
+assert_contains "the wait times out" "$out" "ERROR: WAIT_TIMEOUT merge pr=#7 via=gh"
+assert_contains "waited= reports wall-clock time including the slow lookup, not only sleep" "$out" \
+  "waited=1m 20s timeout=1m"
+assert_not_contains "no removal path" "$out" "MERGE_QUEUE_REMOVED"
+
 # run_lookup <graphql response json> -> the lookup's "<latest removal id>|<reason>" answer, with the real jq filter
 # applied to the fixture by a stub of the gh api executor.
 run_lookup() {
@@ -214,5 +236,8 @@ assert_contains "the lookup goes through the rate-limited gh api executor" "$loo
 reenqueue_body="$(awk '/^dep_updater_reenqueue_auto_merge\(\) \{/,/^\}/' "${dep_updater}")"
 assert_contains "the re-enqueue goes through the shared rate-limit executor with pacing and a timeout" \
   "$reenqueue_body" "github_api_exec_with_rate_limit_retry \"gh pr merge re-enqueue\" -- gh pr merge"
+merge_body="$(awk '/^merge_pr_via_gh_single\(\) \{/,/^\}/' "${dep_updater}")"
+assert_contains "the merge wait deadlines from wall-clock time, not sleep increments alone" \
+  "$merge_body" "dep_updater_now_epoch"
 
 test_summary

@@ -9671,6 +9671,12 @@ cleanup() {
   log "Cleanup complete."
 }
 
+# Wall-clock seconds since epoch for merge-wait deadlines. Tests stub this so a no-op sleep still
+# advances the budget the same way production does when queue lookups take real time.
+dep_updater_now_epoch() {
+  date +%s
+}
+
 # Enable auto-merge again after the merge queue dropped the PR. Returns gh's exit status and never dies, so
 # the caller can report one MERGE_QUEUE_REMOVED line instead of an unrelated gh error. It goes through the
 # shared rate-limit executor (pacing, backoff, a timeout on every attempt) so a stalled or rate-limited call
@@ -9696,6 +9702,7 @@ merge_pr_via_gh_single() {
   local merged ci_status merge_out merge_exit elapsed elapsed_fmt
   local merge_branch merge_head
   local queue_info removal_id_before removal_id_now removal_reason reenqueued
+  local start_epoch deadline now_epoch last_queue_check
 
   merged="$(gh_pr_merged_for_number "$pr_num")"
   if [[ "$merged" == 'true' ]]; then
@@ -9750,8 +9757,16 @@ merge_pr_via_gh_single() {
     log "$merge_out"
   fi
 
-  elapsed=0
-  while (( elapsed < timeout_min * 60 )); do
+  # Wall-clock deadline so slow/rate-limited queue lookups count against --merge-timeout (they used to
+  # only add the sleep interval, which under-reported waited= and could run past the budget).
+  start_epoch="$(dep_updater_now_epoch)"
+  deadline=$(( start_epoch + timeout_min * 60 ))
+  last_queue_check=$start_epoch
+  while true; do
+    now_epoch="$(dep_updater_now_epoch)"
+    if (( now_epoch >= deadline )); then
+      break
+    fi
     merged="$(gh_pr_merged_for_number "$pr_num")"
     if [[ "$merged" == 'true' ]]; then
       log "PR #${pr_num} merged."
@@ -9759,7 +9774,8 @@ merge_pr_via_gh_single() {
     fi
     # GitHub can drop a healthy PR from the merge queue when the queue's own CI run fails (a flaky test, a
     # download outage). Without this check the wait would run out its whole timeout and report nothing useful.
-    if (( elapsed > 0 && elapsed % queue_check_sec == 0 )); then
+    if (( now_epoch - last_queue_check >= queue_check_sec )); then
+      last_queue_check=$now_epoch
       queue_info="$(gh_pr_merge_queue_removals "$pr_num")"
       removal_id_now=''
       removal_reason="${queue_info#*|}"
@@ -9788,10 +9804,16 @@ merge_pr_via_gh_single() {
         fi
       fi
     fi
+    # A slow/rate-limited queue lookup may already have spent the remaining budget; do not sleep past it.
+    now_epoch="$(dep_updater_now_epoch)"
+    if (( now_epoch >= deadline )); then
+      break
+    fi
     sleep "$poll_sec"
-    elapsed=$(( elapsed + poll_sec ))
   done
 
+  now_epoch="$(dep_updater_now_epoch)"
+  elapsed=$(( now_epoch - start_epoch ))
   if (( elapsed < 60 )); then
     elapsed_fmt="${elapsed}s"
   else
