@@ -140,23 +140,26 @@ answered_models=""
 unwrap_default_review() {
   local -r out_file="$1" model="$2" state_file="$3" head="$4" base="$5"
   local -r expect="${MODEL_REVIEW_ANSWER_MODEL:-$model}"
-  local unwrapped key is_error all_keys author mismatch=0 decided=0
+  local unwrapped key is_error error_text all_keys author mismatch=0 decided=0
   local -a deciding_keys=()
+  local -r shape_jq='type == "object" and (.result | type) == "string"'
+  local -r first_line_jq='.result | split("\n")[0] | .[0:200]'
+  local -r models_jq='(.modelUsage // {}) | keys | join(",")'
+  local -r deciding_jq='(.modelUsage // {}) | to_entries | group_by(.value.outputTokens // 0)
+    | (last // []) | .[].key'
   command -v jq >/dev/null 2>&1 || fail "jq is required to read the default reviewer's result"
   unwrapped="${out_file}.text"
-  if ! runner_exec_stdout 'model-review result shape' --probe -- \
-    jq -e 'type == "object" and (.result | type) == "string"' "$out_file" >/dev/null; then
+  if ! runner_exec_stdout 'model-review result shape' --probe -- jq -e "$shape_jq" "$out_file" >/dev/null; then
     record_result "$state_file" "$head" "$base" error 0 no-json
     fail "the reviewer did not print a JSON result; an error, not a clean pass"
   fi
   is_error="$(runner_exec_stdout 'model-review is_error' --probe -- jq -r '.is_error // false' "$out_file")"
   if [[ "$is_error" == "true" ]]; then
     record_result "$state_file" "$head" "$base" error 0 reviewer-error
-    fail "the reviewer reported an error: $(runner_exec_stdout 'model-review result text' --probe -- \
-      jq -r '.result | split("\n")[0] | .[0:200]' "$out_file")"
+    error_text="$(runner_exec_stdout 'model-review error text' --probe -- jq -r "$first_line_jq" "$out_file")"
+    fail "the reviewer reported an error: ${error_text}"
   fi
-  all_keys="$(runner_exec_stdout 'model-review models' --probe -- \
-    jq -r '(.modelUsage // {}) | keys | join(",")' "$out_file")"
+  all_keys="$(runner_exec_stdout 'model-review models' --probe -- jq -r "$models_jq" "$out_file")"
   if [[ -z "$all_keys" ]]; then
     record_result "$state_file" "$head" "$base" error 0 model-unknown
     fail "the reviewer did not report which model answered; an error, not a clean pass"
@@ -166,8 +169,7 @@ unwrap_default_review() {
     decided=1
     deciding_keys+=("$key")
     model_matches "$expect" "$key" || mismatch=1
-  done < <(runner_exec_stdout 'model-review deciding models' --probe -- jq -r \
-    '(.modelUsage // {}) | to_entries | group_by(.value.outputTokens // 0) | (last // []) | .[].key' "$out_file")
+  done < <(runner_exec_stdout 'model-review deciding models' --probe -- jq -r "$deciding_jq" "$out_file")
   if (( decided == 0 || mismatch == 1 )); then
     # Nothing is recorded: an error result counts toward the two-failure cap, after which the review is
     # skipped (a non-blocking SKIPPED), and a persistent substitution must keep failing the push instead.
