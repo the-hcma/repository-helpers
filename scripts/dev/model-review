@@ -164,7 +164,8 @@ model_matches() {
 # availableModels can still swap a version-specific model, and claude does so without an error. EVERY model in
 # modelUsage must match: it aggregates a whole session, so no single entry can be trusted to be the one that
 # wrote the verdict, and failing closed is the only attribution that cannot accept a wrong author. A result that
-# cannot be verified (no JSON, no modelUsage, an error that lists no model) or names the wrong model records
+# cannot be verified (no JSON, no modelUsage), names the wrong model or the author, or is an error that does not
+# come from the expected model records
 # nothing, so it keeps failing the push on every run instead of exhausting the two-failure cap and becoming a
 # non-blocking SKIPPED. The expected model is MODEL_REVIEW_ANSWER_MODEL when set, else the requested one: an
 # alias whose id does not contain its own name (opus mapped by ANTHROPIC_DEFAULT_OPUS_MODEL to a gateway id
@@ -179,8 +180,7 @@ unwrap_default_review() {
   local -r shape_jq='type == "object" and (.result | type) == "string"'
   local -r first_line_jq='.result | split("\n")[0] | .[0:200]'
   local -r models_jq='(.modelUsage // {}) | keys[]'
-  local -r count_jq='(.modelUsage // {}) | length'
-  local unwrapped normalized key is_error error_text model_count all_keys="" author_id mismatch=0
+  local unwrapped normalized key is_error error_text no_model all_keys="" author_id mismatch=0
   local -a listed_keys=()
   local -r no_json='the reviewer did not print a JSON result, so its model cannot be verified'
   command -v jq >/dev/null 2>&1 || fail "jq is required to read the default reviewer's result"
@@ -194,15 +194,9 @@ unwrap_default_review() {
     fail "${no_json}; an error, not a clean pass"
   fi
   is_error="$(runner_exec_stdout 'model-review is_error' --probe -- jq --raw-output '.is_error // false' "$out_file")"
+  error_text=""
   if [[ "$is_error" == "true" ]]; then
     error_text="$(runner_exec_stdout 'model-review error text' --probe -- jq --raw-output "$first_line_jq" "$out_file")"
-    model_count="$(runner_exec_stdout 'model-review model count' --probe -- jq --raw-output "$count_jq" "$out_file")"
-    # An error that lists no model cannot be tied to the reviewer (a rate limited reply has this shape), so like
-    # any unverifiable result it records nothing and keeps failing the push instead of feeding the skip cap.
-    if [[ "$model_count" != "0" ]]; then
-      record_result "$state_file" "$head" "$base" error 0 reviewer-error
-    fi
-    fail "the reviewer reported an error: ${error_text}"
   fi
   while IFS= read -r key; do
     [[ -n "$key" ]] || continue
@@ -211,7 +205,9 @@ unwrap_default_review() {
     model_matches "$expect" "$key" || mismatch=1
   done < <(runner_exec_stdout 'model-review models' --probe -- jq --raw-output "$models_jq" "$out_file")
   if (( ${#listed_keys[@]} == 0 )); then
-    fail "the reviewer did not report which model answered, so it cannot be verified; an error, not a clean pass"
+    no_model="the reviewer did not report which model answered"
+    [[ -z "$error_text" ]] || no_model="${no_model} (it reported an error: ${error_text})"
+    fail "${no_model}, so it cannot be verified; an error, not a clean pass"
   fi
   if (( mismatch == 1 )); then
     printf 'ERROR: MODEL_REVIEW_MODEL_MISMATCH requested=%s expected=%s answered=%s head=%s\n' \
@@ -228,6 +224,12 @@ unwrap_default_review() {
       fi
     done
   done < <(author_ids)
+  # Only an error that was verified to come from the expected, non-author model counts as the reviewer failing,
+  # because a recorded failure feeds the two-failure cap; every other error above failed without recording.
+  if [[ "$is_error" == "true" ]]; then
+    record_result "$state_file" "$head" "$base" error 0 reviewer-error
+    fail "the reviewer reported an error: ${error_text}"
+  fi
   runner_exec_stdout 'model-review result text' --probe -- jq --raw-output '.result' "$out_file" >"$unwrapped" \
     || fail "cannot read the reviewer's result text"
   mv -- "$unwrapped" "$out_file"
