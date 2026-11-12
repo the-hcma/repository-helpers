@@ -215,4 +215,73 @@ assert_contains 'pre-pr-checks starts the model-review job' "$checks_src" \
 assert_contains 'pre-pr-checks documents the skip' "$checks_src" 'PRE_PR_CHECKS_SKIP=model-review'
 assert_contains 'the ecosystem planner adds the job' "$eco_src" "prec_plan_add_job 'model-review'"
 
+printf '\n=== the default reviewer pins availableModels to the reviewer model ===\n'
+# A fake `claude` on PATH records its arguments, one per line, and answers with a clean verdict. The state
+# directory is fresh so the whole branch is reviewed again.
+fake_bin="${tmp}/fake-bin"
+mkdir -p "$fake_bin"
+cat >"${fake_bin}/claude" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"${FAKE_CLAUDE_ARGS}"
+cat >/dev/null
+printf 'Looks fine.\nVERDICT: CLEAN\n'
+FAKE
+chmod +x "${fake_bin}/claude"
+export FAKE_CLAUDE_ARGS="${tmp}/claude-args"
+default_rc=0
+default_out="$(env -u MODEL_REVIEW_CMD PATH="${fake_bin}:${PATH}" MODEL_REVIEW_MODEL=opus \
+  MODEL_REVIEW_AUTHOR_MODEL=sonnet MODEL_REVIEW_STATE_DIR="${tmp}/state-default" \
+  bash "$review" --dir "$repo" 2>&1)" || default_rc=$?
+assert_contains 'the default command reviews cleanly' "rc=${default_rc}" 'rc=0'
+assert_contains 'the default review reports a clean verdict' "$default_out" 'clean (0 findings)'
+claude_args="$(cat "$FAKE_CLAUDE_ARGS")"
+assert_contains 'the default command runs print mode' $'\n'"$claude_args" $'\n-p\n'
+assert_contains 'the default command names the reviewer model' "$claude_args" $'--model\nopus'
+assert_contains 'the allowed models are pinned to the reviewer as one JSON word' "$claude_args" \
+  $'--settings\n{"availableModels":["opus"]}'
+assert_not_contains 'the author model is not in the pinned list' "$claude_args" 'sonnet'
+
+printf '\n=== a model name that is not a plain name is refused before anything is sent ===\n'
+bad_rc=0
+bad_out="$(env -u MODEL_REVIEW_CMD PATH="${fake_bin}:${PATH}" MODEL_REVIEW_MODEL='opus"],"x":["' \
+  MODEL_REVIEW_STATE_DIR="${tmp}/state-bad" bash "$review" --dir "$repo" 2>&1)" || bad_rc=$?
+assert_contains 'a model name that would break the JSON exits 1' "rc=${bad_rc}" 'rc=1'
+assert_contains 'the refusal names MODEL_REVIEW_MODEL' "$bad_out" \
+  'ERROR: model-review: MODEL_REVIEW_MODEL must not contain quotes'
+custom_rc=0
+custom_out="$(MODEL_REVIEW_MODEL='not a name' MODEL_REVIEW_STATE_DIR="${tmp}/state-custom" \
+  bash "$review" --dir "$repo" 2>&1)" || custom_rc=$?
+assert_not_contains 'a custom MODEL_REVIEW_CMD ignores the default model name' "$custom_out" \
+  'MODEL_REVIEW_MODEL must not contain'
+assert_contains 'a custom MODEL_REVIEW_CMD still reviews' "rc=${custom_rc}" 'rc=0'
+
+printf '\n=== real model ids with a colon, an at sign or a context suffix are accepted and pinned ===\n'
+real_ids=(
+  'us.anthropic.claude-opus-4-1-20250805-v1:0' 'claude-opus-4-1@20250805' 'opus[1m]' 'brk-commons/claude-opus-5-5'
+)
+for real_id in "${real_ids[@]}"; do
+  rm -rf "${tmp}/state-real"
+  real_rc=0
+  env -u MODEL_REVIEW_CMD PATH="${fake_bin}:${PATH}" MODEL_REVIEW_MODEL="$real_id" \
+    MODEL_REVIEW_AUTHOR_MODEL=sonnet MODEL_REVIEW_STATE_DIR="${tmp}/state-real" \
+    bash "$review" --dir "$repo" >/dev/null 2>&1 || real_rc=$?
+  assert_contains "the model id ${real_id} is reviewed" "rc=${real_rc}" 'rc=0'
+  assert_contains "the model id ${real_id} is pinned as the only allowed model" "$(cat "$FAKE_CLAUDE_ARGS")" \
+    "{\"availableModels\":[\"${real_id}\"]}"
+done
+
+printf '\n=== whitespace, a backslash and a control character are refused too ===\n'
+for bad_id in 'opus 1m' 'opus\1m' $'opus\t1m'; do
+  rm -rf "${tmp}/state-bad2"
+  bad2_rc=0
+  env -u MODEL_REVIEW_CMD PATH="${fake_bin}:${PATH}" MODEL_REVIEW_MODEL="$bad_id" \
+    MODEL_REVIEW_STATE_DIR="${tmp}/state-bad2" bash "$review" --dir "$repo" >/dev/null 2>&1 || bad2_rc=$?
+  assert_contains "the model id ${bad_id@Q} is refused with exit 1" "rc=${bad2_rc}" 'rc=1'
+done
+
+printf '\n=== the help text documents the pin and the gateway alias mapping ===\n'
+help_out="$(bash "$review" --help)"
+assert_contains 'the help shows the pinned list' "$help_out" '{"availableModels":["<MODEL_REVIEW_MODEL>"]}'
+assert_contains 'the help mentions the gateway opus mapping' "$help_out" 'ANTHROPIC_DEFAULT_OPUS_MODEL'
+
 test_summary
