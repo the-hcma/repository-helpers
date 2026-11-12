@@ -22,7 +22,7 @@ reviewed (a NOTE says so). It runs from scripts/dev/pre-pr-checks as the `model-
 command is available.
 
 The reviewer is a command that reads the prompt on stdin and prints its review on stdout, split into words
-(no shell is involved). Default: `claude -p --model <MODEL_REVIEW_MODEL> --settings <pin>`, where <pin> is
+(no shell is involved). Default: `claude --print --model <MODEL_REVIEW_MODEL> --settings <pin>`, where <pin> is
 `{"availableModels":["<MODEL_REVIEW_MODEL>"]}`. The pin keeps a restrictive `availableModels` in your Claude
 settings from making claude silently answer from another model (the author, on a native login; an id a gateway
 refuses). Behind a gateway that maps aliases to its own ids, `opus` also needs `ANTHROPIC_DEFAULT_OPUS_MODEL`.
@@ -64,7 +64,7 @@ Exit status:
   3  skipped (reason on a `SKIPPED:` line)
 
 Environment:
-  MODEL_REVIEW_CMD                Reviewer command (default: claude -p --model $MODEL_REVIEW_MODEL --settings <pin>)
+  MODEL_REVIEW_CMD                Reviewer command (default: claude --print --model <model> --settings <pin>)
   MODEL_REVIEW_MODEL              Reviewer model for the default command (default: opus)
   MODEL_REVIEW_ANSWER_MODEL       Id part that must answer when it is not MODEL_REVIEW_MODEL (default: that model)
   MODEL_REVIEW_AUTHOR_MODEL       The author's model (default: $ANTHROPIC_MODEL); used to refuse a same-model review
@@ -106,7 +106,7 @@ reviewer_words() {
   # different model than the one requested); on a native login the review would silently run on the
   # author's own model. The JSON has no spaces, so it stays one word. --output-format json makes claude
   # report which model answered (modelUsage), which unwrap_default_review checks instead of trusting the pin.
-  printf '%s\n' claude -p --model "$model" --settings "{\"availableModels\":[\"${model}\"]}" \
+  printf '%s\n' claude --print --model "$model" --settings "{\"availableModels\":[\"${model}\"]}" \
     --output-format json
 }
 
@@ -174,20 +174,27 @@ answered_models=""
 unwrap_default_review() {
   local -r out_file="$1" model="$2" state_file="$3" head="$4" base="$5"
   local -r expect="${MODEL_REVIEW_ANSWER_MODEL:-$model}"
+  local -r object_jq='if type == "array" then .[-1] else . end'
   local -r shape_jq='type == "object" and (.result | type) == "string"'
   local -r first_line_jq='.result | split("\n")[0] | .[0:200]'
   local -r models_jq='(.modelUsage // {}) | keys[]'
-  local unwrapped key is_error error_text all_keys="" author_id mismatch=0
+  local unwrapped normalized key is_error error_text all_keys="" author_id mismatch=0
   local -a listed_keys=()
+  local -r no_json='the reviewer did not print a JSON result, so its model cannot be verified'
   command -v jq >/dev/null 2>&1 || fail "jq is required to read the default reviewer's result"
   unwrapped="${out_file}.text"
-  if ! runner_exec_stdout 'model-review result shape' --probe -- jq -e "$shape_jq" "$out_file" >/dev/null; then
-    fail "the reviewer did not print a JSON result, so its model cannot be verified; an error, not a clean pass"
+  normalized="${out_file}.object"
+  # A verbose view setting makes claude print an array of messages with the result object last.
+  runner_exec_stdout 'model-review object' --probe -- jq --compact-output "$object_jq" "$out_file" \
+    >"$normalized" || fail "${no_json}; an error, not a clean pass"
+  mv -- "$normalized" "$out_file"
+  if ! runner_exec_stdout 'model-review shape' --probe -- jq --exit-status "$shape_jq" "$out_file" >/dev/null; then
+    fail "${no_json}; an error, not a clean pass"
   fi
-  is_error="$(runner_exec_stdout 'model-review is_error' --probe -- jq -r '.is_error // false' "$out_file")"
+  is_error="$(runner_exec_stdout 'model-review is_error' --probe -- jq --raw-output '.is_error // false' "$out_file")"
   if [[ "$is_error" == "true" ]]; then
     record_result "$state_file" "$head" "$base" error 0 reviewer-error
-    error_text="$(runner_exec_stdout 'model-review error text' --probe -- jq -r "$first_line_jq" "$out_file")"
+    error_text="$(runner_exec_stdout 'model-review error text' --probe -- jq --raw-output "$first_line_jq" "$out_file")"
     fail "the reviewer reported an error: ${error_text}"
   fi
   while IFS= read -r key; do
@@ -195,7 +202,7 @@ unwrap_default_review() {
     listed_keys+=("$key")
     all_keys="${all_keys:+${all_keys},}${key}"
     model_matches "$expect" "$key" || mismatch=1
-  done < <(runner_exec_stdout 'model-review models' --probe -- jq -r "$models_jq" "$out_file")
+  done < <(runner_exec_stdout 'model-review models' --probe -- jq --raw-output "$models_jq" "$out_file")
   if (( ${#listed_keys[@]} == 0 )); then
     fail "the reviewer did not report which model answered, so it cannot be verified; an error, not a clean pass"
   fi
@@ -214,7 +221,7 @@ unwrap_default_review() {
       fi
     done
   done < <(author_ids)
-  runner_exec_stdout 'model-review result text' --probe -- jq -r '.result' "$out_file" >"$unwrapped" \
+  runner_exec_stdout 'model-review result text' --probe -- jq --raw-output '.result' "$out_file" >"$unwrapped" \
     || fail "cannot read the reviewer's result text"
   mv -- "$unwrapped" "$out_file"
   answered_models="$all_keys"
