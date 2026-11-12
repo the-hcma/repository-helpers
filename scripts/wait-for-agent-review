@@ -123,6 +123,8 @@ Environment:
   AGENT_REVIEW_REPORT_FROM      Email sender (required for complete/email-failure)
   AGENT_REVIEW_CYCLE_TIMEOUT    Legacy idle dwell (default: 15m); loop completes early when nothing is outstanding
   AGENT_REVIEW_PR_TIMEOUT       Non-convergence cap while review cycles keep iterating (default: 12h)
+  AGENT_REVIEW_MAX_ROUNDS       Review rounds before the loop accepts a PR with CI green and nothing unanswered
+                                (default: the agent-review-max-rounds repo property, else 3; 0 means no cap)
   AGENT_REVIEW_PROBE_REQUESTED_TTL  Expire outstanding Copilot/Bugbot probe waits (default: 15m)
   AGENT_REVIEW_TRANSIENT_RETRIES  Retries for transient merge/restack failures (default: 5)
   AGENT_REVIEW_TRANSIENT_RETRY_SLEEP  Sleep between transient retries (default: 30s)
@@ -2297,6 +2299,76 @@ cmd_complete_idle() {
   return 0
 }
 
+# cmd_complete_max_rounds <repo> <pr> <head> <rounds> <max_rounds> <signed_off> — the loop's success at the round
+# cap (repository-helpers#861): one machine-parseable NOTE and an operator email that says why it stopped, so the
+# merge is a decision and not a silent timeout. No gh approve; merge stays an explicit operator step.
+cmd_complete_max_rounds() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r rounds="$4"
+  local -r max_rounds="$5"
+  local -r signed_off="$6"
+
+  # Re-check the title before the operator email, like cmd_complete: titles can drift (#651).
+  if ! pr_cc_ensure_pr_title "${repo}" "${pr}"; then
+    agent_review_die \
+      "complete blocked: PR #${pr} title is not a Conventional Commits header (see ERROR: PR_CC_TITLE_* above)"
+  fi
+  printf 'NOTE: AGENT_REVIEW_MAX_ROUNDS pr=#%s repo=%s head=%s rounds=%s cap=%s signed_off=%s reason=max-rounds\n' \
+    "${pr}" "${repo}" "${head:0:7}" "${rounds}" "${max_rounds}" "${signed_off}" >&2
+  # The loop runs this inside an if, where errexit is off, so a failed delivery must be checked here: completing
+  # without telling the operator would defeat the point of the email (the merge is a decision).
+  if ! agent_review_email_max_rounds_complete "${repo}" "${pr}" "${rounds}" "${max_rounds}" "${signed_off}"; then
+    agent_review_die "could not email the operator about the round cap on PR #${pr}; not completing silently"
+  fi
+  printf 'PR #%s review loop complete at the round cap (%s of %s rounds; emailed operator, no self-approve)\n' \
+    "${pr}" "${rounds}" "${max_rounds}" >&2
+}
+
+# cmd_loop_complete_at_max_rounds <repo> <pr> <head> <snapshot> — returns 0 after completing the PR at its round
+# cap, 1 when the loop should carry on. It runs once CI is green and no feedback is unanswered (the loop's
+# earlier gates), and before any wait on a reviewer: at the cap another review would only start another round.
+# A cap of 0 turns it off. Those gates ran a moment ago, so readiness is read again from the same status that
+# cmd_check and the idle wait use (merge_ready: CLEAN, BLOCKED on a required review, or UNSTABLE while still
+# mergeable; BEHIND, conflicts and every other state are not ready):
+# a push, a CI failure or a merge problem that landed since keeps the PR in its normal path, never completed
+# on stale data. The round count comes from the snapshot the loop asserted complete.
+cmd_loop_complete_at_max_rounds() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r snapshot="$4"
+  local max_rounds rounds status status_head ci_ready merge_ready pending
+  local signed_off=0
+
+  max_rounds="$(agent_review_max_rounds_effective "${repo}")"
+  if (( max_rounds == 0 )); then
+    return 1
+  fi
+  rounds="$(agent_review_feedback_rounds_from_snapshot "${snapshot}")" || return 1
+  if (( rounds < max_rounds )); then
+    return 1
+  fi
+  status="$(cmd_status "${repo}" "${pr}")"
+  status_head="$(wait_ar_jq_status "${status}" '.head_sha // ""')"
+  ci_ready="$(wait_ar_jq_status "${status}" '.ci_ready')"
+  merge_ready="$(wait_ar_jq_status "${status}" '.merge_ready')"
+  pending="$(wait_ar_jq_status "${status}" '.pending_threads // 0')"
+  if [[ "${status_head}" != "${head}" || "${ci_ready}" != 'true' || "${merge_ready}" != 'true' ]] \
+    || (( pending > 0 )); then
+    printf 'wait-for-agent-review: PR #%s is at its round cap (%s of %s) but is not ready to complete' \
+      "${pr}" "${rounds}" "${max_rounds}" >&2
+    printf ' (head=%s ci_ready=%s merge_ready=%s pending=%s); continuing\n' \
+      "${status_head:0:7}" "${ci_ready}" "${merge_ready}" "${pending}" >&2
+    return 1
+  fi
+  if agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}"; then
+    signed_off=1
+  fi
+  cmd_complete_max_rounds "${repo}" "${pr}" "${head}" "${rounds}" "${max_rounds}" "${signed_off}"
+}
+
 # Names of the agents in the repo's chain that are evidently set up on the PR (one per line): CodeRabbit
 # by a comment, a commit status or a .coderabbit.yaml in the repo (an installed app with no config and no
 # activity cannot be seen; AGENT_REVIEW_NO_AGENT_GRACE_S=0 opts out), Copilot and Bugbot by a review, review request or comment from their
@@ -2496,6 +2568,11 @@ cmd_loop() {
     agent_review_assert_snapshot_complete "${snapshot}"
     head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
     cmd_loop_note_head "${head}"
+    # Round cap (#861): CI is green and nothing is unanswered here, so a PR that has had its rounds is accepted
+    # instead of waiting for another review.
+    if cmd_loop_complete_at_max_rounds "${repo}" "${pr}" "${head}" "${snapshot}"; then
+      return 0
+    fi
     cmd_loop_observe_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}"
     agent_review_sync_active_probe_agent || true
     cmd_loop_abort_if_no_agent_configured "${repo}" "${pr}" "${head}" "${snapshot}" "${pr_started}" \

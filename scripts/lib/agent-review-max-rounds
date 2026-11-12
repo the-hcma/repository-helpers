@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# agent-review-max-rounds — how many review rounds a PR gets in the loop (repository-helpers#861).
+#
+# A round is one review of a new head that leaves feedback to address (see
+# agent_review_feedback_rounds_from_snapshot). Once a PR has had this many rounds and CI is green with
+# nothing left unanswered, wait-for-agent-review loop accepts it instead of waiting for yet another
+# review, so a reviewer that finds something new on every push cannot hold a PR for hours. Precedence,
+# highest first:
+#   1. AGENT_REVIEW_MAX_ROUNDS (a non-negative integer; validated when the loop starts)
+#   2. the repo's custom property `agent-review-max-rounds` (single-select "0" to "5")
+#   3. the built-in default: 3 rounds
+# 0 means no cap. An unset property, or a failed read, falls back to the default (an unreadable or invalid
+# value WARNs once). GitHub has no numeric property type, hence the single-select of digit strings.
+#
+# Sourced after agent-review-reviewers: the cache helpers are shared with it.
+# shellcheck disable=SC2016  # jq filter strings use single quotes
+
+_ar_max_rounds_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091  # runner-ensure loads scripts/lib/runner at runtime
+source "${_ar_max_rounds_lib_dir}/runner-ensure"
+
+# Rounds allowed when nothing is configured.
+agent_review_max_rounds_default=3
+agent_review_max_rounds_property_name='agent-review-max-rounds'
+# The values the org single-select accepts (repo-practices defines it with these).
+agent_review_max_rounds_allowed_values='0 1 2 3 4 5'
+# Cache TTL for the property read (seconds), and how long a failed read is remembered.
+agent_review_max_rounds_cache_ttl_s=300
+agent_review_max_rounds_failure_ttl_s=60
+
+# Prints the effective round cap for <repo>: a non-negative integer, 0 for "no cap". Returns 0 always.
+agent_review_max_rounds_effective() {
+  local -r repo="${1:-}"
+  local prop allowed_value
+
+  if [[ -n "${AGENT_REVIEW_MAX_ROUNDS:-}" ]]; then
+    # No leading zeros (bash arithmetic reads 08 as an octal error and 010 as 8) and at most six digits (a longer
+    # value overflows 64-bit arithmetic). The loop refuses such a value at start-up; this keeps the lib safe alone.
+    if [[ "${AGENT_REVIEW_MAX_ROUNDS}" =~ ^(0|[1-9][0-9]{0,5})$ ]]; then
+      printf '%s' "${AGENT_REVIEW_MAX_ROUNDS}"
+      return 0
+    fi
+    printf 'wait-for-agent-review: WARN: AGENT_REVIEW_MAX_ROUNDS=%s is invalid' \
+      "${AGENT_REVIEW_MAX_ROUNDS}" >&2
+    printf ' (a non-negative integer of at most six digits, no leading zeros); ignored\n' >&2
+  fi
+  if [[ -n "${repo}" ]]; then
+    prop="$(agent_review_max_rounds_property_cached "${repo}")"
+    # The property is a single-select, so only the allowed digit strings are valid (not any number).
+    for allowed_value in ${agent_review_max_rounds_allowed_values}; do
+      if [[ "${prop}" == "${allowed_value}" ]]; then
+        printf '%s' "${prop}"
+        return 0
+      fi
+    done
+    if [[ -n "${prop}" ]]; then
+      printf 'wait-for-agent-review: WARN: %s=%s is invalid (allowed: %s); using the default of %s\n' \
+        "${agent_review_max_rounds_property_name}" "${prop}" "${agent_review_max_rounds_allowed_values}" \
+        "${agent_review_max_rounds_default}" >&2
+    fi
+  fi
+  printf '%s' "${agent_review_max_rounds_default}"
+}
+
+# Cached property read (file cache, so $(...) subshells and repeated loop passes share one API call).
+agent_review_max_rounds_property_cached() {
+  local -r repo="$1"
+  local cache_dir cache_file now mtime value tmp
+
+  cache_dir="${AGENT_REVIEW_MAX_ROUNDS_CACHE_DIR:-${HOME}/scratch/repository-helpers/agent-review-max-rounds}"
+  cache_file="${cache_dir}/${repo//\//__}"
+  printf -v now '%(%s)T' -1
+  if [[ -f "${cache_file}" ]]; then
+    mtime="$(agent_review_reviewers_mtime "${cache_file}")"
+    if (( now - mtime < agent_review_max_rounds_cache_ttl_s )); then
+      printf '%s' "$(<"${cache_file}")"
+      return 0
+    fi
+  fi
+  if [[ -f "${cache_file}.fail" ]]; then
+    mtime="$(agent_review_reviewers_mtime "${cache_file}.fail")"
+    if (( now - mtime < agent_review_max_rounds_failure_ttl_s )); then
+      return 0
+    fi
+  fi
+  if ! value="$(agent_review_max_rounds_property_fetch "${repo}" 2>/dev/null)"; then
+    printf 'wait-for-agent-review: WARN: could not read %s for %s; using the default of %s rounds\n' \
+      "${agent_review_max_rounds_property_name}" "${repo}" "${agent_review_max_rounds_default}" >&2
+    if agent_review_reviewers_run_quiet mkdir --parents "${cache_dir}"; then
+      : >"${cache_file}.fail"
+    fi
+    return 0
+  fi
+  if agent_review_reviewers_run_quiet mkdir --parents "${cache_dir}"; then
+    # Write via a temp file so a concurrent reader never sees a half-written (empty) cache.
+    if tmp="$(runner_exec_stdout "max-rounds cache temp file" -- mktemp "${cache_file}.XXXXXX" 2>/dev/null)"; then
+      printf '%s' "${value}" >"${tmp}"
+      agent_review_reviewers_run_quiet mv "${tmp}" "${cache_file}"
+    fi
+    agent_review_reviewers_run_quiet rm --force "${cache_file}.fail"
+  fi
+  printf '%s' "${value}"
+}
+
+# Prints the property value as a string; empty when unset. Returns 1 on API failure.
+agent_review_max_rounds_property_fetch() {
+  local -r repo="$1"
+
+  ar_runner_gh_api_stream "agent-review ${agent_review_max_rounds_property_name} property" \
+    "repos/${repo}/properties/values" --jq \
+    '(map({(.property_name): .value}) | add // {})["'"${agent_review_max_rounds_property_name}"'"] // "" | tostring'
+}

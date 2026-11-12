@@ -74,6 +74,8 @@ source "${rp_lib_dir}/secret-audit"
 
 # shellcheck source=scripts/lib/agent-review-reviewers
 source "${rp_lib_dir}/agent-review-reviewers"
+# shellcheck source=scripts/lib/agent-review-max-rounds
+source "${rp_lib_dir}/agent-review-max-rounds"
 
 rp_runner_last_stdout() {
   local uuid
@@ -11140,6 +11142,12 @@ rp_agent_reviewers_allowed_json() {
     --arg csv "$agent_review_reviewers_known_chain" '$csv | split(",")'
 }
 
+# rp_agent_review_max_rounds_allowed_json — JSON array of the digit strings the single-select accepts.
+rp_agent_review_max_rounds_allowed_json() {
+  rp_runner_jq_n 'repo-practices agent-review-max-rounds allowed values' -c \
+    --arg values "$agent_review_max_rounds_allowed_values" '$values | split(" ")'
+}
+
 # rp_agent_reviewers_put_schema <org> <name> <payload> — PUT one org property definition.
 rp_agent_reviewers_put_schema() {
   local -r org="$1" name="$2" payload="$3"
@@ -11149,7 +11157,7 @@ rp_agent_reviewers_put_schema() {
     --method PUT "orgs/${org}/properties/schema/${name}"
 }
 
-# rp_apply_agent_reviewers_schema <org> — define both org properties once per run.
+# rp_apply_agent_reviewers_schema <org> — define the three agent review org properties once per run.
 # GitHub rejects default_value on an optional property, so an unset value is the default.
 rp_apply_agent_reviewers_schema() {
   local -r org="$1"
@@ -11178,6 +11186,16 @@ rp_apply_agent_reviewers_schema() {
     rp_agent_reviewers_put_schema "$org" "$agent_review_reviewers_enabled_property_name" \
       "$payload" || put_exit_code=$?
   fi
+  if (( put_exit_code == 0 )); then
+    allowed="$(rp_agent_review_max_rounds_allowed_json)"
+    payload="$(rp_runner_jq_n 'repo-practices agent-review-max-rounds schema payload' -c \
+      --argjson allowed "$allowed" \
+      '{value_type: "single_select", required: false, allowed_values: $allowed,
+        description: ("Review rounds before the PR loop accepts a PR with CI green and nothing unanswered"
+          + " (unset: 3; 0 means no cap)")}')"
+    rp_agent_reviewers_put_schema "$org" "$agent_review_max_rounds_property_name" \
+      "$payload" || put_exit_code=$?
+  fi
   if (( put_exit_code != 0 )); then
     rp_log_warn "${org}: could not define the agent review custom properties (the gh token needs the admin:org scope); define them in the org settings instead"
     rp_agent_reviewers_schema_applied=2
@@ -11187,12 +11205,12 @@ rp_apply_agent_reviewers_schema() {
   return 0
 }
 
-# rp_agent_reviewers_schema_defined <org> — 0 when both org properties exist, 1 when one is
+# rp_agent_reviewers_schema_defined <org> — 0 when the three org properties exist, 1 when one is
 # missing, 2 when the schema cannot be read. GitHub omits unset properties from a repo's values,
 # so only the org schema can tell "undefined" from "defined but unset".
 rp_agent_reviewers_schema_defined() {
   local -r org="$1"
-  local schema_json
+  local schema_json rounds_allowed
   local fetch_exit=0 defined_exit=0
 
   schema_json="$(rp_gh_api_get_json "repo-practices gh org custom property schema" \
@@ -11200,17 +11218,29 @@ rp_agent_reviewers_schema_defined() {
   if (( fetch_exit != 0 )); then
     return 2
   fi
+  rounds_allowed="$(rp_agent_review_max_rounds_allowed_json)"
+  # The round cap must be the single-select this repo defines, with exactly the allowed digits: a schema that only
+  # shares the name (a text property, a select limited to "3", or one offering "7", which the loop rejects)
+  # would make --apply-fix skip the definition
+  # and leave documented values unselectable or undocumented ones selectable.
   rp_runner_jq_file "repo-practices agent-reviewers schema defined" "$schema_json" -e \
     --arg a "$agent_review_reviewers_property_name" \
     --arg b "$agent_review_reviewers_enabled_property_name" \
-    '[.[]?.property_name] | (index($a) != null) and (index($b) != null)' >/dev/null \
+    --arg c "$agent_review_max_rounds_property_name" \
+    --argjson allowed "$rounds_allowed" \
+    '([.[]? | select(.property_name == $c)] | first) as $r
+      | [.[]?.property_name] as $names
+      | (($names | index($a)) != null) and (($names | index($b)) != null)
+        and ($r != null) and ($r.value_type == "single_select")
+        and (($allowed - ($r.allowed_values // [])) == [])
+        and ((($r.allowed_values // []) - $allowed) == [])' >/dev/null \
     || defined_exit=$?
   return "$defined_exit"
 }
 
 rp_check_agent_reviewers_property() {
   local slug="$1"
-  local values_json reviewers_entry enabled_entry allowed url
+  local values_json reviewers_entry enabled_entry rounds_entry allowed rounds_allowed url rounds_msg suggest_msg
   local fetch_exit=0 invalid_exit=0 defined_exit=0
 
   url="$(rp_github_url "$slug" '/settings/custom-properties')"
@@ -11251,17 +11281,42 @@ rp_check_agent_reviewers_property() {
       return 1
     fi
   fi
+  rounds_entry="$(rp_runner_jq_file "repo-practices agent-review-max-rounds entry" "$values_json" -c \
+    --arg name "$agent_review_max_rounds_property_name" \
+    '[.[]? | select(.property_name == $name)] | first // empty')"
+  if [[ -n "$rounds_entry" ]]; then
+    rounds_allowed="$(rp_agent_review_max_rounds_allowed_json)"
+    rp_runner_jq_file "repo-practices agent-review-max-rounds value valid" "$rounds_entry" -e \
+      --argjson allowed "$rounds_allowed" \
+      '(.value // "") | tostring | . as $v | $v == "" or ($allowed | index($v) != null)' >/dev/null \
+      || invalid_exit=$?
+    if (( invalid_exit != 0 )); then
+      rounds_msg="${slug}: custom property '${agent_review_max_rounds_property_name}' has an invalid value"
+      rp_log_fail "${rounds_msg} (allowed: ${agent_review_max_rounds_allowed_values})"
+      rp_log_check_fail "$slug" 'agent review max rounds property (invalid value)' "$url"
+      return 1
+    fi
+  fi
   rp_agent_reviewers_schema_defined "${slug%%/*}" || defined_exit=$?
   if (( defined_exit == 1 )); then
     if [[ "$rp_apply_fix" -eq 1 ]]; then
       if ! rp_apply_agent_reviewers_schema "${slug%%/*}"; then
-        rp_log_suggest "${slug}: define org custom properties '${agent_review_reviewers_property_name}' (multi-select: coderabbit, copilot, bugbot) and '${agent_review_reviewers_enabled_property_name}' (true/false) in the org settings"
+        suggest_msg="define org custom properties '${agent_review_reviewers_property_name}'"
+        suggest_msg+=" (multi-select: coderabbit, copilot, bugbot),"
+        suggest_msg+=" '${agent_review_reviewers_enabled_property_name}' (true/false) and"
+        suggest_msg+=" '${agent_review_max_rounds_property_name}'"
+        suggest_msg+=" (single-select: ${agent_review_max_rounds_allowed_values}) in the org settings"
+        rp_log_suggest "${slug}: ${suggest_msg}"
       fi
     elif [[ "$rp_suggest" -eq 1 ]]; then
-      rp_log_suggest \
-        "${slug}: define org custom properties '${agent_review_reviewers_property_name}' and '${agent_review_reviewers_enabled_property_name}' (run scripts/github-repo-lint --repo ${slug} --apply-fix); until then only coderabbit is active"
+      suggest_msg="define org custom properties '${agent_review_reviewers_property_name}',"
+      suggest_msg+=" '${agent_review_reviewers_enabled_property_name}' and"
+      suggest_msg+=" '${agent_review_max_rounds_property_name}'"
+      suggest_msg+=" (run scripts/github-repo-lint --repo ${slug} --apply-fix); until then only coderabbit is"
+      suggest_msg+=" active and the review round cap is the default of ${agent_review_max_rounds_default}"
+      rp_log_suggest "${slug}: ${suggest_msg}"
     fi
-    rp_log_check_ok "$slug" 'agent reviewers (properties not defined; default: coderabbit only)' "$url"
+    rp_log_check_ok "$slug" 'agent review properties (not defined; defaults apply)' "$url"
     return 0
   fi
   rp_log_check_ok "$slug" 'agent reviewers property' "$url"

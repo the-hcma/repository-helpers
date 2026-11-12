@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+# Tests for the review round cap of wait-for-agent-review loop (repository-helpers#861): how the cap is resolved
+# (env, repo custom property, default), how rounds are counted from a PR snapshot, what the loop does at the cap
+# and where in the loop that happens.
+# shellcheck disable=SC2016  # the static assertions match literal loop source text ("${var}" needles), not expansions
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+lib="${script_dir}/../scripts/lib/agent-review"
+wait_script="${script_dir}/../scripts/wait-for-agent-review"
+readonly lib wait_script
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+fake_bin="${work_dir}/bin"
+gh_log="${work_dir}/gh.log"
+fixture="${work_dir}/properties.json"
+mkdir -p "${fake_bin}"
+export HOME="${work_dir}/home"
+mkdir -p "${HOME}"
+export AGENT_REVIEW_ENV_FILE=/dev/null
+unset AGENT_REVIEW_MAX_ROUNDS AGENT_REVIEW_AGENT AGENT_REVIEW_QUOTA_FALLBACK_CHAIN AGENT_REVIEW_GITHUB_REPO
+
+# Fake gh: logs the call, fails when FAKE_GH_FAIL=1, else applies the caller's real --jq to the fixture.
+cat >"${fake_bin}/gh" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FAKE_GH_LOG}"
+if [[ "${FAKE_GH_FAIL:-0}" == '1' ]]; then
+  printf 'HTTP 403: Resource not accessible\n' >&2
+  exit 1
+fi
+filter='.'
+while (( $# > 0 )); do
+  if [[ "$1" == '--jq' ]]; then
+    filter="$2"
+    shift
+  fi
+  shift
+done
+exec jq --raw-output "${filter}" "${FAKE_GH_FIXTURE}"
+FAKE
+chmod +x "${fake_bin}/gh"
+
+# run_case <fixture-json> <snippet> [VAR=value…] — runs the snippet with the lib sourced and a fresh cache.
+run_case() {
+  local -r json="$1"
+  local -r snippet="$2"
+  shift 2
+
+  printf '%s' "${json}" >"${fixture}"
+  : >"${gh_log}"
+  rm -rf "${work_dir}/cache"
+  env -u AGENT_REVIEW_MAX_ROUNDS PATH="${fake_bin}:${PATH}" FAKE_GH_LOG="${gh_log}" \
+    FAKE_GH_FIXTURE="${fixture}" AGENT_REVIEW_MAX_ROUNDS_CACHE_DIR="${work_dir}/cache" "$@" \
+    bash -c "source '${lib}'; ${snippet}" 2>&1
+}
+
+printf '\n=== the cap comes from the repo property, else the default of 3 ===\n'
+snippet="printf '[%s]' \"\$(agent_review_max_rounds_effective the-hcma/example 2>/dev/null)\""
+out="$(run_case '[{"property_name":"other","value":"x"}]' "${snippet}")"
+assert_contains 'an unset property gives the default of 3 rounds' "$out" '[3]'
+out="$(run_case '[{"property_name":"agent-review-max-rounds","value":"5"}]' "${snippet}")"
+assert_contains 'a property of 5 gives 5 rounds' "$out" '[5]'
+out="$(run_case '[{"property_name":"agent-review-max-rounds","value":"2"}]' "${snippet}")"
+assert_contains 'a property of 2 gives 2 rounds' "$out" '[2]'
+out="$(run_case '[{"property_name":"agent-review-max-rounds","value":"0"}]' "${snippet}")"
+assert_contains 'a property of 0 means no cap' "$out" '[0]'
+out="$(run_case '[{"property_name":"agent-review-max-rounds","value":null}]' "${snippet}")"
+assert_contains 'a null property value gives the default' "$out" '[3]'
+out="$(run_case '[]' "printf '[%s]' \"\$(agent_review_max_rounds_effective 2>/dev/null)\"")"
+assert_contains 'no repo gives the default without a property read' "$out" '[3]'
+assert_not_contains 'no repo makes no GitHub call' "$(cat "${gh_log}")" 'properties/values'
+
+printf '\n=== AGENT_REVIEW_MAX_ROUNDS wins over the property and skips the read ===\n'
+out="$(run_case '[{"property_name":"agent-review-max-rounds","value":"5"}]' "${snippet}" AGENT_REVIEW_MAX_ROUNDS=1)"
+assert_contains 'the environment override beats the property' "$out" '[1]'
+assert_not_contains 'the property is not read when the environment decides' "$(cat "${gh_log}")" 'properties/values'
+out="$(run_case '[{"property_name":"agent-review-max-rounds","value":"5"}]' "${snippet}" AGENT_REVIEW_MAX_ROUNDS=0)"
+assert_contains 'the environment can turn the cap off' "$out" '[0]'
+
+printf '\n=== an invalid value or a failed read falls back to the default with a warning ===\n'
+out="$(run_case '[{"property_name":"agent-review-max-rounds","value":"many"}]' \
+  'agent_review_max_rounds_effective the-hcma/example')"
+assert_contains 'an invalid property value warns with the allowed values' "$out" \
+  'agent-review-max-rounds=many is invalid (allowed: 0 1 2 3 4 5); using the default of 3'
+out="$(run_case '[{"property_name":"agent-review-max-rounds","value":"many"}]' "${snippet}")"
+assert_contains 'an invalid property value still yields exactly the default' "$out" '[3]'
+out="$(run_case '[]' 'agent_review_max_rounds_effective the-hcma/example' FAKE_GH_FAIL=1)"
+assert_contains 'a failed property read warns' "$out" 'could not read agent-review-max-rounds for the-hcma/example'
+out="$(run_case '[]' "${snippet}" FAKE_GH_FAIL=1)"
+assert_contains 'a failed property read yields the default' "$out" '[3]'
+
+printf '\n=== the property is read once per cache window ===\n'
+out="$(run_case '[{"property_name":"agent-review-max-rounds","value":"4"}]' \
+  'agent_review_max_rounds_effective the-hcma/example >/dev/null; agent_review_max_rounds_effective the-hcma/example')"
+assert_contains 'the cached value is used on the second call' "$out" '4'
+assert_count_equals 'the property is fetched once for two lookups' "$(cat "${gh_log}")" 'properties/values' 1
+
+printf '\n=== an invalid AGENT_REVIEW_MAX_ROUNDS is refused when the loop starts ===\n'
+bad_rc=0
+bad_out="$(env AGENT_REVIEW_MAX_ROUNDS=abc bash -c "source '${lib}'; agent_review_load_env" 2>&1)" || bad_rc=$?
+assert_contains 'a non-numeric value exits non-zero' "rc=${bad_rc}" 'rc=1'
+assert_contains 'the refusal names the variable' "$bad_out" 'invalid AGENT_REVIEW_MAX_ROUNDS'
+assert_contains 'the refusal says what is allowed' "$bad_out" '0 means no cap'
+ok_rc=0
+env AGENT_REVIEW_MAX_ROUNDS=2 bash -c "source '${lib}'; agent_review_load_env" >/dev/null 2>&1 || ok_rc=$?
+assert_contains 'a numeric value is accepted' "rc=${ok_rc}" 'rc=0'
+ok_rc=0
+env AGENT_REVIEW_MAX_ROUNDS=0 bash -c "source '${lib}'; agent_review_load_env" >/dev/null 2>&1 || ok_rc=$?
+assert_contains 'zero is accepted' "rc=${ok_rc}" 'rc=0'
+for bad in 08 09 010 00 -1 1.5 ' 3'; do
+  bad_rc=0
+  bad_out="$(env AGENT_REVIEW_MAX_ROUNDS="${bad}" bash -c "source '${lib}'; agent_review_load_env" 2>&1)" || bad_rc=$?
+  assert_contains "AGENT_REVIEW_MAX_ROUNDS=${bad@Q} is refused at start-up" "rc=${bad_rc}" 'rc=1'
+  assert_contains "the refusal for ${bad@Q} mentions leading zeros" "$bad_out" 'without leading zeros'
+done
+for ok in 7 12; do
+  ok_rc=0
+  env AGENT_REVIEW_MAX_ROUNDS="${ok}" bash -c "source '${lib}'; agent_review_load_env" >/dev/null 2>&1 || ok_rc=$?
+  assert_contains "AGENT_REVIEW_MAX_ROUNDS=${ok} is accepted" "rc=${ok_rc}" 'rc=0'
+  out="$(run_case '[]' "${snippet}" AGENT_REVIEW_MAX_ROUNDS="${ok}")"
+  assert_contains "AGENT_REVIEW_MAX_ROUNDS=${ok} is the cap exactly" "$out" "[${ok}]"
+done
+
+printf '\n=== the library defends itself against a value the loop would have refused ===\n'
+ignored_msg_tail=' is invalid (a non-negative integer of at most six digits, no leading zeros); ignored'
+for bad in 08 010 abc; do
+  out="$(run_case '[{"property_name":"agent-review-max-rounds","value":"5"}]' "${snippet}" \
+    AGENT_REVIEW_MAX_ROUNDS="${bad}")"
+  assert_contains "a bad AGENT_REVIEW_MAX_ROUNDS=${bad} falls through to the property" "$out" '[5]'
+  out="$(run_case '[{"property_name":"agent-review-max-rounds","value":"5"}]' \
+    'agent_review_max_rounds_effective the-hcma/example' AGENT_REVIEW_MAX_ROUNDS="${bad}")"
+  assert_contains "a bad AGENT_REVIEW_MAX_ROUNDS=${bad} warns that it is ignored" "$out" \
+    "AGENT_REVIEW_MAX_ROUNDS=${bad}${ignored_msg_tail}"
+done
+
+printf '\n=== a property outside the single-select is invalid even when it is a number ===\n'
+for bad in 7 99 03 10 '0 1' '1 2' ' 3' '3 '; do
+  out="$(run_case "[{\"property_name\":\"agent-review-max-rounds\",\"value\":\"${bad}\"}]" "${snippet}")"
+  assert_contains "a property of ${bad} yields exactly the default" "$out" '[3]'
+  out="$(run_case "[{\"property_name\":\"agent-review-max-rounds\",\"value\":\"${bad}\"}]" \
+    'agent_review_max_rounds_effective the-hcma/example')"
+  assert_contains "a property of ${bad} warns with the allowed values" "$out" \
+    "agent-review-max-rounds=${bad} is invalid (allowed: 0 1 2 3 4 5); using the default of 3"
+done
+
+printf '\n=== a value too long for bash arithmetic is refused ===\n'
+for bad in 1000000 9223372036854775807 9223372036854775808; do
+  bad_rc=0
+  bad_out="$(env AGENT_REVIEW_MAX_ROUNDS="${bad}" bash -c "source '${lib}'; agent_review_load_env" 2>&1)" || bad_rc=$?
+  assert_contains "AGENT_REVIEW_MAX_ROUNDS=${bad} is refused at start-up" "rc=${bad_rc}" 'rc=1'
+  assert_contains "the refusal for ${bad} names the six digit limit" "$bad_out" 'at most six digits'
+  out="$(run_case '[{"property_name":"agent-review-max-rounds","value":"5"}]' "${snippet}" \
+    AGENT_REVIEW_MAX_ROUNDS="${bad}")"
+  assert_contains "the library ignores AGENT_REVIEW_MAX_ROUNDS=${bad} and uses the property" "$out" '[5]'
+done
+ok_rc=0
+env AGENT_REVIEW_MAX_ROUNDS=999999 bash -c "source '${lib}'; agent_review_load_env" >/dev/null 2>&1 || ok_rc=$?
+assert_contains 'six digits are accepted at start-up' "rc=${ok_rc}" 'rc=0'
+out="$(run_case '[]' "${snippet}" AGENT_REVIEW_MAX_ROUNDS=999999)"
+assert_contains 'six digits are the cap exactly' "$out" '[999999]'
+
+printf '\n=== a process-level AGENT_REVIEW_MAX_ROUNDS beats the env file ===\n'
+cap_env_file="${work_dir}/agent-review.env"
+printf 'AGENT_REVIEW_MAX_ROUNDS=3\n' >"${cap_env_file}"
+load_and_print='source "$1"; agent_review_load_env; printf "[%s]" "${AGENT_REVIEW_MAX_ROUNDS-unset}"'
+out="$(env AGENT_REVIEW_ENV_FILE="${cap_env_file}" AGENT_REVIEW_MAX_ROUNDS=0 \
+  bash -c "${load_and_print}" bash "${lib}" 2>&1)"
+assert_contains 'AGENT_REVIEW_MAX_ROUNDS=0 on the command line disables the cap despite the file' "$out" '[0]'
+out="$(env AGENT_REVIEW_ENV_FILE="${cap_env_file}" AGENT_REVIEW_MAX_ROUNDS=5 \
+  bash -c "${load_and_print}" bash "${lib}" 2>&1)"
+assert_contains 'AGENT_REVIEW_MAX_ROUNDS=5 on the command line beats the file value 3' "$out" '[5]'
+out="$(env -u AGENT_REVIEW_MAX_ROUNDS AGENT_REVIEW_ENV_FILE="${cap_env_file}" \
+  bash -c "${load_and_print}" bash "${lib}" 2>&1)"
+assert_contains 'the file value is used when the process sets none' "$out" '[3]'
+out="$(env -u AGENT_REVIEW_MAX_ROUNDS AGENT_REVIEW_ENV_FILE=/dev/null \
+  bash -c "${load_and_print}" bash "${lib}" 2>&1)"
+assert_contains 'nothing is set when neither the process nor the file sets it' "$out" '[unset]'
+
+# --- counting rounds from a PR snapshot -----------------------------------------------------------------
+snapshot_file="${work_dir}/snapshot.json"
+# rounds <snapshot-json> — prints the round count the lib derives from it.
+rounds() {
+  printf '%s' "$1" >"${snapshot_file}"
+  printf '[%s]' "$(bash -c \
+    "source '${lib}'; agent_review_feedback_rounds_from_snapshot \"\$(<'${snapshot_file}')\"" 2>&1)"
+}
+# thread <login> <commit> [resolved] [reply-login] — one review thread JSON object.
+thread() {
+  local -r login="$1" commit="$2" resolved="${3:-false}" reply="${4:-}"
+  local replies=''
+  if [[ -n "$reply" ]]; then
+    replies=",{\"author\":{\"login\":\"${reply}\"},\"originalCommit\":{\"oid\":\"${commit}\"}}"
+  fi
+  printf '{"id":"t","isResolved":%s,"comments":{"nodes":[{"author":{"login":"%s"},"originalCommit":{"oid":"%s"}}%s]}}' \
+    "$resolved" "$login" "$commit" "$replies"
+}
+# review <login> <commit> <state> <body> — one PR review JSON object.
+review() {
+  jq --null-input --compact-output --arg login "$1" --arg oid "$2" --arg state "$3" --arg body "$4" \
+    '{author:{login:$login},commit:{oid:$oid},state:$state,body:$body}'
+}
+# snapshot <threads-csv> <reviews-csv> — a PR snapshot with those threads and reviews.
+snapshot() {
+  printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[%s]},"reviews":{"nodes":[%s]}}}}}' "$1" "$2"
+}
+
+printf '\n=== a round is a head on which an agent left feedback ===\n'
+assert_contains 'a PR with no feedback has had no rounds' "$(rounds "$(snapshot '' '')")" '[0]'
+out="$(rounds "$(snapshot "$(thread coderabbitai aaa),$(thread coderabbitai aaa)" '')")"
+assert_contains 'two agent threads on one head are one round' "$out" '[1]'
+out="$(rounds "$(snapshot "$(thread coderabbitai aaa),$(thread coderabbitai bbb),$(thread copilot-pull-request-reviewer ccc)" '')")"
+assert_contains 'agent threads on three heads are three rounds' "$out" '[3]'
+out="$(rounds "$(snapshot "$(thread coderabbitai aaa true)" '')")"
+assert_contains 'a resolved thread still counts: a round is history' "$out" '[1]'
+out="$(rounds "$(snapshot "$(thread thehcma aaa)" '')")"
+assert_contains 'a human thread is not an agent round' "$out" '[0]'
+for non_reviewer in github-actions dependabot sonarcloud codecov renovate graphite; do
+  out="$(rounds "$(snapshot "$(thread "${non_reviewer}[bot]" aaa)" '')")"
+  assert_contains "an inline thread from ${non_reviewer} is not a review round" "$out" '[0]'
+  out="$(rounds "$(snapshot '' "$(review "${non_reviewer}[bot]" aaa COMMENTED $'**Actionable comments posted: 2**')")")"
+  assert_contains "an actionable review body from ${non_reviewer} is not a review round" "$out" '[0]'
+done
+for reviewer in 'copilot-pull-request-reviewer' 'cursor[bot]' 'coderabbitai[bot]' 'mergestorm-vortex' 'chatgpt-codex-connector[bot]'; do
+  out="$(rounds "$(snapshot "$(thread "${reviewer}" aaa)" '')")"
+  assert_contains "an inline thread from the review agent ${reviewer} is a round" "$out" '[1]'
+done
+out="$(bash -c "source '${lib}'; printf '[%s]' \"\$(AGENT_REVIEW_ROUND_LOGIN_REGEX='reviewdog' agent_review_round_login_regex)\"")"
+assert_contains 'AGENT_REVIEW_ROUND_LOGIN_REGEX replaces the list of review agents' "$out" '[reviewdog]'
+printf '%s' "$(snapshot "$(thread reviewdog aaa)" '')" >"${snapshot_file}"
+out="$(printf '[%s]' "$(AGENT_REVIEW_ROUND_LOGIN_REGEX='reviewdog' bash -c \
+  "source '${lib}'; agent_review_feedback_rounds_from_snapshot \"\$(<'${snapshot_file}')\"" 2>&1)")"
+assert_contains 'a login added through AGENT_REVIEW_ROUND_LOGIN_REGEX counts as a review agent' "$out" '[1]'
+out="$(rounds "$(snapshot "$(thread thehcma aaa false coderabbitai)" '')")"
+assert_contains 'an agent reply inside a human thread is not a round' "$out" '[0]'
+out="$(rounds "$(snapshot "$(thread coderabbitai aaa false thehcma)" '')")"
+assert_contains 'our reply inside an agent thread does not add a round' "$out" '[1]'
+no_commit='{"id":"t","isResolved":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"}}]}}'
+out="$(rounds "$(snapshot "$no_commit" '')")"
+assert_contains 'a thread with no commit is not counted' "$out" '[0]'
+# thread_in_review <login> <original-commit> <review-commit> — a thread whose first comment says which review it is in.
+thread_in_review() {
+  printf '{"id":"t","isResolved":false,"comments":{"nodes":[{"author":{"login":"%s"},"originalCommit":{"oid":"%s"},"pullRequestReview":{"commit":{"oid":"%s"}}}]}}' \
+    "$1" "$2" "$3"
+}
+out="$(rounds "$(snapshot "$(thread_in_review coderabbitai aaa zzz),$(thread_in_review coderabbitai ccc zzz)" '')")"
+assert_contains "two threads in one review are one round, counted on the review's commit" "$out" '[1]'
+no_review='{"id":"t","isResolved":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"originalCommit":{"oid":"aaa"},"pullRequestReview":null}]}}'
+out="$(rounds "$(snapshot "${no_review}" '')")"
+assert_contains 'a thread outside any review falls back to its original commit' "$out" '[1]'
+
+printf '\n=== review bodies count only when actionable ===\n'
+out="$(rounds "$(snapshot '' "$(review coderabbitai ddd COMMENTED $'**Actionable comments posted: 2**\n\nfix this')")")"
+assert_contains 'an actionable CodeRabbit review body is a round' "$out" '[1]'
+out="$(rounds "$(snapshot '' "$(review coderabbitai ddd COMMENTED '**Actionable comments posted: 0**')")")"
+assert_contains 'a review with no actionable comments is not a round' "$out" '[0]'
+out="$(rounds "$(snapshot '' "$(review coderabbitai ddd COMMENTED '')")")"
+assert_contains 'an empty rate-limit or pause stub is not a round' "$out" '[0]'
+out="$(rounds "$(snapshot '' "$(review copilot-pull-request-reviewer eee CHANGES_REQUESTED '')")")"
+assert_contains 'CHANGES_REQUESTED from an agent is a round' "$out" '[1]'
+out="$(rounds "$(snapshot '' "$(review thehcma fff COMMENTED $'**Actionable comments posted: 3**')")")"
+assert_contains 'a human review is not an agent round' "$out" '[0]'
+out="$(rounds "$(snapshot "$(thread coderabbitai ggg)" "$(review coderabbitai ggg COMMENTED '**Actionable comments posted: 1**')")")"
+assert_contains 'a thread and a review body on one head are one round' "$out" '[1]'
+out="$(rounds "$(snapshot "$(thread coderabbitai ggg)" "$(review coderabbitai hhh COMMENTED '**Actionable comments posted: 1**')")")"
+rate_limit_body='Review rate limited. More reviews will be available in 10 minutes.'
+assert_contains 'a thread and a review body on different heads are two rounds' "$out" '[2]'
+out="$(rounds "$(snapshot '' "$(review coderabbitai iii COMMENTED "${rate_limit_body}")")")"
+assert_contains 'a non-empty rate-limit notice is not a round' "$out" '[0]'
+out="$(rounds "$(snapshot '' "$(review coderabbitai mmm CHANGES_REQUESTED 'Must fix retries when the API is rate limited.')")")"
+assert_contains 'a finding that mentions rate limits is still a round' "$out" '[1]'
+out="$(rounds "$(snapshot '' "$(review coderabbitai nnn COMMENTED 'Must fix: the review paused handling drops the head.')")")"
+assert_contains 'a finding that mentions a paused review is still a round' "$out" '[1]'
+out="$(rounds "$(snapshot '' "$(review coderabbitai ooo COMMENTED $'**Actionable comments posted: 0**\n\nNitpick comments (1)')")")"
+assert_contains 'a review with no actionable comments is not a round even when it lists nitpicks' "$out" '[0]'
+out="$(rounds "$(snapshot '' "$(review coderabbitai jjj COMMENTED 'Reviews paused: this PR has many commits, resume with a full review.')")")"
+assert_contains 'a non-empty pause notice is not a round' "$out" '[0]'
+out="$(rounds "$(snapshot '' "$(review coderabbitai kkk COMMENTED 'Thanks for the fix, the version check now looks right.')")")"
+assert_contains 'a non-empty CodeRabbit reply with no finding marker is not a round' "$out" '[0]'
+out="$(rounds "$(snapshot '' "$(review coderabbitai lll COMMENTED 'Findings outside the changed lines: scripts/x line 4.')")")"
+assert_contains 'an outside-the-diff finding in a review body is still a round' "$out" '[1]'
+
+printf '\n=== a truncated snapshot is never counted ===\n'
+incomplete_more_threads="$(snapshot "$(thread coderabbitai aaa)" '' | jq --compact-output \
+  '.data.repository.pullRequest.reviewThreads.pageInfo = {hasNextPage: true}')"
+printf '%s' "${incomplete_more_threads}" >"${snapshot_file}"
+inc_rc=0
+inc_out="$(bash -c "source '${lib}'; agent_review_feedback_rounds_from_snapshot \"\$(<'${snapshot_file}')\"" 2>&1)" \
+  || inc_rc=$?
+assert_contains 'a snapshot with more threads than were fetched has no count' "rc=${inc_rc}" 'rc=1'
+assert_contains 'the refusal says why' "$inc_out" 'the PR snapshot is incomplete'
+incomplete_more_reviews="$(snapshot '' "$(review coderabbitai ddd COMMENTED '**Actionable comments posted: 1**')" \
+  | jq --compact-output '.data.repository.pullRequest.reviews.pageInfo = {hasPreviousPage: true}')"
+printf '%s' "${incomplete_more_reviews}" >"${snapshot_file}"
+inc_rc=0
+bash -c "source '${lib}'; agent_review_feedback_rounds_from_snapshot \"\$(<'${snapshot_file}')\"" >/dev/null 2>&1 \
+  || inc_rc=$?
+assert_contains 'a snapshot with more reviews than were fetched has no count' "rc=${inc_rc}" 'rc=1'
+
+# --- what the loop does at the cap ------------------------------------------------------------------------
+cap_log="${work_dir}/cap.log"
+# run_cap — drives cmd_loop_complete_at_max_rounds with stubbed collaborators; settings come from ROUNDS, CAP,
+# CI_READY, MERGE_READY, PENDING, STATUS_HEAD (default: the head the loop passes), SIGNED and TITLE_OK. Prints
+# the NOTE/messages, then rc=<n>.
+run_cap() {
+  : >"${cap_log}"
+  env -u AGENT_REVIEW_MAX_ROUNDS ROUNDS="${ROUNDS:-0}" CAP="${CAP:-3}" PENDING="${PENDING:-0}" \
+    CI_READY="${CI_READY:-true}" MERGE_READY="${MERGE_READY:-true}" STATUS_HEAD="${STATUS_HEAD:-0123456789abcdef}" \
+    SIGNED="${SIGNED:-0}" TITLE_OK="${TITLE_OK:-1}" EMAIL_FAIL="${EMAIL_FAIL:-0}" CAP_LOG="${cap_log}" \
+    bash -c "
+      set -uo pipefail
+      source '${wait_script}'
+      agent_review_max_rounds_effective() { printf '%s' \"\${CAP}\"; }
+      agent_review_feedback_rounds_from_snapshot() { [[ \"\${ROUNDS}\" != fail ]] || return 1; printf '%s' \"\${ROUNDS}\"; }
+      cmd_status() {
+        printf '{\"head_sha\":\"%s\",\"ci_ready\":%s,\"merge_ready\":%s,\"pending_threads\":%s}' \
+          \"\${STATUS_HEAD}\" \"\${CI_READY}\" \"\${MERGE_READY}\" \"\${PENDING}\"
+      }
+      agent_review_agent_signed_off_on_head() { [[ \"\${SIGNED}\" == 1 ]]; }
+      pr_cc_ensure_pr_title() { [[ \"\${TITLE_OK}\" == 1 ]]; }
+      agent_review_email_max_rounds_complete() {
+        printf 'EMAIL %s\n' \"\$*\" >>\"\${CAP_LOG}\"
+        [[ \"\${EMAIL_FAIL}\" != 1 ]]
+      }
+      rc=0
+      cmd_loop_complete_at_max_rounds the-hcma/example 7 0123456789abcdef '{}' || rc=\$?
+      echo \"rc=\$rc\"" 2>&1
+}
+
+printf '\n=== below the cap the loop carries on ===\n'
+out="$(ROUNDS=2 CAP=3 run_cap)"
+assert_contains 'two rounds of three leave the loop running' "$out" 'rc=1'
+assert_not_contains 'nothing is emailed below the cap' "$(cat "${cap_log}")" 'EMAIL'
+assert_not_contains 'no cap note is printed below the cap' "$out" 'AGENT_REVIEW_MAX_ROUNDS'
+
+printf '\n=== at the cap the loop completes as a success, with a distinct reason and an email ===\n'
+out="$(ROUNDS=3 CAP=3 run_cap)"
+assert_contains 'the cap completes the loop' "$out" 'rc=0'
+assert_contains 'the note is one machine parseable line' "$out" \
+  'NOTE: AGENT_REVIEW_MAX_ROUNDS pr=#7 repo=the-hcma/example head=0123456 rounds=3 cap=3 signed_off=0 reason=max-rounds'
+assert_contains 'the operator email gets the rounds, the cap and the sign-off state' "$(cat "${cap_log}")" \
+  'EMAIL the-hcma/example 7 3 3 0'
+assert_contains 'the loop says it stopped at the cap and did not approve' "$out" \
+  'review loop complete at the round cap (3 of 3 rounds; emailed operator, no self-approve)'
+out="$(ROUNDS=5 CAP=3 run_cap)"
+assert_contains 'more rounds than the cap still completes' "$out" 'rc=0'
+assert_contains 'the note records the actual round count' "$out" 'rounds=5 cap=3'
+out="$(ROUNDS=3 CAP=3 SIGNED=1 run_cap)"
+assert_contains 'an agent sign-off is reported in the note' "$out" 'signed_off=1'
+assert_contains 'an agent sign-off is reported in the email' "$(cat "${cap_log}")" 'EMAIL the-hcma/example 7 3 3 1'
+
+printf '\n=== the cap never overrides the other gates ===\n'
+out="$(ROUNDS=9 CAP=0 run_cap)"
+assert_contains 'a cap of 0 means no cap, however many rounds' "$out" 'rc=1'
+assert_not_contains 'a cap of 0 sends no email' "$(cat "${cap_log}")" 'EMAIL'
+out="$(ROUNDS=fail CAP=3 run_cap)"
+assert_contains 'a round count that cannot be taken (truncated snapshot) keeps the loop running' "$out" 'rc=1'
+assert_not_contains 'an unavailable round count sends no cap email' "$(cat "${cap_log}")" 'EMAIL'
+out="$(ROUNDS=3 CAP=3 PENDING=1 run_cap)"
+assert_contains 'unanswered feedback at the cap keeps the loop running for triage' "$out" 'rc=1'
+assert_contains 'the note says what was not ready' "$out" 'pending=1'
+assert_not_contains 'unanswered feedback sends no cap email' "$(cat "${cap_log}")" 'EMAIL'
+out="$(ROUNDS=3 CAP=3 MERGE_READY=false run_cap)"
+assert_contains 'a PR whose status says it is not merge ready stays in its normal path' \
+  "$out" 'rc=1'
+assert_contains 'the note names the merge readiness' "$out" 'merge_ready=false'
+assert_not_contains 'a PR that is not merge ready sends no cap email' "$(cat "${cap_log}")" 'EMAIL'
+
+printf '\n=== which merge states count as ready (the loop'"'"'s own definition, used by the cap) ===\n'
+for state in CLEAN BLOCKED; do
+  ready_rc=0
+  bash -c "source '${lib}'; agent_review_merge_state_ready '${state}'" || ready_rc=$?
+  assert_contains "mergeStateStatus ${state} is merge ready" "state=${state} rc=${ready_rc}" 'rc=0'
+done
+for state in BEHIND DIRTY UNSTABLE HAS_HOOKS UNKNOWN DRAFT; do
+  ready_rc=0
+  bash -c "source '${lib}'; agent_review_merge_state_ready '${state}'" || ready_rc=$?
+  assert_contains "mergeStateStatus ${state} alone is not merge ready" "state=${state} rc=${ready_rc}" 'rc=1'
+done
+status_src="$(awk '/^agent_review_status_json_from_snapshot\(\) \{/,/^}/' "${lib}")"
+assert_contains 'UNSTABLE counts as ready only while the PR is still mergeable' "${status_src}" \
+  "[[ \"\${merge_state}\" == 'UNSTABLE' ]] && [[ \"\${mergeable}\" == 'MERGEABLE' ]]"
+out="$(ROUNDS=3 CAP=3 CI_READY=false run_cap)"
+assert_contains 'CI that stopped being ready since the loop gate keeps the PR in the loop' "$out" 'rc=1'
+assert_contains 'the note names the CI readiness' "$out" 'ci_ready=false'
+assert_not_contains 'a PR whose CI is not ready sends no cap email' "$(cat "${cap_log}")" 'EMAIL'
+out="$(ROUNDS=3 CAP=3 STATUS_HEAD=fedcba9876543210 run_cap)"
+assert_contains 'a head that moved since the snapshot is not completed on the older rounds' "$out" 'rc=1'
+assert_contains 'the note shows the newer head' "$out" 'head=fedcba9'
+assert_not_contains 'a moved head sends no cap email' "$(cat "${cap_log}")" 'EMAIL'
+bad_rc=0
+out="$(ROUNDS=3 CAP=3 TITLE_OK=0 run_cap)" || bad_rc=$?
+assert_contains 'a title that is not a Conventional Commits header blocks the cap completion' "$out" \
+  'complete blocked'
+assert_not_contains 'a blocked title sends no cap email' "$(cat "${cap_log}")" 'EMAIL'
+
+printf '\n=== a failed email never becomes a successful completion ===\n'
+mail_rc=0
+out="$(ROUNDS=3 CAP=3 EMAIL_FAIL=1 run_cap)" || mail_rc=$?
+assert_contains 'a failed cap email stops the loop with an error' "$out" \
+  'could not email the operator about the round cap on PR #7; not completing silently'
+assert_not_contains 'a failed cap email is not reported as a completion' "$out" \
+  'review loop complete at the round cap'
+assert_not_contains 'a failed cap email does not return through the success path' "$out" 'rc=0'
+assert_contains 'a failed cap email makes the loop exit with a failure status' "rc=${mail_rc}" 'rc=1'
+
+# --- where the cap sits in the loop ---------------------------------------------------------------------
+printf '\n=== static: the cap runs after the CI and feedback gates and before any reviewer wait ===\n'
+loop_src="$(awk '/^cmd_loop\(\) \{/,/^}/' "${wait_script}")"
+line_of() { grep -nF -- "$1" <<<"${loop_src}" | head -n1 | cut -d: -f1; }
+ci_line="$(line_of 'cmd_loop_abort_if_ci_failed "${repo}" "${pr}"')"
+pending_line="$(line_of 'agent_review_abort_if_pending_threads "${repo}" "${pr}"')"
+note_line="$(line_of 'cmd_loop_note_head "${head}"')"
+cap_line="$(line_of 'cmd_loop_complete_at_max_rounds "${repo}" "${pr}" "${head}" "${snapshot}"')"
+workflow_line="$(line_of "agent_review_named_pr_check_is_pending \"\${repo}\" \"\${pr}\" 'CodeRabbit'")"
+rate_line="$(line_of 'cmd_loop_handle_coderabbit_rate_limit "${repo}" "${pr}" "${head}" "${snapshot}"')"
+if [[ -n "$ci_line" && -n "$pending_line" && -n "$note_line" && -n "$cap_line" \
+  && -n "$workflow_line" && -n "$rate_line" ]] \
+  && (( ci_line < cap_line && pending_line < cap_line && note_line < cap_line \
+    && cap_line < workflow_line && cap_line < rate_line )); then
+  pass_case 'the round cap follows the CI and pending-feedback gates and precedes the CodeRabbit waits'
+else
+  fail_case "the round cap is misplaced in cmd_loop (ci=${ci_line} pending=${pending_line} note=${note_line} cap=${cap_line} workflow=${workflow_line} rate=${rate_line})"
+fi
+snapshot_src="$(awk '/^agent_review_graphql_pr_snapshot\(\) \{/,/^}/' "${lib}")"
+assert_contains 'the snapshot query asks for the commit of the review each thread is in' "${snapshot_src}" \
+  'pullRequestReview { commit { oid } }'
+assert_contains 'the snapshot query asks for the original commit of each thread comment' "${snapshot_src}" \
+  'originalCommit { oid }'
+assert_contains 'the snapshot query asks for the commit of each review' "${snapshot_src}" 'commit { oid }'
+assert_contains 'the snapshot query asks for the review state and body' "${snapshot_src}" 'state'
+assert_contains 'the cap completion returns success from the loop' "${loop_src}" \
+  'if cmd_loop_complete_at_max_rounds'
+complete_line="$(line_of 'agent_review_assert_snapshot_complete "${snapshot}"')"
+if [[ -n "$complete_line" && -n "$cap_line" ]] && (( complete_line < cap_line )); then
+  pass_case 'the snapshot is asserted complete before the cap counts rounds from it'
+else
+  fail_case "the snapshot completeness assertion must precede the cap (complete=${complete_line} cap=${cap_line})"
+fi
+rounds_src="$(awk '/^agent_review_feedback_rounds_from_snapshot\(\) \{/,/^}/' "${script_dir}/../scripts/lib/agent-review-feedback")"
+direct_calls="$(grep -nE '(^|[^A-Za-z_-])(base64|sort|wc|tr|uniq|awk|sed)[[:space:]]' <<<"${rounds_src}" \
+  | grep -v '^[0-9]*:[[:space:]]*#' || true)"
+assert_contains 'the round counter runs no external command directly (runner helpers only)' \
+  "direct=[${direct_calls}]" 'direct=[]'
+
+printf '\n=== the cap is documented where operators look ===\n'
+help_out="$(bash "${wait_script}" --help 2>&1)"
+assert_contains 'the help lists AGENT_REVIEW_MAX_ROUNDS' "$help_out" 'AGENT_REVIEW_MAX_ROUNDS'
+assert_contains 'the help names the repo property and the default' "$help_out" 'agent-review-max-rounds repo property, else 3'
+assert_contains 'the help says 0 means no cap' "$help_out" '0 means no cap'
+
+test_summary
