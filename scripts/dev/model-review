@@ -37,10 +37,12 @@ Guard rails:
   - The default command asks claude for its JSON result and checks which model answered (`modelUsage`). Every
     model that ran must be the expected one (modelUsage aggregates a session, so no single entry can be trusted to
     have written the verdict): otherwise `ERROR: MODEL_REVIEW_MODEL_MISMATCH requested=… expected=… answered=…`
-    (exit 1). A listed model that is the author's is `ERROR: MODEL_REVIEW_SAME_MODEL`, whatever was expected, and
+    (exit 1). A listed model that is the author's is `ERROR: MODEL_REVIEW_SAME_MODEL`, whatever was expected (an alias
+    author such as opus also counts as the id ANTHROPIC_DEFAULT_OPUS_MODEL maps it to), and
     an expected model that is the author's is skipped like a same-model reviewer. The expected model is
     MODEL_REVIEW_ANSWER_MODEL when set, else the requested one, matched on id boundaries (gateway-large-1 is not
-    gateway-large-10). Set it when opus is mapped to a gateway id without "opus", or when a session also lists a
+    gateway-large-10; a version-specific id is not satisfied by a more specific version, a snapshot date is the
+    same version). Set it when opus is mapped to a gateway id without "opus", or when a session also lists a
     helper model (a shared part such as "claude" accepts both; the author check still applies). A result that
     cannot be verified (not JSON, no modelUsage), a mismatch and a same-model answer record nothing: each fails
     every run, and calls the reviewer again, until the environment is fixed, so the once-per-head and --max-runs
@@ -109,14 +111,16 @@ reviewer_words() {
 }
 
 # model_matches <requested> <answered> — true when the answering id contains the requested model on id
-# boundaries, one way
-# only: a shorter answering id (claude-opus-4) is a different model from a longer request (claude-opus-4-5).
-# An alias (opus) is contained in any id of its family (claude-opus-5-5). The requested id is normalized
-# first: a context suffix ([1m]), a provider prefix (brk-commons/ on any id, us.anthropic. before claude) and
-# a Bedrock version suffix (-v1:0) are dropped, because the answering id may omit them, and '@' and '.' read
-# as '-' (a Vertex date, a gateway's dotted claude-opus-5.5).
+# boundaries, one way only: a shorter answering id (claude-opus-4) is a different model from a longer request
+# (claude-opus-4-5). An alias (opus) is contained in any id of its family (claude-opus-5-5), but a
+# version-specific request is not satisfied by a more specific version (claude-opus-4 is not claude-opus-4-5;
+# a snapshot date such as claude-opus-4-20250514 is the same version). The requested id is normalized first: a
+# context suffix ([1m]), a provider prefix (brk-commons/ on any id, us.anthropic. before claude) and a Bedrock
+# version suffix (-v1:0) are dropped, because the answering id may omit them, and '@' and '.' read as '-' (a
+# Vertex date, a gateway's dotted claude-opus-5.5).
 model_matches() {
-  local requested answered rest prefix before after left_ok right_ok
+  local requested answered rest prefix before after left_ok right_ok versioned=0
+  local -r version_tail_re='^-[0-9]{1,3}($|[^0-9])'
   requested="${1,,}"
   answered="${2,,}"
   requested="${requested%%\[*}"
@@ -129,6 +133,7 @@ model_matches() {
   requested="${requested%:*}"
   requested="${requested%-v[0-9]*}"
   [[ -n "$requested" ]] || return 1
+  [[ "$requested" =~ [0-9] ]] && versioned=1
   # The match must sit on id boundaries: gateway-large-1 is not gateway-large-10, and opus is not opusplan.
   rest="$answered"
   prefix=""
@@ -139,6 +144,11 @@ model_matches() {
     right_ok=0
     [[ -z "$before" || ! "${before: -1}" =~ [[:alnum:]] ]] && left_ok=1
     [[ -z "$after" || ! "${after:0:1}" =~ [[:alnum:]] ]] && right_ok=1
+    # A version-specific request is not satisfied by a more specific version: claude-opus-4 is not
+    # claude-opus-4-5, while an eight digit snapshot date (claude-opus-4-20250514) is the same version.
+    if (( versioned == 1 )) && [[ "$after" =~ $version_tail_re ]]; then
+      right_ok=0
+    fi
     if (( left_ok == 1 && right_ok == 1 )); then
       return 0
     fi
@@ -167,7 +177,7 @@ unwrap_default_review() {
   local -r shape_jq='type == "object" and (.result | type) == "string"'
   local -r first_line_jq='.result | split("\n")[0] | .[0:200]'
   local -r models_jq='(.modelUsage // {}) | keys[]'
-  local unwrapped key is_error error_text all_keys="" author mismatch=0
+  local unwrapped key is_error error_text all_keys="" author_id mismatch=0
   local -a listed_keys=()
   command -v jq >/dev/null 2>&1 || fail "jq is required to read the default reviewer's result"
   unwrapped="${out_file}.text"
@@ -195,15 +205,15 @@ unwrap_default_review() {
     exit 1
   fi
   # Whatever the expected model was, a listed model that is the author's is not a different-model review.
-  author="${MODEL_REVIEW_AUTHOR_MODEL:-${ANTHROPIC_MODEL:-}}"
-  if [[ -n "$author" ]]; then
+  while IFS= read -r author_id; do
     for key in "${listed_keys[@]}"; do
-      if model_matches "$author" "$key"; then
-        printf 'ERROR: MODEL_REVIEW_SAME_MODEL author=%s answered=%s head=%s\n' "$author" "$all_keys" "${head:0:7}" >&2
+      if model_matches "$author_id" "$key"; then
+        printf 'ERROR: MODEL_REVIEW_SAME_MODEL author=%s answered=%s head=%s\n' \
+          "$author_id" "$all_keys" "${head:0:7}" >&2
         exit 1
       fi
     done
-  fi
+  done < <(author_ids)
   runner_exec_stdout 'model-review result text' --probe -- jq -r '.result' "$out_file" >"$unwrapped" \
     || fail "cannot read the reviewer's result text"
   mv -- "$unwrapped" "$out_file"
@@ -234,22 +244,41 @@ reviewer_resolvable() {
   fi
 }
 
-# same_model — true when the author model is known and the reviewer command names it.
-same_model() {
-  local author candidate answer=""
+# author_ids — the author's model, one per line, and the id an alias author (opus, sonnet, haiku) really runs
+# on when ANTHROPIC_DEFAULT_<ALIAS>_MODEL maps it: an author "opus" mapped to gateway-large-1 is gateway-large-1.
+author_ids() {
+  local author alias_name var
   author="${MODEL_REVIEW_AUTHOR_MODEL:-${ANTHROPIC_MODEL:-}}"
-  [[ -n "$author" ]] || return 1
+  [[ -n "$author" ]] || return 0
+  printf '%s\n' "$author"
+  alias_name="${author,,}"
+  case "$alias_name" in
+    opus | sonnet | haiku)
+      var="ANTHROPIC_DEFAULT_${alias_name^^}_MODEL"
+      if [[ -n "${!var:-}" ]]; then
+        printf '%s\n' "${!var}"
+      fi
+      ;;
+  esac
+}
+
+# same_model — true when the author model is known and the reviewer command (or the model the answer must come
+# from) names it, on id boundaries, in either direction.
+same_model() {
+  local author_id candidate answer=""
   # The model the answer must come from is only verified for the default command, so a custom
   # MODEL_REVIEW_CMD ignores MODEL_REVIEW_ANSWER_MODEL here too.
   if [[ -z "${MODEL_REVIEW_CMD:-}" ]]; then
     answer="${MODEL_REVIEW_ANSWER_MODEL:-}"
   fi
-  for candidate in "${MODEL_REVIEW_CMD:-${MODEL_REVIEW_MODEL:-opus}}" "$answer"; do
-    [[ -n "$candidate" ]] || continue
-    if [[ "${candidate,,}" == *"${author,,}"* || "${author,,}" == *"${candidate,,}"* ]]; then
-      return 0
-    fi
-  done
+  while IFS= read -r author_id; do
+    for candidate in "${MODEL_REVIEW_CMD:-${MODEL_REVIEW_MODEL:-opus}}" "$answer"; do
+      [[ -n "$candidate" ]] || continue
+      if model_matches "$author_id" "$candidate" || model_matches "$candidate" "$author_id"; then
+        return 0
+      fi
+    done
+  done < <(author_ids)
   return 1
 }
 
