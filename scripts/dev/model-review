@@ -22,7 +22,11 @@ reviewed (a NOTE says so). It runs from scripts/dev/pre-pr-checks as the `model-
 command is available.
 
 The reviewer is a command that reads the prompt on stdin and prints its review on stdout, split into words
-(no shell is involved). Default: `claude -p --model <MODEL_REVIEW_MODEL>`. The review must end with a verdict:
+(no shell is involved). Default: `claude --print --model <MODEL_REVIEW_MODEL> --settings <pin>`, where <pin> is
+`{"availableModels":["<MODEL_REVIEW_MODEL>"]}`. The pin keeps a restrictive `availableModels` in your Claude
+settings from making claude silently answer from another model (the author, on a native login; an id a gateway
+refuses). Behind a gateway that maps aliases to its own ids, `opus` also needs `ANTHROPIC_DEFAULT_OPUS_MODEL`.
+The review must end with a verdict:
 `VERDICT: CLEAN`, or one `FINDING: <file>: <problem>` line per finding followed by `VERDICT: FINDINGS`. Anything
 else is an error, never a clean pass.
 
@@ -30,6 +34,22 @@ Guard rails:
   - The reviewer must differ from the author: when MODEL_REVIEW_AUTHOR_MODEL (else ANTHROPIC_MODEL) is set and
     names the reviewer model, the review is skipped with a `SKIPPED:` line instead of a same-model pass. An
     unknown author model is reported in a NOTE and the review goes ahead.
+  - The default command asks claude for its JSON result and checks which model answered (`modelUsage`). Every
+    model that ran must be the expected one (modelUsage aggregates a session, so no single entry can be trusted to
+    have written the verdict): otherwise `ERROR: MODEL_REVIEW_MODEL_MISMATCH requested=… expected=… answered=…`
+    (exit 1). A listed model that is the author's is `ERROR: MODEL_REVIEW_SAME_MODEL`, whatever was expected (an alias
+    author such as opus also counts as the id ANTHROPIC_DEFAULT_OPUS_MODEL maps it to), and
+    an expected model that is the author's is skipped like a same-model reviewer. The expected model is
+    MODEL_REVIEW_ANSWER_MODEL when set, else the requested one, matched on id boundaries (gateway-large-1 is not
+    gateway-large-10; a version-specific id is not satisfied by a more specific version, a snapshot date is the
+    same version). Set it when opus is mapped to a gateway id without "opus", or when a session also lists a
+    helper model (a shared part such as "claude" accepts both; the author check still applies). A result that
+    cannot be verified (not JSON, no modelUsage), a mismatch and a same-model answer record nothing: each fails
+    every run, and calls the reviewer again, until the environment is fixed, so the once-per-head and --max-runs
+    caps do not count them. A custom MODEL_REVIEW_CMD is trusted as it is, and ignores MODEL_REVIEW_ANSWER_MODEL.
+  - The availableModels pin has limits: an organization-managed list cannot be overridden by --settings, and other
+    lists merge instead of becoming a single-model list. The pin only makes the requested model available; the
+    answering-model check above is what detects a substitution.
   - Each head+base is reviewed once; the recorded result, findings included, is replayed at no cost.
   - At most --max-runs (default 8) distinct heads are reviewed per repository branch.
   - Findings gate the push (exit 2). Fix them and commit, or record a decline with
@@ -44,8 +64,9 @@ Exit status:
   3  skipped (reason on a `SKIPPED:` line)
 
 Environment:
-  MODEL_REVIEW_CMD                Reviewer command (default: claude -p --model $MODEL_REVIEW_MODEL)
+  MODEL_REVIEW_CMD                Reviewer command (default: claude --print --model <model> --settings <pin>)
   MODEL_REVIEW_MODEL              Reviewer model for the default command (default: opus)
+  MODEL_REVIEW_ANSWER_MODEL       Id part that must answer when it is not MODEL_REVIEW_MODEL (default: that model)
   MODEL_REVIEW_AUTHOR_MODEL       The author's model (default: $ANTHROPIC_MODEL); used to refuse a same-model review
   MODEL_REVIEW_MAX_DIFF_BYTES     Largest diff sent; a bigger one is skipped, never cut (default: 200000)
   MODEL_REVIEW_STATE_DIR          State directory (default: ~/scratch/repository-helpers/model-review)
@@ -79,7 +100,152 @@ reviewer_words() {
     return 0
   fi
   model="${MODEL_REVIEW_MODEL:-opus}"
-  printf '%s\n' claude -p --model "$model"
+  # --settings pins availableModels to the reviewer. The user settings may restrict it (for example to
+  # sonnet and haiku, with enforcement); claude then swaps a model outside the list for its default and
+  # answers from that model without an error. Behind a gateway the default id is refused (a 400 naming a
+  # different model than the one requested); on a native login the review would silently run on the
+  # author's own model. The JSON has no spaces, so it stays one word. --output-format json makes claude
+  # report which model answered (modelUsage), which unwrap_default_review checks instead of trusting the pin.
+  printf '%s\n' claude --print --model "$model" --settings "{\"availableModels\":[\"${model}\"]}" \
+    --output-format json
+}
+
+# model_matches <requested> <answered> — true when the answering id contains the requested model on id
+# boundaries, one way only: a shorter answering id (claude-opus-4) is a different model from a longer request
+# (claude-opus-4-5). An alias (opus) is contained in any id of its family (claude-opus-5-5), but a
+# version-specific request is not satisfied by a more specific version (claude-opus-4 is not claude-opus-4-5;
+# a snapshot date such as claude-opus-4-20250514 is the same version). The requested id is normalized first: a
+# context suffix ([1m]), a provider prefix (brk-commons/ on any id, us.anthropic. before claude) and a Bedrock
+# version suffix (-v1:0) are dropped, because the answering id may omit them, and '@' and '.' read as '-' (a
+# Vertex date, a gateway's dotted claude-opus-5.5).
+model_matches() {
+  local requested answered rest prefix before after left_ok right_ok versioned=0
+  local -r version_tail_re='^-[0-9]{1,3}($|[^0-9])'
+  requested="${1,,}"
+  answered="${2,,}"
+  requested="${requested%%\[*}"
+  requested="${requested##*/}"
+  requested="${requested//[@.]/-}"
+  answered="${answered//[@.]/-}"
+  if [[ "$requested" == *claude* ]]; then
+    requested="claude${requested#*claude}"
+  fi
+  requested="${requested%:*}"
+  requested="${requested%-v[0-9]*}"
+  [[ -n "$requested" ]] || return 1
+  [[ "$requested" =~ [0-9] ]] && versioned=1
+  # The match must sit on id boundaries: gateway-large-1 is not gateway-large-10, and opus is not opusplan.
+  rest="$answered"
+  prefix=""
+  while [[ "$rest" == *"$requested"* ]]; do
+    before="${prefix}${rest%%"$requested"*}"
+    after="${rest#*"$requested"}"
+    left_ok=0
+    right_ok=0
+    [[ -z "$before" || ! "${before: -1}" =~ [[:alnum:]] ]] && left_ok=1
+    [[ -z "$after" || ! "${after:0:1}" =~ [[:alnum:]] ]] && right_ok=1
+    # A version-specific request is not satisfied by a more specific version: claude-opus-4 is not
+    # claude-opus-4-5, while an eight digit snapshot date (claude-opus-4-20250514) is the same version.
+    if (( versioned == 1 )) && [[ "$after" =~ $version_tail_re ]]; then
+      right_ok=0
+    fi
+    if (( left_ok == 1 && right_ok == 1 )); then
+      return 0
+    fi
+    prefix="${before}${requested}"
+    rest="$after"
+  done
+  return 1
+}
+
+# unwrap_default_review <out_file> <model> <state_file> <head> <base> — the default command prints one JSON
+# result. Replace out_file with its review text and fail (never a clean pass) when it is not a result, is an
+# error, does not say which model answered, or lists a model other than the expected one: a restrictive
+# availableModels can still swap a version-specific model, and claude does so without an error. EVERY model in
+# modelUsage must match: it aggregates a whole session, so no single entry can be trusted to be the one that
+# wrote the verdict, and failing closed is the only attribution that cannot accept a wrong author. A result that
+# cannot be verified (no JSON, no modelUsage), names the wrong model or the author, or is an error that does not
+# come from the expected model records
+# nothing, so it keeps failing the push on every run instead of exhausting the two-failure cap and becoming a
+# non-blocking SKIPPED. The expected model is MODEL_REVIEW_ANSWER_MODEL when set, else the requested one: an
+# alias whose id does not contain its own name (opus mapped by ANTHROPIC_DEFAULT_OPUS_MODEL to a gateway id
+# without "opus"), or a session that also lists a helper model, needs it (a shared part such as "claude"). A
+# listed model that is the author's is refused whatever was expected. Sets answered_models (comma-separated)
+# for the caller's log line.
+answered_models=""
+unwrap_default_review() {
+  local -r out_file="$1" model="$2" state_file="$3" head="$4" base="$5"
+  local -r expect="${MODEL_REVIEW_ANSWER_MODEL:-$model}"
+  local -r object_jq='if type == "array" then .[-1] else . end'
+  local -r shape_jq='type == "object" and (.result | type) == "string"'
+  local -r first_line_jq='.result | split("\n")[0] | .[0:200]'
+  local -r models_jq='(.modelUsage // {}) | keys[]'
+  local unwrapped normalized key is_error error_text no_model all_keys="" author_id mismatch=0
+  local -a listed_keys=()
+  local -r no_json='the reviewer did not print a JSON result, so its model cannot be verified'
+  command -v jq >/dev/null 2>&1 || fail "jq is required to read the default reviewer's result"
+  unwrapped="${out_file}.text"
+  normalized="${out_file}.object"
+  # A verbose view setting makes claude print an array of messages with the result object last.
+  runner_exec_stdout 'model-review object' --probe -- jq --compact-output "$object_jq" "$out_file" \
+    >"$normalized" || fail "${no_json}; an error, not a clean pass"
+  mv -- "$normalized" "$out_file"
+  if ! runner_exec_stdout 'model-review shape' --probe -- jq --exit-status "$shape_jq" "$out_file" >/dev/null; then
+    fail "${no_json}; an error, not a clean pass"
+  fi
+  is_error="$(runner_exec_stdout 'model-review is_error' --probe -- jq --raw-output '.is_error // false' "$out_file")"
+  error_text=""
+  if [[ "$is_error" == "true" ]]; then
+    error_text="$(runner_exec_stdout 'model-review error text' --probe -- jq --raw-output "$first_line_jq" "$out_file")"
+  fi
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    listed_keys+=("$key")
+    all_keys="${all_keys:+${all_keys},}${key}"
+    model_matches "$expect" "$key" || mismatch=1
+  done < <(runner_exec_stdout 'model-review models' --probe -- jq --raw-output "$models_jq" "$out_file")
+  if (( ${#listed_keys[@]} == 0 )); then
+    no_model="the reviewer did not report which model answered"
+    [[ -z "$error_text" ]] || no_model="${no_model} (it reported an error: ${error_text})"
+    fail "${no_model}, so it cannot be verified; an error, not a clean pass"
+  fi
+  if (( mismatch == 1 )); then
+    printf 'ERROR: MODEL_REVIEW_MODEL_MISMATCH requested=%s expected=%s answered=%s head=%s\n' \
+      "$model" "$expect" "$all_keys" "${head:0:7}" >&2
+    exit 1
+  fi
+  # Whatever the expected model was, a listed model that is the author's is not a different-model review.
+  while IFS= read -r author_id; do
+    for key in "${listed_keys[@]}"; do
+      if model_matches "$author_id" "$key"; then
+        printf 'ERROR: MODEL_REVIEW_SAME_MODEL author=%s answered=%s head=%s\n' \
+          "$author_id" "$all_keys" "${head:0:7}" >&2
+        exit 1
+      fi
+    done
+  done < <(author_ids)
+  # Only an error that was verified to come from the expected, non-author model counts as the reviewer failing,
+  # because a recorded failure feeds the two-failure cap; every other error above failed without recording.
+  if [[ "$is_error" == "true" ]]; then
+    record_result "$state_file" "$head" "$base" error 0 reviewer-error
+    fail "the reviewer reported an error: ${error_text}"
+  fi
+  runner_exec_stdout 'model-review result text' --probe -- jq --raw-output '.result' "$out_file" >"$unwrapped" \
+    || fail "cannot read the reviewer's result text"
+  mv -- "$unwrapped" "$out_file"
+  answered_models="$all_keys"
+}
+
+# validate_reviewer_model — fail when the default reviewer model could break the --settings JSON it is
+# embedded in. Real ids carry ':' (Bedrock), '@' (Vertex) or '[1m]' (context suffix), all safe in a JSON
+# string, so only a quote, a backslash, whitespace or a control character is refused. A custom
+# MODEL_REVIEW_CMD is not touched.
+validate_reviewer_model() {
+  local -r model="${MODEL_REVIEW_MODEL:-opus}"
+  local -r safe_model_re='^[^[:space:][:cntrl:]"\\]+$'
+  [[ -n "${MODEL_REVIEW_CMD:-}" ]] && return 0
+  [[ "$model" =~ $safe_model_re ]] \
+    || fail "MODEL_REVIEW_MODEL must not contain quotes, backslashes, whitespace or control characters"
 }
 
 # reviewer_resolvable — true when the first word of the reviewer command is an executable.
@@ -94,13 +260,42 @@ reviewer_resolvable() {
   fi
 }
 
-# same_model — true when the author model is known and the reviewer command names it.
-same_model() {
-  local author reviewer
+# author_ids — the author's model, one per line, and the id an alias author (opus, sonnet, haiku) really runs
+# on when ANTHROPIC_DEFAULT_<ALIAS>_MODEL maps it: an author "opus" mapped to gateway-large-1 is gateway-large-1.
+author_ids() {
+  local author alias_name var
   author="${MODEL_REVIEW_AUTHOR_MODEL:-${ANTHROPIC_MODEL:-}}"
-  [[ -n "$author" ]] || return 1
-  reviewer="${MODEL_REVIEW_CMD:-${MODEL_REVIEW_MODEL:-opus}}"
-  [[ "${reviewer,,}" == *"${author,,}"* || "${author,,}" == *"${reviewer,,}"* ]]
+  [[ -n "$author" ]] || return 0
+  printf '%s\n' "$author"
+  alias_name="${author,,}"
+  case "$alias_name" in
+    opus | sonnet | haiku)
+      var="ANTHROPIC_DEFAULT_${alias_name^^}_MODEL"
+      if [[ -n "${!var:-}" ]]; then
+        printf '%s\n' "${!var}"
+      fi
+      ;;
+  esac
+}
+
+# same_model — true when the author model is known and the reviewer command (or the model the answer must come
+# from) names it, on id boundaries, in either direction.
+same_model() {
+  local author_id candidate answer=""
+  # The model the answer must come from is only verified for the default command, so a custom
+  # MODEL_REVIEW_CMD ignores MODEL_REVIEW_ANSWER_MODEL here too.
+  if [[ -z "${MODEL_REVIEW_CMD:-}" ]]; then
+    answer="${MODEL_REVIEW_ANSWER_MODEL:-}"
+  fi
+  while IFS= read -r author_id; do
+    for candidate in "${MODEL_REVIEW_CMD:-${MODEL_REVIEW_MODEL:-opus}}" "$answer"; do
+      [[ -n "$candidate" ]] || continue
+      if model_matches "$author_id" "$candidate" || model_matches "$candidate" "$author_id"; then
+        return 0
+      fi
+    done
+  done < <(author_ids)
+  return 1
 }
 
 # encode_key <text>: reversible, collision-free file-name fragment ('%' and '/' escaped).
@@ -180,6 +375,7 @@ main() {
   [[ "$timeout_s" =~ ^[1-9][0-9]*$ ]] || fail "--timeout must be a positive integer"
   max_bytes="${MODEL_REVIEW_MAX_DIFF_BYTES:-200000}"
   [[ "$max_bytes" =~ ^[1-9][0-9]*$ ]] || fail "MODEL_REVIEW_MAX_DIFF_BYTES must be a positive integer"
+  validate_reviewer_model
 
   top="$(git_out 'show-toplevel' "$dir" rev-parse --show-toplevel)" || fail "not a git repository: ${dir}"
   branch="$(git_out 'branch' "$top" rev-parse --abbrev-ref HEAD)" || skip "cannot read the current branch"
@@ -308,6 +504,10 @@ main() {
   if (( review_rc != 0 )); then
     record_result "$state_file" "$head" "$base_commit" error 0 "exit-${review_rc}"
     fail "the reviewer command exited ${review_rc}"
+  fi
+  if [[ -z "${MODEL_REVIEW_CMD:-}" ]]; then
+    unwrap_default_review "$out_file" "${MODEL_REVIEW_MODEL:-opus}" "$state_file" "$head" "$base_commit"
+    printf 'model-review: answered by %s\n' "$answered_models" >&2
   fi
 
   findings_count="$(grep -c '^FINDING: ' "$out_file" || true)"

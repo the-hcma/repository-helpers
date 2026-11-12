@@ -57,6 +57,7 @@ export STUB_CALLS="$calls"
 export MODEL_REVIEW_STATE_DIR="$state"
 export MODEL_REVIEW_CMD="$stub"
 unset ANTHROPIC_MODEL MODEL_REVIEW_AUTHOR_MODEL MODEL_REVIEW_MODEL
+unset ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
 
 # run_review [args…] -> review_out (stdout+stderr) and review_rc
 run_review() {
@@ -214,5 +215,320 @@ assert_contains 'pre-pr-checks starts the model-review job' "$checks_src" \
   "model-review) start_parallel_job 'model-review' prec_run_model_review"
 assert_contains 'pre-pr-checks documents the skip' "$checks_src" 'PRE_PR_CHECKS_SKIP=model-review'
 assert_contains 'the ecosystem planner adds the job' "$eco_src" "prec_plan_add_job 'model-review'"
+
+printf '\n=== the default reviewer pins availableModels to the reviewer model ===\n'
+# A fake `claude` on PATH records its arguments, one per line, and prints the one JSON result that
+# `--output-format json` produces. FAKE_CLAUDE_MODELS is its modelUsage object (default: claude-opus-5-5) and
+# FAKE_CLAUDE_MODE picks the text: ok (clean), findings, error (is_error), nojson (plain text) or nomodels.
+# Each default-command case uses a fresh state directory, so the whole branch is reviewed again.
+fake_bin="${tmp}/fake-bin"
+mkdir -p "$fake_bin"
+cat >"${fake_bin}/claude" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"${FAKE_CLAUDE_ARGS}"
+cat >/dev/null
+models="${FAKE_CLAUDE_MODELS:-}"
+[[ -n "$models" ]] || models='{"claude-opus-5-5":{}}'
+case "${FAKE_CLAUDE_MODE:-ok}" in
+  ok)
+    jq --null-input --argjson m "$models" \
+      '{type:"result",is_error:false,result:"Looks fine.\nVERDICT: CLEAN",modelUsage:$m}' ;;
+  findings)
+    jq --null-input --argjson m "$models" \
+      '{type:"result",is_error:false,result:"FINDING: a.txt: off by one\nVERDICT: FINDINGS",modelUsage:$m}' ;;
+  error)
+    jq --null-input --argjson m "$models" \
+      '{type:"result",is_error:true,result:"API Error: 400 bad model",modelUsage:$m}' ;;
+  nomodels) jq --null-input '{type:"result",is_error:false,result:"Looks fine.\nVERDICT: CLEAN"}' ;;
+  array) jq --null-input --argjson m "$models" \
+    '[{type:"system"},{type:"result",is_error:false,result:"Looks fine.\nVERDICT: CLEAN",modelUsage:$m}]' ;;
+  arraynoresult) printf '[{"type":"system"}]\n' ;;
+  errornomodels)
+    jq --null-input '{type:"result",is_error:true,result:"Rate limit reached",modelUsage:{}}' ;;
+  nojson) printf 'Looks fine.\nVERDICT: CLEAN\n' ;;
+esac
+FAKE
+chmod +x "${fake_bin}/claude"
+export FAKE_CLAUDE_ARGS="${tmp}/claude-args"
+# The default-command cases start from a clean slate: no custom command and no ambient answer-model override.
+default_env=(env -u MODEL_REVIEW_CMD -u MODEL_REVIEW_ANSWER_MODEL)
+# run_default <state-name> [VAR=value…] -> default_out and default_rc (the model is opus, the author sonnet).
+run_default() {
+  local state="$1"
+  shift
+  default_rc=0
+  rm -rf "${tmp}/state-${state}"
+  default_out="$("${default_env[@]}" PATH="${fake_bin}:${PATH}" MODEL_REVIEW_MODEL=opus \
+    MODEL_REVIEW_AUTHOR_MODEL=sonnet MODEL_REVIEW_STATE_DIR="${tmp}/state-${state}" "$@" \
+    bash "$review" --dir "$repo" 2>&1)" || default_rc=$?
+}
+run_default default
+assert_contains 'the default command reviews cleanly' "rc=${default_rc}" 'rc=0'
+assert_contains 'the default review reports a clean verdict' "$default_out" 'clean (0 findings)'
+assert_contains 'the answering model is logged' "$default_out" 'model-review: answered by claude-opus-5-5'
+claude_args="$(cat "$FAKE_CLAUDE_ARGS")"
+assert_contains 'the default command runs print mode' $'\n'"$claude_args" $'\n--print\n'
+assert_contains 'the default command names the reviewer model' "$claude_args" $'--model\nopus'
+assert_contains 'the allowed models are pinned to the reviewer as one JSON word' "$claude_args" \
+  $'--settings\n{"availableModels":["opus"]}'
+assert_contains 'the default command asks for the JSON result' "$claude_args" $'--output-format\njson'
+assert_not_contains 'the author model is not in the pinned list' "$claude_args" 'sonnet'
+
+printf '\n=== a review that a different model answered is an error, never a clean pass ===\n'
+run_default mismatch FAKE_CLAUDE_MODELS='{"claude-sonnet-5-5":{}}'
+assert_contains 'a substituted model exits 1' "rc=${default_rc}" 'rc=1'
+assert_contains 'the mismatch is one machine parseable line' "$default_out" \
+  'ERROR: MODEL_REVIEW_MODEL_MISMATCH requested=opus expected=opus answered=claude-sonnet-5-5 head='
+assert_not_contains 'the substituted answer is not reported clean' "$default_out" 'clean (0 findings)'
+mismatch_state="$(cat "${tmp}"/state-mismatch/* 2>/dev/null || true)"
+assert_not_contains 'the mismatch is not recorded as an error either' "$mismatch_state" ' error '
+assert_not_contains 'the mismatch is not recorded as a clean review' "$mismatch_state" ' clean '
+default_rc=0
+default_out="$("${default_env[@]}" PATH="${fake_bin}:${PATH}" MODEL_REVIEW_MODEL=opus \
+  MODEL_REVIEW_AUTHOR_MODEL=sonnet MODEL_REVIEW_STATE_DIR="${tmp}/state-mismatch" \
+  bash "$review" --dir "$repo" 2>&1)" || default_rc=$?
+assert_contains 'the same head is reviewed again once the right model answers' "rc=${default_rc}" 'rc=0'
+assert_not_contains 'the retry is not a replay of the failure' "$default_out" 'already reviewed'
+assert_contains 'the retry is clean' "$default_out" 'clean (0 findings)'
+
+printf '\n=== a persistent substitution keeps failing the push and is never downgraded to a skip ===\n'
+rm -rf "${tmp}/state-persist"
+persist_codes=''
+for _attempt in 1 2 3; do
+  persist_rc=0
+  "${default_env[@]}" PATH="${fake_bin}:${PATH}" MODEL_REVIEW_MODEL=opus MODEL_REVIEW_AUTHOR_MODEL=sonnet \
+    FAKE_CLAUDE_MODELS='{"claude-sonnet-5-5":{}}' MODEL_REVIEW_STATE_DIR="${tmp}/state-persist" \
+    bash "$review" --dir "$repo" >/dev/null 2>&1 || persist_rc=$?
+  persist_codes="${persist_codes} ${persist_rc}"
+done
+assert_contains 'every attempt exits 1, never the skip exit 3' "codes=${persist_codes}" 'codes= 1 1 1'
+
+printf '\n=== other unusable default results are errors too ===\n'
+run_default errored FAKE_CLAUDE_MODE=error
+assert_contains 'a reported error exits 1' "rc=${default_rc}" 'rc=1'
+assert_contains 'the reported error is shown' "$default_out" 'the reviewer reported an error: API Error: 400 bad model'
+run_default nojson FAKE_CLAUDE_MODE=nojson
+assert_contains 'plain text instead of JSON exits 1' "rc=${default_rc}" 'rc=1'
+assert_contains 'the missing JSON is named' "$default_out" 'did not print a JSON result'
+run_default nomodels FAKE_CLAUDE_MODE=nomodels
+assert_contains 'a result without modelUsage exits 1' "rc=${default_rc}" 'rc=1'
+assert_contains 'the unknown model is named' "$default_out" 'did not report which model answered'
+run_default array FAKE_CLAUDE_MODE=array
+assert_contains 'a verbose-view array with the result last is accepted' "rc=${default_rc}" 'rc=0'
+assert_contains 'the answering model is read from the array result' "$default_out" 'answered by claude-opus-5-5'
+run_default arraynoresult FAKE_CLAUDE_MODE=arraynoresult
+assert_contains 'an array without a result object exits 1' "rc=${default_rc}" 'rc=1'
+assert_contains 'the missing result is named' "$default_out" 'did not print a JSON result'
+rm -rf "${tmp}/state-errornomodels"
+errornomodels_codes=''
+for _attempt in 1 2 3; do
+  errornomodels_rc=0
+  "${default_env[@]}" PATH="${fake_bin}:${PATH}" MODEL_REVIEW_MODEL=opus MODEL_REVIEW_AUTHOR_MODEL=sonnet \
+    FAKE_CLAUDE_MODE=errornomodels MODEL_REVIEW_STATE_DIR="${tmp}/state-errornomodels" \
+    bash "$review" --dir "$repo" >/dev/null 2>&1 || errornomodels_rc=$?
+  errornomodels_codes="${errornomodels_codes} ${errornomodels_rc}"
+done
+assert_contains 'an error that lists no model fails every run, never the skip exit 3' \
+  "codes=${errornomodels_codes}" 'codes= 1 1 1'
+errornomodels_state="$(cat "${tmp}"/state-errornomodels/* 2>/dev/null || true)"
+assert_not_contains 'an error that lists no model is not recorded' "$errornomodels_state" ' error '
+
+# three_runs <state-name> [VAR=value…] -> three_codes: the exit codes of three runs against one state directory.
+three_runs() {
+  local state="$1" run_rc
+  shift
+  rm -rf "${tmp}/state-${state}"
+  three_codes=''
+  for _attempt in 1 2 3; do
+    run_rc=0
+    "${default_env[@]}" PATH="${fake_bin}:${PATH}" MODEL_REVIEW_MODEL=opus MODEL_REVIEW_AUTHOR_MODEL=sonnet \
+      MODEL_REVIEW_STATE_DIR="${tmp}/state-${state}" "$@" \
+      bash "$review" --dir "$repo" >/dev/null 2>&1 || run_rc=$?
+    three_codes="${three_codes} ${run_rc}"
+  done
+}
+three_runs errormismatch FAKE_CLAUDE_MODE=error FAKE_CLAUDE_MODELS='{"claude-haiku-5-5":{}}'
+assert_contains 'an error that lists another model fails every run, never the skip exit 3' \
+  "codes=${three_codes}" 'codes= 1 1 1'
+errormismatch_state="$(cat "${tmp}"/state-errormismatch/* 2>/dev/null || true)"
+assert_not_contains 'an error that lists another model is not recorded' "$errormismatch_state" ' error '
+three_runs errorauthor MODEL_REVIEW_ANSWER_MODEL=claude FAKE_CLAUDE_MODE=error \
+  FAKE_CLAUDE_MODELS='{"claude-sonnet-5-5":{}}'
+assert_contains "an error that lists the author's model fails every run, never the skip exit 3" \
+  "codes=${three_codes}" 'codes= 1 1 1'
+errorauthor_state="$(cat "${tmp}"/state-errorauthor/* 2>/dev/null || true)"
+assert_not_contains "an error that lists the author's model is not recorded" "$errorauthor_state" ' error '
+run_default errorverified FAKE_CLAUDE_MODE=error
+assert_contains 'an error from the expected model is still reported as the reviewer error' \
+  "$default_out" 'the reviewer reported an error: API Error: 400 bad model'
+for unverifiable in nojson nomodels; do
+  rm -rf "${tmp}/state-unverifiable-${unverifiable}"
+  unverifiable_codes=''
+  for _attempt in 1 2 3; do
+    unverifiable_rc=0
+    "${default_env[@]}" PATH="${fake_bin}:${PATH}" MODEL_REVIEW_MODEL=opus \
+      MODEL_REVIEW_AUTHOR_MODEL=sonnet FAKE_CLAUDE_MODE="$unverifiable" \
+      MODEL_REVIEW_STATE_DIR="${tmp}/state-unverifiable-${unverifiable}" \
+      bash "$review" --dir "$repo" >/dev/null 2>&1 || unverifiable_rc=$?
+    unverifiable_codes="${unverifiable_codes} ${unverifiable_rc}"
+  done
+  assert_contains "a ${unverifiable} result fails every run, never the skip exit 3" \
+    "codes=${unverifiable_codes}" 'codes= 1 1 1'
+done
+
+printf '\n=== findings inside the JSON result still gate the push ===\n'
+run_default findings FAKE_CLAUDE_MODE=findings
+assert_contains 'findings exit 2' "rc=${default_rc}" 'rc=2'
+assert_contains 'the findings line is machine parseable' "$default_out" 'ERROR: MODEL_REVIEW_FINDINGS count=1 head='
+assert_contains 'the finding text is printed' "$default_out" 'FINDING: a.txt: off by one'
+
+printf '\n=== the matcher reads an alias, a context suffix and a Vertex date the same way ===\n'
+run_default alias FAKE_CLAUDE_MODELS='{"claude-opus-5.5":{}}'
+assert_contains 'the opus alias matches a dotted gateway id' "rc=${default_rc}" 'rc=0'
+run_default vertex MODEL_REVIEW_MODEL='claude-opus-4-1@20250805' FAKE_CLAUDE_MODELS='{"claude-opus-4-1-20250805":{}}'
+assert_contains 'an at sign matches the dashed date form' "rc=${default_rc}" 'rc=0'
+run_default specific MODEL_REVIEW_MODEL='claude-opus-4-1@20250805' FAKE_CLAUDE_MODELS='{"claude-opus-5-5":{}}'
+assert_contains 'a specific id does not match another version' "rc=${default_rc}" 'rc=1'
+run_default shorter MODEL_REVIEW_MODEL='claude-opus-4-5' FAKE_CLAUDE_MODELS='{"claude-opus-4":{}}'
+assert_contains 'a shorter answering id does not satisfy a longer request' "rc=${default_rc}" 'rc=1'
+run_default prefixed MODEL_REVIEW_MODEL='brk-commons/claude-opus-5-5' FAKE_CLAUDE_MODELS='{"claude-opus-5-5":{}}'
+assert_contains 'a gateway prefix on the request is ignored' "rc=${default_rc}" 'rc=0'
+run_default bedrock MODEL_REVIEW_MODEL='us.anthropic.claude-opus-4-1-20250805-v1:0' \
+  FAKE_CLAUDE_MODELS='{"claude-opus-4-1-20250805":{}}'
+assert_contains 'a Bedrock prefix and version suffix on the request are ignored' "rc=${default_rc}" 'rc=0'
+run_default dotted MODEL_REVIEW_MODEL='claude-opus-5-5' FAKE_CLAUDE_MODELS='{"claude-opus-5.5":{}}'
+assert_contains 'a dotted gateway id matches the dashed request' "rc=${default_rc}" 'rc=0'
+run_default prefixalias MODEL_REVIEW_MODEL='brk-commons/opus' FAKE_CLAUDE_MODELS='{"claude-opus-5-5":{}}'
+assert_contains 'a provider prefix on an alias is ignored' "rc=${default_rc}" 'rc=0'
+
+printf '\n=== several models in modelUsage: every one that ran must be the expected model ===\n'
+helper_only='{"claude-haiku-5-5":{"outputTokens":20},"claude-sonnet-5-5":{"outputTokens":900}}'
+run_default helper MODEL_REVIEW_MODEL=haiku FAKE_CLAUDE_MODELS="$helper_only"
+assert_contains 'a matching helper model does not hide a substituted answer' "rc=${default_rc}" 'rc=1'
+assert_contains 'the models are comma separated on the mismatch line' "$default_out" \
+  'answered=claude-haiku-5-5,claude-sonnet-5-5 head='
+# Even when the helper wrote far less, the output-token count is not trusted to name the author of the verdict.
+helper_ok='{"claude-haiku-5-5":{"outputTokens":20},"claude-opus-5-5":{"outputTokens":900}}'
+run_default helperok FAKE_CLAUDE_MODELS="$helper_ok"
+assert_contains 'a helper model next to the answering model fails closed' "rc=${default_rc}" 'rc=1'
+run_default helperfamily MODEL_REVIEW_ANSWER_MODEL=claude FAKE_CLAUDE_MODELS="$helper_ok"
+assert_contains 'a shared MODEL_REVIEW_ANSWER_MODEL accepts a session with a helper' "rc=${default_rc}" 'rc=0'
+author_helper='{"claude-sonnet-5-5":{"outputTokens":20},"claude-opus-5-5":{"outputTokens":900}}'
+run_default authorhelper MODEL_REVIEW_ANSWER_MODEL=claude FAKE_CLAUDE_MODELS="$author_helper"
+assert_contains 'a listed author model is refused even next to the right one' "rc=${default_rc}" 'rc=1'
+assert_contains 'the same-model error names both models' "$default_out" \
+  'ERROR: MODEL_REVIEW_SAME_MODEL author=sonnet answered=claude-opus-5-5,claude-sonnet-5-5 head='
+run_default notokens FAKE_CLAUDE_MODELS='{"claude-opus-5-5":{},"claude-haiku-5-5":{}}'
+assert_contains 'without output tokens every listed model must match' "rc=${default_rc}" 'rc=1'
+
+printf '\n=== a specific expected id matches on id boundaries only ===\n'
+run_default longer MODEL_REVIEW_ANSWER_MODEL=gateway-large-1 FAKE_CLAUDE_MODELS='{"gateway-large-10":{}}'
+assert_contains 'gateway-large-10 does not satisfy gateway-large-1' "rc=${default_rc}" 'rc=1'
+run_default exactid MODEL_REVIEW_ANSWER_MODEL=gateway-large-1 FAKE_CLAUDE_MODELS='{"gateway-large-1":{}}'
+assert_contains 'gateway-large-1 satisfies gateway-large-1' "rc=${default_rc}" 'rc=0'
+run_default otheralias FAKE_CLAUDE_MODELS='{"claude-opusplan":{}}'
+assert_contains 'opusplan does not satisfy the opus alias' "rc=${default_rc}" 'rc=1'
+
+printf '\n=== a version-specific id is not satisfied by a more specific version ===\n'
+run_default versioned MODEL_REVIEW_ANSWER_MODEL=claude-opus-4 FAKE_CLAUDE_MODELS='{"claude-opus-4-5":{}}'
+assert_contains 'claude-opus-4 does not accept claude-opus-4-5' "rc=${default_rc}" 'rc=1'
+run_default snapshot MODEL_REVIEW_ANSWER_MODEL=claude-opus-4 FAKE_CLAUDE_MODELS='{"claude-opus-4-20250514":{}}'
+assert_contains 'a snapshot date is the same version' "rc=${default_rc}" 'rc=0'
+run_default snapshot2 MODEL_REVIEW_ANSWER_MODEL=claude-opus-4-5 FAKE_CLAUDE_MODELS='{"claude-opus-4-5-20250929":{}}'
+assert_contains 'a dated snapshot of the requested version is accepted' "rc=${default_rc}" 'rc=0'
+run_default minor MODEL_REVIEW_ANSWER_MODEL=gateway-large-1 FAKE_CLAUDE_MODELS='{"gateway-large-1-0":{}}'
+assert_contains 'a further version component is a different model' "rc=${default_rc}" 'rc=1'
+run_default familyalias FAKE_CLAUDE_MODELS='{"claude-opus-4-5":{}}'
+assert_contains 'the opus alias still accepts any opus version' "rc=${default_rc}" 'rc=0'
+
+printf '\n=== the author is resolved through its alias mapping and compared on id boundaries ===\n'
+run_default aliasauthor MODEL_REVIEW_AUTHOR_MODEL=opus ANTHROPIC_DEFAULT_OPUS_MODEL=gateway-large-1 \
+  MODEL_REVIEW_MODEL=gateway-large-1 FAKE_CLAUDE_MODELS='{"gateway-large-1":{}}'
+assert_contains 'an alias author that maps to the reviewer id is skipped' "rc=${default_rc}" 'rc=3'
+assert_contains 'the skip names the author model' "$default_out" 'SKIPPED: model-review: the author model (opus)'
+run_default unmappedauthor MODEL_REVIEW_AUTHOR_MODEL=opus MODEL_REVIEW_MODEL=gateway-large-1 \
+  FAKE_CLAUDE_MODELS='{"gateway-large-1":{}}'
+assert_contains 'without the mapping the same ids are different models' "rc=${default_rc}" 'rc=0'
+run_default longauthor MODEL_REVIEW_AUTHOR_MODEL=gateway-large-10 MODEL_REVIEW_MODEL=gateway-large-1 \
+  FAKE_CLAUDE_MODELS='{"gateway-large-1":{}}'
+assert_contains 'gateway-large-1 is not skipped for author gateway-large-10' "rc=${default_rc}" 'rc=0'
+run_default planauthor MODEL_REVIEW_AUTHOR_MODEL=opusplan
+assert_contains 'opus is not skipped for author opusplan' "rc=${default_rc}" 'rc=0'
+
+printf '\n=== an alias that the answering id does not contain needs MODEL_REVIEW_ANSWER_MODEL ===\n'
+# ANTHROPIC_DEFAULT_OPUS_MODEL can map opus to a gateway id that has no "opus" in it.
+gateway_id='{"gateway-large-1":{}}'
+run_default noanswer FAKE_CLAUDE_MODELS="$gateway_id"
+assert_contains 'an alias the id does not contain is a mismatch' "rc=${default_rc}" 'rc=1'
+run_default withanswer MODEL_REVIEW_ANSWER_MODEL=gateway-large FAKE_CLAUDE_MODELS="$gateway_id"
+assert_contains 'MODEL_REVIEW_ANSWER_MODEL names the id that should answer' "rc=${default_rc}" 'rc=0'
+run_default wronganswer MODEL_REVIEW_ANSWER_MODEL=gateway-large FAKE_CLAUDE_MODELS='{"claude-haiku-5-5":{}}'
+assert_contains 'the expected answer still fails when another model answers' "rc=${default_rc}" 'rc=1'
+assert_contains 'the mismatch line shows the expected model' "$default_out" \
+  'requested=opus expected=gateway-large answered=claude-haiku-5-5'
+
+printf '\n=== the author model never counts as a different-model review ===\n'
+run_default authorexpected MODEL_REVIEW_ANSWER_MODEL=sonnet FAKE_CLAUDE_MODELS='{"claude-sonnet-5-5":{}}'
+assert_contains 'an expected model that is the author is skipped, not reviewed' "rc=${default_rc}" 'rc=3'
+assert_contains 'the skip names the author model' "$default_out" 'SKIPPED: model-review: the author model (sonnet)'
+run_default authoranswered MODEL_REVIEW_ANSWER_MODEL=claude FAKE_CLAUDE_MODELS='{"claude-sonnet-5-5":{}}'
+assert_contains 'an answer from the author passes the expected check but is refused' "rc=${default_rc}" 'rc=1'
+assert_contains 'the same-model error is one machine parseable line' "$default_out" \
+  'ERROR: MODEL_REVIEW_SAME_MODEL author=sonnet answered=claude-sonnet-5-5 head='
+assert_not_contains 'an author answer is not reported clean' "$default_out" 'clean (0 findings)'
+
+printf '\n=== a model name that is not a plain name is refused before anything is sent ===\n'
+bad_rc=0
+bad_out="$("${default_env[@]}" PATH="${fake_bin}:${PATH}" MODEL_REVIEW_MODEL='opus"],"x":["' \
+  MODEL_REVIEW_STATE_DIR="${tmp}/state-bad" bash "$review" --dir "$repo" 2>&1)" || bad_rc=$?
+assert_contains 'a model name that would break the JSON exits 1' "rc=${bad_rc}" 'rc=1'
+assert_contains 'the refusal names MODEL_REVIEW_MODEL' "$bad_out" \
+  'ERROR: model-review: MODEL_REVIEW_MODEL must not contain quotes'
+custom_rc=0
+custom_out="$(MODEL_REVIEW_MODEL='not a name' MODEL_REVIEW_STATE_DIR="${tmp}/state-custom" \
+  bash "$review" --dir "$repo" 2>&1)" || custom_rc=$?
+assert_not_contains 'a custom MODEL_REVIEW_CMD ignores the default model name' "$custom_out" \
+  'MODEL_REVIEW_MODEL must not contain'
+assert_contains 'a custom MODEL_REVIEW_CMD still reviews' "rc=${custom_rc}" 'rc=0'
+custom_answer_rc=0
+custom_answer_out="$(MODEL_REVIEW_CMD="${stub} --model opus" MODEL_REVIEW_AUTHOR_MODEL=sonnet \
+  MODEL_REVIEW_ANSWER_MODEL=sonnet MODEL_REVIEW_STATE_DIR="${tmp}/state-custom-answer" \
+  bash "$review" --dir "$repo" 2>&1)" || custom_answer_rc=$?
+assert_contains 'a custom command is not skipped over MODEL_REVIEW_ANSWER_MODEL' "rc=${custom_answer_rc}" 'rc=0'
+assert_not_contains 'the answer-model setting is not consulted for a custom command' "$custom_answer_out" 'SKIPPED'
+
+printf '\n=== real model ids with a colon, an at sign or a context suffix are accepted and pinned ===\n'
+real_ids=(
+  'us.anthropic.claude-opus-4-1-20250805-v1:0' 'claude-opus-4-1@20250805' 'opus[1m]' 'brk-commons/claude-opus-5-5'
+)
+for real_id in "${real_ids[@]}"; do
+  rm -rf "${tmp}/state-real"
+  real_rc=0
+  "${default_env[@]}" PATH="${fake_bin}:${PATH}" MODEL_REVIEW_MODEL="$real_id" \
+    FAKE_CLAUDE_MODELS="{\"${real_id}\":{}}" \
+    MODEL_REVIEW_AUTHOR_MODEL=sonnet MODEL_REVIEW_STATE_DIR="${tmp}/state-real" \
+    bash "$review" --dir "$repo" >/dev/null 2>&1 || real_rc=$?
+  assert_contains "the model id ${real_id} is reviewed" "rc=${real_rc}" 'rc=0'
+  assert_contains "the model id ${real_id} is pinned as the only allowed model" "$(cat "$FAKE_CLAUDE_ARGS")" \
+    "{\"availableModels\":[\"${real_id}\"]}"
+done
+
+printf '\n=== whitespace, a backslash and a control character are refused too ===\n'
+for bad_id in 'opus 1m' 'opus\1m' $'opus\t1m'; do
+  rm -rf "${tmp}/state-bad2"
+  bad2_rc=0
+  "${default_env[@]}" PATH="${fake_bin}:${PATH}" MODEL_REVIEW_MODEL="$bad_id" \
+    MODEL_REVIEW_STATE_DIR="${tmp}/state-bad2" bash "$review" --dir "$repo" >/dev/null 2>&1 || bad2_rc=$?
+  assert_contains "the model id ${bad_id@Q} is refused with exit 1" "rc=${bad2_rc}" 'rc=1'
+done
+
+printf '\n=== the help text documents the pin and the gateway alias mapping ===\n'
+help_out="$(bash "$review" --help)"
+assert_contains 'the help shows the pinned list' "$help_out" '{"availableModels":["<MODEL_REVIEW_MODEL>"]}'
+assert_contains 'the help mentions the gateway opus mapping' "$help_out" 'ANTHROPIC_DEFAULT_OPUS_MODEL'
+assert_contains 'the help documents the answering-model check' "$help_out" 'MODEL_REVIEW_MODEL_MISMATCH'
+assert_contains 'the help documents MODEL_REVIEW_ANSWER_MODEL' "$help_out" 'MODEL_REVIEW_ANSWER_MODEL'
+assert_contains 'the help documents the same-model error' "$help_out" 'MODEL_REVIEW_SAME_MODEL'
+assert_contains 'the help says every model that ran must match' "$help_out" 'must be the expected one'
 
 test_summary
