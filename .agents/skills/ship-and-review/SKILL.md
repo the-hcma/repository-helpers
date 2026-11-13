@@ -205,15 +205,16 @@ Then: `gt modify`, `scripts/dev/pre-pr-checks`, push, **`scripts/dev/post-pr-sub
 
 ## 4. Complete (email operator; no self-approve)
 
-Two success paths:
+Three success paths:
 
 1. **`complete_ready`** — `check` returns **0** and `status` shows `complete_ready: true`. That requires at least one **agent sign-off on the current head** (Copilot/Bugbot empty pass, or CodeRabbit's `Review completed` commit status or `Finished` check run on that head with no actionable findings). A CodeRabbit status of `Review rate limited` is **not** a review — it ends green with no review — so it never signs a head off. Run:
    ```bash
    ./scripts/wait-for-agent-review complete --pr <n>
    ```
 2. **Nothing outstanding** — `loop` exits **0** after sign-off, threads addressed, CI/merge green, and no in-flight waits. Same sign-off gate applies.
+3. **Round cap** — `loop` exits **0** with the `NOTE: AGENT_REVIEW_MAX_ROUNDS ... reason=max-rounds` line because the PR has had its `agent-review-max-rounds` rounds (default 3; see the Round cap paragraph below) with CI green, the PR merge ready and no feedback unanswered. This path does **not** need an agent sign-off (the note records `signed_off=0|1`) and it approves nothing: the operator is emailed, and the merge still needs the user's explicit confirmation.
 
-Both paths **email `AGENT_REVIEW_REPORT_TO`** when configured. They do **not** run `gh pr review --approve` (self-approve often fails for the PR author and is unnecessary).
+All three paths **email `AGENT_REVIEW_REPORT_TO`** when configured. They do **not** run `gh pr review --approve` (self-approve often fails for the PR author and is unnecessary).
 
 Never add the `merge-it` label: it is ignored and the org no longer uses Graphite merge queue. Merge only after the user explicitly confirms, and only with `scripts/dev/merge-stack --pr <n>` (from the PR's worktree; in a consumer repo `${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/dev/merge-stack --pr <n>`): it picks the right command for the repository's merge setup (`gh stack merge` for a stacked PR, the merge queue or auto-merge otherwise) and confirms the enqueue. For a PR in a gh stack, pass the top PR's number and run it from that stack's worktree: it refuses a lower layer, and it lands the top PR and every open PR below it, so name those PRs and get confirmation for the whole stack first. Do not call `gh pr merge` or `gh stack merge` by hand, do not add the `merge-it` label, and do not pipe the command through `tail` or `head`: read its exit status and output. See the gh-stack Skill, `Merging a stack`.
 
