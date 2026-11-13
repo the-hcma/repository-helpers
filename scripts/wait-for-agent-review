@@ -2326,6 +2326,24 @@ cmd_complete_max_rounds() {
     "${pr}" "${rounds}" "${max_rounds}" >&2
 }
 
+
+# cmd_loop_restack_at_cap <repo> <pr> — restacks a capped head that is BEHIND its base. Returns 0 when it was
+# restacked (the caller starts a new pass), 4 when the restack failed for good (the loop stops) and 1 for a
+# transient failure (mergeability not settled yet; the caller retries with the loop's own backoff and cap).
+cmd_loop_restack_at_cap() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local restack_exit=0
+
+  cmd_restack "${repo}" "${pr}" || restack_exit=$?
+  if (( restack_exit == 0 )); then
+    return 0
+  fi
+  if (( restack_exit == 4 )); then
+    return 4
+  fi
+  return 1
+}
 # cmd_loop_complete_at_max_rounds <repo> <pr> <head> <snapshot> — returns 0 after completing the PR at its round
 # cap, 1 when the loop should carry on, 2 when a capped head is only BEHIND its base (the caller restacks it and
 # starts a new pass). It runs once CI is green and no feedback is unanswered (the loop's earlier gates), and before any
@@ -2595,14 +2613,27 @@ cmd_loop() {
     fi
     if (( cap_exit == 2 )); then
       restack_exit=0
-      cmd_restack "${repo}" "${pr}" || restack_exit=$?
+      cmd_loop_restack_at_cap "${repo}" "${pr}" || restack_exit=$?
       if (( restack_exit == 0 )); then
+        transient_retries=0
         last_head=''
         continue
       fi
-      agent_review_loop_set_stop 'RESTACK_FAILED' \
-        "${agent_review_loop_last_error:-Restack of a PR at its round cap failed — human intervention required.}"
-      return 4
+      transient_retries=$((transient_retries + 1))
+      if (( restack_exit == 4 || transient_retries >= transient_max )); then
+        agent_review_loop_set_stop 'RESTACK_FAILED' \
+          "${agent_review_loop_last_error:-Restack of a PR at its round cap failed — human intervention required.}"
+        return 4
+      fi
+      printf 'wait-for-agent-review loop: transient restack issue on PR #%s at its round cap (retry %s/%s)…\n' \
+        "${pr}" "${transient_retries}" "${transient_max}" >&2
+      pending_exit=0
+      cmd_loop_sleep_abort_if_pending "${repo}" "${pr}" \
+        "${transient_sleep}" 'transient restack poll' || pending_exit=$?
+      if (( pending_exit == 3 )); then
+        return 3
+      fi
+      continue
     fi
     cmd_loop_observe_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}"
     agent_review_sync_active_probe_agent || true
