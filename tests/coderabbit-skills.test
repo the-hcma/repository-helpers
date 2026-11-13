@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# Tests for scripts/lib/coderabbit-skills (detect-first CodeRabbit skills notice, repository-helpers#860).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+lib="${script_dir}/../scripts/lib/coderabbit-skills"
+start_development="${script_dir}/../scripts/dev/start-development"
+readonly lib start_development
+
+pass=0
+fail=0
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+mkdir -p "${work}/bin" "${work}/home" "${work}/nocli"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${work}/bin/coderabbit"
+chmod +x "${work}/bin/coderabbit"
+
+# notice <PATH-dir-with-cli-or-empty> <extra env...> : run the notice with an isolated HOME and PATH.
+notice() {
+  local path_dir="$1"
+  shift
+  # shellcheck disable=SC2016  # the single-quoted script must expand $1 in the child shell, not here
+  env -i HOME="${work}/home" PATH="${path_dir}:/usr/bin:/bin" "$@" \
+    bash -c 'source "$1"; coderabbit_skills_notice' bash "$lib" 2>&1
+}
+
+printf '\n=== unit: notice when the CLI is installed and no skill is ===\n'
+out="$(notice "${work}/bin")"
+if grep -qF 'NOTE: CODERABBIT_SKILLS_MISSING' <<<"$out" \
+  && grep -qF 'coderabbit skills --agent' <<<"$out" \
+  && [[ "$(wc -l <<<"$out")" -eq 1 ]]; then
+  printf '[PASS] output is one NOTE: CODERABBIT_SKILLS_MISSING line naming coderabbit skills --agent\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected one CODERABBIT_SKILLS_MISSING line, got: %s\n' "$out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: no notice when the CLI is not installed ===\n'
+out="$(notice "${work}/nocli")"
+if [[ -z "$out" ]]; then
+  printf '[PASS] output is empty without the coderabbit CLI on PATH\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected no output without the CLI, got: %s\n' "$out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: no notice once a CodeRabbit skill directory exists ===\n'
+for root in .claude/skills .codex/skills .cursor/skills .gemini/skills .copilot/skills .agents/skills; do
+  mkdir -p "${work}/home/${root}/code-review"
+  printf '%s\n' '---' 'name: code-review' 'description: Review code with CodeRabbit' '---' \
+    >"${work}/home/${root}/code-review/SKILL.md"
+  out="$(notice "${work}/bin")"
+  if [[ -z "$out" ]]; then
+    printf '[PASS] output is empty when ~/%s/code-review is the CodeRabbit skill\n' "$root"
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] expected no output with ~/%s/code-review, got: %s\n' "$root" "$out"
+    fail=$(( fail + 1 ))
+  fi
+  rm -rf "${work:?}/home/${root%%/*}"
+done
+mkdir -p "${work}/home/.claude/skills/coderabbit-config"
+out="$(notice "${work}/bin")"
+if [[ -z "$out" ]]; then
+  printf '[PASS] a coderabbit-config directory counts by name\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected no output with coderabbit-config installed, got: %s\n' "$out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "${work:?}/home/.claude"
+
+printf '\n=== unit: a user-owned skill with a generic name does not hide the notice ===\n'
+for generic in code-review autofix; do
+  mkdir -p "${work}/home/.claude/skills/${generic}"
+  printf '%s\n' '---' "name: ${generic}" 'description: my own skill' '---' >"${work}/home/.claude/skills/${generic}/SKILL.md"
+  out="$(notice "${work}/bin")"
+  if [[ "$out" == *CODERABBIT_SKILLS_MISSING* ]]; then
+    printf '[PASS] a non-CodeRabbit ~/.claude/skills/%s still gets the notice\n' "$generic"
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] a non-CodeRabbit %s skill hid the notice: %s\n' "$generic" "$out"
+    fail=$(( fail + 1 ))
+  fi
+  rm -rf "${work:?}/home/.claude"
+done
+mkdir -p "${work}/home/.claude/skills/code-review"
+out="$(notice "${work}/bin")"
+if [[ "$out" == *CODERABBIT_SKILLS_MISSING* ]]; then
+  printf '[PASS] a generic-name directory with no SKILL.md still gets the notice\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] a bare code-review directory hid the notice: %s\n' "$out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "${work:?}/home/.claude"
+
+printf '\n=== unit: a CodeRabbit plugin install counts as skills present ===\n'
+for plugin_dir in .claude/plugins/coderabbit .claude/plugins/cache/some-market/coderabbit .codex/plugins/cache/m/coderabbit-plugin/1.0; do
+  mkdir -p "${work}/home/${plugin_dir}"
+  out="$(notice "${work}/bin")"
+  if [[ -z "$out" ]]; then
+    printf '[PASS] no notice when ~/%s exists\n' "$plugin_dir"
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] a plugin install at ~/%s still got the notice: %s\n' "$plugin_dir" "$out"
+    fail=$(( fail + 1 ))
+  fi
+  rm -rf "${work:?}/home/.claude" "${work:?}/home/.codex"
+done
+mkdir -p "${work}/home/.claude/plugins/other-plugin"
+out="$(notice "${work}/bin")"
+if [[ "$out" == *CODERABBIT_SKILLS_MISSING* ]]; then
+  printf '[PASS] an unrelated plugin does not hide the notice\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] an unrelated plugin hid the notice: %s\n' "$out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "${work:?}/home/.claude"
+
+printf '\n=== unit: with both binaries the preview command names coderabbit ===\n'
+mkdir -p "${work}/bothbin"
+cp "${work}/bin/coderabbit" "${work}/bothbin/coderabbit"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${work}/bothbin/cr"
+chmod +x "${work}/bothbin/cr"
+out="$(notice "${work}/bothbin")"
+if [[ "$out" == *'preview with: coderabbit skills --agent'* ]]; then
+  printf '[PASS] the preview command names coderabbit when both binaries are on PATH\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected a coderabbit preview command with both binaries, got: %s\n' "$out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: a marketplace listing or a stray file is not an installed plugin ===\n'
+mkdir -p "${work}/home/.claude/plugins/marketplaces/coderabbit-marketplace"
+out="$(notice "${work}/bin")"
+if [[ "$out" == *CODERABBIT_SKILLS_MISSING* ]]; then
+  printf '[PASS] a marketplace directory that was added but not installed still gets the notice\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] a marketplace listing hid the notice: %s\n' "$out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "${work:?}/home/.claude"
+mkdir -p "${work}/home/.claude/plugins"
+: >"${work}/home/.claude/plugins/coderabbit.log"
+out="$(notice "${work}/bin")"
+if [[ "$out" == *CODERABBIT_SKILLS_MISSING* ]]; then
+  printf '[PASS] a stray file named after CodeRabbit still gets the notice\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] a stray file hid the notice: %s\n' "$out"
+  fail=$(( fail + 1 ))
+fi
+rm -rf "${work:?}/home/.claude"
+
+printf '\n=== unit: the cr binary alone also triggers the notice ===\n'
+mkdir -p "${work}/crbin"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${work}/crbin/cr"
+chmod +x "${work}/crbin/cr"
+out="$(notice "${work}/crbin")"
+if [[ "$out" == *CODERABBIT_SKILLS_MISSING* ]] && [[ "$out" == *'preview with: cr skills --agent'* ]] && [[ "$out" != *'coderabbit skills --agent'* ]]; then
+  printf '[PASS] a PATH with only cr prints the notice with a cr skills --agent preview command\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected the notice with only cr on PATH, got: %s\n' "$out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: the notice never writes into HOME ===\n'
+out="$(notice "${work}/bin")"
+if [[ "$out" == *CODERABBIT_SKILLS_MISSING* ]] && [[ -z "$(find "${work}/home" -mindepth 1 -print -quit)" ]]; then
+  printf '[PASS] home directory is empty right after a notice run that printed the note\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] the notice wrote into HOME\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: CODERABBIT_SKILLS_NOTICE=0 silences the note and the lib never installs ===\n'
+out="$(notice "${work}/bin" CODERABBIT_SKILLS_NOTICE=0)"
+if [[ -z "$out" ]]; then
+  printf '[PASS] output is empty with CODERABBIT_SKILLS_NOTICE=0\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected no output with the notice off, got: %s\n' "$out"
+  fail=$(( fail + 1 ))
+fi
+if [[ -z "$(find "${work}/home" -mindepth 1 -print -quit)" ]]; then
+  printf '[PASS] home directory is untouched after every notice run\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] the notice wrote into HOME\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: start-development sources the lib and prints the notice before the stack hint ===\n'
+# shellcheck disable=SC2016  # the pattern is literal source text, not an expansion
+src_line="$(grep -nF 'source "${_sd_script_dir}/../lib/coderabbit-skills"' "$start_development" | head -n1 | cut -d: -f1)"
+call_line="$(grep -nx 'coderabbit_skills_notice' "$start_development" | head -n1 | cut -d: -f1)"
+hint_line="$(grep -nF 'echo "To work on this stack, run:"' "$start_development" | head -n1 | cut -d: -f1)"
+if [[ -n "$src_line" && -n "$call_line" && -n "$hint_line" ]] \
+  && (( src_line < call_line && call_line < hint_line )); then
+  printf '[PASS] start-development sources the lib and calls the notice before "To work on this stack"\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] start-development wiring wrong (source=%s call=%s hint=%s)\n' \
+    "$src_line" "$call_line" "$hint_line"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== results ===\n'
+printf 'Passed: %d  Failed: %d\n' "$pass" "$fail"
+test_summary
