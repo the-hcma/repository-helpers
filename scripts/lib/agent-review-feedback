@@ -782,6 +782,88 @@ agent_review_feedback_posted_count() {
   printf '%s' "$((thread_count + issue_count + review_count))"
 }
 
+# The logins whose feedback counts as a review round: the review agents. The loop's wider bot list
+# (agent_review_bot_login_regex) also names dependabot, github-actions, graphite, sonarcloud, codecov and
+# renovate, which are bots but not reviewers: a lint bot commenting through the Actions token must not make the
+# round cap accept a PR early. AGENT_REVIEW_ROUND_LOGIN_REGEX overrides the list (a `|` separated list of
+# case-insensitive patterns, like AGENT_REVIEW_BOT_LOGIN_REGEX).
+# Exact review-agent logins (anchored, with the optional [bot] suffix), so a human whose login merely contains one of
+# the names (vortex-maintainer, cursor-user) never counts as an agent.
+agent_review_round_default_logins='^copilot(-pull-request-reviewer)?(\[bot\])?$|^cursor(\[bot\])?$'
+agent_review_round_default_logins+='|^coderabbitai?(\[bot\])?$|^bugbot(\[bot\])?$'
+agent_review_round_default_logins+='|^chatgpt-codex-connector(\[bot\])?$|^(mergestorm-)?vortex(\[bot\])?$|^mergestorm(\[bot\])?$'
+
+agent_review_round_login_regex() {
+  printf '%s' "${AGENT_REVIEW_ROUND_LOGIN_REGEX:-${agent_review_round_default_logins}}"
+}
+
+# agent_review_feedback_rounds_from_snapshot <snapshot-json> — prints how many review rounds the PR has had
+# (repository-helpers#861): the number of distinct head commits on which an agent left feedback to address.
+# A review of a head that finds nothing, a rate-limit or pause notice (it carries no finding marker) and a reply to
+# one of our replies are not
+# rounds. A head counts when either
+#   - a review agent's inline thread was opened in a review of it (the first comment's review commit, else its
+#     originalCommit), or
+#   - a review agent's review of it has an actionable body: one with an explicit marker (actionable comments, outside
+#     the diff, nitpicks, request changes, CHANGES_REQUESTED). The login is deliberately not passed to
+#     agent_review_feedback_review_body_is_actionable, which would otherwise treat ANY non-empty CodeRabbit
+#     body as triage work; that is right for answering feedback and wrong for counting rounds.
+# It reads only the snapshot, so it needs no state file and gives the same answer from any machine and across
+# loop invocations. Resolved threads still count: a round is history, not an open item. The caller must have
+# asserted the snapshot complete (agent_review_assert_snapshot_complete): a truncated page could hide a head.
+agent_review_feedback_rounds_from_snapshot() {
+  local -r snapshot="$1"
+  local bots incomplete thread_heads review_rows oid idx state body
+  local -A round_heads=()
+
+  # A truncated page (more than 100 reviews or threads) could hide a head, so no count is better than a low one.
+  incomplete="$(ar_runner_jq_file "agent-review feedback rounds snapshot complete" "${snapshot}" --raw-output '
+      (.data.repository.pullRequest.reviews.pageInfo.hasPreviousPage // false)
+      or (.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false)')"
+  if [[ "${incomplete}" == 'true' ]]; then
+    printf 'wait-for-agent-review: WARN: the PR snapshot is incomplete; review rounds cannot be counted\n' >&2
+    return 1
+  fi
+  bots="$(agent_review_round_login_regex)"
+  thread_heads="$(ar_runner_jq_file "agent-review feedback rounds thread heads" "${snapshot}" \
+    --raw-output --arg bots "${bots}" '
+      def is_bot_login($login):
+        ($bots | split("|")) as $patterns
+        | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
+      .data.repository.pullRequest.reviewThreads.nodes[]
+      | .comments.nodes[0] as $first
+      | select(is_bot_login($first.author.login))
+      | ($first.pullRequestReview.commit.oid // $first.originalCommit.oid // empty)')"
+  while IFS= read -r oid; do
+    if [[ -n "${oid}" ]]; then
+      round_heads["${oid}"]=1
+    fi
+  done <<<"${thread_heads}"
+  # Only reviews that could be feedback (a non-empty body, or CHANGES_REQUESTED) are looked at one by one.
+  review_rows="$(ar_runner_jq_file "agent-review feedback rounds review rows" "${snapshot}" \
+    --raw-output --arg bots "${bots}" '
+      def is_bot_login($login):
+        ($bots | split("|")) as $patterns
+        | any($patterns[]; . as $p | ($login // "") | test($p;"i"));
+      .data.repository.pullRequest.reviews.nodes | to_entries[]
+      | select(is_bot_login(.value.author.login))
+      | select((.value.commit.oid // "") != "")
+      | select(.value.state == "CHANGES_REQUESTED" or ((.value.body // "") | length) > 0)
+      | [.key, .value.commit.oid, (.value.state // "")] | @tsv')"
+  while IFS=$'\t' read -r idx oid state; do
+    [[ -n "${oid}" ]] || continue
+    body="$(ar_runner_jq_file "agent-review feedback rounds review body" "${snapshot}" \
+      --raw-output --argjson idx "${idx}" \
+      '.data.repository.pullRequest.reviews.nodes[$idx].body // ""')"
+    # The login is deliberately empty: that switches off the unconditional CodeRabbit fallback, so only a body
+    # with an explicit finding marker counts.
+    if agent_review_feedback_review_body_is_actionable "${body}" "${state}" ''; then
+      round_heads["${oid}"]=1
+    fi
+  done <<<"${review_rows}"
+  printf '%s' "${#round_heads[@]}"
+}
+
 # One-line posted/addressed/pending summary for operator emails.
 agent_review_feedback_stats_line_for_email() {
   local -r repo="$1"

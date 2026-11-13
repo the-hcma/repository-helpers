@@ -53,7 +53,9 @@ case "$args" in
       printf 'HTTP 403\n' >&2
       exit 1
     fi
-    both='[{"property_name":"agent-reviewers"},{"property_name":"agent-review-enabled"}]'
+    both='[{"property_name":"agent-reviewers"},{"property_name":"agent-review-enabled"},'
+    both+='{"property_name":"agent-review-max-rounds","value_type":"single_select",'
+    both+='"allowed_values":["0","1","2","3","4","5"]}]'
     printf '%s' "${MOCK_SCHEMA:-$both}"
     exit 0
     ;;
@@ -127,7 +129,8 @@ check "the enabled failure names the property" "$out" "custom property 'agent-re
 printf '\n=== agent-reviewers property: undefined or unreadable ===\n'
 out="$(run_check '[{"property_name":"team","value":"x"}]' 1 0 MOCK_SCHEMA='[]')"
 check "an undefined property does not fail the audit" "$out" "rc=0"
-check "an undefined property suggests defining it" "$out" "define org custom properties 'agent-reviewers' and 'agent-review-enabled'"
+check "an undefined property suggests defining it" "$out" \
+  "define org custom properties 'agent-reviewers', 'agent-review-enabled' and 'agent-review-max-rounds'"
 
 out="$(run_check '[{"property_name":"agent-reviewers","value":null}]' 1 0 MOCK_SCHEMA='[{"property_name":"agent-reviewers"}]')"
 check "a missing enabled property still suggests defining it" "$out" "define org custom properties"
@@ -176,6 +179,78 @@ check "a failed schema PUT suggests the settings UI" "$out" "in the org settings
 out="$(run_check '[]' 0 1 MOCK_SCHEMA='[]' MOCK_PUT_FAIL=1 CHECK_REPEAT=2 MOCK_ATTEMPTS="${work_dir}/attempts")"
 check "a failed apply is attempted once across repos" "attempts=$(wc -l <"${work_dir}/attempts")" "attempts=1"
 check "every repo after a failed apply still suggests the settings UI" "suggestions=$(grep -c "define org custom properties" <<<"$out")" "suggestions=2"
+
+
+printf '\n=== agent-review-max-rounds property: values ===\n'
+out="$(run_check '[{"property_name":"agent-review-max-rounds","value":"3"}]' 0 0)"
+check "a valid round cap passes" "$out" "rc=0"
+out="$(run_check '[{"property_name":"agent-review-max-rounds","value":"0"}]' 0 0)"
+check "0 (no cap) is valid" "$out" "rc=0"
+out="$(run_check '[{"property_name":"agent-review-max-rounds","value":null}]' 0 0)"
+check "an unset round cap passes" "$out" "rc=0"
+out="$(run_check '[{"property_name":"agent-review-max-rounds","value":"7"}]' 0 0)"
+check "a round cap above the allowed values fails" "$out" "rc=1"
+check "the failure names the property and the allowed values" "$out" \
+  "custom property 'agent-review-max-rounds' has an invalid value (allowed: 0 1 2 3 4 5)"
+out="$(run_check '[{"property_name":"agent-review-max-rounds","value":"many"}]' 0 0)"
+check "a non-numeric round cap fails" "$out" "rc=1"
+
+out="$(run_check '[{"property_name":"agent-review-max-rounds","value":false}]' 0 0)"
+check "a boolean false round cap is rejected, not read as unset" "$out" "rc=1"
+out="$(run_check '[{"property_name":"agent-review-max-rounds","value":0}]' 0 0)"
+check "a numeric 0 round cap is the allowed value 0" "$out" "rc=0"
+
+printf '\n=== agent-review-max-rounds property: the org schema must define it too ===\n'
+two='[{"property_name":"agent-reviewers"},{"property_name":"agent-review-enabled"}]'
+out="$(run_check '[]' 1 0 MOCK_SCHEMA="$two")"
+check "an org with only the two older properties does not fail the audit" "$out" "rc=0"
+check "it suggests defining the round cap property" "$out" "'agent-review-max-rounds'"
+check "it says what the default is until then" "$out" "the review round cap is the default of 3"
+
+printf '\n=== agent-review-max-rounds property: the org schema must have the right type and values ===\n'
+base='{"property_name":"agent-reviewers"},{"property_name":"agent-review-enabled"},'
+narrow="[${base}"'{"property_name":"agent-review-max-rounds","value_type":"single_select","allowed_values":["3"]}]'
+out="$(run_check '[]' 1 0 MOCK_SCHEMA="$narrow")"
+check "a round cap select limited to 3 is not defined" "$out" "define org custom properties"
+text="[${base}"'{"property_name":"agent-review-max-rounds","value_type":"string"}]'
+out="$(run_check '[]' 1 0 MOCK_SCHEMA="$text")"
+check "a round cap of the wrong type is not defined" "$out" "define org custom properties"
+wide="[${base}"'{"property_name":"agent-review-max-rounds","value_type":"single_select",'
+wide+='"allowed_values":["0","1","2","3","4","5","6","7"]}]'
+out="$(run_check '[]' 1 0 MOCK_SCHEMA="$wide")"
+check "a select that also offers values the loop rejects is not defined" "$out" "define org custom properties"
+out="$(run_check '[]' 0 1 MOCK_SCHEMA="$wide")"
+check "apply-fix redefines a select that offers more than 0 to 5" "$(cat "$capture")" \
+  '"allowed_values":["0","1","2","3","4","5"]'
+out="$(run_check '[]' 0 1 MOCK_SCHEMA="$narrow")"
+check "apply-fix redefines a too-narrow round cap select" "$(cat "$capture")" \
+  "orgs/the-hcma/properties/schema/agent-review-max-rounds"
+
+printf '\n=== agent-review-max-rounds property: --apply-fix defines it ===\n'
+out="$(run_check '[]' 0 1 MOCK_SCHEMA="$two")"
+check "apply-fix succeeds when only the round cap schema is missing" "$out" "rc=0"
+cap="$(cat "$capture")"
+check "apply-fix PUTs the round cap schema" "$cap" "orgs/the-hcma/properties/schema/agent-review-max-rounds"
+check "the round cap schema is a single-select" "$cap" '"value_type":"single_select"'
+check "the round cap schema lists the digit strings" "$cap" '"allowed_values":["0","1","2","3","4","5"]'
+check "the round cap schema is optional" "$cap" '"required":false'
+printf '\n=== an invalid repository value still lets --apply-fix repair the org schema ===\n'
+out="$(run_check '[{"property_name":"agent-review-max-rounds","value":"7"}]' 0 1 MOCK_SCHEMA="$wide")"
+check "a repository with an invalid round cap still fails the audit under apply-fix" "$out" "rc=1"
+check "the invalid value is still reported" "$out" "has an invalid value"
+check "apply-fix redefines the schema that offered 7 even though this repo's value is invalid" "$(cat "$capture")" \
+  '"allowed_values":["0","1","2","3","4","5"]'
+out="$(run_check '[{"property_name":"agent-reviewers","value":["nobody"]}]' 0 1 MOCK_SCHEMA="$wide")"
+check "an invalid reviewers value fails the audit under apply-fix" "$out" "rc=1"
+check "an invalid reviewers value does not stop the schema repair" "$(cat "$capture")" \
+  '"allowed_values":["0","1","2","3","4","5"]'
+out="$(run_check '[{"property_name":"agent-review-enabled","value":"maybe"}]' 0 1 MOCK_SCHEMA="$wide")"
+check "an invalid enabled value fails the audit under apply-fix" "$out" "rc=1"
+check "an invalid enabled value does not stop the schema repair" "$(cat "$capture")" \
+  '"allowed_values":["0","1","2","3","4","5"]'
+out="$(run_check '[{"property_name":"agent-review-max-rounds","value":"7"},{"property_name":"agent-reviewers","value":["nobody"]}]' 0 0)"
+check "two invalid values are both reported" "$out" "'agent-review-max-rounds' has an invalid value"
+check "the reviewers value is reported too" "$out" "'agent-reviewers' has an invalid value"
 
 printf '\n=== static: wiring ===\n'
 # shellcheck disable=SC2016  # literal source text, not an expansion
