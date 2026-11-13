@@ -2327,8 +2327,9 @@ cmd_complete_max_rounds() {
 }
 
 # cmd_loop_complete_at_max_rounds <repo> <pr> <head> <snapshot> — returns 0 after completing the PR at its round
-# cap, 1 when the loop should carry on. It runs once CI is green and no feedback is unanswered (the loop's
-# earlier gates), and before any wait on a reviewer: at the cap another review would only start another round.
+# cap, 1 when the loop should carry on, 2 when a capped head is only BEHIND its base (the caller restacks it and
+# starts a new pass). It runs once CI is green and no feedback is unanswered (the loop's earlier gates), and before any
+# wait on a reviewer: at the cap another review would only start another round.
 # A cap of 0 turns it off. Those gates ran a moment ago, so readiness is read again from the same status that
 # cmd_check and the idle wait use (merge_ready: CLEAN, BLOCKED on a required review, or UNSTABLE while still
 # mergeable; BEHIND, conflicts and every other state are not ready):
@@ -2339,7 +2340,7 @@ cmd_loop_complete_at_max_rounds() {
   local -r pr="$2"
   local -r head="$3"
   local -r snapshot="$4"
-  local max_rounds rounds status status_head ci_ready merge_ready pending
+  local max_rounds rounds status status_head ci_ready merge_ready merge_state pending comments_json
   local signed_off=0
 
   max_rounds="$(agent_review_max_rounds_effective "${repo}")"
@@ -2350,11 +2351,28 @@ cmd_loop_complete_at_max_rounds() {
   if (( rounds < max_rounds )); then
     return 1
   fi
-  status="$(cmd_status "${repo}" "${pr}")"
+  # The unanswered-feedback count must not rest on a best-effort read: a failed issue-comment fetch would look like
+  # "no comment pending". Read the comments strictly once and let cmd_status reuse exactly that read; when it fails
+  # the PR stays in its normal path.
+  if ! comments_json="$(agent_review_pr_issue_comments_json_strict "${repo}" "${pr}")"; then
+    printf 'wait-for-agent-review: PR #%s is at its round cap (%s of %s)' "${pr}" "${rounds}" "${max_rounds}" >&2
+    printf ' but its comments could not be read; continuing\n' >&2
+    return 1
+  fi
+  status="$(AGENT_REVIEW_ISSUE_COMMENTS_PREFETCH="${comments_json}" cmd_status "${repo}" "${pr}")"
   status_head="$(wait_ar_jq_status "${status}" '.head_sha // ""')"
   ci_ready="$(wait_ar_jq_status "${status}" '.ci_ready')"
   merge_ready="$(wait_ar_jq_status "${status}" '.merge_ready')"
+  merge_state="$(wait_ar_jq_status "${status}" '.merge_state_status // ""')"
   pending="$(wait_ar_jq_status "${status}" '.pending_threads // 0')"
+  # A capped head that is only BEHIND its base is restacked here: no reviewer will post another review to push the
+  # loop into its restack path, so it would wait for one until the PR timeout. The next pass reads the new head.
+  if [[ "${status_head}" == "${head}" && "${ci_ready}" == 'true' && "${merge_ready}" != 'true' ]] \
+    && (( pending == 0 )) && [[ "$(agent_review_merge_state_class "${merge_state}")" == 'behind' ]]; then
+    printf 'wait-for-agent-review: PR #%s is at its round cap (%s of %s) and BEHIND its base; restacking\n' \
+      "${pr}" "${rounds}" "${max_rounds}" >&2
+    return 2
+  fi
   if [[ "${status_head}" != "${head}" || "${ci_ready}" != 'true' || "${merge_ready}" != 'true' ]] \
     || (( pending > 0 )); then
     printf 'wait-for-agent-review: PR #%s is at its round cap (%s of %s) but is not ready to complete' \
@@ -2482,7 +2500,7 @@ cmd_loop() {
   local pr_cap cycle_cap check_exit ci_exit pending_exit rate_exit status
   local owner name snapshot complete_exit status_pending check_stdout check_stdout_file
   local transient_retries transient_max transient_sleep restack_exit
-  local coderabbit_active
+  local coderabbit_active cap_exit
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
@@ -2570,8 +2588,21 @@ cmd_loop() {
     cmd_loop_note_head "${head}"
     # Round cap (#861): CI is green and nothing is unanswered here, so a PR that has had its rounds is accepted
     # instead of waiting for another review.
-    if cmd_loop_complete_at_max_rounds "${repo}" "${pr}" "${head}" "${snapshot}"; then
+    cap_exit=0
+    cmd_loop_complete_at_max_rounds "${repo}" "${pr}" "${head}" "${snapshot}" || cap_exit=$?
+    if (( cap_exit == 0 )); then
       return 0
+    fi
+    if (( cap_exit == 2 )); then
+      restack_exit=0
+      cmd_restack "${repo}" "${pr}" || restack_exit=$?
+      if (( restack_exit == 0 )); then
+        last_head=''
+        continue
+      fi
+      agent_review_loop_set_stop 'RESTACK_FAILED' \
+        "${agent_review_loop_last_error:-Restack of a PR at its round cap failed — human intervention required.}"
+      return 4
     fi
     cmd_loop_observe_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}"
     agent_review_sync_active_probe_agent || true

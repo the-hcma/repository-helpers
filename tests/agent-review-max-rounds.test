@@ -228,7 +228,7 @@ for non_reviewer in github-actions dependabot sonarcloud codecov renovate graphi
   out="$(rounds "$(snapshot '' "$(review "${non_reviewer}[bot]" aaa COMMENTED $'**Actionable comments posted: 2**')")")"
   assert_contains "an actionable review body from ${non_reviewer} is not a review round" "$out" '[0]'
 done
-for reviewer in 'copilot-pull-request-reviewer' 'cursor[bot]' 'coderabbitai[bot]' 'mergestorm-vortex' 'chatgpt-codex-connector[bot]'; do
+for reviewer in 'copilot-pull-request-reviewer' 'cursor[bot]' 'coderabbitai[bot]' 'mergestorm[bot]' 'chatgpt-codex-connector[bot]'; do
   out="$(rounds "$(snapshot "$(thread "${reviewer}" aaa)" '')")"
   assert_contains "an inline thread from the review agent ${reviewer} is a round" "$out" '[1]'
 done
@@ -314,14 +314,20 @@ run_cap() {
   env -u AGENT_REVIEW_MAX_ROUNDS ROUNDS="${ROUNDS:-0}" CAP="${CAP:-3}" PENDING="${PENDING:-0}" \
     CI_READY="${CI_READY:-true}" MERGE_READY="${MERGE_READY:-true}" STATUS_HEAD="${STATUS_HEAD:-0123456789abcdef}" \
     SIGNED="${SIGNED:-0}" TITLE_OK="${TITLE_OK:-1}" EMAIL_FAIL="${EMAIL_FAIL:-0}" CAP_LOG="${cap_log}" \
+    MERGE_STATE="${MERGE_STATE:-CLEAN}" COMMENTS_FAIL="${COMMENTS_FAIL:-0}" \
     bash -c "
       set -uo pipefail
       source '${wait_script}'
       agent_review_max_rounds_effective() { printf '%s' \"\${CAP}\"; }
       agent_review_feedback_rounds_from_snapshot() { [[ \"\${ROUNDS}\" != fail ]] || return 1; printf '%s' \"\${ROUNDS}\"; }
+      agent_review_pr_issue_comments_json_strict() {
+        [[ \"\${COMMENTS_FAIL}\" != 1 ]] || return 1
+        printf '[]'
+      }
       cmd_status() {
-        printf '{\"head_sha\":\"%s\",\"ci_ready\":%s,\"merge_ready\":%s,\"pending_threads\":%s}' \
-          \"\${STATUS_HEAD}\" \"\${CI_READY}\" \"\${MERGE_READY}\" \"\${PENDING}\"
+        printf 'PREFETCH=%s\n' \"\${AGENT_REVIEW_ISSUE_COMMENTS_PREFETCH:-unset}\" >>\"\${CAP_LOG}\"
+        printf '{\"head_sha\":\"%s\",\"ci_ready\":%s,\"merge_ready\":%s,\"merge_state_status\":\"%s\",\"pending_threads\":%s}' \
+          \"\${STATUS_HEAD}\" \"\${CI_READY}\" \"\${MERGE_READY}\" \"\${MERGE_STATE}\" \"\${PENDING}\"
       }
       agent_review_agent_signed_off_on_head() { [[ \"\${SIGNED}\" == 1 ]]; }
       pr_cc_ensure_pr_title() { [[ \"\${TITLE_OK}\" == 1 ]]; }
@@ -333,6 +339,45 @@ run_cap() {
       cmd_loop_complete_at_max_rounds the-hcma/example 7 0123456789abcdef '{}' || rc=\$?
       echo \"rc=\$rc\"" 2>&1
 }
+
+printf '\n=== the cap gate fails closed on an unreadable comment list and restacks a BEHIND capped head ===\n'
+out="$(ROUNDS=3 CAP=3 COMMENTS_FAIL=1 run_cap)"
+assert_contains 'a failed issue-comment read keeps the PR in its normal path' "$out" 'rc=1'
+assert_contains 'the failed read is explained' "$out" 'its comments could not be read; continuing'
+assert_not_contains 'a failed read sends no cap email' "$(cat "${cap_log}")" 'EMAIL'
+out="$(ROUNDS=3 CAP=3 run_cap)"
+assert_contains 'status reuses the comment read the gate made' "$(cat "${cap_log}")" 'PREFETCH=[]'
+out="$(ROUNDS=3 CAP=3 MERGE_READY=false MERGE_STATE=BEHIND run_cap)"
+assert_contains 'a capped BEHIND head asks the caller to restack (rc 2)' "$out" 'rc=2'
+assert_contains 'the restack is announced' "$out" 'BEHIND its base; restacking'
+assert_not_contains 'a capped BEHIND head sends no cap email yet' "$(cat "${cap_log}")" 'EMAIL'
+out="$(ROUNDS=3 CAP=3 MERGE_READY=false MERGE_STATE=BEHIND CI_READY=false run_cap)"
+assert_contains 'a BEHIND head with CI not ready is not restacked by the gate' "$out" 'rc=1'
+out="$(ROUNDS=3 CAP=3 MERGE_READY=false MERGE_STATE=BEHIND PENDING=1 run_cap)"
+assert_contains 'a BEHIND head with unanswered feedback is not restacked by the gate' "$out" 'rc=1'
+out="$(ROUNDS=3 CAP=3 MERGE_READY=false MERGE_STATE=DIRTY run_cap)"
+assert_contains 'a conflicting capped head stays in its normal path' "$out" 'rc=1'
+assert_not_contains 'a conflicting head is not restacked' "$out" 'restacking'
+
+# login_defs — the default-login constant and its accessor, lifted from the library (it needs the runner to source).
+login_defs_file="${work_dir}/login-defs"
+login_defs() {
+  awk '/^agent_review_round_default_logins/ || /^agent_review_round_login_regex\(\) \{/,/^}/' \
+    "${script_dir}/../scripts/lib/agent-review-feedback"
+}
+
+printf '\n=== the default round logins are exact review agents ===\n'
+login_defs >"${login_defs_file}"
+for login in coderabbitai 'coderabbitai[bot]' copilot-pull-request-reviewer 'cursor[bot]' bugbot chatgpt-codex-connector; do
+  login_rc=0
+  bash -c "source ${login_defs_file}; [[ \"\$1\" =~ \$(agent_review_round_login_regex) ]]" _ "${login}" || login_rc=$?
+  assert_contains "the review agent ${login} counts as an agent" "login=${login} rc=${login_rc}" 'rc=0'
+done
+for login in vortex-maintainer cursor-user human-coderabbit dependabot 'github-actions[bot]' mycopilot; do
+  login_rc=0
+  bash -c "source ${login_defs_file}; [[ \"\$1\" =~ \$(agent_review_round_login_regex) ]]" _ "${login}" || login_rc=$?
+  assert_contains "the login ${login} does not count as an agent" "login=${login} rc=${login_rc}" 'rc=1'
+done
 
 printf '\n=== below the cap the loop carries on ===\n'
 out="$(ROUNDS=2 CAP=3 run_cap)"
@@ -437,7 +482,8 @@ assert_contains 'the snapshot query asks for the original commit of each thread 
 assert_contains 'the snapshot query asks for the commit of each review' "${snapshot_src}" 'commit { oid }'
 assert_contains 'the snapshot query asks for the review state and body' "${snapshot_src}" 'state'
 assert_contains 'the cap completion returns success from the loop' "${loop_src}" \
-  'if cmd_loop_complete_at_max_rounds'
+  'cmd_loop_complete_at_max_rounds "${repo}" "${pr}" "${head}" "${snapshot}" || cap_exit=$?'
+assert_contains 'a capped BEHIND head is restacked, then a new pass starts' "${loop_src}" 'if (( cap_exit == 2 ))'
 complete_line="$(line_of 'agent_review_assert_snapshot_complete "${snapshot}"')"
 if [[ -n "$complete_line" && -n "$cap_line" ]] && (( complete_line < cap_line )); then
   pass_case 'the snapshot is asserted complete before the cap counts rounds from it'
