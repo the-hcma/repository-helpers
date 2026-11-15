@@ -52,7 +52,7 @@ git config remote.pushDefault origin     # if multiple remotes exist (skips remo
 
 When switching a consumer repo to `gh-stack` via `.github/stacking-tool`:
 
-1. Update `AGENTS.md` stacking/merge docs: merge with `${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/dev/merge-stack --pr <n>` from the consumer worktree (it uses `gh stack merge` for a stacked PR and the merge queue or auto-merge otherwise), only after the user explicitly confirms; do not use `merge-it` or run `gh pr merge` or `gh stack merge` by hand.
+1. Update `AGENTS.md` stacking/merge docs: merge with `${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/dev/merge-stack --pr <n>` from the feature worktree of the repository that owns the PR (it uses `gh stack merge` for a stacked PR and the merge queue or auto-merge otherwise), only after the user explicitly confirms; do not use `merge-it` or run `gh pr merge` or `gh stack merge` by hand.
 2. Align `.agents/rules/pr-ship-and-review.md` submit block with the gh-stack-only canonical template (written by `github-repo-lint --apply-fix`, or copy from `${REPOSITORY_HELPERS_DIR}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md` / https://github.com/the-hcma/repository-helpers/blob/main/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md; plus thin `.cursor/rules/pr-ship-and-review.mdc` shim).
 3. Delete root `GRAPHITE.md` (this skill is SSOT).
 4. Keep `.agents/rules/stacking-tool.md` (+ Cursor shim) in sync with the consumer template.
