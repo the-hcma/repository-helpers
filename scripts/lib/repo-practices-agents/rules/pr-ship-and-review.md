@@ -35,17 +35,14 @@ Run this repository's quality gates from the stack worktree (tests, linters, etc
 
 ## 2. Commit and submit
 
-Only after §1 quality gates pass. **Read** `.github/stacking-tool` (`graphite` or `gh-stack`) and follow `.cursor/rules/stacking-tool.mdc` — do not mix backends on the same stack.
+Only after §1 quality gates pass. **Read** `.github/stacking-tool` (it must say `gh-stack`) and follow `.cursor/rules/stacking-tool.mdc`.
+
+The block below is a **template, not a script to paste**: every `<…>` is a placeholder to fill in, and every line is commented out so that pasting it runs nothing. Stage the named files of this change, never `git add -A` (it stages everything in the worktree, secrets included). The gh-stack skill (`${rh}/.agents/skills/gh-stack/SKILL.md`) says why `init` and `add` take a branch name.
 
 ```bash
-# When marker is graphite (apply-fix comments the inactive backend):
-gt create <stack>/<topic> -m 'feat: …'   # or gt modify -m '…'
-gt submit --publish --no-interactive
-
-# When marker is gh-stack:
-# gh stack init <stack>/<topic>   # or gh stack add <branch> for a higher layer
-#   (the branch argument keeps it non-interactive)
-# git add -A && git commit -m 'feat: …'
+# gh stack init <stack>/<topic>      # or: gh stack add <branch>, for a higher layer
+# git add <path> [<path> …]          # only the files that belong to this layer
+# git commit -m '<type>: <summary>'
 # gh stack submit --auto --open --remote origin
 ```
 
@@ -126,4 +123,4 @@ When `check` reports `complete_ready: true`:
 
 `complete_ready` requires an agent sign-off on the current head (not a bare CodeRabbit commit status / rate-limit stub). This emails `AGENT_REVIEW_REPORT_TO`. It does **not** run `gh pr review --approve` (self-approve is skipped; merge stays an explicit operator step).
 
-Never add the `merge-it` label: it is ignored and the org no longer uses Graphite merge queue. Merge only after the user explicitly confirms, and only with `scripts/dev/merge-stack --pr <n>` (from the PR's worktree; in a consumer repo `${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/dev/merge-stack --pr <n>`): it picks the right command for the repository's merge setup (`gh stack merge` for a stacked PR, the merge queue or auto-merge otherwise) and confirms the enqueue. For a PR in a gh stack, pass the top PR's number and run it from that stack's worktree: it refuses a lower layer, and it lands the top PR and every open PR below it, so name those PRs and get confirmation for the whole stack first. Do not call `gh pr merge` or `gh stack merge` by hand, do not add the `merge-it` label, and do not pipe the command through `tail` or `head`: read its exit status and output.
+Never add the `merge-it` label: Graphite is retired (repository-helpers#772), so the label does nothing and `merge-stack` refuses a `graphite` marker (see `${rh}/scripts/dev/merge-stack --help`). Merge only after the user explicitly confirms, and only with `${rh}/scripts/dev/merge-stack --pr <n>`, run from the feature worktree of the repository that owns the PR: it picks the right command for the repository's merge setup (`gh stack merge` for a stacked PR, the merge queue or auto-merge otherwise) and confirms the enqueue. For a PR in a gh stack, pass the top PR's number and run it from that stack's worktree: it refuses a lower layer, and it lands the top PR and every open PR below it (as `merge-stack --help` says), so name those PRs and get confirmation for the whole stack first. Do not call `gh pr merge` or `gh stack merge` by hand, do not add the `merge-it` label, and do not pipe the command through `tail` or `head`: read its exit status and output.
