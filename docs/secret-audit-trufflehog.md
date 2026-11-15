@@ -123,7 +123,7 @@ Rules:
   | entry stale (>90d) or invalid | SUGGEST | **FAIL** | **FAIL** `SECRET_AUDIT_INTAKE_STALE` |
   | entry fresh + valid | OK | OK | OK |
 
-  The CI `--all --strict-onboarding` audit does not check intake (no ledger on the runner) — acceptable: the hard gate is operator-run `--new-repo`, and the nightly sweep is the ongoing coverage.
+  The CI `--all --strict-onboarding` audit does not check intake (no ledger on the runner) — acceptable: the hard gate is operator-run `--new-repo`, and the nightly sweep is the ongoing coverage. `GITHUB_REPO_LINT_INTAKE_ADVISORY=1` turns every **FAIL** above into a SUGGEST; `scripts/dev/pre-pr-checks` sets it for the audit runs it makes, because a developer host's ledger covers only what that host scanned and is not evidence about the diff under review (repository-helpers#874).
 - **On-demand:** `scripts/secret-audit --repo OWNER/NAME --write-marker` upserts one entry (scans first, records only on a clean result). No PR, no working-tree write.
 - **Never** write `status=clean` when TruffleHog reports matching results.
 
