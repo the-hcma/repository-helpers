@@ -28,8 +28,8 @@ settings from making claude silently answer from another model (the author, on a
 refuses). Behind a gateway that maps aliases to its own ids, `opus` also needs `ANTHROPIC_DEFAULT_OPUS_MODEL`.
 The review must end with a verdict:
 `VERDICT: CLEAN`, or one `FINDING: <file>: <problem>` line per finding followed by `VERDICT: FINDINGS`. Anything
-else is an error, never a clean pass. A `FINDING: none` line (the word alone, then the end of the line, or punctuation
-and a space) is not a finding; any other `FINDING:` line is, and a `VERDICT: CLEAN` never hides it.
+else is an error, never a clean pass. A `FINDING: none` line (the word alone, then the end of the line or . , ; ! and a space,
+and nothing file-like after it) is not a finding; any other `FINDING:` line is, and a `VERDICT: CLEAN` never hides it.
 
 Guard rails:
   - The reviewer must differ from the author: when MODEL_REVIEW_AUTHOR_MODEL (else ANTHROPIC_MODEL) is set and
@@ -176,10 +176,25 @@ model_matches() {
 answered_models=""
 
 # A `FINDING:` line that only says there is nothing to report ("FINDING: none. Nothing to fix.") is not a
-# finding (#870). `none` has to stand alone: the end of the line, or at least one punctuation character and
-# then a space or the end. So "none of the new paths release the lock", a file called none.c and
-# "nonexistent" all still count. Anything unclear stays a finding, so the gate stays closed.
-readonly none_finding_re='^FINDING:[[:space:]]*none([.,;:!]+([[:space:]]|$)|$)'
+# finding (#870). The gate stays closed for anything that could be a real finding, so a line is ignored only
+# when all of this holds:
+#   - after `FINDING:` comes the word `none` alone: the end of the line, or `.` `,` `;` `!` and then a space or
+#     the end. A colon is not accepted (`FINDING: none: wrong exit status` is the `<file>: <problem>` form for a
+#     file called none), nor is "none of the new paths release the lock" or "nonexistent";
+#   - the rest of the line mentions nothing file-like (`a.txt`, `b.sh`, a `/`): "none, but a.txt leaks the fd"
+#     is a finding with a polite opening, and a `VERDICT: CLEAN` must not hide it.
+readonly none_finding_re='^FINDING:[[:space:]]*none([.,;!]+([[:space:]]|$)|$)'
+readonly file_like_re='[[:alnum:]_-]\.[[:alpha:]]|/'
+
+# is_none_finding <line>: true when the line is a "nothing to report" line that may be ignored.
+is_none_finding() {
+  local -r line="$1"
+  local rest
+  grep --quiet --ignore-case --extended-regexp "$none_finding_re" <<<"$line" || return 1
+  rest="$(sed --regexp-extended 's/^FINDING:[[:space:]]*[Nn][Oo][Nn][Ee][.,;!]*//' <<<"$line")"
+  ! grep --quiet --extended-regexp "$file_like_re" <<<"$rest"
+}
+
 
 unwrap_default_review() {
   local -r out_file="$1" model="$2" state_file="$3" head="$4" base="$5"
@@ -357,7 +372,7 @@ main() {
   local dir="$PWD" base_ref="" max_runs=8 timeout_s=540 state_dir="" decline="" detect=0
   local top branch head base_commit range_from key key_hash state_file findings_file dirty recorded runs
   local diff_file prompt_file out_file max_bytes diff_bytes review_rc findings_count word author_note
-  local result count detail last_line attempts findings_text
+  local result count detail last_line attempts findings_text finding_line
   local -a cmd=()
 
   while [[ $# -gt 0 ]]; do
@@ -521,8 +536,13 @@ main() {
 
   # Real findings only: every `FINDING: ` line except the "none" ones. A closing `VERDICT: CLEAN` never
   # overrides one, so a reviewer cannot hide a finding behind a clean verdict.
-  findings_text="$(grep '^FINDING: ' "$out_file" | grep --invert-match --ignore-case --extended-regexp \
-    "$none_finding_re" || true)"
+  findings_text=""
+  while IFS= read -r finding_line; do
+    if ! is_none_finding "$finding_line"; then
+      findings_text+="${finding_line}"$'\n'
+    fi
+  done < <(grep '^FINDING: ' "$out_file" || true)
+  findings_text="${findings_text%$'\n'}"
   findings_count=0
   if [[ -n "$findings_text" ]]; then
     findings_count="$(grep --count '' <<<"$findings_text")"
