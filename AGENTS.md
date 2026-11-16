@@ -616,4 +616,6 @@ scripts/dev/pre-pr-checks            # preferred: planned jobs + main worktree g
 bash -n … && shellcheck -S info … && actionlint … && bash tests/*.test
 ```
 
+CI also runs the whole suite on macOS (`ci-part-tests-macos` in `.github/workflows/ci.yml`: Homebrew bash 5 and the GNU userland from the Runtime section, BSD `pgrep` and `ps` as macOS ships them), and the required `shellcheck + tests` check waits for it, so a test that only breaks on macOS fails CI instead of a developer host (#871). The runner label is pinned (`macos-15`, never `macos-latest`) because GitHub retires macOS images and a job on a retired label is cancelled about a second after it starts, which would leave the required check unable to pass: bump the label, and the comment above it, when GitHub announces the retirement.
+
 No PR may be merged with a failing CI check. No exceptions.
