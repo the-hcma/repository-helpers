@@ -45,6 +45,12 @@ case "${1:-}" in
       exit 0
     fi
     if [[ -n "${STUB_STDERR:-}" ]]; then printf "%s\n" "$STUB_STDERR" >&2; fi
+    # STUB_MOVE_HEAD_DIR: the first review call moves HEAD of that repository, as a commit made while the wrapper
+    # waits to retry would.
+    if [[ -n "${STUB_MOVE_HEAD_DIR:-}" && ! -e "${STUB_LOG}.moved" ]]; then
+      : > "${STUB_LOG}.moved"
+      git -C "$STUB_MOVE_HEAD_DIR" commit --quiet --allow-empty --message 'moved while the review ran'
+    fi
     # STUB_FIRST_REVIEW_FILE answers only the first review call of a test, the rest use STUB_REVIEW_FILE.
     if [[ -n "${STUB_FIRST_REVIEW_FILE:-}" && ! -e "${STUB_LOG}.first" ]]; then
       : > "${STUB_LOG}.first"
@@ -528,6 +534,39 @@ assert_contains 'the help documents the connection-error skip' "$(bash "$wrapper
 run_wrapper "${work}/s-hint"
 run_wrapper "${work}/s-hint"
 assert_contains 'a replayed findings result points at --decline' "$out" '--decline "<reason>"'
+
+printf '\n=== a retry never reviews a head that moved while it waited (#879) ===\n'
+moving="${work}/moving"
+git clone --quiet --branch feature "$repo" "$moving" 2> /dev/null
+git -C "$moving" config user.name test
+git -C "$moving" config user.email test@example.invalid
+git -C "$moving" update-ref refs/remotes/origin/main "$(git -C "$repo" rev-parse main)"
+: > "${work}/stub.log"; rm -f "${work}/stub.log.moved"
+rc=0
+out="$(CODERABBIT_BIN="$stub" STUB_LOG="${work}/stub.log" STUB_REVIEW_FILE="$connection_review" \
+  STUB_MOVE_HEAD_DIR="$moving" bash "$wrapper" --dir "$moving" --state-dir "${work}/s-moved" 2>&1)" || rc=$?
+assert_eq 'a retry after HEAD moved is a skip' "$rc" '3'
+assert_contains 'the skip says HEAD moved and nothing was recorded' "$out" 'HEAD moved while waiting to retry; nothing recorded'
+assert_eq 'the moved head was not reviewed a second time' "$(review_calls)" '1'
+assert_eq 'nothing was written to the state directory' "$(find "${work}/s-moved" -type f 2> /dev/null | wc -l | tr -d ' ')" '0'
+: > "${work}/stub.log"
+rc=0
+out="$(CODERABBIT_BIN="$stub" STUB_LOG="${work}/stub.log" STUB_REVIEW_FILE="$clean_review" \
+  bash "$wrapper" --dir "$moving" --state-dir "${work}/s-moved" 2>&1)" || rc=$?
+assert_eq 'the next run reviews the current head' "$rc" '0'
+assert_eq 'with one review' "$(review_calls)" '1'
+
+printf '\n=== a recorded decline wins over a result that arrives after it (#879) ===\n'
+export STUB_REVIEW_FILE="$findings_review"
+run_wrapper "${work}/s-prec"
+run_wrapper "${work}/s-prec" --decline 'accepted while another review was still running'
+assert_eq 'the decline is accepted' "$rc" '0'
+prec_state="$(ls "${work}"/s-prec/*.log)"
+read -r prec_head prec_base _ <<<"$(head -1 "$prec_state")"
+printf '%s %s findings 2\n' "$prec_head" "$prec_base" >> "$prec_state"
+run_wrapper "${work}/s-prec"
+assert_eq 'a findings result appended after the decline does not undo it' "$rc" '0'
+assert_contains 'the replay is the decline, with its reason' "$out" 'accepted while another review was still running (replayed)'
 
 printf '\n=== a decline needs no installed CLI and fails when it cannot be recorded (#879) ===\n'
 rc=0
