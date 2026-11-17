@@ -12,26 +12,59 @@ source "${script_dir}/lib/test-assert"
 test_init
 
 # uses_refs <file>: one "<line><TAB><value><TAB><comment>" per `uses:` step of a workflow or action file. The key
-# may be quoted (YAML allows "uses":), comment lines (the `#   uses: ...` examples in the composite actions) are
-# not steps, and the value loses its separation whitespace and enclosing quotes but nothing inside them. The
-# trailing comment (a `# v6.1.0` release annotation) is kept: the policy requires it on a SHA pin.
+# may be quoted (YAML allows "uses":) and a step may be a flow mapping ({uses: x@y}). Comment lines (the
+# `#   uses: ...` examples in the composite actions) are not steps, and neither is the content of a block scalar
+# (`run: |` text that happens to contain "uses: ..."): it is skipped by indentation. The value loses its
+# separation whitespace and enclosing quotes but nothing inside them. The trailing comment (a `# v6.1.0`
+# release annotation) is kept: the policy requires it on a SHA pin.
 uses_refs() {
   awk '
+    function emit(lineno, value, comment) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", comment)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      if (length(value) >= 2 && ((value ~ /^".*"$/) || (value ~ /^\047.*\047$/))) {
+        value = substr(value, 2, length(value) - 2)
+      }
+      printf "%d\t%s\t%s\n", lineno, value, comment
+    }
+    BEGIN { block_parent = -1 }
+    {
+      line = $0
+      match(line, /^ */)
+      indent = RLENGTH
+      if (block_parent >= 0) {
+        if (line ~ /^[[:space:]]*$/ || indent > block_parent) next
+        block_parent = -1
+      }
+    }
     /^[[:space:]]*#/ { next }
+    /:[[:space:]]*[|>][-+0-9]*[[:space:]]*(#.*)?$/ {
+      # A block scalar starts here: its content is indented deeper than the mapping that owns the key.
+      block_parent = indent
+      if (line ~ /^[[:space:]]*-[[:space:]]/) { block_parent = indent + 2 }
+      next
+    }
     /^[[:space:]]*-?[[:space:]]*["\047]?uses["\047]?:[[:space:]]/ {
-      value = $0
+      value = line
       sub(/^[[:space:]]*-?[[:space:]]*["\047]?uses["\047]?:[[:space:]]*/, "", value)
       comment = ""
       if (match(value, /[[:space:]]+#.*$/)) {
         comment = substr(value, RSTART)
         value = substr(value, 1, RSTART - 1)
       }
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", comment)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-      if (length(value) >= 2 && ((value ~ /^".*"$/) || (value ~ /^\047.*\047$/))) {
-        value = substr(value, 2, length(value) - 2)
+      emit(FNR, value, comment)
+      next
+    }
+    /\{[^}]*["\047]?uses["\047]?:[^}]*\}/ {
+      # Flow mapping: {uses: vendor/tool@v2, name: x}. The value runs to the next comma or the closing brace.
+      value = line
+      sub(/^.*\{[^}]*["\047]?uses["\047]?:[[:space:]]*/, "", value)
+      sub(/[,}].*$/, "", value)
+      comment = ""
+      if (match(line, /\}[[:space:]]+#.*$/)) {
+        comment = substr(line, RSTART + 1)
       }
-      printf "%d\t%s\t%s\n", FNR, value, comment
+      emit(FNR, value, comment)
     }
   ' "$1"
 }
@@ -159,6 +192,25 @@ steps:
   - uses: vendor/unannotated@${sha}
   - uses: actions/cache@${sha} # v6.1.0
 YAML
+# Text that only looks like a step: a block scalar (a shell heredoc in a run: step) and a folded scalar. Beside
+# them a compliant checkout, a flow-mapping step with a violation and one with a compliant SHA pin.
+cat >"${fixture_dir}/shapes.yml" <<YAML
+steps:
+  - uses: actions/checkout@v7.0.1
+  - name: heredoc
+    run: |
+      cat <<EOF
+      uses: vendor/in-heredoc@v2
+      EOF
+  - name: folded
+    run: >-
+      echo
+      uses: vendor/in-folded@v2
+
+  - {uses: vendor/flow-bad@v3, name: flow}
+  - { "uses": "vendor/flow-ok@${sha}", name: ok } # v1.0.0
+  - uses: actions/setup-node@v7.1.0
+YAML
 assert_contains 'a compliant file with quoted keys, quoted values and a commented-out step has no problem' \
   "problems=[$(file_problems workflow "${fixture_dir}/ok.yml")]" 'problems=[]'
 assert_contains 'the compliant file has four steps, so the commented-out one was not counted' \
@@ -170,6 +222,17 @@ assert_contains 'a .yaml workflow is checked: a third-party tag behind a quoted 
 assert_contains 'a SHA pin with no release comment is found' "$bad_problems" "4:vendor/unannotated@${sha} (a SHA pin needs its release tag"
 assert_contains 'a first-party SHA pin in a workflow is found' "$bad_problems" "5:actions/cache@${sha} (a first-party action in a workflow"
 assert_not_contains 'the compliant step beside the violations is not reported' "$bad_problems" '2:actions/checkout'
+# The whole result, not a substring: a stray match elsewhere cannot make the check pass or fail.
+assert_contains 'the shapes file reports exactly the flow-mapping violation, and nothing from the scalars' \
+  "problems=[$(file_problems workflow "${fixture_dir}/shapes.yml")]" \
+  'problems=[ 13:vendor/flow-bad@v3 (a third-party action must be a full commit SHA);]'
+shape_refs="$(uses_refs "${fixture_dir}/shapes.yml" | cut -f2 | paste -sd' ' -)"
+assert_contains 'the steps read from the shapes file are the real ones, in order' \
+  "refs=[${shape_refs}]" "refs=[actions/checkout@v7.0.1 vendor/flow-bad@v3 vendor/flow-ok@${sha} actions/setup-node@v7.1.0]"
+assert_not_contains 'heredoc and folded-scalar text is not read as a step' "$shape_refs" 'in-heredoc'
+assert_not_contains 'folded-scalar text is not read as a step either' "$shape_refs" 'in-folded'
+assert_contains 'a flow-mapping step keeps its trailing release comment' \
+  "$(uses_refs "${fixture_dir}/shapes.yml" | grep -F "flow-ok")" $'\t''# v1.0.0'
 refs="$(uses_refs "${fixture_dir}/ok.yml")"
 assert_contains 'a trailing release comment is returned with its step' "$refs" "vendor/tool@${sha}"$'\t''# v1.2.3'
 assert_contains 'enclosing quotes are removed from the value' "$refs" $'\t'"vendor/quoted@${sha}"$'\t'
