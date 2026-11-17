@@ -311,6 +311,17 @@ Disable org repos in [Graphite merge queue settings](https://app.graphite.com/se
 
 Repos identified as uv Python projects (presence of `uv.lock` + `pyproject.toml` at the repo root) must include `.github/workflows/cve-check.yml`, a scheduled daily `pip-audit` run that classifies JSON output (CVE vs transient failure), retries only transient tool errors, and opens or updates a `security/cve` issue when vulnerabilities are found. The job succeeds when CVEs are found **and** issue notification succeeds; it fails if pip-audit reports CVEs but `gh issue` create/comment fails (so silent notification loss does not occur).
 
+### GitHub Actions pin policy
+
+One policy for the `uses:` steps of this repository, checked by `tests/actions-pin-policy.test`:
+
+- A first-party `actions/*` action is pinned to a full release tag (`actions/checkout@v7.0.1`, never a floating `@v7`): `dep-updater` bumps tag pins and never touches a commit-SHA pin, and this repository has no `dependabot.yml`, so a SHA pin on a first-party action would never be updated.
+- Every other third-party action is pinned to a full commit SHA, with the release tag in a trailing comment (`# v6.1.0`).
+- Every `uses:` inside a composite action of this repository (`actions/*/action.yml`) is a full commit SHA, first-party ones included, because a consumer evaluates nested steps against its own `sha_pinning_required` setting (see the pnpm section below).
+- A local `./path` reference needs no pin.
+
+The review tools do not know this policy by default: the CodeRabbit CLI flagged a first-party tag pin as a major finding in #877. Answer such a finding with a logged `--decline` (above) that cites this section.
+
 ### pnpm / Corepack CI
 
 Repos with `pnpm-lock.yaml` (root or `web/`) must:

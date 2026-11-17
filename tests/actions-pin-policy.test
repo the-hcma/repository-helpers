@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# The GitHub Actions pin policy of AGENTS.md ("GitHub Actions pin policy") holds for this repository (#879).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+rh_root="${script_dir%/tests}"
+readonly rh_root
+
+# shellcheck source=tests/lib/test-assert
+source "${script_dir}/lib/test-assert"
+test_init
+
+# uses_refs <file>: one "<line>:<value>" per `uses:` step of a workflow or action file. Comment lines (the
+# `#   uses: ...` examples in the composite actions) are not steps and a trailing `# v6.1.0` is dropped.
+uses_refs() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*-?[[:space:]]*uses:[[:space:]]/ {
+      value = $0
+      sub(/^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*/, "", value)
+      sub(/[[:space:]]+#.*$/, "", value)
+      gsub(/["\047]/, "", value)
+      print FNR ":" value
+    }
+  ' "$1"
+}
+
+local_re='^\./'
+first_party_tag_re='^actions/[A-Za-z0-9._-]+(/[A-Za-z0-9._/-]+)?@v[0-9]+\.[0-9]+\.[0-9]+$'
+sha_re='^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(/[A-Za-z0-9._/-]+)?@[0-9a-f]{40}$'
+
+printf '\n=== static: workflows use a first-party release tag or a full commit SHA ===\n'
+checked=0
+for workflow in "${rh_root}"/.github/workflows/*.yml; do
+  rel="${workflow#"${rh_root}"/}"
+  bad=""
+  while IFS=: read -r line value; do
+    [[ -n "$value" ]] || continue
+    checked=$(( checked + 1 ))
+    if [[ "$value" =~ $local_re || "$value" =~ $first_party_tag_re || "$value" =~ $sha_re ]]; then
+      continue
+    fi
+    bad+=" ${line}:${value}"
+  done < <(uses_refs "$workflow")
+  if [[ -z "$bad" ]]; then
+    pass_case "${rel} follows the pin policy"
+  else
+    fail_case "${rel} breaks the pin policy:${bad}"
+  fi
+done
+if (( checked > 0 )); then
+  pass_case 'the workflows have uses: steps, so the policy check did not pass by finding nothing'
+else
+  fail_case 'no uses: step was found in .github/workflows, so nothing was checked'
+fi
+
+printf '\n=== static: composite actions pin every nested action to a full commit SHA ===\n'
+composites=0
+for action in "${rh_root}"/actions/*/action.yml; do
+  [[ -f "$action" ]] || continue
+  composites=$(( composites + 1 ))
+  rel="${action#"${rh_root}"/}"
+  bad=""
+  while IFS=: read -r line value; do
+    [[ -n "$value" ]] || continue
+    if [[ "$value" =~ $local_re || "$value" =~ $sha_re ]]; then
+      continue
+    fi
+    bad+=" ${line}:${value}"
+  done < <(uses_refs "$action")
+  if [[ -z "$bad" ]]; then
+    pass_case "${rel} pins its nested actions to a commit SHA"
+  else
+    fail_case "${rel} has a nested action that is not a full commit SHA:${bad}"
+  fi
+done
+if (( composites > 0 )); then
+  pass_case 'the composite actions were found, so the nested-pin check did not pass by finding nothing'
+else
+  fail_case 'no actions/*/action.yml was found'
+fi
+
+printf '\n=== functional: the checker tells a tag, a SHA and a floating ref apart ===\n'
+sample="$(mktemp)"
+cat >"$sample" <<'YAML'
+steps:
+  - uses: actions/checkout@v7.0.1
+  - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+  - uses: ./local/action
+  - uses: some/third-party@v2
+  - uses: actions/checkout@v7
+  - uses: other/tool@main
+  # - uses: commented/out@v1
+YAML
+verdicts=""
+while IFS=: read -r _ value; do
+  if [[ "$value" =~ $local_re || "$value" =~ $first_party_tag_re || "$value" =~ $sha_re ]]; then
+    verdicts+="ok "
+  else
+    verdicts+="bad "
+  fi
+done < <(uses_refs "$sample")
+rm -f -- "$sample"
+assert_contains 'a first-party tag, a SHA and a local path pass; a third-party tag, a floating major and a branch fail' \
+  "$verdicts" 'ok ok ok bad bad bad'
+
+printf '\n=== static: AGENTS.md states the policy in one place ===\n'
+agents="$(<"${rh_root}/AGENTS.md")"
+assert_contains 'AGENTS.md has the GitHub Actions pin policy section' "$agents" '### GitHub Actions pin policy'
+assert_contains 'the policy says first-party actions stay on release tags' "$agents" 'first-party `actions/*` action is pinned to a full release tag'
+assert_contains 'the policy says every other action is pinned to a commit SHA' "$agents" 'Every other third-party action'
+
+test_summary
