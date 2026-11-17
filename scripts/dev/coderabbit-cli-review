@@ -11,6 +11,14 @@ source "${script_dir}/../lib/runner-bootstrap"
 # make jq reject the whole stream and silently drop the findings.
 readonly jq_events='def evs: [inputs | fromjson? | objects];'
 
+# One line per error event, "<headline><TAB><message>": the headline is the first line of the message, which names
+# the kind of error and is all that is classified (a stack trace below a real error that mentions a connection
+# must not turn it into a connection failure); the message has its newlines flattened (a stack trace is part of
+# the same message, not another one) and is cut to 300 characters for the report.
+readonly jq_error_lines='evs | map(select(.type == "error")) | .[]
+  | ((.message // .error // "unknown") | tostring) as $text
+  | [($text | split("\n") | .[0]), ($text | gsub("[\r\n]+"; " ") | .[0:300])] | @tsv'
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -206,7 +214,7 @@ record_result() {
 
 main() {
   local dir="$PWD" base_ref="" max_runs=2 timeout_s=1200 state_dir="" decline=""
-  local detect=0 flag attempt retry_delay_s transport_failure cli_stderr error_messages candidate
+  local detect=0 flag attempt retry_delay_s transport_failure cli_stderr error_messages candidate error_headline
   local cli top branch head base_commit key key_hash state_file findings_file dirty
   local recorded recorded_result recorded_findings runs usage_file remaining
   local help_text ndjson findings_count review_rc review_id error_message cli_version
@@ -368,12 +376,11 @@ main() {
       # A transport failure needs every error event to be one. A single error about the review itself decides
       # the attempt: it is reported as the error it is, and connection text elsewhere never replaces it. The
       # CLI's stderr only decides an attempt that produced no error event and never completed.
-      error_messages="$(ndjson_query 'error messages' "$ndjson" \
-        'evs | map(select(.type == "error")) | .[] | (.message // .error // "unknown")' --raw-output 2> /dev/null || true)"
+      error_messages="$(ndjson_query 'error messages' "$ndjson" "$jq_error_lines" --raw-output 2> /dev/null || true)"
       if [[ -n "$error_messages" ]]; then
         transport_failure=1
-        while IFS= read -r error_message; do
-          if ! is_transport_error "$error_message"; then
+        while IFS=$'\t' read -r error_headline error_message; do
+          if ! is_transport_error "$error_headline"; then
             transport_failure=0
           fi
         done <<<"$error_messages"
@@ -446,21 +453,21 @@ main() {
   fi
   if (( has_error == 1 )); then
     # Report the first error about the review itself: a connection error that came first is not the cause
-    # when the CLI also reported a real one. Only when every error event is a connection failure (which a
-    # skip would already have handled, unless this was the last attempt) is the first one reported.
-    error_messages="$(ndjson_query 'error messages' "$ndjson" \
-      'evs | map(select(.type == "error")) | .[] | (.message // .error // "unknown")' \
-      --raw-output 2> /dev/null || true)"
+    # when the CLI also reported a real one. An all-connection result is skipped above, so the fallback to the
+    # first message is only a safety net.
+    error_messages="$(ndjson_query 'error messages' "$ndjson" "$jq_error_lines" --raw-output 2> /dev/null || true)"
     error_message=""
-    while IFS= read -r candidate; do
-      if ! is_transport_error "$candidate"; then
+    while IFS=$'\t' read -r error_headline candidate; do
+      if ! is_transport_error "$error_headline"; then
         error_message="$candidate"
         break
       fi
     done <<<"$error_messages"
-    : "${error_message:=${error_messages%%$'\n'*}}"
+    if [[ -z "$error_message" ]]; then
+      IFS=$'\t' read -r _ error_message <<<"$error_messages"
+    fi
     print_cli_stderr "$review_id"
-    fail "review reported an error: ${error_message%%$'\n'*}"
+    fail "review reported an error: ${error_message}"
   fi
   if (( has_complete == 0 )); then
     print_cli_stderr "$review_id"
