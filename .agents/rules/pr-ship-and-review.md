@@ -37,7 +37,7 @@ After every later push, re-run **`scripts/dev/post-pr-submission-checks --pr <n>
 
 ### Conventional Commits PR titles (squash / release-please)
 
-`gh stack submit --auto` / `gt submit --publish` may set the PR title from the **branch name**, not Conventional Commits. When the repo squash-merges with `squash_merge_commit_title=PR_TITLE` and `squash_merge_commit_message=BLANK`, that title becomes the entire squash commit message and release-please’s signal.
+`gh stack submit --auto` may set the PR title from the **branch name**, not Conventional Commits. When the repo squash-merges with `squash_merge_commit_title=PR_TITLE` and `squash_merge_commit_message=BLANK`, that title becomes the entire squash commit message and release-please’s signal.
 
 Before the review loop or merge:
 

@@ -5,7 +5,7 @@ alwaysApply: true
 
 # PR workflow (repository-helpers)
 
-**Stacking tool:** read `.github/stacking-tool` first (see `.cursor/rules/stacking-tool.mdc`). This repo trials **`gh-stack`**; use `gh stack` / `.agents/skills/gh-stack/SKILL.md` instead of `gt create` when the marker is `gh-stack`. Prefer `scripts/dev/submit-stack` either way.
+**Stacking tool:** read `.github/stacking-tool` first (see `.cursor/rules/stacking-tool.mdc`). It must say `gh-stack` (Graphite is retired, repository-helpers#772); use `gh stack` / `.agents/skills/gh-stack/SKILL.md` and prefer `scripts/dev/submit-stack`.
 
 Follow this sequence for every PR unless the user explicitly overrides.
 
@@ -37,7 +37,7 @@ Prefer:
 scripts/dev/submit-stack
 ```
 
-Not bare `gt submit` without pre-pr-checks.
+Not a bare `gh stack submit` without pre-pr-checks.
 
 ## 4. Post-submit CI (monitor after every push)
 
