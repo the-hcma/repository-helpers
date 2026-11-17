@@ -11,12 +11,15 @@ readonly rh_root
 source "${script_dir}/lib/test-assert"
 test_init
 
-# uses_refs <file>: one "<line><TAB><value><TAB><comment>" per `uses:` step of a workflow or action file. The key
-# may be quoted (YAML allows "uses":) and a step may be a flow mapping ({uses: x@y}). Comment lines (the
-# `#   uses: ...` examples in the composite actions) are not steps, and neither is the content of a block scalar
-# (`run: |` text that happens to contain "uses: ..."): it is skipped by indentation. The value loses its
-# separation whitespace and enclosing quotes but nothing inside them. The trailing comment (a `# v6.1.0`
-# release annotation) is kept: the policy requires it on a SHA pin.
+# uses_refs <file>: one "<line><TAB><value><TAB><comment>" per `uses:` step of a workflow or action file, and
+# "UNPARSED:<line>" for a line that mentions a `uses:` key this reader did not turn into exactly one step.
+# Shapes read: `uses: x`, a quoted key ("uses":), a value that starts on the next line, and a flow mapping
+# ({uses: x, name: y}, where the step's own first `uses` key is taken, not text inside a quoted value or a nested
+# mapping). Skipped: comment lines (the `#   uses: ...` examples in the composite actions) and the content of
+# a block scalar (`run: |` text), which is skipped by indentation. The value loses its separation whitespace and
+# enclosing quotes but nothing inside them; the trailing comment (a `# v6.1.0` release annotation) is kept
+# because the policy requires it on a SHA pin. A shape that is not read is reported as UNPARSED, so the test
+# fails instead of passing silently on a step it cannot see.
 uses_refs() {
   awk '
     function emit(lineno, value, comment) {
@@ -27,7 +30,19 @@ uses_refs() {
       }
       printf "%d\t%s\t%s\n", lineno, value, comment
     }
-    BEGIN { block_parent = -1 }
+    function split_comment(text) {
+      split_value = text
+      split_comment_text = ""
+      if (match(text, /[[:space:]]+#.*$/)) {
+        split_comment_text = substr(text, RSTART)
+        split_value = substr(text, 1, RSTART - 1)
+      }
+    }
+    function occurrences(text,   tmp) {
+      tmp = text
+      return gsub(/(^|[^[:alnum:]_.-])["\047]?uses["\047]?[[:space:]]*:/, "&", tmp)
+    }
+    BEGIN { block_parent = -1; pending = 0 }
     {
       line = $0
       match(line, /^ */)
@@ -36,36 +51,46 @@ uses_refs() {
         if (line ~ /^[[:space:]]*$/ || indent > block_parent) next
         block_parent = -1
       }
-    }
-    /^[[:space:]]*#/ { next }
-    /:[[:space:]]*[|>][-+0-9]*[[:space:]]*(#.*)?$/ {
-      # A block scalar starts here: its content is indented deeper than the mapping that owns the key.
-      block_parent = indent
-      if (line ~ /^[[:space:]]*-[[:space:]]/) { block_parent = indent + 2 }
-      next
-    }
-    /^[[:space:]]*-?[[:space:]]*["\047]?uses["\047]?:[[:space:]]/ {
-      value = line
-      sub(/^[[:space:]]*-?[[:space:]]*["\047]?uses["\047]?:[[:space:]]*/, "", value)
-      comment = ""
-      if (match(value, /[[:space:]]+#.*$/)) {
-        comment = substr(value, RSTART)
-        value = substr(value, 1, RSTART - 1)
+      if (pending) {
+        # The value of a `uses:` key that had nothing after the colon: the next content line is the value.
+        if (line ~ /^[[:space:]]*$/ || line ~ /^[[:space:]]*#/) next
+        split_comment(line)
+        emit(pending_line, split_value, split_comment_text)
+        pending = 0
+        next
       }
-      emit(FNR, value, comment)
-      next
-    }
-    /\{[^}]*["\047]?uses["\047]?:[^}]*\}/ {
-      # Flow mapping: {uses: vendor/tool@v2, name: x}. The value runs to the next comma or the closing brace.
-      value = line
-      sub(/^.*\{[^}]*["\047]?uses["\047]?:[[:space:]]*/, "", value)
-      sub(/[,}].*$/, "", value)
-      comment = ""
-      if (match(line, /\}[[:space:]]+#.*$/)) {
-        comment = substr(line, RSTART + 1)
+      if (line ~ /^[[:space:]]*#/) next
+      if (line ~ /:[[:space:]]*[|>][-+0-9]*[[:space:]]*(#.*)?$/) {
+        # A block scalar starts here: its content is indented deeper than the mapping that owns the key.
+        block_parent = indent
+        if (line ~ /^[[:space:]]*-[[:space:]]/) { block_parent = indent + 2 }
+        next
       }
-      emit(FNR, value, comment)
+      occ = occurrences(line)
+      emitted = 0
+      if (line ~ /^[[:space:]]*-?[[:space:]]*["\047]?uses["\047]?:([[:space:]]|$)/) {
+        value = line
+        sub(/^[[:space:]]*-?[[:space:]]*["\047]?uses["\047]?:[[:space:]]*/, "", value)
+        split_comment(value)
+        if (split_value ~ /^[[:space:]]*$/) {
+          pending = 1
+          pending_line = FNR
+        } else {
+          emit(FNR, split_value, split_comment_text)
+        }
+        emitted = 1
+      } else if (match(line, /[{,][[:space:]]*["\047]?uses["\047]?:[[:space:]]*/)) {
+        # Flow mapping: the leftmost `uses` key, so a later "uses: x" inside a quoted value is not read as the step.
+        value = substr(line, RSTART + RLENGTH)
+        sub(/[,}].*$/, "", value)
+        comment = ""
+        if (match(line, /\}[[:space:]]+#.*$/)) { comment = substr(line, RSTART + 1) }
+        emit(FNR, value, comment)
+        emitted = 1
+      }
+      if (occ != emitted) { printf "UNPARSED:%d\n", FNR }
     }
+    END { if (pending) { printf "UNPARSED:%d\n", pending_line } }
   ' "$1"
 }
 
@@ -108,12 +133,31 @@ file_problems() {
   local -r context="$1" file="$2"
   local line value comment verdict
   while IFS=$'\t' read -r line value comment; do
+    if [[ "$line" == UNPARSED:* ]]; then
+      printf ' %s: a uses: key this test cannot read as exactly one step (extend uses_refs);' "${line#UNPARSED:}"
+      continue
+    fi
     [[ -n "$value" ]] || continue
     verdict="$(pin_verdict "$context" "$value" "$comment")"
     if [[ "$verdict" != ok ]]; then
       printf ' %s:%s (%s);' "$line" "$value" "$verdict"
     fi
   done < <(uses_refs "$file")
+}
+
+# policy_files <root> <workflow|composite>: the files the policy covers under <root>. GitHub accepts both .yml
+# and .yaml for a workflow and for an action's metadata file, so both are scanned.
+policy_files() {
+  local file
+  case "$2" in
+    workflow) set -- "$1"/.github/workflows/*.yml "$1"/.github/workflows/*.yaml ;;
+    composite) set -- "$1"/actions/*/action.yml "$1"/actions/*/action.yaml ;;
+  esac
+  for file in "$@"; do
+    if [[ -f "$file" ]]; then
+      printf '%s\n' "$file"
+    fi
+  done
 }
 
 # check_files <context> <file...>: one case per file; checked is the number of uses: steps seen in all of them.
@@ -136,7 +180,8 @@ check_files() {
 }
 
 printf '\n=== static: workflows use a first-party release tag, or a commit SHA with its release tag ===\n'
-check_files workflow "${rh_root}"/.github/workflows/*.yml "${rh_root}"/.github/workflows/*.yaml
+mapfile -t workflow_files < <(policy_files "$rh_root" workflow)
+check_files workflow "${workflow_files[@]}"
 if (( checked > 0 )); then
   pass_case 'the workflows have uses: steps, so the policy check did not pass by finding nothing'
 else
@@ -145,7 +190,8 @@ fi
 
 printf '\n=== static: composite actions pin every nested action to a commit SHA with its release tag ===\n'
 checked=0
-check_files composite "${rh_root}"/actions/*/action.yml
+mapfile -t composite_files < <(policy_files "$rh_root" composite)
+check_files composite "${composite_files[@]}"
 if (( checked > 0 )); then
   pass_case 'the composite actions have nested uses: steps, so the nested-pin check did not pass by finding nothing'
 else
@@ -237,6 +283,61 @@ refs="$(uses_refs "${fixture_dir}/ok.yml")"
 assert_contains 'a trailing release comment is returned with its step' "$refs" "vendor/tool@${sha}"$'\t''# v1.2.3'
 assert_contains 'enclosing quotes are removed from the value' "$refs" $'\t'"vendor/quoted@${sha}"$'\t'
 rm -rf -- "$fixture_dir"
+
+printf '\n=== functional: uncommon but valid YAML shapes are read, and unreadable ones fail the test ===\n'
+shapes_dir="$(mktemp -d)"
+third_party_msg='a third-party action must be a full commit SHA'
+cat >"${shapes_dir}/edge.yml" <<YAML
+steps:
+  - uses: actions/checkout@v7.0.1
+  - uses:
+      vendor/next-line@v2
+  - {uses: vendor/shape1@v2, name: "uses: ./safe"}
+  - {uses: vendor/shape2@v2, env: {abuses: actions/checkout@v7.0.1}}
+  - {env: {A: 1}, uses: vendor/shape3@v2}
+  - uses:
+      actions/setup-node@v7.1.0
+  - name: mention
+    run: echo ok
+YAML
+assert_contains 'a value on the next line, a second uses in a quoted value, an abuses key and a nested mapping first are all read exactly' \
+  "problems=[$(file_problems workflow "${shapes_dir}/edge.yml")]" \
+  "problems=[ 3:vendor/next-line@v2 (${third_party_msg}); 5:vendor/shape1@v2 (${third_party_msg}); 5: a uses: key this test cannot read as exactly one step (extend uses_refs); 6:vendor/shape2@v2 (${third_party_msg}); 7:vendor/shape3@v2 (${third_party_msg});]"
+edge_refs="$(uses_refs "${shapes_dir}/edge.yml" | grep -v '^UNPARSED' | cut -f2 | paste -sd' ' -)"
+assert_contains 'the steps read are the real ones in order, with the continued checkout and setup-node values' \
+  "refs=[${edge_refs}]" 'refs=[actions/checkout@v7.0.1 vendor/next-line@v2 vendor/shape1@v2 vendor/shape2@v2 vendor/shape3@v2 actions/setup-node@v7.1.0]'
+assert_not_contains 'the abuses key and the quoted ./safe are never read as a step' "$edge_refs" './safe'
+cat >"${shapes_dir}/mention.yml" <<YAML
+steps:
+  - name: "the uses: key"
+YAML
+assert_contains 'a line that mentions a uses: key without being a step is reported, not skipped' \
+  "problems=[$(file_problems workflow "${shapes_dir}/mention.yml")]" \
+  'problems=[ 2: a uses: key this test cannot read as exactly one step (extend uses_refs);]'
+printf 'steps:\n  - uses:\n' >"${shapes_dir}/dangling.yml"
+assert_contains 'a uses: key with no value at the end of the file is reported' \
+  "problems=[$(file_problems workflow "${shapes_dir}/dangling.yml")]" \
+  'problems=[ 2: a uses: key this test cannot read as exactly one step (extend uses_refs);]'
+
+printf '\n=== functional: both .yml and .yaml are scanned for workflows and composite actions ===\n'
+tree="${shapes_dir}/tree"
+mkdir -p "${tree}/.github/workflows" "${tree}/actions/c" "${tree}/actions/d"
+: >"${tree}/.github/workflows/a.yml"
+: >"${tree}/.github/workflows/b.yaml"
+: >"${tree}/.github/workflows/notes.txt"
+: >"${tree}/actions/c/action.yml"
+: >"${tree}/actions/d/action.yaml"
+listed_workflows="$(policy_files "$tree" workflow | sed "s|^${tree}/||" | paste -sd' ' -)"
+listed_composites="$(policy_files "$tree" composite | sed "s|^${tree}/||" | paste -sd' ' -)"
+assert_contains 'workflow discovery finds .yml and .yaml and ignores other files' \
+  "workflows=[${listed_workflows}]" 'workflows=[.github/workflows/a.yml .github/workflows/b.yaml]'
+assert_contains 'composite discovery finds action.yml and action.yaml' \
+  "composites=[${listed_composites}]" 'composites=[actions/c/action.yml actions/d/action.yaml]'
+printf 'runs:\n  using: composite\n  steps:\n    - uses: vendor/tool@v2\n' >"${tree}/actions/d/action.yaml"
+assert_contains 'a nested third-party tag in an action.yaml is checked and rejected' \
+  "problems=[$(file_problems composite "${tree}/actions/d/action.yaml")]" \
+  'problems=[ 4:vendor/tool@v2 (a nested action of a composite must be a full commit SHA);]'
+rm -rf -- "$shapes_dir"
 
 printf '\n=== static: AGENTS.md states the policy in one place ===\n'
 agents="$(<"${rh_root}/AGENTS.md")"
