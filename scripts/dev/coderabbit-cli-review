@@ -16,6 +16,7 @@ usage() {
 Usage:
   scripts/dev/coderabbit-cli-review [--dir DIR] [--base REF] [--max-runs N]
                                     [--timeout SECONDS] [--state-dir DIR]
+  scripts/dev/coderabbit-cli-review --decline REASON [--dir DIR] [--base REF] [--state-dir DIR]
   scripts/dev/coderabbit-cli-review --detect
   scripts/dev/coderabbit-cli-review --help
 
@@ -33,7 +34,13 @@ Guard rails:
   - At most --max-runs (default 2) distinct heads are reviewed per repository branch.
     Concurrent runs on one branch are not serialised, so they can both spend allowance.
   - Skips (never fails) when the CLI, its flags, sign-in, allowance, a usable git history
-    (shallow clone, no merge-base) or the run cap are missing.
+    (shallow clone, no merge-base) or the run cap are missing, or when the CodeRabbit service cannot be
+    reached: a connection error (for example `Connection failed: WebSocket closed`) is retried once
+    (CODERABBIT_CLI_RETRY_DELAY seconds apart, default 5) and then ends as a skip, with nothing recorded,
+    so the next run can review the head. Only a review that ran and reported a problem is an error.
+  - A finding you judge wrong or not worth a change is answered with `--decline "<reason>"`: the reason is
+    logged (`NOTE: CODERABBIT_CLI_DECLINED`), recorded for this head and shown again on a replay, and the
+    head passes. A decline does not use the review allowance and does not count toward --max-runs.
   - Findings are always reported, even when the CLI also errors. A review with no findings
     and no `complete` event, an error event, or a nonzero CLI exit is an error, never a
     clean pass.
@@ -44,11 +51,14 @@ Exit status:
   2  findings (printed; address them, then commit and run again)
   3  skipped (reason on a `SKIPPED:` line)
 
+--decline records the decline and exits 0.
+
 --detect exits 0 when a CodeRabbit CLI binary is resolvable (no network, no allowance
 used), 1 otherwise.
 
 Environment:
   CODERABBIT_BIN                  Path to the CLI (default: coderabbit/cr on PATH, then ~/.local/bin)
+  CODERABBIT_CLI_RETRY_DELAY      Seconds to wait before the one retry after a connection error (default 5)
   CODERABBIT_CLI_REVIEW_STATE_DIR State directory (default: ~/scratch/repository-helpers/coderabbit-cli-review)
 EOF
 }
@@ -141,11 +151,24 @@ state_lookup() {
     '$1 == head && $2 == base { line = $0 } END { if (line != "") print line; else exit 1 }' "$state_file"
 }
 
-# Number of distinct head+base pairs already reviewed (portable: awk only).
+# Number of distinct head+base pairs already reviewed (portable: awk only). A decline spends no
+# allowance, so it is not a review: a head that was only declined does not count toward the cap.
 state_run_count() {
   local -r state_file="$1"
   [[ -f "$state_file" ]] || { printf '0\n'; return 0; }
-  awk '!seen[$1 ":" $2]++ { n++ } END { print n + 0 }' "$state_file"
+  awk '$3 != "declined" && !seen[$1 ":" $2]++ { n++ } END { print n + 0 }' "$state_file"
+}
+
+# is_transport_error <text>: true when the text says the CodeRabbit service could not be reached (a
+# connection or network failure), as opposed to a review that ran and reported a problem.
+is_transport_error() {
+  local -r text="${1,,}"
+  [[ "$text" == *'connection failed'* || "$text" == *'websocket'* || "$text" == *'connection closed'* \
+    || "$text" == *'connection reset'* || "$text" == *'connection refused'* || "$text" == *econnreset* \
+    || "$text" == *econnrefused* || "$text" == *etimedout* || "$text" == *enotfound* \
+    || "$text" == *eai_again* || "$text" == *'socket hang up'* || "$text" == *'network error'* \
+    || "$text" == *'service unavailable'* || "$text" == *'bad gateway'* || "$text" == *'gateway timeout'* \
+    || "$text" == *'unable to connect'* || "$text" == *'could not reach'* ]]
 }
 
 # encode_key <text>: reversible, collision-free file-name fragment ('%' and '/' escaped).
@@ -156,19 +179,20 @@ encode_key() {
   printf '%s' "$text"
 }
 
-# record_result <state_file> <head> <base> <result> <count>: a failed write warns instead of
-# ending the run silently after the review has already spent allowance.
+# record_result <state_file> <head> <base> <result> <count> [detail]: a failed write warns instead of
+# ending the run silently after the review has already spent allowance. The detail (a decline reason)
+# is the rest of the line.
 record_result() {
   local -r state_file="$1"
-  if ! printf '%s %s %s %s\n' "$2" "$3" "$4" "$5" >> "$state_file" 2> /dev/null; then
+  if ! printf '%s %s %s %s%s\n' "$2" "$3" "$4" "$5" "${6:+ $6}" >> "$state_file" 2> /dev/null; then
     printf 'WARN: coderabbit-cli-review: could not write %s; this result will not be replayed\n' \
       "$state_file" >&2
   fi
 }
 
 main() {
-  local dir="$PWD" base_ref="" max_runs=2 timeout_s=1200 state_dir=""
-  local detect=0 flag
+  local dir="$PWD" base_ref="" max_runs=2 timeout_s=1200 state_dir="" decline=""
+  local detect=0 flag attempt retry_delay_s transport_failure cli_stderr
   local cli top branch head base_commit key key_hash state_file findings_file dirty
   local recorded recorded_result recorded_findings runs usage_file remaining
   local help_text ndjson findings_count review_rc review_id error_message cli_version
@@ -181,6 +205,7 @@ main() {
       --max-runs) max_runs="${2:?--max-runs needs a value}"; shift 2 ;;
       --timeout) timeout_s="${2:?--timeout needs a value}"; shift 2 ;;
       --state-dir) state_dir="${2:?--state-dir needs a value}"; shift 2 ;;
+      --decline) decline="${2:?--decline needs a reason}"; shift 2 ;;
       --detect) detect=1; shift ;;
       -h | --help) usage; exit 0 ;;
       *) usage >&2; exit 1 ;;
@@ -194,6 +219,11 @@ main() {
 
   [[ "$max_runs" =~ ^[0-9]+$ && "$max_runs" -ge 1 ]] || fail "--max-runs must be a positive integer"
   [[ "$timeout_s" =~ ^[0-9]+$ && "$timeout_s" -ge 1 ]] || fail "--timeout must be a positive integer"
+  retry_delay_s="${CODERABBIT_CLI_RETRY_DELAY:-5}"
+  [[ "$retry_delay_s" =~ ^[0-9]+$ ]] || fail "CODERABBIT_CLI_RETRY_DELAY must be a non-negative integer"
+  if [[ -n "$decline" && -z "${decline//[[:space:]]/}" ]]; then
+    fail "--decline needs a reason"
+  fi
   command -v jq > /dev/null 2>&1 || fail "jq not found"
 
   cli="$(resolve_cli)" || skip "CodeRabbit CLI not installed (coderabbit/cr not found)"
@@ -234,15 +264,29 @@ main() {
   state_file="${state_dir}/${key}.log"
   findings_file="${state_dir}/${key}.${head:0:12}.${base_commit:0:12}.findings"
 
+  # A decline answers the findings of this head with a logged reason. It spends no allowance, so it
+  # needs no review result, and a later run replays it.
+  if [[ -n "$decline" ]]; then
+    decline="${decline//$'\n'/ }"
+    record_result "$state_file" "$head" "$base_commit" declined 0 "$decline"
+    printf 'NOTE: CODERABBIT_CLI_DECLINED head=%s reason=%s\n' "${head:0:7}" "$decline" >&2
+    exit 0
+  fi
+
   # Replay: this exact head against this exact base was already reviewed, so spend nothing.
   if recorded="$(state_lookup "$state_file" "$head" "$base_commit")"; then
     recorded_result="$(awk '{ print $3 }' <<<"$recorded")"
     recorded_findings="$(awk '{ print $4 }' <<<"$recorded")"
+    if [[ "$recorded_result" == "declined" ]]; then
+      printf 'NOTE: CODERABBIT_CLI_DECLINED head=%s reason=%s (replayed)\n' "${head:0:7}" \
+        "$(awk '{ $1 = $2 = $3 = $4 = ""; sub(/^ +/, ""); print }' <<<"$recorded")" >&2
+      exit 0
+    fi
     printf 'coderabbit-cli-review: head %s already reviewed (%s findings); replaying\n' \
       "${head:0:7}" "$recorded_findings" >&2
     if [[ "$recorded_result" == "findings" ]]; then
-      printf 'ERROR: CODERABBIT_CLI_FINDINGS count=%s head=%s (replayed; address them and commit to re-run)\n' \
-        "$recorded_findings" "${head:0:7}" >&2
+      printf 'ERROR: CODERABBIT_CLI_FINDINGS count=%s head=%s %s\n' "$recorded_findings" "${head:0:7}" \
+        '(replayed; address them and commit to re-run, or --decline "<reason>")' >&2
       if [[ -f "$findings_file" ]]; then
         cat "$findings_file" >&2
       fi
@@ -289,11 +333,41 @@ main() {
     "$branch" "${base_commit:0:7}" "${head:0:7}" "$(basename "$cli")" \
     "$cli_version" "$remaining" >&2
 
-  review_rc=0
-  runner_exec 'coderabbit-cli-review review' --probe --stream-stdout --timeout "$timeout_s" -- \
-    "$cli" review --agent --fresh --committed --base-commit "$base_commit" --dir "$top" \
-    > "$ndjson" || review_rc=$?
-  review_id="$(runner_last_id)"
+  # One retry after a connection error: a transient blip must not cost the review. Only a review that
+  # produced no finding and said (in an error event, or on stderr when it never completed) that the
+  # service could not be reached is retried; anything the CLI reported about the review itself is not.
+  attempt=1
+  transport_failure=0
+  while :; do
+    review_rc=0
+    runner_exec 'coderabbit-cli-review review' --probe --stream-stdout --timeout "$timeout_s" -- \
+      "$cli" review --agent --fresh --committed --base-commit "$base_commit" --dir "$top" \
+      > "$ndjson" || review_rc=$?
+    review_id="$(runner_last_id)"
+    transport_failure=0
+    if (( review_rc != 124 )) \
+      && [[ "$(ndjson_query 'count findings' "$ndjson" 'evs | map(select(.type == "finding")) | length' \
+        2> /dev/null || printf '0')" == 0 ]]; then
+      error_message="$(ndjson_query 'error message' "$ndjson" \
+        'evs | map(select(.type == "error")) | .[0] | (.message // .error // "")' --raw-output 2> /dev/null || true)"
+      cli_stderr=""
+      if ! ndjson_query 'complete' "$ndjson" 'evs | any(.[]; .type == "complete")' --exit-status \
+        > /dev/null 2>&1; then
+        cli_stderr="$(runner_read "$review_id" stderr 2> /dev/null | tail --lines=20 || true)"
+      fi
+      if is_transport_error "$error_message" || is_transport_error "$cli_stderr"; then
+        transport_failure=1
+      fi
+    fi
+    if (( transport_failure == 1 && attempt < 2 )); then
+      printf 'NOTE: coderabbit-cli-review: the CodeRabbit service could not be reached; retrying once in %ss\n' \
+        "$retry_delay_s" >&2
+      sleep "$retry_delay_s"
+      attempt=$(( attempt + 1 ))
+      continue
+    fi
+    break
+  done
 
   if ndjson_query 'credits' "$ndjson" \
     'evs | any(.[]; .status == "awaiting_confirmation" or .type == "awaiting_confirmation")' \
@@ -332,6 +406,12 @@ main() {
   has_complete=0
   if ndjson_query 'complete' "$ndjson" 'evs | any(.[]; .type == "complete")' --exit-status > /dev/null 2>&1; then
     has_complete=1
+  fi
+  if (( transport_failure == 1 )); then
+    # The service was unreachable on every attempt, so nothing was reviewed and nothing is recorded: the
+    # next run reviews this head. This is not an error of the head under review.
+    print_cli_stderr "$review_id"
+    skip "the CodeRabbit service could not be reached after ${attempt} attempt(s); nothing recorded"
   fi
   if (( has_error == 1 )); then
     error_message="$(ndjson_query 'error message' "$ndjson" \
