@@ -11,103 +11,142 @@ readonly rh_root
 source "${script_dir}/lib/test-assert"
 test_init
 
-# uses_refs <file>: one "<line>:<value>" per `uses:` step of a workflow or action file. Comment lines (the
-# `#   uses: ...` examples in the composite actions) are not steps and a trailing `# v6.1.0` is dropped.
+# uses_refs <file>: one "<line><TAB><value><TAB><comment>" per `uses:` step of a workflow or action file. Comment
+# lines (the `#   uses: ...` examples in the composite actions) are not steps. The trailing comment (a `# v6.1.0`
+# release annotation) is kept: the policy requires it on a SHA pin.
 uses_refs() {
   awk '
     /^[[:space:]]*#/ { next }
     /^[[:space:]]*-?[[:space:]]*uses:[[:space:]]/ {
       value = $0
       sub(/^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*/, "", value)
-      sub(/[[:space:]]+#.*$/, "", value)
+      comment = ""
+      if (match(value, /[[:space:]]+#.*$/)) {
+        comment = substr(value, RSTART)
+        value = substr(value, 1, RSTART - 1)
+      }
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", comment)
       gsub(/["\047]/, "", value)
-      print FNR ":" value
+      printf "%d\t%s\t%s\n", FNR, value, comment
     }
   ' "$1"
 }
 
 local_re='^\./'
+first_party_re='^actions/'
 first_party_tag_re='^actions/[A-Za-z0-9._-]+(/[A-Za-z0-9._/-]+)?@v[0-9]+\.[0-9]+\.[0-9]+$'
 sha_re='^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(/[A-Za-z0-9._/-]+)?@[0-9a-f]{40}$'
+release_comment_re='^#[[:space:]]*v[0-9]+(\.[0-9]+)*'
 
-printf '\n=== static: workflows use a first-party release tag or a full commit SHA ===\n'
-checked=0
-for workflow in "${rh_root}"/.github/workflows/*.yml; do
-  rel="${workflow#"${rh_root}"/}"
-  bad=""
-  while IFS=: read -r line value; do
-    [[ -n "$value" ]] || continue
-    checked=$(( checked + 1 ))
-    if [[ "$value" =~ $local_re || "$value" =~ $first_party_tag_re || "$value" =~ $sha_re ]]; then
-      continue
+# pin_verdict <context: workflow|composite> <value> <comment>: "ok", or why the pin breaks the policy.
+pin_verdict() {
+  local -r context="$1" value="$2" comment="$3"
+
+  if [[ "$value" =~ $local_re ]]; then
+    printf 'ok'
+  elif [[ "$context" == workflow && "$value" =~ $first_party_re ]]; then
+    # A first-party action in a workflow is on a release tag: dep-updater bumps tags and never a SHA.
+    if [[ "$value" =~ $first_party_tag_re ]]; then
+      printf 'ok'
+    else
+      printf 'a first-party action in a workflow must be a full release tag (@vX.Y.Z)'
     fi
-    bad+=" ${line}:${value}"
-  done < <(uses_refs "$workflow")
-  if [[ -z "$bad" ]]; then
-    pass_case "${rel} follows the pin policy"
+  elif [[ "$value" =~ $sha_re ]]; then
+    # Every other pin, and every nested action of a composite, is a SHA with its release tag in a comment.
+    if [[ "$comment" =~ $release_comment_re ]]; then
+      printf 'ok'
+    else
+      printf 'a SHA pin needs its release tag in a trailing comment (# vX.Y.Z)'
+    fi
+  elif [[ "$context" == workflow ]]; then
+    printf 'a third-party action must be a full commit SHA'
   else
-    fail_case "${rel} breaks the pin policy:${bad}"
+    printf 'a nested action of a composite must be a full commit SHA'
   fi
-done
+}
+
+# check_files <context> <label> <file...>: one case per file; sets checked to the number of uses: steps seen.
+checked=0
+check_files() {
+  local -r context="$1" label="$2"
+  shift 2
+  local file rel bad line value comment verdict
+  for file in "$@"; do
+    [[ -f "$file" ]] || continue
+    rel="${file#"${rh_root}"/}"
+    bad=""
+    while IFS=$'\t' read -r line value comment; do
+      [[ -n "$value" ]] || continue
+      checked=$(( checked + 1 ))
+      verdict="$(pin_verdict "$context" "$value" "$comment")"
+      if [[ "$verdict" != ok ]]; then
+        bad+=" ${line}:${value} (${verdict});"
+      fi
+    done < <(uses_refs "$file")
+    if [[ -z "$bad" ]]; then
+      pass_case "${rel} follows the pin policy"
+    else
+      fail_case "${rel} breaks the ${label} pin policy:${bad}"
+    fi
+  done
+}
+
+printf '\n=== static: workflows use a first-party release tag, or a commit SHA with its release tag ===\n'
+check_files workflow workflow "${rh_root}"/.github/workflows/*.yml
 if (( checked > 0 )); then
   pass_case 'the workflows have uses: steps, so the policy check did not pass by finding nothing'
 else
   fail_case 'no uses: step was found in .github/workflows, so nothing was checked'
 fi
 
-printf '\n=== static: composite actions pin every nested action to a full commit SHA ===\n'
-composites=0
-for action in "${rh_root}"/actions/*/action.yml; do
-  [[ -f "$action" ]] || continue
-  composites=$(( composites + 1 ))
-  rel="${action#"${rh_root}"/}"
-  bad=""
-  while IFS=: read -r line value; do
-    [[ -n "$value" ]] || continue
-    if [[ "$value" =~ $local_re || "$value" =~ $sha_re ]]; then
-      continue
-    fi
-    bad+=" ${line}:${value}"
-  done < <(uses_refs "$action")
-  if [[ -z "$bad" ]]; then
-    pass_case "${rel} pins its nested actions to a commit SHA"
-  else
-    fail_case "${rel} has a nested action that is not a full commit SHA:${bad}"
-  fi
-done
-if (( composites > 0 )); then
-  pass_case 'the composite actions were found, so the nested-pin check did not pass by finding nothing'
+printf '\n=== static: composite actions pin every nested action to a commit SHA with its release tag ===\n'
+checked=0
+check_files composite composite "${rh_root}"/actions/*/action.yml
+if (( checked > 0 )); then
+  pass_case 'the composite actions have nested uses: steps, so the nested-pin check did not pass by finding nothing'
 else
-  fail_case 'no actions/*/action.yml was found'
+  fail_case 'no nested uses: step was found in actions/*/action.yml'
 fi
 
-printf '\n=== functional: the checker tells a tag, a SHA and a floating ref apart ===\n'
+printf '\n=== functional: the classifier tells every shape of pin apart ===\n'
+sha='0123456789012345678901234567890123456789'
+expect() { # <label> <context> <value> <comment> <ok|bad>
+  local got
+  got="$(pin_verdict "$2" "$3" "$4")"
+  [[ "$got" == ok ]] || got=bad
+  assert_contains "$1" "verdict=${got}" "verdict=$5"
+}
+expect 'a first-party action on a release tag passes in a workflow' workflow 'actions/checkout@v7.0.1' '' ok
+expect 'a first-party action on a SHA is rejected in a workflow, even with a release comment' workflow "actions/cache@${sha}" '# v6.1.0' bad
+expect 'a first-party action on a floating major is rejected' workflow 'actions/checkout@v7' '' bad
+expect 'a first-party action on a branch is rejected' workflow 'actions/checkout@main' '' bad
+expect 'a first-party action on a SHA passes in a composite' composite "actions/cache@${sha}" '# v6.1.0' ok
+expect 'a first-party action on a tag is rejected in a composite' composite 'actions/cache@v6.1.0' '' bad
+expect 'a third-party SHA with its release tag in a comment passes' workflow "vendor/tool@${sha}" '# v1.2.3' ok
+expect 'a third-party SHA with no release comment is rejected' workflow "vendor/tool@${sha}" '' bad
+expect 'a third-party SHA with an unrelated comment is rejected' workflow "vendor/tool@${sha}" '# pinned' bad
+expect 'a third-party tag is rejected' workflow 'vendor/tool@v2.0.0' '' bad
+expect 'a third-party floating major is rejected' workflow 'vendor/tool@v2' '' bad
+expect 'a local action needs no pin' workflow './local/action' '' ok
+expect 'a short SHA is rejected' workflow 'vendor/tool@0123456' '# v1.0.0' bad
+
+printf '\n=== functional: uses_refs keeps the release comment and skips commented-out steps ===\n'
 sample="$(mktemp)"
-cat >"$sample" <<'YAML'
+cat >"$sample" <<YAML
 steps:
   - uses: actions/checkout@v7.0.1
-  - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-  - uses: ./local/action
-  - uses: some/third-party@v2
-  - uses: actions/checkout@v7
-  - uses: other/tool@main
+  - uses: vendor/tool@${sha} # v1.2.3
   # - uses: commented/out@v1
 YAML
-verdicts=""
-while IFS=: read -r _ value; do
-  if [[ "$value" =~ $local_re || "$value" =~ $first_party_tag_re || "$value" =~ $sha_re ]]; then
-    verdicts+="ok "
-  else
-    verdicts+="bad "
-  fi
-done < <(uses_refs "$sample")
+refs="$(uses_refs "$sample")"
 rm -f -- "$sample"
-assert_contains 'a first-party tag, a SHA and a local path pass; a third-party tag, a floating major and a branch fail' \
-  "$verdicts" 'ok ok ok bad bad bad'
+assert_contains 'a trailing release comment is returned with its step' "$refs" "vendor/tool@${sha}"$'\t''# v1.2.3'
+assert_not_contains 'a commented-out step is not a step' "$refs" 'commented/out'
 
 printf '\n=== static: AGENTS.md states the policy in one place ===\n'
 agents="$(<"${rh_root}/AGENTS.md")"
 assert_contains 'AGENTS.md has the GitHub Actions pin policy section' "$agents" '### GitHub Actions pin policy'
+# shellcheck disable=SC2016  # the needle is literal Markdown with backticks, not a command substitution
 assert_contains 'the policy says first-party actions stay on release tags' "$agents" 'first-party `actions/*` action is pinned to a full release tag'
 assert_contains 'the policy says every other action is pinned to a commit SHA' "$agents" 'Every other third-party action'
 

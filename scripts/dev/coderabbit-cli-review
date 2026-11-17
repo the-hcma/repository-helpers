@@ -40,7 +40,9 @@ Guard rails:
     so the next run can review the head. Only a review that ran and reported a problem is an error.
   - A finding you judge wrong or not worth a change is answered with `--decline "<reason>"`: the reason is
     logged (`NOTE: CODERABBIT_CLI_DECLINED`), recorded for this head and shown again on a replay, and the
-    head passes. A decline does not use the review allowance and does not count toward --max-runs.
+    head passes. A decline does not use the review allowance, does not count toward --max-runs and
+    needs no installed CLI; it fails (exit 1) when it cannot be recorded, because the findings would
+    return on the next run.
   - Findings are always reported, even when the CLI also errors. A review with no findings
     and no `complete` event, an error event, or a nonzero CLI exit is an error, never a
     clean pass.
@@ -179,12 +181,19 @@ encode_key() {
   printf '%s' "$text"
 }
 
-# record_result <state_file> <head> <base> <result> <count> [detail]: a failed write warns instead of
-# ending the run silently after the review has already spent allowance. The detail (a decline reason)
-# is the rest of the line.
+# state_append <state_file> <head> <base> <result> <count> [detail]: appends one result line; non-zero
+# when the write fails. The detail (a decline reason) is the rest of the line.
+state_append() {
+  local -r state_file="$1"
+  printf '%s %s %s %s%s\n' "$2" "$3" "$4" "$5" "${6:+ $6}" >> "$state_file" 2> /dev/null
+}
+
+# record_result <state_file> <head> <base> <result> <count>: a failed write warns instead of ending the
+# run silently after the review has already spent allowance. A decline does not use this: it has nothing
+# to lose but the record itself, so it fails when it cannot be written.
 record_result() {
   local -r state_file="$1"
-  if ! printf '%s %s %s %s%s\n' "$2" "$3" "$4" "$5" "${6:+ $6}" >> "$state_file" 2> /dev/null; then
+  if ! state_append "$@"; then
     printf 'WARN: coderabbit-cli-review: could not write %s; this result will not be replayed\n' \
       "$state_file" >&2
   fi
@@ -226,8 +235,6 @@ main() {
   fi
   command -v jq > /dev/null 2>&1 || fail "jq not found"
 
-  cli="$(resolve_cli)" || skip "CodeRabbit CLI not installed (coderabbit/cr not found)"
-
   top="$(git_out 'show-toplevel' "$dir" rev-parse --show-toplevel)" || fail "not a git repository: ${dir}"
   branch="$(git_out 'branch' "$top" rev-parse --abbrev-ref HEAD)" || skip "cannot read the current branch (repository without commits?)"
   head="$(git_out 'head' "$top" rev-parse HEAD)" || skip "cannot read HEAD (repository without commits?)"
@@ -268,7 +275,9 @@ main() {
   # needs no review result, and a later run replays it.
   if [[ -n "$decline" ]]; then
     decline="${decline//$'\n'/ }"
-    record_result "$state_file" "$head" "$base_commit" declined 0 "$decline"
+    if ! state_append "$state_file" "$head" "$base_commit" declined 0 "$decline"; then
+      fail "could not record the decline in ${state_file}; the findings would come back on the next run"
+    fi
     printf 'NOTE: CODERABBIT_CLI_DECLINED head=%s reason=%s\n' "${head:0:7}" "$decline" >&2
     exit 0
   fi
@@ -299,6 +308,9 @@ main() {
   if (( runs >= max_runs )); then
     skip "run cap reached (${runs} of ${max_runs} reviews already used on ${branch}); the PR review is the next gate"
   fi
+
+  # Only a review needs the CLI: a decline and a replay of a recorded result do not.
+  cli="$(resolve_cli)" || skip "CodeRabbit CLI not installed (coderabbit/cr not found)"
 
   # Every call into the CLI is bounded: it auto-updates and talks to the vendor backend.
   cli_version="$(runner_exec_stdout 'coderabbit-cli-review version' --probe --timeout 30 -- "$cli" --version 2> /dev/null || true)"
