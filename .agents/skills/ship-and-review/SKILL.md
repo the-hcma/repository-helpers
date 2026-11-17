@@ -13,7 +13,7 @@ description: Ship PRs with repository-helpers agent-review loop — pre-pr-check
 
 **Thin always-on rule:** `.cursor/rules/pr-ship-and-review.mdc` (contract + pointers).
 
-When the user asks to **ship**, **submit**, **open a PR**, or **follow the flow**, run this sequence in a **stack worktree** (never the primary clone). See `pr-workflow.mdc` for worktree/Graphite basics.
+When the user asks to **ship**, **submit**, **open a PR**, or **follow the flow**, run this sequence in a **stack worktree** (never the primary clone). See `pr-workflow.mdc` for worktree and gh-stack basics.
 
 Helper scripts:
 
@@ -95,7 +95,7 @@ Exit **10** (`CI_FAILED`) is **coding-agent ownership**, not operator give-up �
 
 1. Read the failure report from `post-pr-submission-checks` (or the loop’s stderr CI lines / `gh run view <id> --log-failed`).
 2. Fix in the stack worktree; run `scripts/dev/pre-pr-checks`.
-3. Push (`gt modify` + `scripts/dev/submit-stack` or `gt submit` / `gh stack submit`).
+3. Commit the fix (stage the named files, never `git add -A`), then push with `scripts/dev/submit-stack` (or `gh stack submit --auto --open --remote origin` for a bare push).
 4. Re-run `scripts/dev/post-pr-submission-checks --pr <n>` until green.
 5. Resume `./scripts/wait-for-agent-review loop --pr <n>`.
 
@@ -195,7 +195,7 @@ Batch resolve threads and replied issue comments / review bodies:
 
 **Never** resolve via raw GraphQL/API without a human reply first.
 
-Then: `gt modify`, `scripts/dev/pre-pr-checks`, push, **`scripts/dev/post-pr-submission-checks --pr <n>`** (wait for green CI; fix failures from the agent log report if red), and **start the next iteration**.
+Then: commit the fix (named files), `scripts/dev/pre-pr-checks`, push with `scripts/dev/submit-stack`, **`scripts/dev/post-pr-submission-checks --pr <n>`** (wait for green CI; fix failures from the agent log report if red), and **start the next iteration**.
 
 ### Restack when BEHIND (exit 4)
 
@@ -216,7 +216,7 @@ Three success paths:
 
 All three paths **email `AGENT_REVIEW_REPORT_TO`** when configured. They do **not** run `gh pr review --approve` (self-approve often fails for the PR author and is unnecessary).
 
-Never add the `merge-it` label: it is ignored and the org no longer uses Graphite merge queue. Merge only after the user explicitly confirms, and only with `scripts/dev/merge-stack --pr <n>` (from the feature worktree of the repository that owns the PR; in a consumer repo `${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/dev/merge-stack --pr <n>`): it picks the right command for the repository's merge setup (`gh stack merge` for a stacked PR, the merge queue or auto-merge otherwise) and confirms the enqueue. For a PR in a gh stack, pass the top PR's number and run it from that stack's worktree: it refuses a lower layer, and it lands the top PR and every open PR below it, so name those PRs and get confirmation for the whole stack first. Do not call `gh pr merge` or `gh stack merge` by hand, do not add the `merge-it` label, and do not pipe the command through `tail` or `head`: read its exit status and output. See the gh-stack Skill, `Merging a stack`.
+Never add the `merge-it` label: Graphite is retired (repository-helpers#772), so the label does nothing and `merge-stack` refuses a `graphite` marker (see `scripts/dev/merge-stack --help`). Merge only after the user explicitly confirms, and only with `scripts/dev/merge-stack --pr <n>` (from the feature worktree of the repository that owns the PR; in a consumer repo `${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/dev/merge-stack --pr <n>`): it picks the right command for the repository's merge setup (`gh stack merge` for a stacked PR, the merge queue or auto-merge otherwise) and confirms the enqueue. For a PR in a gh stack, pass the top PR's number and run it from that stack's worktree: it refuses a lower layer, and it lands the top PR and every open PR below it, so name those PRs and get confirmation for the whole stack first. Do not call `gh pr merge` or `gh stack merge` by hand, do not add the `merge-it` label, and do not pipe the command through `tail` or `head`: read its exit status and output. See the gh-stack Skill, `Merging a stack`.
 
 ### Failure (PR non-convergence timeout, exit 6)
 
