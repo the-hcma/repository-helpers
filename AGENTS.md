@@ -616,4 +616,6 @@ scripts/dev/pre-pr-checks            # preferred: planned jobs + main worktree g
 bash -n … && shellcheck -S info … && actionlint … && bash tests/*.test
 ```
 
+CI also runs the whole suite on macOS, in its own workflow `.github/workflows/ci-macos.yml` (Homebrew bash 5 and the GNU userland listed in the "GNU userland on macOS" invariant above, BSD `pgrep` and `ps` as macOS ships them), so a test that only breaks on macOS shows on the PR instead of on a developer host (#871). That job is deliberately not a required check: `github-repo-lint` derives the required checks from `ci.yml`, so a job there would always block, and GitHub's macOS arm64 runners are capacity constrained, so a required macOS job could block every merge without a test failing. Read its result on the PR before merging: a red `tests (macOS)` is a real finding to fix, an unacquired runner is a re-run. The runner label is pinned (`macos-15`, never `macos-latest`) because GitHub retires macOS images and a job on a retired label is cancelled about a second after it starts: bump the label, and the comment above it, when GitHub announces the retirement.
+
 No PR may be merged with a failing CI check. No exceptions.
