@@ -619,7 +619,7 @@ cmd_release() {
 
 cmd_wait() {
   local repo pr timeout interval owner name head started snapshot review_body check_state_json check_state quota_hit
-  local last_activity now_epoch idle_break idle_s ci_rc
+  local last_activity now_epoch idle_break idle_s ci_rc hold_rc
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   read -r owner name < <(agent_review_repo_parts "${repo}")
@@ -652,9 +652,23 @@ cmd_wait() {
       return 10
     fi
     # A hold posted while this wait runs ends it too: nothing is reviewed until `release` (#865).
-    if agent_review_pr_on_hold "${repo}" "${pr}"; then
+    hold_rc=0
+    agent_review_pr_on_hold "${repo}" "${pr}" || hold_rc=$?
+    if (( hold_rc == 0 )); then
       agent_review_hold_notice "${pr}" "${repo}"
       return 14
+    fi
+    if (( hold_rc == 2 )); then
+      # The comments could not be read, so a hold cannot be ruled out: never evaluate a review as a success on a
+      # guess. Read again after the poll interval, within the same timeout.
+      if (( $(date +%s) - started >= timeout )); then
+        printf 'ERROR: WAIT_TIMEOUT wait-for-agent-review pr=%s waited=%ss timeout=%ss reason=hold-state-unknown\n' \
+          "${pr}" "$(( $(date +%s) - started ))" "${timeout}" >&2
+        return 2
+      fi
+      printf 'wait-for-agent-review: could not read the comments of PR #%s (hold state unknown) - polling again\n' "${pr}" >&2
+      sleep "${interval}"
+      continue
     fi
     snapshot="$(agent_review_graphql_wait_snapshot "${owner}" "${name}" "${pr}")"
     head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
@@ -2715,8 +2729,18 @@ cmd_loop() {
     now="$(date +%s)"
     if (( now - pr_started >= pr_cap )); then
       # The PR cap does not end a held PR: nothing is reviewed until `release`, so there is nothing to give up on.
-      if cmd_loop_stop_if_held "${repo}" "${pr}"; then
-        return 14
+      # Feedback that still needs an answer comes first, as on every other held path (exit 3).
+      if [[ "$(agent_review_hold_flag "${repo}" "${pr}")" == 'true' ]]; then
+        pending_exit=0
+        agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
+        if (( pending_exit == 3 )); then
+          agent_review_loop_set_stop 'THREADS_PENDING' \
+            'Feedback items still need a reply or resolve (threads, issue comments, review bodies).'
+          return 3
+        fi
+        if cmd_loop_stop_if_held "${repo}" "${pr}"; then
+          return 14
+        fi
       fi
       status="$(cmd_status "${repo}" "${pr}" 2>/dev/null || true)"
       read -r owner name < <(agent_review_repo_parts "${repo}")
