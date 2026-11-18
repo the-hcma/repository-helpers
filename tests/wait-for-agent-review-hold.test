@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# Tests for repository-helpers#865: hold / release batch the fix pushes of a PR so each push does not start a
+# CodeRabbit review. A hold is the newest `@coderabbitai pause` comment on the PR (a `resume` ends it); while held,
+# check / wait / loop stop with exit 14 instead of waiting for a review, complete_ready stays false and complete
+# refuses; release posts only `@coderabbitai resume` (which itself starts the one review). Hermetic: GitHub is stubbed.
+# shellcheck disable=SC2016  # the bash -c programs are single-quoted so the child shell expands them
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+rh_root="${script_dir%/tests}"
+readonly rh_root
+wait_script="${rh_root}/scripts/wait-for-agent-review"
+readonly wait_script
+
+# shellcheck disable=SC1091
+source "${script_dir}/lib/test-assert"
+test_init
+
+tmp="$(mktemp -d)"
+readonly tmp
+trap 'rm -rf "$tmp"' EXIT
+
+# run_prog <program>: sources the script (main does not run) and the program. The program's stdout and stderr
+# come back together, then "rc=<status>".
+run_prog() {
+  local out rc=0
+  out="$(bash -c '
+    set -uo pipefail
+    source "$1"
+    agent_review_resolve_repo() { printf "o/r"; }
+    agent_review_resolve_pr() { printf "7"; }
+    posted="$2"
+    '"$1"'
+  ' bash "$wait_script" "${tmp}/posted" 2>&1)" || rc=$?
+  printf '%s\nrc=%s\n' "$out" "$rc"
+}
+
+# comments_json <states...>: PR comments as the REST API returns them, oldest first.
+comment() { # <id> <login> <type> <created_at> <body>
+  jq -nc --arg id "$1" --arg login "$2" --arg type "$3" --arg at "$4" --arg body "$5" \
+    '{id: ($id | tonumber), user: {login: $login, type: $type}, created_at: $at, body: $body}'
+}
+hold_of() { # <comments-json-array> -> the first field of the hold line
+  bash -c 'set -uo pipefail; source "$1"; agent_review_coderabbit_hold_from_comments "$2"' bash "$wait_script" "$1" \
+    | cut -f1
+}
+hold_line() {
+  bash -c 'set -uo pipefail; source "$1"; agent_review_coderabbit_hold_from_comments "$2"' bash "$wait_script" "$1"
+}
+
+printf '\n=== hold state: the newest pause / resume command on the PR ===\n'
+c_pause="$(comment 1 thehcma User 2026-11-18T10:00:00Z '@coderabbitai pause')"
+c_resume="$(comment 2 thehcma User 2026-11-18T11:00:00Z '@coderabbitai resume')"
+c_pause2="$(comment 3 thehcma User 2026-11-18T12:00:00Z '@coderabbitai pause')"
+assert_contains 'no command at all is not a hold' "hold=$(hold_of "[$(comment 9 thehcma User 2026-11-18T09:00:00Z 'looks good')]")" 'hold=none'
+assert_contains 'an empty comment list is not a hold' "hold=$(hold_of '[]')" 'hold=none'
+assert_contains 'a pause is a hold' "hold=$(hold_of "[${c_pause}]")" 'hold=held'
+assert_contains 'the hold records when the pause was posted' "line=$(hold_line "[${c_pause}]")" "line=held"$'\t'"$(date -u -j -f %Y-%m-%dT%H:%M:%SZ 2026-11-18T10:00:00Z +%s 2>/dev/null || date -u -d 2026-11-18T10:00:00Z +%s)"
+assert_contains 'a resume after the pause ends the hold' "hold=$(hold_of "[${c_pause},${c_resume}]")" 'hold=none'
+assert_contains 'a pause after a resume is a hold again' "hold=$(hold_of "[${c_pause},${c_resume},${c_pause2}]")" 'hold=held'
+assert_contains 'a resume with no pause is not a hold' "hold=$(hold_of "[${c_resume}]")" 'hold=none'
+assert_contains 'the order is by time, not by position in the list' "hold=$(hold_of "[${c_resume},${c_pause}]")" 'hold=none'
+# gh api --paginate prints one JSON array per page, back to back, so the reader slurps them.
+assert_contains 'the paginated shape (one array per page) is read too' "hold=$(hold_of "[${c_pause}][${c_resume},${c_pause2}]")" 'hold=held'
+assert_contains 'a resume on a later page ends a pause on an earlier one' "hold=$(hold_of "[${c_pause}][${c_resume}]")" 'hold=none'
+assert_contains 'a pause by another human counts, because CodeRabbit obeys it' \
+  "hold=$(hold_of "[$(comment 4 someone-else User 2026-11-18T10:00:00Z '@coderabbitai pause')]")" 'hold=held'
+assert_contains 'case and padding do not matter' \
+  "hold=$(hold_of "[$(comment 5 thehcma User 2026-11-18T10:00:00Z '  @CodeRabbitAI   PAUSE  ')]")" 'hold=held'
+assert_contains 'a pause with other text on the line is not a command (CodeRabbit ignores it too)' \
+  "hold=$(hold_of "[$(comment 6 thehcma User 2026-11-18T10:00:00Z '@coderabbitai pause please')]")" 'hold=none'
+assert_contains 'a command that is not the first line is not a command' \
+  "hold=$(hold_of "[$(comment 7 thehcma User 2026-11-18T10:00:00Z $'thanks\n@coderabbitai pause')]")" 'hold=none'
+assert_contains 'a command with a hidden marker on a later line is a command' \
+  "hold=$(hold_of "[$(comment 8 thehcma User 2026-11-18T10:00:00Z $'@coderabbitai pause\n\n<!-- marker -->')]")" 'hold=held'
+assert_contains 'a bot-authored pause is ignored' \
+  "hold=$(hold_of "[$(comment 10 coderabbitai[bot] Bot 2026-11-18T10:00:00Z '@coderabbitai pause')]")" 'hold=none'
+assert_contains 'the loop'"'"'s own full-review ask is not a pause' \
+  "hold=$(hold_of "[$(comment 11 thehcma User 2026-11-18T10:00:00Z $'@coderabbitai full review\n\n<!-- wait-for-agent-review:coderabbit-full:abc -->')]")" 'hold=none'
+
+printf '\n=== status: on_hold is reported and complete_ready is forced false while held ===\n'
+status_in='{"complete_ready":true,"pr_merged":false}'
+with_hold() { bash -c 'set -uo pipefail; source "$1"; agent_review_status_with_hold "$2" "$3"' bash "$wait_script" "$1" "$2"; }
+assert_contains 'a held PR reports on_hold true' "$(with_hold "$status_in" true)" '"on_hold":true'
+assert_contains 'a held PR cannot be complete_ready' "$(with_hold "$status_in" true)" '"complete_ready":false'
+assert_contains 'a PR that is not held reports on_hold false' "$(with_hold "$status_in" false)" '"on_hold":false'
+assert_contains 'a PR that is not held keeps complete_ready' "$(with_hold "$status_in" false)" '"complete_ready":true'
+
+printf '\n=== feedback: pause and resume are commands, not feedback to answer ===\n'
+pending_ids="$(bash -c '
+  set -uo pipefail
+  source "$1"
+  agent_review_authenticated_login() { printf thehcma; }
+  agent_review_feedback_issue_comments_pending_from_array_json thehcma o/r 9 "$2" | jq -c "map(.comment_id)"
+' bash "$wait_script" '[
+  {"id":"7001","login":"thehcma","body":"a real note for the reviewer","created_at":"2026-11-18T09:00:00Z","html_url":"u/7001"},
+  {"id":"7002","login":"thehcma","body":"@coderabbitai pause","created_at":"2026-11-18T10:00:00Z","html_url":"u/7002"},
+  {"id":"7003","login":"thehcma","body":"@coderabbitai resume","created_at":"2026-11-18T11:00:00Z","html_url":"u/7003"}
+]' 2>&1)"
+assert_contains 'only the real note is pending feedback' "ids=${pending_ids}" 'ids=["7001"]'
+
+# The hold and release tests record the comment they post instead of calling gh. Only they stub runner_exec: the
+# library's jq helpers run through it too.
+recorder='runner_exec() { printf "%s\n" "$*" >>"$posted"; return 0; }; '
+posted_count() {
+  if [[ -f "${tmp}/posted" ]]; then grep -c . "${tmp}/posted" || true; else printf '0'; fi
+}
+
+printf '\n=== hold posts @coderabbitai pause once ===\n'
+rm -f "${tmp}/posted"
+out="$(run_prog "${recorder}"'agent_review_reviewers_is_enabled() { return 0; }; agent_review_pr_on_hold() { return 1; }; cmd_hold o/r 7')"
+assert_contains 'hold exits 0' "$out" 'rc=0'
+assert_contains 'hold comments the pause on the PR' "$(cat "${tmp}/posted")" 'gh pr comment 7 --repo o/r --body @coderabbitai pause'
+assert_contains 'hold says the PR is now on hold' "$out" 'PR #7 is now on hold'
+assert_contains 'hold says how to end it' "$out" 'wait-for-agent-review release --pr 7'
+assert_equals_count() { # <label> <actual> <expected>
+  if [[ "$2" == "$3" ]]; then pass_case "$1"; else printf '  expected [%s], got [%s]\n' "$3" "$2" >&2; fail_case "$1"; fi
+}
+assert_equals_count 'hold posts exactly one comment' "$(posted_count)" '1'
+rm -f "${tmp}/posted"
+out="$(run_prog "${recorder}"'agent_review_reviewers_is_enabled() { return 0; }; agent_review_pr_on_hold() { return 0; }; cmd_hold o/r 7')"
+assert_contains 'holding a PR that is already on hold is a success' "$out" 'rc=0'
+assert_contains 'and says so' "$out" 'already on hold'
+assert_equals_count 'and posts nothing' "$(posted_count)" '0'
+rm -f "${tmp}/posted"
+out="$(run_prog "${recorder}"'agent_review_reviewers_is_enabled() { return 1; }; agent_review_pr_on_hold() { return 1; }; cmd_hold o/r 7')"
+assert_contains 'a repository without CodeRabbit cannot be held' "$out" 'rc=1'
+assert_contains 'and the reason is given' "$out" 'CodeRabbit is not an enabled reviewer'
+assert_equals_count 'and nothing is posted' "$(posted_count)" '0'
+
+printf '\n=== release posts only @coderabbitai resume ===\n'
+rm -f "${tmp}/posted"
+out="$(run_prog "${recorder}"'agent_review_pr_on_hold() { return 0; }; cmd_release o/r 7')"
+assert_contains 'release exits 0' "$out" 'rc=0'
+assert_contains 'release comments the resume' "$(cat "${tmp}/posted")" 'gh pr comment 7 --repo o/r --body @coderabbitai resume'
+assert_equals_count 'release posts exactly one comment' "$(posted_count)" '1'
+assert_not_contains 'release does not ask for a second review on top of the one resume starts' "$(cat "${tmp}/posted")" 'review'"'"
+assert_not_contains 'and posts no full review' "$(cat "${tmp}/posted")" 'full review'
+assert_contains 'release says what happens next' "$out" 'one incremental review of the commits pushed while paused'
+rm -f "${tmp}/posted"
+out="$(run_prog "${recorder}"'agent_review_pr_on_hold() { return 1; }; cmd_release o/r 7')"
+assert_contains 'releasing a PR that is not on hold is a success' "$out" 'rc=0'
+assert_contains 'and says there is nothing to release' "$out" 'not on hold - nothing to release'
+assert_equals_count 'and posts nothing' "$(posted_count)" '0'
+
+printf '\n=== check: a held PR stops with exit 14 and is never complete_ready ===\n'
+check_stubs='
+  agent_review_require_cmd() { return 0; }
+  agent_review_repo_parts() { printf "o r\n"; }
+  agent_review_graphql_pr_snapshot() { printf "{\"data\":{\"repository\":{\"pullRequest\":{\"headRefOid\":\"abc1234\"}}}}"; }
+  agent_review_assert_snapshot_complete() { return 0; }
+  agent_review_observe_all_agent_quota_on_pr() { return 0; }
+  agent_review_status_json_from_snapshot() {
+    printf "{\"pr_merged\":false,\"ci_conclusion\":\"success\",\"ci_ready\":true,\"complete_ready\":true,\"all_quotas_exhausted\":false,\"fresh_review_on_head\":true,\"agent_review_empty\":true,\"agent_quota_exhausted\":false,\"head_check_error\":false,\"head_check_findings\":false,\"merge_state_status\":\"CLEAN\"}"
+  }
+  agent_review_pending_thread_count_from_snapshot() { printf "%s" "${PENDING:-0}"; }
+  agent_review_feedback_triage_json() { printf "{\"triage\":true}\n"; }
+'
+out="$(run_prog "${check_stubs}"'agent_review_pr_on_hold() { return 0; }; cmd_check o/r 7')"
+assert_contains 'check on a held PR exits 14' "$out" 'rc=14'
+assert_contains 'its status says on_hold' "$out" '"on_hold":true'
+assert_contains 'its status says complete_ready is false although the review state is complete' "$out" '"complete_ready":false'
+assert_contains 'it tells the agent how to release' "$out" 'wait-for-agent-review release --pr 7'
+out="$(run_prog "${check_stubs}"'agent_review_pr_on_hold() { return 1; }; cmd_check o/r 7')"
+assert_contains 'the same PR without a hold is complete_ready and exits 0' "$out" 'rc=0'
+assert_contains 'and reports on_hold false' "$out" '"on_hold":false'
+out="$(run_prog "${check_stubs}"'PENDING=2; agent_review_pr_on_hold() { return 0; }; cmd_check o/r 7')"
+assert_contains 'feedback still needs an answer first, held or not (exit 3)' "$out" 'rc=3'
+
+printf '\n=== complete refuses a held PR ===\n'
+out="$(run_prog '
+  agent_review_pr_is_merged() { return 1; }
+  cmd_status() { printf "{\"pr_merged\":false,\"complete_ready\":false,\"on_hold\":true}"; }
+  cmd_complete o/r 7')"
+assert_contains 'complete on a held PR fails' "$out" 'rc=1'
+assert_contains 'and says the PR is on hold and how to release it' "$out" 'complete blocked: PR #7 is on hold'
+
+printf '\n=== wait does not block on a held PR ===\n'
+out="$(run_prog '
+  agent_review_reviewers_is_disabled() { return 1; }
+  agent_review_reviewers_select_agent() { return 0; }
+  agent_review_pr_on_hold() { return 0; }
+  cmd_wait o/r 7 60 5')"
+assert_contains 'wait on a held PR returns 14 at once' "$out" 'rc=14'
+
+printf '\n=== loop: a held PR stops with exit 14 and neither waits nor asks for a review ===\n'
+rm -f "${tmp}/ask-marker"
+out="$(run_prog '
+  agent_review_require_cmd() { return 0; }
+  agent_review_log_cycle_quota_preamble() { :; }
+  agent_review_sync_active_probe_agent() { :; }
+  agent_review_pr_is_merged() { return 1; }
+  cmd_loop_abort_if_ci_failed() { return 0; }
+  agent_review_abort_if_pending_threads() { return 0; }
+  agent_review_pr_on_hold() { return 0; }
+  agent_review_graphql_pr_snapshot() { : >"'"${tmp}"'/ask-marker"; printf "{}"; }
+  cmd_loop_maybe_request_agents_on_head() { : >"'"${tmp}"'/ask-marker"; }
+  cmd_loop o/r 7')"
+assert_contains 'loop on a held PR exits 14' "$out" 'rc=14'
+assert_contains 'loop tells the agent the PR is on hold' "$out" 'PR #7 is on hold'
+assert_equals_count 'loop read no snapshot and asked for no review' "$([[ -e "${tmp}/ask-marker" ]] && echo asked || echo none)" 'none'
+out="$(run_prog '
+  agent_review_require_cmd() { return 0; }
+  agent_review_log_cycle_quota_preamble() { :; }
+  agent_review_sync_active_probe_agent() { :; }
+  agent_review_pr_is_merged() { return 1; }
+  cmd_loop_abort_if_ci_failed() { return 0; }
+  agent_review_abort_if_pending_threads() { return 3; }
+  agent_review_loop_set_stop() { :; }
+  agent_review_pr_on_hold() { return 0; }
+  cmd_loop o/r 7')"
+assert_contains 'pending feedback still comes first on a held PR (exit 3)' "$out" 'rc=3'
+
+printf '\n=== loop exit 14 is not a failure: no operator email ===\n'
+notified="$(bash -c '
+  set -uo pipefail
+  source "$1"
+  agent_review_loop_notify_stopped() { printf "notified:%s\n" "$3"; }
+  cmd_loop_exit_notify o/r 7 14
+  cmd_loop_exit_notify o/r 7 6
+' bash "$wait_script")"
+assert_contains 'a loop that stopped for a hold sends no email' "$notified" 'notified:6'
+assert_not_contains 'and exit 14 is the one that did not' "$notified" 'notified:14'
+assert_contains 'the default stop reason of exit 14 is ON_HOLD' \
+  "$(bash -c 'set -uo pipefail; source "$1"; agent_review_loop_default_stop_for_exit 14; printf "%s" "$agent_review_loop_stop_reason_code"' bash "$wait_script")" 'ON_HOLD'
+
+printf '\n=== usage documents the commands and exit 14 ===\n'
+usage_out="$(bash "$wait_script" --help 2>&1)"
+assert_contains 'usage lists hold' "$usage_out" 'hold [--pr N] [--repo OWNER/NAME]'
+assert_contains 'usage lists release' "$usage_out" 'release [--pr N] [--repo OWNER/NAME]'
+assert_contains 'usage documents exit 14' "$usage_out" ' 14  the PR is on hold'
+
+printf '\n=== docs: the skill, both rules and AGENTS.md describe the hold ===\n'
+skill="$(<"${rh_root}/.agents/skills/ship-and-review/SKILL.md")"
+rule="$(<"${rh_root}/.agents/rules/pr-ship-and-review.md")"
+template="$(<"${rh_root}/scripts/lib/repo-practices-agents/rules/pr-ship-and-review.md")"
+agents_md="$(<"${rh_root}/AGENTS.md")"
+assert_contains 'the skill explains the hold and its commands' "$skill" 'Batching fix pushes: hold and release'
+assert_contains 'the skill names the per-hour budget of the plans' "$skill" 'Essentials 5, Team 8, Advanced 10'
+assert_contains 'the skill says to push once per round' "$skill" '**Push once per round.**'
+assert_contains 'the skill says when to hold' "$skill" 'Hold the PR when more than one push is coming before you want a review'
+assert_contains 'the skill says release posts nothing but resume' "$skill" 'so `release` posts nothing else'
+assert_contains 'the skill says a held PR cannot complete without the final review' "$skill" 'A held PR cannot complete without that final review'
+assert_contains 'the skill lists exit 14' "$skill" '| 14 | The PR is on hold'
+assert_contains 'the repo rule carries the rule of thumb' "$rule" 'Batch the fix pushes (#865)'
+assert_contains 'the repo rule lists exit 14' "$rule" '| 14 | PR on hold'
+assert_contains 'the consumer template carries the rule of thumb with the helper path' "$template" '"${rh}/scripts/wait-for-agent-review" hold --pr <n>'
+assert_contains 'AGENTS.md describes the hold' "$agents_md" 'Batch the fix pushes (repository-helpers#865)'
+
+test_summary

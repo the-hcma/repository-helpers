@@ -39,7 +39,7 @@ Top-level scripts (see [README.md](./README.md) for operator-oriented summaries)
 | pnpm cutover | `scripts/grandfather-pnpm-release-age` | One-time `minimumReleaseAgeExclude` for existing lockfiles. |
 | Systemd | `scripts/setup-service`, `scripts/setup-github-repo-lint`, `scripts/setup-secret-audit`, `scripts/show-services` | Install timers/units; status summary. |
 | Deploy hook | `scripts/on-deploy` | Example hook; consumer repos implement their own. |
-| Agent review | `scripts/wait-for-agent-review`, `scripts/trigger-agent-review` | PR review loop, triage, operator email (no self-approve). |
+| Agent review | `scripts/wait-for-agent-review`, `scripts/trigger-agent-review` | PR review loop, triage, operator email (no self-approve); `hold` / `release` pause and resume CodeRabbit around a series of fix pushes (loop exit 14 while held). |
 | Dev workflow | `scripts/dev/start-development` | Worktree + session sync entry point. |
 | Dev workflow | `scripts/dev/pre-pr-checks` | Detect-first local CI gates (bash + Python/TS/Rust when present; secret-scan when adopted). |
 | Dev workflow | `scripts/dev/run-tests` | Run `tests/*.test` by file, optionally one CI shard (`--shard I/N`) and in parallel (`--jobs`); shared by CI and `pre-pr-checks`. |
@@ -567,6 +567,8 @@ When CI is green, follow **`.agents/skills/ship-and-review/SKILL.md`** (deep pla
 4. Configure `~/.config/agent-review.env` from `etc/agent-review.env.example`.
 
 See the Skill for CodeRabbit on_push policy, early-complete loop semantics, per-agent quota fallback, and exit codes (**`scripts/wait-for-agent-review --help`** is the SSOT).
+
+**Batch the fix pushes (repository-helpers#865):** CodeRabbit's included plan allows only a few PR reviews per hour and every push starts one, so triage all of exit 3 before pushing, pass `pre-pr-checks`, and push once per round. For a series of pushes run **`wait-for-agent-review hold --pr <n>`** (posts `@coderabbitai pause`) first and **`release --pr <n>`** (posts `@coderabbitai resume`, which itself starts the one review of the commits pushed meanwhile) after. While a PR is held, `check` / `wait` / `loop` exit **14** at once with no email, `complete_ready` is false and `complete` refuses, so a held PR cannot complete without that final review. The hold is the newest pause/resume comment on the PR; see the Skill.
 
 **Round cap (repository-helpers#861):** a round is one review of a new head that leaves feedback to address. Once a PR has had `agent-review-max-rounds` rounds (env `AGENT_REVIEW_MAX_ROUNDS`, else the repo custom property, else 3; `0` means no cap) and CI is green with nothing unanswered, `wait-for-agent-review loop` stops waiting for another review and ends as a success with one `NOTE: AGENT_REVIEW_MAX_ROUNDS pr=#N repo=... head=... rounds=R cap=C signed_off=0|1 reason=max-rounds` line and an operator email saying so, so the merge is a decision and not a silent timeout. Unanswered feedback at the cap still stops for triage (exit 3), and a PR that is not merge ready, whose CI is not ready or whose head moved stays in its normal path. See [docs/custom-properties.md](docs/custom-properties.md).
 

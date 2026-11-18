@@ -334,6 +334,33 @@ agent_review_coderabbit_head_status_from_statuses() {
     | @tsv'
 }
 
+# agent_review_coderabbit_hold_from_comments <comments-json>
+# Reads the PR's issue comments and prints "held<TAB><epoch>" when the newest `@coderabbitai pause` /
+# `@coderabbitai resume` command on the PR is a pause, and "none" otherwise (repository-helpers#865).
+# The state is the comments themselves because that is what CodeRabbit obeys and what every reader of the PR
+# sees; its own display of a pause (a status, a check title) is not documented, so nothing reads that. A command
+# counts when the first line of a human's comment is exactly the command (CodeRabbit ignores other text on the
+# line), whoever posted it: anyone allowed to comment can pause the PR, and the loop must honour that too.
+agent_review_coderabbit_hold_from_comments() {
+  local -r comments_json="${1:-}"
+
+  ar_runner_jq_file "coderabbit hold state" "${comments_json}" -r --slurp '
+    def ts: ((.created_at // "") | if . == "" then 0 else fromdateiso8601 end);
+    def command:
+      ((.body // "") | split("\n") | .[0] | gsub("^[[:space:]]+|[[:space:]]+$"; "") | ascii_downcase
+       | (capture("^@coderabbitai[[:space:]]+(?<c>pause|resume)$")? // null)
+       | if . == null then null else .c end);
+    [ .[] | if type == "array" then .[] else . end ]
+    | map(select(((.user.type // "") != "Bot")
+                 and (((.user.login // "") | test("\\[bot\\]$|^coderabbitai?$"; "i")) | not)))
+    | map(. + {cmd: command})
+    | map(select(.cmd != null))
+    | sort_by(.created_at // "")
+    | if length == 0 then "none"
+      elif (last | .cmd) == "pause" then "held\t\(last | ts)"
+      else "none" end'
+}
+
 # agent_review_coderabbit_seen_in_comments <comments-json>
 # Exit 0 when a CodeRabbit account has commented on the PR (a walkthrough, a command reply, a rate-limit
 # notice), 1 otherwise. The loop's own "@coderabbitai full review" asks are authored by the operator, so
@@ -370,4 +397,27 @@ agent_review_coderabbit_seen_on_pr() {
     unknown) return 2 ;;
     *) return 0 ;;
   esac
+}
+
+# agent_review_pr_on_hold <repo> <pr>
+# Exit 0 when the PR is on hold (its newest CodeRabbit pause/resume command is a pause), 1 otherwise. A failed
+# read is "not on hold", like every other comment read here: the next poll reads again.
+agent_review_pr_on_hold() {
+  local comments_json line
+
+  comments_json="$(agent_review_pr_issue_comments_json "${1}" "${2}")" || return 1
+  line="$(agent_review_coderabbit_hold_from_comments "${comments_json}")" || return 1
+  [[ "${line}" == held* ]]
+}
+
+# agent_review_status_with_hold <status-json> <true|false>
+# Adds "on_hold" to the status JSON and, while the PR is on hold, forces complete_ready to false: a held PR has
+# had pushes that CodeRabbit did not review, so it cannot complete without the review `release` asks for.
+agent_review_status_with_hold() {
+  local -r status_json="${1:-}"
+  local -r held="${2:-false}"
+
+  # shellcheck disable=SC2016  # jq program uses $held from --argjson
+  ar_runner_jq_file "agent-review status with hold" "${status_json}" -c --argjson held "${held}" '
+    . + {on_hold: $held} | if $held then .complete_ready = false else . end'
 }

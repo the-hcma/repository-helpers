@@ -204,6 +204,8 @@ After CI is green, `wait-for-agent-review` drives the PR review loop (CodeRabbit
 scripts/wait-for-agent-review loop --pr <n>
 scripts/wait-for-agent-review check --pr <n>
 scripts/wait-for-agent-review complete --pr <n>   # emails operator when complete_ready
+scripts/wait-for-agent-review hold --pr <n>       # pause CodeRabbit while a series of fix pushes is made
+scripts/wait-for-agent-review release --pr <n>    # resume it: one review of the whole series (loop exit 14 = held)
 ```
 
 `scripts/dev/ship-and-review` runs the full ship path: `pre-pr-checks` → stack submit → CI wait (approves WAITING environments on the operator’s behalf) → `wait-for-agent-review loop`.
