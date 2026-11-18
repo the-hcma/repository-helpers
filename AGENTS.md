@@ -120,8 +120,8 @@ Shared libraries live under `scripts/lib/` (runner, repo-practices, agent-review
 
 ## Repository
 
-- Remote: `https://github.com/the-hcma/repository-helpers` (private).
-- Do not make the repository public without explicit approval.
+- Remote: `https://github.com/the-hcma/repository-helpers` (public).
+- Do not change the repository's visibility without explicit approval.
 - Never commit secrets, credentials, or API keys — use environment variables.
 
 ---
@@ -334,7 +334,7 @@ Repos with `pnpm-lock.yaml` (root or `web/`) must:
 
 `999844287d1b2684baa91c3e8a5b62eda9f4915e`
 
-Pin by SHA for supply-chain integrity (repository-helpers may be public; treat this as an org composite action, not a “private action”). Dependabot does not always bump composite action SHAs automatically — plan periodic pin updates when the helper changes.
+Pin by SHA for supply-chain integrity (repository-helpers is public; treat this as an org composite action, not a “private action”). Dependabot does not always bump composite action SHAs automatically — plan periodic pin updates when the helper changes.
 
 **Nested `uses:` in composites (coding agents):** GitHub evaluates nested steps (e.g. `actions/cache` inside `setup-pnpm-corepack`) against the **consumer** repo’s `sha_pinning_required` setting. Tag pins like `@v6.1.0` inside the composite fail CI even when the consumer workflow only references this action by SHA. Always SHA-pin nested third-party `uses:` in `actions/*/action.yml`, and after fixing them bump every consumer’s `setup-pnpm-corepack@…` pin to the new `main` merge commit. Failure text looks like `The action actions/cache@… is not allowed … must be pinned to a full-length commit SHA`.
 
