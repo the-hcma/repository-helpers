@@ -17,10 +17,11 @@ readonly wait_script
 source "${script_dir}/lib/test-assert"
 test_init
 
-# assert_rc <label> <output> <status>: the status line is exactly rc=<status> (rc=1 must not match rc=14).
-assert_equals_count() { # <label> <actual> <expected>
+# assert_equals_count <label> <actual> <expected>: exact string comparison.
+assert_equals_count() {
   if [[ "$2" == "$3" ]]; then pass_case "$1"; else printf '  expected [%s], got [%s]\n' "$3" "$2" >&2; fail_case "$1"; fi
 }
+# assert_rc <label> <output> <status>: the status line is exactly rc=<status> (rc=1 must not match rc=14).
 assert_rc() {
   if grep -qx -- "rc=$3" <<<"$2"; then pass_case "$1"; else printf '  expected rc=%s, got:\n%s\n' "$3" "$2" >&2; fail_case "$1"; fi
 }
@@ -44,7 +45,8 @@ run_prog() {
   printf '%s\nrc=%s\n' "$out" "$rc"
 }
 
-# comments_json <states...>: PR comments as the REST API returns them, oldest first.
+# comment <id> <login> <type> <created_at> <body>: one PR comment as the REST API returns it (tests join them into
+# an array, oldest first).
 comment() { # <id> <login> <type> <created_at> <body>
   jq -nc --arg id "$1" --arg login "$2" --arg type "$3" --arg at "$4" --arg body "$5" \
     '{id: ($id | tonumber), user: {login: $login, type: $type}, created_at: $at, body: $body}'
@@ -150,7 +152,7 @@ out="$(run_prog "${recorder}"'agent_review_pr_on_hold() { return 0; }; cmd_relea
 assert_rc 'release exits 0' "$out" 0
 assert_equals_count 'release posts exactly the resume invocation' "$(cat "${tmp}/posted")" 'wait-for-agent-review release|o/r|7|@coderabbitai resume|'
 assert_equals_count 'release posts exactly one comment' "$(posted_count)" '1'
-assert_not_contains 'release does not ask for a second review on top of the one resume starts' "$(cat "${tmp}/posted")" 'review'"'"
+assert_not_contains 'release does not ask for a second review on top of the one resume starts' "$(cat "${tmp}/posted")" '@coderabbitai review'
 assert_not_contains 'and posts no full review' "$(cat "${tmp}/posted")" 'full review'
 assert_contains 'release says what happens next' "$out" 'one incremental review of the commits pushed while paused'
 rm -f "${tmp}/posted"
@@ -193,6 +195,8 @@ assert_contains 'and says the PR is on hold and how to release it' "$out" 'compl
 
 printf '\n=== wait does not block on a held PR ===\n'
 out="$(run_prog '
+  agent_review_pr_is_merged() { return 1; }
+  agent_review_ci_check_for_pr() { return 0; }
   agent_review_reviewers_is_disabled() { return 1; }
   agent_review_reviewers_select_agent() { return 0; }
   agent_review_pr_on_hold() { return 0; }
@@ -322,17 +326,6 @@ within() { # <comments-json> <seconds>
 assert_rc 'a resume posted just now is within the grace' "$(within "${recent_resume}" 600)" 0
 assert_rc 'a resume from long ago is not' "$(within "${old_resume}" 600)" 1
 assert_rc 'a pause is not a release' "$(within "[${c_pause}]" 600)" 1
-out="$(run_prog '
-  agent_review_coderabbit_head_state() { printf other; }
-  agent_review_coderabbit_head_paused() { return 0; }
-  agent_review_pr_released_within() { return 0; }
-  agent_review_agent_signed_off_on_head() { return 1; }
-  agent_review_agent_quota_rate_limited_for_agent() { return 1; }
-  agent_review_profile_request_last_resort_full_review() { : >"${ASK_MARKER}"; return 0; }
-  rm -f "${ASK_MARKER}"
-  cmd_loop_resume_paused_coderabbit o/r 7 abc1234 "{}"')"
-assert_rc 'a paused head right after release is not resumed again (returns 1)' "$out" 1
-assert_equals_count 'and no full review is requested' "$([[ -e "${ASK_MARKER}" ]] && echo asked || echo none)" 'none'
 
 printf '\n=== aliases, whitespace and the release grace ===\n'
 assert_contains 'the @coderabbit handle pauses too' \
@@ -369,15 +362,16 @@ out="$(run_prog '
   agent_review_reviewers_is_enabled() { return 0; }
   agent_review_agent_quota_exhausted_for_agent() { return 1; }
   agent_review_named_pr_check_is_pending() { return 1; }
-  cmd_loop_resume_paused_coderabbit() { return 1; }
   agent_review_agent_signed_off_on_head() { return 1; }
   agent_review_pr_released_within() { return 0; }
+  agent_review_coderabbit_head_state() { printf other; }
+  agent_review_coderabbit_head_paused() { : >"${ASK_MARKER}"; return 0; }
   cmd_loop_sleep_abort_if_pending() { return 3; }
   cmd_loop_handle_coderabbit_rate_limit() { : >"${ASK_MARKER}"; return 0; }
   cmd_loop_maybe_request_agents_on_head() { : >"${ASK_MARKER}"; }
   cmd_loop o/r 7')"
 assert_contains 'the loop reports that it is waiting for the incremental review' "$out" 'just released'
-assert_equals_count 'and neither the rate-limit handler nor an agent request ran' "$([[ -e "${ASK_MARKER}" ]] && echo asked || echo none)" 'none'
+assert_equals_count 'and a paused head, the resume path, the rate-limit handler and the agent request were never reached (real loop order)' "$([[ -e "${ASK_MARKER}" ]] && echo asked || echo none)" 'none'
 
 printf '\n=== check with an unreadable hold state is never complete_ready ===\n'
 out="$(run_prog "${check_stubs}"'agent_review_pr_on_hold() { return 2; }; cmd_check o/r 7')"
