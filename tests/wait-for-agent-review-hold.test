@@ -419,6 +419,42 @@ out="$(run_prog '
 assert_rc 'wait returns 14 once a later poll sees the hold' "$out" 14
 assert_equals_count 'and the first poll ran before it did' "$(grep -c poll "${tmp}/polls" 2>/dev/null || true)" '1'
 
+printf '\n=== idle completion and the PR cap never finish a held PR ===\n'
+idle_stubs='
+  agent_review_require_cmd() { return 0; }
+  agent_review_repo_parts() { printf "o r\n"; }
+  agent_review_graphql_pr_snapshot() { printf "{\"data\":{\"repository\":{\"pullRequest\":{\"headRefOid\":\"abc1234\"}}}}"; }
+  agent_review_assert_snapshot_complete() { return 0; }
+  agent_review_observe_all_agent_quota_on_pr() { return 0; }
+  agent_review_pending_thread_count_from_snapshot() { printf 0; }
+  agent_review_agent_signed_off_on_head() { return 0; }
+  agent_review_email_work_complete_checklist() { printf "all done\n"; }
+  agent_review_email_idle_complete() { : >"${ASK_MARKER}"; }
+  cmd_loop_nothing_outstanding() { return 0; }
+'
+for state in on_hold hold_unknown; do
+  rm -f "${ASK_MARKER}"
+  out="$(run_prog "${idle_stubs}"'cmd_status() { printf "{\"complete_ready\":false,\"'"${state}"'\":true}"; }; cmd_complete_idle o/r 7 0 0 early')"
+  assert_rc "idle completion of a PR with ${state} is refused (exit 2)" "$out" 2
+  assert_equals_count "and no completion email is sent for ${state}" "$([[ -e "${ASK_MARKER}" ]] && echo emailed || echo none)" 'none'
+done
+rm -f "${ASK_MARKER}"
+out="$(run_prog "${idle_stubs}"'cmd_status() { printf "{\"complete_ready\":false,\"on_hold\":false,\"hold_unknown\":false}"; }; cmd_complete_idle o/r 7 0 0 early')"
+assert_equals_count 'the same PR without a hold does reach the completion email (positive control)' "$([[ -e "${ASK_MARKER}" ]] && echo emailed || echo none)" 'emailed'
+rm -f "${ASK_MARKER}"
+out="$(run_prog '
+  agent_review_require_cmd() { return 0; }
+  agent_review_log_cycle_quota_preamble() { :; }
+  agent_review_sync_active_probe_agent() { :; }
+  agent_review_hold_flag() { printf true; }
+  agent_review_loop_set_stop() { :; }
+  cmd_complete_idle() { : >"${ASK_MARKER}"; return 0; }
+  cmd_loop_give_up_non_convergence() { : >"${ASK_MARKER}"; return 6; }
+  agent_review_default_pr_timeout_s=0
+  cmd_loop o/r 7')"
+assert_rc 'the PR cap on a held PR ends the loop with 14, not a give-up' "$out" 14
+assert_equals_count 'and neither completed nor gave up' "$([[ -e "${ASK_MARKER}" ]] && echo acted || echo none)" 'none'
+
 printf '\n=== usage documents the commands and exit 14 ===\n'
 usage_out="$(bash "$wait_script" --help 2>&1)"
 assert_contains 'usage lists hold' "$usage_out" 'hold [--pr N] [--repo OWNER/NAME]'
