@@ -22,6 +22,8 @@
 #   email-failure       Email operator that the agent loop timed out
 #   give-up             Email + PR comment that the agent loop is stopping
 #   loop                Run request/wait/check until complete, triage needed, or timeout
+#   hold                Pause CodeRabbit on the PR so a series of fix pushes is not reviewed push by push
+#   release             Resume CodeRabbit after a hold (it then starts one review of the whole series; wait with loop)
 #
 # See .cursor/rules/pr-ship-and-review.mdc for the full loop.
 # shellcheck disable=SC2016  # jq filter strings passed to ar_runner_jq_file helpers
@@ -102,6 +104,8 @@ Commands:
   email-failure [--pr N] [--repo OWNER/NAME] [--reason TEXT]
   give-up [--pr N] [--repo OWNER/NAME] [--reason TEXT]
   loop [--pr N] [--repo OWNER/NAME]
+  hold [--pr N] [--repo OWNER/NAME]
+  release [--pr N] [--repo OWNER/NAME]
 
 Environment:
   AGENT_REVIEW_AGENT            Agent profile name (default: copilot)
@@ -109,6 +113,7 @@ Environment:
   AGENT_REVIEW_QUOTA_FALLBACK_CHAIN  Comma-separated quota escalation (default: coderabbit; the agent-reviewers property selects the set)
   AGENT_REVIEW_CODERABBIT_RESUME_PAUSED  0 leaves a CodeRabbit review that auto-paused on the head paused
                                          (default 1: the loop asks once per head for a full review, never while rate limited)
+  AGENT_REVIEW_RELEASE_GRACE_S      Seconds after `release` the loop waits for the incremental review before asking for one (default 600, 0 off)
   AGENT_REVIEW_NO_AGENT_GRACE_S  Seconds with no sign of any chain agent on the PR before the loop exits 13
                                  (default 900; 0 disables). CodeRabbit is only ever asked for a full review once it
                                  has been seen on the PR, and an unanswered ask is not repeated.
@@ -149,17 +154,20 @@ Exit codes:
  11  permanent merge block (DIRTY/CONFLICTING/DRAFT) — human intervention required
  12  a waiting protected environment could not be approved (ERROR: ENVIRONMENT_APPROVAL_FAILED) — operator must approve it
  13  no review agent has shown itself on the PR within AGENT_REVIEW_NO_AGENT_GRACE_S (default 900s; ERROR: NO_REVIEW_AGENT_CONFIGURED) — set one up, or skip the loop
+ 14  the PR is on hold (`hold` posted `@coderabbitai pause`): pushes are not reviewed and nothing is waited for or
+     asked until `release`; complete_ready stays false while held (check, wait, loop; no operator email)
 
 Non-success loop exits email AGENT_REVIEW_REPORT_TO and post a PR comment when the loop
 command exits, except exit 3 (pending feedback) and exit 10 (CI failed): those are
 coding-agent ownership — fix or triage, then resume; escalate to a human only if unfixable.
+Exit 14 (on hold) is also no email: push the series of fixes, then `release`.
 Success (0 after complete, or PR merged) sends no failure notify.
 Give-up paths (6/7) notify once inside give-up; the loop epilogue skips duplicate email.
 EOF
 }
 
 cmd_status() {
-  local repo pr owner name snapshot head
+  local repo pr owner name snapshot head held
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   read -r owner name < <(agent_review_repo_parts "${repo}")
@@ -173,7 +181,8 @@ cmd_status() {
   agent_review_assert_snapshot_complete "${snapshot}"
   head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
   agent_review_observe_all_agent_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}" || true
-  agent_review_status_json_from_snapshot "${snapshot}" "${repo}" "${pr}"
+  held="$(agent_review_hold_flag "${repo}" "${pr}")"
+  agent_review_status_with_hold "$(agent_review_status_json_from_snapshot "${snapshot}" "${repo}" "${pr}")" "${held}"
 }
 
 # Approves a waiting protected environment (github-repo-lint, dep-updater, ...) on the operator's
@@ -299,6 +308,10 @@ agent_review_loop_default_stop_for_exit() {
       agent_review_loop_set_stop 'NO_REVIEW_AGENT_CONFIGURED' \
         'No review agent has shown itself on the PR; none looks configured for the repository.'
       ;;
+    14)
+      agent_review_loop_set_stop 'ON_HOLD' \
+        'The PR is on hold (CodeRabbit paused): release it to ask for the review of the pushes made meanwhile.'
+      ;;
     *)
       agent_review_loop_set_stop 'LOOP_STOPPED' \
         "Agent review loop stopped (exit ${exit_code})."
@@ -366,8 +379,9 @@ cmd_loop_exit_notify() {
   fi
   # Exit 3 (threads pending) and 10 (CI failed): coding-agent ownership — no
   # operator email / loop-stopped PR comment. Agent triages or fixes, then resumes.
-  # Escalate to humans only when a fix cannot be identified.
-  if (( exit_code == 3 || exit_code == 10 )); then
+  # Escalate to humans only when a fix cannot be identified. Exit 14 (on hold) is the operator's own choice,
+  # not a failure: nothing to report until `release`.
+  if (( exit_code == 3 || exit_code == 10 || exit_code == 14 )); then
     return 0
   fi
   if (( agent_review_loop_notified == 1 )); then
@@ -422,6 +436,11 @@ cmd_request_confirm_clean() {
       ;;
     3)
       printf 'wait-for-agent-review: no full review requested for PR #%s - CodeRabbit is not set up on this repository (see above)\n' \
+        "${pr}" >&2
+      return 0
+      ;;
+    4)
+      printf 'wait-for-agent-review: no full review requested for PR #%s - it is on hold or was just released (see above)\n' \
         "${pr}" >&2
       return 0
       ;;
@@ -519,9 +538,93 @@ cmd_request() {
   fi
 }
 
+# The message a held PR prints wherever the loop, check or wait stops for it (exit 14). It names the repository, so
+# the command can be copied from any checkout.
+agent_review_hold_notice() {
+  local -r pr="${1}"
+  local -r repo="${2}"
+
+  printf 'wait-for-agent-review: PR #%s is on hold - CodeRabbit is paused, so pushes are not reviewed and nothing is waited for or asked.\n' \
+    "${pr}" >&2
+  printf 'wait-for-agent-review: push the rest of the fixes, then run: %q release --pr %s --repo %s\n' \
+    "${script_dir}/wait-for-agent-review" "${pr}" "${repo}" >&2
+}
+
+# agent_review_hold_flag <repo> <pr>: prints true (on hold), false (not on hold) or unknown (the comments could not
+# be read). Anything that guards a completion or a release treats unknown like true.
+agent_review_hold_flag() {
+  local rc=0
+
+  agent_review_pr_on_hold "${1}" "${2}" || rc=$?
+  case "${rc}" in
+    0) printf 'true\n' ;;
+    1) printf 'false\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+# hold: pause CodeRabbit on the PR so a series of fix pushes is not reviewed push by push (#865). CodeRabbit's
+# included plan allows a few reviews per hour, and each fix push otherwise starts one (or queues behind the
+# hourly limit) only to be superseded by the next. The pause is `@coderabbitai pause`, a PR comment, so the hold
+# is visible on the PR and survives this session.
+cmd_hold() {
+  local repo pr state_rc=0
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  if ! agent_review_reviewers_is_enabled coderabbit "${repo}"; then
+    printf 'wait-for-agent-review: not holding PR #%s: CodeRabbit is not an enabled reviewer for %s (agent-reviewers property)\n' \
+      "${pr}" "${repo}" >&2
+    return 1
+  fi
+  agent_review_pr_on_hold "${repo}" "${pr}" || state_rc=$?
+  if (( state_rc == 2 )); then
+    agent_review_die "could not read the comments of PR #${pr}, so its hold state is unknown - run hold again"
+  fi
+  if (( state_rc == 0 )); then
+    printf 'wait-for-agent-review: PR #%s is already on hold\n' "${pr}" >&2
+    agent_review_hold_notice "${pr}" "${repo}"
+    return 0
+  fi
+  agent_review_pr_comment_post "wait-for-agent-review hold" "${repo}" "${pr}" '@coderabbitai pause' \
+    || agent_review_die "could not post the pause comment on PR #${pr}"
+  printf 'wait-for-agent-review: PR #%s is now on hold (posted @coderabbitai pause)\n' "${pr}" >&2
+  agent_review_hold_notice "${pr}" "${repo}"
+}
+
+# release: end a hold. `@coderabbitai resume` restarts CodeRabbit's automatic reviews and, by its documentation,
+# starts an incremental review of the commits pushed while it was paused, so this posts nothing else: asking for a
+# review as well would spend a second one of the hourly budget on the same head. The loop then waits for that
+# review as it does for any head; for a few minutes after the resume it does not read a leftover "paused" state as
+# a reason to ask (AGENT_REVIEW_RELEASE_GRACE_S), and it asks once after its usual cooldown if CodeRabbit stays
+# silent. An unreadable hold state is an error, never a no-op: the PR could still be paused.
+cmd_release() {
+  local repo pr state_rc=0
+
+  repo="$(agent_review_resolve_repo "${1:-}")"
+  pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
+  agent_review_require_cmd gh
+  agent_review_require_cmd jq
+  agent_review_pr_on_hold "${repo}" "${pr}" || state_rc=$?
+  if (( state_rc == 2 )); then
+    agent_review_die "could not read the comments of PR #${pr}, so it is unknown whether it is on hold - run release again"
+  fi
+  if (( state_rc == 1 )); then
+    printf 'wait-for-agent-review: PR #%s is not on hold - nothing to release\n' "${pr}" >&2
+    return 0
+  fi
+  agent_review_pr_comment_post "wait-for-agent-review release" "${repo}" "${pr}" '@coderabbitai resume' \
+    || agent_review_die "could not post the resume comment on PR #${pr}"
+  printf 'wait-for-agent-review: PR #%s released (posted @coderabbitai resume)\n' "${pr}" >&2
+  printf 'wait-for-agent-review: CodeRabbit starts one incremental review of the commits pushed while paused; wait for it with: %q loop --pr %s --repo %s\n' \
+    "${script_dir}/wait-for-agent-review" "${pr}" "${repo}" >&2
+}
+
 cmd_wait() {
   local repo pr timeout interval owner name head started snapshot review_body check_state_json check_state quota_hit
-  local last_activity now_epoch idle_break idle_s ci_rc
+  local last_activity now_epoch idle_break idle_s ci_rc hold_rc
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   read -r owner name < <(agent_review_repo_parts "${repo}")
@@ -552,6 +655,25 @@ cmd_wait() {
     if (( ci_rc == 1 )); then
       agent_review_print_ci_failures "${repo}" "${pr}"
       return 10
+    fi
+    # A hold posted while this wait runs ends it too: nothing is reviewed until `release` (#865).
+    hold_rc=0
+    agent_review_pr_on_hold "${repo}" "${pr}" || hold_rc=$?
+    if (( hold_rc == 0 )); then
+      agent_review_hold_notice "${pr}" "${repo}"
+      return 14
+    fi
+    if (( hold_rc == 2 )); then
+      # The comments could not be read, so a hold cannot be ruled out: never evaluate a review as a success on a
+      # guess. Read again after the poll interval, within the same timeout.
+      if (( $(date +%s) - started >= timeout )); then
+        printf 'ERROR: WAIT_TIMEOUT wait-for-agent-review pr=%s waited=%ss timeout=%ss reason=hold-state-unknown\n' \
+          "${pr}" "$(( $(date +%s) - started ))" "${timeout}" >&2
+        return 2
+      fi
+      printf 'wait-for-agent-review: could not read the comments of PR #%s (hold state unknown) - polling again\n' "${pr}" >&2
+      sleep "${interval}"
+      continue
     fi
     snapshot="$(agent_review_graphql_wait_snapshot "${owner}" "${name}" "${pr}")"
     head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
@@ -691,7 +813,7 @@ cmd_list_feedback() {
 cmd_check() {
   local repo pr owner name snapshot status complete_ready fresh merge_state pr_merged agent_empty agent_quota
   local head_check_error head_check_findings head all_quotas_exhausted pending_count
-  local ci_conclusion merge_class
+  local ci_conclusion merge_class held
 
   # Drop stale diagnostics from prior polls so stop emails stay actionable.
   agent_review_loop_last_error=''
@@ -710,6 +832,8 @@ cmd_check() {
   head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
   agent_review_observe_all_agent_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}" || true
   status="$(agent_review_status_json_from_snapshot "${snapshot}" "${repo}" "${pr}")"
+  held="$(agent_review_hold_flag "${repo}" "${pr}")"
+  status="$(agent_review_status_with_hold "${status}" "${held}")"
   pr_merged="$(wait_ar_jq_status "$status" '.pr_merged')"
   if [[ "${pr_merged}" == 'true' ]]; then
     printf '%s\n' "${status}"
@@ -721,6 +845,27 @@ cmd_check() {
     agent_review_print_ci_failures "${repo}" "${pr}"
     printf '%s\n' "${status}" >&2
     return 10
+  fi
+  # A held PR stops here, before the CI wait: nothing is reviewed until `release`, so there is nothing to wait for.
+  # A PR whose hold state could not be read does not decide on a guess in either direction: exit 2 makes the loop
+  # poll again (complete_ready is already false in the status above). Feedback that still needs an answer comes
+  # first in both cases (exit 3).
+  if [[ "${held}" == 'true' || "${held}" == 'unknown' ]]; then
+    pending_count="$(agent_review_pending_thread_count_from_snapshot "${repo}" "${pr}" "${snapshot}")"
+    if (( pending_count > 0 )); then
+      printf '%s\n' "${status}" >&2
+      agent_review_feedback_triage_json "${repo}" "${pr}" "${snapshot}"
+      printf 'wait-for-agent-review: %s feedback item(s) still need a reply or resolve (threads and comments)\n' \
+        "${pending_count}" >&2
+      return 3
+    fi
+    printf '%s\n' "${status}"
+    if [[ "${held}" == 'true' ]]; then
+      agent_review_hold_notice "${pr}" "${repo}"
+      return 14
+    fi
+    printf 'wait-for-agent-review: could not read the comments of PR #%s, so its hold state is unknown - polling again\n' "${pr}" >&2
+    return 2
   fi
   if [[ "${ci_conclusion}" == 'pending' ]] \
     || [[ "$(wait_ar_jq_status "$status" '.ci_ready')" != 'true' ]]; then
@@ -836,6 +981,12 @@ cmd_complete() {
     return 0
   fi
   complete_ready="$(wait_ar_jq_status "$status" '.complete_ready')"
+  if [[ "$(wait_ar_jq_status "$status" '.on_hold // false')" == 'true' ]]; then
+    agent_review_die "complete blocked: PR #${pr} is on hold, so its last pushes were not reviewed - run: ${script_dir}/wait-for-agent-review release --pr ${pr} --repo ${repo}"
+  fi
+  if [[ "$(wait_ar_jq_status "$status" '.hold_unknown // false')" == 'true' ]]; then
+    agent_review_die "complete blocked: could not read the comments of PR #${pr}, so it is unknown whether it is on hold - run complete again"
+  fi
   if [[ "${complete_ready}" != 'true' ]]; then
     agent_review_die 'complete requires agent and human review empty on current head with no unaddressed threads'
   fi
@@ -1854,6 +2005,11 @@ cmd_loop_handle_coderabbit_rate_limit() {
           "${pr}" >&2
         return 3
       fi
+      # A pause posted during the cooldown ends it: nothing is reviewed until `release` (#865).
+      if cmd_loop_stop_if_held "${repo}" "${pr}"; then
+        agent_review_loop_wait_remove 'coderabbit' || true
+        return 14
+      fi
       remaining="$(agent_review_agent_quota_seconds_until_retry_for_agent 'coderabbit' || true)"
       if [[ -z "${remaining}" ]]; then
         remaining="${poll_s}"
@@ -2044,8 +2200,9 @@ cmd_loop_handle_coderabbit_rate_limit() {
   fi
   request_rc=0
   agent_review_profile_request_last_resort_full_review "${repo}" "${pr}" "${head}" || request_rc=$?
-  if (( request_rc == 3 )); then
-    # CodeRabbit has never been seen on this repository: nothing was asked and nothing is awaited (#759).
+  if (( request_rc == 3 || request_rc == 4 )); then
+    # CodeRabbit has never been seen on this repository (#759), or the PR is on hold / was just released (#865):
+    # nothing was asked and nothing is awaited.
     agent_review_loop_wait_remove 'coderabbit' || true
     agent_review_use_agent "${saved_agent}"
     return 1
@@ -2253,6 +2410,13 @@ cmd_complete_idle() {
   head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
   agent_review_observe_all_agent_quota_on_pr "${repo}" "${pr}" "${head}" "${snapshot}" || true
   status="$(cmd_status "${repo}" "${pr}")"
+  # A held PR (or one whose hold state could not be read) never completes, whoever asks: complete_ready is already
+  # false, but the checklist and sign-off path below would still email "complete" (#865).
+  if [[ "$(wait_ar_jq_status "$status" '.on_hold // false')" == 'true' ]] \
+    || [[ "$(wait_ar_jq_status "$status" '.hold_unknown // false')" == 'true' ]]; then
+    printf 'wait-for-agent-review: refusing idle complete - PR #%s is on hold or its hold state is unknown\n' "${pr}" >&2
+    return 2
+  fi
   if [[ "${mode}" == 'early' ]] \
     && ! cmd_loop_nothing_outstanding "${repo}" "${pr}" "${status}" "${snapshot}" "${head}"; then
     printf 'wait-for-agent-review: refusing early complete — agent review still outstanding on PR #%s\n' \
@@ -2378,6 +2542,12 @@ cmd_loop_complete_at_max_rounds() {
     return 1
   fi
   status="$(AGENT_REVIEW_ISSUE_COMMENTS_PREFETCH="${comments_json}" cmd_status "${repo}" "${pr}")"
+  # A held PR, or one whose hold state could not be read, is never completed by the cap: the cap accepts a head that
+  # CodeRabbit may not have reviewed, and a hold means it has not (#865).
+  if [[ "$(wait_ar_jq_status "$status" '.on_hold // false')" == 'true' ]] \
+    || [[ "$(wait_ar_jq_status "$status" '.hold_unknown // false')" == 'true' ]]; then
+    return 1
+  fi
   status_head="$(wait_ar_jq_status "${status}" '.head_sha // ""')"
   ci_ready="$(wait_ar_jq_status "${status}" '.ci_ready')"
   merge_ready="$(wait_ar_jq_status "${status}" '.merge_ready')"
@@ -2513,12 +2683,29 @@ cmd_loop_abort_if_no_agent_configured() {
   return 13
 }
 
+# cmd_loop_stop_if_held <repo> <pr>: exit 0 (after printing the notice and recording the stop) when the PR is on
+# hold, 1 otherwise. A PR on hold (#865) has CodeRabbit paused, so a push is not reviewed and there is no sign-off
+# to wait for or to ask for: the loop stops at once instead of blocking on a review that cannot come, and
+# `release` asks for the one review of the whole series. The loop then waits for it as usual. The hold comes
+# before the round cap and the idle completion, so a held PR cannot complete without that review (the cap still
+# applies once it is released). An unreadable hold state is not a stop: the next poll reads it again, and
+# complete_ready stays false meanwhile (agent_review_status_with_hold).
+cmd_loop_stop_if_held() {
+  if [[ "$(agent_review_hold_flag "${1}" "${2}")" != 'true' ]]; then
+    return 1
+  fi
+  agent_review_hold_notice "${2}" "${1}"
+  agent_review_loop_set_stop 'ON_HOLD' \
+    'The PR is on hold (CodeRabbit paused): release it to ask for the review of the pushes made meanwhile.'
+  return 0
+}
+
 cmd_loop() {
   local repo pr pr_started last_head head now
   local pr_cap cycle_cap check_exit ci_exit pending_exit rate_exit status
   local owner name snapshot complete_exit status_pending check_stdout check_stdout_file
   local transient_retries transient_max transient_sleep restack_exit
-  local coderabbit_active cap_exit
+  local coderabbit_active cap_exit hold_state
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
@@ -2547,6 +2734,20 @@ cmd_loop() {
   while true; do
     now="$(date +%s)"
     if (( now - pr_started >= pr_cap )); then
+      # The PR cap does not end a held PR: nothing is reviewed until `release`, so there is nothing to give up on.
+      # Feedback that still needs an answer comes first, as on every other held path (exit 3).
+      if [[ "$(agent_review_hold_flag "${repo}" "${pr}")" == 'true' ]]; then
+        pending_exit=0
+        agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
+        if (( pending_exit == 3 )); then
+          agent_review_loop_set_stop 'THREADS_PENDING' \
+            'Feedback items still need a reply or resolve (threads, issue comments, review bodies).'
+          return 3
+        fi
+        if cmd_loop_stop_if_held "${repo}" "${pr}"; then
+          return 14
+        fi
+      fi
       status="$(cmd_status "${repo}" "${pr}" 2>/dev/null || true)"
       read -r owner name < <(agent_review_repo_parts "${repo}")
       snapshot="$(agent_review_graphql_pr_snapshot "${owner}" "${name}" "${pr}" 2>/dev/null || true)"
@@ -2565,6 +2766,32 @@ cmd_loop() {
     if agent_review_pr_is_merged "${repo}" "${pr}"; then
       printf 'PR #%s is merged — loop complete\n' "${pr}" >&2
       return 0
+    fi
+    # A held PR stops before anything that acts on CI (approving a waiting environment, waiting for checks): nothing
+    # is reviewed until `release`. Feedback that still needs an answer comes first (exit 3).
+    hold_state="$(agent_review_hold_flag "${repo}" "${pr}")"
+    if [[ "${hold_state}" == 'true' ]]; then
+      pending_exit=0
+      agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
+      if (( pending_exit == 3 )); then
+        agent_review_loop_set_stop 'THREADS_PENDING' \
+          'Feedback items still need a reply or resolve (threads, issue comments, review bodies).'
+        return 3
+      fi
+      if cmd_loop_stop_if_held "${repo}" "${pr}"; then
+        return 14
+      fi
+    elif [[ "${hold_state}" == 'unknown' ]]; then
+      # The comments could not be read, so a hold cannot be ruled out: do not approve environments, wait on CI or ask
+      # for a review on a guess. Read again on the next pass (the PR cap bounds this).
+      printf 'wait-for-agent-review loop: could not read the comments of PR #%s (hold state unknown) - polling again\n' "${pr}" >&2
+      pending_exit=0
+      cmd_loop_sleep_abort_if_pending "${repo}" "${pr}" \
+        "${agent_review_default_poll_interval_s}" 'hold state unknown' || pending_exit=$?
+      if (( pending_exit == 3 )); then
+        return 3
+      fi
+      continue
     fi
     ci_exit=0
     cmd_loop_abort_if_ci_failed "${repo}" "${pr}" || ci_exit=$?
@@ -2664,6 +2891,20 @@ cmd_loop() {
       fi
       continue
     fi
+    # Right after `release` CodeRabbit starts its incremental review: wait for it instead of asking for another one
+    # while the head may still show the old paused state or an old rate-limit cooldown (#865). Bounded by the grace.
+    if (( coderabbit_active == 1 )) \
+      && ! agent_review_agent_signed_off_on_head "${snapshot}" "${head}" "${repo}" "${pr}" \
+      && agent_review_pr_released_within "${repo}" "${pr}" "$(agent_review_release_grace_s)"; then
+      printf 'wait-for-agent-review loop: PR #%s was just released - waiting for the CodeRabbit incremental review…\n' "${pr}" >&2
+      pending_exit=0
+      cmd_loop_sleep_abort_if_pending "${repo}" "${pr}" \
+        "${agent_review_default_poll_interval_s}" 'CodeRabbit release review' || pending_exit=$?
+      if (( pending_exit == 3 )); then
+        return 3
+      fi
+      continue
+    fi
     if (( coderabbit_active == 1 )) \
       && cmd_loop_resume_paused_coderabbit "${repo}" "${pr}" "${head}" "${snapshot}"; then
       pending_exit=0
@@ -2684,6 +2925,9 @@ cmd_loop() {
     fi
     if (( rate_exit == 7 )); then
       return 7
+    fi
+    if (( rate_exit == 14 )); then
+      return 14
     fi
     if (( rate_exit == 0 )); then
       continue
@@ -2773,6 +3017,12 @@ cmd_loop() {
       10)
         agent_review_loop_set_stop 'CI_FAILED' 'Required CI checks failed.'
         return 10
+        ;;
+      14)
+        # A hold posted after the loop's own hold check and before cmd_check ran: the same stop, not a failed check.
+        agent_review_loop_set_stop 'ON_HOLD' \
+          'The PR is on hold (CodeRabbit paused): release it to ask for the review of the pushes made meanwhile.'
+        return 14
         ;;
       11)
         agent_review_loop_set_stop 'MERGE_STATE_BLOCKED' \
@@ -2993,6 +3243,12 @@ main() {
       ;;
     restack)
       cmd_restack "${repo_arg}" "${pr_arg}"
+      ;;
+    hold)
+      cmd_hold "${repo_arg}" "${pr_arg}"
+      ;;
+    release)
+      cmd_release "${repo_arg}" "${pr_arg}"
       ;;
     resolve-thread)
       cmd_resolve_thread "${thread_id}" "${force_resolve}"

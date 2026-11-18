@@ -334,6 +334,35 @@ agent_review_coderabbit_head_status_from_statuses() {
     | @tsv'
 }
 
+# agent_review_coderabbit_hold_from_comments <comments-json>
+# Reads the PR's issue comments and prints the state set by the newest `@coderabbitai pause` / `@coderabbitai resume`
+# command (repository-helpers#865).
+# The state is the comments themselves because that is what CodeRabbit obeys and what every reader of the PR
+# sees; its own display of a pause (a status, a check title) is not documented, so nothing reads that. A command
+# counts when the whole comment of a human is the command (CodeRabbit ignores a comment with other text), whoever
+# posted it: anyone allowed to comment can pause the PR, and the loop must honour that too. CodeRabbit's documented
+# aliases count as well: the `@coderabbit` handle, and `ignore` for a whole-comment pause. The newest command
+# decides: "held\t<epoch>" for a pause, "released\t<epoch>" for a resume, "none" when there is no command.
+agent_review_coderabbit_hold_from_comments() {
+  local -r comments_json="${1:-}"
+
+  ar_runner_jq_file "coderabbit hold state" "${comments_json}" -r --slurp '
+    def ts: ((.created_at // "") | if . == "" then 0 else fromdateiso8601 end);
+    def command:
+      ((.body // "")
+       | (capture("\\A[[:space:]]*@coderabbit(ai)?[[:space:]]+(?<c>pause|ignore|resume)[[:space:]]*\\z"; "i")? // null)
+       | if . == null then null else (.c | ascii_downcase | if . == "resume" then "resume" else "pause" end) end);
+    [ .[] | if type == "array" then .[] else . end ]
+    | map(select(((.user.type // "") != "Bot")
+                 and (((.user.login // "") | test("\\[bot\\]$|^coderabbitai?$"; "i")) | not)))
+    | map(. + {cmd: command})
+    | map(select(.cmd != null))
+    | sort_by(.created_at // "")
+    | if length == 0 then "none"
+      elif (last | .cmd) == "pause" then "held\t\(last | ts)"
+      else "released\t\(last | ts)" end'
+}
+
 # agent_review_coderabbit_seen_in_comments <comments-json>
 # Exit 0 when a CodeRabbit account has commented on the PR (a walkthrough, a command reply, a rate-limit
 # notice), 1 otherwise. The loop's own "@coderabbitai full review" asks are authored by the operator, so
@@ -370,4 +399,66 @@ agent_review_coderabbit_seen_on_pr() {
     unknown) return 2 ;;
     *) return 0 ;;
   esac
+}
+
+# agent_review_pr_hold_state <repo> <pr>
+# Prints "held<TAB><epoch>", "released<TAB><epoch>" or "none" (see agent_review_coderabbit_hold_from_comments).
+# Exit 1 when the comments cannot be read, so a caller can tell "not on hold" from "could not tell": a failed
+# read must never look like a release or a completion.
+agent_review_pr_hold_state() {
+  local comments_json
+
+  comments_json="$(agent_review_pr_issue_comments_json_strict "${1}" "${2}")" || return 1
+  agent_review_coderabbit_hold_from_comments "${comments_json}"
+}
+
+# agent_review_pr_on_hold <repo> <pr>
+# Exit 0 when the PR is on hold (its newest CodeRabbit pause/resume command is a pause), 1 when it is not, and 2
+# when the state could not be read. Callers that guard a completion or a release treat 2 as "held".
+agent_review_pr_on_hold() {
+  local line
+
+  line="$(agent_review_pr_hold_state "${1}" "${2}")" || return 2
+  [[ "${line}" == held* ]]
+}
+
+# agent_review_pr_released_within <repo> <pr> <seconds>
+# Exit 0 when the newest pause/resume command is a resume posted less than <seconds> ago. Right after `release`
+# the head can still show CodeRabbit's old "Review paused" state until the incremental review registers, and the
+# loop must not answer that with a second review request (#865). AGENT_REVIEW_NOW_EPOCH fixes the clock in tests.
+agent_review_pr_released_within() {
+  local line state epoch now
+
+  line="$(agent_review_pr_hold_state "${1}" "${2}")" || return 1
+  IFS=$'\t' read -r state epoch <<<"${line}"
+  [[ "${state}" == released ]] || return 1
+  now="${AGENT_REVIEW_NOW_EPOCH:-$(date +%s)}"
+  (( now - epoch < 10#${3} ))
+}
+
+# agent_review_release_grace_s: prints the seconds after `release` during which the loop waits for the incremental
+# review instead of asking for one (AGENT_REVIEW_RELEASE_GRACE_S; default 600, 0 turns it off). A value that is
+# not a non-negative decimal integer falls back to the default; leading zeros are decimal (090 is 90).
+agent_review_release_grace_s() {
+  local -r value="${AGENT_REVIEW_RELEASE_GRACE_S:-600}"
+
+  if [[ "${value}" =~ ^[0-9]{1,9}$ ]]; then
+    printf '%s\n' "$((10#${value}))"
+  else
+    printf '600\n'
+  fi
+}
+
+# agent_review_status_with_hold <status-json> <true|false|unknown>
+# Adds "on_hold" to the status JSON and, while the PR is on hold or its state is unknown, forces complete_ready to
+# false: a held PR has had pushes that CodeRabbit did not review, so it cannot complete without the review
+# `release` asks for, and a failed read must not let it complete either.
+agent_review_status_with_hold() {
+  local -r status_json="${1:-}"
+  local -r held="${2:-false}"
+
+  # shellcheck disable=SC2016  # jq program uses $held from --arg
+  ar_runner_jq_file "agent-review status with hold" "${status_json}" -c --arg held "${held}" '
+    . + {on_hold: ($held == "true"), hold_unknown: ($held == "unknown")}
+    | if $held != "false" then .complete_ready = false else . end'
 }

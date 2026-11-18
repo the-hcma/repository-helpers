@@ -644,11 +644,16 @@ agent_review_profile_request() {
 # Posts "@coderabbitai full review" once per head after cooldown + grace (loop-gated).
 # Hard-refuses while CodeRabbit's retry_after window is still in the future — when CR
 # says wait, we must wait (no re-ask storms).
+# Also refuses (exit 4) while the PR is on hold, and for the release grace after a `release`: a pause means CodeRabbit
+# is deliberately not reviewing, and right after a resume its incremental review is already starting, so an ask would
+# spend a second review on the same head (#865). The decision uses the same single read of the comments as the ask
+# marker below, so no later read can disagree with it. Every caller of this helper is covered by that one guard.
 agent_review_profile_request_last_resort_full_review() {
   local -r repo="$1"
   local -r pr="$2"
   local -r head="$3"
   local body retry_after comments_json line now asked_status attempts ready_epoch asked_epoch seen_rc
+  local hold_line hold_state hold_epoch
 
   if [[ -z "${head}" ]]; then
     return 1
@@ -669,6 +674,24 @@ agent_review_profile_request_last_resort_full_review() {
     printf 'wait-for-agent-review: coderabbit full-review marker lookup failed for PR #%s — will retry\n' \
       "${pr}" >&2
     return 2
+  fi
+  if ! hold_line="$(agent_review_coderabbit_hold_from_comments "${comments_json}")"; then
+    printf 'wait-for-agent-review: could not read the hold state of PR #%s - will retry\n' "${pr}" >&2
+    return 2
+  fi
+  IFS=$'\t' read -r hold_state hold_epoch <<<"${hold_line}"
+  if [[ "${hold_state}" == 'held' ]]; then
+    printf 'wait-for-agent-review: not asking CodeRabbit for a full review on PR #%s - the PR is on hold (release it first)\n' \
+      "${pr}" >&2
+    return 4
+  fi
+  if [[ "${hold_state}" == 'released' ]]; then
+    now="$(runner_exec_stdout "coderabbit release grace now" -- date -u +%s)"
+    if (( ${AGENT_REVIEW_NOW_EPOCH:-${now}} - hold_epoch < $(agent_review_release_grace_s) )); then
+      printf 'wait-for-agent-review: not asking CodeRabbit for a full review on PR #%s - it was just released, its incremental review is starting\n' \
+        "${pr}" >&2
+      return 4
+    fi
   fi
   # Never ask an agent nobody has seen on the repository: a repo without CodeRabbit would be asked
   # forever (#759). Exit 3 tells the caller there is no agent to ask, which is not a failure to retry.
