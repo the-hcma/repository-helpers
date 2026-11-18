@@ -1986,6 +1986,11 @@ cmd_loop_handle_coderabbit_rate_limit() {
           "${pr}" >&2
         return 3
       fi
+      # A pause posted during the cooldown ends it: nothing is reviewed until `release` (#865).
+      if cmd_loop_stop_if_held "${repo}" "${pr}"; then
+        agent_review_loop_wait_remove 'coderabbit' || true
+        return 14
+      fi
       remaining="$(agent_review_agent_quota_seconds_until_retry_for_agent 'coderabbit' || true)"
       if [[ -z "${remaining}" ]]; then
         remaining="${poll_s}"
@@ -2680,7 +2685,7 @@ cmd_loop() {
   local pr_cap cycle_cap check_exit ci_exit pending_exit rate_exit status
   local owner name snapshot complete_exit status_pending check_stdout check_stdout_file
   local transient_retries transient_max transient_sleep restack_exit
-  local coderabbit_active cap_exit
+  local coderabbit_active cap_exit hold_state
 
   repo="$(agent_review_resolve_repo "${1:-}")"
   pr="$(agent_review_resolve_pr "${2:-}" "${repo}")"
@@ -2734,7 +2739,8 @@ cmd_loop() {
     fi
     # A held PR stops before anything that acts on CI (approving a waiting environment, waiting for checks): nothing
     # is reviewed until `release`. Feedback that still needs an answer comes first (exit 3).
-    if [[ "$(agent_review_hold_flag "${repo}" "${pr}")" == 'true' ]]; then
+    hold_state="$(agent_review_hold_flag "${repo}" "${pr}")"
+    if [[ "${hold_state}" == 'true' ]]; then
       pending_exit=0
       agent_review_abort_if_pending_threads "${repo}" "${pr}" || pending_exit=$?
       if (( pending_exit == 3 )); then
@@ -2745,6 +2751,17 @@ cmd_loop() {
       if cmd_loop_stop_if_held "${repo}" "${pr}"; then
         return 14
       fi
+    elif [[ "${hold_state}" == 'unknown' ]]; then
+      # The comments could not be read, so a hold cannot be ruled out: do not approve environments, wait on CI or ask
+      # for a review on a guess. Read again on the next pass (the PR cap bounds this).
+      printf 'wait-for-agent-review loop: could not read the comments of PR #%s (hold state unknown) - polling again\n' "${pr}" >&2
+      pending_exit=0
+      cmd_loop_sleep_abort_if_pending "${repo}" "${pr}" \
+        "${agent_review_default_poll_interval_s}" 'hold state unknown' || pending_exit=$?
+      if (( pending_exit == 3 )); then
+        return 3
+      fi
+      continue
     fi
     ci_exit=0
     cmd_loop_abort_if_ci_failed "${repo}" "${pr}" || ci_exit=$?
@@ -2878,6 +2895,9 @@ cmd_loop() {
     fi
     if (( rate_exit == 7 )); then
       return 7
+    fi
+    if (( rate_exit == 14 )); then
+      return 14
     fi
     if (( rate_exit == 0 )); then
       continue
