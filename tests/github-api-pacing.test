@@ -21,6 +21,12 @@ tmp="$(mktemp -d)"
 readonly tmp
 trap 'rm -rf "$tmp"' EXIT
 
+# The gate's waiting budgets (5 s probe, 5 s flock, 10 s probe window, 15 s probe wait) are wall-clock, and the
+# racing-callers cases run real concurrent processes. On a loaded host (other agent sessions, a busy runner) a
+# slow process outlives those budgets, which splits one probe into several and fails the case for a reason that
+# is not in the code under test (repository-helpers#879), so every case here runs with a generous patience.
+export GITHUB_API_PACE_PATIENCE=20
+
 mock_bin="${tmp}/bin"
 mkdir -p "$mock_bin"
 
@@ -349,9 +355,11 @@ assert_contains "caller proceeds after the reset" "$out" "EC=0"
 printf '\n=== pacing: one rate-limit wait blocks every other caller ===\n'
 new_case publish
 mkdir -p "$case_state"
-reset_epoch="$(( EPOCHSECONDS + 5 ))"
+# The reset is a minute away, not five seconds: sleep is mocked, so the wait costs no time, and a loaded host
+# cannot take the reset past before the probe reads the depleted headers.
+reset_epoch="$(( EPOCHSECONDS + 60 ))"
 zen_headers 0 "$reset_epoch" >"$case_zen"
-out="$(run_lib 'github_api_rate_limit_max_wait_s=7; github_api_wait_for_rate_limit "API rate limit exceeded for user ID 9" "" 1 || true' 2>&1)"
+out="$(run_lib 'github_api_rate_limit_max_wait_s=62; github_api_wait_for_rate_limit "API rate limit exceeded for user ID 9" "" 1 || true' 2>&1)"
 assert_contains "the wait publishes its deadline for other callers" \
   "block=$(read_state blocked_until)" "block=$(( reset_epoch + 2 ))"
 assert_contains "primary depletion is read from real response headers" "$out" "source=header_depleted"
@@ -379,13 +387,18 @@ else
 fi
 
 printf '\n=== pacing: the mkdir fallback lock respects a live holder and breaks only an old one ===\n'
+# The fresh-lock cases wait out a live holder for many spins. Those spins take real time on a loaded host, so a
+# lock stamped "now" would turn stale (the 30 s crashed-holder threshold) and a quota stamped "now" would
+# expire (GITHUB_API_QUOTA_TTL_S) while the case is still waiting. They are stamped an hour ahead and the quota
+# TTL is a day, so no amount of elapsed time changes what the case tests (repository-helpers#879).
+quota_ttl_forever=86400
 new_case lockfresh
 mkdir -p "${case_state}/lock"
-printf '%s\n' "$EPOCHSECONDS" >"${case_state}/lock/since"
+printf '%s\n' "$(( EPOCHSECONDS + 3600 ))" >"${case_state}/lock/since"
 printf '%s %s %s\n' 1000 "$(( EPOCHSECONDS + 3000 ))" "$EPOCHSECONDS" >"${case_state}/quota"
 pace_lock_mode='mkdir'
-out="$(MOCK_LOCK_RELEASE_AFTER=40 MOCK_SPIN_COUNT="${case_dir}/spins" MOCK_LOCK_DIR="${case_state}/lock" \
-  run_lib 'github_api_pace_gate holder-wait; printf "EC=%s\n" "$?"' 2>&1)"
+out="$(GITHUB_API_QUOTA_TTL_S="$quota_ttl_forever" MOCK_LOCK_RELEASE_AFTER=40 MOCK_SPIN_COUNT="${case_dir}/spins" \
+  MOCK_LOCK_DIR="${case_state}/lock" run_lib 'github_api_pace_gate holder-wait; printf "EC=%s\n" "$?"' 2>&1)"
 assert_contains "a caller waits out a fresh lock instead of breaking it" "spins=$(cat "${case_dir}/spins")" "spins=40"
 assert_contains "the caller then proceeds normally" "$out" "EC=0"
 read -r remaining_after _ <<<"$(read_state quota)"
@@ -396,7 +409,7 @@ mkdir -p "${case_state}/lock"
 printf '%s\n' "$(( EPOCHSECONDS - 120 ))" >"${case_state}/lock/since"
 printf '%s %s %s\n' 1000 "$(( EPOCHSECONDS + 3000 ))" "$EPOCHSECONDS" >"${case_state}/quota"
 pace_lock_mode='mkdir'
-out="$(run_lib 'github_api_pace_gate crashed-holder; printf "EC=%s\n" "$?"' 2>&1)"
+out="$(GITHUB_API_QUOTA_TTL_S="$quota_ttl_forever" run_lib 'github_api_pace_gate crashed-holder; printf "EC=%s\n" "$?"' 2>&1)"
 assert_contains "a lock held for over 30 s (crashed holder) is broken" "$out" "EC=0"
 assert_not_contains "breaking a stale lock needs no lock-timeout fallback" "$out" "lock_timeout"
 read -r remaining_after _ <<<"$(read_state quota)"
@@ -404,12 +417,13 @@ assert_contains "the caller counted its call after breaking the stale lock" "rem
 
 new_case lockfresh-nosince
 mkdir -p "${case_state}/lock"
+touch -d '1 hour' "${case_state}/lock"
 printf '%s %s %s\n' 1000 "$(( EPOCHSECONDS + 3000 ))" "$EPOCHSECONDS" >"${case_state}/quota"
 pace_lock_mode='mkdir'
 # A holder that has made the lock directory but not yet written "since" (descheduled on a starved runner) is
 # live: the caller must wait it out past the 100 missed reads instead of breaking it (repository-helpers#838).
-out="$(MOCK_LOCK_RELEASE_AFTER=150 MOCK_SPIN_COUNT="${case_dir}/spins" MOCK_LOCK_DIR="${case_state}/lock" \
-  run_lib 'github_api_pace_gate slow-holder; printf "EC=%s\n" "$?"' 2>&1)"
+out="$(GITHUB_API_QUOTA_TTL_S="$quota_ttl_forever" MOCK_LOCK_RELEASE_AFTER=150 MOCK_SPIN_COUNT="${case_dir}/spins" \
+  MOCK_LOCK_DIR="${case_state}/lock" run_lib 'github_api_pace_gate slow-holder; printf "EC=%s\n" "$?"' 2>&1)"
 assert_contains "a fresh lock with no since yet is waited out, not broken, after 100 missed reads" \
   "spins=$(cat "${case_dir}/spins")" "spins=150"
 assert_contains "the caller then proceeds normally after the slow holder" "$out" "EC=0"
@@ -421,8 +435,8 @@ mkdir -p "${case_state}/lock"
 touch -d '2 minutes ago' "${case_state}/lock"
 printf '%s %s %s\n' 1000 "$(( EPOCHSECONDS + 3000 ))" "$EPOCHSECONDS" >"${case_state}/quota"
 pace_lock_mode='mkdir'
-out="$(MOCK_LOCK_RELEASE_AFTER=100000 MOCK_SPIN_COUNT="${case_dir}/spins" MOCK_LOCK_DIR="${case_state}/lock" \
-  run_lib 'github_api_pace_gate crashed-before-since; printf "EC=%s\n" "$?"' 2>&1)"
+out="$(GITHUB_API_QUOTA_TTL_S="$quota_ttl_forever" MOCK_LOCK_RELEASE_AFTER=100000 MOCK_SPIN_COUNT="${case_dir}/spins" \
+  MOCK_LOCK_DIR="${case_state}/lock" run_lib 'github_api_pace_gate crashed-before-since; printf "EC=%s\n" "$?"' 2>&1)"
 assert_contains "an old lock with no since (crashed holder) is still broken" "$out" "EC=0"
 read -r remaining_after _ <<<"$(read_state quota)"
 assert_contains "the caller counted its call after breaking the old since-less lock" "remaining=${remaining_after}" "remaining=999"
@@ -546,7 +560,8 @@ run_lib 'github_api_pace_gate prober' >"${case_dir}/out" 2>&1
 assert_contains "the zen probe runs with the mkdir lock released" "$(cat "${case_dir}/probe-lock-state")" "free"
 assert_not_contains "the zen probe never sees the mkdir lock held" "$(cat "${case_dir}/probe-lock-state")" "held"
 pace_lock_mode=
-assert_contains "the probe has an explicit short timeout" "$(grep -c -- '--probe --timeout 5 -- gh api --include zen' "$lib" || true)" "1"
+assert_contains "the probe has an explicit short timeout (5 s at the default patience)" \
+  "$(grep -cF -- '--probe --timeout "$(( 5 * $(_github_api_pace_patience) ))" -- gh api --include zen' "$lib" || true)" "1"
 
 printf '\n=== pacing: a prober only clears the probe marker it published ===\n'
 new_case probemarker
@@ -673,8 +688,15 @@ MOCK
 chmod +x "${flock_bin}/flock"
 mkdir -p "$case_state"
 printf '%s %s %s\n' 1000 "$(( EPOCHSECONDS + 3000 ))" "$EPOCHSECONDS" >"${case_state}/quota"
-out="$(MOCK_FLOCK_LOG="${case_dir}/flock.log" PATH="${flock_bin}:${PATH}" run_lib 'github_api_pace_gate x; printf "EC=%s\n" "$?"' 2>&1)"
-assert_contains "the gate takes an exclusive flock with a timeout" "$(cat "${case_dir}/flock.log")" "--exclusive --timeout 5"
+out="$(GITHUB_API_PACE_PATIENCE=1 MOCK_FLOCK_LOG="${case_dir}/flock.log" PATH="${flock_bin}:${PATH}" \
+  run_lib 'github_api_pace_gate x; printf "EC=%s\n" "$?"' 2>&1)"
+assert_contains "the gate takes an exclusive flock with a 5 s timeout at the default patience" \
+  "$(cat "${case_dir}/flock.log")" "--exclusive --timeout 5"
+: >"${case_dir}/flock.log"
+out="$(MOCK_FLOCK_LOG="${case_dir}/flock.log" PATH="${flock_bin}:${PATH}" \
+  run_lib 'github_api_pace_gate x; printf "EC=%s\n" "$?"' 2>&1)"
+assert_contains "the flock timeout is multiplied by GITHUB_API_PACE_PATIENCE" \
+  "$(cat "${case_dir}/flock.log")" "--exclusive --timeout $(( 5 * GITHUB_API_PACE_PATIENCE ))"
 assert_contains "the gate completes under flock" "$out" "EC=0"
 if [[ ! -e "${case_state}/lock" ]]; then
   pass_case "no mkdir lock directory is used when flock exists"
@@ -735,5 +757,38 @@ if grep -nE '^[[:space:]]*local( -[a-zA-Z]+)* (.* )?dir( |=|$)' "$lib" >/dev/nul
 else
   pass_case "the pacing library never declares a local named dir"
 fi
+
+printf '\n=== pacing: GITHUB_API_PACE_PATIENCE scales the waiting budgets and nothing else (#879) ===\n'
+patience_of() {
+  env -u GITHUB_API_PACE_PATIENCE ${1:+GITHUB_API_PACE_PATIENCE="$1"} PATH="${mock_bin}:${PATH}" \
+    bash -c 'source "$1"; source "$2"; _github_api_pace_patience' bash "$runner_bootstrap" "$lib"
+}
+# Exact comparison: assert_contains is a substring match, so "patience=10000" would satisfy "patience=1".
+assert_patience() { # <label> <actual> <expected>
+  if [[ "$2" == "$3" ]]; then
+    pass_case "$1"
+  else
+    printf '  expected patience [%s], got [%s]\n' "$3" "$2" >&2
+    fail_case "$1"
+  fi
+}
+assert_patience "an unset patience is 1, so production budgets are unchanged" "$(patience_of )" "1"
+assert_patience "a positive integer patience is used as the multiplier" "$(patience_of 7)" "7"
+assert_patience "zero patience falls back to 1" "$(patience_of 0)" "1"
+assert_patience "a non-numeric patience falls back to 1" "$(patience_of many)" "1"
+assert_patience "a negative patience falls back to 1" "$(patience_of -3)" "1"
+assert_patience "the largest accepted patience is 9999" "$(patience_of 9999)" "9999"
+assert_patience "a patience above 9999 falls back to 1 instead of an unbounded wait" "$(patience_of 10000)" "1"
+
+lib_text="$(<"$lib")"
+patience_uses="$(grep -c '_github_api_pace_patience)' <<<"$lib_text" || true)"
+assert_contains "the probe timeout, flock wait, probe window and probe wait all use the multiplier" \
+  "uses=${patience_uses}" "uses=4"
+assert_contains "the 5 s probe timeout is scaled" "$lib_text" '--timeout "$(( 5 * $(_github_api_pace_patience) ))" -- gh api --include zen'
+assert_contains "the 5 s flock wait is scaled" "$lib_text" 'flock --exclusive --timeout "$(( 5 * $(_github_api_pace_patience) ))"'
+assert_contains "the 10 s probe window is scaled" "$lib_text" 'probe_marker="$(( now + 10 * $(_github_api_pace_patience) ))"'
+assert_contains "the 15 s wait for another caller's probe is scaled" "$lib_text" 'probe_waits > 300 * $(_github_api_pace_patience)'
+assert_contains "the 30 s crashed-holder thresholds are not scaled" "$lib_text" '(( now - since > 30 ))'
+assert_contains "the test file runs every case with a generous patience" "$(<"${BASH_SOURCE[0]}")" 'export GITHUB_API_PACE_PATIENCE=20'
 
 test_summary

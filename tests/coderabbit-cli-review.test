@@ -45,6 +45,18 @@ case "${1:-}" in
       exit 0
     fi
     if [[ -n "${STUB_STDERR:-}" ]]; then printf "%s\n" "$STUB_STDERR" >&2; fi
+    # STUB_MOVE_HEAD_DIR: the first review call moves HEAD of that repository, as a commit made while the wrapper
+    # waits to retry would.
+    if [[ -n "${STUB_MOVE_HEAD_DIR:-}" && ! -e "${STUB_LOG}.moved" ]]; then
+      : > "${STUB_LOG}.moved"
+      git -C "$STUB_MOVE_HEAD_DIR" commit --quiet --allow-empty --message 'moved while the review ran'
+    fi
+    # STUB_FIRST_REVIEW_FILE answers only the first review call of a test, the rest use STUB_REVIEW_FILE.
+    if [[ -n "${STUB_FIRST_REVIEW_FILE:-}" && ! -e "${STUB_LOG}.first" ]]; then
+      : > "${STUB_LOG}.first"
+      cat "$STUB_FIRST_REVIEW_FILE"
+      exit "${STUB_FIRST_REVIEW_RC:-0}"
+    fi
     cat "${STUB_REVIEW_FILE:?}"
     exit "${STUB_REVIEW_RC:-0}"
     ;;
@@ -90,6 +102,26 @@ chmod +x "${fake_to}/timeout"
 
 credits_review="${work}/credits.ndjson"
 printf '%s\n' '{"type":"status","status":"awaiting_confirmation","message":"needs credits"}' > "$credits_review"
+
+connection_review="${work}/connection.ndjson"
+printf '%s\n' '{"type":"error","message":"Connection failed: WebSocket closed"}' > "$connection_review"
+
+mixed_error_review="${work}/mixed-error.ndjson"
+printf '%s\n' '{"type":"error","message":"Connection failed: WebSocket closed"}' \
+  '{"type":"error","message":"backend exploded"}' > "$mixed_error_review"
+second_transport_review="${work}/second-transport.ndjson"
+printf '%s\n' '{"type":"error","message":"Connection failed: WebSocket closed"}' \
+  '{"type":"error","message":"ECONNRESET while streaming"}' > "$second_transport_review"
+
+multiline_transport_review="${work}/multiline-transport.ndjson"
+printf '%s\n' '{"type":"error","message":"Connection failed: WebSocket closed\n    at Socket.<anonymous> (net.js:1:1)\n    at process.processTicksAndRejections"}' \
+  > "$multiline_transport_review"
+multiline_real_review="${work}/multiline-real.ndjson"
+printf '%s\n' '{"type":"error","message":"backend exploded\n    Connection failed: nested cause\n    at somewhere"}' \
+  > "$multiline_real_review"
+
+leading_newline_review="${work}/leading-newline.ndjson"
+printf '%s\n' '{"type":"error","message":"\n  Connection failed: WebSocket closed\n    at Socket"}' > "$leading_newline_review"
 
 error_review="${work}/error.ndjson"
 printf '%s\n' '{"type":"error","message":"backend exploded"}' > "$error_review"
@@ -443,5 +475,201 @@ assert_contains 'pre-pr-checks prints skip notes for passing jobs' "$pre_pr_chec
   'prec_print_skip_notes'
 assert_contains 'pre-pr-checks documents the skip hatch' "$pre_pr_checks_text" \
   'PRE_PR_CHECKS_SKIP=coderabbit-cli'
+
+# The retry waits for CODERABBIT_CLI_RETRY_DELAY seconds; tests never wait.
+export CODERABBIT_CLI_RETRY_DELAY=0
+
+printf '\n=== a connection error is retried once and then skipped, never a failure (#879) ===\n'
+: > "${work}/stub.log"; rm -f "${work}/stub.log.first"
+export STUB_REVIEW_FILE="$connection_review"
+run_wrapper "${work}/s-conn"
+assert_eq 'a connection error that persists exits 3 (skipped), not 1' "$rc" '3'
+assert_contains 'the skip says the service could not be reached' "$out" 'SKIPPED: coderabbit-cli-review: the CodeRabbit service could not be reached after 2 attempt(s)'
+assert_contains 'the retry is announced' "$out" 'retrying once'
+assert_eq 'the review was attempted twice and no more' "$(review_calls)" '2'
+assert_not_contains 'a connection error is not reported as an error' "$out" 'ERROR: coderabbit-cli-review'
+: > "${work}/stub.log"
+export STUB_REVIEW_FILE="$clean_review"
+run_wrapper "${work}/s-conn"
+assert_eq 'nothing was recorded, so the next run reviews the same head' "$rc" '0'
+assert_contains 'that next run is a real review' "$out" 'clean (0 findings)'
+assert_eq 'the next run called the review once' "$(review_calls)" '1'
+
+: > "${work}/stub.log"; rm -f "${work}/stub.log.first"
+export STUB_FIRST_REVIEW_FILE="$connection_review" STUB_REVIEW_FILE="$clean_review"
+run_wrapper "${work}/s-conn2"
+unset STUB_FIRST_REVIEW_FILE
+assert_eq 'a blip on the first attempt that clears on the retry passes' "$rc" '0'
+assert_contains 'the retried review is clean' "$out" 'clean (0 findings)'
+assert_eq 'the blip cost one extra attempt' "$(review_calls)" '2'
+
+: > "${work}/stub.log"
+export STUB_REVIEW_FILE="$incomplete_review" STUB_STDERR='Error: connect ECONNREFUSED 203.0.113.5:443'
+run_wrapper "${work}/s-conn3"
+unset STUB_STDERR
+assert_eq 'a review that never completed with a connection error on stderr is skipped' "$rc" '3'
+assert_eq 'and was attempted twice' "$(review_calls)" '2'
+
+: > "${work}/stub.log"
+export STUB_REVIEW_FILE="$error_review"
+run_wrapper "${work}/s-conn4"
+assert_eq 'an error about the review itself is still a failure' "$rc" '1'
+assert_eq 'and is not retried' "$(review_calls)" '1'
+
+# A message that spans several lines (a stack trace after the first line) is one message, classified whole.
+: > "${work}/stub.log"
+export STUB_REVIEW_FILE="$multiline_transport_review"
+run_wrapper "${work}/s-ml-transport"
+assert_eq 'a multi-line connection error with a stack trace is still a connection failure' "$rc" '3'
+assert_eq 'and was retried once' "$(review_calls)" '2'
+: > "${work}/stub.log"
+export STUB_REVIEW_FILE="$multiline_real_review"
+run_wrapper "${work}/s-ml-real"
+assert_eq 'a multi-line error about the review that mentions a connection later is a failure' "$rc" '1'
+assert_contains 'it is reported as one line, whole' "$out" 'review reported an error: backend exploded     Connection failed: nested cause     at somewhere'
+assert_eq 'and is not retried' "$(review_calls)" '1'
+
+: > "${work}/stub.log"
+export STUB_REVIEW_FILE="$leading_newline_review"
+run_wrapper "${work}/s-leading-nl"
+assert_eq 'a connection error whose message starts with a newline is still a connection failure' "$rc" '3'
+assert_eq 'and was retried once' "$(review_calls)" '2'
+
+# Every error event has to be a connection failure for the attempt to count as one.
+: > "${work}/stub.log"
+export STUB_REVIEW_FILE="$mixed_error_review"
+run_wrapper "${work}/s-mixed"
+assert_eq 'a connection error next to an error about the review itself is a failure' "$rc" '1'
+assert_contains 'the error about the review is the one reported' "$out" 'review reported an error: backend exploded'
+assert_not_contains 'the connection error that came first is not reported as the cause' "$out" 'review reported an error: Connection failed'
+assert_eq 'and it is not retried' "$(review_calls)" '1'
+: > "${work}/stub.log"
+export STUB_REVIEW_FILE="$error_review" STUB_STDERR='Error: connect ECONNREFUSED 203.0.113.5:443'
+run_wrapper "${work}/s-stderr-conn"
+unset STUB_STDERR
+assert_eq 'connection text on stderr never replaces an error event about the review' "$rc" '1'
+assert_contains 'the error event is reported' "$out" 'backend exploded'
+assert_eq 'and it is not retried' "$(review_calls)" '1'
+: > "${work}/stub.log"
+export STUB_REVIEW_FILE="$second_transport_review"
+run_wrapper "${work}/s-two-transport"
+assert_eq 'several error events that are all connection failures still skip' "$rc" '3'
+assert_eq 'after one retry' "$(review_calls)" '2'
+
+: > "${work}/stub.log"
+conn_findings="${work}/conn-findings.ndjson"
+cat "$findings_review" "$connection_review" > "$conn_findings"
+export STUB_REVIEW_FILE="$conn_findings"
+run_wrapper "${work}/s-conn5"
+assert_eq 'findings are reported even when the connection also failed' "$rc" '2'
+assert_eq 'and are not retried' "$(review_calls)" '1'
+
+printf '\n=== a logged decline answers the findings of a head (#879) ===\n'
+: > "${work}/stub.log"
+export STUB_REVIEW_FILE="$findings_review"
+run_wrapper "${work}/s-decl"
+assert_eq 'the head has findings' "$rc" '2'
+run_wrapper "${work}/s-decl" --decline 'the SHA pin conflicts with the tag policy in #879'
+assert_eq 'a decline exits 0' "$rc" '0'
+assert_contains 'the decline is logged with its reason' "$out" \
+  'NOTE: CODERABBIT_CLI_DECLINED head='
+assert_contains 'the logged line carries the reason' "$out" 'reason=the SHA pin conflicts with the tag policy in #879'
+run_wrapper "${work}/s-decl"
+assert_eq 'the declined head passes on a replay' "$rc" '0'
+assert_contains 'the replay shows the decline and its reason' "$out" 'DECLINED head='
+assert_contains 'the replay repeats the reason' "$out" 'the SHA pin conflicts with the tag policy in #879 (replayed)'
+assert_eq 'neither the decline nor its replay ran a review' "$(review_calls)" '1'
+run_wrapper "${work}/s-decl2" --decline 'no review was ever run for this head'
+assert_eq 'a decline needs no earlier review' "$rc" '0'
+run_wrapper "${work}/s-decl3" --decline '   '
+assert_eq 'a blank reason is refused' "$rc" '1'
+assert_contains 'the refusal says a reason is needed' "$out" '--decline needs a reason'
+run_wrapper "${work}/s-decl4" --decline $'two\nlines'
+assert_contains 'a multi-line reason is logged on one line' "$out" 'reason=two lines'
+assert_contains 'the help documents --decline' "$(bash "$wrapper" --help)" '--decline REASON'
+assert_contains 'the help documents the connection-error skip' "$(bash "$wrapper" --help)" 'Connection failed: WebSocket closed'
+run_wrapper "${work}/s-hint"
+run_wrapper "${work}/s-hint"
+assert_contains 'a replayed findings result points at --decline' "$out" '--decline "<reason>"'
+
+printf '\n=== a retry never reviews a head that moved while it waited (#879) ===\n'
+moving="${work}/moving"
+git clone --quiet --branch feature "$repo" "$moving" 2> /dev/null
+git -C "$moving" config user.name test
+git -C "$moving" config user.email test@example.invalid
+git -C "$moving" config commit.gpgsign false
+git -C "$moving" update-ref refs/remotes/origin/main "$(git -C "$repo" rev-parse main)"
+: > "${work}/stub.log"; rm -f "${work}/stub.log.moved"
+rc=0
+out="$(CODERABBIT_BIN="$stub" STUB_LOG="${work}/stub.log" STUB_REVIEW_FILE="$connection_review" \
+  STUB_MOVE_HEAD_DIR="$moving" bash "$wrapper" --dir "$moving" --state-dir "${work}/s-moved" 2>&1)" || rc=$?
+assert_eq 'a retry after HEAD moved is a skip' "$rc" '3'
+assert_contains 'the skip says HEAD moved and nothing was recorded' "$out" 'HEAD moved while waiting to retry; nothing recorded'
+assert_eq 'the moved head was not reviewed a second time' "$(review_calls)" '1'
+assert_eq 'nothing was written to the state directory' "$(find "${work}/s-moved" -type f 2> /dev/null | wc -l | tr -d ' ')" '0'
+: > "${work}/stub.log"
+rc=0
+out="$(CODERABBIT_BIN="$stub" STUB_LOG="${work}/stub.log" STUB_REVIEW_FILE="$clean_review" \
+  bash "$wrapper" --dir "$moving" --state-dir "${work}/s-moved" 2>&1)" || rc=$?
+assert_eq 'the next run reviews the current head' "$rc" '0'
+assert_eq 'with one review' "$(review_calls)" '1'
+
+printf '\n=== a recorded decline wins over a result that arrives after it (#879) ===\n'
+export STUB_REVIEW_FILE="$findings_review"
+run_wrapper "${work}/s-prec"
+run_wrapper "${work}/s-prec" --decline 'accepted while another review was still running'
+assert_eq 'the decline is accepted' "$rc" '0'
+prec_state="$(ls "${work}"/s-prec/*.log)"
+read -r prec_head prec_base _ <<<"$(head -1 "$prec_state")"
+printf '%s %s findings 2\n' "$prec_head" "$prec_base" >> "$prec_state"
+run_wrapper "${work}/s-prec"
+assert_eq 'a findings result appended after the decline does not undo it' "$rc" '0'
+assert_contains 'the replay is the decline, with its reason' "$out" 'accepted while another review was still running (replayed)'
+
+printf '\n=== a decline needs no installed CLI and fails when it cannot be recorded (#879) ===\n'
+rc=0
+out="$(CODERABBIT_BIN=/nonexistent/coderabbit STUB_LOG="${work}/stub.log" \
+  bash "$wrapper" --dir "$repo" --state-dir "${work}/s-nocli" --decline 'declined while the CLI is not installed' 2>&1)" || rc=$?
+assert_eq 'a decline works without the CodeRabbit CLI installed' "$rc" '0'
+assert_contains 'and is logged' "$out" 'NOTE: CODERABBIT_CLI_DECLINED head='
+rc=0
+out="$(CODERABBIT_BIN=/nonexistent/coderabbit STUB_LOG="${work}/stub.log" \
+  bash "$wrapper" --dir "$repo" --state-dir "${work}/s-nocli" 2>&1)" || rc=$?
+assert_eq 'a later run without the CLI replays the decline instead of skipping' "$rc" '0'
+assert_contains 'and says it is a replay' "$out" '(replayed)'
+
+# A decline belongs to the head and base of a branch, so it needs the git context a review needs.
+detached="${work}/detached"
+git clone --quiet "$repo" "$detached" 2> /dev/null
+git -C "$detached" checkout --quiet --detach
+rc=0
+out="$(CODERABBIT_BIN="$stub" STUB_LOG="${work}/stub.log" \
+  bash "$wrapper" --dir "$detached" --state-dir "${work}/s-detached" --decline 'on a detached HEAD' 2>&1)" || rc=$?
+assert_eq 'a decline on a detached HEAD is a skip, not a recorded decline' "$rc" '3'
+assert_contains 'and says why' "$out" 'SKIPPED: coderabbit-cli-review: detached HEAD'
+git -C "$detached" checkout --quiet main
+rc=0
+out="$(CODERABBIT_BIN="$stub" STUB_LOG="${work}/stub.log" \
+  bash "$wrapper" --dir "$detached" --state-dir "${work}/s-detached" --decline 'nothing ahead of main' 2>&1)" || rc=$?
+assert_eq 'a decline on a branch with no commits ahead of its base is a skip' "$rc" '3'
+assert_contains 'and says so' "$out" 'no commits ahead'
+assert_contains 'the help says a decline needs the same git context as a review' "$(bash "$wrapper" --help)" \
+  'needs the same git context as a review'
+
+if [[ "$(id -u)" != 0 ]]; then
+  mkdir -p "${work}/s-readonly"
+  chmod 555 "${work}/s-readonly"
+  run_wrapper "${work}/s-readonly" --decline 'cannot be written'
+  chmod 755 "${work}/s-readonly"
+  assert_eq 'a decline that cannot be recorded fails instead of pretending' "$rc" '1'
+  assert_contains 'and says why' "$out" 'could not record the decline'
+  assert_not_contains 'and does not print the logged-decline line' "$out" 'NOTE: CODERABBIT_CLI_DECLINED'
+else
+  pass_case 'running as root: a read-only state directory cannot be simulated, the write-failure case is skipped'
+fi
+
+printf '\n=== static: a decline spends no allowance, so it is not a run toward the cap (#879) ===\n'
+# shellcheck disable=SC2016  # the needle is literal awk source, not a shell expansion
+assert_contains 'state_run_count leaves declined results out' "$(<"$wrapper")" '$3 != "declined" && !seen[$1 ":" $2]++'
 
 test_summary
