@@ -540,8 +540,8 @@ ci_pr_head_runs_json() {
 }
 
 # ci_rollup_superseded_failures <rollup-json> <runs-json>
-# One "<check name><TAB><run id>" line per FAILURE-class row whose Actions run was cancelled and has a newer run of
-# the same workflow on the same head. Such a row is not a result: an aggregate job (`needs:` with `if: always()`)
+# One "<check name><TAB><run id><TAB><done|waiting>" line per FAILURE-class row whose Actions run was cancelled and
+# has a newer run of the same workflow on the same head (waiting while a newer run is still queued or in progress). Such a row is not a result: an aggregate job (`needs:` with `if: always()`)
 # fails when its dependencies were cancelled by a duplicate run, and the newer run reports the real outcome (#884).
 # A cancelled run with no newer run of its workflow is not listed: nothing has superseded it, so its failure stands.
 ci_rollup_superseded_failures() {
@@ -551,23 +551,32 @@ ci_rollup_superseded_failures() {
   ci_rollup_jq_file "ci-rollup superseded failures" "$rollup_json" -r --argjson runs "$runs_json" '
     def fail_conclusions:
       ["FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"];
-    ($runs
-      | map(select((.conclusion // "") == "cancelled") as $c
-            | select(any($runs[]; (.workflowDatabaseId // -1) == ($c.workflowDatabaseId // -2)
-                                  and .databaseId > $c.databaseId)))
-      | map(.databaseId)) as $superseded
+    # Per cancelled run with newer runs of its workflow on the head: "done" when every newer run has completed,
+    # "waiting" while any of them is still queued or in progress (it has not reported yet).
+    def superseded_state($runs):
+      [ $runs[]
+        | select((.conclusion // "") == "cancelled") as $c
+        | ([ $runs[]
+             | select((.workflowDatabaseId // -1) == ($c.workflowDatabaseId // -2)
+                      and .databaseId > $c.databaseId) ]) as $newer
+        | select(($newer | length) > 0)
+        | {id: $c.databaseId,
+           state: (if any($newer[]; (.status // "") != "completed") then "waiting" else "done" end)} ];
+    (superseded_state($runs)) as $superseded
     | .[]?
     | (.conclusion // "") as $conclusion
     | select((fail_conclusions | index($conclusion)) != null)
     | (.name // .context // "unknown") as $name
     | (((.detailsUrl // "") | capture("/actions/runs/(?<id>[0-9]+)")? // null) | if . == null then null else (.id | tonumber) end) as $run
-    | select($run != null and (($superseded | index($run)) != null))
-    | "\($name)\t\($run)"
+    | ($superseded | map(select(.id == $run)) | .[0] // null) as $s
+    | select($run != null and $s != null)
+    | "\($name)\t\($run)\t\($s.state)"
   '
 }
 
 # ci_rollup_without_superseded_failures <rollup-json> <runs-json>
-# The rollup without the rows ci_rollup_superseded_failures lists.
+# The rollup without the rows ci_rollup_superseded_failures lists as done. A row whose newer run has not finished yet
+# stays, as a pending row, so the gate keeps waiting for that run instead of passing on what is left (#884).
 ci_rollup_without_superseded_failures() {
   local -r rollup_json="$1"
   local -r runs_json="$2"
@@ -575,18 +584,26 @@ ci_rollup_without_superseded_failures() {
   ci_rollup_jq_file "ci-rollup without superseded failures" "$rollup_json" -c --argjson runs "$runs_json" '
     def fail_conclusions:
       ["FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"];
-    ($runs
-      | map(select((.conclusion // "") == "cancelled") as $c
-            | select(any($runs[]; (.workflowDatabaseId // -1) == ($c.workflowDatabaseId // -2)
-                                  and .databaseId > $c.databaseId)))
-      | map(.databaseId)) as $superseded
+    # Per cancelled run with newer runs of its workflow on the head: "done" when every newer run has completed,
+    # "waiting" while any of them is still queued or in progress (it has not reported yet).
+    def superseded_state($runs):
+      [ $runs[]
+        | select((.conclusion // "") == "cancelled") as $c
+        | ([ $runs[]
+             | select((.workflowDatabaseId // -1) == ($c.workflowDatabaseId // -2)
+                      and .databaseId > $c.databaseId) ]) as $newer
+        | select(($newer | length) > 0)
+        | {id: $c.databaseId,
+           state: (if any($newer[]; (.status // "") != "completed") then "waiting" else "done" end)} ];
+    (superseded_state($runs)) as $superseded
     | [ .[]?
         | (.conclusion // "") as $conclusion
         | (((.detailsUrl // "") | capture("/actions/runs/(?<id>[0-9]+)")? // null) | if . == null then null else (.id | tonumber) end) as $run
-        | select(
-            ((fail_conclusions | index($conclusion)) != null
-              and $run != null and (($superseded | index($run)) != null))
-            | not)
+        | (if (fail_conclusions | index($conclusion)) != null and $run != null
+           then ($superseded | map(select(.id == $run)) | .[0] // null) else null end) as $s
+        | if $s == null then .
+          elif $s.state == "waiting" then (. + {conclusion: "", status: "IN_PROGRESS"})
+          else empty end
       ]'
 }
 
