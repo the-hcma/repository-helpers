@@ -512,6 +512,84 @@ ci_rollup_discover_repo_slug() {
   printf '%s\n' "$slug"
 }
 
+# ci_pr_head_runs_json <pr> [repo]
+# The Actions runs of the PR's head SHA as one JSON array (databaseId, workflowDatabaseId, conclusion, status),
+# or nothing and exit 1 when they cannot be listed, so a caller keeps its original verdict (#884).
+ci_pr_head_runs_json() {
+  local -r pr="$1"
+  local -r repo="${2:-}"
+  local head_sha branch runs_json exit_code
+  local -a repo_args=()
+
+  exit_code=0
+  if [[ -n "$repo" ]]; then
+    repo_args=(--repo "$repo")
+  fi
+  head_sha="$(github_api_exec_with_rate_limit_retry "ci-rollup pr head sha" -- gh pr view "$pr" \
+    "${repo_args[@]}" --json headRefOid --jq '.headRefOid // empty')" || exit_code=$?
+  branch="$(github_api_exec_with_rate_limit_retry "ci-rollup pr head branch" -- gh pr view "$pr" \
+    "${repo_args[@]}" --json headRefName --jq '.headRefName // empty')" || exit_code=$?
+  runs_json="$(github_api_exec_with_rate_limit_retry "ci-rollup list head runs" -- gh run list \
+    "${repo_args[@]}" --branch "$branch" --limit 50 \
+    --json databaseId,headSha,conclusion,status,workflowDatabaseId)" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$head_sha" || -z "$branch" || -z "$runs_json" ]]; then
+    return 1
+  fi
+  ci_rollup_jq_file "ci-rollup head runs" "$runs_json" -c --arg head "$head_sha" \
+    '[.[]? | select(.headSha == $head)]'
+}
+
+# ci_rollup_superseded_failures <rollup-json> <runs-json>
+# One "<check name><TAB><run id>" line per FAILURE-class row whose Actions run was cancelled and has a newer run of
+# the same workflow on the same head. Such a row is not a result: an aggregate job (`needs:` with `if: always()`)
+# fails when its dependencies were cancelled by a duplicate run, and the newer run reports the real outcome (#884).
+# A cancelled run with no newer run of its workflow is not listed: nothing has superseded it, so its failure stands.
+ci_rollup_superseded_failures() {
+  local -r rollup_json="$1"
+  local -r runs_json="$2"
+
+  ci_rollup_jq_file "ci-rollup superseded failures" "$rollup_json" -r --argjson runs "$runs_json" '
+    def fail_conclusions:
+      ["FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"];
+    ($runs
+      | map(select((.conclusion // "") == "cancelled") as $c
+            | select(any($runs[]; (.workflowDatabaseId // -1) == ($c.workflowDatabaseId // -2)
+                                  and .databaseId > $c.databaseId)))
+      | map(.databaseId)) as $superseded
+    | .[]?
+    | (.conclusion // "") as $conclusion
+    | select((fail_conclusions | index($conclusion)) != null)
+    | (.name // .context // "unknown") as $name
+    | (((.detailsUrl // "") | capture("/actions/runs/(?<id>[0-9]+)")? // null) | if . == null then null else (.id | tonumber) end) as $run
+    | select($run != null and (($superseded | index($run)) != null))
+    | "\($name)\t\($run)"
+  '
+}
+
+# ci_rollup_without_superseded_failures <rollup-json> <runs-json>
+# The rollup without the rows ci_rollup_superseded_failures lists.
+ci_rollup_without_superseded_failures() {
+  local -r rollup_json="$1"
+  local -r runs_json="$2"
+
+  ci_rollup_jq_file "ci-rollup without superseded failures" "$rollup_json" -c --argjson runs "$runs_json" '
+    def fail_conclusions:
+      ["FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"];
+    ($runs
+      | map(select((.conclusion // "") == "cancelled") as $c
+            | select(any($runs[]; (.workflowDatabaseId // -1) == ($c.workflowDatabaseId // -2)
+                                  and .databaseId > $c.databaseId)))
+      | map(.databaseId)) as $superseded
+    | [ .[]?
+        | (.conclusion // "") as $conclusion
+        | (((.detailsUrl // "") | capture("/actions/runs/(?<id>[0-9]+)")? // null) | if . == null then null else (.id | tonumber) end) as $run
+        | select(
+            ((fail_conclusions | index($conclusion)) != null
+              and $run != null and (($superseded | index($run)) != null))
+            | not)
+      ]'
+}
+
 # ci_failed_workflow_run_id_for_pr <pr> [repo]
 # Newest failed Actions run for the PR head SHA (empty when none).
 ci_failed_workflow_run_id_for_pr() {
