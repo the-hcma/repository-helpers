@@ -512,6 +512,127 @@ ci_rollup_discover_repo_slug() {
   printf '%s\n' "$slug"
 }
 
+# ci_pr_head_runs_json <pr> [repo]
+# The Actions runs of the PR's head SHA as one JSON array (databaseId, headSha, workflowDatabaseId, conclusion,
+# status),
+# or nothing and exit 1 when they cannot be listed, so a caller keeps its original verdict (#884).
+ci_pr_head_runs_json() {
+  local -r pr="$1"
+  local -r repo="${2:-}"
+  local head_sha runs_json exit_code
+  local -a repo_args=()
+
+  exit_code=0
+  if [[ -n "$repo" ]]; then
+    repo_args=(--repo "$repo")
+  fi
+  head_sha="$(github_api_exec_with_rate_limit_retry "ci-rollup pr head sha" -- gh pr view "$pr" \
+    "${repo_args[@]}" --json headRefOid --jq '.headRefOid // empty')" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$head_sha" ]]; then
+    return 1
+  fi
+  # Listed by commit, not by branch name: a busy branch name must not push the runs of this head out of the window
+  # (the runs a failing row refers to are always among them).
+  runs_json="$(github_api_exec_with_rate_limit_retry "ci-rollup list head runs" -- gh run list \
+    "${repo_args[@]}" --commit "$head_sha" --limit 100 \
+    --json databaseId,headSha,conclusion,status,workflowDatabaseId)" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$head_sha" || -z "$runs_json" ]]; then
+    return 1
+  fi
+  ci_rollup_jq_file "ci-rollup head runs" "$runs_json" -c --arg head "$head_sha" \
+    '[.[]? | select(.headSha == $head)]'
+}
+
+# ci_rollup_superseded_failures <rollup-json> <runs-json>
+# One "<check name><TAB><run id><TAB><done|waiting>" line per FAILURE-class row whose Actions run was cancelled and
+# has a newer run of the same workflow on the same head whose newest run is still queued or in progress (waiting) or
+# completed with success (done); a newest run that ended any other way supersedes nothing. Such a row is not a
+# result: an aggregate job (`needs:` with `if: always()`) fails when its dependencies were cancelled by a
+# duplicate run, and the newer run reports the real outcome (#884).
+# A cancelled run with no newer run of its workflow is not listed: nothing has superseded it, so its failure stands.
+ci_rollup_superseded_failures() {
+  local -r rollup_json="$1"
+  local -r runs_json="$2"
+
+  ci_rollup_jq_file "ci-rollup superseded failures" "$rollup_json" -r --argjson runs "$runs_json" '
+    def fail_conclusions:
+      ["FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"];
+    # The Actions run id in the detailsUrl of a check row (null for a status context or an unparseable URL).
+    def run_id:
+      ((.detailsUrl // "") | capture("/actions/runs/(?<id>[0-9]+)")? // null)
+      | if . == null then null else (.id | tonumber) end;
+    # Per cancelled run with newer runs of its workflow on the head: only the newest of those decides. It is
+    # "waiting" while it is queued or in progress, "done" once it completed with success, and not superseded when it
+    # ended any other way (failure, cancelled, skipped, startup_failure), so a failure is never dropped for a run
+    # that did not pass.
+    def superseded_state($runs):
+      [ $runs[]
+        | select((.conclusion // "") == "cancelled") as $c
+        | ([ $runs[]
+             | select((.workflowDatabaseId // -1) == ($c.workflowDatabaseId // -2)
+                      and .databaseId > $c.databaseId) ]
+           | sort_by(.databaseId) | last // null) as $newest
+        | select($newest != null)
+        | (if ($newest.status // "") != "completed" then "waiting"
+           elif ($newest.conclusion // "") == "success" then "done"
+           else null end) as $state
+        | select($state != null)
+        | {id: $c.databaseId, state: $state} ];
+    (superseded_state($runs)) as $superseded
+    | .[]?
+    | (.conclusion // "") as $conclusion
+    | select((fail_conclusions | index($conclusion)) != null)
+    | (.name // .context // "unknown") as $name
+    | run_id as $run
+    | ($superseded | map(select(.id == $run)) | .[0] // null) as $s
+    | select($run != null and $s != null)
+    | "\($name)\t\($run)\t\($s.state)"
+  '
+}
+
+# ci_rollup_without_superseded_failures <rollup-json> <runs-json>
+# The rollup without the rows ci_rollup_superseded_failures lists as done. A row whose newer run has not finished yet
+# stays, as a pending row, so the gate keeps waiting for that run instead of passing on what is left (#884).
+ci_rollup_without_superseded_failures() {
+  local -r rollup_json="$1"
+  local -r runs_json="$2"
+
+  ci_rollup_jq_file "ci-rollup without superseded failures" "$rollup_json" -c --argjson runs "$runs_json" '
+    def fail_conclusions:
+      ["FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"];
+    # The Actions run id in the detailsUrl of a check row (null for a status context or an unparseable URL).
+    def run_id:
+      ((.detailsUrl // "") | capture("/actions/runs/(?<id>[0-9]+)")? // null)
+      | if . == null then null else (.id | tonumber) end;
+    # Per cancelled run with newer runs of its workflow on the head: only the newest of those decides. It is
+    # "waiting" while it is queued or in progress, "done" once it completed with success, and not superseded when it
+    # ended any other way (failure, cancelled, skipped, startup_failure), so a failure is never dropped for a run
+    # that did not pass.
+    def superseded_state($runs):
+      [ $runs[]
+        | select((.conclusion // "") == "cancelled") as $c
+        | ([ $runs[]
+             | select((.workflowDatabaseId // -1) == ($c.workflowDatabaseId // -2)
+                      and .databaseId > $c.databaseId) ]
+           | sort_by(.databaseId) | last // null) as $newest
+        | select($newest != null)
+        | (if ($newest.status // "") != "completed" then "waiting"
+           elif ($newest.conclusion // "") == "success" then "done"
+           else null end) as $state
+        | select($state != null)
+        | {id: $c.databaseId, state: $state} ];
+    (superseded_state($runs)) as $superseded
+    | [ .[]?
+        | (.conclusion // "") as $conclusion
+        | run_id as $run
+        | (if (fail_conclusions | index($conclusion)) != null and $run != null
+           then ($superseded | map(select(.id == $run)) | .[0] // null) else null end) as $s
+        | if $s == null then .
+          elif $s.state == "waiting" then (. + {conclusion: "", status: "IN_PROGRESS"})
+          else empty end
+      ]'
+}
+
 # ci_failed_workflow_run_id_for_pr <pr> [repo]
 # Newest failed Actions run for the PR head SHA (empty when none).
 ci_failed_workflow_run_id_for_pr() {

@@ -250,9 +250,12 @@ ci_repo_slug_for_pr() {
   printf '%s\n' "$slug"
 }
 
+# One NOTE per distinct superseded row and reason for the whole wait: require_ci_success runs on every poll.
+declare -A ci_superseded_noted=()
+
 require_ci_success() {
   local -r pr="$1"
-  local rollup failures repo latest conclusion
+  local rollup failures repo latest conclusion runs_json superseded superseded_state
   local fail_line fail_count
 
   repo="$(ci_repo_slug_for_pr)"
@@ -267,6 +270,32 @@ require_ci_success() {
   latest="$(ci_rollup_latest_by_name_json "$rollup")"
   latest="$(ci_rollup_without_agent_product_checks "$latest")"
   conclusion="$(ci_rollup_conclusion_for_gating "$latest" "")"
+  # A failure that comes from a cancelled run with a newer run of its workflow on the head is not a result: the
+  # newer run reports the real outcome (#884). Only the newest such run decides: a row whose newer run has not
+  # finished stays as a pending row, so the gate waits for it instead of passing on the rows that are left, and a
+  # row whose newest run completed with success is dropped. When the runs cannot be listed the original verdict
+  # stands.
+  if [[ "$conclusion" == 'failure' ]] \
+    && runs_json="$(ci_pr_head_runs_json "$pr" "$repo")" && [[ -n "$runs_json" ]]; then
+    superseded="$(ci_rollup_superseded_failures "$latest" "$runs_json" || true)"
+    if [[ -n "$superseded" ]]; then
+      while IFS=$'\t' read -r fail_line fail_count superseded_state; do
+        [[ -z "$fail_line" ]] && continue
+        if [[ "$superseded_state" == 'waiting' ]]; then
+          superseded_state='run_cancelled_newer_run_not_finished'
+        else
+          superseded_state='run_cancelled_and_superseded'
+        fi
+        if [[ -z "${ci_superseded_noted["${fail_line}|${fail_count}|${superseded_state}"]:-}" ]]; then
+          ci_superseded_noted["${fail_line}|${fail_count}|${superseded_state}"]=1
+          printf 'NOTE: CI_FAILURE_SUPERSEDED pr=%s check=%s run=%s reason=%s\n' \
+            "$pr" "$fail_line" "$fail_count" "$superseded_state" >&2
+        fi
+      done <<<"$superseded"
+      latest="$(ci_rollup_without_superseded_failures "$latest" "$runs_json")"
+      conclusion="$(ci_rollup_conclusion_for_gating "$latest" "")"
+    fi
+  fi
   case "$conclusion" in
     success)
       return 0

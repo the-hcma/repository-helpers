@@ -467,6 +467,250 @@ assert_contains "ci failure agent report" "$out" "CI failure details for coding 
 assert_contains "ci failure log excerpt" "$out" "[FAIL] mock profile: rejected fixture"
 rm -rf "$tmp"
 
+printf '\n=== functional: a failure from a cancelled, superseded run is not a result (#884) ===\n'
+tmp="$(mktemp -d)"
+mock_bin="${tmp}/bin"
+mkdir -p "$mock_bin"
+
+cat >"${mock_bin}/git" <<'MOCK_GIT'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *'rev-parse --show-toplevel'* ]]; then
+  printf '%s\n' '/mock/repo'
+  exit 0
+fi
+if [[ "$*" == *'branch --show-current'* ]]; then
+  printf '%s\n' 'my-branch'
+  exit 0
+fi
+if [[ "$*" == *'rev-parse --abbrev-ref @{u}'* ]]; then
+  printf '%s\n' 'origin/my-branch'
+  exit 0
+fi
+if [[ "$*" == *'ls-remote --heads origin my-branch'* ]]; then
+  printf '%s\trefs/heads/my-branch\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  exit 0
+fi
+if [[ "$*" == *'rev-parse HEAD'* ]]; then
+  printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  exit 0
+fi
+printf 'unexpected git call: %s\n' "$*" >&2
+exit 1
+MOCK_GIT
+chmod +x "${mock_bin}/git"
+
+write_mock_jq_passthrough "${mock_bin}"
+
+# The rollup and the run list come from the environment, so one mock serves every case below.
+cat >"${mock_bin}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *'repo view'* && "$args" == *'nameWithOwner'* ]]; then
+  printf 'the-hcma/mock-repo\n'
+  exit 0
+fi
+if [[ "$args" == *'pr list'* ]]; then
+  printf '42\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json state'* ]]; then
+  printf 'OPEN\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json isDraft'* ]]; then
+  printf 'false\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'--json body'* ]]; then
+  printf '%s\n' $'## Summary\n- ok\n\n## Test plan\n- ok\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'headRefOid'* ]]; then
+  printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'headRefName'* ]]; then
+  printf 'my-branch\n'
+  exit 0
+fi
+if [[ "$args" == *'pr view 42'* && "$args" == *'statusCheckRollup'* ]]; then
+  printf '%s\n' "${MOCK_ROLLUP_JSON}"
+  exit 0
+fi
+if [[ "$args" == *'run list'* ]]; then
+  if [[ "${MOCK_RUNS_FAIL:-0}" == 1 ]]; then
+    exit 1
+  fi
+  # The superseded-run lookup must list the runs of the head commit (--commit <sha>), not of a branch name: a busy
+  # branch name would push them out of the listing. A listing by branch (also used by the failure report, which
+  # tolerates a failed listing) gets no answer here, so the lookup cannot fall back to it unnoticed.
+  if [[ "$args" != *'--commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'* ]]; then
+    printf 'mock: run list without --commit <head sha>: %s\n' "$args" >&2
+    exit 1
+  fi
+  # Every listing is counted (one per poll that sees a failing row). With MOCK_RUNS_AFTER_JSON set, the first listing
+  # returns MOCK_RUNS_JSON and every later one the AFTER json: the newer run finishes during the wait.
+  n=0
+  if [[ -f "${MOCK_RUNS_COUNTER}" ]]; then n="$(<"${MOCK_RUNS_COUNTER}")"; fi
+  n=$(( n + 1 ))
+  printf '%s' "$n" >"${MOCK_RUNS_COUNTER}"
+  if [[ -n "${MOCK_RUNS_AFTER_JSON:-}" ]] && (( n > 1 )); then
+    printf '%s\n' "${MOCK_RUNS_AFTER_JSON}"
+    exit 0
+  fi
+  printf '%s\n' "${MOCK_RUNS_JSON}"
+  exit 0
+fi
+if [[ "$args" == *'run view'* ]]; then
+  printf 'https://example.invalid/run\n'
+  exit 0
+fi
+if [[ "$args" == *'api repos/'* && "$args" == *'squash_merge_commit_title'* ]]; then
+  printf '%s\n' '{"allow_squash_merge":true,"squash_merge_commit_title":"PR_TITLE","squash_merge_commit_message":"BLANK"}'
+  exit 0
+fi
+if [[ "$args" == *'pr view'* && "$args" == *'--json title'* ]]; then
+  printf '%s\n' 'feat: mock title'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$args" >&2
+exit 1
+MOCK_GH
+chmod +x "${mock_bin}/gh"
+
+# A logical clock for the polling cases: `date +%s` reads it and `sleep` advances it, so the number of polls depends
+# on the timeout and the poll interval and never on host speed. Any other `date` call goes to the real one.
+cat >"${mock_bin}/date" <<'MOCK_DATE'
+#!/usr/bin/env bash
+if [[ "$*" == '+%s' && -f "${MOCK_CLOCK:-}" ]]; then
+  cat "${MOCK_CLOCK}"
+  exit 0
+fi
+exec "${MOCK_REAL_DATE}" "$@"
+MOCK_DATE
+cat >"${mock_bin}/sleep" <<'MOCK_SLEEP'
+#!/usr/bin/env bash
+if [[ -f "${MOCK_CLOCK:-}" ]]; then
+  now="$(<"${MOCK_CLOCK}")"
+  add=$(( ${1%%.*} ))
+  if [[ "$1" == *.* ]]; then add=$(( add + 1 )); fi  # a fractional sleep still moves the clock forward
+  printf '%s' "$(( now + add ))" >"${MOCK_CLOCK}"
+  exit 0
+fi
+exec "${MOCK_REAL_SLEEP}" "$@"
+MOCK_SLEEP
+chmod +x "${mock_bin}/date" "${mock_bin}/sleep"
+
+head_sha='deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
+# assert_rc_is <label> <output> <status> and assert_rc_is_not: the output has a line that is exactly rc=<status>
+# (a needle that starts with a newline would make grep -F match every line).
+assert_rc_is() {
+  if grep -qx -- "rc=$3" <<<"$2"; then pass_case "$1"; else printf '  expected rc=%s, got:\n%s\n' "$3" "$2" >&2; fail_case "$1"; fi
+}
+assert_rc_is_not() {
+  if grep -qx -- "rc=$3" <<<"$2"; then printf '  unexpected rc=%s in:\n%s\n' "$3" "$2" >&2; fail_case "$1"; else pass_case "$1"; fi
+}
+# run_superseded_case <rollup-json> <runs-json> [runs-fail]: runs the gate against the mock; prints the output
+# and then "rc=<status>".
+run_superseded_case() {
+  local out rc=0 real_date real_sleep
+  # Absolute paths of the real tools, taken before the mock directory goes first: the mocks fall back to them.
+  real_date="$(command -v date)"
+  real_sleep="$(command -v sleep)"
+  rm -f "${tmp}/runs-counter"
+  printf '1000' >"${tmp}/clock"
+  out="$(PATH="${mock_bin}:${PATH}" GITHUB_API_PACING=0 MOCK_REAL_DATE="${real_date}" MOCK_REAL_SLEEP="${real_sleep}" MOCK_CLOCK="${tmp}/clock" MOCK_ROLLUP_JSON="$1" MOCK_RUNS_JSON="$2" MOCK_RUNS_FAIL="${3:-0}" \
+    MOCK_RUNS_AFTER_JSON="${4:-}" MOCK_RUNS_COUNTER="${tmp}/runs-counter" \
+    POST_PR_CHECKS_TIMEOUT="${POST_PR_TIMEOUT:-1s}" POST_PR_CHECKS_POLL_SECS=1 bash "$script" 2>&1)" || rc=$?
+  printf '%s\nrc=%s\n' "$out" "$rc"
+}
+# The #882 shape: an aggregate job failed inside a run GitHub marked cancelled, and a newer run of the same
+# workflow on the head succeeded.
+shape_rollup='[
+  {"name":"shellcheck + tests","conclusion":"FAILURE","startedAt":"2026-11-18T16:18:23Z","detailsUrl":"https://github.com/o/r/actions/runs/200/job/1"},
+  {"name":"actionlint","conclusion":"SUCCESS","startedAt":"2026-11-18T16:22:04Z","detailsUrl":"https://github.com/o/r/actions/runs/300/job/2"}
+]'
+runs_superseded='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"cancelled","status":"completed","workflowDatabaseId":7}
+]'
+out="$(run_superseded_case "$shape_rollup" "$runs_superseded")"
+assert_rc_is 'the failure of a cancelled run with a newer run of its workflow does not fail the gate' "$out" 0
+assert_contains 'and one NOTE names the check and the run' "$out" 'NOTE: CI_FAILURE_SUPERSEDED pr=42 check=shellcheck + tests run=200 reason=run_cancelled_and_superseded'
+assert_not_contains 'and no failure report is printed' "$out" 'ERROR: CI failures for PR #42'
+
+runs_real_failure='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"failure","status":"completed","workflowDatabaseId":7}
+]'
+out="$(run_superseded_case "$shape_rollup" "$runs_real_failure")"
+assert_contains 'a failure whose own run really failed still fails the gate' "$out" 'ERROR: CI failures for PR #42'
+assert_not_contains 'and is not reported as superseded' "$out" 'CI_FAILURE_SUPERSEDED'
+
+runs_no_newer='[
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"cancelled","status":"completed","workflowDatabaseId":7},
+  {"databaseId":500,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":9}
+]'
+out="$(run_superseded_case "$shape_rollup" "$runs_no_newer")"
+assert_contains 'a cancelled run that nothing superseded keeps its failure (a newer run of another workflow does not count)' "$out" 'ERROR: CI failures for PR #42'
+
+runs_newer_in_progress='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"","status":"in_progress","workflowDatabaseId":7},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"cancelled","status":"completed","workflowDatabaseId":7}
+]'
+out="$(POST_PR_TIMEOUT=4s run_superseded_case "$shape_rollup" "$runs_newer_in_progress")"
+assert_rc_is_not 'a newer run still in progress with no row yet for the check does not let the gate pass' "$out" 0
+assert_contains 'the gate keeps waiting for it (WAIT_TIMEOUT)' "$out" 'ERROR: WAIT_TIMEOUT'
+assert_contains 'and the NOTE says the newer run has not finished' "$out" 'reason=run_cancelled_newer_run_not_finished'
+assert_equals_note_count() {
+  local n
+  n="$(grep -c 'NOTE: CI_FAILURE_SUPERSEDED' <<<"$2" || true)"
+  if [[ "$n" == "$3" ]]; then pass_case "$1"; else printf '  expected %s NOTE line(s), got %s in:\n%s\n' "$3" "$n" "$2" >&2; fail_case "$1"; fi
+}
+assert_equals_note_count 'the NOTE is printed once for the whole wait, not on every poll' "$out" 1
+polls="$(cat "${tmp}/runs-counter" 2>/dev/null || echo 0)"
+if (( polls >= 2 )); then pass_case 'and the gate polled at least twice, so the single NOTE shows the deduplication'; else printf '  only %s poll(s) ran\n' "$polls" >&2; fail_case 'and the gate polled at least twice, so the single NOTE shows the deduplication'; fi
+
+# The newer run is still in progress on the first poll and has completed with success on the next ones: the row stays
+# pending, then is dropped, and the gate ends successfully.
+out="$(POST_PR_TIMEOUT=6s run_superseded_case "$shape_rollup" "$runs_newer_in_progress" 0 "$runs_superseded")"
+assert_rc_is 'a newer run that finishes during the wait turns the pending row into a success' "$out" 0
+assert_contains 'the first NOTE says the newer run has not finished' "$out" 'reason=run_cancelled_newer_run_not_finished'
+assert_contains 'the second NOTE says the row was superseded' "$out" 'reason=run_cancelled_and_superseded'
+assert_equals_note_count 'and each reason is named once' "$out" 2
+
+for ended in cancelled skipped startup_failure failure timed_out; do
+  runs_newest_ended='[
+    {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"'"${ended}"'","status":"completed","workflowDatabaseId":7},
+    {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"cancelled","status":"completed","workflowDatabaseId":7}
+  ]'
+  out="$(run_superseded_case "$shape_rollup" "$runs_newest_ended")"
+  assert_contains "a newer run that ended ${ended} does not supersede the failure of the cancelled one" "$out" 'ERROR: CI failures for PR #42'
+  assert_not_contains "and the row is not dropped for a run that ended ${ended}" "$out" 'CI_FAILURE_SUPERSEDED'
+done
+
+runs_older_head='[
+  {"databaseId":900,"headSha":"0000000000000000000000000000000000000000","conclusion":"success","status":"completed","workflowDatabaseId":7},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"cancelled","status":"completed","workflowDatabaseId":7}
+]'
+out="$(run_superseded_case "$shape_rollup" "$runs_older_head")"
+assert_contains 'a newer run on another head does not supersede a cancelled run on this head' "$out" 'ERROR: CI failures for PR #42'
+assert_not_contains 'and is not reported as superseded either' "$out" 'CI_FAILURE_SUPERSEDED'
+
+pending_rollup='[
+  {"name":"shellcheck + tests","conclusion":"FAILURE","startedAt":"2026-11-18T16:18:23Z","detailsUrl":"https://github.com/o/r/actions/runs/200/job/1"},
+  {"name":"tests (shard 1/4)","status":"IN_PROGRESS","conclusion":"","startedAt":"2026-11-18T16:19:04Z","detailsUrl":"https://github.com/o/r/actions/runs/300/job/3"}
+]'
+out="$(run_superseded_case "$pending_rollup" "$runs_superseded")"
+assert_not_contains 'a superseded failure beside a newer run still in progress is not reported as a failure' "$out" 'ERROR: CI failures for PR #42'
+assert_contains 'and the gate keeps waiting for the newer run (WAIT_TIMEOUT, not success)' "$out" 'ERROR: WAIT_TIMEOUT'
+out="$(run_superseded_case "$shape_rollup" '[]' 1)"
+assert_contains 'when the runs cannot be listed the original failure stands' "$out" 'ERROR: CI failures for PR #42'
+assert_not_contains 'and nothing is called superseded' "$out" 'CI_FAILURE_SUPERSEDED'
+rm -rf "$tmp"
+
 printf '\n=== functional: WAITING env approval failure is raised (not WAIT_TIMEOUT) ===\n'
 tmp="$(mktemp -d)"
 mock_bin="${tmp}/bin"
