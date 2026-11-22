@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# Tests for the loop's cooldown watchdog, heartbeat and log file (#886): a loop that follows a CodeRabbit cooldown
+# posts the gated full-review ask once the cooldown plus grace has passed and head has no review or ask, says what
+# it waits for on every pass, and writes its own log so piping it through `tail` cannot hide it.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+wait_script="${script_dir}/../scripts/wait-for-agent-review"
+profile="${script_dir}/../scripts/lib/agent-review-profiles/coderabbit"
+readonly wait_script profile
+
+work_dir="$(mktemp -d)"
+readonly work_dir
+trap 'rm -rf "${work_dir}"' EXIT
+export HOME="${work_dir}/home"
+mkdir -p "${HOME}"
+export AGENT_REVIEW_ENV_FILE=/dev/null
+export AGENT_REVIEW_CODERABBIT_STATE_CACHE_DIR="${work_dir}/cr-state"
+export AGENT_REVIEW_LOOP_LOG=0
+unset AGENT_REVIEW_AGENT AGENT_REVIEW_QUOTA_FALLBACK_CHAIN AGENT_REVIEW_GITHUB_REPO AGENT_REVIEW_CODERABBIT_WATCHDOG
+
+# watchdog_case <retry_after_offset_s> <head_state> <already_sent_rc> <ask_rc> <calls> [env assignments...]
+# Prints the loop's output, then "rc=<n>" per call; the asks and emails land in files under work_dir.
+watchdog_case() {
+  local -r offset="$1" state="$2" sent_rc="$3" ask_rc="$4" calls="$5"
+  shift 5
+  : >"${work_dir}/asks.log"
+  : >"${work_dir}/mail.log"
+  : >"${work_dir}/marks.log"
+  env "$@" timeout 30 bash -c "
+    set -uo pipefail
+    source '${wait_script}'
+    builtin source '${profile}'
+    # The watchdog sources the profile itself; keep the stubs below.
+    source() { if [[ \"\$1\" == *agent-review-profiles/coderabbit ]]; then return 0; fi; builtin source \"\$@\"; }
+    now=\$(date -u +%s)
+    retry=\$(date -u -d \"@\$(( now + ($offset) ))\" +%Y-%m-%dT%H:%M:%SZ)
+    agent_review_agent_quota_cache_retry_after_for_agent() { printf '%s' \"\${retry}\"; }
+    # SEEN_OFFSET: when the loop first saw the head (default: long before the cooldown ended).
+    cmd_loop_head_seen_head=deadbeefcafe0123
+    cmd_loop_head_seen_epoch=\$(( now + (\${SEEN_OFFSET:--7200}) ))
+    # RL_AFTER_ASK=1: the helper found a new rate limit and returned 0 without posting.
+    agent_review_agent_quota_rate_limited_for_agent() { [[ \"\${RL_AFTER_ASK:-0}\" == 1 && -s '${work_dir}/asks.log' ]]; }
+    agent_review_coderabbit_quota_mark_exhausted() { printf 'MARK\n' >>'${work_dir}/marks.log'; return 0; }
+    agent_review_coderabbit_head_status() { printf '%s\t0\n' '${state}'; }
+    agent_review_agent_signed_off_on_head() { return 1; }
+    cmd_loop_agent_response_seen() { [[ \"\${RESPONSE_SEEN:-0}\" == 1 ]]; }
+    agent_review_use_agent() { :; }
+    agent_review_named_pr_check_is_pending() { [[ \"\${PENDING:-0}\" == 1 ]]; }
+    agent_review_coderabbit_full_review_already_sent() { return ${sent_rc}; }
+    agent_review_profile_request_last_resort_full_review() {
+      printf 'ASK %s %s %s\n' \"\$1\" \"\$2\" \"\$3\" >>'${work_dir}/asks.log'
+      return ${ask_rc}
+    }
+    agent_review_email_send_plain() { printf 'MAIL %s\n' \"\$1\" >>'${work_dir}/mail.log'; }
+    for _ in \$(seq ${calls}); do
+      rc=0
+      cmd_loop_cooldown_watchdog o/r 886 deadbeefcafe0123 snap || rc=\$?
+      echo \"rc=\$rc\"
+    done" 2>&1
+}
+
+printf '\n=== watchdog: an elapsed cooldown with no ask is acted on at once ===\n'
+out="$(watchdog_case -600 none 1 0 1)"
+assert_contains "the watchdog reports that it posted the ask" "$out" "WATCHDOG cooldown ended"
+assert_contains "the watchdog says the head has no review or ask" "$out" "has no CodeRabbit review and no ask awaiting a reply"
+assert_contains "the watchdog tells the loop to poll again (exit 0)" "$out" "rc=0"
+assert_contains "the ask is posted for the PR's repo, number and head" "$(cat "${work_dir}/asks.log")" \
+  "ASK o/r 886 deadbeefcafe0123"
+
+out="$(watchdog_case -600 rate_limited 1 0 1)"
+assert_contains "a head whose status says rate limited is asked too" "$out" "rc=0"
+
+printf '\n=== watchdog: it stays out of the way when there is nothing to do ===\n'
+out="$(watchdog_case -30 none 1 0 1)"
+assert_contains "inside the post-cooldown grace nothing is asked (exit 1)" "$out" "rc=1"
+assert_not_contains "inside the grace no ask is posted" "$(cat "${work_dir}/asks.log")" "ASK"
+
+out="$(watchdog_case 300 none 1 0 1)"
+assert_contains "while the cooldown is still running nothing is asked" "$out" "rc=1"
+assert_not_contains "while the cooldown runs no ask is posted" "$(cat "${work_dir}/asks.log")" "ASK"
+
+out="$(watchdog_case -600 none 0 0 1)"
+assert_contains "a head that already has an ask is not asked again" "$out" "rc=1"
+assert_not_contains "an already asked head gets no second ask" "$(cat "${work_dir}/asks.log")" "ASK"
+
+out="$(watchdog_case -600 completed 1 0 1)"
+assert_contains "a head CodeRabbit already reviewed is left alone" "$out" "rc=1"
+assert_not_contains "a reviewed head gets no ask" "$(cat "${work_dir}/asks.log")" "ASK"
+
+out="$(watchdog_case -600 in_progress 1 0 1)"
+assert_contains "a head whose CodeRabbit check is queued or running is left alone" "$out" "rc=1"
+assert_not_contains "a running CodeRabbit check gets no ask" "$(cat "${work_dir}/asks.log")" "ASK"
+
+out="$(watchdog_case -600 none 1 0 1 PENDING=1)"
+assert_contains "a CodeRabbit workflow that started after the cached status was read is waited for" "$out" "rc=1"
+assert_not_contains "a pending CodeRabbit workflow gets no ask" "$(cat "${work_dir}/asks.log")" "ASK"
+
+out="$(watchdog_case -600 none 1 0 1 AGENT_REVIEW_CODERABBIT_WATCHDOG=0)"
+assert_contains "AGENT_REVIEW_CODERABBIT_WATCHDOG=0 turns the watchdog off" "$out" "rc=1"
+assert_not_contains "a disabled watchdog posts no ask" "$(cat "${work_dir}/asks.log")" "ASK"
+
+printf '\n=== watchdog: a fresh push after an earlier cooldown is not asked at once ===\n'
+out="$(watchdog_case -600 none 1 0 1 SEEN_OFFSET=-30)"
+assert_contains "a head first seen after the cooldown ended waits out the silent-head wait" "$out" "rc=1"
+assert_not_contains "a fresh push gets no ask before the silent-head wait" "$(cat "${work_dir}/asks.log")" "ASK"
+
+out="$(watchdog_case -600 none 1 0 1 SEEN_OFFSET=-500)"
+assert_contains "a head seen 500s ago after the cooldown is still inside the silent-head wait (1800s)" "$out" "rc=1"
+
+out="$(watchdog_case -3000 none 1 0 1 SEEN_OFFSET=-2000)"
+assert_contains "a head seen past the silent-head wait and grace after the cooldown is asked" "$out" "rc=0"
+
+printf '\n=== watchdog: asks that were refused on purpose or never posted ===\n'
+out="$(watchdog_case -1500 none 1 3 1 AGENT_REVIEW_STALL_NOTIFY_S=600)"
+assert_contains "helper exit 3 (CodeRabbit not configured) returns without an ask" "$out" "rc=1"
+assert_not_contains "helper exit 3 prints no retry message" "$out" "will retry"
+assert_not_contains "helper exit 3 sends no stall email" "$(cat "${work_dir}/mail.log")" "MAIL"
+
+out="$(watchdog_case -1500 none 1 4 1 AGENT_REVIEW_STALL_NOTIFY_S=600)"
+assert_contains "helper exit 4 (held or just released) returns without an ask" "$out" "rc=1"
+assert_not_contains "helper exit 4 prints no retry message" "$out" "will retry"
+assert_not_contains "helper exit 4 sends no stall email" "$(cat "${work_dir}/mail.log")" "MAIL"
+
+out="$(watchdog_case -1500 none 2 0 1 AGENT_REVIEW_STALL_NOTIFY_S=600)"
+assert_contains "a failed marker lookup is reported as not posted" "$out" "marker lookup failed"
+assert_not_contains "a failed marker lookup posts no ask" "$(cat "${work_dir}/asks.log")" "ASK"
+assert_count_equals "a failed marker lookup past the stall limit emails the operator" "$(cat "${work_dir}/mail.log")" "MAIL" 1
+
+out="$(watchdog_case -600 none 1 0 1 RL_AFTER_ASK=1)"
+assert_contains "a helper that returned 0 without posting (new rate limit) is not an ask" "$out" "rc=1"
+assert_not_contains "no provisional retry_after replaces the real wait" "$(cat "${work_dir}/marks.log")" "MARK"
+
+out="$(watchdog_case -600 none 1 0 1)"
+assert_count_equals "a posted ask holds the gate closed with one provisional retry_after" "$(cat "${work_dir}/marks.log")" "MARK" 1
+
+printf '\n=== watchdog: an unreadable head status still reaches the stall report ===\n'
+out="$(watchdog_case -1500 unknown 1 0 1 AGENT_REVIEW_STALL_NOTIFY_S=600)"
+assert_contains "an unreadable status is reported as not posted" "$out" "CodeRabbit status unreadable"
+assert_not_contains "an unreadable status posts no ask" "$(cat "${work_dir}/asks.log")" "ASK"
+assert_count_equals "an unreadable status past the stall limit emails the operator" "$(cat "${work_dir}/mail.log")" "MAIL" 1
+
+out="$(watchdog_case -1500 unknown 1 0 1 AGENT_REVIEW_STALL_NOTIFY_S=600 RESPONSE_SEEN=1)"
+assert_contains "an unreadable status on a head CodeRabbit already answered is left alone" "$out" "rc=1"
+assert_not_contains "an answered head with an unreadable status prints no stall line" "$out" "was not posted"
+assert_not_contains "an answered head with an unreadable status sends no stall email" "$(cat "${work_dir}/mail.log")" "MAIL"
+
+out="$(watchdog_case -1500 unknown 0 0 1 AGENT_REVIEW_STALL_NOTIFY_S=600)"
+assert_contains "an unreadable status on a head with an outstanding ask is left alone" "$out" "rc=1"
+assert_not_contains "an outstanding ask is never reported as unposted during an outage" "$out" "was not posted"
+assert_not_contains "an outstanding ask sends no stall email during an outage" "$(cat "${work_dir}/mail.log")" "MAIL"
+
+printf '\n=== watchdog: a stalled ask emails the operator once per head ===\n'
+out="$(watchdog_case -1500 none 1 2 2 AGENT_REVIEW_STALL_NOTIFY_S=600)"
+assert_contains "a failed ask is reported as not posted" "$out" "was not posted (helper exit 2)"
+assert_count_equals "both polls report the failed ask by returning 1" "$out" "rc=1" 2
+assert_count_equals "the operator is emailed once for two stalled polls" "$(cat "${work_dir}/mail.log")" "MAIL" 1
+assert_contains "the email names the PR and the head" "$(cat "${work_dir}/mail.log")" \
+  "PR agent review stalled: no CodeRabbit ask for head deadbee (#886)"
+
+out="$(watchdog_case -500 none 1 2 1 AGENT_REVIEW_STALL_NOTIFY_S=600)"
+assert_contains "a stall that has not reached the limit yet is retried" "$out" "will retry"
+assert_not_contains "a stall under the limit sends no email" "$(cat "${work_dir}/mail.log")" "MAIL"
+
+out="$(watchdog_case -500 none 1 2 1 AGENT_REVIEW_STALL_NOTIFY_S=0600)"
+assert_not_contains "a leading-zero limit of 0600 is 600 seconds, not octal 384 (440s past due sends no email)" \
+  "$(cat "${work_dir}/mail.log")" "MAIL"
+
+out="$(watchdog_case -1500 none 1 2 1 AGENT_REVIEW_STALL_NOTIFY_S=08)"
+assert_count_equals "a leading-zero limit of 08 is eight seconds, not an arithmetic error" "$(cat "${work_dir}/mail.log")" "MAIL" 1
+assert_not_contains "a limit of 08 raises no arithmetic error" "$out" "value too great for base"
+
+out="$(watchdog_case -1500 none 1 2 1 AGENT_REVIEW_STALL_NOTIFY_S=0)"
+assert_not_contains "AGENT_REVIEW_STALL_NOTIFY_S=0 turns the stall email off" "$(cat "${work_dir}/mail.log")" "MAIL"
+
+# heartbeat_case <retry_after_offset_s|none> [env assignments...]
+heartbeat_case() {
+  local -r offset="$1"
+  shift
+  env "$@" timeout 30 bash -c "
+    set -uo pipefail
+    source '${wait_script}'
+    now=\$(date -u +%s)
+    if [[ '${offset}' == none ]]; then retry=''; else retry=\$(date -u -d \"@\$(( now + (${offset}) ))\" +%Y-%m-%dT%H:%M:%SZ); fi
+    agent_review_agent_quota_cache_retry_after_for_agent() { printf '%s' \"\${retry}\"; }
+    agent_review_loop_wait_agents='coderabbit'
+    cmd_loop_head_seen_head=deadbeefcafe0123
+    cmd_loop_head_seen_epoch=\$(( now + (\${SEEN_OFFSET:--7200}) ))
+    if [[ \"\${ASKED:-0}\" == 1 ]]; then cmd_loop_full_review_asked_head=deadbeefcafe0123; cmd_loop_full_review_asked_epoch=\$(( now + (\${ASKED_OFFSET:--30}) )); fi
+    cmd_loop_heartbeat 886 deadbeefcafe0123 \${ACTIVE:-1}" 2>&1
+}
+
+printf '\n=== heartbeat: every pass says what it waits for, until when and what comes next ===\n'
+out="$(heartbeat_case 900)"
+assert_contains "a running cooldown names its end and the next action" "$out" "cooldown (source cache retry_after) ends"
+assert_contains "a running cooldown says the grace and the ask follow" "$out" "then 60s grace, then the full-review ask"
+assert_contains "the heartbeat names the PR, the head and the waited-on agent" "$out" \
+  "heartbeat PR #886 head deadbee waiting on [coderabbit]"
+
+out="$(heartbeat_case -20)"
+assert_contains "inside the grace the heartbeat counts the grace down" "$out" "the full-review ask for this head is due in"
+
+out="$(heartbeat_case -600)"
+assert_contains "past the grace the heartbeat says the ask is due" "$out" "the full-review ask is due now"
+
+out="$(heartbeat_case none)"
+assert_contains "with no cooldown the heartbeat still says what it does" "$out" "no CodeRabbit cooldown on record"
+
+out="$(heartbeat_case -600 SEEN_OFFSET=-30)"
+assert_contains "a head first seen after the cooldown shows the silent-head due time, not 'due now'" "$out" "the full-review ask for this head is due in"
+assert_not_contains "the heartbeat does not claim the ask is due when the watchdog would wait" "$out" "due now"
+
+out="$(heartbeat_case -20 ASKED=1)"
+assert_contains "after this loop's own ask the heartbeat waits for the reply" "$out" "ask for this head is posted; waiting for CodeRabbit's reply"
+assert_not_contains "after the ask the heartbeat does not promise another one" "$out" "then the full-review ask"
+
+out="$(heartbeat_case 1800 ASKED=1 ASKED_OFFSET=-600)"
+assert_contains "a later real cooldown after the ask is shown as a cooldown again" "$out" "cooldown (source cache retry_after) ends"
+assert_not_contains "a later real cooldown is not described as waiting for a reply" "$out" "waiting for CodeRabbit's reply"
+
+out="$(heartbeat_case -600 ACTIVE=0)"
+assert_contains "a repo without CodeRabbit says no cooldown applies" "$out" "CodeRabbit is not enabled for this repository"
+assert_not_contains "a repo without CodeRabbit never promises a watchdog ask" "$out" "full-review ask"
+
+printf '\n=== loop log: the loop writes its own log and prints its path ===\n'
+log_dir="${work_dir}/loop-logs"
+out="$(AGENT_REVIEW_LOOP_LOG=1 AGENT_REVIEW_LOOP_LOG_DIR="${log_dir}" timeout 30 bash -c "
+  set -uo pipefail
+  source '${wait_script}'
+  cmd_loop_start_log o/r 886
+  printf 'wait-for-agent-review: a line after the log started\n' >&2" 2>&1)"
+assert_contains "the path of the loop log is printed at the start" "$out" "wait-for-agent-review: loop log: ${log_dir}/o_r-pr886-"
+assert_contains "the loop's own output still reaches the terminal" "$out" "a line after the log started"
+log_files=("${log_dir}"/o_r-pr886-*.log)
+log_file="${log_files[0]}"
+assert_contains "the line printed after the start is in the log file" "$(cat "${log_file}")" \
+  "a line after the log started"
+
+out="$(AGENT_REVIEW_LOOP_LOG=0 timeout 30 bash -c "
+  set -uo pipefail
+  source '${wait_script}'
+  cmd_loop_start_log o/r 886" 2>&1)"
+assert_not_contains "AGENT_REVIEW_LOOP_LOG=0 prints no log path" "$out" "loop log:"
+
+# A directory that exists but takes no new files: the log cannot be created, which tee alone would not report.
+ro_dir="${work_dir}/ro-logs"
+mkdir -p "${ro_dir}"
+chmod 555 "${ro_dir}"
+if [[ -w "${ro_dir}" ]]; then
+  pass_case "skipped: this user can write into a read-only directory (running as root)"
+else
+  out="$(AGENT_REVIEW_LOOP_LOG=1 AGENT_REVIEW_LOOP_LOG_DIR="${ro_dir}" timeout 30 bash -c "
+    set -uo pipefail
+    source '${wait_script}'
+    cmd_loop_start_log o/r 886
+    printf 'a line after a failed log open\n' >&2" 2>&1)"
+  assert_contains "a log file that cannot be created is warned about" "$out" "WARN could not create loop log"
+  assert_not_contains "no log path is announced when the file cannot be created" "$out" "loop log: "
+  assert_contains "the loop's output still reaches the terminal without the log" "$out" "a line after a failed log open"
+fi
+chmod 755 "${ro_dir}"
+
+printf '\n=== cooldown anchor: a comment edited in place counts from its edit time ===\n'
+out="$(timeout 30 bash -c "
+  set -uo pipefail
+  source '${wait_script}'
+  builtin source '${profile}'
+  updated=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  created=\$(date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+  comments=\"[{\\\"created_at\\\":\\\"\${created}\\\",\\\"updated_at\\\":\\\"\${updated}\\\",\\\"user\\\":{\\\"login\\\":\\\"coderabbitai[bot]\\\"},\\\"html_url\\\":\\\"https://example.test/c\\\",\\\"body\\\":\\\"Review limit reached. Next included review available in 41 minutes\\\"}]\"
+  signal=\$(agent_review_quota_exhaustion_issue_comment_signal_today \"\${comments}\")
+  expected=\$(date -u -d \"\${updated} + 41 minutes\" +%Y-%m-%dT%H:%M:%SZ)
+  echo \"signal=\${signal#*\$'\t'}\"
+  echo \"expected=\${expected}\"" 2>&1)" || true
+signal_line="$(grep '^signal=' <<<"$out" || true)"
+expected_line="$(grep '^expected=' <<<"$out" || true)"
+assert_contains "the expected retry_after was computed (an empty value would pass vacuously)" "${expected_line}" "expected=20"
+assert_contains "retry_after is the edit time plus the stated minutes, not the creation time" \
+  "${signal_line#signal=}" "${expected_line#expected=}"
+
+printf '\n=== static: the fallback-pass message cannot read as a refusal of the full review ===\n'
+assert_not_contains "the old 'all agent quotas exhausted' wording is gone from the fallback pass" \
+  "$(cat "${wait_script}")" "all agent quotas exhausted for today — no review requests"
+assert_contains "the fallback-pass message says it does not block the CodeRabbit ask" \
+  "$(cat "${wait_script}")" "this does not block the CodeRabbit full-review ask"
+assert_contains "the stall email names a full-review command that works for the repository" \
+  "$(cat "${wait_script}")" "gh pr comment \${pr} --repo \${repo} --body '@coderabbitai full review'"
+assert_contains "the loop calls the watchdog before the in-flight check deferral" \
+  "$(awk '/cmd_loop_cooldown_watchdog "\$\{repo\}"/ {w=1} w && /agent_review_named_pr_check_is_pending/ {print "watchdog-first"; exit}' "${wait_script}")" \
+  "watchdog-first"
+
+test_summary
