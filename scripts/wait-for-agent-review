@@ -1812,8 +1812,8 @@ cmd_loop_cooldown_watchdog() {
   local -r head="$3"
   local -r snapshot="${4:-}"
   local -r grace_s="${agent_review_default_coderabbit_post_cooldown_grace_s}"
-  local retry_after retry_epoch now_epoch due_epoch late_s stall_s head_status head_state head_state_epoch
-  local sent_rc=0 helper_rc=0 saved_agent profiles_dir provisional_retry
+  local retry_after retry_epoch now_epoch due_epoch late_s head_status head_state head_state_epoch
+  local sent_rc=0 helper_rc=0 saved_agent profiles_dir provisional_retry silent_due_epoch
 
   if [[ "${AGENT_REVIEW_CODERABBIT_WATCHDOG:-1}" == '0' ]]; then
     return 1
@@ -1828,6 +1828,18 @@ cmd_loop_cooldown_watchdog() {
   fi
   now_epoch="$(runner_exec_stdout "watchdog now epoch" -- date -u +%s)"
   due_epoch=$(( retry_epoch + grace_s ))
+  # A cooldown that ended before the loop saw this head says nothing about it (the cache holds the day's cooldown,
+  # and a fresh push has its own on-push review coming): such a head gets the silent-head wait first, as in the
+  # handler, and only then the ask. A head the loop has not noted has no first-seen clock to count from.
+  if [[ "${cmd_loop_head_seen_head:-}" != "${head}" ]]; then
+    return 1
+  fi
+  if (( retry_epoch <= cmd_loop_head_seen_epoch )); then
+    silent_due_epoch=$(( cmd_loop_head_seen_epoch + agent_review_default_coderabbit_silent_head_wait_s + grace_s ))
+    if (( silent_due_epoch > due_epoch )); then
+      due_epoch="${silent_due_epoch}"
+    fi
+  fi
   if (( now_epoch < due_epoch )); then
     return 1
   fi
@@ -1853,15 +1865,33 @@ cmd_loop_cooldown_watchdog() {
   # shellcheck disable=SC1090,SC1091  # profile loaded at runtime for last-resort helpers
   source "${profiles_dir}/coderabbit"
   agent_review_coderabbit_full_review_already_sent "${repo}" "${pr}" "${head}" || sent_rc=$?
+  late_s=$(( now_epoch - due_epoch ))
+  if (( sent_rc == 2 )); then
+    # The marker lookup failed, so posting stays off, but an overdue head must still reach the stall report.
+    agent_review_use_agent "${saved_agent}"
+    cmd_loop_watchdog_report_unposted "${repo}" "${pr}" "${head}" "${retry_after}" "${grace_s}" "${late_s}" 'marker lookup failed'
+    return 1
+  fi
   if (( sent_rc != 1 )); then
     agent_review_use_agent "${saved_agent}"
     return 1
   fi
-  late_s=$(( now_epoch - due_epoch ))
   printf 'wait-for-agent-review: WATCHDOG cooldown ended %s (due %ss ago incl. %ss grace) and head %s has no CodeRabbit review or ask on PR #%s — posting the full-review ask\n' \
     "${retry_after}" "${late_s}" "${grace_s}" "${head:0:7}" "${pr}" >&2
   agent_review_profile_request_last_resort_full_review "${repo}" "${pr}" "${head}" || helper_rc=$?
+  if (( helper_rc == 3 || helper_rc == 4 )); then
+    # CodeRabbit was never seen on this repository (#759), or the PR is on hold / was just released (#865): nothing
+    # to ask on purpose, so neither a retry message nor a stall email.
+    agent_review_use_agent "${saved_agent}"
+    return 1
+  fi
   if (( helper_rc == 0 )); then
+    # The helper also returns 0 without posting when CodeRabbit became rate limited meanwhile: that wait is the
+    # real one, so no provisional retry_after replaces it and no reply is awaited.
+    if agent_review_agent_quota_rate_limited_for_agent 'coderabbit'; then
+      agent_review_use_agent "${saved_agent}"
+      return 1
+    fi
     # Hold the gate closed until CodeRabbit replies, as the handler does after its own ask.
     provisional_retry="$(runner_exec_stdout "watchdog provisional retry_after" -- \
       date --utc --date="now + ${grace_s} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
@@ -1874,21 +1904,35 @@ cmd_loop_cooldown_watchdog() {
     return 0
   fi
   agent_review_use_agent "${saved_agent}"
+  cmd_loop_watchdog_report_unposted "${repo}" "${pr}" "${head}" "${retry_after}" "${grace_s}" "${late_s}" "helper exit ${helper_rc}"
+  return 1
+}
+
+# Reports a watchdog ask that was not posted and, once the stall limit has passed, emails the operator once per head.
+cmd_loop_watchdog_report_unposted() {
+  local -r repo="$1"
+  local -r pr="$2"
+  local -r head="$3"
+  local -r retry_after="$4"
+  local -r grace_s="$5"
+  local -r late_s="$6"
+  local -r why="$7"
+  local stall_s
+
   stall_s="${AGENT_REVIEW_STALL_NOTIFY_S:-600}"
   if ! [[ "${stall_s}" =~ ^[0-9]+$ ]]; then
     stall_s=600
   fi
-  printf 'wait-for-agent-review: WATCHDOG ask for head %s on PR #%s was not posted (helper exit %s) — %ss past due, will retry\n' \
-    "${head:0:7}" "${pr}" "${helper_rc}" "${late_s}" >&2
+  printf 'wait-for-agent-review: WATCHDOG ask for head %s on PR #%s was not posted (%s) — %ss past due, will retry\n' \
+    "${head:0:7}" "${pr}" "${why}" "${late_s}" >&2
   if (( stall_s > 0 && late_s >= stall_s )) && [[ "${cmd_loop_stall_notified_head:-}" != "${head}" ]]; then
     cmd_loop_stall_notified_head="${head}"
     # The email helper dies when SMTP is not configured; a subshell keeps that from ending the loop.
     ( agent_review_email_send_plain \
       "PR agent review stalled: no CodeRabbit ask for head ${head:0:7} (#${pr})" \
-      "The review loop on ${repo}#${pr} is ${late_s}s past CodeRabbit's cooldown (${retry_after}) plus ${grace_s}s grace and the full-review ask for head ${head} could not be posted (helper exit ${helper_rc}). Check the loop log and ask by hand with: scripts/wait-for-agent-review request --pr ${pr}" ) \
+      "The review loop on ${repo}#${pr} is ${late_s}s past CodeRabbit's cooldown (${retry_after}) plus ${grace_s}s grace and the full-review ask for head ${head} could not be posted (${why}). Check the loop log and ask by hand with: scripts/wait-for-agent-review request --pr ${pr}" ) \
       || printf 'wait-for-agent-review: WATCHDOG could not send the stall email for PR #%s\n' "${pr}" >&2
   fi
-  return 1
 }
 
 # Heartbeat (#886): one line per pass saying what the loop is waiting for, until when and what it does next, so a

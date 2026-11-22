@@ -32,6 +32,7 @@ watchdog_case() {
   shift 5
   : >"${work_dir}/asks.log"
   : >"${work_dir}/mail.log"
+  : >"${work_dir}/marks.log"
   env "$@" timeout 30 bash -c "
     set -uo pipefail
     source '${wait_script}'
@@ -41,8 +42,12 @@ watchdog_case() {
     now=\$(date -u +%s)
     retry=\$(date -u -d \"@\$(( now + ($offset) ))\" +%Y-%m-%dT%H:%M:%SZ)
     agent_review_agent_quota_cache_retry_after_for_agent() { printf '%s' \"\${retry}\"; }
-    agent_review_agent_quota_rate_limited_for_agent() { return 1; }
-    agent_review_coderabbit_quota_mark_exhausted() { return 0; }
+    # SEEN_OFFSET: when the loop first saw the head (default: long before the cooldown ended).
+    cmd_loop_head_seen_head=deadbeefcafe0123
+    cmd_loop_head_seen_epoch=\$(( now + (\${SEEN_OFFSET:--7200}) ))
+    # RL_AFTER_ASK=1: the helper found a new rate limit and returned 0 without posting.
+    agent_review_agent_quota_rate_limited_for_agent() { [[ \"\${RL_AFTER_ASK:-0}\" == 1 && -s '${work_dir}/asks.log' ]]; }
+    agent_review_coderabbit_quota_mark_exhausted() { printf 'MARK\n' >>'${work_dir}/marks.log'; return 0; }
     agent_review_coderabbit_head_status() { printf '%s\t0\n' '${state}'; }
     agent_review_agent_signed_off_on_head() { return 1; }
     cmd_loop_agent_response_seen() { return 1; }
@@ -91,6 +96,40 @@ assert_not_contains "a reviewed head gets no ask" "$(cat "${work_dir}/asks.log")
 out="$(watchdog_case -600 none 1 0 1 AGENT_REVIEW_CODERABBIT_WATCHDOG=0)"
 assert_contains "AGENT_REVIEW_CODERABBIT_WATCHDOG=0 turns the watchdog off" "$out" "rc=1"
 assert_not_contains "a disabled watchdog posts no ask" "$(cat "${work_dir}/asks.log")" "ASK"
+
+printf '\n=== watchdog: a fresh push after an earlier cooldown is not asked at once ===\n'
+out="$(watchdog_case -600 none 1 0 1 SEEN_OFFSET=-30)"
+assert_contains "a head first seen after the cooldown ended waits out the silent-head wait" "$out" "rc=1"
+assert_not_contains "a fresh push gets no ask before the silent-head wait" "$(cat "${work_dir}/asks.log")" "ASK"
+
+out="$(watchdog_case -600 none 1 0 1 SEEN_OFFSET=-500)"
+assert_contains "a head seen 500s ago after the cooldown is still inside the silent-head wait (1800s)" "$out" "rc=1"
+
+out="$(watchdog_case -3000 none 1 0 1 SEEN_OFFSET=-2000)"
+assert_contains "a head seen past the silent-head wait and grace after the cooldown is asked" "$out" "rc=0"
+
+printf '\n=== watchdog: asks that were refused on purpose or never posted ===\n'
+out="$(watchdog_case -1500 none 1 3 1 AGENT_REVIEW_STALL_NOTIFY_S=600)"
+assert_contains "helper exit 3 (CodeRabbit not configured) returns without an ask" "$out" "rc=1"
+assert_not_contains "helper exit 3 prints no retry message" "$out" "will retry"
+assert_not_contains "helper exit 3 sends no stall email" "$(cat "${work_dir}/mail.log")" "MAIL"
+
+out="$(watchdog_case -1500 none 1 4 1 AGENT_REVIEW_STALL_NOTIFY_S=600)"
+assert_contains "helper exit 4 (held or just released) returns without an ask" "$out" "rc=1"
+assert_not_contains "helper exit 4 prints no retry message" "$out" "will retry"
+assert_not_contains "helper exit 4 sends no stall email" "$(cat "${work_dir}/mail.log")" "MAIL"
+
+out="$(watchdog_case -1500 none 2 0 1 AGENT_REVIEW_STALL_NOTIFY_S=600)"
+assert_contains "a failed marker lookup is reported as not posted" "$out" "marker lookup failed"
+assert_not_contains "a failed marker lookup posts no ask" "$(cat "${work_dir}/asks.log")" "ASK"
+assert_count_equals "a failed marker lookup past the stall limit emails the operator" "$(cat "${work_dir}/mail.log")" "MAIL" 1
+
+out="$(watchdog_case -600 none 1 0 1 RL_AFTER_ASK=1)"
+assert_contains "a helper that returned 0 without posting (new rate limit) is not an ask" "$out" "rc=1"
+assert_not_contains "no provisional retry_after replaces the real wait" "$(cat "${work_dir}/marks.log")" "MARK"
+
+out="$(watchdog_case -600 none 1 0 1)"
+assert_count_equals "a posted ask holds the gate closed with one provisional retry_after" "$(cat "${work_dir}/marks.log")" "MARK" 1
 
 printf '\n=== watchdog: a stalled ask emails the operator once per head ===\n'
 out="$(watchdog_case -1500 none 1 2 2 AGENT_REVIEW_STALL_NOTIFY_S=600)"
