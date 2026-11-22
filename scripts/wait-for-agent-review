@@ -1898,7 +1898,7 @@ cmd_loop_cooldown_watchdog() {
     cmd_loop_watchdog_report_unposted "${repo}" "${pr}" "${head}" "${retry_after}" "${grace_s}" "${late_s}" 'CodeRabbit status unreadable'
     return 1
   fi
-  printf 'wait-for-agent-review: WATCHDOG cooldown ended %s (due %ss ago incl. %ss grace) and head %s has no CodeRabbit review or ask on PR #%s — posting the full-review ask\n' \
+  printf 'wait-for-agent-review: WATCHDOG cooldown ended %s (due %ss ago incl. %ss grace) and head %s has no CodeRabbit review and no ask awaiting a reply on PR #%s — posting the full-review ask\n' \
     "${retry_after}" "${late_s}" "${grace_s}" "${head:0:7}" "${pr}" >&2
   agent_review_profile_request_last_resort_full_review "${repo}" "${pr}" "${head}" || helper_rc=$?
   if (( helper_rc == 3 || helper_rc == 4 )); then
@@ -1915,6 +1915,7 @@ cmd_loop_cooldown_watchdog() {
       return 1
     fi
     cmd_loop_full_review_asked_head="${head}"
+    cmd_loop_full_review_asked_epoch="${now_epoch}"
     # Hold the gate closed until CodeRabbit replies, as the handler does after its own ask.
     provisional_retry="$(runner_exec_stdout "watchdog provisional retry_after" -- \
       date --utc --date="now + ${grace_s} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
@@ -1965,7 +1966,7 @@ cmd_loop_heartbeat() {
   local -r pr="$1"
   local -r head="$2"
   local -r coderabbit_active="${3:-1}"
-  local retry_after retry_epoch now_epoch due_epoch next grace_s
+  local retry_after retry_epoch now_epoch due_epoch next grace_s provisional_hold
 
   if [[ "${coderabbit_active}" != '1' ]]; then
     printf 'wait-for-agent-review: heartbeat PR #%s head %s waiting on [%s] — CodeRabbit is not enabled for this repository, no CodeRabbit cooldown applies\n' \
@@ -1974,8 +1975,22 @@ cmd_loop_heartbeat() {
   fi
   # This loop's own ask holds the gate with a provisional retry_after: that is a wait for CodeRabbit's reply, not a
   # cooldown with an ask still to come.
+  # A later cached retry_after than the provisional hold is CodeRabbit's real answer to the ask (a new cooldown, after
+  # which one more ask is allowed): that falls through to the cooldown view below.
+  provisional_hold=0
   if [[ "${cmd_loop_full_review_asked_head:-}" == "${head}" ]]; then
-    printf 'wait-for-agent-review: heartbeat PR #%s head %s waiting on [%s] — the full-review ask for this head is posted; waiting for CodeRabbit'"'"'s reply (one ask per head)\n' \
+    provisional_hold=1
+    retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent 'coderabbit' 2>/dev/null || true)"
+    if [[ -n "${retry_after}" ]]; then
+      retry_epoch="$(runner_exec_stdout "heartbeat asked retry_after epoch" -- date -u -d "${retry_after}" +%s 2>/dev/null || true)"
+      if [[ "${retry_epoch}" =~ ^[0-9]+$ ]] \
+        && (( retry_epoch > ${cmd_loop_full_review_asked_epoch:-0} + ${agent_review_default_coderabbit_post_cooldown_grace_s:-60} + 5 )); then
+        provisional_hold=0
+      fi
+    fi
+  fi
+  if (( provisional_hold == 1 )); then
+    printf 'wait-for-agent-review: heartbeat PR #%s head %s waiting on [%s] — the full-review ask for this head is posted; waiting for CodeRabbit'"'"'s reply\n' \
       "${pr}" "${head:0:7}" "${agent_review_loop_wait_agents:-none}" >&2
     return 0
   fi
@@ -2439,6 +2454,7 @@ cmd_loop_handle_coderabbit_rate_limit() {
     return 0
   fi
   cmd_loop_full_review_asked_head="${head}"
+  printf -v cmd_loop_full_review_asked_epoch '%(%s)T' -1
   # Keep the wait gate closed until CR replies (observe extends retry_after) or grace
   # elapses. Clearing observed here used to allow another full-review ask while CR's
   # "More reviews will be available in N minutes" reply was still in flight.
