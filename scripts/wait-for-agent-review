@@ -1797,6 +1797,30 @@ cmd_loop_resume_paused_coderabbit() {
   (( helper_rc == 0 ))
 }
 
+# Prints the epoch at which the watchdog asks for <head>: the cooldown's end plus the grace, and for a head first seen
+# after that end (the cache holds the day's cooldown, and a fresh push has its own on-push review coming) not before
+# the silent-head wait and grace from when the loop first saw it. Returns 1, printing nothing, for a head the loop has
+# not noted (no first-seen clock to count from). Shared by the watchdog and the heartbeat so they never disagree.
+# shellcheck disable=SC2154  # agent_review_default_coderabbit_* are assigned in scripts/lib/agent-review
+cmd_loop_watchdog_due_epoch() {
+  local -r head="$1"
+  local -r retry_epoch="$2"
+  local -r grace_s="${agent_review_default_coderabbit_post_cooldown_grace_s}"
+  local due_epoch silent_due_epoch
+
+  if [[ "${cmd_loop_head_seen_head:-}" != "${head}" ]]; then
+    return 1
+  fi
+  due_epoch=$(( retry_epoch + grace_s ))
+  if (( retry_epoch <= cmd_loop_head_seen_epoch )); then
+    silent_due_epoch=$(( cmd_loop_head_seen_epoch + agent_review_default_coderabbit_silent_head_wait_s + grace_s ))
+    if (( silent_due_epoch > due_epoch )); then
+      due_epoch="${silent_due_epoch}"
+    fi
+  fi
+  printf '%s\n' "${due_epoch}"
+}
+
 # Watchdog (#886): once CodeRabbit's cooldown plus the post-cooldown grace has passed and <head> has no
 # CodeRabbit review, no ask and no rate limit, post the gated full-review ask whatever phase the loop is in. A
 # long-lived loop once sat past that point with nothing posted and nothing printed, while a fresh loop on the same
@@ -1813,7 +1837,7 @@ cmd_loop_cooldown_watchdog() {
   local -r snapshot="${4:-}"
   local -r grace_s="${agent_review_default_coderabbit_post_cooldown_grace_s}"
   local retry_after retry_epoch now_epoch due_epoch late_s head_status head_state head_state_epoch
-  local sent_rc=0 helper_rc=0 saved_agent profiles_dir provisional_retry silent_due_epoch
+  local sent_rc=0 helper_rc=0 saved_agent profiles_dir provisional_retry
 
   if [[ "${AGENT_REVIEW_CODERABBIT_WATCHDOG:-1}" == '0' ]]; then
     return 1
@@ -1827,18 +1851,9 @@ cmd_loop_cooldown_watchdog() {
     return 1
   fi
   now_epoch="$(runner_exec_stdout "watchdog now epoch" -- date -u +%s)"
-  due_epoch=$(( retry_epoch + grace_s ))
-  # A cooldown that ended before the loop saw this head says nothing about it (the cache holds the day's cooldown,
-  # and a fresh push has its own on-push review coming): such a head gets the silent-head wait first, as in the
-  # handler, and only then the ask. A head the loop has not noted has no first-seen clock to count from.
-  if [[ "${cmd_loop_head_seen_head:-}" != "${head}" ]]; then
+  # A head the loop has not noted has no first-seen clock, so it is not due.
+  if ! due_epoch="$(cmd_loop_watchdog_due_epoch "${head}" "${retry_epoch}")"; then
     return 1
-  fi
-  if (( retry_epoch <= cmd_loop_head_seen_epoch )); then
-    silent_due_epoch=$(( cmd_loop_head_seen_epoch + agent_review_default_coderabbit_silent_head_wait_s + grace_s ))
-    if (( silent_due_epoch > due_epoch )); then
-      due_epoch="${silent_due_epoch}"
-    fi
   fi
   if (( now_epoch < due_epoch )); then
     return 1
@@ -1851,6 +1866,12 @@ cmd_loop_cooldown_watchdog() {
   IFS=$'\t' read -r head_state head_state_epoch <<<"${head_status}"
   # Only a head CodeRabbit has said nothing about (or only that it is rate limited) is waiting on an ask: a
   # completed, running, skipped, paused or failed review each says something else.
+  if [[ "${head_state}" == 'unknown' ]]; then
+    # Both status reads failed: nothing is asked on a guess, but an overdue head must still reach the stall report.
+    cmd_loop_watchdog_report_unposted "${repo}" "${pr}" "${head}" "${retry_after}" "${grace_s}" \
+      "$(( now_epoch - due_epoch ))" 'CodeRabbit status unreadable'
+    return 1
+  fi
   if [[ "${head_state}" != 'none' && "${head_state}" != 'rate_limited' ]]; then
     return 1
   fi
@@ -1940,8 +1961,14 @@ cmd_loop_watchdog_report_unposted() {
 cmd_loop_heartbeat() {
   local -r pr="$1"
   local -r head="$2"
-  local retry_after retry_epoch now_epoch next grace_s
+  local -r coderabbit_active="${3:-1}"
+  local retry_after retry_epoch now_epoch due_epoch next grace_s
 
+  if [[ "${coderabbit_active}" != '1' ]]; then
+    printf 'wait-for-agent-review: heartbeat PR #%s head %s waiting on [%s] — CodeRabbit is not enabled for this repository, no CodeRabbit cooldown applies\n' \
+      "${pr}" "${head:0:7}" "${agent_review_loop_wait_agents:-none}" >&2
+    return 0
+  fi
   retry_after="$(agent_review_agent_quota_cache_retry_after_for_agent 'coderabbit' 2>/dev/null || true)"
   grace_s="${agent_review_default_coderabbit_post_cooldown_grace_s:-60}"
   now_epoch="$(runner_exec_stdout "heartbeat now epoch" -- date -u +%s)"
@@ -1953,10 +1980,12 @@ cmd_loop_heartbeat() {
       next="CodeRabbit cooldown ${retry_after} is unreadable"
     elif (( now_epoch < retry_epoch )); then
       next="CodeRabbit cooldown (source cache retry_after) ends ${retry_after}, in $(( retry_epoch - now_epoch ))s; then ${grace_s}s grace, then the full-review ask"
-    elif (( now_epoch < retry_epoch + grace_s )); then
-      next="CodeRabbit cooldown ended ${retry_after}; grace ends in $(( retry_epoch + grace_s - now_epoch ))s, then the full-review ask"
+    elif ! due_epoch="$(cmd_loop_watchdog_due_epoch "${head}" "${retry_epoch}")"; then
+      next="CodeRabbit cooldown ended ${retry_after}; this head has not been noted yet, so no ask is timed"
+    elif (( now_epoch < due_epoch )); then
+      next="CodeRabbit cooldown ended ${retry_after}; the full-review ask for this head is due in $(( due_epoch - now_epoch ))s (grace, or the silent-head wait for a head first seen after the cooldown)"
     else
-      next="CodeRabbit cooldown ended ${retry_after} $(( now_epoch - retry_epoch ))s ago; the full-review ask is due now (watchdog posts it if head has no review or ask)"
+      next="CodeRabbit cooldown ended ${retry_after}; the full-review ask is due now (the watchdog posts it if the head has no review or ask)"
     fi
   fi
   printf 'wait-for-agent-review: heartbeat PR #%s head %s waiting on [%s] — %s\n' \
@@ -3019,7 +3048,13 @@ cmd_loop() {
     agent_review_assert_snapshot_complete "${snapshot}"
     head="$(wait_ar_jq_snapshot "$snapshot" '.data.repository.pullRequest.headRefOid')"
     cmd_loop_note_head "${head}"
-    cmd_loop_heartbeat "${pr}" "${head}"
+    # A repo that does not use CodeRabbit (agent-reviewers property) never waits on its checks or rate limit; the
+    # CI and feedback gates still apply (#716).
+    coderabbit_active=1
+    if ! agent_review_reviewers_is_enabled coderabbit "${repo}"; then
+      coderabbit_active=0
+    fi
+    cmd_loop_heartbeat "${pr}" "${head}" "${coderabbit_active}"
     # Round cap (#861): CI is green and nothing is unanswered here, so a PR that has had its rounds is accepted
     # instead of waiting for another review.
     cap_exit=0
@@ -3061,10 +3096,6 @@ cmd_loop() {
       || return $?
     # A repo that does not use CodeRabbit (agent-reviewers property) never waits on its checks or
     # rate limit; the CI and feedback gates still apply (#716).
-    coderabbit_active=1
-    if ! agent_review_reviewers_is_enabled coderabbit "${repo}"; then
-      coderabbit_active=0
-    fi
     # Watchdog (#886): an elapsed cooldown with no review or ask on the head is acted on whatever phase the loop
     # is in, before any wait below can defer it.
     if (( coderabbit_active == 1 )) \

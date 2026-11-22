@@ -131,6 +131,12 @@ assert_not_contains "no provisional retry_after replaces the real wait" "$(cat "
 out="$(watchdog_case -600 none 1 0 1)"
 assert_count_equals "a posted ask holds the gate closed with one provisional retry_after" "$(cat "${work_dir}/marks.log")" "MARK" 1
 
+printf '\n=== watchdog: an unreadable head status still reaches the stall report ===\n'
+out="$(watchdog_case -1500 unknown 1 0 1 AGENT_REVIEW_STALL_NOTIFY_S=600)"
+assert_contains "an unreadable status is reported as not posted" "$out" "CodeRabbit status unreadable"
+assert_not_contains "an unreadable status posts no ask" "$(cat "${work_dir}/asks.log")" "ASK"
+assert_count_equals "an unreadable status past the stall limit emails the operator" "$(cat "${work_dir}/mail.log")" "MAIL" 1
+
 printf '\n=== watchdog: a stalled ask emails the operator once per head ===\n'
 out="$(watchdog_case -1500 none 1 2 2 AGENT_REVIEW_STALL_NOTIFY_S=600)"
 assert_contains "a failed ask is reported as not posted" "$out" "was not posted (helper exit 2)"
@@ -146,16 +152,20 @@ assert_not_contains "a stall under the limit sends no email" "$(cat "${work_dir}
 out="$(watchdog_case -1500 none 1 2 1 AGENT_REVIEW_STALL_NOTIFY_S=0)"
 assert_not_contains "AGENT_REVIEW_STALL_NOTIFY_S=0 turns the stall email off" "$(cat "${work_dir}/mail.log")" "MAIL"
 
-# heartbeat_case <retry_after_offset_s|none>
+# heartbeat_case <retry_after_offset_s|none> [env assignments...]
 heartbeat_case() {
-  timeout 30 bash -c "
+  local -r offset="$1"
+  shift
+  env "$@" timeout 30 bash -c "
     set -uo pipefail
     source '${wait_script}'
     now=\$(date -u +%s)
-    if [[ '$1' == none ]]; then retry=''; else retry=\$(date -u -d \"@\$(( now + ($1) ))\" +%Y-%m-%dT%H:%M:%SZ); fi
+    if [[ '${offset}' == none ]]; then retry=''; else retry=\$(date -u -d \"@\$(( now + (${offset}) ))\" +%Y-%m-%dT%H:%M:%SZ); fi
     agent_review_agent_quota_cache_retry_after_for_agent() { printf '%s' \"\${retry}\"; }
     agent_review_loop_wait_agents='coderabbit'
-    cmd_loop_heartbeat 886 deadbeefcafe0123" 2>&1
+    cmd_loop_head_seen_head=deadbeefcafe0123
+    cmd_loop_head_seen_epoch=\$(( now + (\${SEEN_OFFSET:--7200}) ))
+    cmd_loop_heartbeat 886 deadbeefcafe0123 \${ACTIVE:-1}" 2>&1
 }
 
 printf '\n=== heartbeat: every pass says what it waits for, until when and what comes next ===\n'
@@ -166,13 +176,21 @@ assert_contains "the heartbeat names the PR, the head and the waited-on agent" "
   "heartbeat PR #886 head deadbee waiting on [coderabbit]"
 
 out="$(heartbeat_case -20)"
-assert_contains "inside the grace the heartbeat counts the grace down" "$out" "grace ends in"
+assert_contains "inside the grace the heartbeat counts the grace down" "$out" "the full-review ask for this head is due in"
 
 out="$(heartbeat_case -600)"
 assert_contains "past the grace the heartbeat says the ask is due" "$out" "the full-review ask is due now"
 
 out="$(heartbeat_case none)"
 assert_contains "with no cooldown the heartbeat still says what it does" "$out" "no CodeRabbit cooldown on record"
+
+out="$(heartbeat_case -600 SEEN_OFFSET=-30)"
+assert_contains "a head first seen after the cooldown shows the silent-head due time, not 'due now'" "$out" "the full-review ask for this head is due in"
+assert_not_contains "the heartbeat does not claim the ask is due when the watchdog would wait" "$out" "due now"
+
+out="$(heartbeat_case -600 ACTIVE=0)"
+assert_contains "a repo without CodeRabbit says no cooldown applies" "$out" "CodeRabbit is not enabled for this repository"
+assert_not_contains "a repo without CodeRabbit never promises a watchdog ask" "$out" "full-review ask"
 
 printf '\n=== loop log: the loop writes its own log and prints its path ===\n'
 log_dir="${work_dir}/loop-logs"
