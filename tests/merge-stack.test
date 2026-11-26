@@ -62,12 +62,6 @@ case "$1 $2" in
     exec jq -r "${filter}" "${FAKE_PR_FIXTURE}"
     ;;
   'api repos/'*)
-    if [[ "$*" == *'check-suites'* ]]; then
-      [[ -z "${FAKE_RUNS_FAIL:-}" ]] || exit 1
-      # Number of UNFINISHED check suites for the head commit (any provider); the real call filters with --jq.
-      printf '%s\n' "${FAKE_RUNS:-1}"
-      exit 0
-    fi
     [[ -z "${FAKE_SETUP_FAIL:-}" ]] || exit 1
     printf '%s\n' "${FAKE_ALLOW_AUTO:-true}"
     exit 0
@@ -209,25 +203,30 @@ assert_not_contains 'the direct merge does not request auto-merge' "$(<"${gh_log
 assert_eq 'the NOTE line is exactly the documented one for green checks' "$(grep '^NOTE: MERGE_STACK_DIRECT' <<<"${out}")" 'NOTE: MERGE_STACK_DIRECT pr=#12 repo=the-hcma/example reason=no-queue-no-auto-merge'
 assert_contains 'the PR is reported merged, not queued' "${out}" 'PR #12 merged'
 assert_not_contains 'a direct merge is not reported as queued' "${out}" 'queued'
-# No check reported for the head: right after a push GitHub says CLEAN before any workflow has registered, so an
-# empty list only passes when no check suite for that head is unfinished, from Actions or any external CI app (a
-# repository whose only workflows are branch cleanup ones, which never report on a PR, has none and so merges
-# directly).
-run_merge "${pr_open}" "${direct_envs[@]}" FAKE_RUNS=0 -- --pr 12
-assert_eq 'a PR with no checks and no unfinished check suite for its head merges directly on CLEAN alone' "${rc}" '0'
-assert_eq 'the zero-checks NOTE line ends in checks=none' "$(grep '^NOTE: MERGE_STACK_DIRECT' <<<"${out}")" 'NOTE: MERGE_STACK_DIRECT pr=#12 repo=the-hcma/example reason=no-queue-no-auto-merge checks=none'
-run_merge "${pr_open}" "${direct_envs[@]}" FAKE_RUNS=2 -- --pr 12
-assert_eq 'no checks while a check suite for the head is unfinished refuses the direct merge with exit 2' "${rc}" '2'
-assert_contains 'the check-suite query is scoped to the PR head commit and asks for up to 100' "$(<"${gh_log}")" "commits/${head_sha}/check-suites?per_page=100"
-assert_contains 'the refusal says CI may not have reported yet' "${out}" 'CI may not have reported yet'
-assert_not_contains 'no merge command runs while a run exists but reports nothing' "$(<"${gh_log}")" 'pr merge'
+# No check reported for the head: right after a push GitHub says CLEAN before any check has registered, and no API
+# can rule out a CI that has not posted yet, so the gate does not guess. An empty list is re-read, then refused;
+# --allow-no-checks (the caller's explicit statement that this repository has no CI) lets it through.
+run_merge "${pr_open}" "${direct_envs[@]}" -- --pr 12
+assert_eq 'no reported check refuses the direct merge with exit 2' "${rc}" '2'
+assert_contains 'the refusal names the zero-checks state' "${out}" 'checks=none'
+assert_contains 'the refusal names the flag for a repository with no CI' "${out}" '--allow-no-checks'
+assert_contains 'the refusal says nothing was merged' "${out}" 'nothing was merged'
+assert_not_contains 'no merge command runs for an empty check list' "$(<"${gh_log}")" 'pr merge'
 assert_contains 'the empty check list is re-read before it is believed' "$(grep -c 'statusCheckRollup' "${gh_log}" | sed 's/^/reads=/')" 'reads=3'
-run_merge "${pr_open}" "${direct_envs[@]}" FAKE_RUNS_FAIL=1 -- --pr 12
-assert_eq 'an unreadable run list with no checks refuses the direct merge with exit 2' "${rc}" '2'
-assert_not_contains 'no merge command runs when the runs cannot be read' "$(<"${gh_log}")" 'pr merge'
-run_merge "${pr_checks_green}" "${direct_envs[@]}" FAKE_RUNS=2 -- --pr 12
-assert_eq 'reported green checks merge even when suites are unfinished' "${rc}" '0'
-assert_eq 'green checks with runs keep the exact NOTE line' "$(grep '^NOTE: MERGE_STACK_DIRECT' <<<"${out}")" 'NOTE: MERGE_STACK_DIRECT pr=#12 repo=the-hcma/example reason=no-queue-no-auto-merge'
+run_merge "${pr_open}" "${direct_envs[@]}" -- --pr 12 --allow-no-checks
+assert_eq '--allow-no-checks merges a clean PR with no reported check and exits 0' "${rc}" '0'
+assert_eq 'the zero-checks NOTE line ends in checks=none' "$(grep '^NOTE: MERGE_STACK_DIRECT' <<<"${out}")" 'NOTE: MERGE_STACK_DIRECT pr=#12 repo=the-hcma/example reason=no-queue-no-auto-merge checks=none'
+assert_contains 'the allowed zero-checks merge is pinned to the head commit' "$(<"${gh_log}")" "--match-head-commit ${head_sha}"
+run_merge "$(printf '%s' "${pr_open}" | sed 's/CLEAN/BLOCKED/')" "${direct_envs[@]}" -- --pr 12 --allow-no-checks
+assert_eq '--allow-no-checks does not override a PR that is not CLEAN' "${rc}" '2'
+assert_not_contains 'no merge command runs for a BLOCKED PR even with --allow-no-checks' "$(<"${gh_log}")" 'pr merge'
+run_merge "${pr_checks_failing}" "${direct_envs[@]}" -- --pr 12 --allow-no-checks
+assert_eq '--allow-no-checks does not override a failing check' "${rc}" '2'
+assert_contains 'a failing check is still reported as red' "${out}" 'checks=red'
+run_merge "${pr_checks_pending}" "${direct_envs[@]}" -- --pr 12 --allow-no-checks
+assert_eq '--allow-no-checks does not override a pending check' "${rc}" '2'
+run_merge "${pr_checks_green}" "${direct_envs[@]}" -- --pr 12 --allow-no-checks
+assert_eq 'green checks keep the exact NOTE line even with --allow-no-checks' "$(grep '^NOTE: MERGE_STACK_DIRECT' <<<"${out}")" 'NOTE: MERGE_STACK_DIRECT pr=#12 repo=the-hcma/example reason=no-queue-no-auto-merge'
 run_merge "${pr_checks_green}" "${direct_envs[@]}" -- --pr 12 --repo the-hcma/example
 assert_contains 'a --repo is passed to the direct merge' "$(<"${gh_log}")" 'pr merge 12 --repo the-hcma/example --squash'
 run_merge "$(printf '%s' "${pr_checks_green}" | sed 's/"headRefOid":"[0-9a-f]*",//')" "${direct_envs[@]}" -- --pr 12

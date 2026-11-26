@@ -11,9 +11,9 @@
 #                          gh pr merge <pr> --squash --match-head-commit <sha>
 #                                                            (neither queue nor auto-merge: nothing to enqueue into, so it
 #                                                             merges now, pinned to the head it checked, but only a PR with
-#                                                             mergeStateStatus CLEAN and every check green, or no check
-#                                                             reported and no unfinished check suite for that head; otherwise
-#                                                             refused)
+#                                                             mergeStateStatus CLEAN and every check green; otherwise
+#                                                             refused. No reported check at all merges only with
+#                                                             --allow-no-checks)
 #   .github/stacking-tool is graphite → refused (Graphite is retired, repository-helpers#772)
 #
 # The direct merge (repository-helpers#888) is for a repository on a plan without rulesets or branch protection,
@@ -35,7 +35,7 @@
 # 3 queued but not merged within --timeout (ERROR: WAIT_TIMEOUT line).
 #
 # Usage:
-#   scripts/dev/merge-stack --pr <number> [--repo OWNER/NAME] [--wait] [--timeout SECONDS]
+#   scripts/dev/merge-stack --pr <number> [--repo OWNER/NAME] [--wait] [--timeout SECONDS] [--allow-no-checks]
 #   scripts/dev/merge-stack --help
 set -euo pipefail
 
@@ -57,6 +57,7 @@ source "${script_dir}/../lib/github-api-rate-limit"
 pr_number=""
 repo_arg=""
 wait_for_merge=0
+allow_no_checks=0
 wait_timeout_s=2400
 # Seconds between --wait polls and between the bounded re-reads of GitHub's state (tests set them to 0).
 poll_interval_s="${MERGE_STACK_POLL_INTERVAL_S:-15}"
@@ -92,6 +93,10 @@ parse_args() {
         ;;
       --wait)
         wait_for_merge=1
+        shift
+        ;;
+      --allow-no-checks)
+        allow_no_checks=1
         shift
         ;;
       --timeout)
@@ -304,19 +309,20 @@ plan_plain_merge() {
 # so a push between the check and the merge fails the merge instead of landing code nobody checked.
 direct_head_oid=""
 
-# direct_checks — "green" or "none" (no unfinished check suite for the head, so there is no check to wait for); set by
+# direct_checks — "green", or "none" when no check was reported and --allow-no-checks was given; set by
 # require_direct_ready and echoed in the MERGE_STACK_DIRECT note when it is "none".
 direct_checks=""
 
 # require_direct_ready — the gate for a direct merge: mergeStateStatus is CLEAN and every check on the head is
 # green (a success, skipped or neutral conclusion; a pending or failing check is not). Without a queue or
 # auto-merge nothing waits for pending checks, so a PR that is not ready now is refused, never merged on hope.
-# Right after a push GitHub reports CLEAN before any workflow has registered, so an empty check list is not
-# "green": it is re-read a few times, and if it stays empty the merge goes ahead only when no check suite for this
-# head commit is still unfinished (nothing is pending, so nothing more will report). An unfinished suite, or a
-# suite list that cannot be read, refuses. Exits 2 with nothing merged.
+# The gate judges readiness only from what GitHub reports on the PR (the check rollup and mergeStateStatus). It does
+# not try to prove that no CI exists: right after a push GitHub reports CLEAN before any check has registered, and
+# no API can rule out a CI that has not posted yet. So an empty check list is re-read a few times and, if it stays
+# empty, refused unless the caller passes --allow-no-checks (the caller already holds the user's confirmation, and
+# this is the repository without CI that the direct merge exists for). Exits 2 with nothing merged.
 require_direct_ready() {
-  local merge_state checks attempt slug runs runs_ok
+  local merge_state checks attempt
 
   # Read the head first and pin the merge to it: if it moves after this read, the merge is refused, never widened.
   direct_head_oid="$(gh_read "merge-stack gh pr view ${pr_number} head" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json headRefOid --jq '.headRefOid // ""')" || direct_head_oid=''
@@ -335,28 +341,16 @@ require_direct_ready() {
       runner_exec "merge-stack checks register sleep" -- sleep "$retry_sleep_s"
     fi
   done
-  if [[ "$merge_state" != 'CLEAN' || ( "$checks" != 'green' && "$checks" != 'none' ) ]]; then
-    printf 'ERROR: merge-stack: PR #%s has no merge queue or auto-merge to wait in, so it can only be merged now, and it is not ready (mergeStateStatus=%s, checks=%s: pending means a check is still running, red means one failed); wait for pending checks or fix the PR, then run merge-stack again; nothing was merged\n' \
+  if [[ "$checks" == 'none' && "$allow_no_checks" == 1 && "$merge_state" == 'CLEAN' ]]; then
+    direct_checks='none'
+    return 0
+  fi
+  if [[ "$merge_state" != 'CLEAN' || "$checks" != 'green' ]]; then
+    printf 'ERROR: merge-stack: PR #%s has no merge queue or auto-merge to wait in, so it can only be merged now, and it is not ready (mergeStateStatus=%s, checks=%s: pending means a check is still running, red means one failed, none means no check is reported yet); wait for pending checks or fix the PR, then run merge-stack again; for a repository with no CI at all pass --allow-no-checks; nothing was merged\n' \
       "$pr_number" "$merge_state" "${checks:-unknown}" >&2
     exit 2
   fi
-  direct_checks="$checks"
-  if [[ "$checks" == 'none' ]]; then
-    slug="${repo_arg:-$(local_slug)}"
-    # Unfinished check suites for exactly this head, from any check provider (GitHub Actions, or an external CI
-    # app): a suite that is queued or running has checks still to come, so the PR must wait. A finished suite has
-    # already reported everything it will (its checks are in the rollup read above), and GitHub also creates
-    # suites that finish with no check at all, so counting every suite would refuse forever. More than 100 suites
-    # is treated as unknown and refuses, as does an unreadable list. Not visible: a CI that posts only legacy
-    # commit statuses and has not posted yet.
-    runs_ok=1
-    runs="$(gh_read "merge-stack gh check suites ${direct_head_oid}" api "repos/${slug}/commits/${direct_head_oid}/check-suites?per_page=100" --jq 'if .total_count > 100 then 1 else [.check_suites[]? | select(.status != "completed")] | length end')" || runs_ok=0
-    if (( runs_ok == 0 )) || [[ ! "$runs" =~ ^[0-9]+$ ]] || (( runs > 0 )); then
-      printf 'ERROR: merge-stack: PR #%s reports no checks for its head, but %s has unfinished check suites for that commit (or they could not be read), so CI may not have reported yet; wait for the checks, then run merge-stack again; nothing was merged\n' \
-        "$pr_number" "${slug:-the repository}" >&2
-      exit 2
-    fi
-  fi
+  direct_checks='green'
 }
 
 # enqueue_directly — puts the PR into the base branch's merge queue with the enqueuePullRequest mutation. Used
