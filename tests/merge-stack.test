@@ -108,6 +108,9 @@ case "$1 $2" in
     ;;
   'pr merge')
     printf '%s\n' "${FAKE_PR_MERGE_OUT:-pr merge output}"
+    if [[ -n "${FAKE_MERGE_MARKS_MERGED:-}" && "${FAKE_PR_MERGE_RC:-0}" == 0 ]]; then
+      printf '%s' "${FAKE_MERGED_JSON}" >"${FAKE_PR_FIXTURE}"
+    fi
     exit "${FAKE_PR_MERGE_RC:-0}"
     ;;
 esac
@@ -117,6 +120,9 @@ chmod +x "${fake_bin}/gh"
 
 pr_open='{"state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null}'
 pr_queued='{"state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":{"enabledAt":"x"},"mergedAt":null}'
+pr_checks_green='{"state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null,"statusCheckRollup":[{"conclusion":"SUCCESS"},{"state":"SUCCESS"},{"conclusion":"SKIPPED"},{"conclusion":"NEUTRAL"}]}'
+pr_checks_failing='{"state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null,"statusCheckRollup":[{"conclusion":"SUCCESS"},{"conclusion":"FAILURE"}]}'
+pr_checks_pending='{"state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null,"statusCheckRollup":[{"conclusion":"SUCCESS"},{"conclusion":"","status":"IN_PROGRESS"}]}'
 pr_merged='{"state":"MERGED","mergeStateStatus":"UNKNOWN","isDraft":false,"autoMergeRequest":null,"mergedAt":"2026-10-19T00:00:00Z"}'
 stack_json='{"branches":[{"name":"a","pr":{"number":10},"isQueued":true},{"name":"b","pr":{"number":11},"isQueued":true}]}'
 stack_unqueued_json='{"branches":[{"name":"a","pr":{"number":10},"isQueued":false},{"name":"b","pr":{"number":11},"isQueued":false}]}'
@@ -183,12 +189,47 @@ run_merge "${pr_queued_release}" FAKE_NO_STACK=1 FAKE_QUEUE_RULES=1 -- --pr 12
 assert_contains 'the queue is read for the PR own base branch, not main' "$(<"${gh_log}")" 'b=release/1#a'
 run_merge "${pr_queued}" FAKE_NO_STACK=1 FAKE_QUEUE_RULES=0 FAKE_ALLOW_AUTO=true -- --pr 12
 assert_contains 'without a merge queue but with auto-merge allowed --squash is kept' "$(<"${gh_log}")" 'pr merge 12 --auto --squash'
-run_merge "${pr_open}" FAKE_NO_STACK=1 FAKE_QUEUE_RULES=0 FAKE_ALLOW_AUTO=false -- --pr 12
-assert_eq 'a repository with neither a merge queue nor auto-merge exits 1' "${rc}" '1'
-assert_contains 'the refusal names what to enable' "${out}" 'merge queue'
-assert_contains 'the refusal names auto-merge as the alternative' "${out}" 'auto-merge'
+printf '\n=== neither a merge queue nor auto-merge: merge directly when ready (#888) ===\n'
+# A repository on a plan without rulesets or branch protection has nothing to enqueue into. The caller already holds
+# the user's confirmation, so a CLEAN PR with every check green is merged now; anything else is refused with nothing
+# merged. A stacked PR is never merged this way.
+direct_envs=(FAKE_NO_STACK=1 FAKE_QUEUE_RULES=0 FAKE_ALLOW_AUTO=false FAKE_MERGE_MARKS_MERGED=1 "FAKE_MERGED_JSON=${pr_merged}")
+run_merge "${pr_checks_green}" "${direct_envs[@]}" -- --pr 12
+assert_eq 'neither queue nor auto-merge merges a clean, green PR directly and exits 0' "${rc}" '0'
+assert_contains 'the direct merge runs gh pr merge --squash' "$(<"${gh_log}")" 'pr merge 12 --squash'
+assert_not_contains 'the direct merge does not request auto-merge' "$(<"${gh_log}")" '--auto'
+assert_contains 'one NOTE line says it merged directly and why' "${out}" 'NOTE: MERGE_STACK_DIRECT pr=#12 repo=the-hcma/example reason=no-queue-no-auto-merge'
+assert_contains 'the PR is reported merged, not queued' "${out}" 'PR #12 merged'
+assert_not_contains 'a direct merge is not reported as queued' "${out}" 'queued'
+run_merge "${pr_open}" "${direct_envs[@]}" -- --pr 12
+assert_eq 'a PR with no checks at all merges directly on CLEAN alone' "${rc}" '0'
+run_merge "${pr_checks_green}" "${direct_envs[@]}" -- --pr 12 --repo the-hcma/example
+assert_contains 'a --repo is passed to the direct merge' "$(<"${gh_log}")" 'pr merge 12 --repo the-hcma/example --squash'
+run_merge "${pr_checks_failing}" "${direct_envs[@]}" -- --pr 12
+assert_eq 'a failing check refuses the direct merge with exit 2' "${rc}" '2'
+assert_contains 'the refusal says the PR is not ready' "${out}" 'it is not ready'
 assert_contains 'the refusal says nothing was merged' "${out}" 'nothing was merged'
-assert_not_contains 'no merge command runs when there is nothing to enqueue into' "$(<"${gh_log}")" 'pr merge'
+assert_not_contains 'no merge command runs for a failing check' "$(<"${gh_log}")" 'pr merge'
+assert_not_contains 'no direct-merge NOTE for a refused PR' "${out}" 'MERGE_STACK_DIRECT'
+run_merge "${pr_checks_pending}" "${direct_envs[@]}" -- --pr 12
+assert_eq 'a pending check refuses the direct merge with exit 2' "${rc}" '2'
+assert_not_contains 'no merge command runs for a pending check' "$(<"${gh_log}")" 'pr merge'
+run_merge "$(printf '%s' "${pr_checks_green}" | sed 's/CLEAN/BLOCKED/')" "${direct_envs[@]}" -- --pr 12
+assert_eq 'a PR that is not CLEAN refuses the direct merge with exit 2' "${rc}" '2'
+assert_contains 'the not-ready state is reported' "${out}" 'mergeStateStatus=BLOCKED'
+assert_not_contains 'no merge command runs for a BLOCKED PR' "$(<"${gh_log}")" 'pr merge'
+run_merge "${pr_checks_green}" "${direct_envs[@]}" FAKE_PR_MERGE_RC=1 FAKE_PR_MERGE_OUT='merge failed' -- --pr 12
+assert_eq 'a failed direct merge command exits 2' "${rc}" '2'
+assert_contains 'the failed command output is shown' "${out}" 'merge failed'
+assert_contains 'a failed direct merge says nothing was merged' "${out}" 'nothing was merged'
+run_merge "${pr_checks_green}" FAKE_NO_STACK=1 FAKE_QUEUE_RULES=0 FAKE_ALLOW_AUTO=false -- --pr 12
+assert_eq 'a merge command that exits 0 but leaves the PR open is not success' "${rc}" '2'
+assert_contains 'the unmerged PR is named' "${out}" 'is not MERGED after the direct merge command'
+run_merge "${pr_checks_green}" FAKE_QUEUE_RULES=0 FAKE_ALLOW_AUTO=false -- --pr 11
+assert_eq 'a stacked PR with neither queue nor auto-merge still uses gh stack merge' "${rc}" '0'
+assert_contains 'the stacked PR is stack-merged' "$(<"${gh_log}")" 'stack merge --yes --squash'
+assert_not_contains 'a stacked PR is never merged directly' "$(<"${gh_log}")" 'pr merge'
+assert_not_contains 'a stacked PR gets no direct-merge NOTE' "${out}" 'MERGE_STACK_DIRECT'
 run_merge "${pr_open}" FAKE_NO_STACK=1 FAKE_SETUP_FAIL=1 -- --pr 12
 assert_eq 'an unreadable merge setup exits 1' "${rc}" '1'
 assert_contains 'the unreadable setup is named' "${out}" 'could not read the merge setup'
