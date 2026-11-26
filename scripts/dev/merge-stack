@@ -8,8 +8,20 @@
 #   PR is in a gh stack  → gh stack merge --yes --squash   (current stack, no argument; atomic, bottom-up, queue-aware)
 #   PR is not in a stack → gh pr merge <pr> --auto           (the base branch has a merge queue: it picks the method)
 #                          gh pr merge <pr> --auto --squash  (auto-merge allowed, no merge queue)
-#                          refused                           (neither: nothing to enqueue into; nothing is merged)
+#                          gh pr merge <pr> --squash --match-head-commit <sha>
+#                                                            (neither queue nor auto-merge: nothing to enqueue into, so it
+#                                                             merges now, pinned to the head it checked, but only a PR with
+#                                                             mergeStateStatus CLEAN and every check green, on the
+#                                                             default branch and known not to be in a stack; otherwise
+#                                                             refused. No reported check at all merges only with
+#                                                             --allow-no-checks)
 #   .github/stacking-tool is graphite → refused (Graphite is retired, repository-helpers#772)
+#
+# The direct merge (repository-helpers#888) is for a repository on a plan without rulesets or branch protection,
+# where there is no queue or auto-merge to wait in. The caller already holds the user's explicit confirmation (the
+# precondition for running merge-stack at all), and the readiness gate stands in for the queue's checks. It prints
+# one NOTE: MERGE_STACK_DIRECT line saying why, and confirms the PR is MERGED before reporting success. A stacked
+# PR never takes this path; it keeps using gh stack merge.
 #
 # It never pipes the merge command through tail/head: the command's own exit status and output are shown,
 # and it confirms the PR is merged or queued (autoMergeRequest / merge queue entry) before reporting
@@ -24,7 +36,7 @@
 # 3 queued but not merged within --timeout (ERROR: WAIT_TIMEOUT line).
 #
 # Usage:
-#   scripts/dev/merge-stack --pr <number> [--repo OWNER/NAME] [--wait] [--timeout SECONDS]
+#   scripts/dev/merge-stack --pr <number> [--repo OWNER/NAME] [--wait] [--timeout SECONDS] [--allow-no-checks]
 #   scripts/dev/merge-stack --help
 set -euo pipefail
 
@@ -46,6 +58,7 @@ source "${script_dir}/../lib/github-api-rate-limit"
 pr_number=""
 repo_arg=""
 wait_for_merge=0
+allow_no_checks=0
 wait_timeout_s=2400
 # Seconds between --wait polls and between the bounded re-reads of GitHub's state (tests set them to 0).
 poll_interval_s="${MERGE_STACK_POLL_INTERVAL_S:-15}"
@@ -81,6 +94,10 @@ parse_args() {
         ;;
       --wait)
         wait_for_merge=1
+        shift
+        ;;
+      --allow-no-checks)
+        allow_no_checks=1
         shift
         ;;
       --timeout)
@@ -248,9 +265,10 @@ ready_state() {
 #   merge queue on the base branch → "--auto" (the queue decides the method; GitHub ignores a method flag there
 #                                    and only prints that the strategy is set by the queue)
 #   auto-merge allowed, no queue   → "--auto --squash"
-#   neither                        → refuses: there is nothing to enqueue into, and merging directly is not the
-#                                    wrapper's job
-# An unreadable setup is also a refusal, never a guess. Returns 1 after printing the reason to stderr.
+#   neither                        → "direct": there is nothing to enqueue into, so the caller merges now after a
+#                                    readiness gate (require_direct_ready); never a bare auto-merge request that
+#                                    GitHub would refuse
+# An unreadable setup is a refusal, never a guess. Returns 1 after printing the reason to stderr.
 plan_plain_merge() {
   local slug base queue_rules queue_read allow_auto
 
@@ -284,9 +302,110 @@ plan_plain_merge() {
     printf -- '--auto --squash'
     return 0
   fi
-  printf 'ERROR: merge-stack: %s has no merge queue on %s and auto-merge is disabled, so there is nothing to enqueue PR #%s into; enable a merge queue in the protect-main ruleset (scripts/github-repo-lint --apply-fix) or allow auto-merge in the repository settings; nothing was merged\n' \
-    "$slug" "$base" "$pr_number" >&2
-  return 1
+  printf 'direct'
+  return 0
+}
+
+# direct_head_oid — the head commit the readiness gate checked; the merge is pinned to it with --match-head-commit,
+# so a push between the check and the merge fails the merge instead of landing code nobody checked.
+direct_head_oid=""
+
+# direct_checks — "green", or "none" when no check was reported and --allow-no-checks was given; set by
+# require_direct_ready and echoed in the MERGE_STACK_DIRECT note when it is "none".
+direct_checks=""
+
+# require_direct_not_stacked <tool> — a direct merge squashes the PR into its own base branch, so a PR that is a layer
+# of a gh stack would land one layer and leave the rest. Stack membership must therefore be KNOWN to be "none"
+# before the direct path runs; "could not tell" refuses, it does not fall through. Three conditions, all required:
+#   - the PR targets the repository's default branch (a layer above the bottom targets its parent branch);
+#   - the stack marker is gh-stack and --repo (if given) is the current clone, so the stack can be probed at all;
+#   - `gh stack view --json` either succeeds (in_stack and stack_is_incomplete already ruled out a stack) or says
+#     plainly that the branch is not part of one. A timeout or any other failure is "unknown".
+# Exits 2 with nothing merged.
+require_direct_not_stacked() {
+  local -r tool="$1"
+  local slug base default_branch probe_out probe_rc reason=''
+
+  slug="${repo_arg:-$(local_slug)}"
+  base="$(pr_field '.baseRefName // ""' || true)"
+  default_branch="$(gh_read "merge-stack gh default branch" api "repos/${slug}" --jq '.default_branch // ""' || true)"
+  if [[ -z "$base" || -z "$default_branch" ]]; then
+    reason="could not read the base branch (${base:-unknown}) or the default branch (${default_branch:-unknown})"
+  elif [[ "$base" != "$default_branch" ]]; then
+    reason="its base branch is ${base}, not the default branch ${default_branch}, so it may be a layer of a stack"
+  elif [[ "$tool" != "$stacking_tool_value_gh_stack" ]]; then
+    reason="stack detection does not apply to the ${tool} marker"
+  elif [[ -n "$repo_arg" && "$(local_slug)" != "$repo_arg" ]]; then
+    reason="--repo ${repo_arg} is not the current directory's repository, so its stacks cannot be probed; run it from that clone"
+  else
+    # Not through the retry wrapper: the answer needs gh's own message on failure, to tell "this branch is not part
+    # of a stack" (a confirmed no) from a timeout or any other error (unknown). One attempt; a transient failure refuses.
+    probe_rc=0
+    probe_out="$(runner_sh_stdout "merge-stack gh stack view membership" --probe --timeout 60 -- "exec gh stack view --json 2>&1")" || probe_rc=$?
+    if (( probe_rc != 0 )); then
+      case "$probe_out" in
+        *'not part of a stack'* | *'not in a stack'* | *'no stack'*) ;;
+        *) reason="its stack membership could not be read" ;;
+      esac
+    fi
+  fi
+  if [[ -n "$reason" ]]; then
+    printf 'ERROR: merge-stack: PR #%s has no merge queue or auto-merge, but it cannot be merged directly because %s; a direct squash merge would land one layer of a stack; nothing was merged\n' \
+      "$pr_number" "$reason" >&2
+    exit 2
+  fi
+}
+
+# require_direct_ready — the gate for a direct merge: mergeStateStatus is CLEAN and every check on the head is
+# green (a success, skipped or neutral conclusion; a pending or failing check is not). Without a queue or
+# auto-merge nothing waits for pending checks, so a PR that is not ready now is refused, never merged on hope.
+# The gate judges readiness only from what GitHub reports on the PR (the check rollup and mergeStateStatus). It does
+# not try to prove that no CI exists: right after a push GitHub reports CLEAN before any check has registered, and
+# no API can rule out a CI that has not posted yet. So an empty check list is re-read a few times and, if it stays
+# empty, refused unless the caller passes --allow-no-checks (the caller already holds the user's confirmation, and
+# this is the repository without CI that the direct merge exists for).
+# The head commit, mergeStateStatus and check rollup come from ONE `gh pr view` response, so the state judged is
+# always the state of the head being pinned. Every re-read must report the same head as the first: a head that moves
+# (even one that moves away and back) refuses. Exits 2 with nothing merged.
+require_direct_ready() {
+  local snapshot oid merge_state checks attempt pinned=''
+
+  for attempt in 1 2 3; do
+    # CheckRun entries carry .conclusion ("" while running), status contexts carry .state; both must be a green value.
+    # shellcheck disable=SC2016  # $pr and $v are jq variables, not shell expansions
+    snapshot="$(gh_read "merge-stack gh pr view ${pr_number} snapshot" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json headRefOid,mergeStateStatus,statusCheckRollup --jq '. as $pr | ($pr.statusCheckRollup // []) | map(.conclusion // .state // "") as $v | [($pr.headRefOid // "-"), ($pr.mergeStateStatus // "UNKNOWN"), (if ($v | length) == 0 then "none" elif ($v | any(.[]; IN("SUCCESS", "SKIPPED", "NEUTRAL", "", "PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED") | not)) then "red" elif ($v | any(.[]; IN("", "PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"))) then "pending" else "green" end)] | join(" ")')" || snapshot=''
+    read -r oid merge_state checks <<<"$snapshot"
+    if [[ ! "$oid" =~ ^[0-9a-f]{40}$ ]]; then
+      printf 'ERROR: merge-stack: could not read the head commit of PR #%s, so a direct merge cannot be pinned to what was checked; nothing was merged\n' \
+        "$pr_number" >&2
+      exit 2
+    fi
+    if [[ -z "$pinned" ]]; then
+      pinned="$oid"
+    elif [[ "$oid" != "$pinned" ]]; then
+      printf 'ERROR: merge-stack: the head of PR #%s moved from %s to %s while it was being checked, so what was checked is not what would be merged; nothing was merged\n' \
+        "$pr_number" "${pinned:0:12}" "${oid:0:12}" >&2
+      exit 2
+    fi
+    # Re-read only while GitHub is still computing (UNKNOWN right after a push) or no check has registered yet.
+    if [[ "$merge_state" != 'UNKNOWN' && "$checks" != 'none' ]]; then
+      break
+    fi
+    if (( attempt < 3 )); then
+      runner_exec "merge-stack direct ready sleep" -- sleep "$retry_sleep_s"
+    fi
+  done
+  direct_head_oid="$pinned"
+  if [[ "$checks" == 'none' && "$allow_no_checks" == 1 && "$merge_state" == 'CLEAN' ]]; then
+    direct_checks='none'
+    return 0
+  fi
+  if [[ "$merge_state" != 'CLEAN' || "$checks" != 'green' ]]; then
+    printf 'ERROR: merge-stack: PR #%s has no merge queue or auto-merge to wait in, so it can only be merged now, and it is not ready (mergeStateStatus=%s, checks=%s: pending means a check is still running, red means one failed, none means no check is reported yet); wait for pending checks or fix the PR, then run merge-stack again; for a repository with no CI at all pass --allow-no-checks; nothing was merged\n' \
+      "$pr_number" "$merge_state" "${checks:-unknown}" >&2
+    exit 2
+  fi
+  direct_checks='green'
 }
 
 # enqueue_directly — puts the PR into the base branch's merge queue with the enqueuePullRequest mutation. Used
@@ -336,8 +455,25 @@ confirm_landed() {
   return 1
 }
 
+# confirm_merged — true once the PR reads as MERGED. GitHub's view can lag the merge command by a few seconds, so
+# this re-reads a bounded number of times, like confirm_landed. Used by the direct merge, which has no auto-merge
+# request or queue entry that confirm_landed would otherwise accept.
+confirm_merged() {
+  local attempt
+
+  for attempt in 1 2 3 4 5 6; do
+    if [[ "$(pr_field '.state' || true)" == 'MERGED' ]]; then
+      return 0
+    fi
+    if (( attempt < 6 )); then
+      runner_exec "merge-stack confirm merged sleep" -- sleep "$retry_sleep_s"
+    fi
+  done
+  return 1
+}
+
 main() {
-  local state is_draft stacked=0 merge_rc=0 merge_out tool open_pr open_prs merge_state landed_rc queue_rc plain_flags
+  local state is_draft stacked=0 direct=0 checks_note merge_rc=0 merge_out tool open_pr open_prs merge_state landed_rc queue_rc plain_flags
   local -a repo_flags=()
 
   parse_args "$@"
@@ -397,6 +533,18 @@ main() {
     exit 1
   else
     plain_flags="$(plan_plain_merge)" || exit 1
+    if [[ "$plain_flags" == 'direct' ]]; then
+      direct=1
+      require_direct_not_stacked "$tool"
+      require_direct_ready
+      checks_note=''
+      if [[ "$direct_checks" == 'none' ]]; then
+        checks_note=' checks=none'
+      fi
+      printf 'NOTE: MERGE_STACK_DIRECT pr=#%s repo=%s reason=no-queue-no-auto-merge%s\n' \
+        "$pr_number" "${repo_arg:-$(local_slug)}" "$checks_note"
+      plain_flags="--squash --match-head-commit ${direct_head_oid}"
+    fi
     printf 'merge-stack: PR #%s is not in a stack: gh pr merge %s\n' "$pr_number" "$plain_flags"
     merge_out="$(runner_sh_stdout "merge-stack gh pr merge ${pr_number}" --timeout 180 -- "exec gh pr merge $(printf '%q' "$pr_number") ${repo_arg:+--repo $(printf '%q' "$repo_arg")} ${plain_flags} 2>&1")" || merge_rc=$?
     printf '%s\n' "$merge_out"
@@ -418,9 +566,26 @@ main() {
     fi
   fi
   if (( merge_rc != 0 )); then
-    printf 'ERROR: merge-stack: the merge command failed (exit %s); read its output above, nothing was queued\n' \
-      "$merge_rc" >&2
+    if (( direct == 1 )); then
+      # A failed command can still have merged (a lost response, a timeout), so the state is checked, not assumed.
+      printf 'ERROR: merge-stack: the merge command failed (exit %s); read its output above and check whether PR #%s merged before retrying: gh pr view %s --json state,mergedAt\n' \
+        "$merge_rc" "$pr_number" "$pr_number" >&2
+    else
+      printf 'ERROR: merge-stack: the merge command failed (exit %s); read its output above, nothing was queued\n' \
+        "$merge_rc" >&2
+    fi
     exit 2
+  fi
+
+  # A direct merge has no queue to wait in: it is MERGED now or it failed.
+  if (( direct == 1 )); then
+    if ! confirm_merged; then
+      printf 'ERROR: merge-stack: could not confirm that PR #%s is MERGED after the direct merge command exited 0 (GitHub may still be catching up); check before retrying: gh pr view %s --json state,mergedAt\n' \
+        "$pr_number" "$pr_number" >&2
+      exit 2
+    fi
+    printf 'merge-stack: PR #%s merged\n' "$pr_number"
+    exit 0
   fi
 
   # Confirm the enqueue instead of assuming it: a merge command that exits 0 without any of the signals in
