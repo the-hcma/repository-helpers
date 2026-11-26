@@ -297,6 +297,10 @@ plan_plain_merge() {
   return 0
 }
 
+# direct_head_oid — the head commit the readiness gate checked; the merge is pinned to it with --match-head-commit,
+# so a push between the check and the merge fails the merge instead of landing code nobody checked.
+direct_head_oid=""
+
 # require_direct_ready — the gate for a direct merge: mergeStateStatus is CLEAN and every check on the head is
 # green (a success, skipped or neutral conclusion; a pending or failing check is not). Without a queue or
 # auto-merge nothing waits for pending checks, so a PR that is not ready now is refused, never merged on hope.
@@ -304,6 +308,13 @@ plan_plain_merge() {
 require_direct_ready() {
   local merge_state checks_green
 
+  # Read the head first and pin the merge to it: if it moves after this read, the merge is refused, never widened.
+  direct_head_oid="$(gh_read "merge-stack gh pr view ${pr_number} head" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json headRefOid --jq '.headRefOid // ""')" || direct_head_oid=''
+  if [[ ! "$direct_head_oid" =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'ERROR: merge-stack: could not read the head commit of PR #%s, so a direct merge cannot be pinned to what was checked; nothing was merged\n' \
+      "$pr_number" >&2
+    exit 2
+  fi
   merge_state="$(ready_state "$pr_number")"
   # CheckRun entries carry .conclusion ("" while running), status contexts carry .state; both must be a green value.
   checks_green="$(gh_read "merge-stack gh pr view ${pr_number} checks" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json statusCheckRollup --jq '((.statusCheckRollup // []) | all(.[]; ((.conclusion // .state // "") | IN("SUCCESS", "SKIPPED", "NEUTRAL")))) | tostring')" || checks_green=''
@@ -444,7 +455,7 @@ main() {
       require_direct_ready
       printf 'NOTE: MERGE_STACK_DIRECT pr=#%s repo=%s reason=no-queue-no-auto-merge\n' \
         "$pr_number" "${repo_arg:-$(local_slug)}"
-      plain_flags='--squash'
+      plain_flags="--squash --match-head-commit ${direct_head_oid}"
     fi
     printf 'merge-stack: PR #%s is not in a stack: gh pr merge %s\n' "$pr_number" "$plain_flags"
     merge_out="$(runner_sh_stdout "merge-stack gh pr merge ${pr_number}" --timeout 180 -- "exec gh pr merge $(printf '%q' "$pr_number") ${repo_arg:+--repo $(printf '%q' "$repo_arg")} ${plain_flags} 2>&1")" || merge_rc=$?
@@ -467,16 +478,22 @@ main() {
     fi
   fi
   if (( merge_rc != 0 )); then
-    printf 'ERROR: merge-stack: the merge command failed (exit %s); read its output above, nothing was %s\n' \
-      "$merge_rc" "$( (( direct == 1 )) && printf 'merged' || printf 'queued')" >&2
+    if (( direct == 1 )); then
+      # A failed command can still have merged (a lost response, a timeout), so the state is checked, not assumed.
+      printf 'ERROR: merge-stack: the merge command failed (exit %s); read its output above and check whether PR #%s merged before retrying: gh pr view %s --json state,mergedAt\n' \
+        "$merge_rc" "$pr_number" "$pr_number" >&2
+    else
+      printf 'ERROR: merge-stack: the merge command failed (exit %s); read its output above, nothing was queued\n' \
+        "$merge_rc" >&2
+    fi
     exit 2
   fi
 
   # A direct merge has no queue to wait in: it is MERGED now or it failed.
   if (( direct == 1 )); then
     if ! confirm_merged; then
-      printf 'ERROR: merge-stack: PR #%s is not MERGED after the direct merge command; nothing was merged\n' \
-        "$pr_number" >&2
+      printf 'ERROR: merge-stack: could not confirm that PR #%s is MERGED after the direct merge command exited 0 (GitHub may still be catching up); check before retrying: gh pr view %s --json state,mergedAt\n' \
+        "$pr_number" "$pr_number" >&2
       exit 2
     fi
     printf 'merge-stack: PR #%s merged\n' "$pr_number"
