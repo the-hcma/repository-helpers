@@ -59,9 +59,21 @@ case "$1 $2" in
         exit 0
       fi
     fi
+    if [[ "${filter}" == *'statusCheckRollup'* && -n "${FAKE_HEAD_MOVES_ON_READ:-}" ]]; then
+      snaps=$(( $(cat "${FAKE_GH_LOG}.snaps" 2>/dev/null || printf 0) + 1 ))
+      printf '%s' "${snaps}" >"${FAKE_GH_LOG}.snaps"
+      if (( snaps == FAKE_HEAD_MOVES_ON_READ )); then
+        sed 's/0123456789abcdef0123456789abcdef01234567/fedcba9876543210fedcba9876543210fedcba98/' "${FAKE_PR_FIXTURE}" | exec jq -r "${filter}"
+      fi
+    fi
     exec jq -r "${filter}" "${FAKE_PR_FIXTURE}"
     ;;
   'api repos/'*)
+    if [[ "$*" == *'default_branch'* ]]; then
+      [[ -z "${FAKE_DEFAULT_BRANCH_FAIL:-}" ]] || exit 1
+      printf '%s\n' "${FAKE_DEFAULT_BRANCH:-main}"
+      exit 0
+    fi
     [[ -z "${FAKE_SETUP_FAIL:-}" ]] || exit 1
     printf '%s\n' "${FAKE_ALLOW_AUTO:-true}"
     exit 0
@@ -119,11 +131,11 @@ FAKE
 chmod +x "${fake_bin}/gh"
 
 head_sha='0123456789abcdef0123456789abcdef01234567'
-pr_open='{"headRefOid":"0123456789abcdef0123456789abcdef01234567","state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null}'
+pr_open='{"headRefOid":"0123456789abcdef0123456789abcdef01234567","state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null,"baseRefName":"main"}'
 pr_queued='{"state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":{"enabledAt":"x"},"mergedAt":null}'
-pr_checks_green='{"headRefOid":"0123456789abcdef0123456789abcdef01234567","state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null,"statusCheckRollup":[{"conclusion":"SUCCESS"},{"state":"SUCCESS"},{"conclusion":"SKIPPED"},{"conclusion":"NEUTRAL"}]}'
-pr_checks_failing='{"headRefOid":"0123456789abcdef0123456789abcdef01234567","state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null,"statusCheckRollup":[{"conclusion":"SUCCESS"},{"conclusion":"FAILURE"}]}'
-pr_checks_pending='{"headRefOid":"0123456789abcdef0123456789abcdef01234567","state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null,"statusCheckRollup":[{"conclusion":"SUCCESS"},{"conclusion":"","status":"IN_PROGRESS"}]}'
+pr_checks_green='{"headRefOid":"0123456789abcdef0123456789abcdef01234567","state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null,"statusCheckRollup":[{"conclusion":"SUCCESS"},{"state":"SUCCESS"},{"conclusion":"SKIPPED"},{"conclusion":"NEUTRAL"}],"baseRefName":"main"}'
+pr_checks_failing='{"headRefOid":"0123456789abcdef0123456789abcdef01234567","state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null,"statusCheckRollup":[{"conclusion":"SUCCESS"},{"conclusion":"FAILURE"}],"baseRefName":"main"}'
+pr_checks_pending='{"headRefOid":"0123456789abcdef0123456789abcdef01234567","state":"OPEN","mergeStateStatus":"CLEAN","isDraft":false,"autoMergeRequest":null,"mergedAt":null,"statusCheckRollup":[{"conclusion":"SUCCESS"},{"conclusion":"","status":"IN_PROGRESS"}],"baseRefName":"main"}'
 pr_merged='{"state":"MERGED","mergeStateStatus":"UNKNOWN","isDraft":false,"autoMergeRequest":null,"mergedAt":"2026-10-19T00:00:00Z"}'
 stack_json='{"branches":[{"name":"a","pr":{"number":10},"isQueued":true},{"name":"b","pr":{"number":11},"isQueued":true}]}'
 stack_unqueued_json='{"branches":[{"name":"a","pr":{"number":10},"isQueued":false},{"name":"b","pr":{"number":11},"isQueued":false}]}'
@@ -141,7 +153,7 @@ run_merge() {
   shift
   printf '%s' "${pr_json}" >"${work_dir}/pr.json"
   : >"${gh_log}"
-  rm -f "${gh_log}.views" "${gh_log}.reads" "${gh_log}.queue"
+  rm -f "${gh_log}.views" "${gh_log}.reads" "${gh_log}.queue" "${gh_log}.snaps"
   rc=0
   out="$(cd "${fixture_repo}" && env PATH="${fake_bin}:${PATH}" MERGE_STACK_POLL_INTERVAL_S=0 MERGE_STACK_RETRY_SLEEP_S=0 FAKE_GH_LOG="${gh_log}" FAKE_PR_FIXTURE="${work_dir}/pr.json" \
     FAKE_STACK_FIXTURE="${work_dir}/stack.json" "${envs[@]+"${envs[@]}"}" \
@@ -262,6 +274,36 @@ assert_eq 'a stacked PR with neither queue nor auto-merge still uses gh stack me
 assert_contains 'the stacked PR is stack-merged' "$(<"${gh_log}")" 'stack merge --yes --squash'
 assert_not_contains 'a stacked PR is never merged directly' "$(<"${gh_log}")" 'pr merge'
 assert_not_contains 'a stacked PR gets no direct-merge NOTE' "${out}" 'MERGE_STACK_DIRECT'
+
+printf '\n=== a direct merge needs the stack membership to be known (#888 review) ===\n'
+# A direct squash merge lands the PR into its own base, so a layer of a stack would land alone. Unknown membership,
+# a base that is not the default branch, and a stack that cannot be probed all refuse; a plain "not part of a stack"
+# (FAKE_NO_STACK) is the confirmed answer that lets it through.
+run_merge "${pr_checks_green}" FAKE_STACK_FAIL_AFTER=0 FAKE_QUEUE_RULES=0 FAKE_ALLOW_AUTO=false -- --pr 12
+assert_eq 'an unreadable stack refuses the direct merge with exit 2' "${rc}" '2'
+assert_contains 'the unreadable stack is named' "${out}" 'stack membership could not be read'
+assert_not_contains 'no merge command runs when the stack cannot be read' "$(<"${gh_log}")" 'pr merge'
+run_merge "$(printf '%s' "${pr_checks_green}" | sed 's/"baseRefName":"main"/"baseRefName":"feature-parent"/')" "${direct_envs[@]}" -- --pr 12
+assert_eq 'a base branch that is not the default branch refuses the direct merge with exit 2' "${rc}" '2'
+assert_contains 'the non-default base is named' "${out}" 'not the default branch main'
+assert_not_contains 'no merge command runs for a non-default base' "$(<"${gh_log}")" 'pr merge'
+run_merge "${pr_checks_green}" "${direct_envs[@]}" FAKE_DEFAULT_BRANCH_FAIL=1 -- --pr 12
+assert_eq 'an unreadable default branch refuses the direct merge with exit 2' "${rc}" '2'
+assert_not_contains 'no merge command runs when the default branch cannot be read' "$(<"${gh_log}")" 'pr merge'
+run_merge "${pr_checks_green}" "${direct_envs[@]}" -- --pr 12 --repo the-hcma/other
+assert_eq 'a --repo that is not the current clone refuses the direct merge with exit 2' "${rc}" '2'
+assert_contains 'the other repository is named' "${out}" 'cannot be probed'
+run_merge "${pr_checks_green}" "${direct_envs[@]}" FAKE_DEFAULT_BRANCH=trunk -- --pr 12
+assert_eq 'a default branch other than main is compared, not assumed' "${rc}" '2'
+
+printf '\n=== the head cannot move between what is checked and what is merged (#888 review) ===\n'
+run_merge "${pr_checks_green}" "${direct_envs[@]}" FAKE_HEAD_MOVES_ON_READ=2 -- --pr 12 --allow-no-checks
+assert_eq 'a head that is stable across the single snapshot read still merges' "${rc}" '0'
+run_merge "${pr_open}" "${direct_envs[@]}" FAKE_HEAD_MOVES_ON_READ=2 -- --pr 12 --allow-no-checks
+assert_eq 'a head that moves while an empty check list is re-read refuses with exit 2' "${rc}" '2'
+assert_contains 'the moved head is named' "${out}" 'moved from'
+assert_not_contains 'no merge command runs for a moved head' "$(<"${gh_log}")" 'pr merge'
+assert_contains 'the state and the checks come from one response with the head' "$(<"${gh_log}")" 'pr view 12 --json headRefOid,mergeStateStatus,statusCheckRollup'
 run_merge "${pr_open}" FAKE_NO_STACK=1 FAKE_SETUP_FAIL=1 -- --pr 12
 assert_eq 'an unreadable merge setup exits 1' "${rc}" '1'
 assert_contains 'the unreadable setup is named' "${out}" 'could not read the merge setup'

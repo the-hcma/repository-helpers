@@ -11,7 +11,8 @@
 #                          gh pr merge <pr> --squash --match-head-commit <sha>
 #                                                            (neither queue nor auto-merge: nothing to enqueue into, so it
 #                                                             merges now, pinned to the head it checked, but only a PR with
-#                                                             mergeStateStatus CLEAN and every check green; otherwise
+#                                                             mergeStateStatus CLEAN and every check green, on the
+#                                                             default branch and known not to be in a stack; otherwise
 #                                                             refused. No reported check at all merges only with
 #                                                             --allow-no-checks)
 #   .github/stacking-tool is graphite → refused (Graphite is retired, repository-helpers#772)
@@ -313,6 +314,48 @@ direct_head_oid=""
 # require_direct_ready and echoed in the MERGE_STACK_DIRECT note when it is "none".
 direct_checks=""
 
+# require_direct_not_stacked <tool> — a direct merge squashes the PR into its own base branch, so a PR that is a layer
+# of a gh stack would land one layer and leave the rest. Stack membership must therefore be KNOWN to be "none"
+# before the direct path runs; "could not tell" refuses, it does not fall through. Three conditions, all required:
+#   - the PR targets the repository's default branch (a layer above the bottom targets its parent branch);
+#   - the stack marker is gh-stack and --repo (if given) is the current clone, so the stack can be probed at all;
+#   - `gh stack view --json` either succeeds (in_stack and stack_is_incomplete already ruled out a stack) or says
+#     plainly that the branch is not part of one. A timeout or any other failure is "unknown".
+# Exits 2 with nothing merged.
+require_direct_not_stacked() {
+  local -r tool="$1"
+  local slug base default_branch probe_out probe_rc reason=''
+
+  slug="${repo_arg:-$(local_slug)}"
+  base="$(pr_field '.baseRefName // ""' || true)"
+  default_branch="$(gh_read "merge-stack gh default branch" api "repos/${slug}" --jq '.default_branch // ""' || true)"
+  if [[ -z "$base" || -z "$default_branch" ]]; then
+    reason="could not read the base branch (${base:-unknown}) or the default branch (${default_branch:-unknown})"
+  elif [[ "$base" != "$default_branch" ]]; then
+    reason="its base branch is ${base}, not the default branch ${default_branch}, so it may be a layer of a stack"
+  elif [[ "$tool" != "$stacking_tool_value_gh_stack" ]]; then
+    reason="stack detection does not apply to the ${tool} marker"
+  elif [[ -n "$repo_arg" && "$(local_slug)" != "$repo_arg" ]]; then
+    reason="--repo ${repo_arg} is not the current directory's repository, so its stacks cannot be probed; run it from that clone"
+  else
+    # Not through the retry wrapper: the answer needs gh's own message on failure, to tell "this branch is not part
+    # of a stack" (a confirmed no) from a timeout or any other error (unknown). One attempt; a transient failure refuses.
+    probe_rc=0
+    probe_out="$(timeout 60 gh stack view --json 2>&1)" || probe_rc=$?
+    if (( probe_rc != 0 )); then
+      case "$probe_out" in
+        *'not part of a stack'* | *'not in a stack'* | *'no stack'*) ;;
+        *) reason="its stack membership could not be read" ;;
+      esac
+    fi
+  fi
+  if [[ -n "$reason" ]]; then
+    printf 'ERROR: merge-stack: PR #%s has no merge queue or auto-merge, but it cannot be merged directly because %s; a direct squash merge would land one layer of a stack; nothing was merged\n' \
+      "$pr_number" "$reason" >&2
+    exit 2
+  fi
+}
+
 # require_direct_ready — the gate for a direct merge: mergeStateStatus is CLEAN and every check on the head is
 # green (a success, skipped or neutral conclusion; a pending or failing check is not). Without a queue or
 # auto-merge nothing waits for pending checks, so a PR that is not ready now is refused, never merged on hope.
@@ -320,27 +363,39 @@ direct_checks=""
 # not try to prove that no CI exists: right after a push GitHub reports CLEAN before any check has registered, and
 # no API can rule out a CI that has not posted yet. So an empty check list is re-read a few times and, if it stays
 # empty, refused unless the caller passes --allow-no-checks (the caller already holds the user's confirmation, and
-# this is the repository without CI that the direct merge exists for). Exits 2 with nothing merged.
+# this is the repository without CI that the direct merge exists for).
+# The head commit, mergeStateStatus and check rollup come from ONE `gh pr view` response, so the state judged is
+# always the state of the head being pinned. Every re-read must report the same head as the first: a head that moves
+# (even one that moves away and back) refuses. Exits 2 with nothing merged.
 require_direct_ready() {
-  local merge_state checks attempt
+  local snapshot oid merge_state checks attempt pinned=''
 
-  # Read the head first and pin the merge to it: if it moves after this read, the merge is refused, never widened.
-  direct_head_oid="$(gh_read "merge-stack gh pr view ${pr_number} head" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json headRefOid --jq '.headRefOid // ""')" || direct_head_oid=''
-  if [[ ! "$direct_head_oid" =~ ^[0-9a-f]{40}$ ]]; then
-    printf 'ERROR: merge-stack: could not read the head commit of PR #%s, so a direct merge cannot be pinned to what was checked; nothing was merged\n' \
-      "$pr_number" >&2
-    exit 2
-  fi
-  merge_state="$(ready_state "$pr_number")"
   for attempt in 1 2 3; do
     # CheckRun entries carry .conclusion ("" while running), status contexts carry .state; both must be a green value.
-    # shellcheck disable=SC2016  # $c is a jq variable, not a shell expansion
-    checks="$(gh_read "merge-stack gh pr view ${pr_number} checks" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json statusCheckRollup --jq '(.statusCheckRollup // []) | map(.conclusion // .state // "") as $v | if ($v | length) == 0 then "none" elif ($v | any(.[]; IN("SUCCESS", "SKIPPED", "NEUTRAL", "", "PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED") | not)) then "red" elif ($v | any(.[]; IN("", "PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"))) then "pending" else "green" end')" || checks=''
-    [[ "$checks" == 'none' ]] || break
+    # shellcheck disable=SC2016  # $pr and $v are jq variables, not shell expansions
+    snapshot="$(gh_read "merge-stack gh pr view ${pr_number} snapshot" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json headRefOid,mergeStateStatus,statusCheckRollup --jq '. as $pr | ($pr.statusCheckRollup // []) | map(.conclusion // .state // "") as $v | [($pr.headRefOid // "-"), ($pr.mergeStateStatus // "UNKNOWN"), (if ($v | length) == 0 then "none" elif ($v | any(.[]; IN("SUCCESS", "SKIPPED", "NEUTRAL", "", "PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED") | not)) then "red" elif ($v | any(.[]; IN("", "PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"))) then "pending" else "green" end)] | join(" ")')" || snapshot=''
+    read -r oid merge_state checks <<<"$snapshot"
+    if [[ ! "$oid" =~ ^[0-9a-f]{40}$ ]]; then
+      printf 'ERROR: merge-stack: could not read the head commit of PR #%s, so a direct merge cannot be pinned to what was checked; nothing was merged\n' \
+        "$pr_number" >&2
+      exit 2
+    fi
+    if [[ -z "$pinned" ]]; then
+      pinned="$oid"
+    elif [[ "$oid" != "$pinned" ]]; then
+      printf 'ERROR: merge-stack: the head of PR #%s moved from %s to %s while it was being checked, so what was checked is not what would be merged; nothing was merged\n' \
+        "$pr_number" "${pinned:0:12}" "${oid:0:12}" >&2
+      exit 2
+    fi
+    # Re-read only while GitHub is still computing (UNKNOWN right after a push) or no check has registered yet.
+    if [[ "$merge_state" != 'UNKNOWN' && "$checks" != 'none' ]]; then
+      break
+    fi
     if (( attempt < 3 )); then
-      runner_exec "merge-stack checks register sleep" -- sleep "$retry_sleep_s"
+      runner_exec "merge-stack direct ready sleep" -- sleep "$retry_sleep_s"
     fi
   done
+  direct_head_oid="$pinned"
   if [[ "$checks" == 'none' && "$allow_no_checks" == 1 && "$merge_state" == 'CLEAN' ]]; then
     direct_checks='none'
     return 0
@@ -480,6 +535,7 @@ main() {
     plain_flags="$(plan_plain_merge)" || exit 1
     if [[ "$plain_flags" == 'direct' ]]; then
       direct=1
+      require_direct_not_stacked "$tool"
       require_direct_ready
       checks_note=''
       if [[ "$direct_checks" == 'none' ]]; then
