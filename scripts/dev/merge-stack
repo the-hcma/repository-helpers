@@ -316,7 +316,7 @@ direct_checks=""
 # active workflow at all (nothing could ever report). Workflows that exist but report nothing for this head (not
 # started yet, or filtered out by path) refuse. Exits 2 with nothing merged.
 require_direct_ready() {
-  local merge_state checks attempt slug workflows
+  local merge_state checks attempt slug workflows workflows_ok
 
   # Read the head first and pin the merge to it: if it moves after this read, the merge is refused, never widened.
   direct_head_oid="$(gh_read "merge-stack gh pr view ${pr_number} head" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json headRefOid --jq '.headRefOid // ""')" || direct_head_oid=''
@@ -329,22 +329,24 @@ require_direct_ready() {
   for attempt in 1 2 3; do
     # CheckRun entries carry .conclusion ("" while running), status contexts carry .state; both must be a green value.
     # shellcheck disable=SC2016  # $c is a jq variable, not a shell expansion
-    checks="$(gh_read "merge-stack gh pr view ${pr_number} checks" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json statusCheckRollup --jq '(.statusCheckRollup // []) as $c | if ($c | length) == 0 then "none" elif ($c | all(.[]; ((.conclusion // .state // "") | IN("SUCCESS", "SKIPPED", "NEUTRAL")))) then "green" else "red" end')" || checks=''
+    checks="$(gh_read "merge-stack gh pr view ${pr_number} checks" pr view "$pr_number" "${repo_flags[@]+"${repo_flags[@]}"}" --json statusCheckRollup --jq '(.statusCheckRollup // []) | map(.conclusion // .state // "") as $v | if ($v | length) == 0 then "none" elif ($v | any(.[]; IN("SUCCESS", "SKIPPED", "NEUTRAL", "", "PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED") | not)) then "red" elif ($v | any(.[]; IN("", "PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"))) then "pending" else "green" end')" || checks=''
     [[ "$checks" == 'none' ]] || break
     if (( attempt < 3 )); then
       runner_exec "merge-stack checks register sleep" -- sleep "$retry_sleep_s"
     fi
   done
   if [[ "$merge_state" != 'CLEAN' || ( "$checks" != 'green' && "$checks" != 'none' ) ]]; then
-    printf 'ERROR: merge-stack: PR #%s has no merge queue or auto-merge to wait in, so it can only be merged now, and it is not ready (mergeStateStatus=%s, checks=%s); wait for the checks or fix the PR, then run merge-stack again; nothing was merged\n' \
+    printf 'ERROR: merge-stack: PR #%s has no merge queue or auto-merge to wait in, so it can only be merged now, and it is not ready (mergeStateStatus=%s, checks=%s: pending means a check is still running, red means one failed); wait for pending checks or fix the PR, then run merge-stack again; nothing was merged\n' \
       "$pr_number" "$merge_state" "${checks:-unknown}" >&2
     exit 2
   fi
   direct_checks="$checks"
   if [[ "$checks" == 'none' ]]; then
     slug="${repo_arg:-$(local_slug)}"
-    workflows="$(gh_read "merge-stack gh workflows ${slug}" api "repos/${slug}/actions/workflows" --jq '[.workflows[]? | select(.state == "active")] | length')" || workflows=''
-    if [[ ! "$workflows" =~ ^[0-9]+$ ]] || (( workflows > 0 )); then
+    # --paginate so an active workflow past the first page (30) is not missed; one id per line, empty when none.
+    workflows_ok=1
+    workflows="$(gh_read "merge-stack gh workflows ${slug}" api --paginate "repos/${slug}/actions/workflows" --jq '.workflows[]? | select(.state == "active") | .id')" || workflows_ok=0
+    if (( workflows_ok == 0 )) || [[ -n "$workflows" ]]; then
       printf 'ERROR: merge-stack: PR #%s reports no checks for its head, but %s has active workflows (or they could not be read), so CI may not have started yet; wait for the checks, then run merge-stack again; nothing was merged\n' \
         "$pr_number" "${slug:-the repository}" >&2
       exit 2
@@ -417,7 +419,7 @@ confirm_merged() {
 }
 
 main() {
-  local state is_draft stacked=0 direct=0 merge_rc=0 merge_out tool open_pr open_prs merge_state landed_rc queue_rc plain_flags
+  local state is_draft stacked=0 direct=0 checks_note merge_rc=0 merge_out tool open_pr open_prs merge_state landed_rc queue_rc plain_flags
   local -a repo_flags=()
 
   parse_args "$@"
@@ -480,8 +482,12 @@ main() {
     if [[ "$plain_flags" == 'direct' ]]; then
       direct=1
       require_direct_ready
+      checks_note=''
+      if [[ "$direct_checks" == 'none' ]]; then
+        checks_note=' checks=none'
+      fi
       printf 'NOTE: MERGE_STACK_DIRECT pr=#%s repo=%s reason=no-queue-no-auto-merge%s\n' \
-        "$pr_number" "${repo_arg:-$(local_slug)}" "${direct_checks/#none/ checks=none}"
+        "$pr_number" "${repo_arg:-$(local_slug)}" "$checks_note"
       plain_flags="--squash --match-head-commit ${direct_head_oid}"
     fi
     printf 'merge-stack: PR #%s is not in a stack: gh pr merge %s\n' "$pr_number" "$plain_flags"
