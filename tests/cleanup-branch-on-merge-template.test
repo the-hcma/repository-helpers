@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Tests for the cleanup-branch-on-merge.yml template (#890): only "reference does not exist" is
+# success, any other delete failure fails the job and prints the API message, and the job and the
+# gh call both carry a timeout.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+template="${script_dir}/../scripts/lib/repo-practices-workflows/cleanup-branch-on-merge.yml"
+readonly template
+
+# shellcheck source=tests/lib/test-assert
+source "${script_dir}/lib/test-assert"
+test_init
+
+pass=0
+fail=0
+
+check() {
+  local -r label="$1"
+  shift
+  if "$@"; then
+    printf '[PASS] %s\n' "$label"
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] %s\n' "$label"
+    fail=$(( fail + 1 ))
+  fi
+}
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+mkdir -p "${work}/bin"
+
+# The run block is the last block of the template: everything after `run: |`, de-indented.
+awk '/^        run: \|$/ {found=1; next} found {sub(/^          /, ""); print}' "$template" >"${work}/run.sh"
+
+# Fake gh: prints $FAKE_GH_OUTPUT on stderr and exits $FAKE_GH_STATUS.
+cat >"${work}/bin/gh" <<'GH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FAKE_GH_LOG:?}"
+[[ -z "${FAKE_GH_OUTPUT:-}" ]] || printf '%s\n' "$FAKE_GH_OUTPUT" >&2
+exit "${FAKE_GH_STATUS:-0}"
+GH
+chmod +x "${work}/bin/gh"
+
+# Fake timeout: records its duration argument, then runs the command (or exits like GNU timeout
+# does on expiry when FAKE_TIMEOUT_EXPIRES is set).
+cat >"${work}/bin/timeout" <<'TO'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >>"${FAKE_TIMEOUT_LOG:?}"
+shift
+[[ -z "${FAKE_TIMEOUT_EXPIRES:-}" ]] || exit 124
+exec "$@"
+TO
+chmod +x "${work}/bin/timeout"
+
+# run_template <gh-status> <gh-output> [expires]: sets exit_code and output.
+run_template() {
+  : >"${work}/gh.log"
+  : >"${work}/timeout.log"
+  exit_code=0
+  output="$(PATH="${work}/bin:${PATH}" BRANCH="${BRANCH_UNDER_TEST:-feature/x}" DEFAULT_BRANCH=main REPOSITORY=the-hcma/example \
+    FAKE_GH_STATUS="$1" FAKE_GH_OUTPUT="$2" FAKE_TIMEOUT_EXPIRES="${3:-}" \
+    FAKE_GH_LOG="${work}/gh.log" FAKE_TIMEOUT_LOG="${work}/timeout.log" \
+    bash -e "${work}/run.sh" 2>&1)" || exit_code=$?
+}
+
+printf '\n=== static: timeouts and comment ===\n'
+check 'job sets timeout-minutes' grep -qE '^    timeout-minutes: [0-9]+$' "$template"
+check 'comment says why scripts/gh-api is not used' grep -qF 'scripts/gh-api wrapper cannot be required here' "$template"
+check 'run block was extracted' test -s "${work}/run.sh"
+
+printf '\n=== functional: delete outcomes ===\n'
+run_template 0 ''
+check 'success deletes and exits 0' test "$exit_code" -eq 0
+check 'gh is called with DELETE on the branch ref' grep -qF 'api --method DELETE repos/the-hcma/example/git/refs/heads/feature/x' "${work}/gh.log"
+check 'gh call is wrapped in a 60s timeout' grep -qx '60' "${work}/timeout.log"
+
+run_template 1 'gh: Reference does not exist (HTTP 422)'
+check '422 reference-does-not-exist passes' test "$exit_code" -eq 0
+check '422 logs that the branch was already deleted' grep -qF 'already deleted' <<<"$output"
+
+run_template 1 'gh: Reference does not exist (HTTP 404)'
+check '404 reference-does-not-exist passes' test "$exit_code" -eq 0
+
+run_template 1 'gh: Reference does not exist (HTTP 500)'
+check 'missing-ref message with a 500 status fails' test "$exit_code" -ne 0
+
+run_template 1 'gh: Reference does not exist'
+check 'missing-ref message without a status fails' test "$exit_code" -ne 0
+
+run_template 1 'gh: Resource not accessible by integration (HTTP 403)'
+check '403 fails the job' test "$exit_code" -ne 0
+check '403 prints the API message' grep -qF 'Resource not accessible by integration (HTTP 403)' <<<"$output"
+
+run_template 1 'gh: Not Found (HTTP 404)'
+check 'a bare 404 (not the missing-ref message) fails' test "$exit_code" -ne 0
+
+run_template 1 'gh: Server Error (HTTP 500)'
+check '500 fails the job' test "$exit_code" -ne 0
+
+run_template 0 '' expires
+check 'timeout expiry fails the job' test "$exit_code" -ne 0
+check 'timeout expiry says so' grep -qF 'Timed out' <<<"$output"
+
+BRANCH_UNDER_TEST=main run_template 0 ''
+check 'the default branch is never deleted' test ! -s "${work}/gh.log"
+check 'the default-branch skip exits 0' test "$exit_code" -eq 0
+
+BRANCH_UNDER_TEST=MAIN run_template 0 ''
+check 'a branch differing only in case from the default is still cleaned up' grep -qF 'refs/heads/MAIN' "${work}/gh.log"
+
+printf '\n=== results: %s passed, %s failed ===\n' "$pass" "$fail"
+[[ "$fail" -eq 0 ]]
