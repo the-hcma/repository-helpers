@@ -118,10 +118,18 @@ rp_log_gh_api_fail() {
 # branch protection. No retry can fix it, so callers report "unavailable", not a failure (#889).
 # A 403 with any other message (a missing token scope, say) is not a plan limit.
 rp_last_api_error_is_plan_limit() {
-  local detail
+  local uuid stderr_text line
 
-  detail="$(rp_runner_last_stderr_summary)" || return 1
-  [[ "$detail" == *'Upgrade to GitHub Pro'* && "$detail" == *'HTTP 403'* ]]
+  uuid="$(runner_last_id)"
+  [[ -n "$uuid" ]] || return 1
+  stderr_text="$(runner_read "$uuid" stderr 2>/dev/null || true)"
+  # Any line: the throttled executor can print a NOTE line before gh's own error line.
+  while IFS= read -r line; do
+    if [[ "$line" == *'Upgrade to GitHub Pro'* && "$line" == *'HTTP 403'* ]]; then
+      return 0
+    fi
+  done <<<"$stderr_text"
+  return 1
 }
 
 # rp_log_plan_skip <slug> <what>
@@ -7149,7 +7157,8 @@ rp_repo_uses_github_merge_queue() {
 
 # Exit 0 when protect-main is required, 1 when not, 2 on GitHub API failure
 # (do not treat API errors as "not required").
-# Exit 0 required, 1 not required, 2 when a GitHub API error left the answer unknown (#800).
+# Exit 0 required, 1 not required, 2 when a GitHub API error left the answer unknown (#800),
+# 3 when the rulesets API is unavailable on this plan (HTTP 403 plan limit, #889).
 rp_repo_requires_protect_main_ruleset() {
   local slug="$1"
   local mq_exit=0
@@ -7169,6 +7178,11 @@ rp_repo_requires_protect_main_ruleset() {
     return 0
   fi
   if (( mq_exit == 2 || release_please_ec == 2 )); then
+    # Plan limit only when the ruleset read is the sole failure: a real release-please read error
+    # must not be masked by a later plan-limit 403 (#889).
+    if (( mq_exit == 2 && release_please_ec != 2 )) && rp_last_api_error_is_plan_limit; then
+      return 3
+    fi
     return 2
   fi
   return 1
@@ -9649,11 +9663,11 @@ rp_check_protect_main_ruleset() {
   local require_exit=0
 
   rp_repo_requires_protect_main_ruleset "$slug" || require_exit=$?
+  if (( require_exit == 3 )); then
+    rp_log_plan_skip "$slug" 'protect-main ruleset'
+    return 0
+  fi
   if (( require_exit == 2 )); then
-    if rp_last_api_error_is_plan_limit; then
-      rp_log_plan_skip "$slug" 'protect-main ruleset'
-      return 0
-    fi
     rp_log_gh_api_fail "$slug" 'could not determine whether protect-main is required'
     rp_log_check_fail "$slug" 'protect-main ruleset (GitHub API error; retry)' \
       "$(rp_github_url "$slug" '/settings/rules')"
@@ -9762,11 +9776,11 @@ rp_check_classic_main_protection() {
   local require_exit=0
 
   rp_repo_requires_protect_main_ruleset "$slug" || require_exit=$?
+  if (( require_exit == 3 )); then
+    rp_log_plan_skip "$slug" 'classic main branch protection'
+    return 0
+  fi
   if (( require_exit == 2 )); then
-    if rp_last_api_error_is_plan_limit; then
-      rp_log_plan_skip "$slug" 'classic main branch protection'
-      return 0
-    fi
     rp_log_gh_api_fail "$slug" 'could not determine whether protect-main is required'
     rp_log_check_fail "$slug" 'classic main branch protection (GitHub API error; retry)' \
       "$(rp_github_url "$slug" '/settings/branches')"
