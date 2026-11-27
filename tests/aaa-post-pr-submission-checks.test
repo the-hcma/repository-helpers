@@ -563,6 +563,11 @@ if [[ "$args" == *'run list'* ]]; then
   printf '%s\n' "${MOCK_RUNS_JSON}"
   exit 0
 fi
+if [[ "$args" == *'api repos/'* && "$args" == *'/actions/runs/'*'/attempts/'* ]]; then
+  # The conclusion of an earlier attempt of a rerun run (#884).
+  printf '%s\n' "${MOCK_ATTEMPT_CONCLUSION:-}"
+  exit 0
+fi
 if [[ "$args" == *'run view'* ]]; then
   printf 'https://example.invalid/run\n'
   exit 0
@@ -708,6 +713,46 @@ assert_not_contains 'a superseded failure beside a newer run still in progress i
 assert_contains 'and the gate keeps waiting for the newer run (WAIT_TIMEOUT, not success)' "$out" 'ERROR: WAIT_TIMEOUT'
 out="$(run_superseded_case "$shape_rollup" '[]' 1)"
 assert_contains 'when the runs cannot be listed the original failure stands' "$out" 'ERROR: CI failures for PR #42'
+
+# A green rollup is still a failure when the same code failed first: a flake is fixed, never accepted (#884).
+green_rollup='[
+  {"name":"shellcheck + tests","conclusion":"SUCCESS","startedAt":"2026-11-18T16:22:04Z","detailsUrl":"https://github.com/o/r/actions/runs/300/job/2"}
+]'
+runs_clean='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":1}
+]'
+out="$(run_superseded_case "$green_rollup" "$runs_clean")"
+assert_rc_is 'a green head whose runs all passed first time passes the gate' "$out" 0
+assert_not_contains 'and reports no flake' "$out" 'CI_FLAKE_DETECTED'
+
+runs_rerun_after_failure='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":2}
+]'
+out="$(MOCK_ATTEMPT_CONCLUSION=failure run_superseded_case "$green_rollup" "$runs_rerun_after_failure")"
+assert_rc_is_not 'a run that passed on a rerun after a failed attempt does not pass the gate' "$out" 0
+assert_contains 'and the flake is named with the run and attempts' "$out" 'run=300 attempt=2 passed after attempt 1 failure'
+assert_contains 'and the report says a flake is fixed, not accepted' "$out" 'A flaky test is never accepted'
+
+out="$(MOCK_ATTEMPT_CONCLUSION=cancelled run_superseded_case "$green_rollup" "$runs_rerun_after_failure")"
+assert_rc_is 'a rerun after a cancelled attempt is not a flake' "$out" 0
+
+runs_failed_then_passed='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":1},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"failure","status":"completed","workflowDatabaseId":7,"attempt":1}
+]'
+out="$(run_superseded_case "$green_rollup" "$runs_failed_then_passed")"
+assert_rc_is_not 'a newer run that passed after a failed run of the same workflow does not pass the gate' "$out" 0
+assert_contains 'and the flake names both runs' "$out" 'workflow=7 failed_run=200 passing_run=300'
+
+runs_other_workflow_failed='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":1},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"failure","status":"completed","workflowDatabaseId":9,"attempt":1}
+]'
+out="$(run_superseded_case "$green_rollup" "$runs_other_workflow_failed")"
+assert_rc_is 'a failed run of another workflow is not a flake of this one' "$out" 0
+
+out="$(run_superseded_case "$green_rollup" "$runs_rerun_after_failure" 1)"
+assert_rc_is 'when the runs cannot be listed the green verdict stands' "$out" 0
 assert_not_contains 'and nothing is called superseded' "$out" 'CI_FAILURE_SUPERSEDED'
 rm -rf "$tmp"
 
@@ -1065,6 +1110,7 @@ else
   printf '[FAIL] post-pr-submission-checks: push check must verify remote tip and be --pr-gated\n'
   fail=$(( fail + 1 ))
 fi
+
 
 test_summary
 

@@ -80,6 +80,10 @@ Say in the PR description whether the merge should close the issue. Default, unl
 
 Avoid applying a "no closing keywords" convention to every PR regardless of whether it finishes the issue: finished issues then stay open and need a manual close pass. Spell the keyword the way the "Unlinked closing keywords" failure mode in `${rh}/.agents/rules/github-content-formatting.md` requires.
 
+## Flaky tests are never accepted
+
+A test that fails and then passes on the same code is a **bug to fix**, not noise to work around. Never record it as known-flaky, list it in a doc or allowlist, skip or quarantine it, or retry until green. When CI goes green only on a rerun, `post-pr-submission-checks` fails with `CI_FLAKE_DETECTED` (the failed and passing runs are named): find the failing job in the failed attempt, fix the root cause (shared state, ordering, timing, a missing wait or mock), and push the fix. Rerunning the job does not clear it for that head. A flake found in code this PR did not touch still gets fixed: open an issue or a PR for it first, and link it from this PR.
+
 ## 3. Agent review loop
 
 > **Reply before resolve (required):** For every valid agent review thread (Copilot, Bugbot, CodeRabbit, …), post an **on-thread human reply** as the authenticated operator **before** resolving. Exit code **3** means threads **lack a human reply** — resolving without replying is non-compliant.

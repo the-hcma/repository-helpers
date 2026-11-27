@@ -78,6 +78,10 @@ When `check` reports **`complete_ready: true`** (requires **agent sign-off** on 
 - **Batch the fix pushes (#865).** CodeRabbit allows only a few reviews per hour and every push starts one, so triage all feedback before pushing, pass `pre-pr-checks`, and push once per round. For a series of pushes run `scripts/wait-for-agent-review hold --pr <n>` first and `scripts/wait-for-agent-review release --pr <n>` after (exit **14** means the PR is on hold, after any unanswered feedback (exit 3): nothing is waited for or asked, and it cannot complete while held: `release` lifts the hold and requests the one incremental review of the series). Details: the canonical skill.
 - **No `merge-it`.** Merge only after the user explicitly confirms, and only with `scripts/dev/merge-stack --pr <n>` (from the feature worktree of the repository that owns the PR; in a consumer repo `${REPOSITORY_HELPERS_DIR:-$HOME/work/ai/repository-helpers}/scripts/dev/merge-stack --pr <n>`): it picks the right command for the repository's merge setup (`gh stack merge` for a stacked PR, the merge queue or auto-merge otherwise) and confirms the enqueue. For a PR in a gh stack, pass the top PR's number and run it from that stack's worktree: it refuses a lower layer, and it lands the top PR and every open PR below it, so name those PRs and get confirmation for the whole stack first. Do not call `gh pr merge` or `gh stack merge` by hand, do not add the `merge-it` label, and do not pipe the command through `tail` or `head`: read its exit status and output.
 
+## Flaky tests are never accepted
+
+A test that fails and then passes on the same code is a **bug to fix**. Never record it as known-flaky, list it, skip or quarantine it, or retry until green. When CI goes green only on a rerun, `post-pr-submission-checks` fails with `CI_FLAKE_DETECTED`: fix the root cause and push the fix (rerunning does not clear it for that head). A flake in code this PR did not touch still gets an issue or PR first, linked from this PR.
+
 ## Exit codes (condensed)
 
 | Code | Meaning |

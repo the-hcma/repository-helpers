@@ -514,7 +514,7 @@ ci_rollup_discover_repo_slug() {
 
 # ci_pr_head_runs_json <pr> [repo]
 # The Actions runs of the PR's head SHA as one JSON array (databaseId, headSha, workflowDatabaseId, conclusion,
-# status),
+# status, attempt),
 # or nothing and exit 1 when they cannot be listed, so a caller keeps its original verdict (#884).
 ci_pr_head_runs_json() {
   local -r pr="$1"
@@ -535,7 +535,7 @@ ci_pr_head_runs_json() {
   # (the runs a failing row refers to are always among them).
   runs_json="$(github_api_exec_with_rate_limit_retry "ci-rollup list head runs" -- gh run list \
     "${repo_args[@]}" --commit "$head_sha" --limit 100 \
-    --json databaseId,headSha,conclusion,status,workflowDatabaseId)" || exit_code=$?
+    --json databaseId,headSha,conclusion,status,workflowDatabaseId,attempt)" || exit_code=$?
   if (( exit_code != 0 )) || [[ -z "$head_sha" || -z "$runs_json" ]]; then
     return 1
   fi
@@ -631,6 +631,65 @@ ci_rollup_without_superseded_failures() {
           elif $s.state == "waiting" then (. + {conclusion: "", status: "IN_PROGRESS"})
           else empty end
       ]'
+}
+
+# ci_rollup_failed_then_passed_runs <runs-json>
+# One "<workflow id><TAB><failed run id><TAB><passing run id>" line per run that failed (failure, timed_out or
+# startup_failure) while a newer run of the same workflow on the same head succeeded. The same code passed after it
+# failed: a flake, never a result to accept (#884). A cancelled run is not listed here (that is a superseded run).
+ci_rollup_failed_then_passed_runs() {
+  local -r runs_json="$1"
+
+  ci_rollup_jq_file "ci-rollup failed then passed runs" "$runs_json" -r '
+    . as $runs
+    | [ .[]?
+        | select((.status // "") == "completed"
+                 and ((.conclusion // "") as $c | ["failure", "timed_out", "startup_failure"] | index($c)) != null) ]
+    | .[]
+    | . as $f
+    | ([ $runs[]?
+         | select((.workflowDatabaseId // -1) == ($f.workflowDatabaseId // -2)
+                  and .databaseId > $f.databaseId
+                  and (.status // "") == "completed"
+                  and (.conclusion // "") == "success") ]
+       | sort_by(.databaseId) | last // null) as $p
+    | select($p != null)
+    | "\($f.workflowDatabaseId)\t\($f.databaseId)\t\($p.databaseId)"
+  '
+}
+
+# ci_rollup_rerun_passed_runs <runs-json>
+# One "<run id><TAB><attempt>" line per run that completed with success on a rerun (attempt above 1): the candidates
+# for "an earlier attempt of this run failed" (#884).
+ci_rollup_rerun_passed_runs() {
+  local -r runs_json="$1"
+
+  ci_rollup_jq_file "ci-rollup rerun passed runs" "$runs_json" -r '
+    .[]?
+    | select((.status // "") == "completed" and (.conclusion // "") == "success" and ((.attempt // 1) > 1))
+    | "\(.databaseId)\t\(.attempt)"
+  '
+}
+
+# ci_run_attempt_conclusion <run id> <attempt> [repo]
+# Prints the conclusion of one attempt of an Actions run (empty and exit 1 when it cannot be read).
+ci_run_attempt_conclusion() {
+  local -r run_id="$1"
+  local -r attempt="$2"
+  local -r repo="${3:-}"
+  local conclusion exit_code
+  local slug="$repo"
+
+  exit_code=0
+  if [[ -z "$slug" ]]; then
+    slug="$(ci_rollup_discover_repo_slug)" || return 1
+  fi
+  conclusion="$(github_api_exec_with_rate_limit_retry "ci-rollup run attempt conclusion" -- gh api \
+    "repos/${slug}/actions/runs/${run_id}/attempts/${attempt}" --jq '.conclusion // empty')" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$conclusion" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$conclusion"
 }
 
 # ci_failed_workflow_run_id_for_pr <pr> [repo]
