@@ -112,6 +112,34 @@ rp_log_gh_api_fail() {
   rp_log_fail "${slug}: ${context} (GitHub API: ${detail})"
 }
 
+# rp_last_api_error_is_plan_limit
+# True when the most recent gh api failure is GitHub's plan limit (HTTP 403 "Upgrade to GitHub
+# Pro or make this repository public ..."): a private repository on a plan without rulesets or
+# branch protection. No retry can fix it, so callers report "unavailable", not a failure (#889).
+# A 403 with any other message (a missing token scope, say) is not a plan limit.
+rp_last_api_error_is_plan_limit() {
+  local uuid stderr_text line
+
+  uuid="$(runner_last_id)"
+  [[ -n "$uuid" ]] || return 1
+  stderr_text="$(runner_read "$uuid" stderr 2>/dev/null || true)"
+  # Any line: the throttled executor can print a NOTE line before gh's own error line.
+  while IFS= read -r line; do
+    if [[ "$line" == *'Upgrade to GitHub Pro'* && "$line" == *'HTTP 403'* ]]; then
+      return 0
+    fi
+  done <<<"$stderr_text"
+  return 1
+}
+
+# rp_log_plan_skip <slug> <what>
+# Informational only: does not set the exit status and is not a failure in the compact report,
+# but is always printed so a skipped baseline check stays visible.
+rp_log_plan_skip() {
+  # Printed in compact mode too: a skipped baseline check must stay visible (strict onboarding).
+  printf 'SKIP: %s: %s unavailable on this plan (private repository without GitHub Pro)\n' "$1" "$2" >&2
+}
+
 # rp_runner_exec_stdout <label> -- <cmd> [args…]
 rp_runner_exec_stdout() {
   local -r label="$1"
@@ -1678,8 +1706,12 @@ rp_check_stacking_tool() {
         sig_fetch_exit=0
         sig_ruleset_json="$(rp_fetch_protect_main_ruleset "$slug")" || sig_fetch_exit=$?
         if (( sig_fetch_exit == 2 )); then
-          rp_log_gh_api_fail "$slug" 'could not read protect-main ruleset for the graphite/signatures check'
-          repo_fail=1
+          if rp_last_api_error_is_plan_limit; then
+            rp_log_plan_skip "$slug" 'graphite/signatures check'
+          else
+            rp_log_gh_api_fail "$slug" 'could not read protect-main ruleset for the graphite/signatures check'
+            repo_fail=1
+          fi
         elif ! rp_validate_graphite_marker_vs_signatures "$slug" "$marker_value" "$sig_ruleset_json"; then
           repo_fail=1
         fi
@@ -7124,11 +7156,13 @@ rp_repo_uses_github_merge_queue() {
 
 # Exit 0 when protect-main is required, 1 when not, 2 on GitHub API failure
 # (do not treat API errors as "not required").
-# Exit 0 required, 1 not required, 2 when a GitHub API error left the answer unknown (#800).
+# Exit 0 required, 1 not required, 2 when a GitHub API error left the answer unknown (#800),
+# 3 when the rulesets API is unavailable on this plan (HTTP 403 plan limit, #889).
 rp_repo_requires_protect_main_ruleset() {
   local slug="$1"
   local mq_exit=0
   local release_please_ec=0
+  local labels_exit=0
   if [[ "$rp_merge_only" -eq 0 ]] && rp_is_strict_repo "$slug"; then
     return 0
   fi
@@ -7136,14 +7170,21 @@ rp_repo_requires_protect_main_ruleset() {
   if (( release_please_ec == 0 )); then
     return 0
   fi
-  if rp_repo_has_merge_it_label "$slug"; then
+  rp_repo_merge_it_label_check "$slug" || labels_exit=$?
+  if (( labels_exit == 0 )); then
     return 0
   fi
   rp_repo_uses_github_merge_queue "$slug" || mq_exit=$?
   if (( mq_exit == 0 )); then
     return 0
   fi
-  if (( mq_exit == 2 || release_please_ec == 2 )); then
+  if (( mq_exit == 2 || release_please_ec == 2 || labels_exit == 2 )); then
+    # Plan limit only when the ruleset read is the sole failure: a real release-please or label
+    # read error must not be masked by a later plan-limit 403 (#889).
+    if (( mq_exit == 2 && release_please_ec != 2 && labels_exit != 2 )) \
+      && rp_last_api_error_is_plan_limit; then
+      return 3
+    fi
     return 2
   fi
   return 1
@@ -9624,6 +9665,10 @@ rp_check_protect_main_ruleset() {
   local require_exit=0
 
   rp_repo_requires_protect_main_ruleset "$slug" || require_exit=$?
+  if (( require_exit == 3 )); then
+    rp_log_plan_skip "$slug" 'protect-main ruleset'
+    return 0
+  fi
   if (( require_exit == 2 )); then
     rp_log_gh_api_fail "$slug" 'could not determine whether protect-main is required'
     rp_log_check_fail "$slug" 'protect-main ruleset (GitHub API error; retry)' \
@@ -9639,6 +9684,10 @@ rp_check_protect_main_ruleset() {
   fetch_exit=$?
   set -e
   if (( fetch_exit == 2 )); then
+    if rp_last_api_error_is_plan_limit; then
+      rp_log_plan_skip "$slug" 'protect-main ruleset'
+      return 0
+    fi
     rp_log_gh_api_fail "$slug" 'could not read protect-main ruleset'
     rp_log_check_fail "$slug" 'protect-main ruleset (GitHub API error; retry)' \
       "$(rp_github_url "$slug" '/settings/rules')"
@@ -9729,6 +9778,10 @@ rp_check_classic_main_protection() {
   local require_exit=0
 
   rp_repo_requires_protect_main_ruleset "$slug" || require_exit=$?
+  if (( require_exit == 3 )); then
+    rp_log_plan_skip "$slug" 'classic main branch protection'
+    return 0
+  fi
   if (( require_exit == 2 )); then
     rp_log_gh_api_fail "$slug" 'could not determine whether protect-main is required'
     rp_log_check_fail "$slug" 'classic main branch protection (GitHub API error; retry)' \
@@ -9744,6 +9797,10 @@ rp_check_classic_main_protection() {
   fetch_exit=$?
   set -e
   if (( fetch_exit == 2 )); then
+    if rp_last_api_error_is_plan_limit; then
+      rp_log_plan_skip "$slug" 'classic main branch protection'
+      return 0
+    fi
     rp_log_gh_api_fail "$slug" 'could not read classic main branch protection'
     rp_log_check_fail "$slug" 'classic main branch protection (GitHub API error; retry)' \
       "$(rp_github_url "$slug" '/settings/branches')"
@@ -10038,6 +10095,10 @@ rp_check_graphite_merge_queue() {
     return $?
   fi
   if (( mq_exit == 2 )); then
+    if rp_last_api_error_is_plan_limit; then
+      rp_log_plan_skip "$slug" 'GitHub merge queue setup'
+      return 0
+    fi
     rp_log_gh_api_fail "$slug" 'could not read protect-main ruleset for merge queue check'
     rp_log_check_fail "$slug" 'GitHub merge queue setup (GitHub API error; retry)' \
       "$(rp_github_url "$slug" '/settings/rules')"

@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# Tests for #889: a plan-limit 403 on rulesets / branch protection is "unavailable on this plan"
+# (SKIP), not a failure; any other 403 body still fails.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+rh_root="${script_dir}/.."
+readonly rh_root
+checker="${rh_root}/scripts/github-repo-lint"
+readonly checker
+
+# shellcheck source=tests/lib/test-assert
+source "${script_dir}/lib/test-assert"
+# shellcheck source=tests/lib/github-repo-lint-ci-mocks
+source "${script_dir}/lib/github-repo-lint-ci-mocks"
+grl_test_ci_secret_scan_init "$rh_root"
+
+pass=0
+fail=0
+
+# run_with_403 <403-message> [checker-arg…]: sets output/exit_code from a mocked repo whose ruleset
+# and classic protection reads answer HTTP 403 with the message (after a NOTE line, as the throttled
+# executor can print one); the stacking-tool marker says graphite so the signatures check reads
+# the ruleset too; every other call fails as "unexpected".
+run_with_403() {
+  local -r message="$1"
+  local -r release_please_error="${RELEASE_PLEASE_ERROR:-}"
+  local -r labels_error="${LABELS_ERROR:-}"
+  local -r rulesets_ok="${RULESETS_OK:-}"
+  shift
+  local mock_dir mock_bin
+
+  mock_dir="$(mktemp -d)"
+  mock_bin="${mock_dir}/bin"
+  mkdir -p "$mock_bin"
+  cat >"${mock_bin}/gh" <<MOCK_GH
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck disable=SC1091
+source "${script_dir}/lib/github-repo-lint-ci-mocks"
+grl_test_ci_secret_scan_init "${rh_root}"
+args="\$*"
+if [[ "\$args" == *'auth status'* ]]; then
+  exit 0
+fi
+if [[ "\$args" == *'release-please.yml'* ]]; then
+  if [[ -n "${release_please_error}" ]]; then
+    printf 'gh: Server Error (HTTP 500)\n' >&2
+  fi
+  exit 1
+fi
+if [[ -n "${rulesets_ok}" && "\$args" == *'/rulesets'* ]]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+if [[ "\$args" == *'/rulesets'* || "\$args" == *'/protection'* ]]; then
+  printf 'NOTE: GITHUB_API_PACE_WAIT pacing before retry\n' >&2
+  printf 'gh: %s (HTTP 403)\n' '${message}' >&2
+  exit 1
+fi
+if [[ "\$args" == *'contents/.github/stacking-tool'* ]]; then
+  printf '%s\n' '{"content":"Z3JhcGhpdGUK"}'
+  exit 0
+fi
+if [[ "\$args" == *'/labels'* ]]; then
+  if [[ -n "${labels_error}" ]]; then
+    printf 'gh: Server Error (HTTP 500)\n' >&2
+    exit 1
+  fi
+  printf '%s\n' '[]'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "\$args" >&2
+exit 1
+MOCK_GH
+  chmod +x "${mock_bin}/gh"
+  write_mock_jq_passthrough "${mock_bin}"
+
+  exit_code=0
+  output="$(PATH="${mock_bin}:${PATH}" bash "$checker" --repo "${TEST_REPO:-the-hcma/private-repo}" "$@" 2>&1)" \
+    || exit_code=$?
+  rm -rf "$mock_dir"
+}
+
+printf '\n=== plan-limit 403 is SKIP, not FAIL ===\n'
+output=''
+exit_code=0
+run_with_403 'Upgrade to GitHub Pro or make this repository public to enable this feature.'
+
+if grep -qF 'SKIP: the-hcma/private-repo: protect-main ruleset unavailable on this plan' <<<"$output" \
+  && grep -qF 'SKIP: the-hcma/private-repo: classic main branch protection unavailable on this plan' <<<"$output" \
+  && grep -qF 'SKIP: the-hcma/private-repo: GitHub merge queue setup unavailable on this plan' <<<"$output"; then
+  printf '[PASS] plan-limit 403: ruleset, classic protection and merge queue print SKIP\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected three SKIP lines\n%s\n' "$output"
+  fail=$(( fail + 1 ))
+fi
+
+if ! grep -E 'FAIL: .*(protect-main ruleset|classic main branch protection|merge queue)' <<<"$output" >/dev/null \
+  && ! grep -qF 'GitHub API error; retry' <<<"$output"; then
+  printf '[PASS] plan-limit 403: no FAIL for the plan-limited checks and no "retry" advice\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] plan-limited checks must not fail\n%s\n' "$output"
+  fail=$(( fail + 1 ))
+fi
+
+if grep -qF 'SKIP: the-hcma/private-repo: graphite/signatures check unavailable on this plan' <<<"$output" \
+  && ! grep -qF 'could not read protect-main ruleset for the graphite/signatures check' <<<"$output"; then
+  printf '[PASS] plan-limit 403: graphite/signatures check prints SKIP (after a NOTE stderr line)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] expected the graphite/signatures SKIP\n%s\n' "$output"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== plan-limit SKIP is not a failure in the compact report ===\n'
+output=''
+exit_code=0
+run_with_403 'Upgrade to GitHub Pro or make this repository public to enable this feature.' --compact
+if ! grep -qE 'protect-main ruleset \(GitHub API|classic main branch protection \(GitHub API|merge queue setup \(GitHub API' <<<"$output" \
+  && grep -qF 'SKIP: the-hcma/private-repo: protect-main ruleset unavailable on this plan' <<<"$output"; then
+  printf '[PASS] compact: plan-limited checks are visible as SKIP and absent from failures\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] compact report must show SKIP and no plan-limit failures\n%s\n' "$output"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== strict onboarding: plan-limit 403 at the fetch sites is SKIP too ===\n'
+output=''
+exit_code=0
+run_with_403 'Upgrade to GitHub Pro or make this repository public to enable this feature.' --strict-onboarding
+if grep -qF 'SKIP: the-hcma/private-repo: protect-main ruleset unavailable on this plan' <<<"$output" \
+  && grep -qF 'SKIP: the-hcma/private-repo: classic main branch protection unavailable on this plan' <<<"$output" \
+  && ! grep -qE 'FAIL: .*(could not read protect-main ruleset|could not read classic main branch protection)' <<<"$output"; then
+  printf '[PASS] strict onboarding: ruleset and classic protection reads skip on a plan-limit 403\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] strict onboarding must SKIP plan-limited reads\n%s\n' "$output"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== non-strict repo: plan-limit 403 on the requirement probe is SKIP ===\n'
+output=''
+exit_code=0
+TEST_REPO=the-hcma/repository-helpers run_with_403 'Upgrade to GitHub Pro or make this repository public to enable this feature.'
+if grep -qF 'SKIP: the-hcma/repository-helpers: protect-main ruleset unavailable on this plan' <<<"$output" \
+  && grep -qF 'SKIP: the-hcma/repository-helpers: classic main branch protection unavailable on this plan' <<<"$output" \
+  && ! grep -qF 'could not determine whether protect-main is required' <<<"$output"; then
+  printf '[PASS] non-strict repo: requirement probe plan-limit skips protect-main and classic protection\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] non-strict repo must SKIP on a plan-limit 403\n%s\n' "$output"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== a real release-please read error is not masked by the plan-limit SKIP ===\n'
+output=''
+exit_code=0
+TEST_REPO=the-hcma/repository-helpers RELEASE_PLEASE_ERROR=1 run_with_403 'Upgrade to GitHub Pro or make this repository public to enable this feature.'
+if grep -qE 'FAIL: the-hcma/repository-helpers: could not determine whether protect-main is required' <<<"$output"; then
+  printf '[PASS] release-please API error still fails (not reported as a plan-limit SKIP)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] a real release-please error must not be masked\n%s\n' "$output"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== a real labels read error is not masked by the plan-limit SKIP ===\n'
+output=''
+exit_code=0
+TEST_REPO=the-hcma/repository-helpers LABELS_ERROR=1 run_with_403 'Upgrade to GitHub Pro or make this repository public to enable this feature.'
+if grep -qF 'FAIL: the-hcma/repository-helpers: could not determine whether protect-main is required' <<<"$output"; then
+  printf '[PASS] labels API error still fails (not reported as a plan-limit SKIP)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] a real labels error must not be masked\n%s\n' "$output"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== a labels read error alone (rulesets readable, no merge queue) is not "not required" ===\n'
+output=''
+exit_code=0
+TEST_REPO=the-hcma/repository-helpers LABELS_ERROR=1 RULESETS_OK=1 run_with_403 'unused'
+if grep -qF 'FAIL: the-hcma/repository-helpers: could not determine whether protect-main is required' <<<"$output"; then
+  printf '[PASS] labels API error with readable rulesets still fails instead of skipping the requirement\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] a labels error must not silently mean "protect-main not required"\n%s\n' "$output"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== other 403 still fails ===\n'
+output=''
+exit_code=0
+run_with_403 'Resource not accessible by personal access token'
+
+if [[ "$exit_code" -ne 0 ]] \
+  && grep -qF 'FAIL: the-hcma/private-repo: could not read protect-main ruleset' <<<"$output" \
+  && ! grep -qF 'unavailable on this plan' <<<"$output"; then
+  printf '[PASS] a non-plan 403 still fails and is not reported as unavailable\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] a non-plan 403 must still fail (exit=%s)\n%s\n' "$exit_code" "$output"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== results: %s passed, %s failed ===\n' "$pass" "$fail"
+[[ "$fail" -eq 0 ]]
