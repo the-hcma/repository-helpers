@@ -674,15 +674,17 @@ ci_rollup_rerun_passed_runs() {
 }
 
 # ci_run_attempt_runner_never_acquired <run id> <attempt> [repo]
-# Exit 0 when the attempt failed only because no runner was ever acquired for its failed jobs (every failed job, on
-# every page, has no runner and ran no step: GitHub's "was not acquired by Runner" outage). That is infrastructure, not a flaky
-# test, and its documented fix is a rerun (#884). Exit 1 for anything else, including an unreadable job list: an
-# attempt that cannot be shown to be an outage counts as a failure.
+# Exit 0 when the attempt failed because no runner was ever acquired (GitHub's "was not acquired by Runner" outage):
+# at least one failed job has no runner and ran no step, and every other failed job started only after those gave
+# up. That second kind is an aggregate (`needs:` with `if: always()`), which gets a runner and fails because its
+# dependency did; a failed job that started earlier ran alongside the outage and is a real failure. An outage is
+# not a flaky test, and its documented fix is a rerun (#884). Exit 1 for anything else, including an unreadable job
+# list: an attempt that cannot be shown to be an outage counts as a failure.
 ci_run_attempt_runner_never_acquired() {
   local -r run_id="$1"
   local -r attempt="$2"
   local -r repo="${3:-}"
-  local verdict exit_code
+  local jobs exit_code verdict
   local slug="$repo"
 
   exit_code=0
@@ -690,15 +692,20 @@ ci_run_attempt_runner_never_acquired() {
     slug="$(ci_rollup_discover_repo_slug)" || return 1
   fi
   # Every page of jobs (--paginate): a real failed job on a later page must not hide behind an outage on page 1.
-  # One line per failed job: true when it never got a runner and ran no step.
-  verdict="$(github_api_exec_with_rate_limit_retry "ci-rollup run attempt jobs" -- gh api --paginate \
+  # One compact object per failed job.
+  jobs="$(github_api_exec_with_rate_limit_retry "ci-rollup run attempt jobs" -- gh api --paginate \
     "repos/${slug}/actions/runs/${run_id}/attempts/${attempt}/jobs?per_page=100" \
     --jq '.jobs[]? | select((.conclusion // "") as $c | ["failure", "timed_out", "startup_failure"] | index($c) != null)
-      | (((.runner_id // 0) == 0) and ((.steps // []) | length == 0))')" || exit_code=$?
-  if (( exit_code != 0 )) || [[ -z "$verdict" ]]; then
+      | {never: (((.runner_id // 0) == 0) and ((.steps // []) | length == 0)),
+         started: (.started_at // ""), completed: (.completed_at // "")}')" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$jobs" ]]; then
     return 1
   fi
-  ! grep -qx 'false' <<<"$verdict"
+  verdict="$(ci_rollup_jq_file "ci-rollup run attempt outage" "$jobs" -s -r '
+    ([.[] | select(.never) | .completed] | max // "") as $gave_up
+    | (any(.[]; .never))
+      and (all(.[]; .never or ((.started != "") and (.started >= $gave_up))))')" || return 1
+  [[ "$verdict" == 'true' ]]
 }
 
 # ci_run_attempt_conclusion <run id> <attempt> [repo]
