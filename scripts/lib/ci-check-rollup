@@ -634,7 +634,7 @@ ci_rollup_without_superseded_failures() {
 }
 
 # ci_rollup_failed_then_passed_runs <runs-json>
-# One "<workflow id><TAB><failed run id><TAB><passing run id>" line per run that failed (failure, timed_out or
+# One "<workflow id><TAB><failed run id><TAB><passing run id><TAB><failed run attempt>" line per run that failed (failure, timed_out or
 # startup_failure) while a newer run of the same workflow on the same head succeeded: it passed after it failed, so a
 # flake (or a base branch that moved under the merge commit; the two cannot be told apart), never a result to
 # accept (#884). A cancelled run is not listed here (that is a superseded run).
@@ -655,7 +655,7 @@ ci_rollup_failed_then_passed_runs() {
                   and (.conclusion // "") == "success") ]
        | sort_by(.databaseId) | last // null) as $p
     | select($p != null)
-    | "\($f.workflowDatabaseId)\t\($f.databaseId)\t\($p.databaseId)"
+    | "\($f.workflowDatabaseId)\t\($f.databaseId)\t\($p.databaseId)\t\($f.attempt // 1)"
   '
 }
 
@@ -670,6 +670,32 @@ ci_rollup_rerun_passed_runs() {
     | select((.status // "") == "completed" and (.conclusion // "") == "success" and ((.attempt // 1) > 1))
     | "\(.databaseId)\t\(.attempt)"
   '
+}
+
+# ci_run_attempt_runner_never_acquired <run id> <attempt> [repo]
+# Exit 0 when the attempt failed only because no runner was ever acquired for its failed jobs (every failed job has
+# no runner and ran no step: GitHub's "was not acquired by Runner" outage). That is infrastructure, not a flaky
+# test, and its documented fix is a rerun (#884). Exit 1 for anything else, including an unreadable job list: an
+# attempt that cannot be shown to be an outage counts as a failure.
+ci_run_attempt_runner_never_acquired() {
+  local -r run_id="$1"
+  local -r attempt="$2"
+  local -r repo="${3:-}"
+  local verdict exit_code
+  local slug="$repo"
+
+  exit_code=0
+  if [[ -z "$slug" ]]; then
+    slug="$(ci_rollup_discover_repo_slug)" || return 1
+  fi
+  verdict="$(github_api_exec_with_rate_limit_retry "ci-rollup run attempt jobs" -- gh api \
+    "repos/${slug}/actions/runs/${run_id}/attempts/${attempt}/jobs" \
+    --jq '[.jobs[]? | select((.conclusion // "") as $c | ["failure", "timed_out", "startup_failure"] | index($c) != null)]
+      | (length > 0) and all(.[]; ((.runner_id // 0) == 0) and ((.steps // []) | length == 0))')" || exit_code=$?
+  if (( exit_code != 0 )); then
+    return 1
+  fi
+  [[ "$verdict" == 'true' ]]
 }
 
 # ci_run_attempt_conclusion <run id> <attempt> [repo]
