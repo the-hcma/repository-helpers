@@ -543,6 +543,10 @@ if [[ "$args" == *'run list'* ]]; then
   if [[ "${MOCK_RUNS_FAIL:-0}" == 1 ]]; then
     exit 1
   fi
+  # An older gh has no attempt or event field and fails the whole listing.
+  if [[ "${MOCK_RUNS_NO_ATTEMPT:-0}" == 1 && "$args" == *'attempt'* ]]; then
+    exit 1
+  fi
   # The superseded-run lookup must list the runs of the head commit (--commit <sha>), not of a branch name: a busy
   # branch name would push them out of the listing. A listing by branch (also used by the failure report, which
   # tolerates a failed listing) gets no answer here, so the lookup cannot fall back to it unnoticed.
@@ -556,11 +560,70 @@ if [[ "$args" == *'run list'* ]]; then
   if [[ -f "${MOCK_RUNS_COUNTER}" ]]; then n="$(<"${MOCK_RUNS_COUNTER}")"; fi
   n=$(( n + 1 ))
   printf '%s' "$n" >"${MOCK_RUNS_COUNTER}"
+  # Only the first listing works: a later one fails, so a gate that lists again cannot see the runs it saw before.
+  if [[ "${MOCK_RUNS_FAIL_AFTER_FIRST:-0}" == 1 ]] && (( n > 1 )); then
+    exit 1
+  fi
   if [[ -n "${MOCK_RUNS_AFTER_JSON:-}" ]] && (( n > 1 )); then
     printf '%s\n' "${MOCK_RUNS_AFTER_JSON}"
     exit 0
   fi
   printf '%s\n' "${MOCK_RUNS_JSON}"
+  exit 0
+fi
+if [[ "$args" == *'api '* && "$args" == *' repos/'* && "$args" == *'/actions/runs/'*'/attempts/'*'/jobs'* ]]; then
+  # The jobs of an attempt as the REST API returns them, run through the --jq filter the script passes, so the real
+  # filter decides. An outage is a job that never got a runner (no runner, no steps) plus an aggregate job that
+  # got one after the first gave up and failed on its dependency, next to a job that passed.
+  # MOCK_JOBS_FAIL=1 fails the call; MOCK_JOBS_CONCURRENT=1 adds a real failure that ran alongside the outage;
+  # MOCK_JOBS_LATE_REAL=1 adds a late independent real failure; MOCK_OUTAGE_ATTEMPTS (space-separated attempt
+  # numbers) makes only those attempts an outage.
+  if [[ "${MOCK_JOBS_FAIL:-0}" == 1 ]]; then exit 1; fi
+  outage=0
+  if [[ -n "${MOCK_OUTAGE_ATTEMPTS:-}" ]]; then
+    attempt_no="${args##*/attempts/}"
+    attempt_no="${attempt_no%%/*}"
+    if [[ " ${MOCK_OUTAGE_ATTEMPTS} " == *" ${attempt_no} "* ]]; then outage=1; fi
+  elif [[ "${MOCK_RUNNER_NEVER_ACQUIRED:-0}" == 1 ]]; then
+    outage=1
+  fi
+  jq_filter=""
+  prev=""
+  for arg in "$@"; do
+    if [[ "$prev" == --jq ]]; then jq_filter="$arg"; fi
+    prev="$arg"
+  done
+  jobs_json='{"jobs":['
+  if (( outage == 1 )); then
+    jobs_json+='{"conclusion":"failure","runner_id":0,"steps":[],"started_at":"2026-11-27T10:00:00Z","completed_at":"2026-11-27T10:15:00Z"},'
+    jobs_json+='{"conclusion":"failure","runner_id":9,"steps":[{"name":"Require every part"}],"started_at":"2026-11-27T10:15:05Z","completed_at":"2026-11-27T10:15:30Z"},'
+    jobs_json+='{"conclusion":"success","runner_id":3,"steps":[{"name":"build"}],"started_at":"2026-11-27T10:00:00Z","completed_at":"2026-11-27T10:03:00Z"}'
+    if [[ "${MOCK_JOBS_CONCURRENT:-0}" == 1 ]]; then
+      jobs_json+=',{"conclusion":"failure","runner_id":4,"steps":[{"name":"test"}],"started_at":"2026-11-27T10:05:00Z","completed_at":"2026-11-27T10:06:00Z"}'
+    fi
+    if [[ "${MOCK_JOBS_LATE_REAL:-0}" == 1 ]]; then
+      jobs_json+=',{"conclusion":"failure","runner_id":5,"steps":[{"name":"test"}],"started_at":"2026-11-27T10:20:00Z","completed_at":"2026-11-27T10:21:00Z"}'
+    fi
+  else
+    jobs_json+='{"conclusion":"failure","runner_id":9,"steps":[{"name":"test"}],"started_at":"2026-11-27T10:00:00Z","completed_at":"2026-11-27T10:01:00Z"},'
+    jobs_json+='{"conclusion":"skipped","runner_id":0,"steps":[],"started_at":"2026-11-27T10:00:00Z","completed_at":"2026-11-27T10:00:01Z"}'
+  fi
+  jobs_json+=']}'
+  printf '%s' "$jobs_json" | jq -c "$jq_filter"
+  exit 0
+fi
+if [[ "$args" == *'api repos/'* && "$args" == *'/actions/runs/'*'/attempts/'* ]]; then
+  # The conclusion of an earlier attempt of a rerun run (#884).
+  # MOCK_ATTEMPTS is a space-separated list of conclusions by attempt number (attempt 1 first); without it every
+  # attempt answers MOCK_ATTEMPT_CONCLUSION.
+  if [[ -n "${MOCK_ATTEMPTS:-}" ]]; then
+    read -ra attempt_list <<<"${MOCK_ATTEMPTS}"
+    attempt_no="${args##*/attempts/}"
+    attempt_no="${attempt_no%% *}"
+    printf '%s\n' "${attempt_list[$(( attempt_no - 1 ))]:-}"
+    exit 0
+  fi
+  printf '%s\n' "${MOCK_ATTEMPT_CONCLUSION:-}"
   exit 0
 fi
 if [[ "$args" == *'run view'* ]]; then
@@ -709,6 +772,176 @@ assert_contains 'and the gate keeps waiting for the newer run (WAIT_TIMEOUT, not
 out="$(run_superseded_case "$shape_rollup" '[]' 1)"
 assert_contains 'when the runs cannot be listed the original failure stands' "$out" 'ERROR: CI failures for PR #42'
 assert_not_contains 'and nothing is called superseded' "$out" 'CI_FAILURE_SUPERSEDED'
+
+# A green rollup is still a failure when a run failed first on the same head: a flake is fixed, never accepted (#884).
+green_rollup='[
+  {"name":"shellcheck + tests","conclusion":"SUCCESS","startedAt":"2026-11-18T16:22:04Z","detailsUrl":"https://github.com/o/r/actions/runs/300/job/2"}
+]'
+runs_clean='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":1}
+]'
+out="$(run_superseded_case "$green_rollup" "$runs_clean")"
+assert_rc_is 'a green head whose runs all passed first time passes the gate' "$out" 0
+assert_not_contains 'and reports no flake' "$out" 'CI_FLAKE_DETECTED'
+
+runs_rerun_after_failure='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":2}
+]'
+out="$(MOCK_ATTEMPT_CONCLUSION=failure run_superseded_case "$green_rollup" "$runs_rerun_after_failure")"
+assert_rc_is_not 'a run that passed on a rerun after a failed attempt does not pass the gate' "$out" 0
+assert_contains 'and the flake is named with the run and attempts' "$out" 'run=300 attempt=2 passed after attempt 1 failure'
+assert_contains 'and the report says a flake is fixed, not accepted' "$out" 'A flaky test is never accepted'
+
+out="$(MOCK_ATTEMPT_CONCLUSION=cancelled run_superseded_case "$green_rollup" "$runs_rerun_after_failure")"
+assert_rc_is 'a rerun after a cancelled attempt is not a flake' "$out" 0
+
+runs_failed_then_passed='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":1,"event":"pull_request"},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"failure","status":"completed","workflowDatabaseId":7,"attempt":1,"event":"pull_request"}
+]'
+out="$(run_superseded_case "$green_rollup" "$runs_failed_then_passed")"
+assert_rc_is_not 'a newer run that passed after a failed run of the same workflow does not pass the gate' "$out" 0
+assert_contains 'and the flake names both runs' "$out" 'workflow=7 failed_run=200 passing_run=300'
+
+runs_other_workflow_failed='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":1,"event":"pull_request"},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"failure","status":"completed","workflowDatabaseId":9,"attempt":1,"event":"pull_request"}
+]'
+out="$(run_superseded_case "$green_rollup" "$runs_other_workflow_failed")"
+assert_rc_is 'a failed run of another workflow is not a flake of this one' "$out" 0
+
+out="$(run_superseded_case "$green_rollup" "$runs_rerun_after_failure" 1)"
+assert_rc_is 'when the runs cannot be listed the green verdict stands' "$out" 0
+
+runs_rerun_three='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":3}
+]'
+out="$(MOCK_ATTEMPTS='failure cancelled' run_superseded_case "$green_rollup" "$runs_rerun_three")"
+assert_rc_is_not 'attempt 1 failed, attempt 2 was cancelled, attempt 3 passed: still a flake' "$out" 0
+assert_contains 'and the failed earlier attempt is named' "$out" 'run=300 attempt=3 passed after attempt 1 failure'
+out="$(MOCK_ATTEMPTS='cancelled cancelled' run_superseded_case "$green_rollup" "$runs_rerun_three")"
+assert_rc_is 'attempts that were only ever cancelled before the pass are not a flake' "$out" 0
+
+out="$(MOCK_ATTEMPT_CONCLUSION=failure MOCK_RUNNER_NEVER_ACQUIRED=1 run_superseded_case "$green_rollup" "$runs_rerun_after_failure")"
+assert_rc_is 'a rerun after a runner that was never acquired is an outage, not a flake' "$out" 0
+assert_contains 'and the outage is noted' "$out" 'NOTE: CI_RERUN_RUNNER_NOT_ACQUIRED pr=42 run=300 attempt=1'
+assert_not_contains 'and no flake is reported' "$out" 'CI_FLAKE_DETECTED'
+
+out="$(MOCK_RUNNER_NEVER_ACQUIRED=1 run_superseded_case "$green_rollup" "$runs_failed_then_passed")"
+assert_rc_is 'a failed run that never got a runner, followed by a passing run, is not a flake' "$out" 0
+assert_contains 'and its outage is noted' "$out" 'NOTE: CI_RERUN_RUNNER_NOT_ACQUIRED pr=42 run=200 attempt=1'
+
+runs_failed_twice_then_passed='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":1,"event":"pull_request"},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"failure","status":"completed","workflowDatabaseId":7,"attempt":2,"event":"pull_request"}
+]'
+out="$(MOCK_ATTEMPTS='failure failure' MOCK_OUTAGE_ATTEMPTS='2' run_superseded_case "$green_rollup" "$runs_failed_twice_then_passed")"
+assert_rc_is_not 'attempt 1 failed for real and attempt 2 was an outage: still a flake' "$out" 0
+assert_contains 'and the failed run is named' "$out" 'workflow=7 failed_run=200 passing_run=300'
+out="$(MOCK_ATTEMPTS='failure failure' MOCK_OUTAGE_ATTEMPTS='1 2' run_superseded_case "$green_rollup" "$runs_failed_twice_then_passed")"
+assert_rc_is 'a run whose every failed attempt was an outage is not a flake' "$out" 0
+
+runs_push_failed_pr_passed='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":1,"event":"pull_request"},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"failure","status":"completed","workflowDatabaseId":7,"attempt":1,"event":"push"}
+]'
+out="$(run_superseded_case "$green_rollup" "$runs_push_failed_pr_passed")"
+assert_rc_is 'a failed push run and a passing pull_request run of one workflow are not a retry' "$out" 0
+runs_pr_failed_pr_passed='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":1,"event":"pull_request"},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"failure","status":"completed","workflowDatabaseId":7,"attempt":1,"event":"pull_request"}
+]'
+out="$(run_superseded_case "$green_rollup" "$runs_pr_failed_pr_passed")"
+assert_rc_is_not 'a failed and a passing run of the same event are still a flake' "$out" 0
+
+out="$(MOCK_JOBS_FAIL=1 run_superseded_case "$green_rollup" "$runs_failed_then_passed")"
+assert_rc_is_not 'an unreadable job list for a failed run counts as a real failure' "$out" 0
+assert_contains 'and it is reported as a flake' "$out" 'ERROR: CI_FLAKE_DETECTED'
+assert_not_contains 'and is not called an outage' "$out" 'CI_RERUN_RUNNER_NOT_ACQUIRED'
+
+out="$(MOCK_ATTEMPTS='' MOCK_OUTAGE_ATTEMPTS='2' run_superseded_case "$green_rollup" "$runs_failed_twice_then_passed")"
+assert_rc_is 'an earlier attempt that cannot be read is not counted, in the failed-then-passed check too' "$out" 0
+
+out="$(MOCK_ATTEMPT_CONCLUSION=failure MOCK_RUNNER_NEVER_ACQUIRED=1 MOCK_JOBS_CONCURRENT=1 run_superseded_case "$green_rollup" "$runs_rerun_after_failure")"
+assert_rc_is_not 'an outage with a real failure that ran alongside it is still a flake' "$out" 0
+assert_contains 'and it is reported as a flake' "$out" 'ERROR: CI_FLAKE_DETECTED'
+assert_not_contains 'and is not called an outage' "$out" 'CI_RERUN_RUNNER_NOT_ACQUIRED'
+
+# Known limit (the jobs API does not say which job needs which): a late independent job that failed for real is
+# taken for an aggregate, so the attempt still counts as an outage.
+out="$(MOCK_ATTEMPT_CONCLUSION=failure MOCK_RUNNER_NEVER_ACQUIRED=1 MOCK_JOBS_LATE_REAL=1 run_superseded_case "$green_rollup" "$runs_rerun_after_failure")"
+assert_rc_is 'known limit: a late independent failure after the outage gave up is taken for the aggregate' "$out" 0
+
+runs_failed_then_cancelled_rerun='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":1,"event":"pull_request"},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"cancelled","status":"completed","workflowDatabaseId":7,"attempt":2,"event":"pull_request"}
+]'
+out="$(MOCK_ATTEMPTS='failure cancelled' run_superseded_case "$green_rollup" "$runs_failed_then_cancelled_rerun")"
+assert_rc_is_not 'attempt 1 failed and the rerun was cancelled, then a newer run passed: still a flake' "$out" 0
+assert_contains 'and it is reported as a flake' "$out" 'ERROR: CI_FLAKE_DETECTED'
+assert_contains 'and the run with the failed attempt is named' "$out" 'workflow=7 failed_run=200 passing_run=300'
+out="$(MOCK_ATTEMPTS='cancelled cancelled' run_superseded_case "$green_rollup" "$runs_failed_then_cancelled_rerun")"
+assert_rc_is 'a rerun that was cancelled after only cancelled attempts is a superseded run, not a flake' "$out" 0
+assert_not_contains 'and no outage is noted for it' "$out" 'CI_RERUN_RUNNER_NOT_ACQUIRED'
+out="$(MOCK_ATTEMPTS='failure cancelled' MOCK_OUTAGE_ATTEMPTS='1' run_superseded_case "$green_rollup" "$runs_failed_then_cancelled_rerun")"
+assert_rc_is 'a failed first attempt that was an outage, then a cancelled rerun and a pass, is not a flake' "$out" 0
+assert_contains 'and the outage is named at the attempt where it happened' "$out" 'NOTE: CI_RERUN_RUNNER_NOT_ACQUIRED pr=42 run=200 attempt=1'
+
+# A workflow whose only checks are ones the gate ignores (the merged-PR closer here) is not scanned: re-running it is
+# not a flaky test. A workflow that also supplies a gating check stays in the scan.
+runs_closer='[
+  {"databaseId":600,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":11,"attempt":1,"event":"pull_request"},
+  {"databaseId":500,"headSha":"'"${head_sha}"'","conclusion":"failure","status":"completed","workflowDatabaseId":11,"attempt":1,"event":"pull_request"},
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":1,"event":"pull_request"}
+]'
+closer_rollup='[
+  {"name":"shellcheck + tests","conclusion":"SUCCESS","startedAt":"2026-11-18T16:22:04Z","detailsUrl":"https://github.com/o/r/actions/runs/300/job/2"},
+  {"name":"close-merged-prs","conclusion":"SUCCESS","startedAt":"2026-11-18T16:20:04Z","detailsUrl":"https://github.com/o/r/actions/runs/500/job/9"}
+]'
+out="$(MOCK_ATTEMPT_CONCLUSION=failure run_superseded_case "$closer_rollup" "$runs_closer")"
+assert_rc_is 'a failed then passed run of a workflow with only ignored checks is not a flake' "$out" 0
+assert_not_contains 'and nothing is reported' "$out" 'CI_FLAKE_DETECTED'
+mixed_rollup='[
+  {"name":"shellcheck + tests","conclusion":"SUCCESS","startedAt":"2026-11-18T16:22:04Z","detailsUrl":"https://github.com/o/r/actions/runs/300/job/2"},
+  {"name":"close-merged-prs","conclusion":"SUCCESS","startedAt":"2026-11-18T16:20:04Z","detailsUrl":"https://github.com/o/r/actions/runs/200/job/9"}
+]'
+out="$(MOCK_ATTEMPT_CONCLUSION=failure run_superseded_case "$mixed_rollup" "$runs_failed_then_passed")"
+assert_rc_is_not 'a workflow that also supplies a gating check stays in the scan' "$out" 0
+assert_contains 'and its flake is reported' "$out" 'ERROR: CI_FLAKE_DETECTED'
+
+# Runs without event metadata (an older gh) are never paired: a failed push run and a passing pull_request run
+# would look alike.
+runs_no_event='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"failure","status":"completed","workflowDatabaseId":7}
+]'
+out="$(MOCK_RUNS_NO_ATTEMPT=1 run_superseded_case "$green_rollup" "$runs_no_event")"
+assert_rc_is 'without event metadata a failed and a passing run are not paired' "$out" 0
+assert_contains 'and the degraded flake check is noted' "$out" 'NOTE: CI_FLAKE_CHECK_DEGRADED'
+
+# A rerun that is still running whose first attempt failed, next to a newer run that passed, is a candidate: the
+# newer success must not hide the failed first attempt.
+runs_pending_rerun='[
+  {"databaseId":300,"headSha":"'"${head_sha}"'","conclusion":"success","status":"completed","workflowDatabaseId":7,"attempt":1,"event":"pull_request"},
+  {"databaseId":200,"headSha":"'"${head_sha}"'","conclusion":"","status":"in_progress","workflowDatabaseId":7,"attempt":2,"event":"pull_request"}
+]'
+out="$(MOCK_ATTEMPTS='failure' run_superseded_case "$green_rollup" "$runs_pending_rerun")"
+assert_rc_is_not 'a failed first attempt whose rerun is still running, with a newer run that passed, is a flake' "$out" 0
+assert_contains 'and it is reported as a flake' "$out" 'ERROR: CI_FLAKE_DETECTED'
+
+# The listing that found the candidate is the one used: a second listing that fails must not hide it.
+out="$(MOCK_RUNS_FAIL_AFTER_FIRST=1 MOCK_ATTEMPTS='failure cancelled' run_superseded_case "$shape_rollup" "$runs_failed_then_cancelled_rerun")"
+assert_rc_is_not 'the run listing that dropped the failed row is reused for the flake check' "$out" 0
+assert_contains 'and the flake is reported' "$out" 'ERROR: CI_FLAKE_DETECTED'
+
+# An older gh has no attempt or event field: the superseded-run logic keeps working and the degraded flake check is noted.
+out="$(MOCK_RUNS_NO_ATTEMPT=1 run_superseded_case "$shape_rollup" "$runs_superseded")"
+assert_rc_is 'an older gh keeps the superseded-run logic working' "$out" 0
+assert_contains 'and says the flake check is degraded' "$out" 'NOTE: CI_FLAKE_CHECK_DEGRADED'
+
+out="$(MOCK_ATTEMPT_CONCLUSION='' run_superseded_case "$green_rollup" "$runs_rerun_after_failure")"
+assert_rc_is 'when the earlier attempt cannot be read the green verdict stands' "$out" 0
+assert_not_contains 'and no flake is reported for it' "$out" 'CI_FLAKE_DETECTED'
 rm -rf "$tmp"
 
 printf '\n=== functional: WAITING env approval failure is raised (not WAIT_TIMEOUT) ===\n'

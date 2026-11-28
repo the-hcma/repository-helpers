@@ -253,11 +253,99 @@ ci_repo_slug_for_pr() {
 # One NOTE per distinct superseded row and reason for the whole wait: require_ci_success runs on every poll.
 declare -A ci_superseded_noted=()
 
+# report_ci_flakes <pr> <repo> <runs-json>
+# Exit 0 (and an ERROR block on stderr) when a run on the head passed only after the same workflow failed: a rerun
+# attempt that passed after a failed attempt, or a newer run that passed after a failed one. A failure because no runner
+# was ever acquired is an outage, not a flake, and is left out with a NOTE. Exit 1 when none (#884).
+report_ci_flakes() {
+  local -r pr="$1"
+  local -r repo="$2"
+  local -r runs_json="$3"
+  local flakes=0 real_failure saw_failed outage_attempt latest_conclusion wf failed passed failed_attempt run attempt prior prior_conclusion n
+
+  while IFS=$'\t' read -r wf failed passed failed_attempt latest_conclusion; do
+    [[ -z "$failed" ]] && continue
+    # Every attempt of the failed run counts: only when each failed attempt was an outage is the run one.
+    # The latest attempt of a run that failed is known to have failed; a run whose latest attempt was cancelled or
+    # skipped is read attempt by attempt like the earlier ones.
+    real_failure=0
+    saw_failed=0
+    outage_attempt="${failed_attempt:-1}"
+    for (( n = ${failed_attempt:-1}; n >= 1; n-- )); do
+      if (( n < ${failed_attempt:-1} )) || [[ "$latest_conclusion" != failure && "$latest_conclusion" != timed_out && "$latest_conclusion" != startup_failure ]]; then
+        prior_conclusion="$(ci_run_attempt_conclusion "$failed" "$n" "$repo" || true)"
+        case "$prior_conclusion" in
+          failure|timed_out|startup_failure) ;;
+          # Not a failure, or unreadable: an earlier attempt that cannot be shown to have failed is not counted
+          # (the same as in the rerun check below).
+          *) continue ;;
+        esac
+      fi
+      if ! ci_run_attempt_runner_never_acquired "$failed" "$n" "$repo"; then
+        real_failure=1
+        break
+      fi
+      # The attempt where the outage was found (the first one seen walking back from the latest).
+      if (( saw_failed == 0 )); then
+        outage_attempt="$n"
+      fi
+      saw_failed=1
+    done
+    if (( real_failure == 0 && saw_failed == 0 )); then
+      continue
+    fi
+    if (( real_failure == 0 )); then
+      printf 'NOTE: CI_RERUN_RUNNER_NOT_ACQUIRED pr=%s run=%s attempt=%s (an outage, not a flake)\n' \
+        "$pr" "$failed" "$outage_attempt" >&2
+      continue
+    fi
+    if (( flakes == 0 )); then
+      printf 'ERROR: CI_FLAKE_DETECTED pr=%s: CI passed only after a run failed on the same head (flaky).\n' "$pr" >&2
+    fi
+    printf '  workflow=%s failed_run=%s passing_run=%s\n' "$wf" "$failed" "$passed" >&2
+    flakes=1
+  done < <(ci_rollup_failed_then_passed_runs "$runs_json" || true)
+
+  while IFS=$'\t' read -r run attempt; do
+    [[ -z "$run" ]] && continue
+    # Every earlier attempt counts, not only the previous one: attempt 1 failed, attempt 2 was cancelled and
+    # attempt 3 passed is still a pass that followed a failure.
+    for (( prior = attempt - 1; prior >= 1; prior-- )); do
+      prior_conclusion="$(ci_run_attempt_conclusion "$run" "$prior" "$repo" || true)"
+      case "$prior_conclusion" in
+        failure|timed_out|startup_failure)
+          if ci_run_attempt_runner_never_acquired "$run" "$prior" "$repo"; then
+            printf 'NOTE: CI_RERUN_RUNNER_NOT_ACQUIRED pr=%s run=%s attempt=%s (an outage, not a flake)\n' \
+              "$pr" "$run" "$prior" >&2
+            continue
+          fi
+          if (( flakes == 0 )); then
+            printf 'ERROR: CI_FLAKE_DETECTED pr=%s: CI passed only after a run failed on the same head (flaky).\n' "$pr" >&2
+          fi
+          printf '  run=%s attempt=%s passed after attempt %s %s\n' "$run" "$attempt" "$prior" "$prior_conclusion" >&2
+          flakes=1
+          break
+          ;;
+        *) ;;
+      esac
+    done
+  done < <(ci_rollup_rerun_passed_runs "$runs_json" || true)
+
+  if (( flakes == 1 )); then
+    printf '%s\n' \
+      'A flaky test is never accepted: find the failing job in the failed attempt, fix the root cause, and push the' \
+      'fix (a new head). Rerunning, recording the test as known-flaky or retrying until green is not a fix.' >&2
+    return 0
+  fi
+  return 1
+}
+
 require_ci_success() {
   local -r pr="$1"
   local rollup failures repo latest conclusion runs_json superseded superseded_state
   local fail_line fail_count
 
+  runs_json=""
   repo="$(ci_repo_slug_for_pr)"
   if [[ -n "$repo" ]]; then
     rollup="$(ci_rollup_json_for_pr "$pr" "$repo")"
@@ -298,6 +386,20 @@ require_ci_success() {
   fi
   case "$conclusion" in
     success)
+      # Green is not enough when a run failed first on the same head: a rerun that passed is a flake, and a flake is fixed,
+      # never accepted (#884). When the runs cannot be listed the green verdict stands.
+      # The listing the superseded-run step already took is reused (a second one that failed would drop the
+      # candidate it found); one is fetched only when there is none. Workflows with a check the gate ignores are left
+      # out: re-running the merged-PR closer is not a flaky test.
+      if [[ -z "$runs_json" ]]; then
+        runs_json="$(ci_pr_head_runs_json "$pr" "$repo" || true)"
+      fi
+      if [[ -n "$runs_json" ]]; then
+        runs_json="$(ci_rollup_runs_without_external_workflows "$rollup" "$runs_json" || printf '%s' "$runs_json")"
+        if report_ci_flakes "$pr" "$repo" "$runs_json"; then
+          return 1
+        fi
+      fi
       return 0
       ;;
     failure)

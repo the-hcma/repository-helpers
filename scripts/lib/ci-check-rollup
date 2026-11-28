@@ -104,6 +104,24 @@ ci_discover_required_contexts_from_ci_yml_text() {
   ' <<<"$text"
 }
 
+# The jq definition of a check that never gates a PR (labels, branch cleanup, the merged-PR closer, dependabot,
+# Graphite, unexpanded matrix names). Shared by the gating conclusion and by the flake scan, so the scan skips the
+# workflows the gate ignores (#884).
+readonly ci_rollup_jq_is_external='
+    def is_external($n):
+      ($n // "") as $v
+      # Unexpanded ${{ ... }} matrix display names never get a real check (#733);
+      # a CANCELLED/FAILURE placeholder from cancel-in-progress must not keep empty-
+      # required gating pending forever (same idea as skipping them in discovery).
+      | ($v | startswith("Graphite /"))
+        or $v == "label"
+        or ($v | startswith("label-"))
+        or $v == "cleanup-merged-branch"
+        or $v == "close-merged-prs"
+        or ($v | test("(?i)dependabot"))
+        or ($v | index("${{") != null);
+'
+
 ci_rollup_conclusion_for_gating() {
   local rollup_json="$1"
   local required_contexts="${2:-}"
@@ -139,18 +157,7 @@ ci_rollup_conclusion_for_gating() {
       ($c // "") as $v | ok_conclusions | index($v) != null;
     def is_success($c):
       ($c // "") == "SUCCESS";
-    def is_external($n):
-      ($n // "") as $v
-      # Unexpanded ${{ ... }} matrix display names never get a real check (#733);
-      # a CANCELLED/FAILURE placeholder from cancel-in-progress must not keep empty-
-      # required gating pending forever (same idea as skipping them in discovery).
-      | ($v | startswith("Graphite /"))
-        or $v == "label"
-        or ($v | startswith("label-"))
-        or $v == "cleanup-merged-branch"
-        or $v == "close-merged-prs"
-        or ($v | test("(?i)dependabot"))
-        or ($v | index("${{") != null);
+    '"${ci_rollup_jq_is_external}"'
     def is_incomplete:
       ((.conclusion // "") == "")
         or ((.status // "") != "" and (.status // "") != "COMPLETED")
@@ -514,7 +521,7 @@ ci_rollup_discover_repo_slug() {
 
 # ci_pr_head_runs_json <pr> [repo]
 # The Actions runs of the PR's head SHA as one JSON array (databaseId, headSha, workflowDatabaseId, conclusion,
-# status),
+# status, attempt, event),
 # or nothing and exit 1 when they cannot be listed, so a caller keeps its original verdict (#884).
 ci_pr_head_runs_json() {
   local -r pr="$1"
@@ -535,7 +542,18 @@ ci_pr_head_runs_json() {
   # (the runs a failing row refers to are always among them).
   runs_json="$(github_api_exec_with_rate_limit_retry "ci-rollup list head runs" -- gh run list \
     "${repo_args[@]}" --commit "$head_sha" --limit 100 \
-    --json databaseId,headSha,conclusion,status,workflowDatabaseId)" || exit_code=$?
+    --json databaseId,headSha,conclusion,status,workflowDatabaseId,attempt,event)" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$runs_json" ]]; then
+    # An older gh (before 2.46) has no `attempt` or `event` field and fails the whole listing. The superseded-run
+    # logic needs only the older fields, so keep it working; the flake check then sees no attempts.
+    exit_code=0
+    runs_json="$(github_api_exec_with_rate_limit_retry "ci-rollup list head runs (older gh)" -- gh run list \
+      "${repo_args[@]}" --commit "$head_sha" --limit 100 \
+      --json databaseId,headSha,conclusion,status,workflowDatabaseId)" || exit_code=$?
+    if (( exit_code == 0 )) && [[ -n "$runs_json" ]]; then
+      printf 'NOTE: CI_FLAKE_CHECK_DEGRADED reason=gh_run_list_lacks_attempt_and_event (upgrade gh)\n' >&2
+    fi
+  fi
   if (( exit_code != 0 )) || [[ -z "$head_sha" || -z "$runs_json" ]]; then
     return 1
   fi
@@ -631,6 +649,137 @@ ci_rollup_without_superseded_failures() {
           elif $s.state == "waiting" then (. + {conclusion: "", status: "IN_PROGRESS"})
           else empty end
       ]'
+}
+
+# ci_rollup_runs_without_external_workflows <rollup-json> <runs-json>
+# The runs without every run of a workflow that has a check the gate ignores (ci_rollup_jq_is_external: the merged-PR
+# closer, branch cleanup, labels, dependabot, ...): re-running repository-maintenance automation is not a flaky test
+# (#884). A workflow is excluded when one of its runs has such a check row and none of its runs supplies a gating one: a
+# workflow that also supplies a gating check stays in the scan.
+ci_rollup_runs_without_external_workflows() {
+  local -r rollup_json="$1"
+  local -r runs_json="$2"
+
+  ci_rollup_jq_file "ci-rollup runs without external workflows" "$rollup_json" -c --argjson runs "$runs_json" \
+    "${ci_rollup_jq_is_external}"'
+    # The Actions run id in the detailsUrl of a check row (null for a status context or an unparseable URL).
+    def run_id:
+      ((.detailsUrl // "") | capture("/actions/runs/(?<id>[0-9]+)")? // null)
+      | if . == null then null else (.id | tonumber) end;
+    ([ .[]? | select(is_external(.name // .context // "")) | run_id | select(. != null) ]) as $external_runs
+    | ([ .[]? | select(is_external(.name // .context // "") | not) | run_id | select(. != null) ]) as $gating_runs
+    | ([ $runs[]? | select(.databaseId as $id | $gating_runs | index($id) != null) | .workflowDatabaseId ]) as $gating_workflows
+    | ([ $runs[]?
+         | select(.databaseId as $id | $external_runs | index($id) != null)
+         | .workflowDatabaseId
+         | select(. as $w | $gating_workflows | index($w) == null) ]) as $workflows
+    | [ $runs[]? | select((.workflowDatabaseId as $w | $workflows | index($w)) == null) ]'
+}
+
+# ci_rollup_failed_then_passed_runs <runs-json>
+# One "<workflow id><TAB><failed run id><TAB><passing run id><TAB><failed run attempt><TAB><its conclusion>" line per run that failed (failure, timed_out or
+# startup_failure), or whose rerun was cancelled, skipped or is still running (its earlier attempts may have failed), while a newer run of the same workflow, with the same trigger event, on the same head succeeded (a
+# push run tests the branch and a pull_request run the merge with the base, so one is no retry of the other; runs
+# without event metadata, from an older gh, are never paired): it passed
+# after it failed, so a
+# flake (or a base branch that moved under the merge commit; the two cannot be told apart), never a result to
+# accept (#884). A cancelled run is not listed here (that is a superseded run).
+ci_rollup_failed_then_passed_runs() {
+  local -r runs_json="$1"
+
+  ci_rollup_jq_file "ci-rollup failed then passed runs" "$runs_json" -r '
+    . as $runs
+    | [ .[]?
+        | select(((.status // "") != "completed" and ((.attempt // 1) > 1))
+                 or ((.status // "") == "completed"
+                 and (((.conclusion // "") as $c | ["failure", "timed_out", "startup_failure"] | index($c)) != null
+                      # A rerun that was cancelled or skipped may still have failed on an earlier attempt: the caller
+                      # reads those attempts. A first attempt that was cancelled is a superseded run, not a failure.
+                      or (((.conclusion // "") as $c | ["cancelled", "skipped"] | index($c)) != null
+                          and ((.attempt // 1) > 1))))) ]
+    | .[]
+    | . as $f
+    | ([ $runs[]?
+         | select((.workflowDatabaseId // -1) == ($f.workflowDatabaseId // -2)
+                  and (($f.event // "") != "" and (.event // "") == ($f.event // ""))
+                  and .databaseId > $f.databaseId
+                  and (.status // "") == "completed"
+                  and (.conclusion // "") == "success") ]
+       | sort_by(.databaseId) | last // null) as $p
+    | select($p != null)
+    | "\($f.workflowDatabaseId)\t\($f.databaseId)\t\($p.databaseId)\t\($f.attempt // 1)\t\($f.conclusion // "")"
+  '
+}
+
+# ci_rollup_rerun_passed_runs <runs-json>
+# One "<run id><TAB><attempt>" line per run that completed with success on a rerun (attempt above 1): the candidates
+# for "an earlier attempt of this run failed" (#884).
+ci_rollup_rerun_passed_runs() {
+  local -r runs_json="$1"
+
+  ci_rollup_jq_file "ci-rollup rerun passed runs" "$runs_json" -r '
+    .[]?
+    | select((.status // "") == "completed" and (.conclusion // "") == "success" and ((.attempt // 1) > 1))
+    | "\(.databaseId)\t\(.attempt)"
+  '
+}
+
+# ci_run_attempt_runner_never_acquired <run id> <attempt> [repo]
+# Exit 0 when the attempt failed because no runner was ever acquired (GitHub's "was not acquired by Runner" outage):
+# at least one failed job has no runner and ran no step, and every other failed job started only after those gave
+# up. That second kind is an aggregate (`needs:` with `if: always()`), which gets a runner and fails because its
+# dependency did; a failed job that started earlier ran alongside the outage and is a real failure. An outage is
+# not a flaky test, and its documented fix is a rerun (#884). The jobs API does not say which job `needs:` which, so
+# "started after the outage gave up" is a timing heuristic, not an exact test: a job with no `needs:` that was
+# queued late and failed for real is taken for an aggregate (a known limit, pinned by a test). Exit 1 for anything else, including an unreadable job
+# list: an attempt that cannot be shown to be an outage counts as a failure.
+ci_run_attempt_runner_never_acquired() {
+  local -r run_id="$1"
+  local -r attempt="$2"
+  local -r repo="${3:-}"
+  local jobs exit_code verdict
+  local slug="$repo"
+
+  exit_code=0
+  if [[ -z "$slug" ]]; then
+    slug="$(ci_rollup_discover_repo_slug)" || return 1
+  fi
+  # Every page of jobs (--paginate): a real failed job on a later page must not hide behind an outage on page 1.
+  # One compact object per failed job.
+  jobs="$(github_api_exec_with_rate_limit_retry "ci-rollup run attempt jobs" -- gh api --paginate \
+    "repos/${slug}/actions/runs/${run_id}/attempts/${attempt}/jobs?per_page=100" \
+    --jq '.jobs[]? | select((.conclusion // "") as $c | ["failure", "timed_out", "startup_failure"] | index($c) != null)
+      | {never: (((.runner_id // 0) == 0) and ((.steps // []) | length == 0)),
+         started: (.started_at // ""), completed: (.completed_at // "")}')" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$jobs" ]]; then
+    return 1
+  fi
+  verdict="$(ci_rollup_jq_file "ci-rollup run attempt outage" "$jobs" -s -r '
+    ([.[] | select(.never) | .completed] | max // "") as $gave_up
+    | (any(.[]; .never))
+      and (all(.[]; .never or ((.started != "") and (.started >= $gave_up))))')" || return 1
+  [[ "$verdict" == 'true' ]]
+}
+
+# ci_run_attempt_conclusion <run id> <attempt> [repo]
+# Prints the conclusion of one attempt of an Actions run (empty and exit 1 when it cannot be read).
+ci_run_attempt_conclusion() {
+  local -r run_id="$1"
+  local -r attempt="$2"
+  local -r repo="${3:-}"
+  local conclusion exit_code
+  local slug="$repo"
+
+  exit_code=0
+  if [[ -z "$slug" ]]; then
+    slug="$(ci_rollup_discover_repo_slug)" || return 1
+  fi
+  conclusion="$(github_api_exec_with_rate_limit_retry "ci-rollup run attempt conclusion" -- gh api \
+    "repos/${slug}/actions/runs/${run_id}/attempts/${attempt}" --jq '.conclusion // empty')" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$conclusion" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$conclusion"
 }
 
 # ci_failed_workflow_run_id_for_pr <pr> [repo]
